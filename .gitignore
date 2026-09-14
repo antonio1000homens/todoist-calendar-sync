@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.aws-sam/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+.DS_Store
+config/bootstrap-ssm-migration.env
+config/profile-config.env
+
+# Never reintroduce the superseded Node-RED runtime/state.
+flows.json
+flows_cred.json
+.flows*.backup
+.config*.json
+.config*.backup
+.sessions.json

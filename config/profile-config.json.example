@@ -1,0 +1,20 @@
+{
+  "home": {
+    "calendarId": "home@example.test",
+    "channelId": "example-home-channel",
+    "todoistRoute": "/todoist-home",
+    "todoistProjectId": "example-home-project"
+  },
+  "antonio": {
+    "calendarId": "personal@example.test",
+    "channelId": "example-personal-channel",
+    "todoistRoute": "/todoist-personal",
+    "todoistProjectId": "example-personal-project"
+  },
+  "work": {
+    "calendarId": "work@example.test",
+    "channelId": "example-work-channel",
+    "todoistRoute": "/todoist-work",
+    "todoistProjectId": "example-work-project"
+  }
+}

@@ -1,0 +1,86 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: todoist-calendar-sync-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'master')
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      CODE_BUCKET: ${{ vars.CODE_BUCKET }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      RESOURCE_NAME_PREFIX: ${{ vars.RESOURCE_NAME_PREFIX }}
+      SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+      TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: ${{ vars.TODOIST_CALENDAR_SYNC_SLACK_CHANNEL }}
+      TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL: ${{ vars.TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL }}
+      SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
+    steps:
+      - name: Validate non-secret deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME CODE_BUCKET STACK_NAME RESOURCE_NAME_PREFIX SSM_PREFIX TODOIST_CALENDAR_SYNC_SLACK_CHANNEL SYNC_PROFILE_CONFIG_JSON; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing production environment variable: $name" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+          token: ${{ github.token }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and test exact deployment revision
+        run: npm test
+
+      - name: Check public-source boundary
+        run: bash scripts/check-public-source.sh
+
+      - name: Validate SAM template
+        run: sam validate --lint --template template.yaml
+
+      - name: Build SAM application
+        run: PATH="$PWD/node_modules/.bin:$PATH" sam build --template template.yaml
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.0.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: github-actions-todoist-calendar-sync
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy todoist-calendar-sync
+        env:
+          SKIP_SOURCE_VALIDATION: 'true'
+          BILLING_ALARM_EMAIL: ${{ env.TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL }}
+        run: bash ./deploy.sh

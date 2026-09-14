@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Dedicated least-privilege GitHub Actions OIDC deployment role for todoist-calendar-sync.
+
+Parameters:
+  DeploymentRoleName:
+    Type: String
+    Default: GitHubActionsTodoistCalendarSyncDeployRole
+  CodeBucketName:
+    Type: String
+    Default: aws2022-lambda-code
+  SamCliManagedSourceBucketName:
+    Type: String
+    Default: aws-sam-cli-managed-default-samclisourcebucket-hhzix2ljvzic
+  ApplicationStackName:
+    Type: String
+    Default: todoist-calendar-sync
+  LegacyApplicationStackName:
+    Type: String
+    Default: gcp-app2-sync
+  ResourceNamePrefix:
+    Type: String
+    Default: todoist-calendar-sync
+  LegacyResourceNamePrefix:
+    Type: String
+    Default: gcp-app2-sync
+
+Resources:
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref DeploymentRoleName
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": repo:antonio1000homens/todoist-calendar-sync:environment:production
+
+  DeploymentPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: TodoistCalendarSyncDeploymentPolicy
+      Description: Deploy todoist-calendar-sync while retaining narrowly scoped access to the legacy resource prefix during cutover.
+      Roles: [!Ref DeploymentRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadLegacyApplicationArtifacts
+            Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${CodeBucketName}/${LegacyResourceNamePrefix}/*
+              - !Sub arn:${AWS::Partition}:s3:::${SamCliManagedSourceBucketName}/*
+
+          - Sid: ManageApplicationStacks
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResource
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:ListStackResources
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${LegacyApplicationStackName}/*
+
+          - Sid: UseSamTransform
+            Effect: Allow
+            Action: cloudformation:CreateChangeSet
+            Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+
+          - Sid: ValidateCloudFormationTemplates
+            Effect: Allow
+            Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+            Resource: "*"
+
+          - Sid: ManageApplicationLambdaFunctions
+            Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:GetFunctionConcurrency
+              - lambda:GetPolicy
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+              - lambda:PublishVersion
+              - lambda:ListVersionsByFunction
+              - lambda:CreateAlias
+              - lambda:UpdateAlias
+              - lambda:DeleteAlias
+              - lambda:GetAlias
+              - lambda:ListAliases
+              - lambda:AddPermission
+              - lambda:RemovePermission
+              - lambda:CreateFunctionUrlConfig
+              - lambda:UpdateFunctionUrlConfig
+              - lambda:DeleteFunctionUrlConfig
+              - lambda:GetFunctionUrlConfig
+              - lambda:PutFunctionConcurrency
+              - lambda:DeleteFunctionConcurrency
+              - lambda:CreateEventSourceMapping
+              - lambda:UpdateEventSourceMapping
+              - lambda:DeleteEventSourceMapping
+              - lambda:GetEventSourceMapping
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:ListTags
+            Resource:
+              - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LegacyResourceNamePrefix}-*
+
+          - Sid: InspectLambdaEventSourceMappings
+            Effect: Allow
+            Action: lambda:ListEventSourceMappings
+            Resource: "*"
+
+          - Sid: ManageApplicationCodeDeploy
+            Effect: Allow
+            Action:
+              - codedeploy:CreateApplication
+              - codedeploy:GetApplication
+              - codedeploy:DeleteApplication
+              - codedeploy:CreateDeploymentGroup
+              - codedeploy:GetDeploymentGroup
+              - codedeploy:UpdateDeploymentGroup
+              - codedeploy:DeleteDeploymentGroup
+              - codedeploy:TagResource
+              - codedeploy:UntagResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ResourceNamePrefix}-*/*
+              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${LegacyResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${LegacyResourceNamePrefix}-*/*
+
+          - Sid: RunApplicationCodeDeployments
+            Effect: Allow
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:StopDeployment
+              - codedeploy:RegisterApplicationRevision
+              - codedeploy:ListApplications
+              - codedeploy:ListDeploymentGroups
+              - codedeploy:ListDeployments
+              - codedeploy:GetDeploymentConfig
+            Resource: "*"
+
+          - Sid: ManageApplicationIamRoles
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:PassRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:PutRolePolicy
+              - iam:GetRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+            Resource:
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LegacyResourceNamePrefix}-*
+
+          - Sid: ManageApplicationQueues
+            Effect: Allow
+            Action:
+              - sqs:CreateQueue
+              - sqs:DeleteQueue
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+              - sqs:SetQueueAttributes
+              - sqs:TagQueue
+              - sqs:UntagQueue
+              - sqs:ListQueueTags
+            Resource:
+              - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${LegacyResourceNamePrefix}-*
+
+          - Sid: ManageApplicationEventRules
+            Effect: Allow
+            Action:
+              - events:PutRule
+              - events:DeleteRule
+              - events:DescribeRule
+              - events:PutTargets
+              - events:RemoveTargets
+              - events:ListTargetsByRule
+              - events:TagResource
+              - events:UntagResource
+              - events:ListTagsForResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${LegacyResourceNamePrefix}-*
+
+          - Sid: ManageApplicationDynamoDbTables
+            Effect: Allow
+            Action:
+              - dynamodb:CreateTable
+              - dynamodb:DeleteTable
+              - dynamodb:DescribeTable
+              - dynamodb:UpdateTable
+              - dynamodb:UpdateTimeToLive
+              - dynamodb:DescribeTimeToLive
+              - dynamodb:TagResource
+              - dynamodb:UntagResource
+              - dynamodb:ListTagsOfResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LegacyResourceNamePrefix}-state-*
+
+          - Sid: ManageApplicationLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:DeleteRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:ListTagsForResource
+            Resource:
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LegacyResourceNamePrefix}-*
+
+          - Sid: InspectLogGroups
+            Effect: Allow
+            Action: logs:DescribeLogGroups
+            Resource: "*"
+
+          - Sid: ManageApplicationAlarms
+            Effect: Allow
+            Action: [cloudwatch:PutMetricAlarm, cloudwatch:DeleteAlarms, cloudwatch:TagResource, cloudwatch:UntagResource]
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${LegacyResourceNamePrefix}-*
+
+          - Sid: InspectAlarms
+            Effect: Allow
+            Action: cloudwatch:DescribeAlarms
+            Resource: "*"
+
+          - Sid: ManageApplicationBudgets
+            Effect: Allow
+            Action: [budgets:ModifyBudget, budgets:ViewBudget]
+            Resource:
+              - !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${ResourceNamePrefix}-*
+              - !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${LegacyResourceNamePrefix}-*
+
+  CanonicalArtifactPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: TodoistCalendarSyncCanonicalArtifactAccess
+      Roles: [!Ref DeploymentRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PackageCanonicalApplicationArtifacts
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucketName}/todoist-calendar-sync/*
+
+          - Sid: InspectCodeBucket
+            Effect: Allow
+            Action: s3:GetBucketLocation
+            Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucketName}
+
+          - Sid: ListCanonicalApplicationArtifacts
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBucketName}
+            Condition:
+              StringLike:
+                s3:prefix: todoist-calendar-sync/*
+
+  DeploymentAdditionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: TodoistCalendarSyncDeploymentAdditionsPolicy
+      Description: Read-only secret access plus backup and alert management during the todoist-calendar-sync cutover.
+      Roles: [!Ref DeploymentRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadApplicationParameters
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/todoist-calendar-sync/*
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lambdas/gcp-app2-sync/*
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lambdas/shared/slack-bot-token
+
+          - Sid: ManageApplicationDynamoDbBackups
+            Effect: Allow
+            Action: [dynamodb:UpdateContinuousBackups, dynamodb:DescribeContinuousBackups]
+            Resource:
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LegacyResourceNamePrefix}-state-*
+
+          - Sid: ManageApplicationAlertTopics
+            Effect: Allow
+            Action:
+              - sns:CreateTopic
+              - sns:DeleteTopic
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:TagResource
+              - sns:UntagResource
+              - sns:ListTagsForResource
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - sns:ListSubscriptionsByTopic
+            Resource:
+              - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ResourceNamePrefix}-alerts-*
+              - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${LegacyResourceNamePrefix}-alerts-*
+
+Outputs:
+  DeploymentRoleArn:
+    Description: Configure this as the protected production environment variable AWS_ROLE_TO_ASSUME.
+    Value: !GetAtt DeploymentRole.Arn

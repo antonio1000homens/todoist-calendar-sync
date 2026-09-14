@@ -1,0 +1,27 @@
+{
+  "name": "todoist-calendar-sync",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --import ./test/setup-env.mjs --test test/**/*.test.mjs",
+    "migrate:project-comments": "npm run build --silent && node scripts/project-comment-migration.mjs",
+    "check:public": "bash scripts/check-public-source.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.965.0",
+    "@aws-sdk/client-sqs": "^3.965.0",
+    "@aws-sdk/client-ssm": "^3.965.0",
+    "@aws-sdk/lib-dynamodb": "^3.965.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
+    "@types/node": "^22.15.3",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.8.3"
+  }
+}
