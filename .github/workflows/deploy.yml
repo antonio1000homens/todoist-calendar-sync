@@ -73,7 +73,7 @@ jobs:
         run: PATH="$PWD/node_modules/.bin:$PATH" sam build --template template.yaml
 
       - name: Configure AWS credentials through GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@v6.0.0
+        uses: aws-actions/configure-aws-credentials@v6.2.4
         with:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           role-session-name: github-actions-todoist-calendar-sync
