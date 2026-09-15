@@ -40,16 +40,22 @@ console.log(JSON.stringify({
 }));
 
 if (apply) {
-  for (let offset = 0; offset < candidates.length; offset += 25) {
-    let pending = candidates.slice(offset, offset + 25);
+  const batchSize = 5;
+  for (let offset = 0; offset < candidates.length; offset += batchSize) {
+    let pending = candidates.slice(offset, offset + batchSize);
     for (let attempt = 0; pending.length > 0 && attempt < 8; attempt += 1) {
-      const result = await client.send(new BatchWriteCommand({
-        RequestItems: { [tableName]: pending },
-      }));
-      pending = result.UnprocessedItems?.[tableName] || [];
-      if (pending.length > 0) await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+      try {
+        const result = await client.send(new BatchWriteCommand({
+          RequestItems: { [tableName]: pending },
+        }));
+        pending = result.UnprocessedItems?.[tableName] || [];
+      } catch (error) {
+        if (error.name !== "ProvisionedThroughputExceededException") throw error;
+      }
+      if (pending.length > 0) await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
     }
     if (pending.length > 0) throw new Error(`Unprocessed audit deletes remain after retries at offset ${offset}`);
+    if (offset + batchSize < candidates.length) await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   console.log(JSON.stringify({ event: "routine_audit_cleanup_complete", deleted: candidates.length }));
 }
