@@ -489,6 +489,19 @@ function changeSummary(decision: ManualDecision): string | undefined {
   }
 }
 
+function actionGuidance(decision: ManualDecision): string | undefined {
+  switch (decision.type) {
+    case "standalone_todoist_task_deleted":
+      return "*Choose one:* Delete the Calendar event if the Todoist deletion was intentional, or restore the Todoist task if the Calendar event should remain. No provider action happens until you choose.";
+    case "todoist_owned_recurrence_task_deleted":
+      return "*Choose one:* Delete the Calendar series if the Todoist deletion was intentional, keep it and unlink it, or restore the Todoist task. No provider action happens until you choose.";
+    case "calendar_owned_recurrence_task_deleted":
+      return "*Choose one:* Skip this occurrence, delete this and future occurrences, delete the whole Calendar series, or restore the Todoist task. No provider action happens until you choose.";
+    default:
+      return undefined;
+  }
+}
+
 function contextLines(decision: ManualDecision): string[] {
   const detail = decision.context;
   const { taskTitle, calendarTitle } = contextTitles(decision);
@@ -607,7 +620,7 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
   }));
   const allActions = [...decision.permittedActions, ...dynamicActions];
   if (allActions.length) {
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: "*What should happen next?* Destructive choices require confirmation." } });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: actionGuidance(decision) || "*What should happen next?* Choose the proposed action. Destructive choices require confirmation." } });
   }
   for (let index = 0; index < allActions.length; index += 5) {
     blocks.push({
@@ -811,6 +824,31 @@ export class ManualInterventionService {
       : mapping.recurrenceOwner === "todoist"
         ? "todoist_owned_recurrence_task_deleted"
         : "standalone_todoist_task_deleted";
+    const identity = {
+      taskId: task.id,
+      eventId: mapping.eventId,
+      masterEventId: mapping.masterEventId,
+      activeInstanceId: mapping.activeInstanceId,
+      mappingUpdatedAt: mapping.updatedAt,
+    };
+    const effective = await this.policies.resolve(delivery.profile, type, mapping.seriesId, MANUAL_DECISION_CATALOG[type].defaultMode || "prompt");
+    if (effective.mode === "prompt") {
+      const existing = await this.store.get(decisionKey(delivery.profile, type, identity).decisionId);
+      if (existing) return true;
+      const pair = await this.providerClients(delivery.profile);
+      try {
+        await pair.todoist.getTask(task.id);
+        await state.audit(delivery.profile, "manual_decision_suppressed_current_task_exists", {
+          type,
+          taskId: task.id,
+          eventId: mapping.eventId,
+          sourceDeliveryId: delivery.id,
+        });
+        return true;
+      } catch (error) {
+        if (!providerNotFound(error)) throw error;
+      }
+    }
     const context: Record<string, unknown> = {
       taskTitle: task.content,
       todoistDue: todoistDue(task),
@@ -820,13 +858,7 @@ export class ManualInterventionService {
     const routed = await this.createDecision(
       delivery.profile,
       type,
-      {
-        taskId: task.id,
-        eventId: mapping.eventId,
-        masterEventId: mapping.masterEventId,
-        activeInstanceId: mapping.activeInstanceId,
-        mappingUpdatedAt: mapping.updatedAt,
-      },
+      identity,
       {
         sourceDeliveryId: delivery.id,
         taskId: task.id,
