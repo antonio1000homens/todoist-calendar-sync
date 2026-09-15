@@ -160,9 +160,20 @@ test('mapped explicit Todoist deletion is intercepted before provider mutation i
     },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
-  const service = new ManualInterventionService(decisions, notifier, async () => {
-    throw new Error('provider clients must not be called while raising the decision');
-  }, policies);
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: {
+      async getTask() {
+        const error = new Error('not found');
+        error.status = 404;
+        throw error;
+      },
+    },
+    calendar: {
+      async getEvent() {
+        return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
+      },
+    },
+  }), policies);
 
   assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), true);
   assert.equal(notifier.posted.length, 1);
@@ -172,6 +183,27 @@ test('mapped explicit Todoist deletion is intercepted before provider mutation i
   assert.equal(notifier.posted[0].policyScope, 'profile');
   assert.equal(audits.at(-1).action, 'manual_decision_requested');
   assert.equal(audits.at(-1).detail.handlingMode, 'prompt');
+});
+
+test('stale Todoist deletion webhook does not create a prompt when the task already exists', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const audits = [];
+  const mapping = mappedCalendarRecurrence();
+  const state = {
+    async getMappingByTask() { return mapping; },
+    async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
+  };
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: { async getTask() { return { id: 'task-1', content: 'test recurring' }; } },
+    calendar: {},
+  }), new FakePolicyStore());
+
+  assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), true);
+  assert.equal(decisions.decisions.size, 0);
+  assert.equal(notifier.posted.length, 0);
+  assert.equal(audits.at(-1).action, 'manual_decision_suppressed_current_task_exists');
 });
 
 test('terminal deterministic decision is not reopened by the same detector state', async () => {
@@ -184,9 +216,20 @@ test('terminal deterministic decision is not reopened by the same detector state
     async getMappingByTask() { return mapping; },
     async audit() {},
   };
-  const service = new ManualInterventionService(decisions, notifier, async () => {
-    throw new Error('detector must not call providers');
-  }, policies);
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: {
+      async getTask() {
+        const error = new Error('not found');
+        error.status = 404;
+        throw error;
+      },
+    },
+    calendar: {
+      async getEvent() {
+        return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
+      },
+    },
+  }), policies);
 
   await service.interceptTodoistDeletion(todoistDeleteDelivery(), state);
   const original = [...decisions.decisions.values()][0];

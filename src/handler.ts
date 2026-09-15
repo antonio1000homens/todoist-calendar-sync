@@ -1,6 +1,7 @@
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda";
 import { calendarWatchToken, profileForChannel, profileForTodoistRoute, proxySharedSecret, todoistWebhookSecret } from "./config.js";
 import { enqueueDelivery } from "./queue.js";
+import { StateRepository } from "./repository.js";
 import { equalSecret, sha256, validTodoistSignature } from "./security.js";
 import type { Delivery, Profile } from "./types.js";
 
@@ -68,7 +69,8 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
   let profile: Profile | undefined;
   if (path === "/calendar") {
     kind = "calendar";
-    profile = profileForChannel(headers["x-goog-channel-id"]);
+    profile = profileForChannel(headers["x-goog-channel-id"])
+      || await new StateRepository().getCalendarWatchByChannel(headers["x-goog-channel-id"] || "");
     if (!profile || !equalSecret(headers["x-goog-channel-token"], await calendarWatchToken())) {
       log("webhook_rejected", { path, kind, profile, reason: "invalid_calendar_channel" });
       return response(401, { error: "invalid_calendar_channel" });
@@ -102,6 +104,14 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     bodyBytes: Buffer.byteLength(body),
     providerMetadata: delivery.headers,
   });
+
+  if (kind === "calendar") {
+    try {
+      await new StateRepository().markCalendarWatchNotification(profile);
+    } catch (error) {
+      logError("calendar_watch_notification_state_failed", error, { profile });
+    }
+  }
 
   try {
     await enqueueDelivery(delivery);

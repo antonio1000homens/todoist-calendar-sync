@@ -135,8 +135,8 @@ test('new deletion prompt enriches once and displays the moved Calendar occurren
 
   const clients = async () => {
     providerFactoryCalls += 1;
-    return {
-      calendar: {
+      return {
+        calendar: {
         async getEvent() {
           return {
             id: 'event-1',
@@ -146,7 +146,13 @@ test('new deletion prompt enriches once and displays the moved Calendar occurren
           };
         },
       },
-      todoist: {},
+      todoist: {
+        async getTask() {
+          const error = new Error('not found');
+          error.status = 404;
+          throw error;
+        },
+      },
     };
   };
 
@@ -177,14 +183,16 @@ test('new deletion prompt enriches once and displays the moved Calendar occurren
   const service = new ManualInterventionService(store, notifier, clients, policies);
 
   assert.equal(await service.interceptTodoistDeletion(delivery, state), true);
-  assert.equal(providerFactoryCalls, 1);
+  assert.equal(providerFactoryCalls, 2);
   assert.equal(notifier.posted.length, 1);
   assert.equal(notifier.posted[0].context.calendarTitle, 'Moved dentist appointment');
   assert.equal(notifier.posted[0].context.calendarStart, '2026-09-17T14:30:00+01:00');
+  assert.match(sectionText(decisionBlocks(notifier.posted[0])), /Delete the Calendar event if the Todoist deletion was intentional/);
+  assert.match(sectionText(decisionBlocks(notifier.posted[0])), /restore the Todoist task if the Calendar event should remain/);
 
   // Same deterministic state must not re-read Calendar or re-post the prompt.
   assert.equal(await service.interceptTodoistDeletion(delivery, state), true);
-  assert.equal(providerFactoryCalls, 1);
+  assert.equal(providerFactoryCalls, 2);
   assert.equal(notifier.posted.length, 1);
 });
 
@@ -349,7 +357,13 @@ test('Todoist-owned recurrence deletion enriches from the active Calendar occurr
         return { id, summary: 'Series master', start: { dateTime: '2026-09-15T10:00:00+01:00' } };
       },
     },
-    todoist: {},
+    todoist: {
+      async getTask() {
+        const error = new Error('not found');
+        error.status = 404;
+        throw error;
+      },
+    },
   });
   const mapping = {
     profile: 'home',
@@ -398,7 +412,13 @@ test('recurrence deletion falls back to the master without overwriting the known
         return { id, summary: 'Recurring series', start: { dateTime: '2026-09-15T10:00:00+01:00' } };
       },
     },
-    todoist: {},
+    todoist: {
+      async getTask() {
+        const error = new Error('not found');
+        error.status = 404;
+        throw error;
+      },
+    },
   });
   const mapping = {
     profile: 'home',

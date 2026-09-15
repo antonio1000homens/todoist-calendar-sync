@@ -89,6 +89,37 @@ export class StateRepository {
     await client.send(new DeleteCommand({ TableName: this.ensureTable(), Key: key(`SYNC#${profile}`) }));
   }
 
+  async getCalendarWatch(profile: Profile): Promise<import("./types.js").CalendarWatchState | undefined> {
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`WATCH#${profile}`), ConsistentRead: true }));
+    return result.Item?.status ? result.Item as import("./types.js").CalendarWatchState : undefined;
+  }
+
+  async getCalendarWatchByChannel(channelId: string): Promise<import("./types.js").Profile | undefined> {
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`WATCH_CHANNEL#${channelId}`), ConsistentRead: true }));
+    return result.Item?.profile as import("./types.js").Profile | undefined;
+  }
+
+  async putCalendarWatch(state: import("./types.js").CalendarWatchState): Promise<void> {
+    const writes = [
+      { Put: { TableName: this.ensureTable(), Item: { ...key(`WATCH#${state.profile}`), ...state, expiresAt: Math.floor(Date.parse(state.expiration) / 1000) } } },
+      { Put: { TableName: this.ensureTable(), Item: { ...key(`WATCH_CHANNEL#${state.channelId}`), profile: state.profile, generation: state.generation, expiresAt: Math.floor(Date.parse(state.expiration) / 1000) } } },
+    ];
+    await client.send(new TransactWriteCommand({ TransactItems: writes as never }));
+  }
+
+  async deleteCalendarWatchChannel(channelId: string): Promise<void> {
+    await client.send(new DeleteCommand({ TableName: this.ensureTable(), Key: key(`WATCH_CHANNEL#${channelId}`) }));
+  }
+
+  async markCalendarWatchNotification(profile: Profile, receivedAt = now()): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(),
+      Key: key(`WATCH#${profile}`),
+      UpdateExpression: "SET lastNotificationAt = :receivedAt",
+      ExpressionAttributeValues: { ":receivedAt": receivedAt },
+    }));
+  }
+
   /** @deprecated Ingress no longer claims before enqueue. Kept for compatibility/tests. */
   async claimDelivery(id: string): Promise<boolean> {
     try {
