@@ -1,4 +1,4 @@
-import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, PutCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient, pacedScan } from "./dynamodb-capacity.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -6,6 +6,8 @@ import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { logEvent } from "./observability.js";
+import { mappingLookupSk, profileLookupIndexReady, profileLookupPk, PROFILE_LOOKUP_INDEX_NAME } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 interface TodoistCanonicalState {
@@ -197,18 +199,33 @@ class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async listMappings(profile: Profile): Promise<Mapping[]> {
-    const result = await pacedScan<Mapping>({
-      TableName: this.ensureTable(),
-      FilterExpression: "begins_with(pk, :prefix) AND sk = :map",
-      ExpressionAttributeValues: {
-        ":prefix": `TASK#${profile}#`,
-        ":map": "MAP",
-      },
-    }, {
-      operation: "list_reconciliation_mappings",
-      profile,
-    });
-    return result.items;
+    const table = this.ensureTable();
+    if (!await profileLookupIndexReady(documentClient, table)) {
+      const result = await pacedScan<Mapping>({
+        TableName: table,
+        FilterExpression: "begins_with(pk, :prefix) AND sk = :map",
+        ExpressionAttributeValues: { ":prefix": `TASK#${profile}#`, ":map": "MAP" },
+      }, { operation: "list_reconciliation_mappings_scan_fallback", profile });
+      return result.items;
+    }
+
+    const items: Mapping[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    let pages = 0;
+    do {
+      const result = await documentClient.send(new QueryCommand({
+        TableName: table,
+        IndexName: PROFILE_LOOKUP_INDEX_NAME,
+        KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
+        ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": mappingLookupSk("task", "") },
+        ExclusiveStartKey: exclusiveStartKey,
+      }));
+      pages += 1;
+      items.push(...((result.Items || []) as Mapping[]));
+      exclusiveStartKey = result.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    logEvent("dynamodb_query_complete", { operation: "list_reconciliation_mappings", profile, accessMethod: "query", pages, returnedCount: items.length }, "reconciliation");
+    return items;
   }
 
   async getBaseline(profile: Profile, taskId: string): Promise<ReconciliationBaseline | undefined> {

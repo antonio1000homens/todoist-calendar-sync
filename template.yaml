@@ -67,6 +67,16 @@ Parameters:
     Default: 20
     MinValue: 1
     Description: Maximum mapped/unmapped Todoist candidates processed by one reconciliation chunk.
+  ProfileLookupIndexReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups.
+  ProfileLookupIndexWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Provisioned write capacity for profile-scoped mapping and recurrence lookups.
   BillingAlarmEmail:
     Type: String
     Default: ""
@@ -117,11 +127,27 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: lookupPk
+          AttributeType: S
+        - AttributeName: lookupSk
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ProfileLookupIndex
+          KeySchema:
+            - AttributeName: lookupPk
+              KeyType: HASH
+            - AttributeName: lookupSk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ProfileLookupIndexReadCapacity
+            WriteCapacityUnits: !Ref ProfileLookupIndexWriteCapacity
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true

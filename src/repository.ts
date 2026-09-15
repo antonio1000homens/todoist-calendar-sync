@@ -2,12 +2,23 @@ import {
   DeleteCommand,
   GetCommand,
   PutCommand,
+  QueryCommand,
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
+import {
+  mappingLookupSk,
+  profileLookupIndexReady,
+  profileLookupPk,
+  PROFILE_LOOKUP_INDEX_NAME,
+  PROFILE_LOOKUP_MIGRATION_VERSION,
+  PROFILE_LOOKUP_READY_KEY,
+  PROFILE_LOOKUP_READY_SORT_KEY,
+  recurrenceLookupSk,
+} from "./profile-lookup.js";
 import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
@@ -301,9 +312,9 @@ export class StateRepository {
     const item = { ...mapping, updatedAt: now() };
     await client.send(new TransactWriteCommand({
       TransactItems: [
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP") } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP") } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP") } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("event", mapping.eventId) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("task", mapping.taskId) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("owner", mapping.taskId) } } },
       ],
     }));
   }
@@ -405,7 +416,7 @@ export class StateRepository {
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
-      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`) },
+      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), lookupPk: profileLookupPk(link.profile), lookupSk: recurrenceLookupSk(link.seriesId) },
     }));
   }
 
@@ -419,15 +430,33 @@ export class StateRepository {
   }
 
   async listRecurrenceLinks(profile: Profile): Promise<RecurrenceLink[]> {
-    const result = await pacedScan<RecurrenceLink>({
-      TableName: this.ensureTable(),
-      FilterExpression: "begins_with(pk, :prefix)",
-      ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
-    }, {
-      operation: "list_recurrence_links",
-      profile,
-    });
-    return result.items;
+    const table = this.ensureTable();
+    if (!await profileLookupIndexReady(client, table)) {
+      const result = await pacedScan<RecurrenceLink>({
+        TableName: table,
+        FilterExpression: "begins_with(pk, :prefix)",
+        ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
+      }, { operation: "list_recurrence_links_scan_fallback", profile });
+      return result.items;
+    }
+
+    const items: RecurrenceLink[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    let pages = 0;
+    do {
+      const result = await client.send(new QueryCommand({
+        TableName: table,
+        IndexName: PROFILE_LOOKUP_INDEX_NAME,
+        KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
+        ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": "RECURRENCE#" },
+        ExclusiveStartKey: exclusiveStartKey,
+      }));
+      pages += 1;
+      items.push(...((result.Items || []) as RecurrenceLink[]));
+      exclusiveStartKey = result.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+    logEvent("dynamodb_query_complete", { operation: "list_recurrence_links", profile, accessMethod: "query", pages, returnedCount: items.length }, "state-repository");
+    return items;
   }
 
   async getCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<CalendarProjectionTombstone | undefined> {
@@ -509,6 +538,18 @@ export class StateRepository {
         detail: safeDetail,
         createdAt: now(),
         expiresAt: auditExpiresAt(),
+      },
+    }));
+  }
+
+  async markProfileLookupIndexReady(): Promise<void> {
+    await client.send(new PutCommand({
+      TableName: this.ensureTable(),
+      Item: {
+        ...key(PROFILE_LOOKUP_READY_KEY, PROFILE_LOOKUP_READY_SORT_KEY),
+        ready: true,
+        version: PROFILE_LOOKUP_MIGRATION_VERSION,
+        completedAt: now(),
       },
     }));
   }
