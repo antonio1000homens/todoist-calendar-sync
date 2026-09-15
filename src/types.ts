@@ -2,6 +2,20 @@ export type Profile = "home" | "antonio" | "work";
 export type CutoverMode = "aws";
 export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual";
 export type ReconciliationReason = "webhook" | "scheduled" | "baseline_recovery" | "manual";
+export type CalendarWatchStatus = "active" | "replaced" | "missing";
+
+export interface CalendarWatchState {
+  profile: Profile;
+  channelId: string;
+  resourceId: string;
+  expiration: string;
+  callbackUrl: string;
+  generation: string;
+  createdAt: string;
+  renewedAt: string;
+  lastNotificationAt?: string;
+  status: CalendarWatchStatus;
+}
 
 /**
  * Ordering is isolated by sync profile. Work that can mutate one profile must
