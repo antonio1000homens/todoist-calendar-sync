@@ -79,7 +79,7 @@ do {
         Key: { pk: item.pk, sk: item.sk },
         UpdateExpression: "SET lookupPk = :lookupPk, lookupSk = :lookupSk",
         ConditionExpression: "attribute_not_exists(lookupPk)",
-        ExpressionAttributeValues: lookup,
+        ExpressionAttributeValues: { ":lookupPk": lookup.lookupPk, ":lookupSk": lookup.lookupSk },
       }));
       updated += 1;
     } catch (error) {
