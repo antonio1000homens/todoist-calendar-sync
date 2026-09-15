@@ -6,6 +6,8 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
+import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
+import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
@@ -494,14 +496,19 @@ export class StateRepository {
   }
 
   async audit(profile: Profile, action: string, detail: Record<string, unknown>): Promise<void> {
+    const disposition = classifyAuditAction(action);
+    const safeDetail = sanitizeTelemetryDetail(detail);
+    logEvent(action, { profile, auditClass: disposition, ...safeDetail }, "state-repository");
+    if (disposition === "routine") return;
+
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
       Item: {
         ...key(`AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`),
         action,
-        detail,
+        detail: safeDetail,
         createdAt: now(),
-        expiresAt: ttl(30),
+        expiresAt: auditExpiresAt(),
       },
     }));
   }
