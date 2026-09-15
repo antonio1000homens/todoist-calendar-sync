@@ -52,6 +52,10 @@ export function profileForChannel(channelId: string | undefined): Profile | unde
   return channelId ? channelProfiles.get(channelId) : undefined;
 }
 
+export function configuredProfiles(): Profile[] {
+  return PROFILE_NAMES.slice();
+}
+
 export function profileForTodoistRoute(route: string): Profile | undefined {
   return routeProfiles.get(route);
 }

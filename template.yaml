@@ -67,6 +67,16 @@ Parameters:
     Default: 20
     MinValue: 1
     Description: Maximum mapped/unmapped Todoist candidates processed by one reconciliation chunk.
+  ProfileLookupIndexReadCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups.
+  ProfileLookupIndexWriteCapacity:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Provisioned write capacity for profile-scoped mapping and recurrence lookups.
   BillingAlarmEmail:
     Type: String
     Default: ""
@@ -117,11 +127,27 @@ Resources:
           AttributeType: S
         - AttributeName: sk
           AttributeType: S
+        - AttributeName: lookupPk
+          AttributeType: S
+        - AttributeName: lookupSk
+          AttributeType: S
       KeySchema:
         - AttributeName: pk
           KeyType: HASH
         - AttributeName: sk
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ProfileLookupIndex
+          KeySchema:
+            - AttributeName: lookupPk
+              KeyType: HASH
+            - AttributeName: lookupSk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref ProfileLookupIndexReadCapacity
+            WriteCapacityUnits: !Ref ProfileLookupIndexWriteCapacity
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true
@@ -187,6 +213,14 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-reconciler-${Stage}
       RetentionInDays: 14
 
+  WatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-watch-${Stage}
+      RetentionInDays: 30
+
   IngressFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -204,6 +238,11 @@ Resources:
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CalendarWatchTokenParameter}
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TodoistWebhookSecretParameter}
                 - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${ProxySharedSecretParameter}
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt SyncState.Arn
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: BUFFERED
@@ -318,6 +357,109 @@ Resources:
       FunctionName: !Ref ReconcilerFunction
       Principal: events.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ResourceNamePrefix}-reconcile-${Stage}
+
+  WatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-watch-${Stage}
+      Handler: watch.handler
+      Timeout: 120
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncState
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterPrefix}/*
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CalendarWatchTokenParameter}
+      Events:
+        WatchSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(12 hours)
+            Name: !Sub ${ResourceNamePrefix}-watch-${Stage}
+            Description: Renew Google Calendar watches independently of reconciliation.
+            Enabled: true
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/watch.ts]
+        Format: cjs
+        Target: es2022
+
+  WatchRenewalFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: WatchLogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-watch-${Stage}
+      FilterPattern: '{ $.event = "watch_renewal_failed" }'
+      MetricTransformations:
+        - MetricNamespace: TodoistCalendarSync/Watch
+          MetricName: RenewalFailures
+          MetricValue: "1"
+          DefaultValue: 0
+
+  WatchRenewalFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-watch-renewal-failures-${Stage}
+      AlarmDescription: A Google Calendar watch replacement failed; inspect the watch Lambda logs and verify the previous watch.
+      Namespace: TodoistCalendarSync/Watch
+      MetricName: RenewalFailures
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  WatchMissingMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: WatchLogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-watch-${Stage}
+      FilterPattern: '{ $.event = "watch_missing" }'
+      MetricTransformations:
+        - MetricNamespace: TodoistCalendarSync/Watch
+          MetricName: MissingWatches
+          MetricValue: "1"
+          DefaultValue: 0
+
+  WatchMissingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-watch-missing-${Stage}
+      AlarmDescription: The watch lifecycle check found a profile without persisted Calendar watch state.
+      Namespace: TodoistCalendarSync/Watch
+      MetricName: MissingWatches
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  WatchLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-watch-errors-${Stage}
+      AlarmDescription: The Calendar watch lifecycle Lambda failed after isolating profile errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WatchFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
 
   DlqAlarm:
     Type: AWS::CloudWatch::Alarm

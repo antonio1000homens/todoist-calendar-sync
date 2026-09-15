@@ -119,6 +119,20 @@ export class GoogleCalendar {
   async deleteEvent(eventId: string): Promise<void> {
     await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, { method: "DELETE" });
   }
+
+  async watch(channelId: string, address: string, token: string): Promise<{ resourceId: string; expiration: string }> {
+    return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/watch`, {
+      method: "POST",
+      body: JSON.stringify({ id: channelId, type: "web_hook", address, token }),
+    });
+  }
+
+  async stopWatch(channelId: string, resourceId: string): Promise<void> {
+    await this.request<void>("/channels/stop", {
+      method: "POST",
+      body: JSON.stringify({ id: channelId, resourceId }),
+    });
+  }
 }
 
 export class Todoist {
