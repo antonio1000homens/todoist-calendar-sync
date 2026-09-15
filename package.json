@@ -10,6 +10,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --import ./test/setup-env.mjs --test test/**/*.test.mjs",
     "migrate:project-comments": "npm run build --silent && node scripts/project-comment-migration.mjs",
+    "migrate:profile-lookup-index": "npm run build --silent && node scripts/backfill-profile-lookup-index.mjs",
+    "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",
     "check:public": "bash scripts/check-public-source.sh"
   },
   "dependencies": {
