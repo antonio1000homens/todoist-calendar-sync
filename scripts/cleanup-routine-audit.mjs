@@ -4,14 +4,27 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { BatchWriteCommand, DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { classifyAuditAction } from "../dist/audit-policy.js";
 
-const tableName = process.env.STATE_TABLE_NAME || "todoist-calendar-sync-state-production";
+const tableName = process.env.STATE_TABLE_NAME?.trim();
+if (!tableName) {
+  throw new Error("STATE_TABLE_NAME is required; refusing to default an administrative cleanup to production");
+}
+
 const apply = process.argv.includes("--apply");
-const client = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+const client = DynamoDBDocumentClient.from(new DynamoDBClient({
+  maxAttempts: 5,
+  retryMode: "standard",
+}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const candidates = [];
 const counts = new Map();
 let lastEvaluatedKey;
+
+function retryableThrottle(error) {
+  return error?.name === "ProvisionedThroughputExceededException"
+    || error?.name === "ThrottlingException"
+    || error?.name === "RequestLimitExceeded";
+}
 
 do {
   const result = await client.send(new ScanCommand({
@@ -50,7 +63,7 @@ if (apply) {
         }));
         pending = result.UnprocessedItems?.[tableName] || [];
       } catch (error) {
-        if (error.name !== "ProvisionedThroughputExceededException") throw error;
+        if (!retryableThrottle(error)) throw error;
       }
       if (pending.length > 0) await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
     }
