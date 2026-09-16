@@ -8,12 +8,12 @@ lookupSk = MAPPING#TASK#<taskId>       # reconciliation mappings
 lookupSk = RECURRENCE#<seriesId>       # recurrence links
 ```
 
-Mapping and recurrence writes populate these attributes in the same transaction/write as the canonical item. The production table keeps its existing primary key, `DeletionPolicy: Retain`, and `UpdateReplacePolicy: Retain`; adding the GSI does not replace the table.
+Mapping and recurrence writes populate these attributes in the same transaction/write as the canonical item. The production table keeps its existing primary key, `DeletionPolicy: Retain`, and `UpdateReplacePolicy: Retain`; the GSI is additive and does not replace the table.
 
 ## Rollout
 
-1. Deploy the additive GSI/write-path change and leave the readiness marker absent.
-2. Wait at least five minutes (the WorkerFunction timeout) so invocations running the pre-index write path have drained. New invocations already populate `lookupPk`/`lookupSk` on every eligible write.
+1. Deploy the indexed write path and GSI capacity/monitoring changes, confirm the existing `ProfileLookupIndex` is `ACTIVE`, and leave the readiness marker absent.
+2. Wait at least five minutes (the WorkerFunction timeout) so invocations running the pre-index-attribute write path have drained. New invocations already populate `lookupPk`/`lookupSk` on every eligible write.
 3. Run `npm run build` followed by `AWS_PROFILE=default AWS_REGION=eu-west-2 STATE_TABLE_NAME=<table> node scripts/backfill-profile-lookup-index.mjs --confirm-writers-drained`.
 4. The migration requires an explicit `STATE_TABLE_NAME`; it never defaults to production. It uses 25-item scan/query pages, paces scan pages, retries throttling with bounded exponential backoff, refuses to overwrite partial/conflicting lookup attributes, and requires the source item to still exist before adding index fields.
 5. The migration performs catch-up passes until a stable pass makes no updates and has no conditional races. It then verifies the exact set of expected lookup identities against the GSI before writing `SYSTEM#PROFILE_LOOKUP_INDEX / READY`.
