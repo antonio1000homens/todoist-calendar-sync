@@ -44,8 +44,11 @@ test("backfill cannot resurrect deleted rows and publishes readiness only after 
   assert.match(backfillSource, /--confirm-writers-drained/);
   assert.match(backfillSource, /attribute_exists\(pk\).*attribute_exists\(sk\).*attribute_not_exists\(lookupPk\).*attribute_not_exists\(lookupSk\)/);
   assert.match(backfillSource, /catchup-/);
-  assert.match(backfillSource, /missing = \[\.\.\.readyExpected\]\.filter/);
-  assert.match(backfillSource, /missing\.length === 0/);
+  assert.match(backfillSource, /profileLookupParity\(readyExpected, actual\)/);
+  assert.match(backfillSource, /backfillPass\(`verify-\$\{attempt\}`\)/);
+  assert.match(backfillSource, /verificationPass\.updated === 0 && verificationPass\.conditionalMisses === 0/);
+  assert.match(backfillSource, /missing\.length === 0 && unexpected\.length === 0/);
+  assert.match(backfillSource, /missing=\$\{missing\.length\}, unexpected=\$\{unexpected\.length\}/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
 });
 

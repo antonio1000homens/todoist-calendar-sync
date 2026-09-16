@@ -9,6 +9,7 @@ import {
   PROFILE_LOOKUP_READY_KEY,
   PROFILE_LOOKUP_READY_SORT_KEY,
   recurrenceLookupSk,
+  profileLookupParity,
 } from "../dist/profile-lookup.js";
 
 const tableName = process.env.STATE_TABLE_NAME?.trim();
@@ -209,17 +210,20 @@ if (!readyExpected) {
 }
 
 for (let attempt = 1; attempt <= 10; attempt += 1) {
+  const verificationPass = await backfillPass(`verify-${attempt}`);
   const actual = await indexedIdentities();
-  const missing = [...readyExpected].filter((identity) => !actual.has(identity));
+  const readyExpected = verificationPass.expected;
+  const { missing, unexpected } = profileLookupParity(readyExpected, actual);
   console.log(JSON.stringify({
     event: "profile_lookup_backfill_verify",
     attempt,
     expected: readyExpected.size,
     indexed: actual.size,
     missing: missing.length,
+    unexpected: unexpected.length,
   }));
-  if (missing.length === 0) break;
-  if (attempt === 10) throw new Error(`Profile lookup GSI did not reach exact backfill parity (${missing.length} expected rows missing); ready marker was not written`);
+  if (verificationPass.updated === 0 && verificationPass.conditionalMisses === 0 && missing.length === 0 && unexpected.length === 0) break;
+  if (attempt === 10) throw new Error(`Profile lookup GSI did not reach exact backfill parity (missing=${missing.length}, unexpected=${unexpected.length}); ready marker was not written`);
   await sleep(2000);
 }
 
