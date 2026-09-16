@@ -10,6 +10,7 @@ ssm_prefix="${SSM_PREFIX:-/todoist-calendar-sync}"
 calendar_watch_token_parameter="${CALENDAR_WATCH_TOKEN_PARAMETER:-${ssm_prefix%/}/calendar-watch-token}"
 todoist_webhook_secret_parameter="${TODOIST_WEBHOOK_SECRET_PARAMETER:-${ssm_prefix%/}/todoist-webhook-secret}"
 proxy_shared_secret_parameter="${PROXY_SHARED_SECRET_PARAMETER:-${ssm_prefix%/}/proxy-shared-secret}"
+calendar_watch_callback_url="${CALENDAR_WATCH_CALLBACK_URL:-https://calendar-sync.alf-broadcast.co.uk/calendar}"
 google_prefix="${GOOGLE_CREDENTIALS_PARAMETER_PREFIX:-${ssm_prefix%/}/google}"
 todoist_prefix="${TODOIST_TOKEN_PARAMETER_PREFIX:-${ssm_prefix%/}/todoist}"
 slack_bot_token_parameter="${SLACK_BOT_TOKEN_PARAMETER:-/lambdas/shared/slack-bot-token}"
@@ -130,6 +131,7 @@ sam deploy \
     "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
     "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \
     "ProxySharedSecretParameter=$proxy_shared_secret_parameter" \
+    "CalendarWatchCallbackUrl=$calendar_watch_callback_url" \
     "GoogleCredentialsParameterPrefix=$google_prefix" \
     "TodoistTokenParameterPrefix=$todoist_prefix" \
     "SlackBotTokenParameter=$slack_bot_token_parameter" \
