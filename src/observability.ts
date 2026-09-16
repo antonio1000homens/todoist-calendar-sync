@@ -9,7 +9,7 @@ const SAFE_STRING_KEYS = new Set([
 ]);
 
 const SAFE_NUMBER_KEYS = new Set([
-  "count", "scannedCount", "returnedCount", "pages", "consumedCapacityUnits", "durationMs",
+  "count", "scannedCount", "evaluatedCount", "returnedCount", "pages", "consumedCapacityUnits", "durationMs",
   "pacedDelayMs", "pacingDelayMs", "receiveCount", "bodyBytes", "mutationCount", "limit",
   "used", "scanned", "skipped", "conflicts", "blocked", "imported", "rebound", "providerMutations",
 ]);

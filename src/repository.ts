@@ -11,13 +11,13 @@ import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingLookupSk,
-  profileLookupIndexReady,
   profileLookupPk,
   PROFILE_LOOKUP_INDEX_NAME,
   PROFILE_LOOKUP_MIGRATION_VERSION,
   PROFILE_LOOKUP_READY_KEY,
   PROFILE_LOOKUP_READY_SORT_KEY,
   recurrenceLookupSk,
+  readProfileLookup,
 } from "./profile-lookup.js";
 import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
 
@@ -462,32 +462,27 @@ export class StateRepository {
 
   async listRecurrenceLinks(profile: Profile): Promise<RecurrenceLink[]> {
     const table = this.ensureTable();
-    if (!await profileLookupIndexReady(client, table)) {
-      const result = await pacedScan<RecurrenceLink>({
-        TableName: table,
-        FilterExpression: "begins_with(pk, :prefix)",
-        ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
-      }, { operation: "list_recurrence_links_scan_fallback", profile });
-      return result.items;
-    }
-
-    const items: RecurrenceLink[] = [];
-    let exclusiveStartKey: Record<string, unknown> | undefined;
-    let pages = 0;
-    do {
-      const result = await client.send(new QueryCommand({
+    return readProfileLookup<RecurrenceLink>({
+      client,
+      tableName: table,
+      profile,
+      operation: "list_recurrence_links",
+      component: "state-repository",
+      queryInput: {
         TableName: table,
         IndexName: PROFILE_LOOKUP_INDEX_NAME,
         KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
         ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": "RECURRENCE#" },
-        ExclusiveStartKey: exclusiveStartKey,
-      }));
-      pages += 1;
-      items.push(...((result.Items || []) as RecurrenceLink[]));
-      exclusiveStartKey = result.LastEvaluatedKey;
-    } while (exclusiveStartKey);
-    logEvent("dynamodb_query_complete", { operation: "list_recurrence_links", profile, accessMethod: "query", pages, returnedCount: items.length }, "state-repository");
-    return items;
+      },
+      fallback: async () => {
+        const result = await pacedScan<RecurrenceLink>({
+          TableName: table,
+          FilterExpression: "begins_with(pk, :prefix)",
+          ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
+        }, { operation: "list_recurrence_links_scan_fallback", profile });
+        return result.items;
+      },
+    });
   }
 
   async getCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<CalendarProjectionTombstone | undefined> {
