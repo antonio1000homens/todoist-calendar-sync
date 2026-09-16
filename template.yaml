@@ -21,6 +21,9 @@ Parameters:
   ProxySharedSecretParameter:
     Type: String
     Default: /todoist-calendar-sync/proxy-shared-secret
+  CalendarWatchCallbackUrl:
+    Type: String
+    Default: https://calendar-sync.alf-broadcast.co.uk/calendar
   GoogleCredentialsParameterPrefix:
     Type: String
     Default: /todoist-calendar-sync/google
@@ -102,6 +105,7 @@ Globals:
         CALENDAR_WATCH_TOKEN_PARAMETER: !Ref CalendarWatchTokenParameter
         TODOIST_WEBHOOK_SECRET_PARAMETER: !Ref TodoistWebhookSecretParameter
         PROXY_SHARED_SECRET_PARAMETER: !Ref ProxySharedSecretParameter
+        CALENDAR_WATCH_CALLBACK_URL: !Ref CalendarWatchCallbackUrl
         GOOGLE_CREDENTIALS_PARAMETER_PREFIX: !Ref GoogleCredentialsParameterPrefix
         TODOIST_TOKEN_PARAMETER_PREFIX: !Ref TodoistTokenParameterPrefix
         TODOIST_CALENDAR_SYNC_DYNAMODB_SCAN_RCU_BUDGET_PER_SECOND: !Ref DynamoDbScanRcuBudgetPerSecond
