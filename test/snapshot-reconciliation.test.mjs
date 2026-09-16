@@ -112,7 +112,7 @@ class FakeStore {
   async deleteBaseline(profile, taskId) { this.baselines.delete(`${profile}:${taskId}`); }
 }
 
-function fakeClients({ listedTasks, taskById, calendarEvents }) {
+function fakeClients({ listedTasks, taskById, calendarEvents, upsertTaskError }) {
   const todoistUpdates = [];
   const calendarUpdates = [];
   const calendarDeletes = [];
@@ -132,6 +132,7 @@ function fakeClients({ listedTasks, taskById, calendarEvents }) {
           throw error;
         },
         async upsertTask(next, existingId) {
+          if (upsertTaskError) throw upsertTaskError;
           todoistUpdates.push({ next, existingId });
           const previous = taskById.get(existingId) || { id: existingId, project_id: HOME };
           const updated = { ...previous, ...next, id: existingId, project_id: previous.project_id || HOME };
@@ -275,6 +276,27 @@ test("repairs a missed Calendar date change by updating Todoist", async () => {
   assert.equal(clients.metrics.todoistUpdates.length, 1);
   assert.equal(clients.metrics.todoistUpdates[0].next.due.date, "2026-09-12");
   assert.equal(clients.metrics.calendarUpdates.length, 0);
+});
+
+test("treats a Todoist deletion during Calendar repair as a conflict, not a failed delivery", async () => {
+  const m = mapping();
+  const oldTask = task();
+  const oldEvent = event();
+  const movedEvent = event({ start: { date: "2026-09-12" }, end: { date: "2026-09-13" } });
+  const notFound = new Error("Task not found");
+  notFound.status = 404;
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(oldTask, oldEvent));
+  const clients = fakeClients({
+    listedTasks: [oldTask],
+    taskById: new Map([[oldTask.id, oldTask]]),
+    calendarEvents: new Map([[movedEvent.id, movedEvent]]),
+    upsertTaskError: notFound,
+  });
+  await makeReconciler({ state, store, clients }).reconcile("home");
+  assert.equal(clients.metrics.todoistUpdates.length, 0);
+  assert.equal(state.mapping?.taskId, m.taskId);
+  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_task_disappeared_during_repair"), true);
 });
 
 test("does not guess when Todoist and Calendar both changed differently", async () => {
