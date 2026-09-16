@@ -448,6 +448,39 @@ function escapeSlackMrkdwnText(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function operationalFailureContext(delivery: Delivery, error: unknown): Record<string, unknown> {
+  const providerError = error as { status?: number; body?: string };
+  const context: Record<string, unknown> = {
+    kind: delivery.kind,
+    status: Number(providerError.status) || undefined,
+    failure: error instanceof Error ? error.message : String(error),
+    deliveryId: delivery.id,
+  };
+  if (delivery.reconcile) {
+    context.reconcileReason = delivery.reconcile.reason;
+    context.reconcileGeneration = delivery.reconcile.generation;
+    const continuation = delivery.reconcile.continuation;
+    if (continuation) {
+      context.reconcileContinuation = `${continuation.phase} sequence ${continuation.sequence}`;
+      if (continuation.afterTaskId) context.reconcileAfterTaskId = continuation.afterTaskId;
+      if (continuation.afterEventId) context.reconcileAfterEventId = continuation.afterEventId;
+    }
+  }
+  if (typeof providerError.body === "string") {
+    try {
+      const body = JSON.parse(providerError.body) as Record<string, unknown>;
+      if (typeof body.error_tag === "string") context.providerErrorTag = body.error_tag;
+      const extra = body.error_extra as Record<string, unknown> | undefined;
+      if (extra && typeof extra.event_id === "string") context.providerEventId = extra.event_id;
+    } catch {
+      // Provider response bodies are diagnostic only; retain the safe message.
+    }
+  }
+  const taskMatch = (error instanceof Error ? error.message : String(error)).match(/\/tasks\/([^\s/?]+)/);
+  if (taskMatch) context.providerTaskId = taskMatch[1];
+  return Object.fromEntries(Object.entries(context).filter(([, value]) => value !== undefined));
+}
+
 function contextTitles(decision: ManualDecision): { taskTitle?: string; calendarTitle?: string } {
   const detail = decision.context;
   const legacyTitle = contextString(detail, "title");
@@ -497,9 +530,34 @@ function actionGuidance(decision: ManualDecision): string | undefined {
       return "*Choose one:* Delete the Calendar series if the Todoist deletion was intentional, keep it and unlink it, or restore the Todoist task. No provider action happens until you choose.";
     case "calendar_owned_recurrence_task_deleted":
       return "*Choose one:* Skip this occurrence, delete this and future occurrences, delete the whole Calendar series, or restore the Todoist task. No provider action happens until you choose.";
+    case "operational_dlq":
+      return "*What should happen next?* Request a fresh reconciliation. The worker will re-read current provider state and apply only guarded repairs; it will not replay the failed delivery.";
+    case "operational_provider_auth":
+      return "*What should happen next?* Fix the provider credentials or permissions, then request a fresh reconciliation. No provider mutation is attempted by this alert.";
     default:
       return undefined;
   }
+}
+
+function operationalContextLines(decision: ManualDecision): string[] {
+  if (!decision.type.startsWith("operational_")) return [];
+  const detail = decision.context;
+  const kind = contextString(detail, "kind");
+  const status = typeof detail.status === "number" ? detail.status : undefined;
+  const providerTaskId = contextString(detail, "providerTaskId");
+  const providerEventId = contextString(detail, "providerEventId");
+  const failure = contextString(detail, "failure");
+  const reason = contextString(detail, "reconcileReason");
+  const generation = contextString(detail, "reconcileGeneration");
+  const continuation = contextString(detail, "reconcileContinuation");
+  return [
+    kind ? `*Delivery:* ${escapeSlackMrkdwnText(kind)}` : undefined,
+    status ? `*Provider response:* HTTP ${status}` : undefined,
+    providerTaskId ? `*Affected Todoist task:* \`${escapeSlackMrkdwnText(providerTaskId)}\`` : undefined,
+    providerEventId ? `*Affected Calendar event:* \`${escapeSlackMrkdwnText(providerEventId)}\`` : undefined,
+    failure ? `*Failure:* ${escapeSlackMrkdwnText(failure)}` : undefined,
+    reason ? `*Reconciliation:* ${escapeSlackMrkdwnText(reason)}${generation ? ` (${escapeSlackMrkdwnText(generation)})` : ""}${continuation ? `, ${escapeSlackMrkdwnText(continuation)}` : ""}` : undefined,
+  ].filter(Boolean) as string[];
 }
 
 function contextLines(decision: ManualDecision): string[] {
@@ -520,6 +578,7 @@ function contextLines(decision: ManualDecision): string[] {
     displayTaskDue ? `*Todoist due:* ${displayTaskDue}` : undefined,
     displayCalendarStart ? `*Calendar start:* ${displayCalendarStart}` : undefined,
     changeSummary(decision) ? `*What changed:* ${changeSummary(decision)}` : undefined,
+    ...operationalContextLines(decision),
   ].filter(Boolean) as string[];
   return lines;
 }
@@ -979,7 +1038,7 @@ export class ManualInterventionService {
       type,
       { deliveryId: delivery.id, status, message: error instanceof Error ? error.message : String(error) },
       { sourceDeliveryId: delivery.id },
-      { kind: delivery.kind, status, error: error instanceof Error ? error.message : String(error) },
+      operationalFailureContext(delivery, error),
     );
   }
 
@@ -1007,12 +1066,12 @@ export class ManualInterventionService {
       policyAction: resolution,
       seriesId: decision.seriesId,
     });
-    const elements: unknown[] = [
-      { type: "button", action_id: "gcp_sync_policy", text: { type: "plain_text", text: "Default for profile" }, value: value("prompt", "profile") },
-      ...(decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy", text: { type: "plain_text", text: "Default for series" }, value: value("prompt", "series") }] : []),
-      ...(action.autoAllowed ? [{ type: "button", action_id: "gcp_sync_policy", style: "primary", text: { type: "plain_text", text: "Auto-apply for profile" }, value: value("auto", "profile") }] : []),
-      ...(action.autoAllowed && decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy", style: "primary", text: { type: "plain_text", text: "Auto for series" }, value: value("auto", "series") }] : []),
-      { type: "button", action_id: "gcp_sync_policy", text: { type: "plain_text", text: "Always ask" }, value: JSON.stringify({ realm: "gcp-sync", profile: decision.profile, decisionId: decision.decisionId, decisionType: decision.type, policyOperation: "set", policyScope: "profile", policyMode: "prompt" }) },
+  const elements: unknown[] = [
+      { type: "button", action_id: "gcp_sync_policy_profile_prompt", text: { type: "plain_text", text: "Default for profile" }, value: value("prompt", "profile") },
+      ...(decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy_series_prompt", text: { type: "plain_text", text: "Default for series" }, value: value("prompt", "series") }] : []),
+      ...(action.autoAllowed ? [{ type: "button", action_id: "gcp_sync_policy_profile_auto", style: "primary", text: { type: "plain_text", text: "Auto-apply for profile" }, value: value("auto", "profile") }] : []),
+      ...(action.autoAllowed && decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy_series_auto", style: "primary", text: { type: "plain_text", text: "Auto for series" }, value: value("auto", "series") }] : []),
+      { type: "button", action_id: "gcp_sync_policy_always_ask", text: { type: "plain_text", text: "Always ask" }, value: JSON.stringify({ realm: "gcp-sync", profile: decision.profile, decisionId: decision.decisionId, decisionType: decision.type, policyOperation: "set", policyScope: "profile", policyMode: "prompt" }) },
     ];
     return [
       { type: "section", text: { type: "mrkdwn", text: "*Future handling*\nSave this choice as a suggested default, or auto-apply it when the action is explicitly auto-safe." } },
