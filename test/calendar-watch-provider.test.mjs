@@ -17,14 +17,14 @@ test("Google Calendar watch creates and stops a webhook channel", async () => {
   };
   try {
     const calendar = new GoogleCalendar({ client_id: "id", client_secret: "secret", refresh_token: "refresh" }, "home@example.test");
-    const created = await calendar.watch("home-calendar-sync-v3-1", "https://calendar-sync.example/calendar", "watch-token");
+    const created = await calendar.watch("home-calendar-sync-v3-1", "https://calendar-sync.alf-broadcast.co.uk/calendar", "watch-token");
     await calendar.stopWatch("home-calendar-sync-v3-1", created.resourceId);
     assert.equal(calls.filter(({ url }) => url.endsWith("/events/watch")).length, 1);
     const watch = calls.find(({ url }) => url.endsWith("/events/watch"));
     assert.deepEqual(JSON.parse(watch.init.body), {
       id: "home-calendar-sync-v3-1",
       type: "web_hook",
-      address: "https://calendar-sync.example/calendar",
+      address: "https://calendar-sync.alf-broadcast.co.uk/calendar",
       token: "watch-token",
     });
     assert.match(calls.at(-1).url, /\/channels\/stop$/);

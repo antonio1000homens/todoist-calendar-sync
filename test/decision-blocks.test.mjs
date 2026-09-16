@@ -113,6 +113,41 @@ test('deletion decision card prioritizes human-readable task and Calendar contex
   assert.match(technical, /decision ID `home-standalone_todoist_task_deleted-cf9aa1f32416bbecc517`/);
 });
 
+test('operational quarantine card identifies the failed provider object and reconciliation', () => {
+  const type = 'operational_dlq';
+  const decision = {
+    decisionId: 'work-operational_dlq-test',
+    profile: 'work',
+    type,
+    severity: MANUAL_DECISION_CATALOG[type].severity,
+    status: 'pending',
+    createdAt: '2026-09-15T18:17:32.685Z',
+    decisionDeadline: '2026-09-22T18:17:32.685Z',
+    context: {
+      kind: 'reconcile',
+      status: 404,
+      providerTaskId: 'task-123',
+      providerEventId: 'event-456',
+      failure: 'Todoist task was not found during Calendar repair',
+      reconcileReason: 'scheduled',
+      reconcileGeneration: 'generation-1',
+      reconcileContinuation: 'mapped sequence 1',
+    },
+    fingerprint: 'test',
+    permittedActions: MANUAL_DECISION_CATALOG[type].actions,
+  };
+  const blocks = decisionBlocks(decision);
+  const human = mrkdwnText(blocks);
+  assert.match(human, /Delivery:\* reconcile/);
+  assert.match(human, /Affected Todoist task:\* `task-123`/);
+  assert.match(human, /Affected Calendar event:\* `event-456`/);
+  assert.match(human, /HTTP 404/);
+  assert.match(human, /scheduled.*generation-1.*mapped sequence 1/);
+  assert.match(human, /will not replay the failed delivery/);
+  const resolved = decisionResolutionBlocks(decision, 'Resolved');
+  assert.equal(resolved.filter((block) => block.type === 'actions').length, 0);
+});
+
 test('resolution and stale updates preserve the original human-readable decision context', () => {
   const type = 'standalone_todoist_task_deleted';
   const decision = {

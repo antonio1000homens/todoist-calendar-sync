@@ -94,6 +94,8 @@ The Slack bot token is shared infrastructure and currently remains at:
 
 Normal deployments pass **parameter names**, not plaintext secret values. Secret rotation is a separate operator action.
 
+Calendar watch subscriptions use `https://calendar-sync.alf-broadcast.co.uk/calendar` by default. The deploy script passes this through the `CalendarWatchCallbackUrl` parameter (or `CALENDAR_WATCH_CALLBACK_URL` override), and the Cloudflare relay must forward it to the Lambda ingress using the matching proxy shared secret.
+
 ## Development
 
 Requirements:

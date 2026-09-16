@@ -1,0 +1,12 @@
+name = "todoist-calendar-sync"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+account_id = "621c4fdc4eb5b80534b779e6c65e6a54"
+workers_dev = false
+
+routes = [
+  { pattern = "calendar-sync.alf-broadcast.co.uk", custom_domain = true }
+]
+
+[vars]
+TODOIST_CALENDAR_SYNC_AWS_INGRESS_URL = "https://t4gxew4vz5a3dwc4u6dqntckim0lpcfb.lambda-url.eu-west-2.on.aws/"

@@ -418,7 +418,23 @@ export class SnapshotReconciler {
       return "conflict";
     }
 
-    const nextTask = await clients.todoist.upsertTask(toTodoistTask(event), task.id);
+    let nextTask: TodoistTask;
+    try {
+      nextTask = await clients.todoist.upsertTask(toTodoistTask(event), task.id);
+    } catch (error) {
+      // The snapshot list and this write are not atomic. A task can be deleted
+      // after listTasks() returns it, so a 404 here is a stale-read race, not a
+      // delivery failure. Leave the mapping/baseline untouched and let the
+      // next reconciliation (or the existing deletion decision) arbitrate the
+      // now-current provider state.
+      if (Number((error as { status?: number }).status) !== 404) throw error;
+      await this.state.audit(profile, "todoist_snapshot_reconcile_task_disappeared_during_repair", {
+        taskId: mapping.taskId,
+        eventId: event.id,
+        reason: "todoist_task_deleted_after_snapshot",
+      });
+      return "conflict";
+    }
     const nextMapping: Mapping = {
       ...mapping,
       projectId: nextTask.project_id || mapping.projectId,
