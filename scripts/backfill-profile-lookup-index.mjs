@@ -210,7 +210,9 @@ if (!readyExpected) {
 }
 
 for (let attempt = 1; attempt <= 10; attempt += 1) {
+  const verificationPass = await backfillPass(`verify-${attempt}`);
   const actual = await indexedIdentities();
+  const readyExpected = verificationPass.expected;
   const { missing, unexpected } = profileLookupParity(readyExpected, actual);
   console.log(JSON.stringify({
     event: "profile_lookup_backfill_verify",
@@ -220,7 +222,7 @@ for (let attempt = 1; attempt <= 10; attempt += 1) {
     missing: missing.length,
     unexpected: unexpected.length,
   }));
-  if (missing.length === 0 && unexpected.length === 0) break;
+  if (verificationPass.updated === 0 && verificationPass.conditionalMisses === 0 && missing.length === 0 && unexpected.length === 0) break;
   if (attempt === 10) throw new Error(`Profile lookup GSI did not reach exact backfill parity (missing=${missing.length}, unexpected=${unexpected.length}); ready marker was not written`);
   await sleep(2000);
 }

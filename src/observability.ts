@@ -1,5 +1,5 @@
 const SAFE_STRING_KEYS = new Set([
-  "profile", "taskId", "eventId", "seriesId", "masterEventId", "activeInstanceId",
+  "profile", "taskId", "eventId", "seriesId", "masterEventId", "activeInstanceId", "accessMethod",
   "deliveryId", "sourceDeliveryId", "messageId", "messageGroupId", "decisionId",
   "targetId", "targetType", "slackUserId", "commentId", "projectId", "oldProjectId",
   "newProjectId", "calendarStatus", "mode", "reason", "type", "action", "event",

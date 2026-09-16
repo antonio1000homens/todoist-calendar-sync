@@ -10,13 +10,15 @@ import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
-  mappingLookupSk,
-  profileLookupPk,
-  PROFILE_LOOKUP_INDEX_NAME,
+  mappingEventLookupAttributes,
+  mappingLookupAttributes,
+  mappingOwnerLookupAttributes,
+  recurrenceLookupAttributes,
+  recurrenceLookupQueryInput,
+  mappingLookupQueryInput,
   PROFILE_LOOKUP_MIGRATION_VERSION,
   PROFILE_LOOKUP_READY_KEY,
   PROFILE_LOOKUP_READY_SORT_KEY,
-  recurrenceLookupSk,
   readProfileLookup,
 } from "./profile-lookup.js";
 import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
@@ -343,9 +345,9 @@ export class StateRepository {
     const item = { ...mapping, updatedAt: now() };
     await client.send(new TransactWriteCommand({
       TransactItems: [
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("event", mapping.eventId) } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("task", mapping.taskId) } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), lookupPk: profileLookupPk(mapping.profile), lookupSk: mappingLookupSk("owner", mapping.taskId) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
   }
@@ -447,7 +449,7 @@ export class StateRepository {
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
-      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), lookupPk: profileLookupPk(link.profile), lookupSk: recurrenceLookupSk(link.seriesId) },
+      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
     }));
   }
 
@@ -468,12 +470,7 @@ export class StateRepository {
       profile,
       operation: "list_recurrence_links",
       component: "state-repository",
-      queryInput: {
-        TableName: table,
-        IndexName: PROFILE_LOOKUP_INDEX_NAME,
-        KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
-        ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": "RECURRENCE#" },
-      },
+      queryInput: recurrenceLookupQueryInput(table, profile),
       fallback: async () => {
         const result = await pacedScan<RecurrenceLink>({
           TableName: table,

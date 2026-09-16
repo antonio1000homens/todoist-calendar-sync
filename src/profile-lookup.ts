@@ -1,5 +1,5 @@
 import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-import type { Profile } from "./types.js";
+import type { Mapping, Profile, RecurrenceLink } from "./types.js";
 import { logEvent } from "./observability.js";
 
 export const PROFILE_LOOKUP_INDEX_NAME = "ProfileLookupIndex";
@@ -29,6 +29,52 @@ export function mappingLookupSk(kind: "event" | "task" | "owner", id: string): s
 
 export function recurrenceLookupSk(seriesId: string): string {
   return `RECURRENCE#${seriesId}`;
+}
+
+export function mappingLookupAttributes(mapping: Pick<Mapping, "profile" | "eventId" | "taskId">): Record<string, string> {
+  return {
+    lookupPk: profileLookupPk(mapping.profile),
+    lookupSk: mappingLookupSk("task", mapping.taskId),
+  };
+}
+
+export function mappingEventLookupAttributes(mapping: Pick<Mapping, "profile" | "eventId">): Record<string, string> {
+  return {
+    lookupPk: profileLookupPk(mapping.profile),
+    lookupSk: mappingLookupSk("event", mapping.eventId),
+  };
+}
+
+export function mappingOwnerLookupAttributes(mapping: Pick<Mapping, "profile" | "taskId">): Record<string, string> {
+  return {
+    lookupPk: profileLookupPk(mapping.profile),
+    lookupSk: mappingLookupSk("owner", mapping.taskId),
+  };
+}
+
+export function recurrenceLookupAttributes(link: Pick<RecurrenceLink, "profile" | "seriesId">): Record<string, string> {
+  return {
+    lookupPk: profileLookupPk(link.profile),
+    lookupSk: recurrenceLookupSk(link.seriesId),
+  };
+}
+
+export function mappingLookupQueryInput(tableName: string, profile: Profile): Record<string, unknown> {
+  return {
+    TableName: tableName,
+    IndexName: PROFILE_LOOKUP_INDEX_NAME,
+    KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
+    ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": mappingLookupSk("task", "") },
+  };
+}
+
+export function recurrenceLookupQueryInput(tableName: string, profile: Profile): Record<string, unknown> {
+  return {
+    TableName: tableName,
+    IndexName: PROFILE_LOOKUP_INDEX_NAME,
+    KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
+    ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": "RECURRENCE#" },
+  };
 }
 
 export async function profileLookupIndexReady(

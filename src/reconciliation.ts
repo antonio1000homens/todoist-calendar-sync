@@ -7,7 +7,7 @@ import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { logEvent } from "./observability.js";
-import { mappingLookupSk, profileLookupPk, PROFILE_LOOKUP_INDEX_NAME, readProfileLookup } from "./profile-lookup.js";
+import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 interface TodoistCanonicalState {
@@ -206,12 +206,7 @@ class DynamoReconciliationStore implements ReconciliationStore {
       profile,
       operation: "list_reconciliation_mappings",
       component: "reconciliation",
-      queryInput: {
-        TableName: table,
-        IndexName: PROFILE_LOOKUP_INDEX_NAME,
-        KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :lookupSk)",
-        ExpressionAttributeValues: { ":lookupPk": profileLookupPk(profile), ":lookupSk": mappingLookupSk("task", "") },
-      },
+      queryInput: mappingLookupQueryInput(table, profile),
       fallback: async () => {
         const result = await pacedScan<Mapping>({
           TableName: table,

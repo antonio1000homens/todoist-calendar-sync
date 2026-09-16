@@ -10,10 +10,9 @@ test("putMapping storage keys override stale DynamoDB pk/sk fields", () => {
   assert.match(putMapping, /Item:\s*\{\s*\.\.\.item\s*,\s*\.\.\.key\(`EVENT#/);
   assert.match(putMapping, /Item:\s*\{\s*\.\.\.item\s*,\s*\.\.\.key\(`TASK#/);
   assert.match(putMapping, /Item:\s*\{\s*\.\.\.item\s*,\s*\.\.\.key\(`TASKOWNER#/);
-  assert.match(putMapping, /lookupPk:\s*profileLookupPk\(mapping\.profile\)/);
-  assert.match(putMapping, /lookupSk:\s*mappingLookupSk\("event", mapping\.eventId\)/);
-  assert.match(putMapping, /lookupSk:\s*mappingLookupSk\("task", mapping\.taskId\)/);
-  assert.match(putMapping, /lookupSk:\s*mappingLookupSk\("owner", mapping\.taskId\)/);
+  assert.match(putMapping, /mappingEventLookupAttributes\(mapping\)/);
+  assert.match(putMapping, /mappingLookupAttributes\(mapping\)/);
+  assert.match(putMapping, /mappingOwnerLookupAttributes\(mapping\)/);
   assert.doesNotMatch(putMapping, /Item:\s*\{\s*\.\.\.key\([^}]+\)\s*,\s*\.\.\.item\s*\}/);
 });
 
@@ -45,8 +44,7 @@ test("mapping index keys remain distinct even when the domain object carries a s
 test("recurrence-link storage key also overrides stale pk/sk fields", () => {
   const putRecurrenceLink = repositorySource.match(/async putRecurrenceLink\(link: RecurrenceLink\): Promise<void>\s*\{[\s\S]*?\n\s*\}/)?.[0] || "";
   assert.match(putRecurrenceLink, /Item:\s*\{\s*\.\.\.link\s*,\s*updatedAt:\s*now\(\)\s*,\s*\.\.\.key\(`RECURRENCE#/);
-  assert.match(putRecurrenceLink, /lookupPk:\s*profileLookupPk\(link\.profile\)/);
-  assert.match(putRecurrenceLink, /lookupSk:\s*recurrenceLookupSk\(link\.seriesId\)/);
+  assert.match(putRecurrenceLink, /recurrenceLookupAttributes\(link\)/);
 });
 
 test("deletes remove canonical rows and let DynamoDB remove derived GSI entries", () => {

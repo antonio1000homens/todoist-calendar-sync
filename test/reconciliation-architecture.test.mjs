@@ -121,11 +121,14 @@ test("profile lookup GSI is additive and hot paths query it after backfill", () 
   const mappingMethod = repositorySource.match(/async listRecurrenceLinks[\s\S]*?\n  }/)?.[0] || "";
   assert.match(mappingMethod, /readProfileLookup/);
   assert.match(mappingMethod, /list_recurrence_links_scan_fallback/);
-  assert.match(repositorySource, /lookupPk: profileLookupPk/);
-  assert.match(repositorySource, /lookupSk: recurrenceLookupSk/);
+  assert.match(repositorySource, /mappingEventLookupAttributes\(mapping\)/);
+  assert.match(repositorySource, /mappingLookupAttributes\(mapping\)/);
+  assert.match(repositorySource, /mappingOwnerLookupAttributes\(mapping\)/);
+  assert.match(repositorySource, /recurrenceLookupAttributes\(link\)/);
+  assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
   assert.match(reconciliationSource, /readProfileLookup/);
   assert.match(reconciliationSource, /list_reconciliation_mappings_scan_fallback/);
-  assert.match(reconciliationSource, /mappingLookupSk\("task", ""\)/);
+  assert.match(reconciliationSource, /mappingLookupQueryInput\(table, profile\)/);
   assert.match(backfillSource, /Limit:\s*25/);
   assert.match(backfillSource, /attribute_not_exists\(lookupPk\)/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
