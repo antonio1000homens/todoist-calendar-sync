@@ -72,6 +72,8 @@ function recurrenceLink(mapping: Mapping, owner: RecurrenceLink["owner"] = "todo
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(owner === "calendar" && mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(owner === "calendar" && mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     updatedAt: mapping.updatedAt,
   };
 }
@@ -508,6 +510,8 @@ export class ProjectAwareSynchronizer {
       activeInstanceId: active.id,
       originalStart: eventStart(active),
       activeEffectiveStart: eventEffectiveStart(active),
+      ...(sourceMapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+      ...(sourceMapping.completedThroughOriginalStart ? { completedThroughOriginalStart: sourceMapping.completedThroughOriginalStart } : {}),
       updatedAt: new Date().toISOString(),
     };
   }
