@@ -1,0 +1,27 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Add read-only production state access required by the todoist-calendar-sync GitHub Actions E2E workflow.
+
+Parameters:
+  DeploymentRoleName:
+    Type: String
+    Default: GitHubActionsTodoistCalendarSyncDeployRole
+  ResourceNamePrefix:
+    Type: String
+    Default: todoist-calendar-sync
+
+Resources:
+  ProductionE2eStateReadPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: TodoistCalendarSyncProductionE2eStateRead
+      Roles:
+        - !Ref DeploymentRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadProductionSyncMappingState
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+            Resource:
+              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*

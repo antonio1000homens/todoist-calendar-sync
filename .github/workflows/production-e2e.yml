@@ -1,0 +1,165 @@
+name: Production E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Sync profile to exercise
+        required: true
+        default: antonio
+        type: choice
+        options:
+          - antonio
+          - home
+          - work
+          - all
+      timeout_seconds:
+        description: Maximum wait for each asynchronous hop
+        required: true
+        default: '180'
+        type: choice
+        options:
+          - '120'
+          - '180'
+          - '300'
+      cleanup:
+        description: Delete the disposable Calendar item and verify Todoist cleanup
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: todoist-calendar-sync-production-e2e
+  cancel-in-progress: false
+
+jobs:
+  full-journey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+      SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
+      E2E_RESULT_FILE: e2e-result.json
+      E2E_RUN_TAG: gh-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Validate protected environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME STACK_NAME SSM_PREFIX SYNC_PROFILE_CONFIG_JSON; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing production environment variable: $name" >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build production client code
+        run: npm run build
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.0.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: github-actions-todoist-calendar-e2e
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve production state resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          state_table="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SyncState \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+
+          dlq_physical="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SyncDlq \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+
+          if [[ "$dlq_physical" == https://* ]]; then
+            dlq_url="$dlq_physical"
+          else
+            dlq_url="$(aws sqs get-queue-url \
+              --region "$AWS_REGION" \
+              --queue-name "$dlq_physical" \
+              --query QueueUrl \
+              --output text)"
+          fi
+
+          {
+            echo "STATE_TABLE_NAME=$state_table"
+            echo "SYNC_DLQ_URL=$dlq_url"
+            echo "GOOGLE_CREDENTIALS_PARAMETER_PREFIX=${SSM_PREFIX%/}/google"
+            echo "TODOIST_TOKEN_PARAMETER_PREFIX=${SSM_PREFIX%/}/todoist"
+          } >> "$GITHUB_ENV"
+
+      - name: Run full provider journey
+        env:
+          E2E_PROFILE: ${{ inputs.profile }}
+          E2E_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          E2E_CLEANUP: ${{ inputs.cleanup }}
+        run: node scripts/production-e2e.mjs
+
+      - name: Publish E2E summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f "$E2E_RESULT_FILE" ]; then
+            echo '## Production E2E' >> "$GITHUB_STEP_SUMMARY"
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The E2E runner did not produce a result file.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node <<'NODE' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('node:fs');
+          const result = JSON.parse(fs.readFileSync(process.env.E2E_RESULT_FILE, 'utf8'));
+          console.log('## Production E2E');
+          console.log('');
+          console.log(`Status: **${result.status}**`);
+          console.log(`DLQ depth: **${result.initialDlqDepth} → ${result.finalDlqDepth ?? 'unknown'}**`);
+          console.log('');
+          console.log('| Profile | Result | Calendar event | Todoist task | Cleanup |');
+          console.log('| --- | --- | --- | --- | --- |');
+          for (const entry of result.results || []) {
+            console.log(`| ${entry.profile} | ${entry.status} | ${entry.eventId || '-'} | ${entry.taskId || '-'} | ${entry.cleanup ? 'yes' : 'no'} |`);
+          }
+          if (result.error) {
+            console.log('');
+            console.log(`Failure: \`${String(result.error).replaceAll('`', '\\`')}\``);
+          }
+          NODE
+
+      - name: Upload E2E result
+        if: always() && hashFiles('e2e-result.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: e2e-result.json
+          retention-days: 14
