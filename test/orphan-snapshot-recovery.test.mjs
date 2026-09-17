@@ -43,7 +43,7 @@ function event(id, title, hour) {
     summary: title,
     description: "",
     start: { dateTime: `2099-01-10T${hh}:30:00+00:00`, timeZone: "Europe/London" },
-    end: { dateTime: `2099-01-10T${hh}:00:00Z`, timeZone: "Europe/London" },
+    end: { dateTime: `2099-01-10T${hh}:45:00+00:00`, timeZone: "Europe/London" },
   };
 }
 
