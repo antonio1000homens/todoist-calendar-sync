@@ -80,7 +80,7 @@ jobs:
         run: npx wrangler deploy --config cloudflare/calendar-sync/wrangler.toml --dry-run
 
       - name: Configure AWS credentials through GitHub OIDC
-        uses: aws-actions/configure-aws-credentials@v6.0.0
+        uses: aws-actions/configure-aws-credentials@v6.2.4
         with:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           role-session-name: github-actions-todoist-calendar-sync
