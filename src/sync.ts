@@ -235,25 +235,60 @@ export function calendarOccurrenceHasEnded(event: CalendarEvent, now = Date.now(
   return Number.isFinite(endTime) && endTime <= now;
 }
 
+function compareLogicalStarts(left: string, right: string): number {
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return leftTime - rightTime;
+  return left.localeCompare(right);
+}
+
+function latestLogicalStart(...values: Array<string | undefined>): string | undefined {
+  return values.filter((value): value is string => Boolean(value)).reduce<string | undefined>((latest, value) => {
+    if (!latest) return value;
+    return compareLogicalStarts(value, latest) > 0 ? value : latest;
+  }, undefined);
+}
+
+function logicalStartAfter(value: string, boundary: string): boolean {
+  return compareLogicalStarts(value, boundary) > 0;
+}
+
 function nextActiveInstance(instances: CalendarEvent[], after?: string, now = Date.now()): CalendarEvent | undefined {
-  const afterValue = after ? Date.parse(after) : Number.NaN;
   return instances
     .filter((event) => event.status !== "cancelled" && Boolean(eventStart(event)))
     .filter((event) => !calendarOccurrenceHasEnded(event, now))
-    .filter((event) => !Number.isFinite(afterValue) || Date.parse(eventStart(event) || "") > afterValue)
-    .sort((a, b) => (eventStart(a) || "").localeCompare(eventStart(b) || ""))[0];
+    .filter((event) => !after || logicalStartAfter(eventStart(event) || "", after))
+    .sort((a, b) => compareLogicalStarts(eventStart(a) || "", eventStart(b) || ""))[0];
 }
 
 export function selectCalendarRecurrenceInstance(
   instances: CalendarEvent[],
-  existing?: Pick<RecurrenceLink, "activeInstanceId" | "originalStart">,
+  existing?: Pick<RecurrenceLink, "activeInstanceId" | "originalStart" | "calendarProgressVersion" | "completedThroughOriginalStart">,
   now = Date.now(),
 ): CalendarEvent | undefined {
+  if (existing?.calendarProgressVersion === 1) {
+    return nextActiveInstance(instances, existing.completedThroughOriginalStart, now);
+  }
   if (existing?.activeInstanceId) {
     const current = instances.find((event) => event.id === existing.activeInstanceId);
     if (current && current.status !== "cancelled" && !calendarOccurrenceHasEnded(current, now)) return current;
   }
   return nextActiveInstance(instances, existing?.originalStart, now);
+}
+
+export function suppressedLegacyCalendarRecurrenceCandidate(
+  instances: CalendarEvent[],
+  existing?: Pick<RecurrenceLink, "activeInstanceId" | "originalStart" | "calendarProgressVersion">,
+  now = Date.now(),
+): CalendarEvent | undefined {
+  if (!existing?.activeInstanceId || existing.calendarProgressVersion === 1) return undefined;
+  const current = instances.find((event) => event.id === existing.activeInstanceId);
+  if (!current || current.status === "cancelled" || calendarOccurrenceHasEnded(current, now)) return undefined;
+  const earliest = nextActiveInstance(instances, undefined, now);
+  const earliestStart = earliest ? eventStart(earliest) : undefined;
+  const currentStart = eventStart(current) || existing.originalStart;
+  if (!earliest || earliest.id === current.id || !earliestStart || !currentStart) return undefined;
+  return compareLogicalStarts(earliestStart, currentStart) < 0 ? earliest : undefined;
 }
 
 // Only compare fields that this synchronizer can faithfully carry in both
@@ -324,6 +359,8 @@ function recurrenceLink(mapping: Mapping, owner: RecurrenceLink["owner"]): Recur
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(owner === "calendar" && mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(owner === "calendar" && mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
     eventId: mapping.eventId,
     updatedAt: mapping.updatedAt,
@@ -341,6 +378,8 @@ function recurrenceMapping(link: RecurrenceLink): Mapping {
     activeInstanceId: link.activeInstanceId,
     originalStart: link.originalStart,
     activeEffectiveStart: link.activeEffectiveStart,
+    ...(link.owner === "calendar" && link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(link.owner === "calendar" && link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
   };
 }
@@ -356,6 +395,8 @@ function todoistOwnedMapping(mapping: Mapping, masterEventId: string, taskId: st
     activeInstanceId: active?.id,
     originalStart: active ? eventStart(active) : mapping.originalStart,
     activeEffectiveStart: active ? eventEffectiveStart(active) : mapping.activeEffectiveStart,
+    calendarProgressVersion: undefined,
+    completedThroughOriginalStart: undefined,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -407,16 +448,29 @@ export class Synchronizer {
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
       const instances = await calendar.listInstances(link.masterEventId);
+      const suppressed = suppressedLegacyCalendarRecurrenceCandidate(instances, link);
+      if (suppressed) {
+        await this.state.audit(profile, "calendar_recurrence_backward_shift_suppressed_legacy_state", {
+          seriesId: link.seriesId,
+          currentInstanceId: link.activeInstanceId,
+          candidateInstanceId: suppressed.id,
+          taskId: link.taskId,
+        });
+      }
       const active = selectCalendarRecurrenceInstance(instances, link);
       if (!active || active.id === link.activeInstanceId) continue;
-      // Remove ownership before deleting an internally replaced Todoist mirror.
-      // Its resulting Todoist deletion webhook must never be able to resolve a
-      // stale Calendar-owned mapping and delete the recurring master.
+      const progressAware = link.calendarProgressVersion === 1;
+      let task: TodoistTask | undefined;
+      if (progressAware) {
+        try { task = await todoist.getTask(link.taskId); } catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
+      }
       await this.state.deleteMapping(recurrenceMapping(link));
-      await todoist.deleteTask(link.taskId).catch((error: unknown) => {
-        if (Number((error as { status?: number }).status) !== 404) throw error;
-      });
-      const nextTask = await todoist.upsertTask(toTodoistTask(active));
+      if (!progressAware) {
+        await todoist.deleteTask(link.taskId).catch((error: unknown) => {
+          if (Number((error as { status?: number }).status) !== 404) throw error;
+        });
+      }
+      const nextTask = await todoist.upsertTask(toTodoistTask(active), progressAware ? task?.id : undefined);
       const next: Mapping = {
         profile,
         eventId: active.id,
@@ -427,6 +481,8 @@ export class Synchronizer {
         activeInstanceId: active.id,
         originalStart: eventStart(active),
         activeEffectiveStart: eventEffectiveStart(active),
+        ...(link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+        ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
         updatedAt: new Date().toISOString(),
       };
       await this.state.putMapping(next);
@@ -540,9 +596,6 @@ export class Synchronizer {
           return this.state.audit(delivery.profile, "todoist_recurrence_calendar_master_delete_suppressed", { eventId: event.id, taskId: mapping.taskId, mode: delivery.mode });
         }
         await this.state.putCalendarProjectionTombstone(delivery.profile, mapping.taskId, delivery.receivedAt);
-        // The Todoist recurrence remains authoritative. Deleting its projected
-        // Calendar master suppresses Calendar projection only; it never deletes
-        // the Todoist recurring task.
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "todoist_recurrence_calendar_master_deleted_projection_only", { eventId: event.id, taskId: mapping.taskId, projectionSuppressed: true });
       }
@@ -569,9 +622,6 @@ export class Synchronizer {
           return this.state.audit(delivery.profile, "calendar_recurrence_delete_suppressed", { seriesId: series, mode: delivery.mode });
         }
         const oldMapping = recurrenceMapping(existingRecurrence);
-        // A cancelled active instance advances the series; a cancelled master
-        // ends it. In both cases drop the old mirror ownership before deleting
-        // the Todoist task so that deletion webhook is recognised as internal.
         await this.state.deleteMapping(oldMapping);
         await todoist.deleteTask(existingRecurrence.taskId).catch((error: unknown) => {
           if (Number((error as { status?: number }).status) !== 404) throw error;
@@ -582,7 +632,7 @@ export class Synchronizer {
           return this.state.audit(delivery.profile, "calendar_recurrence_master_deleted", { seriesId: series });
         }
         const { calendar } = await this.clients(delivery.profile);
-        const next = nextActiveInstance(await calendar.listInstances(existingRecurrence.masterEventId), existingRecurrence.originalStart);
+        const next = selectCalendarRecurrenceInstance(await calendar.listInstances(existingRecurrence.masterEventId), existingRecurrence);
         if (!next) return this.state.audit(delivery.profile, "calendar_recurrence_instance_deleted_no_next", { seriesId: series });
         const nextTask = await todoist.upsertTask(toTodoistTask(next));
         const nextMapping: Mapping = {
@@ -595,6 +645,8 @@ export class Synchronizer {
           activeInstanceId: next.id,
           originalStart: eventStart(next),
           activeEffectiveStart: eventEffectiveStart(next),
+          ...(existingRecurrence.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+          ...(existingRecurrence.completedThroughOriginalStart ? { completedThroughOriginalStart: existingRecurrence.completedThroughOriginalStart } : {}),
           updatedAt: new Date().toISOString(),
         };
         await this.state.putMapping(nextMapping);
@@ -676,9 +728,6 @@ export class Synchronizer {
     const activeBefore = mapping?.activeInstanceId
       ? instancesBefore.find((instance) => instance.id === mapping.activeInstanceId && instance.status !== "cancelled")
       : undefined;
-    // If Todoist currently reflects a Calendar exception, restore Calendar's
-    // master from the stored Todoist template rather than accidentally turning
-    // that one-off exception into the global recurrence title/description.
     const templateTask = activeBefore && occurrenceStateMatches(activeBefore, task)
       ? todoistTemplateTask(master, task)
       : task;
@@ -715,21 +764,32 @@ export class Synchronizer {
     const { calendar } = await this.clients(delivery.profile);
     const seriesId = master.iCalUID || master.id;
     const existing = await this.state.getRecurrenceLink(delivery.profile, seriesId);
-    const active = selectCalendarRecurrenceInstance(await calendar.listInstances(master.id), existing);
+    const instances = await calendar.listInstances(master.id);
+    const suppressed = suppressedLegacyCalendarRecurrenceCandidate(instances, existing);
+    if (suppressed && existing) {
+      await this.state.audit(delivery.profile, "calendar_recurrence_backward_shift_suppressed_legacy_state", {
+        seriesId,
+        currentInstanceId: existing.activeInstanceId,
+        candidateInstanceId: suppressed.id,
+        taskId: existing.taskId,
+      });
+    }
+    const active = selectCalendarRecurrenceInstance(instances, existing);
     if (!active) return this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "calendar_recurrence_mutation_suppressed", { seriesId, mode: delivery.mode });
     }
+    const progressAware = existing?.calendarProgressVersion === 1;
     let task: TodoistTask | undefined;
-    if (existing?.taskId && existing.activeInstanceId === active.id) {
+    if (existing?.taskId && (existing.activeInstanceId === active.id || progressAware)) {
       try { task = await todoist.getTask(existing.taskId); } catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
     }
-    if (task && hasCanonicalState(active, task)) {
+    if (task && existing?.activeInstanceId === active.id && hasCanonicalState(active, task)) {
       return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
     }
     if (existing?.taskId && (!task || existing.activeInstanceId !== active.id)) {
       await this.state.deleteMapping(recurrenceMapping(existing));
-      if (existing.activeInstanceId !== active.id) {
+      if (existing.activeInstanceId !== active.id && !progressAware) {
         await todoist.deleteTask(existing.taskId).catch((error: unknown) => { if (Number((error as { status?: number }).status) !== 404) throw error; });
       }
     }
@@ -744,6 +804,14 @@ export class Synchronizer {
       activeInstanceId: active.id,
       originalStart: eventStart(active),
       activeEffectiveStart: eventEffectiveStart(active),
+      ...(existing
+        ? existing.calendarProgressVersion === 1
+          ? {
+              calendarProgressVersion: 1 as const,
+              ...(existing.completedThroughOriginalStart ? { completedThroughOriginalStart: existing.completedThroughOriginalStart } : {}),
+            }
+          : {}
+        : { calendarProgressVersion: 1 as const }),
       updatedAt: new Date().toISOString(),
     };
     await this.state.putMapping(mapping);
@@ -781,18 +849,31 @@ export class Synchronizer {
 
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
-    // A Calendar-owned series uses a normal Todoist mirror. Completing that
-    // mirror cancels just its active Calendar instance and binds the next one.
     if (lifecycle.reason === "completed" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId) {
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
         return this.state.audit(delivery.profile, "todoist_recurrence_mutation_suppressed", { taskId: task.id, mode: delivery.mode });
       }
+      const completedThroughOriginalStart = latestLogicalStart(mapping.completedThroughOriginalStart, mapping.originalStart);
+      const progressMapping: Mapping = {
+        ...mapping,
+        ...(mapping.originalStart || mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+        ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+        updatedAt: new Date().toISOString(),
+      };
+      // Persist the completion boundary before mutating Calendar or binding a
+      // successor. A retry can then never roll the logical series backwards.
+      await this.state.putMapping(progressMapping);
+      if (progressMapping.seriesId) await this.state.putRecurrenceLink(recurrenceLink(progressMapping, "calendar"));
+
       await calendar.deleteEvent(mapping.eventId).catch((error: unknown) => {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
-      const next = nextActiveInstance(await calendar.listInstances(mapping.masterEventId), mapping.originalStart);
+      const instances = await calendar.listInstances(mapping.masterEventId);
+      const next = progressMapping.calendarProgressVersion === 1
+        ? nextActiveInstance(instances, progressMapping.completedThroughOriginalStart)
+        : nextActiveInstance(instances, mapping.originalStart);
       if (!next) {
-        await this.state.deleteMapping(mapping);
+        await this.state.deleteMapping(progressMapping);
         return this.state.audit(delivery.profile, "calendar_recurrence_completed_no_next", { seriesId: mapping.seriesId, taskId: task.id });
       }
       const nextTask = await todoist.upsertTask(toTodoistTask(next));
@@ -806,18 +887,21 @@ export class Synchronizer {
         activeInstanceId: next.id,
         originalStart: eventStart(next),
         activeEffectiveStart: eventEffectiveStart(next),
+        ...(progressMapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+        ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
         updatedAt: new Date().toISOString(),
       };
-      await this.state.deleteMapping(mapping);
+      await this.state.deleteMapping(progressMapping);
       await this.state.putMapping(nextMapping);
       await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
       await this.state.recordMutation(delivery.profile);
-      return this.state.audit(delivery.profile, "calendar_recurrence_completed_rolled", { seriesId: mapping.seriesId, eventId: next.id, taskId: nextTask.id });
+      return this.state.audit(delivery.profile, "calendar_recurrence_completed_rolled", {
+        seriesId: mapping.seriesId,
+        eventId: next.id,
+        taskId: nextTask.id,
+        completedThroughOriginalStart,
+      });
     }
-    // Todoist owns its recurrence. Supported rules are projected as a Google
-    // RRULE master. Completion chooses the next *effective* Google instance,
-    // so deferred moved/deleted exceptions are applied without materialising
-    // future Todoist tasks.
     if (lifecycle.reason === "completed" && mapping?.recurrenceOwner === "todoist") {
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
         return this.state.audit(delivery.profile, "todoist_recurrence_mutation_suppressed", { taskId: task.id, mode: delivery.mode });
@@ -828,10 +912,6 @@ export class Synchronizer {
       let mappedEvent: CalendarEvent | undefined;
       try { mappedEvent = await calendar.getEvent(mapping.eventId); } catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
       if (!mappedEvent && mapping.masterEventId) {
-        // Google can return 404/410 for a user-deleted recurring master before
-        // its cancellation delta reaches this worker. Treat that provider state
-        // as the deletion signal immediately: retain ownership metadata and
-        // write the same suppression boundary the later Calendar delta would.
         await this.state.putCalendarProjectionTombstone(delivery.profile, task.id, delivery.receivedAt);
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "todoist_recurrence_completion_suppressed_missing_calendar_master", {
@@ -872,9 +952,6 @@ export class Synchronizer {
         });
       }
 
-      // Rolling fallback, including a supported RRULE that has been changed to
-      // an unsupported Todoist expression. Drop ownership before deleting the
-      // old Calendar object so its cancellation webhook cannot delete Todoist.
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
       await calendar.deleteEvent(mapping.eventId).catch((error: unknown) => {
@@ -930,9 +1007,6 @@ export class Synchronizer {
     if (!mapping) {
       const linkedEvent = await calendar.findByTodoistTaskId(task.id);
       if (linkedEvent?.status === "cancelled") {
-        // A delayed Todoist update can arrive after a Calendar deletion. The
-        // cancelled event is a tombstone: do not recreate it from that stale
-        // update, or the two-way delete becomes a resurrection loop.
         cancelledCalendarLink = true;
       } else if (linkedEvent) {
         mapping = { profile: delivery.profile, eventId: linkedEvent.id, taskId: task.id, updatedAt: new Date().toISOString() };
@@ -956,8 +1030,6 @@ export class Synchronizer {
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "todoist_deleted_calendar_recurrence", { taskId: task.id, masterEventId: mapping.masterEventId });
       }
-      // Google may retain a cancelled event as a 410 tombstone rather than a
-      // 404. Either response means the desired delete has already happened.
       await calendar.deleteEvent(mapping.eventId).catch((error: unknown) => {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
@@ -994,9 +1066,6 @@ export class Synchronizer {
     const desiredRrule = todoistRecurrenceToRrule(task);
     const previousSeriesId = mapping?.recurrenceOwner === "todoist" ? mapping.seriesId : undefined;
     if (mapping?.recurrenceOwner === "todoist" && existingEvent?.recurrence?.length && !desiredRrule) {
-      // A Todoist recurrence changed from an RRULE-compatible expression to a
-      // non-recurring/unsupported one. Remove the Calendar series safely and
-      // recreate the appropriate ordinary projection below.
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
       await calendar.deleteEvent(existingEvent.id).catch((error: unknown) => {
