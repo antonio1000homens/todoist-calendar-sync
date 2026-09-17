@@ -19,6 +19,12 @@ export interface CanonicalIdentityRecord {
   updatedAt: string;
 }
 
+export interface CanonicalTodoistDue {
+  date?: string | null;
+  datetime?: string | null;
+  timezone?: string | null;
+}
+
 const DEFAULT_RETENTION_DAYS = 90;
 
 function hasOffset(value: string): boolean {
@@ -42,7 +48,7 @@ function localDateTime(value: string, timeZone: string): string {
   return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}:${values.second}`;
 }
 
-function timedIdentity(value: string, timeZone?: string): string {
+function timedIdentity(value: string, timeZone?: string | null): string {
   return localDateTime(value, timeZone || "Europe/London");
 }
 
@@ -62,10 +68,8 @@ export function calendarCanonicalIdentity(event: CalendarEvent): CanonicalIdenti
   };
 }
 
-export function todoistCanonicalIdentity(task: TodoistTask | undefined): CanonicalIdentity | undefined {
-  if (!task) return undefined;
-  const title = normalizedText(task.content).toLowerCase();
-  const due = task.due;
+export function todoistCanonicalIdentityFromFields(content: string | undefined, due: CanonicalTodoistDue | null | undefined): CanonicalIdentity | undefined {
+  const title = normalizedText(content).toLowerCase();
   const dateTime = due?.datetime || (due?.date?.includes("T") ? due.date : undefined);
   const date = due?.date;
   if (!title || (!date && !dateTime)) return undefined;
@@ -78,6 +82,11 @@ export function todoistCanonicalIdentity(task: TodoistTask | undefined): Canonic
     normalizedStart: timedIdentity(dateTime, due?.timezone),
     allDay: false,
   };
+}
+
+export function todoistCanonicalIdentity(task: TodoistTask | undefined): CanonicalIdentity | undefined {
+  if (!task) return undefined;
+  return todoistCanonicalIdentityFromFields(task.content, task.due);
 }
 
 export function sameCanonicalIdentity(a: CanonicalIdentity | undefined, b: CanonicalIdentity | undefined): boolean {
