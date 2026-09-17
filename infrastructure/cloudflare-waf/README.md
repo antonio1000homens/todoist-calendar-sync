@@ -1,8 +1,13 @@
 # Calendar WAF custom ruleset
 
-This Terraform stack owns the Calendar-specific zone custom ruleset only. It
-does not manage the zone `http_request_firewall_custom` entry point; Windsor
+This deployment owns the Calendar-specific zone custom ruleset only. It does
+not manage the zone `http_request_firewall_custom` entry point; Windsor
 continues to own that entry point and executes this ruleset from it.
+
+The production workflow reconciles the rule through the Cloudflare Rulesets
+API because provider 5.x does not serialize the API-only `phase = "current"`
+skip parameter. Terraform still validates the declaration and stores the
+deployment state in the project bucket.
 
 The ruleset has one narrow rule for `POST /calendar` on
 `calendar-sync.alf-broadcast.co.uk`. Its `phase = "current"` skip action skips
