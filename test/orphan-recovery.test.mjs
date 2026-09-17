@@ -125,7 +125,7 @@ function fixture({ events = [], tasks = [] } = {}) {
 
   const calendar = {
     async listDelta(token) {
-      return { items: [...eventMap.values()].map(structuredClone), nextSyncToken: token ? "sync-token-next" : "snapshot-token" };
+      return { items: [...eventMap.values()].map((event) => structuredClone(event)), nextSyncToken: token ? "sync-token-next" : "snapshot-token" };
     },
     async findByTodoistTaskId(taskId) {
       return [...eventMap.values()].find((event) => event.extendedProperties?.shared?.taskId === taskId);
@@ -147,7 +147,7 @@ function fixture({ events = [], tasks = [] } = {}) {
   };
 
   const todoist = {
-    async listTasks() { return [...taskMap.values()].map(structuredClone); },
+    async listTasks() { return [...taskMap.values()].map((task) => structuredClone(task)); },
     async getTask(taskId) {
       const task = taskMap.get(taskId);
       if (!task) { const error = new Error("not found"); error.status = 404; throw error; }
