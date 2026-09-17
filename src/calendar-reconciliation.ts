@@ -5,6 +5,14 @@ import {
   ReconciliationMutationBudget,
   type ProviderClientFactory,
 } from "./mutation-budget.js";
+import {
+  calendarCanonicalIdentity,
+  CanonicalIdentityStore,
+  sameCanonicalIdentity,
+  todoistCanonicalIdentity,
+  type CanonicalIdentity,
+  type CanonicalIdentityRepository,
+} from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
 import { hasCanonicalState, selectCalendarRecurrenceInstance, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
@@ -94,6 +102,7 @@ export async function reconcileUnmappedCalendar(
   mutationBudget = new ReconciliationMutationBudget(MAX_PROVIDER_MUTATIONS),
   continuation?: ReconciliationContinuation,
   maxCandidates = candidateLimit(),
+  identities: CanonicalIdentityRepository | undefined = state instanceof StateRepository ? new CanonicalIdentityStore() : undefined,
 ): Promise<CalendarRecoverySummary> {
   if (continuation && continuation.phase !== "calendar") {
     throw new Error(`Calendar recovery cannot resume continuation phase ${continuation.phase}`);
@@ -149,17 +158,42 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
 
-  const findCanonicalTask = async (event: CalendarEvent): Promise<{ task?: TodoistTask; ambiguous: boolean }> => {
-    const matches = tasks.filter((task) => hasCanonicalState(event, task));
-    if (matches.length !== 1) return { task: undefined, ambiguous: matches.length > 1 };
+  const eligibleUniqueTask = async (matches: TodoistTask[]): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
+    const eligible: TodoistTask[] = [];
+    let ownershipConflict = false;
+    for (const candidate of matches) {
+      if (reservedTaskIds.has(candidate.id)) {
+        ownershipConflict = true;
+        continue;
+      }
+      const existing = await state.getMappingByTaskAnyProfile(candidate.id);
+      if (existing) {
+        ownershipConflict = true;
+        continue;
+      }
+      eligible.push(candidate);
+    }
+    return {
+      task: eligible.length === 1 && !ownershipConflict ? eligible[0] : undefined,
+      ambiguous: eligible.length > 1 || ownershipConflict,
+      candidateTaskIds: eligible.map((task) => task.id).sort(),
+    };
+  };
 
-    const candidate = matches[0];
-    if (reservedTaskIds.has(candidate.id)) return { task: undefined, ambiguous: true };
+  const findCanonicalTask = async (event: CalendarEvent): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
+    return eligibleUniqueTask(tasks.filter((task) => hasCanonicalState(event, task)));
+  };
 
-    const existing = await state.getMappingByTaskAnyProfile(candidate.id);
-    if (existing) return { task: undefined, ambiguous: true };
+  const findIdentityTask = async (identity: CanonicalIdentity): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
+    return eligibleUniqueTask(tasks.filter((task) => sameCanonicalIdentity(todoistCanonicalIdentity(task), identity)));
+  };
 
-    return { task: candidate, ambiguous: false };
+  const rememberStandaloneIdentity = async (event: CalendarEvent, task: TodoistTask): Promise<void> => {
+    if (!identities) return;
+    const eventIdentity = calendarCanonicalIdentity(event);
+    const taskIdentity = todoistCanonicalIdentity(task);
+    if (eventIdentity) await identities.put(profile, "calendar", event.id, eventIdentity);
+    if (taskIdentity) await identities.put(profile, "todoist", task.id, taskIdentity);
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
@@ -170,12 +204,39 @@ export async function reconcileUnmappedCalendar(
     const match = await findCanonicalTask(event);
     if (match.ambiguous) {
       summary.conflicts += 1;
-      await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", { eventId: event.id });
+      await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", { eventId: event.id, candidateTaskIds: match.candidateTaskIds });
       return;
     }
 
     let task = match.task;
     let created = false;
+    let recoveredPreviousIdentity = false;
+    const currentIdentity = calendarCanonicalIdentity(event);
+
+    if (!task && currentIdentity && identities) {
+      const previousIdentity = (await identities.get(profile, "calendar", event.id))?.identity;
+      if (previousIdentity && !sameCanonicalIdentity(previousIdentity, currentIdentity)) {
+        const historical = await findIdentityTask(previousIdentity);
+        if (historical.ambiguous) {
+          summary.conflicts += 1;
+          await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", {
+            eventId: event.id,
+            source: "snapshot_previous_identity",
+            candidateTaskIds: historical.candidateTaskIds,
+            previousIdentity,
+            currentIdentity,
+          });
+          return;
+        }
+        if (historical.task) {
+          if (!await canMutate()) return;
+          task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
+          await state.recordMutation(profile);
+          recoveredPreviousIdentity = true;
+        }
+      }
+    }
+
     if (!task) {
       if (!await canMutate()) return;
       task = await pair.todoist.upsertTask(toTodoistTask(event));
@@ -202,9 +263,15 @@ export async function reconcileUnmappedCalendar(
       updatedAt: new Date().toISOString(),
     };
     await state.putMapping(mapping);
+    await rememberStandaloneIdentity(event, task);
     if (created) summary.imported += 1;
     else summary.rebound += 1;
-    await state.audit(profile, created ? "calendar_snapshot_imported_task" : "calendar_snapshot_rebound_mapping", {
+    const action = created
+      ? "calendar_snapshot_imported_task"
+      : recoveredPreviousIdentity
+        ? "calendar_orphan_todoist_rebound_previous_identity"
+        : "calendar_snapshot_rebound_mapping";
+    await state.audit(profile, action, {
       eventId: event.id,
       taskId: task.id,
       commentId,
