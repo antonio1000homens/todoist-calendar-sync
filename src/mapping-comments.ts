@@ -65,6 +65,15 @@ function optionalString(value: unknown): value is string | undefined {
   return value === undefined || nonEmptyString(value);
 }
 
+function laterLogicalStart(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return rightTime > leftTime ? right : left;
+  return right.localeCompare(left) > 0 ? right : left;
+}
+
 export function mappingProjectId(mapping: Mapping, configuredProjectId: string): string {
   return mapping.projectId || configuredProjectId;
 }
@@ -170,6 +179,35 @@ export function findProjectMappingComment(index: ProjectMappingIndex, mapping: P
     .filter((entry) => entry.payload.eventId === mapping.eventId)
     .sort(newest);
   return exact[0];
+}
+
+/**
+ * Recover recurrence metadata from an exact project-comment breadcrumb without
+ * allowing an older comment to roll a live mapping backwards. Existing mapping
+ * values win, except the completion watermark is merged monotonically.
+ */
+export function recoverMappingFromProjectComment(mapping: Mapping, parsed: ParsedMappingComment): Mapping {
+  const payload = parsed.payload;
+  if (payload.profile !== mapping.profile || payload.taskId !== mapping.taskId || payload.eventId !== mapping.eventId) {
+    throw new Error("project mapping comment identity does not match mapping");
+  }
+  const recurrenceOwner = mapping.recurrenceOwner || payload.recurrenceOwner;
+  const completedThroughOriginalStart = recurrenceOwner === "calendar"
+    ? laterLogicalStart(mapping.completedThroughOriginalStart, payload.completedThroughOriginalStart)
+    : undefined;
+  return {
+    ...mapping,
+    ...(recurrenceOwner ? { recurrenceOwner } : {}),
+    ...(mapping.seriesId || payload.seriesId ? { seriesId: mapping.seriesId || payload.seriesId } : {}),
+    ...(mapping.masterEventId || payload.masterEventId ? { masterEventId: mapping.masterEventId || payload.masterEventId } : {}),
+    ...(mapping.activeInstanceId || payload.activeInstanceId ? { activeInstanceId: mapping.activeInstanceId || payload.activeInstanceId } : {}),
+    ...(mapping.originalStart || payload.originalStart ? { originalStart: mapping.originalStart || payload.originalStart } : {}),
+    ...(mapping.activeEffectiveStart || payload.activeEffectiveStart ? { activeEffectiveStart: mapping.activeEffectiveStart || payload.activeEffectiveStart } : {}),
+    ...(recurrenceOwner === "calendar" && (mapping.calendarProgressVersion === 1 || payload.calendarProgressVersion === 1)
+      ? { calendarProgressVersion: 1 as const }
+      : {}),
+    ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+  };
 }
 
 export function nextProjectCommentMapping(mapping: Mapping, projectId: string, projectCommentId: string, revision: number): Mapping {
