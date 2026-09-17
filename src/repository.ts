@@ -2,12 +2,25 @@ import {
   DeleteCommand,
   GetCommand,
   PutCommand,
+  QueryCommand,
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
+import {
+  mappingEventLookupAttributes,
+  mappingLookupAttributes,
+  mappingOwnerLookupAttributes,
+  recurrenceLookupAttributes,
+  recurrenceLookupQueryInput,
+  mappingLookupQueryInput,
+  PROFILE_LOOKUP_MIGRATION_VERSION,
+  PROFILE_LOOKUP_READY_KEY,
+  PROFILE_LOOKUP_READY_SORT_KEY,
+  readProfileLookup,
+} from "./profile-lookup.js";
 import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
@@ -332,9 +345,9 @@ export class StateRepository {
     const item = { ...mapping, updatedAt: now() };
     await client.send(new TransactWriteCommand({
       TransactItems: [
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP") } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP") } } },
-        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP") } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) } } },
+        { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
   }
@@ -436,7 +449,7 @@ export class StateRepository {
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
-      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`) },
+      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
     }));
   }
 
@@ -450,15 +463,23 @@ export class StateRepository {
   }
 
   async listRecurrenceLinks(profile: Profile): Promise<RecurrenceLink[]> {
-    const result = await pacedScan<RecurrenceLink>({
-      TableName: this.ensureTable(),
-      FilterExpression: "begins_with(pk, :prefix)",
-      ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
-    }, {
-      operation: "list_recurrence_links",
+    const table = this.ensureTable();
+    return readProfileLookup<RecurrenceLink>({
+      client,
+      tableName: table,
       profile,
+      operation: "list_recurrence_links",
+      component: "state-repository",
+      queryInput: recurrenceLookupQueryInput(table, profile),
+      fallback: async () => {
+        const result = await pacedScan<RecurrenceLink>({
+          TableName: table,
+          FilterExpression: "begins_with(pk, :prefix)",
+          ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
+        }, { operation: "list_recurrence_links_scan_fallback", profile });
+        return result.items;
+      },
     });
-    return result.items;
   }
 
   async getCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<CalendarProjectionTombstone | undefined> {
@@ -540,6 +561,18 @@ export class StateRepository {
         detail: safeDetail,
         createdAt: now(),
         expiresAt: auditExpiresAt(),
+      },
+    }));
+  }
+
+  async markProfileLookupIndexReady(): Promise<void> {
+    await client.send(new PutCommand({
+      TableName: this.ensureTable(),
+      Item: {
+        ...key(PROFILE_LOOKUP_READY_KEY, PROFILE_LOOKUP_READY_SORT_KEY),
+        ready: true,
+        version: PROFILE_LOOKUP_MIGRATION_VERSION,
+        completedAt: now(),
       },
     }));
   }

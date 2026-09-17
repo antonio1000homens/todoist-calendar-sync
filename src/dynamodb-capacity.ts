@@ -2,14 +2,17 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   ScanCommand,
+  type QueryCommandInput,
   type ScanCommandInput,
 } from "@aws-sdk/lib-dynamodb";
 
 const DEFAULT_SCAN_PAGE_ITEM_LIMIT = 25;
 const DEFAULT_SCAN_RCU_BUDGET_PER_SECOND = 10;
+const DEFAULT_PROFILE_LOOKUP_QUERY_RCU_BUDGET_PER_SECOND = 5;
 const DEFAULT_SCAN_JITTER_MS = 50;
 const LARGE_ITEM_WARNING_BYTES = 16 * 1024;
 const LARGE_ITEM_CRITICAL_BYTES = 64 * 1024;
+const PROFILE_LOOKUP_INDEX_NAME = "ProfileLookupIndex";
 
 const baseClient = new DynamoDBClient({
   maxAttempts: 5,
@@ -94,6 +97,13 @@ export function scanRcuBudgetPerSecond(): number {
   );
 }
 
+export function profileLookupQueryRcuBudgetPerSecond(): number {
+  return positiveNumber(
+    process.env.TODOIST_CALENDAR_SYNC_PROFILE_LOOKUP_QUERY_RCU_BUDGET_PER_SECOND,
+    DEFAULT_PROFILE_LOOKUP_QUERY_RCU_BUDGET_PER_SECOND,
+  );
+}
+
 export function pacingDelayMs(
   consumedCapacityUnits: number,
   elapsedMs: number,
@@ -108,6 +118,58 @@ export function pacingDelayMs(
 function sleep(ms: number): Promise<void> {
   return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
+
+export function profileLookupQueryInput(input: QueryCommandInput): QueryCommandInput {
+  if (input.IndexName !== PROFILE_LOOKUP_INDEX_NAME) return input;
+  const pageItemLimit = scanPageItemLimit();
+  const requestedLimit = Number(input.Limit);
+  const boundedLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+    ? Math.min(Math.floor(requestedLimit), pageItemLimit)
+    : pageItemLimit;
+  return {
+    ...input,
+    Limit: boundedLimit,
+    ReturnConsumedCapacity: "TOTAL",
+  };
+}
+
+documentClient.middlewareStack.add(
+  (next, context) => async (args) => {
+    const input = args.input as QueryCommandInput;
+    if (context.commandName !== "QueryCommand" || input.IndexName !== PROFILE_LOOKUP_INDEX_NAME) {
+      return next(args);
+    }
+
+    const pacedInput = profileLookupQueryInput(input);
+    const startedAt = Date.now();
+    const result = await next({ ...args, input: pacedInput });
+    const output = result.output as {
+      Items?: unknown[];
+      LastEvaluatedKey?: Record<string, unknown>;
+      ConsumedCapacity?: { CapacityUnits?: number };
+    };
+    const consumedCapacityUnits = Number(output.ConsumedCapacity?.CapacityUnits || 0);
+    const nextPage = Boolean(output.LastEvaluatedKey);
+    const waitMs = nextPage
+      ? pacingDelayMs(consumedCapacityUnits, Date.now() - startedAt, profileLookupQueryRcuBudgetPerSecond())
+      : 0;
+
+    console.log(JSON.stringify({
+      service: "todoist-calendar-sync",
+      event: "dynamodb_profile_lookup_query_page",
+      indexName: PROFILE_LOOKUP_INDEX_NAME,
+      returnedCount: output.Items?.length || 0,
+      consumedCapacityUnits,
+      rcuBudgetPerSecond: profileLookupQueryRcuBudgetPerSecond(),
+      nextPage,
+      pacingDelayMs: waitMs,
+    }));
+
+    if (waitMs > 0) await sleep(waitMs);
+    return result;
+  },
+  { step: "initialize", name: "todoistCalendarSyncProfileLookupQueryPacing", priority: "low" },
+);
 
 export interface PacedScanOptions {
   operation: string;
