@@ -21,7 +21,7 @@ require_success() {
 
 expression='http.host eq "calendar-sync.alf-broadcast.co.uk" and http.request.method eq "POST" and http.request.uri.path eq "/calendar"'
 rules="$(jq -cn --arg expression "$expression" '[{ref:"calendar_sync_webhook_skip_current_phase",description:"Allow Google Calendar webhook POSTs through the remaining custom WAF rules",expression:$expression,action:"skip",action_parameters:{phase:"current"},enabled:true}]')"
-list_response="$(api_call "${api}/rulesets?per_page=100")"
+list_response="$(api_call "${api}/rulesets?per_page=50")"
 require_success "$list_response"
 existing_id="$(jq -r --arg name "$ruleset_name" '.result[] | select(.name == $name and .kind == "custom" and .phase == "http_request_firewall_custom") | .id' <<<"$list_response" | head -n1)"
 payload="$(jq -cn --arg name "$ruleset_name" --argjson rules "$rules" '{name:$name,description:"Calendar-specific WAF bypass owned by todoist-calendar-sync",kind:"custom",phase:"http_request_firewall_custom",rules:$rules}')"
