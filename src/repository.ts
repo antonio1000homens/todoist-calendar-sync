@@ -275,7 +275,12 @@ export class StateRepository {
         UpdateExpression: "SET lastStartedAt = :now, expiresAt = :expiresAt",
         ConditionExpression: "#pending = :true AND generation = :generation",
         ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: { ":true": true, ":generation": generation, ":now": now(), ":expiresAt": ttl(30) },
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":generation": generation,
+          ":now": now(),
+          ":expiresAt": ttl(30),
+        },
       }));
       return true;
     } catch (error) {
@@ -289,10 +294,16 @@ export class StateRepository {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET #pending = :false, lastCompletedAt = :now, expiresAt = :expiresAt REMOVE lastError",
+        UpdateExpression: "SET #pending = :false, lastCompletedAt = :now, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
         ConditionExpression: "#pending = :true AND generation = :generation",
         ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: { ":false": false, ":true": true, ":generation": generation, ":now": now(), ":expiresAt": ttl(30) },
+        ExpressionAttributeValues: {
+          ":true": true,
+          ":false": false,
+          ":generation": generation,
+          ":now": now(),
+          ":expiresAt": ttl(30),
+        },
       }));
     } catch (error) {
       if (!conditionalFailure(error)) throw error;
@@ -374,6 +385,9 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
+      // A newer mapping may have replaced either stale index between owner
+      // inspection and cleanup. Conditional cancellation means there is
+      // nothing safe to delete; leave the newer index untouched.
       if ((error as { name?: string }).name === "TransactionCanceledException") return;
       throw error;
     }
