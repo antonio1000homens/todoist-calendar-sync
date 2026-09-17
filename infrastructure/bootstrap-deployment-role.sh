@@ -49,7 +49,6 @@ aws cloudformation deploy \
   --parameter-overrides \
     "DeploymentRoleName=$role_name" \
     "ResourceNamePrefix=$resource_name_prefix" \
-    "LegacyResourceNamePrefix=$legacy_resource_name_prefix" \
   >&2
 
 role_arn="$(aws cloudformation describe-stacks \
