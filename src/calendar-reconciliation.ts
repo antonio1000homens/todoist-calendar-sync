@@ -71,6 +71,8 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
     eventId: mapping.eventId,
     updatedAt: mapping.updatedAt,
@@ -325,6 +327,7 @@ export async function reconcileUnmappedCalendar(
       activeInstanceId: active.id,
       originalStart: start,
       activeEffectiveStart: active.start?.dateTime || active.start?.date || start,
+      calendarProgressVersion: 1,
       updatedAt: new Date().toISOString(),
     };
     await state.putMapping(mapping);
