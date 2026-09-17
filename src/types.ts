@@ -173,6 +173,10 @@ export interface Mapping {
   originalStart?: string;
   /** Actual scheduled start of the active occurrence after Calendar exceptions have been applied. */
   activeEffectiveStart?: string;
+  /** Marks Calendar-owned recurrence state whose completion progress is safe to use for backward re-anchoring. */
+  calendarProgressVersion?: 1;
+  /** Monotonic immutable `originalStart` of the latest logically completed Calendar-owned occurrence. */
+  completedThroughOriginalStart?: string;
   updatedAt: string;
 }
 
@@ -184,6 +188,10 @@ export interface RecurrenceLink {
   activeInstanceId?: string;
   originalStart?: string;
   activeEffectiveStart?: string;
+  /** Marks Calendar-owned recurrence state whose completion progress is safe to use for backward re-anchoring. */
+  calendarProgressVersion?: 1;
+  /** Monotonic immutable `originalStart` of the latest logically completed Calendar-owned occurrence. */
+  completedThroughOriginalStart?: string;
   taskId: string;
   eventId: string;
   updatedAt: string;
