@@ -16,11 +16,24 @@ type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => P
 
 type CalendarDelta = { items: CalendarEvent[]; nextSyncToken?: string };
 
-function standaloneCalendarCandidate(event: CalendarEvent): boolean {
+function standaloneCalendarShape(event: CalendarEvent): boolean {
   if (event.status === "cancelled" || (event.status && event.status !== "confirmed")) return false;
   if (event.recurringEventId || event.recurrence?.length) return false;
-  if (event.extendedProperties?.shared?.syncSource === "todoist-calendar-sync") return false;
   return Boolean(calendarCanonicalIdentity(event));
+}
+
+function standaloneCalendarSource(event: CalendarEvent): boolean {
+  if (!standaloneCalendarShape(event)) return false;
+  const shared = event.extendedProperties?.shared;
+  return shared?.syncSource !== "todoist-calendar-sync" && !shared?.taskId;
+}
+
+function standaloneCalendarOrphanCandidate(event: CalendarEvent): boolean {
+  if (!standaloneCalendarShape(event)) return false;
+  // An orphan may still retain the generic syncSource marker after taskId
+  // metadata or the DynamoDB mapping was lost. A concrete taskId, however,
+  // remains an ownership claim and must be resolved through exact-ID recovery.
+  return !event.extendedProperties?.shared?.taskId;
 }
 
 function standaloneTodoistCandidate(task: TodoistTask): boolean {
@@ -84,7 +97,7 @@ export class OrphanRecoveringSynchronizer {
   }
 
   private async eligibleCalendarMatches(profile: Profile, events: CalendarEvent[], identity: CanonicalIdentity): Promise<CalendarEvent[]> {
-    const matching = events.filter((event) => standaloneCalendarCandidate(event) && sameCanonicalIdentity(calendarCanonicalIdentity(event), identity));
+    const matching = events.filter((event) => standaloneCalendarOrphanCandidate(event) && sameCanonicalIdentity(calendarCanonicalIdentity(event), identity));
     const eligible: CalendarEvent[] = [];
     for (const event of matching) {
       const existing = await this.state.getMappingByEvent(profile, event.id);
@@ -109,7 +122,7 @@ export class OrphanRecoveringSynchronizer {
   }
 
   private async rememberCalendarResult(profile: Profile, event: CalendarEvent, clients: ProviderClients): Promise<void> {
-    if (!standaloneCalendarCandidate(event)) return;
+    if (!standaloneCalendarSource(event)) return;
     const mapping = await this.state.getMappingByEvent(profile, event.id);
     if (!mapping || mapping.recurrenceOwner) return;
     const eventIdentity = calendarCanonicalIdentity(event);
@@ -144,15 +157,12 @@ export class OrphanRecoveringSynchronizer {
     const blockedEventIds = new Set<string>();
 
     for (const event of delta.items) {
-      if (!standaloneCalendarCandidate(event)) continue;
+      if (!standaloneCalendarSource(event)) continue;
       const mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (mapping) {
         await this.seedCalendarIdentityFromMappedTask(delivery.profile, event, mapping, clients);
         continue;
       }
-      // Exact embedded provider identity remains higher confidence than any
-      // canonical-title/start inference and is handled by the normal synchronizer.
-      if (event.extendedProperties?.shared?.taskId) continue;
 
       const currentIdentity = calendarCanonicalIdentity(event);
       if (!currentIdentity) continue;
