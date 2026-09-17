@@ -174,6 +174,27 @@ function masterEvent() {
   };
 }
 
+function completedDelivery(id, taskId, occurrence, receivedAt) {
+  return {
+    id,
+    kind: "todoist",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt,
+    headers: {},
+    body: JSON.stringify({
+      event_name: "item:completed",
+      event_data: {
+        id: taskId,
+        content: occurrence.summary,
+        description: "",
+        due: occurrence.start.date ? { date: occurrence.start.date } : { datetime: occurrence.start.dateTime },
+        is_completed: true,
+      },
+    }),
+  };
+}
+
 test("legacy Calendar recurrence keeps a live mapped occurrence and exposes the suppressed earlier candidate", () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");
@@ -204,15 +225,14 @@ test("timed completion boundaries compare logical instants across offsets", () =
   assert.equal(selectCalendarRecurrenceInstance([sameInstant, later], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "later");
 });
 
-test("Calendar master re-anchor updates the same Todoist mirror in place for trusted progress state", async () => {
+test("Calendar master re-anchor updates the same Todoist mirror once under repeated notifications", async () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");
   const link = linkFor(current, { calendarProgressVersion: 1 });
   const state = new FakeState(link);
   const clients = fakeClients(state, [earlier, current], link, masterEvent());
   const sync = new Synchronizer(state, undefined, async () => clients);
-
-  await sync.process({
+  const delivery = {
     id: "calendar-reanchor",
     kind: "calendar",
     profile: PROFILE,
@@ -220,7 +240,10 @@ test("Calendar master re-anchor updates the same Todoist mirror in place for tru
     receivedAt: "2099-09-16T10:00:00Z",
     headers: {},
     body: "",
-  });
+  };
+
+  await sync.process(delivery);
+  await sync.process({ ...delivery, id: "calendar-reanchor-duplicate" });
 
   assert.deepEqual(clients.todoistDeletes, []);
   assert.equal(clients.todoistUpserts.length, 1);
@@ -267,24 +290,7 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
   const clients = fakeClients(state, [completed, successor], link);
   const sync = new Synchronizer(state, undefined, async () => clients);
 
-  await sync.process({
-    id: "complete-day-17",
-    kind: "todoist",
-    profile: PROFILE,
-    mode: "aws",
-    receivedAt: "2099-09-17T12:00:00Z",
-    headers: {},
-    body: JSON.stringify({
-      event_name: "item:completed",
-      event_data: {
-        id: link.taskId,
-        content: completed.summary,
-        description: "",
-        due: { date: completed.start.date },
-        is_completed: true,
-      },
-    }),
-  });
+  await sync.process(completedDelivery("complete-day-17", link.taskId, completed, "2099-09-17T12:00:00Z"));
 
   const boundaryWrite = state.operations.findIndex((operation) => operation.action === "put-link" && operation.link.completedThroughOriginalStart === "2099-09-17");
   const deleteCalendar = state.operations.findIndex((operation) => operation.action === "delete-calendar");
@@ -293,4 +299,27 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
   assert.equal(state.links[0].activeInstanceId, "day-18");
   assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-17");
   assert.equal(state.links[0].calendarProgressVersion, 1);
+});
+
+test("multiple Calendar-owned completions advance the watermark monotonically and stale completion replays cannot roll it back", async () => {
+  const day17 = instance("day-17", "2099-09-17", "2099-09-18");
+  const day18 = instance("day-18", "2099-09-18", "2099-09-19");
+  const day19 = instance("day-19", "2099-09-19", "2099-09-20");
+  const link = linkFor(day17, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [day17, day18, day19], link);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process(completedDelivery("complete-day-17", link.taskId, day17, "2099-09-17T12:00:00Z"));
+  const day18TaskId = state.links[0].taskId;
+  assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-17");
+  assert.equal(state.links[0].activeInstanceId, "day-18");
+
+  await sync.process(completedDelivery("complete-day-18", day18TaskId, day18, "2099-09-18T12:00:00Z"));
+  assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-18");
+  assert.equal(state.links[0].activeInstanceId, "day-19");
+
+  await sync.process(completedDelivery("stale-replay-day-17", link.taskId, day17, "2099-09-19T12:00:00Z"));
+  assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-18");
+  assert.equal(state.links[0].activeInstanceId, "day-19");
 });
