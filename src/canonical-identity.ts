@@ -62,7 +62,8 @@ export function calendarCanonicalIdentity(event: CalendarEvent): CanonicalIdenti
   };
 }
 
-export function todoistCanonicalIdentity(task: TodoistTask): CanonicalIdentity | undefined {
+export function todoistCanonicalIdentity(task: TodoistTask | undefined): CanonicalIdentity | undefined {
+  if (!task) return undefined;
   const title = normalizedText(task.content).toLowerCase();
   const due = task.due;
   const dateTime = due?.datetime || (due?.date?.includes("T") ? due.date : undefined);
