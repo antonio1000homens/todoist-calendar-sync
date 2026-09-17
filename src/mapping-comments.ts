@@ -26,6 +26,8 @@ export interface ProjectMappingCommentPayload {
   activeInstanceId?: string;
   originalStart?: string;
   activeEffectiveStart?: string;
+  calendarProgressVersion?: 1;
+  completedThroughOriginalStart?: string;
   mappingRevision: number;
   updatedAt: string;
 }
@@ -86,6 +88,8 @@ export function serializeMappingComment(
     ...(mapping.activeInstanceId ? { activeInstanceId: mapping.activeInstanceId } : {}),
     ...(mapping.originalStart ? { originalStart: mapping.originalStart } : {}),
     ...(mapping.activeEffectiveStart ? { activeEffectiveStart: mapping.activeEffectiveStart } : {}),
+    ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     mappingRevision: revision,
     updatedAt: mapping.updatedAt || new Date().toISOString(),
   };
@@ -106,7 +110,8 @@ export function parseMappingComment(comment: TodoistCommentRecord): ParsedMappin
     if (!Number.isInteger(value.mappingRevision) || Number(value.mappingRevision) < 1) throw new Error("invalid mappingRevision");
     if (!nonEmptyString(value.updatedAt) || !Number.isFinite(Date.parse(value.updatedAt))) throw new Error("invalid updatedAt");
     if (value.recurrenceOwner !== undefined && !["calendar", "todoist"].includes(value.recurrenceOwner)) throw new Error("invalid recurrenceOwner");
-    for (const field of ["calendarUrl", "seriesId", "masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart"] as const) {
+    if (value.calendarProgressVersion !== undefined && value.calendarProgressVersion !== 1) throw new Error("invalid calendarProgressVersion");
+    for (const field of ["calendarUrl", "seriesId", "masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart", "completedThroughOriginalStart"] as const) {
       if (!optionalString(value[field])) throw new Error(`invalid ${field}`);
     }
     return { comment, payload: value as ProjectMappingCommentPayload };
