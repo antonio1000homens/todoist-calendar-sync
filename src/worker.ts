@@ -7,6 +7,7 @@ import {
   isMutationBudgetExhausted,
   ReconciliationMutationBudget,
 } from "./mutation-budget.js";
+import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
@@ -450,7 +451,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
 
-      await new ProjectAwareSynchronizer(state, scheduleOrphan).process(delivery);
+      await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
 
       if (delivery.kind === "calendar" || delivery.kind === "todoist") {
         const baselineRecovery = delivery.kind === "calendar" && !hadCalendarToken;

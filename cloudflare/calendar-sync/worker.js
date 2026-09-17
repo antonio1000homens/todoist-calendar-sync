@@ -6,18 +6,10 @@ const STATIC_CHANNEL_PROFILES = new Map([
   ["antonio1000homens-nrwindsor", "antonio"],
   ["home1000homens-nrwindsor", "home"],
   ["work1000homens-nrwindsor", "work"],
-  ["antonio1000homens-calendar-sync-v2", "antonio"],
-  ["home1000homens-calendar-sync-v2", "home"],
-  ["work1000homens-calendar-sync-v2", "work"],
 ]);
 
 const V3_CHANNEL = /^(antonio1000homens|home1000homens|work1000homens)-calendar-sync-v3-[^\s/]+$/;
 const V3_PROFILES = { antonio1000homens: "antonio", home1000homens: "home", work1000homens: "work" };
-const LEGACY_ALIASES = {
-  "antonio1000homens-calendar-sync-v2": "antonio1000homens-nrwindsor",
-  "home1000homens-calendar-sync-v2": "home1000homens-nrwindsor",
-  "work1000homens-calendar-sync-v2": "work1000homens-nrwindsor",
-};
 
 export function profileForChannel(channelId) {
   if (!channelId) return undefined;
@@ -25,10 +17,6 @@ export function profileForChannel(channelId) {
   if (staticProfile) return staticProfile;
   const match = channelId.match(V3_CHANNEL);
   return match ? V3_PROFILES[match[1]] : undefined;
-}
-
-export function canonicalChannelId(channelId) {
-  return LEGACY_ALIASES[channelId] || channelId;
 }
 
 function errorResponse(error, status) {
@@ -43,8 +31,6 @@ function forwardedHeaders(request, url, secret) {
   headers.delete("host");
   headers.delete(PROXY_AUTH_HEADER);
   headers.delete("x-worker-verified");
-  const channelId = headers.get("x-goog-channel-id");
-  if (channelId) headers.set("x-goog-channel-id", canonicalChannelId(channelId));
   headers.set("x-forwarded-host", url.host);
   headers.set("x-forwarded-proto", "https");
   headers.set(PROXY_AUTH_HEADER, secret);

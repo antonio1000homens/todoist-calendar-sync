@@ -124,7 +124,7 @@ test("profile lookup GSI is additive and hot paths query it after backfill", () 
   assert.match(repositorySource, /mappingEventLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingOwnerLookupAttributes\(mapping\)/);
-  assert.match(repositorySource, /recurrenceLookupAttributes\(link\)/);
+  assert.match(repositorySource, /recurrenceLookupAttributes\(next\)/);
   assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
   assert.match(reconciliationSource, /readProfileLookup/);
   assert.match(reconciliationSource, /list_reconciliation_mappings_scan_fallback/);
