@@ -1,4 +1,7 @@
 node_modules/
+.terraform/
+*.tfstate
+*.tfstate.*
 dist/
 .aws-sam*/
 .env
