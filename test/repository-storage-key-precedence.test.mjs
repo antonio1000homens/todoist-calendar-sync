@@ -42,7 +42,7 @@ test("mapping index keys remain distinct even when the domain object carries a s
 });
 
 test("recurrence-link storage key also overrides stale pk/sk fields", () => {
-  const putRecurrenceLink = repositorySource.match(/async putRecurrenceLink\(link: RecurrenceLink\): Promise<void>\s*\{[\s\S]*?\n\s*\}/)?.[0] || "";
+  const putRecurrenceLink = repositorySource.match(/async putRecurrenceLink\(link: RecurrenceLink\): Promise<void>[\s\S]*?\n  async getRecurrenceLink/)?.[0] || "";
   assert.match(putRecurrenceLink, /Item:\s*\{\s*\.\.\.next\s*,\s*updatedAt:\s*now\(\)\s*,\s*\.\.\.key\(`RECURRENCE#/);
   assert.match(putRecurrenceLink, /recurrenceLookupAttributes\(next\)/);
 });
