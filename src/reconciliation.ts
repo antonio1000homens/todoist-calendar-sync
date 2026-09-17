@@ -6,6 +6,8 @@ import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { logEvent } from "./observability.js";
+import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 interface TodoistCanonicalState {
@@ -197,18 +199,23 @@ class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async listMappings(profile: Profile): Promise<Mapping[]> {
-    const result = await pacedScan<Mapping>({
-      TableName: this.ensureTable(),
-      FilterExpression: "begins_with(pk, :prefix) AND sk = :map",
-      ExpressionAttributeValues: {
-        ":prefix": `TASK#${profile}#`,
-        ":map": "MAP",
-      },
-    }, {
-      operation: "list_reconciliation_mappings",
+    const table = this.ensureTable();
+    return readProfileLookup<Mapping>({
+      client: documentClient,
+      tableName: table,
       profile,
+      operation: "list_reconciliation_mappings",
+      component: "reconciliation",
+      queryInput: mappingLookupQueryInput(table, profile),
+      fallback: async () => {
+        const result = await pacedScan<Mapping>({
+          TableName: table,
+          FilterExpression: "begins_with(pk, :prefix) AND sk = :map",
+          ExpressionAttributeValues: { ":prefix": `TASK#${profile}#`, ":map": "MAP" },
+        }, { operation: "list_reconciliation_mappings_scan_fallback", profile });
+        return result.items;
+      },
     });
-    return result.items;
   }
 
   async getBaseline(profile: Profile, taskId: string): Promise<ReconciliationBaseline | undefined> {

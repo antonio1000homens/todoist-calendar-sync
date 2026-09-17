@@ -72,14 +72,14 @@ Parameters:
     Description: Maximum mapped/unmapped Todoist candidates processed by one reconciliation chunk.
   ProfileLookupIndexReadCapacity:
     Type: Number
-    Default: 5
+    Default: 10
     MinValue: 1
-    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups.
+    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups; GSI-specific alarms monitor throttling/utilization.
   ProfileLookupIndexWriteCapacity:
     Type: Number
-    Default: 5
+    Default: 10
     MinValue: 1
-    Description: Provisioned write capacity for profile-scoped mapping and recurrence lookups.
+    Description: Provisioned write capacity for profile-scoped lookup rows; one mapping write projects three records into this GSI.
   BillingAlarmEmail:
     Type: String
     Default: ""
@@ -574,6 +574,46 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
+  ProfileLookupIndexReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-read-throttles-${Stage}
+      AlarmDescription: ProfileLookupIndex read capacity has throttled a reconciliation lookup; inspect worker query pacing and index capacity.
+      Namespace: AWS/DynamoDB
+      MetricName: ReadThrottleEvents
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SyncState
+        - Name: GlobalSecondaryIndexName
+          Value: ProfileLookupIndex
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ProfileLookupIndexWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-write-throttles-${Stage}
+      AlarmDescription: ProfileLookupIndex write capacity has throttled state updates; increase the explicit GSI WCU if this is sustained demand.
+      Namespace: AWS/DynamoDB
+      MetricName: WriteThrottleEvents
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SyncState
+        - Name: GlobalSecondaryIndexName
+          Value: ProfileLookupIndex
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
   DynamoDbReadUtilizationAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -644,6 +684,92 @@ Resources:
         - Id: utilization
           Expression: "100 * consumed / (provisioned * 60)"
           Label: DynamoDB write capacity utilization
+          ReturnData: true
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ProfileLookupIndexReadUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-read-utilization-${Stage}
+      AlarmDescription: ProfileLookupIndex read capacity has remained above 80 percent for two minutes.
+      Metrics:
+        - Id: consumed
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ConsumedReadCapacityUnits
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref SyncState
+                - Name: GlobalSecondaryIndexName
+                  Value: ProfileLookupIndex
+            Period: 60
+            Stat: Sum
+          ReturnData: false
+        - Id: provisioned
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ProvisionedReadCapacityUnits
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref SyncState
+                - Name: GlobalSecondaryIndexName
+                  Value: ProfileLookupIndex
+            Period: 60
+            Stat: Average
+          ReturnData: false
+        - Id: utilization
+          Expression: "100 * consumed / (provisioned * 60)"
+          Label: Profile lookup index read capacity utilization
+          ReturnData: true
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ProfileLookupIndexWriteUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-write-utilization-${Stage}
+      AlarmDescription: ProfileLookupIndex write capacity has remained above 80 percent for two minutes.
+      Metrics:
+        - Id: consumed
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ConsumedWriteCapacityUnits
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref SyncState
+                - Name: GlobalSecondaryIndexName
+                  Value: ProfileLookupIndex
+            Period: 60
+            Stat: Sum
+          ReturnData: false
+        - Id: provisioned
+          MetricStat:
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ProvisionedWriteCapacityUnits
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref SyncState
+                - Name: GlobalSecondaryIndexName
+                  Value: ProfileLookupIndex
+            Period: 60
+            Stat: Average
+          ReturnData: false
+        - Id: utilization
+          Expression: "100 * consumed / (provisioned * 60)"
+          Label: Profile lookup index write capacity utilization
           ReturnData: true
       EvaluationPeriods: 2
       DatapointsToAlarm: 2
