@@ -64,7 +64,7 @@ SAM_CLI_MANAGED_SOURCE_BUCKET_NAME=<sam-managed-bucket> \
 bash infrastructure/bootstrap-deployment-role.sh
 ```
 
-The bootstrap now deploys a second small IAM policy stack named `todoist-calendar-sync-github-actions-e2e-access`. It adds only read-only `dynamodb:GetItem` access to the canonical and legacy sync state-table name prefixes. It does not grant mutation access to production state.
+The bootstrap now deploys a second small IAM policy stack named `todoist-calendar-sync-github-actions-e2e-access`. It adds only read-only `dynamodb:GetItem` access to the active sync state-table resource prefix supplied through `RESOURCE_NAME_PREFIX`. It does not grant mutation access to production state.
 
 ## Triggering the test
 
