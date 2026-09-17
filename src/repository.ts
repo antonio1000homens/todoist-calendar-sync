@@ -67,6 +67,16 @@ function conditionalFailure(error: unknown): boolean {
   return (error as { name?: string }).name === "ConditionalCheckFailedException";
 }
 
+function latestOriginalStart(...values: Array<string | undefined>): string | undefined {
+  return values.filter((value): value is string => Boolean(value)).reduce<string | undefined>((latest, value) => {
+    if (!latest) return value;
+    const latestTime = Date.parse(latest);
+    const valueTime = Date.parse(value);
+    if (Number.isFinite(latestTime) && Number.isFinite(valueTime)) return valueTime > latestTime ? value : latest;
+    return value.localeCompare(latest) > 0 ? value : latest;
+  }, undefined);
+}
+
 export class StateRepository {
   private readonly table = tableName;
 
@@ -265,12 +275,7 @@ export class StateRepository {
         UpdateExpression: "SET lastStartedAt = :now, expiresAt = :expiresAt",
         ConditionExpression: "#pending = :true AND generation = :generation",
         ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":generation": generation,
-          ":now": now(),
-          ":expiresAt": ttl(30),
-        },
+        ExpressionAttributeValues: { ":true": true, ":generation": generation, ":now": now(), ":expiresAt": ttl(30) },
       }));
       return true;
     } catch (error) {
@@ -284,16 +289,10 @@ export class StateRepository {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET #pending = :false, lastCompletedAt = :now, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
+        UpdateExpression: "SET #pending = :false, lastCompletedAt = :now, expiresAt = :expiresAt REMOVE lastError",
         ConditionExpression: "#pending = :true AND generation = :generation",
         ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":false": false,
-          ":generation": generation,
-          ":now": now(),
-          ":expiresAt": ttl(30),
-        },
+        ExpressionAttributeValues: { ":false": false, ":true": true, ":generation": generation, ":now": now(), ":expiresAt": ttl(30) },
       }));
     } catch (error) {
       if (!conditionalFailure(error)) throw error;
@@ -375,9 +374,6 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
-      // A newer mapping may have replaced either stale index between owner
-      // inspection and cleanup. Conditional cancellation means there is
-      // nothing safe to delete; leave the newer index untouched.
       if ((error as { name?: string }).name === "TransactionCanceledException") return;
       throw error;
     }
@@ -447,9 +443,28 @@ export class StateRepository {
   }
 
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
+    let next = link;
+    if (link.owner === "calendar") {
+      const existing = await this.getRecurrenceLink(link.profile, link.seriesId);
+      const mapped = await this.getMappingByTask(link.profile, link.taskId);
+      const mappedCalendar = mapped?.recurrenceOwner === "calendar" && mapped.seriesId === link.seriesId ? mapped : undefined;
+      const calendarProgressVersion = link.calendarProgressVersion
+        ?? mappedCalendar?.calendarProgressVersion
+        ?? existing?.calendarProgressVersion;
+      const completedThroughOriginalStart = latestOriginalStart(
+        existing?.completedThroughOriginalStart,
+        mappedCalendar?.completedThroughOriginalStart,
+        link.completedThroughOriginalStart,
+      );
+      next = {
+        ...link,
+        ...(calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+        ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+      };
+    }
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
-      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
+      Item: { ...next, updatedAt: now(), ...key(`RECURRENCE#${next.profile}#${next.seriesId}`), ...recurrenceLookupAttributes(next) },
     }));
   }
 
