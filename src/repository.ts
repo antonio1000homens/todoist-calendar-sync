@@ -67,6 +67,16 @@ function conditionalFailure(error: unknown): boolean {
   return (error as { name?: string }).name === "ConditionalCheckFailedException";
 }
 
+function latestOriginalStart(...values: Array<string | undefined>): string | undefined {
+  return values.filter((value): value is string => Boolean(value)).reduce<string | undefined>((latest, value) => {
+    if (!latest) return value;
+    const latestTime = Date.parse(latest);
+    const valueTime = Date.parse(value);
+    if (Number.isFinite(latestTime) && Number.isFinite(valueTime)) return valueTime > latestTime ? value : latest;
+    return value.localeCompare(latest) > 0 ? value : latest;
+  }, undefined);
+}
+
 export class StateRepository {
   private readonly table = tableName;
 
@@ -447,14 +457,69 @@ export class StateRepository {
   }
 
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
-    await client.send(new PutCommand({
-      TableName: this.ensureTable(),
-      Item: { ...link, updatedAt: now(), ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
-    }));
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      let next = link;
+      let conditionExpression: string | undefined;
+      let expressionAttributeValues: Record<string, unknown> | undefined;
+
+      if (link.owner === "calendar") {
+        const existing = await this.getRecurrenceLink(link.profile, link.seriesId);
+        const mapped = await this.getMappingByTask(link.profile, link.taskId);
+        const mappedCalendar = mapped?.recurrenceOwner === "calendar" && mapped.seriesId === link.seriesId ? mapped : undefined;
+        const calendarProgressVersion = link.calendarProgressVersion
+          ?? mappedCalendar?.calendarProgressVersion
+          ?? existing?.calendarProgressVersion;
+        const completedThroughOriginalStart = latestOriginalStart(
+          existing?.completedThroughOriginalStart,
+          mappedCalendar?.completedThroughOriginalStart,
+          link.completedThroughOriginalStart,
+        );
+        next = {
+          ...link,
+          ...(calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+          ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+        };
+
+        const conditions: string[] = [];
+        const values: Record<string, unknown> = {};
+        if (existing?.completedThroughOriginalStart) {
+          conditions.push("completedThroughOriginalStart = :expectedCompletedThroughOriginalStart");
+          values[":expectedCompletedThroughOriginalStart"] = existing.completedThroughOriginalStart;
+        } else {
+          conditions.push("attribute_not_exists(completedThroughOriginalStart)");
+        }
+        if (existing?.calendarProgressVersion === 1) {
+          conditions.push("calendarProgressVersion = :expectedCalendarProgressVersion");
+          values[":expectedCalendarProgressVersion"] = 1;
+        } else {
+          conditions.push("attribute_not_exists(calendarProgressVersion)");
+        }
+        conditionExpression = conditions.join(" AND ");
+        expressionAttributeValues = Object.keys(values).length ? values : undefined;
+      }
+
+      try {
+        await client.send(new PutCommand({
+          TableName: this.ensureTable(),
+          Item: { ...next, updatedAt: now(), ...key(`RECURRENCE#${next.profile}#${next.seriesId}`), ...recurrenceLookupAttributes(next) },
+          ...(conditionExpression ? { ConditionExpression: conditionExpression } : {}),
+          ...(expressionAttributeValues ? { ExpressionAttributeValues: expressionAttributeValues } : {}),
+        }));
+        return;
+      } catch (error) {
+        if (link.owner === "calendar" && conditionalFailure(error) && attempt < 4) continue;
+        throw error;
+      }
+    }
+    throw new Error(`Unable to persist recurrence progress for ${link.profile}/${link.seriesId} because state changed repeatedly`);
   }
 
   async getRecurrenceLink(profile: Profile, seriesId: string): Promise<RecurrenceLink | undefined> {
-    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`RECURRENCE#${profile}#${seriesId}`) }));
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`RECURRENCE#${profile}#${seriesId}`),
+      ConsistentRead: true,
+    }));
     return result.Item as RecurrenceLink | undefined;
   }
 

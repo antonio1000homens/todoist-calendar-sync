@@ -4,6 +4,7 @@ import {
   buildProjectMappingIndex,
   findProjectMappingComment,
   nextProjectCommentMapping,
+  recoverMappingFromProjectComment,
   upsertProjectMappingComment,
   type ProjectCommentClient,
   type ProjectMappingIndex,
@@ -80,6 +81,17 @@ function exactProjectComments(index: ProjectMappingIndex, mapping: Mapping): Tod
 
 function legacyCommentId(mapping: Mapping): string | undefined {
   return mapping.taskCommentId || (mapping.commentId && mapping.commentId !== mapping.projectCommentId ? mapping.commentId : undefined);
+}
+
+function recurrenceStateChanged(before: Mapping, after: Mapping): boolean {
+  return before.recurrenceOwner !== after.recurrenceOwner
+    || before.seriesId !== after.seriesId
+    || before.masterEventId !== after.masterEventId
+    || before.activeInstanceId !== after.activeInstanceId
+    || before.originalStart !== after.originalStart
+    || before.activeEffectiveStart !== after.activeEffectiveStart
+    || before.calendarProgressVersion !== after.calendarProgressVersion
+    || before.completedThroughOriginalStart !== after.completedThroughOriginalStart;
 }
 
 async function findLegacyComment(
@@ -170,14 +182,16 @@ export async function migrateProjectComments(
         // comment GET merely to discover optional migration metadata.
         const explicitLegacyId = legacyCommentId(mapping);
         if (explicitLegacyId) summary.legacyTaskCommentsFound += 1;
+        const recovered = recoverMappingFromProjectComment(mapping, projectEntry);
         if (apply && (
           mapping.projectCommentId !== projectEntry.comment.id
           || mapping.commentId !== undefined
           || mapping.mappingRevision !== projectEntry.payload.mappingRevision
+          || recurrenceStateChanged(mapping, recovered)
         )) {
           const normalized = nextProjectCommentMapping(
             {
-              ...mapping,
+              ...recovered,
               ...(explicitLegacyId ? { taskCommentId: explicitLegacyId } : {}),
             },
             projectId,

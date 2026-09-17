@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --import ./test/setup-env.mjs --test test/**/*.test.mjs",
+    "e2e:production": "npm run build --silent && node scripts/production-e2e.mjs",
     "migrate:project-comments": "npm run build --silent && node scripts/project-comment-migration.mjs",
     "migrate:profile-lookup-index": "npm run build --silent && node scripts/backfill-profile-lookup-index.mjs",
     "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",
@@ -16,7 +17,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.965.0",
-    "@aws-sdk/client-sqs": "^3.965.0",
+    "@aws-sdk/client-sqs": "^3.1131.0",
     "@aws-sdk/client-ssm": "^3.965.0",
     "@aws-sdk/lib-dynamodb": "^3.965.0"
   },
