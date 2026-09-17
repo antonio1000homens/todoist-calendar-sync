@@ -19,11 +19,11 @@
     "@aws-sdk/client-dynamodb": "^3.965.0",
     "@aws-sdk/client-sqs": "^3.1131.0",
     "@aws-sdk/client-ssm": "^3.965.0",
-    "@aws-sdk/lib-dynamodb": "^3.965.0"
+    "@aws-sdk/lib-dynamodb": "^3.1131.0"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.162",
-    "@types/node": "^22.15.3",
+    "@types/node": "^26.5.1",
     "esbuild": "^0.25.12",
     "typescript": "^5.8.3",
     "wrangler": "^4.35.0"
