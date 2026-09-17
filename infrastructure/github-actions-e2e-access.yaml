@@ -8,9 +8,6 @@ Parameters:
   ResourceNamePrefix:
     Type: String
     Default: todoist-calendar-sync
-  LegacyResourceNamePrefix:
-    Type: String
-    Default: gcp-app2-sync
 
 Resources:
   ProductionE2eStateReadPolicy:
@@ -28,4 +25,3 @@ Resources:
               - dynamodb:GetItem
             Resource:
               - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
-              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LegacyResourceNamePrefix}-state-*
