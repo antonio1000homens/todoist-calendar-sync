@@ -102,7 +102,7 @@ export async function reconcileUnmappedCalendar(
   mutationBudget = new ReconciliationMutationBudget(MAX_PROVIDER_MUTATIONS),
   continuation?: ReconciliationContinuation,
   maxCandidates = candidateLimit(),
-  identities: CanonicalIdentityRepository = new CanonicalIdentityStore(),
+  identities: CanonicalIdentityRepository | undefined = state instanceof StateRepository ? new CanonicalIdentityStore() : undefined,
 ): Promise<CalendarRecoverySummary> {
   if (continuation && continuation.phase !== "calendar") {
     throw new Error(`Calendar recovery cannot resume continuation phase ${continuation.phase}`);
@@ -189,6 +189,7 @@ export async function reconcileUnmappedCalendar(
   };
 
   const rememberStandaloneIdentity = async (event: CalendarEvent, task: TodoistTask): Promise<void> => {
+    if (!identities) return;
     const eventIdentity = calendarCanonicalIdentity(event);
     const taskIdentity = todoistCanonicalIdentity(task);
     if (eventIdentity) await identities.put(profile, "calendar", event.id, eventIdentity);
@@ -212,7 +213,7 @@ export async function reconcileUnmappedCalendar(
     let recoveredPreviousIdentity = false;
     const currentIdentity = calendarCanonicalIdentity(event);
 
-    if (!task && currentIdentity) {
+    if (!task && currentIdentity && identities) {
       const previousIdentity = (await identities.get(profile, "calendar", event.id))?.identity;
       if (previousIdentity && !sameCanonicalIdentity(previousIdentity, currentIdentity)) {
         const historical = await findIdentityTask(previousIdentity);
