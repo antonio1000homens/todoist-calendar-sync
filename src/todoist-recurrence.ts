@@ -53,14 +53,19 @@ export function todoistRecurrenceKey(task: TodoistTask): string | undefined {
  * Translate only recurrence expressions that have an unambiguous RFC5545
  * equivalent. Todoist completion-relative `every!` rules and richer natural
  * language expressions deliberately fall back to the rolling projection.
- * A trailing `at ...` is safe to ignore here because DTSTART carries the
- * authoritative occurrence time and timezone.
+ * A trailing time is safe to ignore here because DTSTART carries the
+ * authoritative occurrence time and timezone. Todoist may expose timed
+ * recurrence strings either as `every day at 9am` or as the normalized API
+ * form `every week 09:30`.
  */
 export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined {
   const key = todoistRecurrenceKey(task);
   if (!key || key.includes("every!")) return undefined;
   if (/\b(until|starting|ending)\b/.test(key)) return undefined;
-  const value = key.replace(/\s+at\s+.+$/, "").trim();
+  const value = key
+    .replace(/\s+at\s+.+$/, "")
+    .replace(/\s+(?:(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[ap]m)?|(?:0?[1-9]|1[0-2])\s*[ap]m)$/i, "")
+    .trim();
 
   if (value === "every day" || value === "daily") return "RRULE:FREQ=DAILY";
   if (value === "every weekday" || value === "every workday" || value === "weekdays") {

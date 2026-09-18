@@ -172,6 +172,27 @@ test("translates common interval, weekday and timed recurrence phrases", () => {
   assert.equal(todoistRecurrenceToRrule({ id: "a", content: "A", due: { date: "2026-09-01", string: "every 2 weeks", is_recurring: true } }), "RRULE:FREQ=WEEKLY;INTERVAL=2");
   assert.equal(todoistRecurrenceToRrule({ id: "b", content: "B", due: { date: "2026-09-01", string: "every monday and friday", is_recurring: true } }), "RRULE:FREQ=WEEKLY;BYDAY=MO,FR");
   assert.equal(todoistRecurrenceToRrule({ id: "c", content: "C", due: { datetime: "2026-09-01T09:00:00+01:00", timezone: "Europe/London", string: "every day at 9am", is_recurring: true } }), "RRULE:FREQ=DAILY");
+  assert.equal(todoistRecurrenceToRrule({ id: "d", content: "D", due: { datetime: "2026-09-19T09:30:00+01:00", timezone: "Europe/London", string: "every week 09:30", is_recurring: true } }), "RRULE:FREQ=WEEKLY");
+  assert.equal(todoistRecurrenceToRrule({ id: "e", content: "E", due: { datetime: "2026-09-19T09:30:00+01:00", timezone: "Europe/London", string: "every saturday 09:30", is_recurring: true } }), "RRULE:FREQ=WEEKLY;BYDAY=SA");
+  assert.equal(todoistRecurrenceToRrule({ id: "f", content: "F", due: { datetime: "2026-09-19T09:30:00+01:00", timezone: "Europe/London", string: "every 2 weeks 09:30", is_recurring: true } }), "RRULE:FREQ=WEEKLY;INTERVAL=2");
+});
+
+test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {
+  const task = {
+    id: "trampoline",
+    content: "trampoline",
+    due: {
+      datetime: "2026-09-19T09:30:00+01:00",
+      timezone: "Europe/London",
+      string: "every week 09:30",
+      is_recurring: true,
+    },
+  };
+  const event = toCalendarEvent(task);
+  assert.deepEqual(event.recurrence, ["RRULE:FREQ=WEEKLY"]);
+  assert.deepEqual(event.start, { dateTime: "2026-09-19T09:30:00+01:00", timeZone: "Europe/London" });
+  assert.equal(event.extendedProperties.shared.syncRecurrenceOwner, "todoist");
+  assert.equal(event.extendedProperties.shared.todoistRecurrence, "every week 09:30");
 });
 
 test("validates Todoist HMAC over the exact raw body", () => {
