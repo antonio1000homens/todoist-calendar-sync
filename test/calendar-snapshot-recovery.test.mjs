@@ -17,15 +17,18 @@ function futureEvent(id, day, summary = `Event ${id}`) {
 
 function fakeState() {
   const mappings = [];
+  const completedProjections = [];
   const audits = [];
   let mutations = 0;
   return {
     mappings,
+    completedProjections,
     audits,
     get mutations() { return mutations; },
     async mutationAllowed() { return true; },
     async getMappingByEvent(profile, eventId) { return mappings.find((mapping) => mapping.profile === profile && mapping.eventId === eventId); },
     async getMappingByTaskAnyProfile(taskId) { return mappings.find((mapping) => mapping.taskId === taskId); },
+    async getCompletedCalendarProjectionByEvent(profile, eventId) { return completedProjections.find((item) => item.profile === profile && item.eventId === eventId); },
     async getRecurrenceLink() { return undefined; },
     async putMapping(mapping) { mappings.push(mapping); },
     async putRecurrenceLink() {},
@@ -80,6 +83,28 @@ test("snapshot recovery imports one future unmapped Calendar event and binds it"
   assert.equal(state.mappings[0].eventId, "calendar-1");
   assert.equal(state.mappings[0].taskId, "created-1");
   assert.equal(state.mutations, 2);
+});
+
+test("snapshot recovery ignores a retained completed Calendar projection", async () => {
+  const event = futureEvent("calendar-completed", 10, "Completed appointment");
+  const state = fakeState();
+  state.completedProjections.push({
+    profile: "home",
+    taskId: "completed-task",
+    eventId: event.id,
+    completedAt: "2099-01-10T12:00:00Z",
+  });
+  const clients = fakeClients([event]);
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.skipped, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(summary.rebound, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(clients.comments, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_snapshot_completed_projection_ignored"));
 });
 
 test("snapshot recovery treats multiple canonical Todoist matches as a conflict without mutation", async () => {
