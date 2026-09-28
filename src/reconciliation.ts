@@ -270,6 +270,11 @@ export class SnapshotReconciler {
     };
   }
 
+  private async completedProjection(profile: Profile, eventId: string) {
+    const state = this.state as unknown as Partial<Pick<StateRepository, "getCompletedCalendarProjectionByEvent">>;
+    return state.getCompletedCalendarProjectionByEvent?.(profile, eventId);
+  }
+
   private async repair(delivery: Delivery): Promise<void> {
     if (this.repairCurrentState) return this.repairCurrentState(delivery);
     return new ProjectAwareSynchronizer(this.state).process(delivery);
@@ -448,7 +453,7 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
-    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(profile, mapping.eventId);
+    const completedProjection = await this.completedProjection(profile, mapping.eventId);
     if (completedProjection?.taskId === mapping.taskId) {
       await this.state.deleteMapping(mapping);
       await this.store.deleteBaseline(profile, mapping.taskId);
