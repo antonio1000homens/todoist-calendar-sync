@@ -312,6 +312,17 @@ export class ProjectAwareSynchronizer {
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!lifecycle) return;
 
+    // Completion is terminal for synchronization. Preserve the projection in
+    // the profile that currently owns it rather than interpreting a concurrent
+    // project move as a reason to delete Calendar history.
+    if (lifecycle.action === "complete_projection" && mapping?.profile) {
+      return this.delegate.process({
+        ...delivery,
+        profile: mapping.profile,
+        body: JSON.stringify(payload),
+      });
+    }
+
     const oldProjectId = rawPayload.event_data_extra?.old_item?.project_id;
     const transition = todoistProjectTransition(oldProjectId, task.project_id, mapping?.profile);
     const explicitProjectChange = Boolean(oldProjectId && oldProjectId !== task.project_id);
