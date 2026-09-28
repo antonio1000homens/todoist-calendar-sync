@@ -398,13 +398,13 @@ test("stale Calendar cancellation after Calendar-owned rollover cannot advance t
   assert.deepEqual(clients.todoistDeletes, []);
   assert.equal(clients.todoistUpserts.length, 1);
   assert.equal(tasks.has(day2TaskId), true);
-  const staleCancellationAudit = state.audits.find(
-    (entry) => entry.action === "calendar_recurrence_stale_instance_cancellation_ignored",
+  const retainedCancellationAudit = state.audits.find(
+    (entry) => entry.action === "calendar_completed_projection_ignored",
   );
-  assert.deepEqual(staleCancellationAudit?.detail, {
-    seriesId: SERIES,
+  assert.deepEqual(retainedCancellationAudit?.detail, {
     eventId: day1.id,
-    activeInstanceId: day2.id,
+    taskId: task.id,
+    completedAt: "2099-01-01T12:00:00Z",
   });
 });
 
