@@ -12,7 +12,7 @@ import {
   todoistRecurrenceKey,
   todoistRecurrenceToRrule,
 } from "./todoist-recurrence.js";
-import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
+import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 function taskDateTime(task: TodoistTask): string | undefined {
   const due = task.due;
@@ -305,7 +305,7 @@ export function hasCanonicalState(event: CalendarEvent, task: TodoistTask): bool
   return startsMatch(event, task);
 }
 
-type TodoistCalendarAction = "upsert" | "delete_projection" | "skip";
+type TodoistCalendarAction = "upsert" | "delete_projection" | "complete_projection" | "skip";
 
 export interface TodoistCalendarLifecycle {
   action: TodoistCalendarAction;
@@ -325,7 +325,7 @@ export function todoistCalendarLifecycle(payload: TodoistWebhookPayload): Todois
   const dueRemoved = hadDue && !oldTask?.due?.is_recurring && !hasDue;
   const dueAdded = !hadDue && hasDue;
   if (explicitlyDeleted) return { action: "delete_projection", reason: "deleted", dueAdded: false };
-  if (completed) return { action: "delete_projection", reason: "completed", dueAdded: false };
+  if (completed) return { action: "complete_projection", reason: "completed", dueAdded: false };
   if (dueRemoved) return { action: "delete_projection", reason: "due_removed", dueAdded: false };
   if (!hasDue) return { action: "skip", reason: "undated", dueAdded: false };
   return { action: "upsert", reason: "eligible", dueAdded };
@@ -381,6 +381,24 @@ function recurrenceMapping(link: RecurrenceLink): Mapping {
     ...(link.owner === "calendar" && link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(link.owner === "calendar" && link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
+  };
+}
+
+function completedCalendarProjection(
+  mapping: Mapping,
+  completedAt: string,
+  eventId = mapping.eventId,
+  originalStart = mapping.originalStart,
+): CompletedCalendarProjection {
+  return {
+    profile: mapping.profile,
+    taskId: mapping.taskId,
+    eventId,
+    completedAt,
+    recurrenceOwner: mapping.recurrenceOwner,
+    seriesId: mapping.seriesId,
+    masterEventId: mapping.masterEventId,
+    originalStart,
   };
 }
 
@@ -520,6 +538,14 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, todoist: Todoist): Promise<void> {
+    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, event.id);
+    if (completedProjection) {
+      return this.state.audit(delivery.profile, "calendar_completed_projection_ignored", {
+        eventId: event.id,
+        taskId: completedProjection.taskId,
+        completedAt: completedProjection.completedAt,
+      });
+    }
     let mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
     let parentMapping = event.recurringEventId
       ? await this.state.getMappingByEvent(delivery.profile, event.recurringEventId)
@@ -818,6 +844,29 @@ export class Synchronizer {
     await this.state.putRecurrenceLink(recurrenceLink(mapping, "calendar"));
     await this.state.recordMutation(delivery.profile);
     return this.state.audit(delivery.profile, task ? "calendar_recurrence_updated_task" : "calendar_recurrence_created_task", { seriesId, eventId: active.id, taskId: nextTask.id });
+  }
+
+  private async deleteCompletedCalendarHistory(
+    profile: Profile,
+    taskId: string,
+    calendar: GoogleCalendar,
+    coveredByDeletedEventId?: string,
+  ): Promise<number> {
+    const completed = await this.state.listCompletedCalendarProjectionsByTask(profile, taskId);
+    let removed = 0;
+    for (const projection of completed) {
+      const covered = projection.eventId === coveredByDeletedEventId
+        || projection.masterEventId === coveredByDeletedEventId;
+      if (!covered) {
+        await calendar.deleteEvent(projection.eventId).catch((error: unknown) => {
+          if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+        });
+        await this.state.recordMutation(profile);
+      }
+      await this.state.deleteCompletedCalendarProjection(projection);
+      removed += 1;
+    }
+    return removed;
   }
 
   private async processTodoist(delivery: Delivery): Promise<void> {
