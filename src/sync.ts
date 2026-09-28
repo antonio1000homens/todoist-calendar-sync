@@ -889,8 +889,10 @@ export class Synchronizer {
     const completed = await this.listCompletedProjections(profile, taskId);
     let removed = 0;
     for (const projection of completed) {
-      const covered = projection.eventId === coveredByDeletedEventId
-        || projection.masterEventId === coveredByDeletedEventId;
+      const covered = Boolean(coveredByDeletedEventId && (
+        projection.eventId === coveredByDeletedEventId
+        || projection.masterEventId === coveredByDeletedEventId
+      ));
       if (!covered) {
         await calendar.deleteEvent(projection.eventId).catch((error: unknown) => {
           if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
