@@ -86,6 +86,15 @@ function originalStart(event: CalendarEvent): string | undefined {
     || event.start?.date;
 }
 
+async function completedProjection(
+  state: StateRepository,
+  profile: Profile,
+  eventId: string,
+) {
+  const completionState = state as unknown as Partial<Pick<StateRepository, "getCompletedCalendarProjectionByEvent">>;
+  return completionState.getCompletedCalendarProjectionByEvent?.(profile, eventId);
+}
+
 /**
  * Snapshot-style Calendar recovery independent of the incremental sync token.
  * listDelta(undefined) is used only as a read-only full listing here; its
@@ -199,13 +208,13 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
-    const completedProjection = await state.getCompletedCalendarProjectionByEvent(profile, event.id);
-    if (completedProjection) {
+    const completed = await completedProjection(state, profile, event.id);
+    if (completed) {
       summary.skipped += 1;
       await state.audit(profile, "calendar_snapshot_completed_projection_ignored", {
         eventId: event.id,
-        taskId: completedProjection.taskId,
-        completedAt: completedProjection.completedAt,
+        taskId: completed.taskId,
+        completedAt: completed.completedAt,
       });
       return;
     }
