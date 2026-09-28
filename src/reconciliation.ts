@@ -57,7 +57,8 @@ type ReconcileOutcome =
   | "created"
   | "blocked"
   | "conflict"
-  | "recurring_deferred";
+  | "recurring_deferred"
+  | "completed_retained";
 
 export interface SnapshotReconciliationResult {
   continuation?: ReconciliationContinuation;
@@ -189,6 +190,7 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
     blocked: 0,
     conflict: 0,
     recurring_deferred: 0,
+    completed_retained: 0,
   };
 }
 
@@ -446,6 +448,17 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(profile, mapping.eventId);
+    if (completedProjection?.taskId === mapping.taskId) {
+      await this.state.deleteMapping(mapping);
+      await this.store.deleteBaseline(profile, mapping.taskId);
+      await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
+        taskId: mapping.taskId,
+        eventId: mapping.eventId,
+        completedAt: completedProjection.completedAt,
+      });
+      return "completed_retained";
+    }
     if (mapping.recurrenceOwner) return "recurring_deferred";
 
     const task = listedTask || await this.currentTask(clients.todoist, mapping.taskId);
