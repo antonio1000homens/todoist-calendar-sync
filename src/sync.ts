@@ -437,6 +437,40 @@ export class Synchronizer {
     };
   }
 
+  private completedState(): Partial<Pick<StateRepository,
+    "getCompletedCalendarProjectionByEvent"
+    | "listCompletedCalendarProjectionsByTask"
+    | "putCompletedCalendarProjection"
+    | "deleteCompletedCalendarProjection"
+  >> {
+    // Several focused unit tests use lightweight state doubles. Keeping the
+    // adapter tolerant lets those doubles opt into the new completed state only
+    // when the behavior under test needs it, while production always supplies
+    // the full StateRepository implementation.
+    return this.state as unknown as Partial<Pick<StateRepository,
+      "getCompletedCalendarProjectionByEvent"
+      | "listCompletedCalendarProjectionsByTask"
+      | "putCompletedCalendarProjection"
+      | "deleteCompletedCalendarProjection"
+    >>;
+  }
+
+  private async getCompletedProjection(profile: Profile, eventId: string): Promise<CompletedCalendarProjection | undefined> {
+    return this.completedState().getCompletedCalendarProjectionByEvent?.(profile, eventId);
+  }
+
+  private async listCompletedProjections(profile: Profile, taskId: string): Promise<CompletedCalendarProjection[]> {
+    return await this.completedState().listCompletedCalendarProjectionsByTask?.(profile, taskId) || [];
+  }
+
+  private async putCompletedProjection(projection: CompletedCalendarProjection): Promise<void> {
+    await this.completedState().putCompletedCalendarProjection?.(projection);
+  }
+
+  private async deleteCompletedProjection(projection: CompletedCalendarProjection): Promise<void> {
+    await this.completedState().deleteCompletedCalendarProjection?.(projection);
+  }
+
   private async bindTodoistOwnedOccurrence(
     profile: Profile,
     mapping: Mapping,
@@ -538,7 +572,7 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, todoist: Todoist): Promise<void> {
-    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, event.id);
+    const completedProjection = await this.getCompletedProjection(delivery.profile, event.id);
     if (completedProjection) {
       return this.state.audit(delivery.profile, "calendar_completed_projection_ignored", {
         eventId: event.id,
@@ -852,7 +886,7 @@ export class Synchronizer {
     calendar: GoogleCalendar,
     coveredByDeletedEventId?: string,
   ): Promise<number> {
-    const completed = await this.state.listCompletedCalendarProjectionsByTask(profile, taskId);
+    const completed = await this.listCompletedProjections(profile, taskId);
     let removed = 0;
     for (const projection of completed) {
       const covered = projection.eventId === coveredByDeletedEventId
@@ -863,7 +897,7 @@ export class Synchronizer {
         });
         await this.state.recordMutation(profile);
       }
-      await this.state.deleteCompletedCalendarProjection(projection);
+      await this.deleteCompletedProjection(projection);
       removed += 1;
     }
     return removed;
@@ -915,7 +949,7 @@ export class Synchronizer {
       if (progressMapping.seriesId) await this.state.putRecurrenceLink(recurrenceLink(progressMapping, "calendar"));
 
       const retained = completedCalendarProjection(progressMapping, delivery.receivedAt);
-      await this.state.putCompletedCalendarProjection(retained);
+      await this.putCompletedProjection(retained);
       await this.state.audit(delivery.profile, "calendar_recurrence_completed_occurrence_retained", {
         seriesId: mapping.seriesId,
         taskId: task.id,
@@ -995,7 +1029,7 @@ export class Synchronizer {
             completedEventId,
             completed ? eventStart(completed) : mapping.originalStart,
           );
-          await this.state.putCompletedCalendarProjection(retained);
+          await this.putCompletedProjection(retained);
           await this.state.audit(delivery.profile, "todoist_recurrence_completed_occurrence_retained", {
             taskId: task.id,
             masterEventId: mappedEvent.id,
@@ -1022,7 +1056,7 @@ export class Synchronizer {
       }
 
       const retained = completedCalendarProjection(mapping, delivery.receivedAt);
-      await this.state.putCompletedCalendarProjection(retained);
+      await this.putCompletedProjection(retained);
       await this.state.audit(delivery.profile, "todoist_recurrence_completed_calendar_retained", {
         taskId: task.id,
         eventId: mapping.eventId,
@@ -1061,14 +1095,14 @@ export class Synchronizer {
         return this.state.audit(delivery.profile, "todoist_completion_retention_suppressed", { taskId: task.id, mode: delivery.mode });
       }
       if (!mapping) {
-        const retained = await this.state.listCompletedCalendarProjectionsByTask(delivery.profile, task.id);
+        const retained = await this.listCompletedProjections(delivery.profile, task.id);
         return this.state.audit(delivery.profile, retained.length ? "todoist_completed_calendar_already_retained" : "todoist_completed_calendar_missing_mapping", {
           taskId: task.id,
           retainedEventIds: retained.map((projection) => projection.eventId),
         });
       }
       const retained = completedCalendarProjection(mapping, delivery.receivedAt);
-      await this.state.putCompletedCalendarProjection(retained);
+      await this.putCompletedProjection(retained);
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
       return this.state.audit(delivery.profile, "todoist_completed_calendar_retained", {
@@ -1100,7 +1134,7 @@ export class Synchronizer {
     if (!mapping) {
       const linkedEvent = await calendar.findByTodoistTaskId(task.id);
       const retainedLinkedEvent = linkedEvent
-        ? await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, linkedEvent.id)
+        ? await this.getCompletedProjection(delivery.profile, linkedEvent.id)
         : undefined;
       if (linkedEvent?.status === "cancelled") {
         cancelledCalendarLink = true;
@@ -1223,8 +1257,8 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
-      const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, existingEvent.id);
-      if (completedProjection?.taskId === task.id) await this.state.deleteCompletedCalendarProjection(completedProjection);
+      const completedProjection = await this.getCompletedProjection(delivery.profile, existingEvent.id);
+      if (completedProjection?.taskId === task.id) await this.deleteCompletedProjection(completedProjection);
       return this.state.audit(delivery.profile, "todoist_noop_canonical_state", { taskId: task.id, eventId: existingEvent.id });
     }
     const event = toCalendarEvent(task, existingEvent, !recurringDateEdit);
@@ -1258,8 +1292,8 @@ export class Synchronizer {
     await this.state.putMapping(nextMapping);
     if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
     else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
-    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, stored.id);
-    if (completedProjection?.taskId === task.id) await this.state.deleteCompletedCalendarProjection(completedProjection);
+    const completedProjection = await this.getCompletedProjection(delivery.profile, stored.id);
+    if (completedProjection?.taskId === task.id) await this.deleteCompletedProjection(completedProjection);
     if (projectionTombstone) await this.state.deleteCalendarProjectionTombstone(delivery.profile, task.id);
     await this.state.recordRecurrence(delivery.profile, stored.id, stored.recurrence);
     await this.state.recordMutation(delivery.profile);
@@ -1275,7 +1309,7 @@ export class Synchronizer {
   private async processOrphan(delivery: Delivery): Promise<void> {
     const orphan = delivery.orphan;
     if (!orphan) return;
-    const completedProjection = await this.state.getCompletedCalendarProjectionByEvent(delivery.profile, orphan.eventId);
+    const completedProjection = await this.getCompletedProjection(delivery.profile, orphan.eventId);
     if (completedProjection) {
       return this.state.audit(delivery.profile, "orphan_completed_projection_retained", { ...orphan, completedAt: completedProjection.completedAt });
     }
