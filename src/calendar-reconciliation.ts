@@ -199,6 +199,16 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
+    const completedProjection = await state.getCompletedCalendarProjectionByEvent(profile, event.id);
+    if (completedProjection) {
+      summary.skipped += 1;
+      await state.audit(profile, "calendar_snapshot_completed_projection_ignored", {
+        eventId: event.id,
+        taskId: completedProjection.taskId,
+        completedAt: completedProjection.completedAt,
+      });
+      return;
+    }
     if (await state.getMappingByEvent(profile, event.id)) {
       summary.skipped += 1;
       return;
