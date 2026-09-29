@@ -459,6 +459,18 @@ export class Synchronizer {
     return this.completedState().getCompletedCalendarProjectionByEvent?.(profile, eventId);
   }
 
+  private async calendarMutationBlockedByCompletion(delivery: Delivery, eventId: string): Promise<boolean> {
+    const completedProjection = await this.getCompletedProjection(delivery.profile, eventId);
+    if (!completedProjection) return false;
+    await this.state.audit(delivery.profile, "calendar_completed_projection_ignored", {
+      eventId,
+      taskId: completedProjection.taskId,
+      completedAt: completedProjection.completedAt,
+      recheckedBeforeMutation: true,
+    });
+    return true;
+  }
+
   private async listCompletedProjections(profile: Profile, taskId: string): Promise<CompletedCalendarProjection[]> {
     return await this.completedState().listCompletedCalendarProjectionsByTask?.(profile, taskId) || [];
   }
@@ -628,6 +640,7 @@ export class Synchronizer {
         if (!next) {
           return this.state.audit(delivery.profile, "todoist_recurrence_calendar_active_instance_deleted_no_next", { eventId: event.id, taskId: task.id });
         }
+        if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
         const result = await this.bindTodoistOwnedOccurrence(delivery.profile, parentMapping, task, next, todoist);
         return this.state.audit(delivery.profile, "todoist_recurrence_calendar_active_instance_deleted_skipped", {
           taskId: task.id,
@@ -637,6 +650,7 @@ export class Synchronizer {
           nextEffectiveStart: result.mapping.activeEffectiveStart,
         });
       }
+      if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
       const result = await this.bindTodoistOwnedOccurrence(delivery.profile, parentMapping, task, event, todoist);
       return this.state.audit(
         delivery.profile,
@@ -681,6 +695,7 @@ export class Synchronizer {
         if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
           return this.state.audit(delivery.profile, "calendar_recurrence_delete_suppressed", { seriesId: series, mode: delivery.mode });
         }
+        if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
         const oldMapping = recurrenceMapping(existingRecurrence);
         await this.state.deleteMapping(oldMapping);
         await todoist.deleteTask(existingRecurrence.taskId).catch((error: unknown) => {
@@ -716,6 +731,7 @@ export class Synchronizer {
       }
       if (!mapping) return;
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) return this.state.audit(delivery.profile, "calendar_delete_suppressed", { eventId: event.id, mode: delivery.mode });
+      if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
       try {
         await todoist.deleteTask(mapping.taskId);
       } catch (error) {
@@ -741,6 +757,7 @@ export class Synchronizer {
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "calendar_mutation_suppressed", { eventId: event.id, taskId: task?.id, mode: delivery.mode });
     }
+    if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
     if (task && hasCanonicalState(event, task)) {
       const nextMapping: Mapping = {
         profile: delivery.profile,
@@ -847,6 +864,7 @@ export class Synchronizer {
     if (task && existing?.activeInstanceId === active.id && hasCanonicalState(active, task)) {
       return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
     }
+    if (await this.calendarMutationBlockedByCompletion(delivery, active.id)) return;
     if (existing?.taskId && (!task || existing.activeInstanceId !== active.id)) {
       await this.state.deleteMapping(recurrenceMapping(existing));
       if (existing.activeInstanceId !== active.id && !progressAware) {
@@ -1016,32 +1034,40 @@ export class Synchronizer {
 
       if (current?.due?.is_recurring && todoistRecurrenceToRrule(current) && mappedEvent?.recurrence?.length) {
         const instances = await calendar.listInstances(mappedEvent.id);
-        let completed = mapping.activeInstanceId
-          ? instances.find((instance) => instance.id === mapping!.activeInstanceId)
-          : undefined;
+        const completedTask = payload.event_data_extra?.old_item || task;
+        const completed = selectTodoistCurrentInstance(instances, completedTask);
         if (!completed) {
-          const previousTask = payload.event_data_extra?.old_item || task;
-          completed = selectTodoistCurrentInstance(instances, previousTask);
-        }
-        const completedEventId = completed?.id || mapping.activeInstanceId;
-        if (completedEventId) {
-          const retained = completedCalendarProjection(
-            mapping,
-            delivery.receivedAt,
-            completedEventId,
-            completed ? eventStart(completed) : mapping.originalStart,
-          );
-          await this.putCompletedProjection(retained);
-          await this.state.audit(delivery.profile, "todoist_recurrence_completed_occurrence_retained", {
+          return this.state.audit(delivery.profile, "todoist_recurrence_completion_occurrence_unresolved", {
             taskId: task.id,
             masterEventId: mappedEvent.id,
-            eventId: completedEventId,
+            webhookDue: completedTask.due?.datetime || completedTask.due?.date,
           });
         }
+        const existingCompletion = await this.getCompletedProjection(delivery.profile, completed.id);
+        if (existingCompletion?.taskId === task.id) {
+          return this.state.audit(delivery.profile, "todoist_recurrence_duplicate_completion_ignored", {
+            taskId: task.id,
+            masterEventId: mappedEvent.id,
+            eventId: completed.id,
+            completedAt: existingCompletion.completedAt,
+          });
+        }
+        const retained = completedCalendarProjection(
+          mapping,
+          delivery.receivedAt,
+          completed.id,
+          eventStart(completed),
+        );
+        await this.putCompletedProjection(retained);
+        await this.state.audit(delivery.profile, "todoist_recurrence_completed_occurrence_retained", {
+          taskId: task.id,
+          masterEventId: mappedEvent.id,
+          eventId: completed.id,
+        });
         const next = selectNextEffectiveTodoistInstance(
           instances,
-          completed?.id || mapping.activeInstanceId,
-          mapping.activeEffectiveStart || (completed ? eventEffectiveStart(completed) : undefined) || mapping.originalStart,
+          completed.id,
+          eventEffectiveStart(completed) || eventStart(completed),
         );
         if (!next) {
           return this.state.audit(delivery.profile, "todoist_recurrence_completed_calendar_series_no_next", { taskId: task.id, eventId: mappedEvent.id });
@@ -1050,7 +1076,7 @@ export class Synchronizer {
         return this.state.audit(delivery.profile, "todoist_recurrence_completed_advanced_to_effective_instance", {
           taskId: task.id,
           masterEventId: mappedEvent.id,
-          completedEventId: completed?.id || mapping.activeInstanceId,
+          completedEventId: completed.id,
           nextEventId: next.id,
           nextOriginalStart: result.mapping.originalStart,
           nextEffectiveStart: result.mapping.activeEffectiveStart,
