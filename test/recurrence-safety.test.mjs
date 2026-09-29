@@ -497,6 +497,21 @@ test("Todoist recurring completion advances the same task to the next effective 
   assert.equal(state.links[0].originalStart, "2026-09-07");
   assert.equal(state.links[0].activeEffectiveStart, "2026-09-07");
   assert.equal(state.audits.at(-1).action, "todoist_recurrence_completed_advanced_to_effective_instance");
+
+  await sync.process({
+    id: "todoist-complete-replay",
+    kind: "todoist",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt: "2026-09-06T10:00:01Z",
+    headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: initialTask, event_data_extra: { old_item: initialTask } }),
+  });
+
+  assert.equal(state.completedProjections.length, 1);
+  assert.equal(state.links[0].activeInstanceId, "instance-7");
+  assert.equal(state.links[0].originalStart, "2026-09-07");
+  assert.equal(state.audits.at(-1).action, "todoist_recurrence_duplicate_completion_ignored");
 });
 
 test("rolling Todoist recurrence retains the completed Calendar event and binds a fresh successor", async () => {
