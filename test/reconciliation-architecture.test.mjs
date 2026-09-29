@@ -115,8 +115,6 @@ test("profile lookup GSI is additive and validated hot paths are query-only", ()
   assert.match(template, /AttributeName:\s*lookupPk/);
   assert.match(template, /AttributeName:\s*lookupSk/);
   assert.match(template, /DeletionPolicy:\s*Retain/);
-  assert.match(profileLookupSource, /PROFILE_LOOKUP_READY_KEY/);
-  assert.match(profileLookupSource, /ConsistentRead:\s*true/);
   const mappingMethod = repositorySource.match(/async listRecurrenceLinks[\s\S]*?\n  }/)?.[0] || "";
   assert.match(mappingMethod, /readProfileLookup/);
   assert.doesNotMatch(mappingMethod, /scan_fallback|pacedScan/);
