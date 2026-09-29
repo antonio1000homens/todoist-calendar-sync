@@ -1,5 +1,5 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
-import { documentClient, pacedScan } from "./dynamodb-capacity.js";
+import { documentClient } from "./dynamodb-capacity.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
@@ -204,19 +204,10 @@ class DynamoReconciliationStore implements ReconciliationStore {
     const table = this.ensureTable();
     return readProfileLookup<Mapping>({
       client: documentClient,
-      tableName: table,
       profile,
       operation: "list_reconciliation_mappings",
       component: "reconciliation",
       queryInput: mappingLookupQueryInput(table, profile),
-      fallback: async () => {
-        const result = await pacedScan<Mapping>({
-          TableName: table,
-          FilterExpression: "begins_with(pk, :prefix) AND sk = :map",
-          ExpressionAttributeValues: { ":prefix": `TASK#${profile}#`, ":map": "MAP" },
-        }, { operation: "list_reconciliation_mappings_scan_fallback", profile });
-        return result.items;
-      },
     });
   }
 

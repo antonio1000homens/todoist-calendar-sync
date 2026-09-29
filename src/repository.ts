@@ -6,7 +6,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
+import { documentClient as client } from "./dynamodb-capacity.js";
 import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
@@ -15,10 +15,6 @@ import {
   mappingOwnerLookupAttributes,
   recurrenceLookupAttributes,
   recurrenceLookupQueryInput,
-  mappingLookupQueryInput,
-  PROFILE_LOOKUP_MIGRATION_VERSION,
-  PROFILE_LOOKUP_READY_KEY,
-  PROFILE_LOOKUP_READY_SORT_KEY,
   readProfileLookup,
 } from "./profile-lookup.js";
 import type { CompletedCalendarProjection, Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
@@ -531,19 +527,10 @@ export class StateRepository {
     const table = this.ensureTable();
     return readProfileLookup<RecurrenceLink>({
       client,
-      tableName: table,
       profile,
       operation: "list_recurrence_links",
       component: "state-repository",
       queryInput: recurrenceLookupQueryInput(table, profile),
-      fallback: async () => {
-        const result = await pacedScan<RecurrenceLink>({
-          TableName: table,
-          FilterExpression: "begins_with(pk, :prefix)",
-          ExpressionAttributeValues: { ":prefix": `RECURRENCE#${profile}#` },
-        }, { operation: "list_recurrence_links_scan_fallback", profile });
-        return result.items;
-      },
     });
   }
 
@@ -696,15 +683,4 @@ export class StateRepository {
     }));
   }
 
-  async markProfileLookupIndexReady(): Promise<void> {
-    await client.send(new PutCommand({
-      TableName: this.ensureTable(),
-      Item: {
-        ...key(PROFILE_LOOKUP_READY_KEY, PROFILE_LOOKUP_READY_SORT_KEY),
-        ready: true,
-        version: PROFILE_LOOKUP_MIGRATION_VERSION,
-        completedAt: now(),
-      },
-    }));
-  }
 }

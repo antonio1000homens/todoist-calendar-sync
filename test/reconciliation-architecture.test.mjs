@@ -10,7 +10,6 @@ const repositorySource = await readFile(new URL("../src/repository.ts", import.m
 const reconciliationSource = await readFile(new URL("../src/reconciliation.ts", import.meta.url), "utf8");
 const queueSource = await readFile(new URL("../src/queue.ts", import.meta.url), "utf8");
 const typesSource = await readFile(new URL("../src/types.ts", import.meta.url), "utf8");
-const profileLookupSource = await readFile(new URL("../src/profile-lookup.ts", import.meta.url), "utf8");
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const deployPolicy = await readFile(new URL("../infrastructure/github-actions-deploy-role.yaml", import.meta.url), "utf8");
 
@@ -111,23 +110,21 @@ test("state table uses fixed 25/25 provisioned capacity, remains protected and w
   assert.match(template, /dynamodb:TransactWriteItems/);
 });
 
-test("profile lookup GSI is additive and hot paths query it after backfill", () => {
+test("profile lookup GSI is additive and validated hot paths are query-only", () => {
   assert.match(template, /IndexName:\s*ProfileLookupIndex/);
   assert.match(template, /AttributeName:\s*lookupPk/);
   assert.match(template, /AttributeName:\s*lookupSk/);
   assert.match(template, /DeletionPolicy:\s*Retain/);
-  assert.match(profileLookupSource, /PROFILE_LOOKUP_READY_KEY/);
-  assert.match(profileLookupSource, /ConsistentRead:\s*true/);
   const mappingMethod = repositorySource.match(/async listRecurrenceLinks[\s\S]*?\n  }/)?.[0] || "";
   assert.match(mappingMethod, /readProfileLookup/);
-  assert.match(mappingMethod, /list_recurrence_links_scan_fallback/);
+  assert.doesNotMatch(mappingMethod, /scan_fallback|pacedScan/);
   assert.match(repositorySource, /mappingEventLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingOwnerLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /recurrenceLookupAttributes\(next\)/);
   assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
   assert.match(reconciliationSource, /readProfileLookup/);
-  assert.match(reconciliationSource, /list_reconciliation_mappings_scan_fallback/);
+  assert.doesNotMatch(reconciliationSource, /list_reconciliation_mappings_scan_fallback|pacedScan/);
   assert.match(reconciliationSource, /mappingLookupQueryInput\(table, profile\)/);
   assert.match(backfillSource, /Limit:\s*25/);
   assert.match(backfillSource, /attribute_not_exists\(lookupPk\)/);
