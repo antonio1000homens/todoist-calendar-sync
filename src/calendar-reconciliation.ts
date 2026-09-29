@@ -86,6 +86,15 @@ function originalStart(event: CalendarEvent): string | undefined {
     || event.start?.date;
 }
 
+async function completedProjection(
+  state: StateRepository,
+  profile: Profile,
+  eventId: string,
+) {
+  const completionState = state as unknown as Partial<Pick<StateRepository, "getCompletedCalendarProjectionByEvent">>;
+  return completionState.getCompletedCalendarProjectionByEvent?.(profile, eventId);
+}
+
 /**
  * Snapshot-style Calendar recovery independent of the incremental sync token.
  * listDelta(undefined) is used only as a read-only full listing here; its
@@ -160,6 +169,19 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
 
+  const completionBlocksRecovery = async (eventId: string, recheckedBeforeMutation = false): Promise<boolean> => {
+    const completed = await completedProjection(state, profile, eventId);
+    if (!completed) return false;
+    summary.skipped += 1;
+    await state.audit(profile, "calendar_snapshot_completed_projection_ignored", {
+      eventId,
+      taskId: completed.taskId,
+      completedAt: completed.completedAt,
+      ...(recheckedBeforeMutation ? { recheckedBeforeMutation: true } : {}),
+    });
+    return true;
+  };
+
   const eligibleUniqueTask = async (matches: TodoistTask[]): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
     const eligible: TodoistTask[] = [];
     let ownershipConflict = false;
@@ -199,6 +221,7 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
+    if (await completionBlocksRecovery(event.id)) return;
     if (await state.getMappingByEvent(profile, event.id)) {
       summary.skipped += 1;
       return;
@@ -232,6 +255,7 @@ export async function reconcileUnmappedCalendar(
         }
         if (historical.task) {
           if (!await canMutate()) return;
+          if (await completionBlocksRecovery(event.id, true)) return;
           task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
           await state.recordMutation(profile);
           recoveredPreviousIdentity = true;
@@ -241,6 +265,7 @@ export async function reconcileUnmappedCalendar(
 
     if (!task) {
       if (!await canMutate()) return;
+      if (await completionBlocksRecovery(event.id, true)) return;
       task = await pair.todoist.upsertTask(toTodoistTask(event));
       tasks.push(task);
       await state.recordMutation(profile);
@@ -250,6 +275,7 @@ export async function reconcileUnmappedCalendar(
 
     let commentId: string | undefined;
     if (await canMutate()) {
+      if (await completionBlocksRecovery(event.id, true)) return;
       const existingComment = await pair.todoist.findComment(task.id, event.id);
       const comment = await pair.todoist.upsertComment(task.id, taskComment(event), existingComment?.id);
       commentId = comment.id;
@@ -296,6 +322,7 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
+    if (await completionBlocksRecovery(active.id)) return;
 
     const match = await findCanonicalTask(active);
     if (match.ambiguous) {
@@ -308,6 +335,7 @@ export async function reconcileUnmappedCalendar(
     let created = false;
     if (!task) {
       if (!await canMutate()) return;
+      if (await completionBlocksRecovery(active.id, true)) return;
       task = await pair.todoist.upsertTask(toTodoistTask(active));
       tasks.push(task);
       await state.recordMutation(profile);

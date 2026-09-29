@@ -69,8 +69,12 @@ class FakeState {
     this.audits = [];
     this.operations = [];
     this.recurrenceLinks = [];
+    this.completedProjections = [];
   }
   async getMappingByTaskAnyProfile() { return this.mapping; }
+  async listCompletedCalendarProjectionsByTaskAnyProfile(taskId) {
+    return this.completedProjections.filter((projection) => projection.taskId === taskId).map((projection) => structuredClone(projection));
+  }
   async getMappingByTask(profile) { return this.mapping?.profile === profile ? this.mapping : undefined; }
   async getMappingByEvent(profile, eventId) { return this.mapping?.profile === profile && this.mapping?.eventId === eventId ? this.mapping : undefined; }
   async acceptTaskVersion(_profile, taskId, updatedAt, deliveryId) {
@@ -237,6 +241,33 @@ test("mapped Home -> Work migrates the projection without recreating the Todoist
   assert.equal(state.mapping?.profile, "work");
   assert.equal(state.mapping?.taskId, task.id);
   assert.equal(state.mapping?.projectId, WORK);
+});
+
+test("post-completion project updates cannot delete retained Calendar history", async () => {
+  const previous = { id: "task-completed-move", project_id: HOME, content: "Completed history", due: { date: "2026-09-06" }, updated_at: "2026-09-03T09:00:00Z" };
+  const task = { ...previous, project_id: WORK, updated_at: "2026-09-03T10:00:00Z" };
+  const calendars = calendarSet();
+  calendars.home.events.set("home-history", {
+    id: "home-history",
+    summary: task.content,
+    start: { date: "2026-09-06" },
+    extendedProperties: { shared: { taskId: task.id } },
+  });
+  const state = new FakeState();
+  state.completedProjections.push({
+    profile: "home",
+    taskId: task.id,
+    eventId: "home-history",
+    completedAt: "2026-09-03T09:30:00Z",
+  });
+  const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
+
+  await sync.process(delivery("completed-project-update", task, previous));
+
+  assert.deepEqual(calendars.home.deleted, []);
+  assert.deepEqual(calendars.work.created, []);
+  assert.equal(state.mapping, undefined);
+  assert.equal(state.audits.at(-1).action, "todoist_completed_projection_terminal_update_ignored");
 });
 
 test("mapped Home -> Work migration is not suppressed when Todoist retains updated_at", async () => {

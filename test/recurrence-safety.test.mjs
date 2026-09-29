@@ -66,6 +66,7 @@ class FakeState {
     this.operations = [];
     this.audits = [];
     this.tombstones = [];
+    this.completedProjections = [];
     this.links = link ? [structuredClone(link)] : [];
     this.mappingsByTask = new Map();
     this.mappingsByEvent = new Map();
@@ -124,6 +125,15 @@ class FakeState {
   }
   async deleteCalendarProjectionTombstone() {}
   async recordRecurrence() {}
+  async getCompletedCalendarProjectionByEvent(profile, eventId) { return this.completedProjections.find((item) => item.profile === profile && item.eventId === eventId); }
+  async listCompletedCalendarProjectionsByTask(profile, taskId) { return this.completedProjections.filter((item) => item.profile === profile && item.taskId === taskId); }
+  async putCompletedCalendarProjection(projection) {
+    const index = this.completedProjections.findIndex((item) => item.profile === projection.profile && item.eventId === projection.eventId);
+    if (index >= 0) this.completedProjections[index] = structuredClone(projection); else this.completedProjections.push(structuredClone(projection));
+  }
+  async deleteCompletedCalendarProjection(projection) {
+    this.completedProjections = this.completedProjections.filter((item) => !(item.profile === projection.profile && item.eventId === projection.eventId));
+  }
   async getSyncToken() { return "sync-token"; }
   async putSyncToken() {}
   async deleteSyncToken() {}
@@ -388,13 +398,13 @@ test("stale Calendar cancellation after Calendar-owned rollover cannot advance t
   assert.deepEqual(clients.todoistDeletes, []);
   assert.equal(clients.todoistUpserts.length, 1);
   assert.equal(tasks.has(day2TaskId), true);
-  const staleCancellationAudit = state.audits.find(
-    (entry) => entry.action === "calendar_recurrence_stale_instance_cancellation_ignored",
+  const retainedCancellationAudit = state.audits.find(
+    (entry) => entry.action === "calendar_completed_projection_ignored",
   );
-  assert.deepEqual(staleCancellationAudit?.detail, {
-    seriesId: SERIES,
+  assert.deepEqual(retainedCancellationAudit?.detail, {
     eventId: day1.id,
-    activeInstanceId: day2.id,
+    taskId: task.id,
+    completedAt: "2099-01-01T12:00:00Z",
   });
 });
 
@@ -479,11 +489,71 @@ test("Todoist recurring completion advances the same task to the next effective 
   assert.deepEqual(clients.calendarDeletes, []);
   assert.deepEqual(clients.calendarUpserts, []);
   assert.deepEqual(clients.todoistRecurringUpdates, []);
+  assert.equal(state.completedProjections.length, 1);
+  assert.equal(state.completedProjections[0].eventId, currentInstance.id);
+  assert.equal(state.completedProjections[0].masterEventId, master.id);
   assert.equal(state.links[0].masterEventId, "todoist-master");
   assert.equal(state.links[0].activeInstanceId, "instance-7");
   assert.equal(state.links[0].originalStart, "2026-09-07");
   assert.equal(state.links[0].activeEffectiveStart, "2026-09-07");
   assert.equal(state.audits.at(-1).action, "todoist_recurrence_completed_advanced_to_effective_instance");
+
+  await sync.process({
+    id: "todoist-complete-replay",
+    kind: "todoist",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt: "2026-09-06T10:00:01Z",
+    headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: initialTask, event_data_extra: { old_item: initialTask } }),
+  });
+
+  assert.equal(state.completedProjections.length, 1);
+  assert.equal(state.links[0].activeInstanceId, "instance-7");
+  assert.equal(state.links[0].originalStart, "2026-09-07");
+  assert.equal(state.audits.at(-1).action, "todoist_recurrence_duplicate_completion_ignored");
+});
+
+test("rolling Todoist recurrence retains the completed Calendar event and binds a fresh successor", async () => {
+  const initialTask = { id: "task-rolling", content: "Water plants", description: "", due: { date: "2026-09-06", string: "every! 3 days", is_recurring: true } };
+  const oldEvent = { ...toCalendarEvent(initialTask), id: "rolling-old", status: "confirmed" };
+  const advancedTask = { ...initialTask, due: { ...initialTask.due, date: "2026-09-09" } };
+  const link = {
+    profile: PROFILE,
+    owner: "todoist",
+    seriesId: initialTask.id,
+    taskId: initialTask.id,
+    eventId: oldEvent.id,
+    activeInstanceId: oldEvent.id,
+    originalStart: "2026-09-06",
+    activeEffectiveStart: "2026-09-06",
+    updatedAt: "2026-09-06T00:00:00Z",
+  };
+  const state = new FakeState(link);
+  const tasks = new Map([[initialTask.id, advancedTask]]);
+  const clients = fakeClients(state, [oldEvent], tasks);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "todoist-complete-rolling",
+    kind: "todoist",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt: "2026-09-06T10:00:00Z",
+    headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: initialTask, event_data_extra: { old_item: initialTask } }),
+  });
+
+  assert.deepEqual(clients.calendarDeletes, []);
+  assert.equal(state.completedProjections.length, 1);
+  assert.equal(state.completedProjections[0].eventId, oldEvent.id);
+  assert.equal(clients.events.has(oldEvent.id), true);
+  assert.equal(clients.calendarUpserts.length, 1);
+  assert.equal(clients.calendarUpserts[0].existingId, undefined);
+  assert.notEqual(clients.calendarUpserts[0].id, oldEvent.id);
+  assert.equal(state.links[0].eventId, clients.calendarUpserts[0].id);
+  assert.equal(state.links[0].activeInstanceId, clients.calendarUpserts[0].id);
+  assert.equal(state.audits.some((entry) => entry.action === "todoist_recurrence_completed_calendar_retained"), true);
 });
 
 test("future Calendar instance deletion in a Todoist-owned RRULE is deferred", async () => {

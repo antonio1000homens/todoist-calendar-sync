@@ -153,6 +153,11 @@ export class ProjectAwareSynchronizer {
     };
   }
 
+  private async completedProjectionsByTaskAnyProfile(taskId: string) {
+    const completedState = this.state as unknown as Partial<Pick<StateRepository, "listCompletedCalendarProjectionsByTaskAnyProfile">>;
+    return await completedState.listCompletedCalendarProjectionsByTaskAnyProfile?.(taskId) || [];
+  }
+
   async process(delivery: Delivery): Promise<void> {
     if (delivery.kind === "todoist") return this.processTodoist(delivery);
     if (delivery.kind === "orphan") {
@@ -311,6 +316,50 @@ export class ProjectAwareSynchronizer {
     const payload: TodoistWebhookPayload = { ...rawPayload, event_data: task };
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!lifecycle) return;
+
+    // Completed projections remain terminal even after their active mapping is
+    // removed. Resolve the durable owner before project-transition handling so
+    // a later item:updated/project move cannot rediscover and delete history.
+    if (!mapping) {
+      const retained = await this.completedProjectionsByTaskAnyProfile(task.id);
+      if (retained.length) {
+        const ownerProfiles = [...new Set(retained.map((projection) => projection.profile))];
+        if (lifecycle.reason === "deleted") {
+          for (const ownerProfile of ownerProfiles) {
+            await this.delegate.process({
+              ...delivery,
+              profile: ownerProfile,
+              body: JSON.stringify(payload),
+            });
+          }
+          return;
+        }
+        if (lifecycle.action === "complete_projection") {
+          return this.delegate.process({
+            ...delivery,
+            profile: retained[0].profile,
+            body: JSON.stringify(payload),
+          });
+        }
+        return this.state.audit(retained[0].profile, "todoist_completed_projection_terminal_update_ignored", {
+          taskId: task.id,
+          event: payload.event_name,
+          retainedEventIds: retained.map((projection) => projection.eventId),
+          ownerProfiles,
+        });
+      }
+    }
+
+    // Completion is terminal for synchronization. Preserve the projection in
+    // the profile that currently owns it rather than interpreting a concurrent
+    // project move as a reason to delete Calendar history.
+    if (lifecycle.action === "complete_projection" && mapping?.profile) {
+      return this.delegate.process({
+        ...delivery,
+        profile: mapping.profile,
+        body: JSON.stringify(payload),
+      });
+    }
 
     const oldProjectId = rawPayload.event_data_extra?.old_item?.project_id;
     const transition = todoistProjectTransition(oldProjectId, task.project_id, mapping?.profile);

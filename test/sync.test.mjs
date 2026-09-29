@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canRecreateCalendarProjection, hasCanonicalState, matchingTask, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
+import { canRecreateCalendarProjection, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
@@ -70,8 +70,13 @@ test("classifies Todoist due removal separately from deletion and completion", (
     dueAdded: true,
   });
   assert.deepEqual(todoistCalendarLifecycle({ event_name: "item:completed", event_data: { id: "task-4", content: "Task", due } }), {
-    action: "delete_projection",
+    action: "complete_projection",
     reason: "completed",
+    dueAdded: false,
+  });
+  assert.deepEqual(todoistCalendarLifecycle({ event_name: "item:deleted", event_data: { id: "task-4", content: "Task", due, is_deleted: true } }), {
+    action: "delete_projection",
+    reason: "deleted",
     dueAdded: false,
   });
   assert.deepEqual(todoistCalendarLifecycle({ event_name: "item:updated", event_data: { id: "task-5", content: "Recurring", due: null }, event_data_extra: { old_item: { id: "task-5", content: "Recurring", due: { ...due, is_recurring: true } } } }), {
@@ -79,6 +84,136 @@ test("classifies Todoist due removal separately from deletion and completion", (
     reason: "undated",
     dueAdded: false,
   });
+});
+
+
+test("completion retains a standalone Calendar event and blocks resurrection until explicit deletion", async () => {
+  const mapping = { profile: "home", eventId: "event-history", taskId: "task-history", updatedAt: "2026-09-28T10:00:00Z" };
+  const event = {
+    id: mapping.eventId,
+    status: "confirmed",
+    summary: "Historical appointment",
+    description: "",
+    start: { date: "2026-09-28" },
+    end: { date: "2026-09-29" },
+    extendedProperties: { shared: { taskId: mapping.taskId, syncSource: "todoist-calendar-sync" } },
+  };
+  let activeMapping = structuredClone(mapping);
+  const completed = [];
+  const audits = [];
+  const calendarDeletes = [];
+  let todoistUpserts = 0;
+  let deltaItems = [];
+
+  const state = {
+    async getMappingByTask(_profile, taskId) { return activeMapping?.taskId === taskId ? structuredClone(activeMapping) : undefined; },
+    async getMappingByEvent(_profile, eventId) { return activeMapping?.eventId === eventId ? structuredClone(activeMapping) : undefined; },
+    async deleteMapping(value) { if (activeMapping?.taskId === value.taskId && activeMapping?.eventId === value.eventId) activeMapping = undefined; },
+    async mutationAllowed() { return true; },
+    async recordMutation() {},
+    async getCalendarProjectionTombstone() { return undefined; },
+    async deleteCalendarProjectionTombstone() {},
+    async getCompletedCalendarProjectionByEvent(profile, eventId) { return completed.find((item) => item.profile === profile && item.eventId === eventId); },
+    async listCompletedCalendarProjectionsByTask(profile, taskId) { return completed.filter((item) => item.profile === profile && item.taskId === taskId); },
+    async putCompletedCalendarProjection(value) {
+      const index = completed.findIndex((item) => item.profile === value.profile && item.eventId === value.eventId);
+      if (index >= 0) completed[index] = structuredClone(value); else completed.push(structuredClone(value));
+    },
+    async deleteCompletedCalendarProjection(value) {
+      const index = completed.findIndex((item) => item.profile === value.profile && item.eventId === value.eventId);
+      if (index >= 0) completed.splice(index, 1);
+    },
+    async getSyncToken() { return "sync-token"; },
+    async putSyncToken() {},
+    async audit(_profile, action, detail) { audits.push({ action, detail }); },
+  };
+  const calendar = {
+    async listDelta() { return { items: deltaItems.map((item) => structuredClone(item)), nextSyncToken: "next-token" }; },
+    async findByTodoistTaskId(taskId) { return taskId === mapping.taskId ? structuredClone(event) : undefined; },
+    async deleteEvent(id) { calendarDeletes.push(id); },
+  };
+  const todoist = {
+    async upsertTask() { todoistUpserts += 1; return { id: "resurrected" }; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+  const task = { id: mapping.taskId, content: event.summary, due: { date: "2026-09-28" } };
+
+  await sync.process({
+    id: "complete-history", kind: "todoist", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: { ...task, is_completed: true } }),
+  });
+
+  assert.equal(activeMapping, undefined);
+  assert.deepEqual(calendarDeletes, []);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].eventId, event.id);
+  assert.equal(audits.at(-1).action, "todoist_completed_calendar_retained");
+
+  deltaItems = [event];
+  await sync.process({ id: "calendar-history-edit", kind: "calendar", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:01:00Z", headers: {}, body: "" });
+  assert.equal(todoistUpserts, 0);
+  assert.equal(audits.some((entry) => entry.action === "calendar_completed_projection_ignored"), true);
+
+  await sync.process({
+    id: "delete-history", kind: "todoist", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:02:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:deleted", event_data: { ...task, is_deleted: true } }),
+  });
+  assert.deepEqual(calendarDeletes, [event.id]);
+  assert.equal(completed.length, 0);
+  assert.equal(audits.at(-1).action, "todoist_deleted_completed_calendar_history");
+});
+
+test("rechecks completion immediately before Calendar-to-Todoist mutation", async () => {
+  const mapping = { profile: "home", eventId: "event-race", taskId: "task-race", updatedAt: "2026-09-28T10:00:00Z" };
+  const event = {
+    id: mapping.eventId,
+    status: "confirmed",
+    summary: "Edited after completion",
+    description: "",
+    start: { date: "2026-09-28" },
+    end: { date: "2026-09-29" },
+    extendedProperties: { shared: { taskId: mapping.taskId } },
+  };
+  const task = { id: mapping.taskId, content: "Before completion", description: "", due: { date: "2026-09-28" } };
+  const marker = { profile: "home", taskId: mapping.taskId, eventId: mapping.eventId, completedAt: "2026-09-28T12:00:00Z" };
+  let completionReads = 0;
+  let todoistUpserts = 0;
+  const audits = [];
+
+  const state = {
+    async getCompletedCalendarProjectionByEvent() {
+      completionReads += 1;
+      return completionReads === 1 ? undefined : marker;
+    },
+    async getMappingByEvent() { return mapping; },
+    async getMappingByTask() { return mapping; },
+    async mutationAllowed() { return true; },
+    async getSyncToken() { return "sync-token"; },
+    async putSyncToken() {},
+    async audit(_profile, action, detail) { audits.push({ action, detail }); },
+  };
+  const calendar = {
+    async listDelta() { return { items: [event], nextSyncToken: "next-token" }; },
+  };
+  const todoist = {
+    async getTask() { return task; },
+    async upsertTask() { todoistUpserts += 1; return task; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  await sync.process({
+    id: "calendar-completion-race",
+    kind: "calendar",
+    profile: "home",
+    mode: "aws",
+    receivedAt: "2026-09-28T12:00:01Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.equal(completionReads >= 2, true);
+  assert.equal(todoistUpserts, 0);
+  assert.equal(audits.some((entry) => entry.action === "calendar_completed_projection_ignored" && entry.detail.recheckedBeforeMutation === true), true);
 });
 
 test("allows a newer due-date re-add but suppresses stale dated webhooks", () => {

@@ -63,6 +63,7 @@ class FakeState {
     this.audits = [];
     this.operations = [];
     this.links = link ? [structuredClone(link)] : [];
+    this.completedProjections = [];
     this.mappingsByTask = new Map();
     this.mappingsByEvent = new Map();
     if (link) this.storeMapping(mappingFromLink(link));
@@ -104,6 +105,16 @@ class FakeState {
   async putCalendarProjectionTombstone() {}
   async deleteCalendarProjectionTombstone() {}
   async recordRecurrence() {}
+  async getCompletedCalendarProjectionByEvent(profile, eventId) { return this.completedProjections.find((item) => item.profile === profile && item.eventId === eventId); }
+  async listCompletedCalendarProjectionsByTask(profile, taskId) { return this.completedProjections.filter((item) => item.profile === profile && item.taskId === taskId); }
+  async putCompletedCalendarProjection(projection) {
+    this.operations.push({ action: "put-completed", projection: structuredClone(projection) });
+    const index = this.completedProjections.findIndex((item) => item.profile === projection.profile && item.eventId === projection.eventId);
+    if (index >= 0) this.completedProjections[index] = structuredClone(projection); else this.completedProjections.push(structuredClone(projection));
+  }
+  async deleteCompletedCalendarProjection(projection) {
+    this.completedProjections = this.completedProjections.filter((item) => !(item.profile === projection.profile && item.eventId === projection.eventId));
+  }
   async audit(_profile, action, detail) { this.audits.push({ action, detail }); }
 }
 
@@ -293,9 +304,13 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
   await sync.process(completedDelivery("complete-day-17", link.taskId, completed, "2099-09-17T12:00:00Z"));
 
   const boundaryWrite = state.operations.findIndex((operation) => operation.action === "put-link" && operation.link.completedThroughOriginalStart === "2099-09-17");
+  const retainedWrite = state.operations.findIndex((operation) => operation.action === "put-completed" && operation.projection.eventId === completed.id);
   const deleteCalendar = state.operations.findIndex((operation) => operation.action === "delete-calendar");
   assert.ok(boundaryWrite >= 0);
-  assert.ok(deleteCalendar > boundaryWrite);
+  assert.ok(retainedWrite > boundaryWrite);
+  assert.equal(deleteCalendar, -1);
+  assert.equal(state.completedProjections.length, 1);
+  assert.equal(state.completedProjections[0].eventId, completed.id);
   assert.equal(state.links[0].activeInstanceId, "day-18");
   assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-17");
   assert.equal(state.links[0].calendarProgressVersion, 1);
@@ -320,6 +335,8 @@ test("multiple Calendar-owned completions advance the watermark monotonically an
   assert.equal(state.links[0].activeInstanceId, "day-19");
 
   await sync.process(completedDelivery("stale-replay-day-17", link.taskId, day17, "2099-09-19T12:00:00Z"));
+  assert.equal(state.completedProjections.some((projection) => projection.eventId === day17.id), true);
+  assert.equal(state.completedProjections.some((projection) => projection.eventId === day18.id), true);
   assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-18");
   assert.equal(state.links[0].activeInstanceId, "day-19");
 });

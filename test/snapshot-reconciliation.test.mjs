@@ -71,6 +71,7 @@ class FakeState {
   constructor(mapping) {
     this.mapping = mapping;
     this.tombstones = new Map();
+    this.completedProjections = new Map();
     this.audits = [];
     this.operations = [];
   }
@@ -92,6 +93,9 @@ class FakeState {
   }
   async getCalendarProjectionTombstone(profile, taskId) {
     return this.tombstones.get(`${profile}:${taskId}`);
+  }
+  async getCompletedCalendarProjectionByEvent(profile, eventId) {
+    return this.completedProjections.get(`${profile}:${eventId}`);
   }
   async recordMutation(profile) { this.operations.push(`mutation:${profile}`); }
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
@@ -218,6 +222,56 @@ test("repairs a missed Todoist due removal when Calendar is unchanged", async ()
   assert.deepEqual(clients.metrics.calendarDeletes, [oldEvent.id]);
   assert.equal(state.mapping, undefined);
   assert.ok(state.tombstones.has(`home:${undated.id}`));
+});
+
+test("retained completion wins over a missing Todoist task during snapshot reconciliation", async () => {
+  const m = mapping();
+  const oldTask = task();
+  const oldEvent = event();
+  const state = new FakeState(m);
+  state.completedProjections.set(`home:${m.eventId}`, {
+    profile: "home", taskId: m.taskId, eventId: m.eventId, completedAt: "2026-09-03T21:00:00Z",
+  });
+  const store = new FakeStore(m, baseline(oldTask, oldEvent));
+  const clients = fakeClients({ listedTasks: [], taskById: new Map(), calendarEvents: new Map([[oldEvent.id, oldEvent]]) });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+
+  assert.equal(result.counts.completed_retained, 1);
+  assert.equal(state.mapping, undefined);
+  assert.equal(store.baselines.has(`home:${m.taskId}`), false);
+  assert.deepEqual(clients.metrics.calendarDeletes, []);
+  assert.deepEqual(clients.metrics.todoistDeletes, []);
+  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_completed_projection_retained"), true);
+});
+
+test("rechecks completion before destructive snapshot reconciliation", async () => {
+  const m = mapping();
+  const oldTask = task();
+  const oldEvent = event();
+  const marker = {
+    profile: "home",
+    taskId: m.taskId,
+    eventId: m.eventId,
+    completedAt: "2026-09-03T21:00:00Z",
+  };
+  const state = new FakeState(m);
+  let completedReads = 0;
+  state.getCompletedCalendarProjectionByEvent = async () => {
+    completedReads += 1;
+    return completedReads === 1 ? undefined : marker;
+  };
+  const store = new FakeStore(m, baseline(oldTask, oldEvent));
+  const clients = fakeClients({ listedTasks: [], taskById: new Map(), calendarEvents: new Map([[oldEvent.id, oldEvent]]) });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+
+  assert.equal(completedReads >= 2, true);
+  assert.equal(result.counts.completed_retained, 1);
+  assert.deepEqual(clients.metrics.calendarDeletes, []);
+  assert.deepEqual(clients.metrics.todoistDeletes, []);
+  assert.equal(state.mapping, undefined);
+  assert.equal(store.baselines.has(`home:${m.taskId}`), false);
 });
 
 test("ignores Calendar end-only drift because end is not a synchronized canonical field", async () => {

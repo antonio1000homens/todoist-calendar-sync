@@ -180,6 +180,17 @@ export interface Mapping {
   updatedAt: string;
 }
 
+export interface CompletedCalendarProjection {
+  profile: Profile;
+  taskId: string;
+  eventId: string;
+  completedAt: string;
+  recurrenceOwner?: "calendar" | "todoist";
+  seriesId?: string;
+  masterEventId?: string;
+  originalStart?: string;
+}
+
 export interface RecurrenceLink {
   profile: Profile;
   owner: "calendar" | "todoist";

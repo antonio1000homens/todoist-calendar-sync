@@ -21,7 +21,7 @@ import {
   PROFILE_LOOKUP_READY_SORT_KEY,
   readProfileLookup,
 } from "./profile-lookup.js";
-import type { Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
+import type { CompletedCalendarProjection, Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
 const allProfiles: Profile[] = ["home", "antonio", "work"];
@@ -581,6 +581,72 @@ export class StateRepository {
     await client.send(new DeleteCommand({
       TableName: this.ensureTable(),
       Key: key(`PROJECTION#${profile}#TASK#${taskId}`, "TOMBSTONE"),
+    }));
+  }
+
+  async getCompletedCalendarProjectionByEvent(profile: Profile, eventId: string): Promise<CompletedCalendarProjection | undefined> {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`COMPLETED_EVENT#${profile}#${eventId}`),
+      ConsistentRead: true,
+    }));
+    return result.Item?.completedAt ? result.Item as CompletedCalendarProjection : undefined;
+  }
+
+  async listCompletedCalendarProjectionsByTask(profile: Profile, taskId: string): Promise<CompletedCalendarProjection[]> {
+    const items: CompletedCalendarProjection[] = [];
+    let exclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const result = await client.send(new QueryCommand({
+        TableName: this.ensureTable(),
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :event)",
+        ExpressionAttributeValues: {
+          ":pk": `COMPLETED_TASK#${profile}#${taskId}`,
+          ":event": "EVENT#",
+        },
+        ConsistentRead: true,
+        ExclusiveStartKey: exclusiveStartKey,
+      }));
+      items.push(...(result.Items || []) as CompletedCalendarProjection[]);
+      exclusiveStartKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (exclusiveStartKey);
+    return items;
+  }
+
+  async listCompletedCalendarProjectionsByTaskAnyProfile(taskId: string): Promise<CompletedCalendarProjection[]> {
+    const results: CompletedCalendarProjection[] = [];
+    for (const profile of allProfiles) {
+      results.push(...await this.listCompletedCalendarProjectionsByTask(profile, taskId));
+    }
+    return results;
+  }
+
+  async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    const item = { ...projection, updatedAt: now() };
+    await client.send(new TransactWriteCommand({
+      TransactItems: [
+        {
+          Put: {
+            TableName: this.ensureTable(),
+            Item: { ...item, ...key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) },
+          },
+        },
+        {
+          Put: {
+            TableName: this.ensureTable(),
+            Item: { ...item, ...key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) },
+          },
+        },
+      ],
+    }));
+  }
+
+  async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    await client.send(new TransactWriteCommand({
+      TransactItems: [
+        { Delete: { TableName: this.ensureTable(), Key: key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) } },
+        { Delete: { TableName: this.ensureTable(), Key: key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) } },
+      ],
     }));
   }
 

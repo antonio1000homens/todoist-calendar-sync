@@ -57,7 +57,8 @@ type ReconcileOutcome =
   | "created"
   | "blocked"
   | "conflict"
-  | "recurring_deferred";
+  | "recurring_deferred"
+  | "completed_retained";
 
 export interface SnapshotReconciliationResult {
   continuation?: ReconciliationContinuation;
@@ -189,6 +190,7 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
     blocked: 0,
     conflict: 0,
     recurring_deferred: 0,
+    completed_retained: 0,
   };
 }
 
@@ -268,6 +270,24 @@ export class SnapshotReconciler {
     };
   }
 
+  private async completedProjection(profile: Profile, eventId: string) {
+    const state = this.state as unknown as Partial<Pick<StateRepository, "getCompletedCalendarProjectionByEvent">>;
+    return state.getCompletedCalendarProjectionByEvent?.(profile, eventId);
+  }
+
+  private async retainCompletedProjectionIfMarked(profile: Profile, mapping: Mapping): Promise<ReconcileOutcome | undefined> {
+    const completedProjection = await this.completedProjection(profile, mapping.eventId);
+    if (completedProjection?.taskId !== mapping.taskId) return undefined;
+    await this.state.deleteMapping(mapping);
+    await this.store.deleteBaseline(profile, mapping.taskId);
+    await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
+      taskId: mapping.taskId,
+      eventId: mapping.eventId,
+      completedAt: completedProjection.completedAt,
+    });
+    return "completed_retained";
+  }
+
   private async repair(delivery: Delivery): Promise<void> {
     if (this.repairCurrentState) return this.repairCurrentState(delivery);
     return new ProjectAwareSynchronizer(this.state).process(delivery);
@@ -320,6 +340,8 @@ export class SnapshotReconciler {
     event: CalendarEvent | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
+    if (completedOutcome) return completedOutcome;
     if (!hasDue(task)) {
       if (event && event.status !== "cancelled") {
         await clients.calendar.deleteEvent(event.id).catch((error: unknown) => {
@@ -382,6 +404,8 @@ export class SnapshotReconciler {
     event: CalendarEvent | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
+    if (completedOutcome) return completedOutcome;
     if (!event || event.status === "cancelled") {
       if (task) {
         await clients.todoist.deleteTask(task.id).catch((error: unknown) => {
@@ -446,6 +470,8 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
+    if (completedOutcome) return completedOutcome;
     if (mapping.recurrenceOwner) return "recurring_deferred";
 
     const task = listedTask || await this.currentTask(clients.todoist, mapping.taskId);
