@@ -41,6 +41,8 @@ export interface ProjectCommentMigrationSummary {
   projectCommentsCreated: number;
   existingProjectCommentsReused: number;
   legacyTaskCommentsFound: number;
+  legacyTaskCommentsCleanupEligible: number;
+  legacyTaskCommentsDeleted: number;
   missingTasks: number;
   missingCalendarEvents: number;
   tombstonedMappings: number;
@@ -60,6 +62,8 @@ function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommen
     projectCommentsCreated: 0,
     existingProjectCommentsReused: 0,
     legacyTaskCommentsFound: 0,
+    legacyTaskCommentsCleanupEligible: 0,
+    legacyTaskCommentsDeleted: 0,
     missingTasks: 0,
     missingCalendarEvents: 0,
     tombstonedMappings: 0,
@@ -79,8 +83,10 @@ function exactProjectComments(index: ProjectMappingIndex, mapping: Mapping): Tod
     .map((entry) => entry.comment);
 }
 
-function legacyCommentId(mapping: Mapping): string | undefined {
-  return mapping.taskCommentId || (mapping.commentId && mapping.commentId !== mapping.projectCommentId ? mapping.commentId : undefined);
+function legacyCommentId(mapping: Mapping, canonicalProjectCommentId?: string): string | undefined {
+  const projectCommentId = mapping.projectCommentId || canonicalProjectCommentId;
+  if (mapping.taskCommentId && mapping.taskCommentId !== projectCommentId) return mapping.taskCommentId;
+  return mapping.commentId && mapping.commentId !== projectCommentId ? mapping.commentId : undefined;
 }
 
 function recurrenceStateChanged(before: Mapping, after: Mapping): boolean {
@@ -148,9 +154,11 @@ async function validateMapping(
  * Report or progressively backfill one Todoist project's mapping index.
  *
  * Read priority is deliberately project comment -> legacy task comment. Apply
- * mode creates/updates only project comments; it never writes or deletes a
- * task comment. Re-running apply is idempotent because an existing exact v1
- * project mapping is reused and only the DynamoDB shape is normalised.
+ * mode creates/updates only project comments by default. When cleanupLegacy is
+ * enabled, a task comment is eligible for deletion only after an exact project
+ * mapping exists and the live task/project, Calendar event, and tombstone checks
+ * all pass. Missing project mappings are never created and cleaned in the same
+ * pass, making cleanup explicitly two-phase and re-runnable.
  */
 export async function migrateProjectComments(
   profile: Profile,
@@ -158,6 +166,7 @@ export async function migrateProjectComments(
   state: ProjectCommentMigrationState,
   clients: ProjectCommentMigrationClients,
   apply = false,
+  cleanupLegacy = false,
 ): Promise<ProjectCommentMigrationSummary> {
   const projectId = profiles[profile].todoistProjectId;
   const index = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId));
@@ -180,20 +189,39 @@ export async function migrateProjectComments(
         summary.existingProjectCommentsReused += 1;
         // A project mapping is sufficient evidence. Never fan out to a task
         // comment GET merely to discover optional migration metadata.
-        const explicitLegacyId = legacyCommentId(mapping);
+        const explicitLegacyId = legacyCommentId(mapping, projectEntry.comment.id);
         if (explicitLegacyId) summary.legacyTaskCommentsFound += 1;
         const recovered = recoverMappingFromProjectComment(mapping, projectEntry);
-        if (apply && (
+
+        let cleanupValidated = false;
+        if (cleanupLegacy && explicitLegacyId) {
+          const valid = await validateMapping(profile, projectId, mapping, state, clients, summary);
+          cleanupValidated = Boolean(valid);
+          if (cleanupValidated) summary.legacyTaskCommentsCleanupEligible += 1;
+        }
+
+        const needsNormalization = (
           mapping.projectCommentId !== projectEntry.comment.id
           || mapping.commentId !== undefined
           || mapping.mappingRevision !== projectEntry.payload.mappingRevision
           || recurrenceStateChanged(mapping, recovered)
-        )) {
+          || Boolean(cleanupLegacy && cleanupValidated && mapping.taskCommentId)
+        );
+
+        if (apply && cleanupLegacy && cleanupValidated && explicitLegacyId) {
+          await clients.todoist.deleteComment(explicitLegacyId);
+          summary.legacyTaskCommentsDeleted += 1;
+        }
+
+        if (apply && needsNormalization) {
+          const { commentId: _commentId, taskCommentId: _taskCommentId, ...withoutLegacyAliases } = recovered;
           const normalized = nextProjectCommentMapping(
-            {
-              ...recovered,
-              ...(explicitLegacyId ? { taskCommentId: explicitLegacyId } : {}),
-            },
+            cleanupLegacy && cleanupValidated
+              ? withoutLegacyAliases
+              : {
+                  ...withoutLegacyAliases,
+                  ...(explicitLegacyId ? { taskCommentId: explicitLegacyId } : {}),
+                },
             projectId,
             projectEntry.comment.id,
             projectEntry.payload.mappingRevision,
@@ -259,10 +287,11 @@ export async function listMappingsForProjectCommentMigration(profile: Profile): 
 export async function runProjectCommentMigration(
   profile: Profile,
   apply = false,
+  cleanupLegacy = false,
   state: ProjectCommentMigrationState = new StateRepository(),
   clientFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): Promise<ProjectCommentMigrationSummary> {
   const mappings = await listMappingsForProjectCommentMigration(profile);
   const clients = await clientFactory(profile);
-  return migrateProjectComments(profile, mappings, state, clients, apply);
+  return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy);
 }

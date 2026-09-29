@@ -1,3 +1,5 @@
+import { profiles } from "./config.js";
+import { attachProjectCommentReference } from "./mapping-comments.js";
 import {
   createBudgetedClientFactory,
   defaultProviderClientFactory,
@@ -273,23 +275,24 @@ export async function reconcileUnmappedCalendar(
     }
     reservedTaskIds.add(task.id);
 
-    let commentId: string | undefined;
-    if (await canMutate()) {
-      if (await completionBlocksRecovery(event.id, true)) return;
-      const existingComment = await pair.todoist.findComment(task.id, event.id);
-      const comment = await pair.todoist.upsertComment(task.id, taskComment(event), existingComment?.id);
-      commentId = comment.id;
-      await state.recordMutation(profile);
-    }
-
-    const mapping: Mapping = {
+    const projectId = task.project_id || profiles[profile].todoistProjectId;
+    const draftMapping: Mapping = {
       profile,
       eventId: event.id,
       taskId: task.id,
-      projectId: task.project_id,
-      commentId,
+      projectId,
       updatedAt: new Date().toISOString(),
     };
+    let mapping = draftMapping;
+    if (await canMutate()) {
+      if (await completionBlocksRecovery(event.id, true)) return;
+      const existingComment = await pair.todoist.findComment(task.id, event.id);
+      const comment = await pair.todoist.upsertComment(task.id, taskComment(event), existingComment?.id, draftMapping);
+      const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
+      mapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
+      await state.recordMutation(profile);
+    }
+
     await state.putMapping(mapping);
     await rememberStandaloneIdentity(event, task);
     if (created) summary.imported += 1;
@@ -302,7 +305,7 @@ export async function reconcileUnmappedCalendar(
     await state.audit(profile, action, {
       eventId: event.id,
       taskId: task.id,
-      commentId,
+      projectCommentId: mapping.projectCommentId,
     });
   };
 
