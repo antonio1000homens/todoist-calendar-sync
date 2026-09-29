@@ -10,7 +10,6 @@ const repositorySource = await readFile(new URL("../src/repository.ts", import.m
 const reconciliationSource = await readFile(new URL("../src/reconciliation.ts", import.meta.url), "utf8");
 const queueSource = await readFile(new URL("../src/queue.ts", import.meta.url), "utf8");
 const typesSource = await readFile(new URL("../src/types.ts", import.meta.url), "utf8");
-const profileLookupSource = await readFile(new URL("../src/profile-lookup.ts", import.meta.url), "utf8");
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const deployPolicy = await readFile(new URL("../infrastructure/github-actions-deploy-role.yaml", import.meta.url), "utf8");
 
