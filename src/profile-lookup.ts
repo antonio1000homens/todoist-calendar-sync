@@ -1,4 +1,4 @@
-import { GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 import type { Mapping, Profile, RecurrenceLink } from "./types.js";
 import { logEvent } from "./observability.js";
 
@@ -77,33 +77,15 @@ export function recurrenceLookupQueryInput(tableName: string, profile: Profile):
   };
 }
 
-export async function profileLookupIndexReady(
-  client: { send: (command: any) => Promise<any> },
-  tableName: string,
-): Promise<boolean> {
-  const result = await client.send(new GetCommand({
-    TableName: tableName,
-    Key: { pk: PROFILE_LOOKUP_READY_KEY, sk: PROFILE_LOOKUP_READY_SORT_KEY },
-    ConsistentRead: true,
-  }));
-  return result.Item?.ready === true && result.Item.version === PROFILE_LOOKUP_MIGRATION_VERSION;
-}
-
 interface ProfileLookupQueryOptions {
   client: { send: (command: any) => Promise<any> };
-  tableName: string;
   profile: Profile;
   operation: string;
   component: string;
   queryInput: Record<string, unknown>;
-  fallback: () => Promise<unknown[]>;
 }
 
 export async function readProfileLookup<T>(options: ProfileLookupQueryOptions): Promise<T[]> {
-  if (!await profileLookupIndexReady(options.client, options.tableName)) {
-    return (await options.fallback()) as T[];
-  }
-
   const startedAt = Date.now();
   const items: T[] = [];
   let exclusiveStartKey: Record<string, unknown> | undefined;
