@@ -85,7 +85,6 @@ test("mapping lookup is query-only, paginates in order and emits aggregate query
   });
   const { result, lines } = await captureLogs(() => readProfileLookup({
     client,
-    tableName: "state",
     profile: "home",
     operation: "list_reconciliation_mappings",
     component: "reconciliation",
@@ -112,7 +111,6 @@ test("recurrence lookup is query-only and uses the recurrence prefix", async () 
   const client = fakeClient({ pages: [{ Items: [{ seriesId: "one" }], ScannedCount: 1, ConsumedCapacity: { CapacityUnits: 1 }, LastEvaluatedKey: { lookupSk: "RECURRENCE#one" } }, { Items: [{ seriesId: "two" }], ScannedCount: 1, ConsumedCapacity: { CapacityUnits: 1 } }] });
   const { result, lines } = await captureLogs(() => readProfileLookup({
     client,
-    tableName: "state",
     profile: "antonio",
     operation: "list_recurrence_links",
     component: "state-repository",
