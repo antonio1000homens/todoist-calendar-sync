@@ -163,6 +163,59 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
   assert.equal(audits.at(-1).action, "todoist_deleted_completed_calendar_history");
 });
 
+test("rechecks completion immediately before Calendar-to-Todoist mutation", async () => {
+  const mapping = { profile: "home", eventId: "event-race", taskId: "task-race", updatedAt: "2026-09-28T10:00:00Z" };
+  const event = {
+    id: mapping.eventId,
+    status: "confirmed",
+    summary: "Edited after completion",
+    description: "",
+    start: { date: "2026-09-28" },
+    end: { date: "2026-09-29" },
+    extendedProperties: { shared: { taskId: mapping.taskId } },
+  };
+  const task = { id: mapping.taskId, content: "Before completion", description: "", due: { date: "2026-09-28" } };
+  const marker = { profile: "home", taskId: mapping.taskId, eventId: mapping.eventId, completedAt: "2026-09-28T12:00:00Z" };
+  let completionReads = 0;
+  let todoistUpserts = 0;
+  const audits = [];
+
+  const state = {
+    async getCompletedCalendarProjectionByEvent() {
+      completionReads += 1;
+      return completionReads === 1 ? undefined : marker;
+    },
+    async getMappingByEvent() { return mapping; },
+    async getMappingByTask() { return mapping; },
+    async mutationAllowed() { return true; },
+    async getSyncToken() { return "sync-token"; },
+    async putSyncToken() {},
+    async audit(_profile, action, detail) { audits.push({ action, detail }); },
+  };
+  const calendar = {
+    async listDelta() { return { items: [event], nextSyncToken: "next-token" }; },
+  };
+  const todoist = {
+    async getTask() { return task; },
+    async upsertTask() { todoistUpserts += 1; return task; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  await sync.process({
+    id: "calendar-completion-race",
+    kind: "calendar",
+    profile: "home",
+    mode: "aws",
+    receivedAt: "2026-09-28T12:00:01Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.equal(completionReads >= 2, true);
+  assert.equal(todoistUpserts, 0);
+  assert.equal(audits.some((entry) => entry.action === "calendar_completed_projection_ignored" && entry.detail.recheckedBeforeMutation === true), true);
+});
+
 test("allows a newer due-date re-add but suppresses stale dated webhooks", () => {
   const readded = todoistCalendarLifecycle({ event_name: "item:updated", event_data: { id: "task-1", content: "Task", due: { date: "2026-09-02" }, updated_at: "2026-09-01T12:01:00Z" }, event_data_extra: { old_item: { id: "task-1", content: "Task", due: null } } });
   assert.equal(canRecreateCalendarProjection(readded, "2026-09-01T12:01:00Z", "2026-09-01T12:00:00Z"), true);
