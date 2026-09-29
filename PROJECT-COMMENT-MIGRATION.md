@@ -8,8 +8,9 @@ DynamoDB remains authoritative. Project comments are a recoverable provider-side
 
 - Mapping discovery checks `gcp-app2-sync:mapping:v1` project comments first.
 - Legacy task comments are read only when the project index has no matching mapping.
-- New/updated mapping comments are written only to the Todoist project.
-- Legacy task comments are not updated or deleted by the migration.
+- New/updated mapping comments are written only to the Todoist project and their IDs are persisted as `projectCommentId`.
+- Runtime code no longer persists newly written project-comment IDs in the deprecated `commentId` field.
+- Legacy task comments are read-only migration fallback evidence; they are not updated. Permanent mapping removal may delete a known legacy breadcrumb together with the project mapping comment.
 - Project comments are fetched with cursor pagination and cached for the lifetime of a Todoist client so reconciliation does not issue one comment-list request per task.
 
 ## Phase 1: report

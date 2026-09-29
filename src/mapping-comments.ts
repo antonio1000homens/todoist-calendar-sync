@@ -210,7 +210,7 @@ export function recoverMappingFromProjectComment(mapping: Mapping, parsed: Parse
   };
 }
 
-export function nextProjectCommentMapping(mapping: Mapping, projectId: string, projectCommentId: string, revision: number): Mapping {
+export function attachProjectCommentReference(mapping: Mapping, projectId: string, projectCommentId: string): Mapping {
   const { commentId, ...withoutLegacyAlias } = mapping;
   const legacyTaskCommentId = mapping.taskCommentId || (commentId && commentId !== projectCommentId ? commentId : undefined);
   return {
@@ -218,6 +218,12 @@ export function nextProjectCommentMapping(mapping: Mapping, projectId: string, p
     projectId,
     projectCommentId,
     ...(legacyTaskCommentId ? { taskCommentId: legacyTaskCommentId } : {}),
+  };
+}
+
+export function nextProjectCommentMapping(mapping: Mapping, projectId: string, projectCommentId: string, revision: number): Mapping {
+  return {
+    ...attachProjectCommentReference(mapping, projectId, projectCommentId),
     mappingRevision: revision,
     updatedAt: new Date().toISOString(),
   };
