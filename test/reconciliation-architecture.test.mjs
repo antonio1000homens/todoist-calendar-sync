@@ -111,7 +111,7 @@ test("state table uses fixed 25/25 provisioned capacity, remains protected and w
   assert.match(template, /dynamodb:TransactWriteItems/);
 });
 
-test("profile lookup GSI is additive and hot paths query it after backfill", () => {
+test("profile lookup GSI is additive and validated hot paths are query-only", () => {
   assert.match(template, /IndexName:\s*ProfileLookupIndex/);
   assert.match(template, /AttributeName:\s*lookupPk/);
   assert.match(template, /AttributeName:\s*lookupSk/);
@@ -120,14 +120,14 @@ test("profile lookup GSI is additive and hot paths query it after backfill", () 
   assert.match(profileLookupSource, /ConsistentRead:\s*true/);
   const mappingMethod = repositorySource.match(/async listRecurrenceLinks[\s\S]*?\n  }/)?.[0] || "";
   assert.match(mappingMethod, /readProfileLookup/);
-  assert.match(mappingMethod, /list_recurrence_links_scan_fallback/);
+  assert.doesNotMatch(mappingMethod, /scan_fallback|pacedScan/);
   assert.match(repositorySource, /mappingEventLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /mappingOwnerLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /recurrenceLookupAttributes\(next\)/);
   assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
   assert.match(reconciliationSource, /readProfileLookup/);
-  assert.match(reconciliationSource, /list_reconciliation_mappings_scan_fallback/);
+  assert.doesNotMatch(reconciliationSource, /list_reconciliation_mappings_scan_fallback|pacedScan/);
   assert.match(reconciliationSource, /mappingLookupQueryInput\(table, profile\)/);
   assert.match(backfillSource, /Limit:\s*25/);
   assert.match(backfillSource, /attribute_not_exists\(lookupPk\)/);
