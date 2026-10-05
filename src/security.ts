@@ -21,6 +21,16 @@ export function normalizedText(value: unknown): string {
   return String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\u200B/g, "").replace(/\s+/g, " ").trim();
 }
 
+/**
+ * Todoist task content may contain Markdown links. Google Calendar summaries do
+ * not render that Markdown, so exposing the raw value makes the URL visible in
+ * the event title. Keep the human-readable label while preserving other text.
+ */
+export function todoistCalendarTitle(value: unknown): string {
+  const text = normalizedText(value);
+  return normalizedText(text.replace(/\[([^\]\n]+)\]\(((?:https?:\/\/|mailto:)[^)]+)\)/gi, "$1"));
+}
+
 export function normalizedStart(value: string | undefined, dateOnly: boolean): string {
   if (!value) return "";
   if (dateOnly) return `date:${value.slice(0, 10)}`;
