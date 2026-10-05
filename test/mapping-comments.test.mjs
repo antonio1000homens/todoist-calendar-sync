@@ -202,3 +202,55 @@ test("Todoist mapping writes target the project and retain recurrence metadata",
   assert.equal(parsed.payload.masterEventId, "master-1");
   assert.equal(parsed.payload.activeInstanceId, "event-1");
 });
+
+
+test("Todoist mapping write respects explicit recurrence metadata clears", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const token = "project-clear-token";
+  const projectId = profiles.home.todoistProjectId;
+  rememberTodoistTokenProject(token, projectId);
+  const existingContent = serializeMappingComment(mapping({ projectId, mappingRevision: 5 }), projectId, undefined, 5);
+  let writtenContent;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (_url, init = {}) => {
+    const method = init.method || "GET";
+    if (method === "GET") {
+      return new Response(JSON.stringify({
+        results: [{ id: "project-comment-existing", project_id: projectId, content: existingContent }],
+        next_cursor: null,
+      }), { status: 200 });
+    }
+    const body = JSON.parse(String(init.body || "{}"));
+    writtenContent = body.content;
+    return new Response(JSON.stringify({ id: "project-comment-existing", project_id: projectId, content: body.content }), { status: 200 });
+  };
+
+  const todoist = new Todoist(token);
+  await todoist.upsertComment(
+    "task-1",
+    "todoist-calendar-sync\ncalendarEventId=event-1",
+    "project-comment-existing",
+    mapping({
+      projectId,
+      projectCommentId: "project-comment-existing",
+      recurrenceOwner: undefined,
+      seriesId: undefined,
+      masterEventId: undefined,
+      activeInstanceId: undefined,
+      originalStart: undefined,
+      activeEffectiveStart: undefined,
+      calendarProgressVersion: undefined,
+      completedThroughOriginalStart: undefined,
+    }),
+  );
+
+  const parsed = parseMappingComment({ id: "project-comment-existing", content: writtenContent });
+  assert.ok(parsed && !("error" in parsed));
+  assert.equal(parsed.payload.recurrenceOwner, undefined);
+  assert.equal(parsed.payload.seriesId, undefined);
+  assert.equal(parsed.payload.masterEventId, undefined);
+  assert.equal(parsed.payload.activeInstanceId, undefined);
+  assert.equal(parsed.payload.originalStart, undefined);
+  assert.equal(parsed.payload.activeEffectiveStart, undefined);
+});
