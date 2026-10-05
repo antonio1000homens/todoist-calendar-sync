@@ -209,7 +209,11 @@ export async function migrateProjectComments(
         );
 
         if (apply && cleanupLegacy && cleanupValidated && explicitLegacyId) {
-          await clients.todoist.deleteComment(explicitLegacyId);
+          try {
+            await clients.todoist.deleteComment(explicitLegacyId);
+          } catch (error) {
+            if (!providerMissing(error)) throw error;
+          }
           summary.legacyTaskCommentsDeleted += 1;
         }
 
