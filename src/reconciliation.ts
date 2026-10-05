@@ -425,7 +425,7 @@ export class SnapshotReconciler {
 
     let nextTask: TodoistTask;
     try {
-      nextTask = await clients.todoist.upsertTask(toTodoistTask(event), task.id);
+      nextTask = await clients.todoist.upsertTask(toTodoistTask(event, task), task.id);
     } catch (error) {
       // The snapshot list and this write are not atomic. A task can be deleted
       // after listTasks() returns it, so a 404 here is a stale-read race, not a
