@@ -1,7 +1,7 @@
 import { profiles, googleCredentials, todoistToken } from "./config.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
-import { normalizedStart, normalizedText } from "./security.js";
+import { normalizedStart, normalizedText, todoistCalendarTitle } from "./security.js";
 import {
   calendarRecurrenceMatchesTodoist,
   isTodoistOwnedCalendarRecurrence,
@@ -109,7 +109,7 @@ function recurrenceAnchorMatches(event: CalendarEvent): boolean {
 
 function occurrenceStateMatches(event: CalendarEvent, task: TodoistTask): boolean {
   return event.status !== "cancelled"
-    && normalizedText(event.summary) === normalizedText(task.content)
+    && normalizedText(event.summary) === todoistCalendarTitle(task.content)
     && normalizedText(event.description) === normalizedText(task.description)
     && startsMatch(event, task);
 }
@@ -127,16 +127,20 @@ function todoistTemplateTask(master: CalendarEvent, task: TodoistTask): TodoistT
 export function matchingTask(event: CalendarEvent, tasks: TodoistTask[]): TodoistTask | undefined {
   const summary = normalizedText(event.summary).toLowerCase();
   if (!summary || (!event.start?.date && !event.start?.dateTime)) return undefined;
-  return tasks.find((task) => normalizedText(task.content).toLowerCase().includes(summary) && startsMatch(event, task));
+  return tasks.find((task) => todoistCalendarTitle(task.content).toLowerCase().includes(summary) && startsMatch(event, task));
 }
 
-export function toTodoistTask(event: CalendarEvent): Omit<TodoistTask, "id"> {
+export function toTodoistTask(event: CalendarEvent, existing?: TodoistTask): Omit<TodoistTask, "id"> {
   const start = event.start || {};
   const due = start.dateTime
     ? { datetime: start.dateTime, timezone: start.timeZone || "Europe/London" }
     : start.date ? { date: start.date } : undefined;
+  const calendarTitle = normalizedText(event.summary) || "Untitled calendar event";
+  const content = existing && calendarTitle === todoistCalendarTitle(existing.content)
+    ? existing.content
+    : calendarTitle;
   return {
-    content: normalizedText(event.summary) || "Untitled calendar event",
+    content,
     description: normalizedText(event.description),
     due,
   };
@@ -188,7 +192,7 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
   const anchorEnd = end.dateTime || end.date || "";
   return {
     id: "",
-    summary: normalizedText(task.content) || "Untitled Todoist task",
+    summary: todoistCalendarTitle(task.content) || "Untitled Todoist task",
     description: normalizedText(task.description),
     start,
     end,
@@ -296,7 +300,7 @@ export function suppressedLegacyCalendarRecurrenceCandidate(
 // retained only as a last-resort safety net for provider retries or defects.
 export function hasCanonicalState(event: CalendarEvent, task: TodoistTask): boolean {
   const textMatches = event.status !== "cancelled"
-    && normalizedText(event.summary) === normalizedText(task.content)
+    && normalizedText(event.summary) === todoistCalendarTitle(task.content)
     && normalizedText(event.description) === normalizedText(task.description);
   if (!textMatches) return false;
   if (todoistRecurrenceToRrule(task)) {
@@ -491,7 +495,7 @@ export class Synchronizer {
     todoist: Todoist,
   ): Promise<{ mapping: Mapping; task: TodoistTask; mutated: boolean }> {
     const mutated = !occurrenceStateMatches(occurrence, task);
-    const nextTask = mutated ? await todoist.updateRecurringOccurrence(task, toTodoistTask(occurrence)) : task;
+    const nextTask = mutated ? await todoist.updateRecurringOccurrence(task, toTodoistTask(occurrence, task)) : task;
     const masterEventId = mapping.masterEventId || mapping.eventId;
     const nextMapping = todoistOwnedMapping(mapping, masterEventId, task.id, occurrence);
     await this.state.putMapping(nextMapping);
@@ -534,7 +538,7 @@ export class Synchronizer {
           if (Number((error as { status?: number }).status) !== 404) throw error;
         });
       }
-      const nextTask = await todoist.upsertTask(toTodoistTask(active), progressAware ? task?.id : undefined);
+      const nextTask = await todoist.upsertTask(toTodoistTask(active, progressAware ? task : undefined), progressAware ? task?.id : undefined);
       const next: Mapping = {
         profile,
         eventId: active.id,
@@ -769,7 +773,7 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
     }
-    const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id);
+    const nextTask = await todoist.upsertTask(toTodoistTask(event, task), task?.id);
     const existingComment = mapping?.commentId ? { id: mapping.commentId } : await todoist.findComment(nextTask.id, event.id);
     const comment = await todoist.upsertComment(nextTask.id, taskComment(event), existingComment?.id);
     const nextMapping: Mapping = { profile: delivery.profile, eventId: event.id, taskId: nextTask.id, commentId: comment.id, updatedAt: new Date().toISOString() };
@@ -871,7 +875,7 @@ export class Synchronizer {
         await todoist.deleteTask(existing.taskId).catch((error: unknown) => { if (Number((error as { status?: number }).status) !== 404) throw error; });
       }
     }
-    const nextTask = await todoist.upsertTask(toTodoistTask(active), task?.id);
+    const nextTask = await todoist.upsertTask(toTodoistTask(active, task), task?.id);
     const mapping: Mapping = {
       profile: delivery.profile,
       eventId: active.id,
