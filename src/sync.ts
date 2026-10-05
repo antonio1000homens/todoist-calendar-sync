@@ -1,4 +1,5 @@
 import { profiles, googleCredentials, todoistToken } from "./config.js";
+import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedStart, normalizedText } from "./security.js";
@@ -739,7 +740,7 @@ export class Synchronizer {
         await this.scheduleOrphan?.(delivery, event.id, mapping.taskId);
         return this.state.audit(delivery.profile, "calendar_orphan_recheck_scheduled", { eventId: event.id, taskId: mapping.taskId });
       }
-      if (mapping.commentId) await todoist.deleteComment(mapping.commentId).catch(() => undefined);
+      await deleteMappingComments(todoist, mapping);
       await this.state.deleteMapping(mapping);
       await this.state.recordMutation(delivery.profile);
       return this.state.audit(delivery.profile, "calendar_deleted_task", { eventId: event.id, taskId: mapping.taskId });
@@ -760,19 +761,33 @@ export class Synchronizer {
     if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
     if (task && hasCanonicalState(event, task)) {
       const nextMapping: Mapping = {
+        ...(mapping || {}),
         profile: delivery.profile,
         eventId: event.id,
         taskId: task.id,
-        commentId: mapping?.commentId,
+        projectId: task.project_id || mapping?.projectId || profiles[delivery.profile].todoistProjectId,
         updatedAt: new Date().toISOString(),
       };
       await this.state.putMapping(nextMapping);
       return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
     }
     const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id);
-    const existingComment = mapping?.commentId ? { id: mapping.commentId } : await todoist.findComment(nextTask.id, event.id);
-    const comment = await todoist.upsertComment(nextTask.id, taskComment(event), existingComment?.id);
-    const nextMapping: Mapping = { profile: delivery.profile, eventId: event.id, taskId: nextTask.id, commentId: comment.id, updatedAt: new Date().toISOString() };
+    const knownCommentId = mapping?.projectCommentId || mapping?.commentId;
+    const existingComment = knownCommentId ? { id: knownCommentId } : await todoist.findComment(nextTask.id, event.id);
+    const projectId = nextTask.project_id || mapping?.projectId || profiles[delivery.profile].todoistProjectId;
+    const draftMapping: Mapping = {
+      ...(mapping || {}),
+      profile: delivery.profile,
+      eventId: event.id,
+      taskId: nextTask.id,
+      projectId,
+      updatedAt: new Date().toISOString(),
+    };
+    const comment = await todoist.upsertComment(nextTask.id, taskComment(event), existingComment?.id, draftMapping);
+    const referenceMapping = existingComment?.id && !draftMapping.projectCommentId && !draftMapping.commentId
+      ? { ...draftMapping, commentId: existingComment.id }
+      : draftMapping;
+    const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
     await this.state.putMapping(nextMapping);
     await this.state.recordRecurrence(delivery.profile, event.id, event.recurrence);
     await this.state.recordMutation(delivery.profile);
@@ -1150,7 +1165,7 @@ export class Synchronizer {
       await calendar.deleteEvent(mapping.eventId).catch((error: unknown) => {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
-      if (mapping.commentId) await todoist.deleteComment(mapping.commentId).catch(() => undefined);
+      await deleteMappingComments(todoist, mapping);
       await this.state.putCalendarProjectionTombstone(delivery.profile, task.id, task.updated_at || delivery.receivedAt);
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
@@ -1272,7 +1287,11 @@ export class Synchronizer {
         profile: delivery.profile,
         eventId: existingEvent.id,
         taskId: task.id,
+        projectId: task.project_id || mapping?.projectId,
+        projectCommentId: mapping?.projectCommentId,
+        taskCommentId: mapping?.taskCommentId,
         commentId: mapping?.commentId,
+        mappingRevision: mapping?.mappingRevision,
         recurrenceId: existingEvent.recurringEventId,
         recurrenceOwner: todoistRecurring ? "todoist" : undefined,
         seriesId: todoistRecurring ? task.id : undefined,
@@ -1307,7 +1326,11 @@ export class Synchronizer {
       profile: delivery.profile,
       eventId: stored.id,
       taskId: task.id,
+      projectId: task.project_id || mapping?.projectId,
+      projectCommentId: mapping?.projectCommentId,
+      taskCommentId: mapping?.taskCommentId,
       commentId: mapping?.commentId,
+      mappingRevision: mapping?.mappingRevision,
       recurrenceId: stored.recurringEventId,
       recurrenceOwner: todoistRecurring ? "todoist" : undefined,
       seriesId: todoistRecurring ? task.id : undefined,

@@ -1,6 +1,6 @@
 import { createSign, randomUUID } from "node:crypto";
 import { profileForTodoistProject, todoistProjectForToken } from "./config.js";
-import { buildProjectMappingIndex, findProjectMappingComment, serializeMappingComment, type TodoistCommentRecord } from "./mapping-comments.js";
+import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
 
 const CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3";
@@ -306,7 +306,7 @@ export class Todoist {
    * historical name this now writes only project comments. Existing task
    * comments are migration fallback evidence and are never updated here.
    */
-  async upsertComment(taskId: string, content: string, existingId?: string): Promise<{ id: string }> {
+  async upsertComment(taskId: string, content: string, existingId?: string, mappingDetails?: Mapping): Promise<{ id: string }> {
     const projectId = todoistProjectForToken(this.token);
     const profile = profileForTodoistProject(projectId);
     if (!projectId || !profile) throw new Error("Todoist mapping project is not configured for this token");
@@ -315,7 +315,8 @@ export class Todoist {
     const index = buildProjectMappingIndex(comments);
     const existing = findProjectMappingComment(index, { taskId, eventId, projectCommentId: existingId });
     const revision = Math.max(0, existing?.payload.mappingRevision || 0) + 1;
-    const mapping: Mapping = {
+    const baseMapping: Mapping = {
+      ...(mappingDetails || {}),
       profile,
       projectId,
       taskId,
@@ -323,6 +324,7 @@ export class Todoist {
       mappingRevision: revision,
       updatedAt: new Date().toISOString(),
     };
+    const mapping = existing && !mappingDetails ? recoverMappingFromProjectComment(baseMapping, existing) : baseMapping;
     const projectComment = await this.upsertProjectComment(
       projectId,
       serializeMappingComment(mapping, projectId, calendarUrl, revision),

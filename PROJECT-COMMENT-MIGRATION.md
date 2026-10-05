@@ -8,8 +8,9 @@ DynamoDB remains authoritative. Project comments are a recoverable provider-side
 
 - Mapping discovery checks `gcp-app2-sync:mapping:v1` project comments first.
 - Legacy task comments are read only when the project index has no matching mapping.
-- New/updated mapping comments are written only to the Todoist project.
-- Legacy task comments are not updated or deleted by the migration.
+- New/updated mapping comments are written only to the Todoist project and their IDs are persisted as `projectCommentId`.
+- Runtime code no longer persists newly written project-comment IDs in the deprecated `commentId` field.
+- Legacy task comments are read-only migration fallback evidence; they are not updated. Permanent mapping removal may delete a known legacy breadcrumb together with the project mapping comment.
 - Project comments are fetched with cursor pagination and cached for the lifetime of a Todoist client so reconciliation does not issue one comment-list request per task.
 
 ## Phase 1: report
@@ -65,7 +66,29 @@ Run report mode again. The expected steady state is:
 - no unexplained malformed or duplicate project mappings;
 - remaining legacy task comments are fallback-only and do not receive new writes.
 
-Do not bulk-delete legacy task comments as part of this rollout. Keeping them temporarily makes rollback safe and preserves recovery evidence while the new project index beds in.
+Do not bulk-delete legacy task comments as part of the initial rollout. Keeping them temporarily makes rollback safe and preserves recovery evidence while the new project index beds in.
+
+## Phase 4: clean up legacy task comments
+
+After Phase 3 reports a healthy project index, preview legacy task-comment cleanup explicitly:
+
+```bash
+npm run migrate:project-comments -- home --cleanup-legacy
+npm run migrate:project-comments -- antonio --cleanup-legacy
+npm run migrate:project-comments -- work --cleanup-legacy
+```
+
+Review `legacyTaskCommentsCleanupEligible`, `legacyTaskCommentsDeleted`, and all validation/failure counters. Cleanup eligibility requires an exact project mapping plus a live task in the expected project, a live Calendar event, and no projection tombstone.
+
+Then apply one profile at a time:
+
+```bash
+npm run migrate:project-comments -- home --cleanup-legacy --apply
+npm run migrate:project-comments -- antonio --cleanup-legacy --apply
+npm run migrate:project-comments -- work --cleanup-legacy --apply
+```
+
+Cleanup is deliberately two-phase. If a mapping is still missing its project comment, the migration may create that project comment in apply mode, but it will not delete the task comment in the same pass. Re-run the cleanup report after the project mapping exists before applying deletion.
 
 ## Rollback
 

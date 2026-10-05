@@ -1,6 +1,7 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
+import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
@@ -340,7 +341,7 @@ export class SnapshotReconciler {
         });
       }
       await this.state.putCalendarProjectionTombstone(profile, mapping.taskId, task?.updated_at || new Date().toISOString());
-      if (mapping.commentId) await clients.todoist.deleteComment(mapping.commentId).catch(() => undefined);
+      await deleteMappingComments(clients.todoist, mapping);
       await this.state.deleteMapping(mapping);
       await this.store.deleteBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
@@ -369,15 +370,20 @@ export class SnapshotReconciler {
     }
 
     const stored = await clients.calendar.upsertEvent(toCalendarEvent(task, event), event.id);
-    const existingComment = mapping.commentId ? { id: mapping.commentId } : await clients.todoist.findComment(task.id, stored.id);
-    const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id);
-    const nextMapping: Mapping = {
+    const knownCommentId = mapping.projectCommentId || mapping.commentId;
+    const existingComment = knownCommentId ? { id: knownCommentId } : await clients.todoist.findComment(task.id, stored.id);
+    const projectId = task.project_id || mapping.projectId || profiles[profile].todoistProjectId;
+    const draftMapping: Mapping = {
       ...mapping,
-      projectId: task.project_id || mapping.projectId,
+      projectId,
       eventId: stored.id,
-      commentId: comment.id,
       updatedAt: new Date().toISOString(),
     };
+    const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id, draftMapping);
+    const referenceMapping = existingComment?.id && !draftMapping.projectCommentId && !draftMapping.commentId
+      ? { ...draftMapping, commentId: existingComment.id }
+      : draftMapping;
+    const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
     await this.state.putMapping(nextMapping);
     await this.store.putBaseline(profile, task.id, task, stored);
     await this.state.recordMutation(profile);
@@ -403,7 +409,7 @@ export class SnapshotReconciler {
           if (Number((error as { status?: number }).status) !== 404) throw error;
         });
       }
-      if (mapping.commentId) await clients.todoist.deleteComment(mapping.commentId).catch(() => undefined);
+      await deleteMappingComments(clients.todoist, mapping);
       await this.state.deleteMapping(mapping);
       await this.store.deleteBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);

@@ -337,3 +337,64 @@ test("validates Todoist HMAC over the exact raw body", () => {
   assert.equal(validTodoistSignature(body, signature, secret), true);
   assert.equal(validTodoistSignature(`${body} `, signature, secret), false);
 });
+
+
+test("Todoist canonical no-op preserves canonical project-comment mapping references", async () => {
+  const task = {
+    id: "task-canonical",
+    project_id: "project-home",
+    content: "Canonical task",
+    description: "",
+    due: { date: "2026-10-05" },
+    updated_at: "2026-10-05T18:00:00Z",
+  };
+  const event = {
+    id: "event-canonical",
+    status: "confirmed",
+    summary: "Canonical task",
+    description: "",
+    start: { date: "2026-10-05" },
+    end: { date: "2026-10-06" },
+    extendedProperties: { shared: { taskId: task.id } },
+  };
+  const original = {
+    profile: "home",
+    projectId: "project-home",
+    eventId: event.id,
+    taskId: task.id,
+    projectCommentId: "project-comment-7",
+    taskCommentId: "legacy-task-comment-2",
+    mappingRevision: 7,
+    updatedAt: "2026-10-05T17:00:00Z",
+  };
+  let saved;
+  const state = {
+    async acceptTaskVersion() { return true; },
+    async getCalendarProjectionTombstone() { return undefined; },
+    async getMappingByTask() { return structuredClone(original); },
+    async mutationAllowed() { return true; },
+    async putMapping(value) { saved = structuredClone(value); },
+    async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async audit() {},
+  };
+  const calendar = {
+    async getEvent() { return structuredClone(event); },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {} }));
+
+  await sync.process({
+    id: "canonical-noop",
+    kind: "todoist",
+    profile: "home",
+    mode: "aws",
+    receivedAt: "2026-10-05T18:00:01Z",
+    headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task }),
+  });
+
+  assert.ok(saved);
+  assert.equal(saved.projectId, "project-home");
+  assert.equal(saved.projectCommentId, "project-comment-7");
+  assert.equal(saved.taskCommentId, "legacy-task-comment-2");
+  assert.equal(saved.mappingRevision, 7);
+});

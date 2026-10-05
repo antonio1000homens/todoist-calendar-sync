@@ -3,6 +3,7 @@ import test from "node:test";
 import { profiles, rememberTodoistTokenProject } from "../dist/config.js";
 import {
   MAPPING_COMMENT_MARKER,
+  attachProjectCommentReference,
   buildProjectMappingIndex,
   findProjectMappingComment,
   parseMappingComment,
@@ -70,6 +71,26 @@ test("referenced project comment wins only for the same mapping identity; otherw
   assert.equal(findProjectMappingComment(index, mapping())?.comment.id, "new");
   assert.equal(findProjectMappingComment(index, { ...mapping(), projectCommentId: "old" })?.comment.id, "old");
   assert.equal(findProjectMappingComment(index, { ...mapping(), projectCommentId: "wrong-reference" })?.comment.id, "new");
+});
+
+test("project comment reference replaces the deprecated alias and preserves a genuine legacy task comment", () => {
+  const alreadyProject = attachProjectCommentReference(
+    mapping({ commentId: "project-comment", projectCommentId: undefined, taskCommentId: undefined }),
+    "project-home",
+    "project-comment",
+  );
+  assert.equal(alreadyProject.projectCommentId, "project-comment");
+  assert.equal(alreadyProject.commentId, undefined);
+  assert.equal(alreadyProject.taskCommentId, undefined);
+
+  const migratedLegacy = attachProjectCommentReference(
+    mapping({ commentId: "legacy-task-comment", projectCommentId: undefined, taskCommentId: undefined }),
+    "project-home",
+    "project-comment",
+  );
+  assert.equal(migratedLegacy.projectCommentId, "project-comment");
+  assert.equal(migratedLegacy.commentId, undefined);
+  assert.equal(migratedLegacy.taskCommentId, "legacy-task-comment");
 });
 
 test("project mapping upsert never updates an unverified stored comment id", async () => {
@@ -142,4 +163,94 @@ test("Todoist provider uses canonical newest project mapping and skips task fall
   const todoist = new Todoist(token);
   assert.deepEqual(await todoist.findComment("task-1", "event-1"), { id: "newer" });
   assert.equal(requests.length, 1, "project hit must avoid legacy task-comment lookup");
+});
+
+
+test("Todoist mapping writes target the project and retain recurrence metadata", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const token = "project-write-token";
+  const projectId = profiles.home.todoistProjectId;
+  rememberTodoistTokenProject(token, projectId);
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (url, init = {}) => {
+    const value = String(url);
+    requests.push({ url: value, method: init.method || "GET", body: init.body ? JSON.parse(String(init.body)) : undefined });
+    if ((init.method || "GET") === "GET") {
+      return new Response(JSON.stringify({ results: [], next_cursor: null }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ id: "project-comment-1", project_id: projectId }), { status: 200 });
+  };
+
+  const todoist = new Todoist(token);
+  await todoist.upsertComment(
+    "task-1",
+    "todoist-calendar-sync\ncalendarEventId=event-1\ncalendarUrl=https://calendar.example/event",
+    undefined,
+    mapping({ projectId }),
+  );
+
+  assert.equal(requests.some((request) => request.url.includes("task_id=")), false);
+  const write = requests.find((request) => request.method === "POST");
+  assert.ok(write);
+  assert.equal(write.body.project_id, projectId);
+  assert.equal(write.body.task_id, undefined);
+  const parsed = parseMappingComment({ id: "project-comment-1", content: write.body.content });
+  assert.ok(parsed && !("error" in parsed));
+  assert.equal(parsed.payload.seriesId, "series-1");
+  assert.equal(parsed.payload.masterEventId, "master-1");
+  assert.equal(parsed.payload.activeInstanceId, "event-1");
+});
+
+
+test("Todoist mapping write respects explicit recurrence metadata clears", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const token = "project-clear-token";
+  const projectId = profiles.home.todoistProjectId;
+  rememberTodoistTokenProject(token, projectId);
+  const existingContent = serializeMappingComment(mapping({ projectId, mappingRevision: 5 }), projectId, undefined, 5);
+  let writtenContent;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (_url, init = {}) => {
+    const method = init.method || "GET";
+    if (method === "GET") {
+      return new Response(JSON.stringify({
+        results: [{ id: "project-comment-existing", project_id: projectId, content: existingContent }],
+        next_cursor: null,
+      }), { status: 200 });
+    }
+    const body = JSON.parse(String(init.body || "{}"));
+    writtenContent = body.content;
+    return new Response(JSON.stringify({ id: "project-comment-existing", project_id: projectId, content: body.content }), { status: 200 });
+  };
+
+  const todoist = new Todoist(token);
+  await todoist.upsertComment(
+    "task-1",
+    "todoist-calendar-sync\ncalendarEventId=event-1",
+    "project-comment-existing",
+    mapping({
+      projectId,
+      projectCommentId: "project-comment-existing",
+      recurrenceOwner: undefined,
+      seriesId: undefined,
+      masterEventId: undefined,
+      activeInstanceId: undefined,
+      originalStart: undefined,
+      activeEffectiveStart: undefined,
+      calendarProgressVersion: undefined,
+      completedThroughOriginalStart: undefined,
+    }),
+  );
+
+  const parsed = parseMappingComment({ id: "project-comment-existing", content: writtenContent });
+  assert.ok(parsed && !("error" in parsed));
+  assert.equal(parsed.payload.recurrenceOwner, undefined);
+  assert.equal(parsed.payload.seriesId, undefined);
+  assert.equal(parsed.payload.masterEventId, undefined);
+  assert.equal(parsed.payload.activeInstanceId, undefined);
+  assert.equal(parsed.payload.originalStart, undefined);
+  assert.equal(parsed.payload.activeEffectiveStart, undefined);
 });

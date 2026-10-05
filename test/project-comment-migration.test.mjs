@@ -26,8 +26,9 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
+  const deletes = [];
   let creates = 0;
   return {
     clients: {
@@ -50,7 +51,10 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead } = {})
           comments.push(created);
           return { ...created };
         },
-        async deleteComment() {},
+        async deleteComment(commentId) {
+          deletes.push(commentId);
+          if (deleteError) throw deleteError;
+        },
         async getTask(taskId) {
           return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId };
         },
@@ -62,6 +66,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead } = {})
       },
     },
     get creates() { return creates; },
+    deletes,
     comments,
   };
 }
@@ -115,6 +120,74 @@ test("apply backfills a missing project comment once, preserves legacy task fall
   assert.equal(secondState.saved.length, 0, "already-normalized mapping should not be rewritten");
 });
 
+test("apply does not misclassify an ambiguous commentId that already points at the project mapping", async () => {
+  const source = mapping({ commentId: "project-comment-existing" });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment({ ...source, commentId: undefined, mappingRevision: 2 }, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment] });
+
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true);
+
+  assert.equal(summary.legacyTaskCommentsFound, 0);
+  assert.equal(fake.deletes.length, 0);
+  assert.equal(state.saved.length, 1);
+  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
+  assert.equal(state.saved[0].taskCommentId, undefined);
+  assert.equal(state.saved[0].commentId, undefined);
+});
+
+test("legacy cleanup is report-only unless apply is explicit", async () => {
+  const source = mapping({
+    projectCommentId: "project-comment-existing",
+    taskCommentId: "legacy-task-comment",
+    mappingRevision: 2,
+  });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment] });
+
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, false, true);
+
+  assert.equal(summary.legacyTaskCommentsFound, 1);
+  assert.equal(summary.legacyTaskCommentsCleanupEligible, 1);
+  assert.equal(summary.legacyTaskCommentsDeleted, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.equal(state.saved.length, 0);
+});
+
+test("legacy cleanup deletes only after a valid project mapping is verified and removes the fallback id", async () => {
+  const source = mapping({
+    projectCommentId: "project-comment-existing",
+    taskCommentId: "legacy-task-comment",
+    mappingRevision: 2,
+  });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment] });
+
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+
+  assert.equal(summary.legacyTaskCommentsCleanupEligible, 1);
+  assert.equal(summary.legacyTaskCommentsDeleted, 1);
+  assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
+  assert.equal(state.saved.length, 1);
+  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
+  assert.equal(state.saved[0].taskCommentId, undefined);
+  assert.equal(state.saved[0].commentId, undefined);
+});
+
 test("report mode validates a missing project mapping but never writes provider or DynamoDB state", async () => {
   const state = new FakeState();
   const fake = fakeClients();
@@ -138,4 +211,31 @@ test("tombstone blocks project-comment backfill so stale breadcrumbs cannot be i
   assert.equal(summary.projectCommentsCreated, 0);
   assert.equal(fake.creates, 0);
   assert.equal(state.saved.length, 0);
+});
+
+
+test("legacy cleanup treats an already-missing task comment as an idempotent delete", async () => {
+  const source = mapping({
+    projectCommentId: "project-comment-existing",
+    taskCommentId: "legacy-task-comment",
+    mappingRevision: 2,
+  });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const missing = new Error("already deleted");
+  missing.status = 404;
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment], deleteError: missing });
+
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+
+  assert.equal(summary.failures, 0);
+  assert.equal(summary.legacyTaskCommentsDeleted, 1);
+  assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
+  assert.equal(state.saved.length, 1);
+  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
+  assert.equal(state.saved[0].taskCommentId, undefined);
 });

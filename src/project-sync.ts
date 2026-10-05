@@ -1,4 +1,5 @@
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
+import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository, type CalendarProjectionTombstone, type CalendarProjectionTombstoneReason } from "./repository.js";
 import { canRecreateCalendarProjection, hasCanonicalState, Synchronizer, toCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
@@ -460,17 +461,16 @@ export class ProjectAwareSynchronizer {
       ? existingEvent
       : await clients.calendar.upsertEvent(toCalendarEvent(task, existingEvent), existingEvent?.id);
     const existingComment = await clients.todoist.findComment(task.id, stored.id);
-    const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id);
     const todoistRecurring = Boolean(task.due?.is_recurring);
     const todoistRrule = Boolean(todoistRecurring && todoistRecurrenceToRrule(task) && stored.recurrence?.length);
     let active: CalendarEvent | undefined;
     if (todoistRrule) active = selectTodoistCurrentInstance(await clients.calendar.listInstances(stored.id), task);
-    const nextMapping: Mapping = {
+    const projectId = task.project_id || profiles[destinationProfile].todoistProjectId;
+    const draftMapping: Mapping = {
       profile: destinationProfile,
-      projectId: task.project_id,
+      projectId,
       eventId: stored.id,
       taskId: task.id,
-      commentId: comment.id,
       recurrenceId: stored.recurringEventId,
       recurrenceOwner: todoistRecurring ? "todoist" : undefined,
       seriesId: todoistRecurring ? task.id : undefined,
@@ -480,6 +480,9 @@ export class ProjectAwareSynchronizer {
       activeEffectiveStart: todoistRrule ? (active ? eventEffectiveStart(active) : undefined) : todoistRecurring ? eventEffectiveStart(stored) : undefined,
       updatedAt: new Date().toISOString(),
     };
+    const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id, draftMapping);
+    const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
+    const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
     await this.state.putMapping(nextMapping);
     if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
     if (destinationTombstone) await this.state.deleteCalendarProjectionTombstone(destinationProfile, task.id);
@@ -517,7 +520,7 @@ export class ProjectAwareSynchronizer {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
     }
-    if (sourceMapping?.commentId) await sourceClients.todoist.deleteComment(sourceMapping.commentId).catch(() => undefined);
+    if (sourceMapping) await deleteMappingComments(sourceClients.todoist, sourceMapping);
     if (sourceMapping?.seriesId) await this.state.deleteRecurrenceLink(sourceProfile, sourceMapping.seriesId);
     if (sourceMapping) await this.state.deleteMapping(sourceMapping);
     if (eventId || sourceMapping) await this.state.recordMutation(sourceProfile);
@@ -639,8 +642,11 @@ export class ProjectAwareSynchronizer {
     const existingComment = await destinationClients.todoist.findComment(task.id, preparedDestination.eventId);
     const activeEvent = await destinationClients.calendar.getEvent(preparedDestination.eventId).catch(() => undefined);
     const commentEvent: CalendarEvent = activeEvent || { id: preparedDestination.eventId };
-    const comment = await destinationClients.todoist.upsertComment(task.id, taskComment(commentEvent), existingComment?.id);
-    const nextMapping: Mapping = { ...preparedDestination, commentId: comment.id };
+    const projectId = preparedDestination.projectId || task.project_id || profiles[destinationProfile].todoistProjectId;
+    const draftMapping: Mapping = { ...preparedDestination, projectId };
+    const comment = await destinationClients.todoist.upsertComment(task.id, taskComment(commentEvent), existingComment?.id, draftMapping);
+    const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
+    const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
     await this.state.putMapping(nextMapping);
     await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
     if (destinationTombstone) await this.state.deleteCalendarProjectionTombstone(destinationProfile, task.id);
