@@ -22,7 +22,7 @@
     "@aws-sdk/lib-dynamodb": "^3.1141.0"
   },
   "devDependencies": {
-    "@types/aws-lambda": "^8.10.162",
+    "@types/aws-lambda": "^8.10.164",
     "@types/node": "^26.6.3",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
