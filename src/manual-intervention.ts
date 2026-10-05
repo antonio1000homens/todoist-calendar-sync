@@ -1283,7 +1283,7 @@ export class ManualInterventionService {
     if (action === "calendar_wins") {
       if (!event) return this.markStale(decision, "Calendar no longer exists, so Calendar cannot win this conflict.", slackUserId);
       if (task) {
-        await pair.todoist.upsertTask(toTodoistTask(event), task.id);
+        await pair.todoist.upsertTask(toTodoistTask(event, task), task.id);
       } else {
         const recreated = await pair.todoist.upsertTask(toTodoistTask(event));
         await state.deleteMapping(mapping);
