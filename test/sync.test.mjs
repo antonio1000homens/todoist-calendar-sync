@@ -10,7 +10,7 @@ test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
   const tasks = [
     { id: "wrong-date", content: "pay invoice", due: { date: "2026-09-02" } },
-    { id: "match", content: "Pay invoice for August", due: { date: "2026-09-01" } },
+    { id: "match", content: "Pay [invoice](https://example.com/invoices/august) for August", due: { date: "2026-09-01" } },
   ];
   assert.equal(matchingTask(event, tasks)?.id, "match");
 });
@@ -35,6 +35,43 @@ test("converts Todoist all-day and timed representations into valid Calendar spa
   const v1Timed = toCalendarEvent({ id: "task-v1", content: "Timed v1", due: { date: "2026-09-01T09:30:00Z", timezone: "Europe/London" } });
   assert.equal(v1Timed.start.dateTime, "2026-09-01T09:30:00Z");
   assert.equal(v1Timed.start.date, undefined);
+});
+
+test("renders Todoist Markdown links as labels in Calendar titles", () => {
+  const task = {
+    id: "task-link",
+    content: "Review [BBC News](https://www.bbc.co.uk/news) with [Antonio](mailto:antonio@example.com)",
+    due: { date: "2026-10-06" },
+  };
+  const calendar = toCalendarEvent(task);
+  assert.equal(calendar.summary, "Review BBC News with Antonio");
+  assert.equal(calendar.extendedProperties.shared.originalSummary, task.content);
+
+  const bareUrl = toCalendarEvent({
+    id: "task-bare-url",
+    content: "Visit https://example.com directly",
+    due: { date: "2026-10-06" },
+  });
+  assert.equal(bareUrl.summary, "Visit https://example.com directly");
+});
+
+test("filtered Calendar titles stay canonical without destroying the Todoist link", () => {
+  const task = {
+    id: "task-link-roundtrip",
+    content: "Read [release notes](https://example.com/releases/1)",
+    description: "Before deployment",
+    due: { date: "2026-10-06" },
+  };
+  const calendar = toCalendarEvent(task);
+
+  assert.equal(hasCanonicalState(calendar, task), true);
+
+  const moved = toTodoistTask({ ...calendar, start: { date: "2026-10-07" } }, task);
+  assert.equal(moved.content, task.content);
+  assert.deepEqual(moved.due, { date: "2026-10-07" });
+
+  const renamed = toTodoistTask({ ...calendar, summary: "Read release notes urgently" }, task);
+  assert.equal(renamed.content, "Read release notes urgently");
 });
 
 test("rejects undated Todoist tasks from Calendar projection", () => {
