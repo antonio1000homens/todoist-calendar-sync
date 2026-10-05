@@ -1,6 +1,6 @@
 import { GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
-import { normalizedText } from "./security.js";
+import { normalizedText, todoistCalendarTitle } from "./security.js";
 import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 
 export type CanonicalIdentitySide = "calendar" | "todoist";
@@ -69,7 +69,7 @@ export function calendarCanonicalIdentity(event: CalendarEvent): CanonicalIdenti
 }
 
 export function todoistCanonicalIdentityFromFields(content: string | undefined, due: CanonicalTodoistDue | null | undefined): CanonicalIdentity | undefined {
-  const title = normalizedText(content).toLowerCase();
+  const title = todoistCalendarTitle(content).toLowerCase();
   const dateTime = due?.datetime || (due?.date?.includes("T") ? due.date : undefined);
   const date = due?.date;
   if (!title || (!date && !dateTime)) return undefined;
