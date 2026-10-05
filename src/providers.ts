@@ -324,7 +324,7 @@ export class Todoist {
       mappingRevision: revision,
       updatedAt: new Date().toISOString(),
     };
-    const mapping = existing ? recoverMappingFromProjectComment(baseMapping, existing) : baseMapping;
+    const mapping = existing && !mappingDetails ? recoverMappingFromProjectComment(baseMapping, existing) : baseMapping;
     const projectComment = await this.upsertProjectComment(
       projectId,
       serializeMappingComment(mapping, projectId, calendarUrl, revision),
