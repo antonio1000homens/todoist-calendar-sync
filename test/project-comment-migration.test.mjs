@@ -26,7 +26,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -51,7 +51,10 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead } = {})
           comments.push(created);
           return { ...created };
         },
-        async deleteComment(commentId) { deletes.push(commentId); },
+        async deleteComment(commentId) {
+          deletes.push(commentId);
+          if (deleteError) throw deleteError;
+        },
         async getTask(taskId) {
           return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId };
         },
@@ -208,4 +211,31 @@ test("tombstone blocks project-comment backfill so stale breadcrumbs cannot be i
   assert.equal(summary.projectCommentsCreated, 0);
   assert.equal(fake.creates, 0);
   assert.equal(state.saved.length, 0);
+});
+
+
+test("legacy cleanup treats an already-missing task comment as an idempotent delete", async () => {
+  const source = mapping({
+    projectCommentId: "project-comment-existing",
+    taskCommentId: "legacy-task-comment",
+    mappingRevision: 2,
+  });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const missing = new Error("already deleted");
+  missing.status = 404;
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment], deleteError: missing });
+
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+
+  assert.equal(summary.failures, 0);
+  assert.equal(summary.legacyTaskCommentsDeleted, 1);
+  assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
+  assert.equal(state.saved.length, 1);
+  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
+  assert.equal(state.saved[0].taskCommentId, undefined);
 });
