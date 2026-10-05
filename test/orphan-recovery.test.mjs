@@ -187,6 +187,20 @@ test("canonical identity treats Calendar offset time and Todoist floating wall-c
   assert.equal(sameCanonicalIdentity(calendarCanonicalIdentity(event), todoistCanonicalIdentity(task)), true);
 });
 
+test("canonical identity matches a filtered Calendar title to Todoist Markdown link content", () => {
+  const event = {
+    id: "event-link",
+    summary: "Read release notes",
+    start: { date: "2026-10-06" },
+  };
+  const task = {
+    id: "task-link",
+    content: "Read [release notes](https://example.com/releases/1)",
+    due: { date: "2026-10-06" },
+  };
+  assert.equal(sameCanonicalIdentity(calendarCanonicalIdentity(event), todoistCanonicalIdentity(task)), true);
+});
+
 test("Calendar edit re-links the unique Todoist task matching the previous canonical identity and updates it", async () => {
   const oldTask = timedTask("task-1", "School run", 8);
   const changedEvent = timedEvent("event-1", "School pickup", 15);
