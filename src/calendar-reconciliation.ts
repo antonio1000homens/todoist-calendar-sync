@@ -256,7 +256,7 @@ export async function reconcileUnmappedCalendar(
         if (historical.task) {
           if (!await canMutate()) return;
           if (await completionBlocksRecovery(event.id, true)) return;
-          task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
+          task = await pair.todoist.upsertTask(toTodoistTask(event, historical.task), historical.task.id);
           await state.recordMutation(profile);
           recoveredPreviousIdentity = true;
         }
