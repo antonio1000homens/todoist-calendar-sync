@@ -40,11 +40,11 @@ test("converts Todoist all-day and timed representations into valid Calendar spa
 test("renders Todoist Markdown links as labels in Calendar titles", () => {
   const task = {
     id: "task-link",
-    content: "Review [BBC News](https://www.bbc.co.uk/news) with [Antonio](mailto:antonio@example.com)",
+    content: "Review [BBC News](https://www.bbc.co.uk/news) with [Contact](mailto:person@example.test)",
     due: { date: "2026-10-06" },
   };
   const calendar = toCalendarEvent(task);
-  assert.equal(calendar.summary, "Review BBC News with Antonio");
+  assert.equal(calendar.summary, "Review BBC News with Contact");
   assert.equal(calendar.extendedProperties.shared.originalSummary, task.content);
 
   const bareUrl = toCalendarEvent({
