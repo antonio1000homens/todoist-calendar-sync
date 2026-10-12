@@ -1,6 +1,6 @@
 import { createSign, randomUUID } from "node:crypto";
 import { profileForTodoistProject, todoistProjectForToken } from "./config.js";
-import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, type TodoistCommentRecord } from "./mapping-comments.js";
+import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
 
 const CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3";
@@ -291,7 +291,12 @@ export class Todoist {
 
   async findLegacyTaskComment(taskId: string, eventId: string): Promise<TodoistCommentRecord | undefined> {
     const comments = await this.listTaskComments(taskId);
-    return comments.find((comment) => String(comment.content || "").includes(`calendarEventId=${eventId}`));
+    return comments.find((comment) => {
+      const lines = String(comment.content || "").split(/\r?\n/);
+      return LEGACY_TASK_COMMENT_MARKERS.has(lines[0])
+        && lines.includes(`calendarEventId=${eventId}`)
+        && (!comment.task_id || comment.task_id === taskId);
+    });
   }
 
   private legacyCommentFields(content: string): { eventId: string; calendarUrl?: string } {
@@ -346,6 +351,10 @@ export class Todoist {
     }
     const legacy = await this.findLegacyTaskComment(taskId, eventId);
     return legacy ? { id: legacy.id } : undefined;
+  }
+
+  async getComment(commentId: string): Promise<TodoistCommentRecord> {
+    return this.request<TodoistCommentRecord>(`/${encodeURIComponent(commentId)}`, {}, true);
   }
 
   async deleteComment(commentId: string): Promise<void> {

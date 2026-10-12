@@ -1,0 +1,165 @@
+name: Project comment mapping migration
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/project-comment-migration.yml]
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Profile to inspect or migrate (all is report-only)
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - home
+          - antonio
+          - work
+      operation:
+        description: Migration phase (report by default)
+        type: choice
+        required: true
+        default: report
+        options:
+          - report
+          - backfill-apply
+          - cleanup-report
+          - cleanup-apply
+      confirmation:
+        description: For writes, type BACKFILL or DELETE_VERIFIED_LEGACY_COMMENTS
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: todoist-calendar-sync-production-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      STACK_NAME: ${{ vars.STACK_NAME }}
+      SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+      SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
+      MIGRATION_PROFILE: ${{ inputs.profile || 'all' }}
+      MIGRATION_OPERATION: ${{ inputs.operation || 'report' }}
+      MIGRATION_CONFIRMATION: ${{ inputs.confirmation }}
+    steps:
+      - name: Validate migration guardrails
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME STACK_NAME SSM_PREFIX SYNC_PROFILE_CONFIG_JSON; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing production environment variable: $name" >&2
+              exit 1
+            fi
+          done
+          case "$MIGRATION_OPERATION" in
+            report|cleanup-report) ;;
+            backfill-apply)
+              [[ "$MIGRATION_PROFILE" != all && "$MIGRATION_CONFIRMATION" == BACKFILL ]] || {
+                echo 'Backfill writes require one profile and confirmation BACKFILL' >&2
+                exit 1
+              } ;;
+            cleanup-apply)
+              [[ "$MIGRATION_PROFILE" != all && "$MIGRATION_CONFIRMATION" == DELETE_VERIFIED_LEGACY_COMMENTS ]] || {
+                echo 'Legacy deletion requires one profile and exact confirmation DELETE_VERIFIED_LEGACY_COMMENTS' >&2
+                exit 1
+              } ;;
+            *) exit 2 ;;
+          esac
+
+      - uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and test migration revision
+        run: npm test
+
+      - name: Authenticate to production AWS
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: github-actions-project-comment-migration
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve production DynamoDB and credential prefixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          state_table="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SyncState \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+          {
+            echo "STATE_TABLE_NAME=$state_table"
+            echo "GOOGLE_CREDENTIALS_PARAMETER_PREFIX=${SSM_PREFIX%/}/google"
+            echo "TODOIST_TOKEN_PARAMETER_PREFIX=${SSM_PREFIX%/}/todoist"
+          } >> "$GITHUB_ENV"
+
+      - name: Report, backfill, or clean up verified mapping comments
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=("$MIGRATION_PROFILE")
+          case "$MIGRATION_OPERATION" in
+            report) ;;
+            backfill-apply) args+=(--apply) ;;
+            cleanup-report) args+=(--cleanup-legacy) ;;
+            cleanup-apply) args+=(--cleanup-legacy --apply) ;;
+          esac
+          npm run migrate:project-comments -- "${args[@]}" | tee project-comment-migration-results.json
+
+      - name: Summarise migration results
+        if: always()
+        shell: bash
+        run: |
+          echo '## Project comment migration' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Profile: **$MIGRATION_PROFILE**; operation: **$MIGRATION_OPERATION**" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f project-comment-migration-results.json ]]; then
+            node - <<'NODE' >> "$GITHUB_STEP_SUMMARY"
+          const fs = require('node:fs');
+          const text = fs.readFileSync('project-comment-migration-results.json', 'utf8');
+          const match = text.match(/\{\s*"mode":\s*"(report|apply)"[\s\S]*\}\s*$/);
+          if (!match) {
+            console.log('The runner did not produce a parsable summary; inspect workflow logs.');
+            process.exit(0);
+          }
+          const result = JSON.parse(match[0]);
+          const columns = ['mappingsScanned','projectCommentsMissing','projectCommentsCreated','legacyTaskCommentsFound','legacyTaskCommentsCleanupEligible','legacyTaskCommentsDeleted','legacyTaskCommentsAlreadyMissing','legacyTaskCommentsCleanupRejected','duplicateProjectComments','missingTasks','missingCalendarEvents','tombstonedMappings','failures'];
+          console.log('| Profile | ' + columns.join(' | ') + ' |');
+          console.log('| --- | ' + columns.map(() => '---:').join(' | ') + ' |');
+          for (const [profile, info] of Object.entries(result.results || {})) {
+            console.log('| ' + profile + ' | ' + columns.map(k => info[k] ?? 0).join(' | ') + ' |');
+          }
+          NODE
+          fi
+
+      - name: Upload sanitized migration result
+        if: always() && hashFiles('project-comment-migration-results.json') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: project-comment-migration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: project-comment-migration-results.json
+          retention-days: 14

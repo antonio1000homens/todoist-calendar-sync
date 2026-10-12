@@ -18,7 +18,6 @@ DynamoDB remains authoritative. Project comments are a recoverable provider-side
 Run the migration without `--apply`. This performs no project-comment or DynamoDB mapping writes.
 
 ```bash
-cd gcp-app2-sync
 npm ci
 npm run migrate:project-comments -- home
 npm run migrate:project-comments -- antonio
@@ -35,9 +34,11 @@ Review at least these counters before applying:
 
 - `projectCommentsMissing`: mappings that need a v1 project comment.
 - `legacyTaskCommentsFound`: mappings currently recoverable through the legacy fallback.
+- `legacyTaskCommentsCleanupRejected`: comment IDs whose fetched task, marker or event identity did not match; these are never deleted.
+- `legacyTaskCommentsAlreadyMissing`: stale IDs removed from mapping metadata when the Todoist comment is already gone.
 - `malformedProjectComments`: v1-marked comments that could not be parsed safely.
 - `duplicateProjectComments`: ambiguous exact task/event project mappings; these are not auto-migrated unless DynamoDB already points at one canonical `projectCommentId`.
-- `missingTasks`, `missingCalendarEvents`, `tombstonedMappings`, and `projectMismatches`: stale mappings that are deliberately not backfilled.
+- `missingTasks`, `completedTasks`, `deletedTasks`, `missingCalendarEvents`, `tombstonedMappings`, and `projectMismatches`: mappings not safe to backfill. Completed Todoist tasks may retain Calendar history but must not be re-indexed as live mappings.
 - `failures`: provider/state errors that require investigation.
 
 ## Phase 2: apply
@@ -78,7 +79,7 @@ npm run migrate:project-comments -- antonio --cleanup-legacy
 npm run migrate:project-comments -- work --cleanup-legacy
 ```
 
-Review `legacyTaskCommentsCleanupEligible`, `legacyTaskCommentsDeleted`, and all validation/failure counters. Cleanup eligibility requires an exact project mapping plus a live task in the expected project, a live Calendar event, and no projection tombstone.
+Review `legacyTaskCommentsCleanupEligible`, `legacyTaskCommentsDeleted`, and all validation/failure counters. Cleanup eligibility requires an exact project mapping plus a live task in the expected project, a live Calendar event, and no projection tombstone. **Before deleting**, the runner also fetches the actual Todoist comment by ID and checks its task ID, application marker, and exact Calendar event ID. A mismatched/user-authored comment is never removed. Ordinary synchronizer mapping-deletion paths use this same identity check.
 
 Then apply one profile at a time:
 
@@ -93,3 +94,12 @@ Cleanup is deliberately two-phase. If a mapping is still missing its project com
 ## Rollback
 
 Rolling back application code does not require deleting project comments. DynamoDB is still authoritative, and the migration does not remove legacy task comments. If a rollback is required, leave both comment forms in place until the old runtime has been retired again.
+
+## Production GitHub Actions entry point
+
+The [Project comment mapping migration workflow](.github/workflows/project-comment-migration.yml) runs with the production environment and GitHub OIDC role. It defaults to read-only `profile=all`, `operation=report`. Prefer this controlled runner to an ad hoc shell, because it resolves the deployed DynamoDB table and SSM credentials from the existing stack.
+
+- Backfill writes require choosing a **single** profile, `operation=backfill-apply` and typing `BACKFILL` in the confirmation field.
+- Preview safe deletion with `operation=cleanup-report` first. Production cleanup requires one profile, `operation=cleanup-apply` and exact confirmation `DELETE_VERIFIED_LEGACY_COMMENTS`.
+- After each write, run report mode again and investigate duplicates, provider mismatches, tombstones, failures and rejected comment IDs. Reports contain summary counts only.
+- Do not treat missing Todoist tasks as successful migration: completed, moved, or deleted mappings require a separate ownership/tombstone assessment, not a blind comment creation.

@@ -26,7 +26,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, completedTask = false } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -51,12 +51,20 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           comments.push(created);
           return { ...created };
         },
+        async getComment(commentId) {
+          if (getError) throw getError;
+          return legacyComment ? { ...legacyComment } : {
+            id: commentId,
+            task_id: "task-1",
+            content: "todoist-calendar-sync\ncalendarEventId=event-1",
+          };
+        },
         async deleteComment(commentId) {
           deletes.push(commentId);
           if (deleteError) throw deleteError;
         },
         async getTask(taskId) {
-          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId };
+          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId, is_completed: completedTask };
         },
       },
       calendar: {
@@ -228,14 +236,77 @@ test("legacy cleanup treats an already-missing task comment as an idempotent del
   const missing = new Error("already deleted");
   missing.status = 404;
   const state = new FakeState();
-  const fake = fakeClients({ projectComments: [projectComment], deleteError: missing });
+  const fake = fakeClients({ projectComments: [projectComment], getError: missing });
 
   const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
 
   assert.equal(summary.failures, 0);
-  assert.equal(summary.legacyTaskCommentsDeleted, 1);
-  assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
+  assert.equal(summary.legacyTaskCommentsDeleted, 0);
+  assert.equal(summary.legacyTaskCommentsAlreadyMissing, 1);
+  assert.deepEqual(fake.deletes, []);
   assert.equal(state.saved.length, 1);
   assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
   assert.equal(state.saved[0].taskCommentId, undefined);
+});
+
+
+test("cleanup rejects a stored ID pointing to a user-authored comment", async () => {
+  const source = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "human-comment", mappingRevision: 2 });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment], legacyComment: { id: "human-comment", task_id: "task-1", content: "Important note written by a person" } });
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+  assert.equal(summary.legacyTaskCommentsCleanupRejected, 1);
+  assert.equal(summary.legacyTaskCommentsDeleted, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.equal(state.saved.length, 0);
+});
+
+test("cleanup rejects a legacy comment belonging to another task or event", async () => {
+  const source = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "wrong-comment", mappingRevision: 2 });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  for (const legacyComment of [
+    { id: "wrong-comment", task_id: "someone-else", content: "todoist-calendar-sync\ncalendarEventId=event-1" },
+    { id: "wrong-comment", task_id: "task-1", content: "todoist-calendar-sync\\ncalendarEventId=another-event" },
+  ]) {
+    const state = new FakeState();
+    const fake = fakeClients({ projectComments: [projectComment], legacyComment });
+    const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+    assert.equal(summary.legacyTaskCommentsCleanupRejected, 1);
+    assert.equal(summary.legacyTaskCommentsDeleted, 0);
+    assert.deepEqual(fake.deletes, []);
+    assert.equal(state.saved.length, 0);
+  }
+});
+
+
+test("backfill and cleanup must skip completed tasks whose Calendar history survives", async () => {
+  const source = mapping({ commentId: "old-task-comment" });
+  const state = new FakeState();
+  const fake = fakeClients({ completedTask: true });
+  const backfill = await migrateProjectComments("home", [source], state, fake.clients, true);
+  assert.equal(backfill.completedTasks, 1);
+  assert.equal(backfill.projectCommentsCreated, 0);
+  assert.equal(fake.creates, 0);
+  assert.deepEqual(state.saved, []);
+
+  const indexed = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "old-task-comment" });
+  const projectComment = {
+    id: indexed.projectCommentId,
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(indexed, profiles.home.todoistProjectId),
+  };
+  const cleanupClients = fakeClients({ projectComments: [projectComment], completedTask: true });
+  const cleanup = await migrateProjectComments("home", [indexed], new FakeState(), cleanupClients.clients, true, true);
+  assert.equal(cleanup.completedTasks, 1);
+  assert.equal(cleanup.legacyTaskCommentsCleanupEligible, 0);
+  assert.deepEqual(cleanupClients.deletes, []);
 });

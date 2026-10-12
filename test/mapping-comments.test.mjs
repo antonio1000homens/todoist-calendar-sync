@@ -5,6 +5,7 @@ import {
   MAPPING_COMMENT_MARKER,
   attachProjectCommentReference,
   buildProjectMappingIndex,
+  deleteMappingComments,
   findProjectMappingComment,
   parseMappingComment,
   serializeMappingComment,
@@ -253,4 +254,35 @@ test("Todoist mapping write respects explicit recurrence metadata clears", async
   assert.equal(parsed.payload.activeInstanceId, undefined);
   assert.equal(parsed.payload.originalStart, undefined);
   assert.equal(parsed.payload.activeEffectiveStart, undefined);
+});
+
+
+test("deleteMappingComments never deletes a user-authored or unrelated provider comment", async () => {
+  const source = mapping({ projectCommentId: "project", taskCommentId: "task" });
+  const deleted = [];
+  const client = {
+    async getComment(id) {
+      return id === "project"
+        ? { id, project_id: "project-home", content: "Notes by a person" }
+        : { id, task_id: "task-1", content: "Private task notes" };
+    },
+    async deleteComment(id) { deleted.push(id); },
+  };
+  await deleteMappingComments(client, source);
+  assert.deepEqual(deleted, []);
+});
+
+test("deleteMappingComments deletes only identity-matched project and task breadcrumbs", async () => {
+  const source = mapping({ projectCommentId: "project", taskCommentId: "task" });
+  const deleted = [];
+  const client = {
+    async getComment(id) {
+      return id === "project"
+        ? { id, project_id: "project-home", content: serializeMappingComment(source, "project-home") }
+        : { id, task_id: "task-1", content: "todoist-calendar-sync\ncalendarEventId=event-1" };
+    },
+    async deleteComment(id) { deleted.push(id); },
+  };
+  await deleteMappingComments(client, source);
+  assert.deepEqual(deleted, ["project", "task"]);
 });

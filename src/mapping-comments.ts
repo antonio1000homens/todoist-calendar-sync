@@ -2,6 +2,8 @@ import type { Mapping, Profile } from "./types.js";
 
 export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v1";
 export const LEGACY_MAPPING_COMMENT_MARKER = "gcp-app2-sync:mapping:v1";
+/** Historical task-comment identities are accepted only for migration/cleanup. */
+export const LEGACY_TASK_COMMENT_MARKERS = new Set<string>(["gcp-app2-sync", "todoist-calendar-sync"]);
 const ACCEPTED_MAPPING_COMMENT_MARKERS = new Set([MAPPING_COMMENT_MARKER, LEGACY_MAPPING_COMMENT_MARKER]);
 const VALID_PROFILES = new Set<Profile>(["home", "antonio", "work"]);
 
@@ -55,6 +57,7 @@ export interface ProjectCommentClient {
   upsertProjectComment(projectId: string, content: string, existingId?: string): Promise<TodoistCommentRecord>;
   findLegacyTaskComment(taskId: string, eventId: string): Promise<TodoistCommentRecord | undefined>;
   deleteComment(commentId: string): Promise<void>;
+  getComment(commentId: string): Promise<TodoistCommentRecord>;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -286,8 +289,32 @@ export async function upsertProjectMappingComment(
   return migrated;
 }
 
+export function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, mapping: Mapping): boolean {
+  const lines = String(comment.content || "").split(/\r?\n/);
+  return comment.task_id === mapping.taskId
+    && LEGACY_TASK_COMMENT_MARKERS.has(lines[0])
+    && lines.includes(`calendarEventId=${mapping.eventId}`);
+}
+
+/** Delete only comments whose provider payload proves they belong to this mapping. */
 export async function deleteMappingComments(client: ProjectCommentClient, mapping: Mapping): Promise<void> {
   const ids = mappingCommentIds(mapping);
-  if (ids.project) await client.deleteComment(ids.project).catch(() => undefined);
-  if (ids.legacyTask && ids.legacyTask !== ids.project) await client.deleteComment(ids.legacyTask).catch(() => undefined);
+  if (ids.project) {
+    try {
+      const comment = await client.getComment(ids.project);
+      const parsed = parseMappingComment(comment);
+      if (parsed && !("error" in parsed)
+        && parsed.payload.profile === mapping.profile
+        && parsed.payload.taskId === mapping.taskId
+        && parsed.payload.eventId === mapping.eventId) {
+        await client.deleteComment(ids.project);
+      }
+    } catch { /* Missing or inaccessible provider comments must not break mapping deletion. */ }
+  }
+  if (ids.legacyTask && ids.legacyTask !== ids.project) {
+    try {
+      const comment = await client.getComment(ids.legacyTask);
+      if (isOwnedLegacyTaskMappingComment(comment, mapping)) await client.deleteComment(ids.legacyTask);
+    } catch { /* Preserve legacy best-effort deletion semantics. */ }
+  }
 }
