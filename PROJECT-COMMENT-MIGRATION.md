@@ -103,3 +103,19 @@ The [Project comment mapping migration workflow](.github/workflows/project-comme
 - Preview safe deletion with `operation=cleanup-report` first. Production cleanup requires one profile, `operation=cleanup-apply` and exact confirmation `DELETE_VERIFIED_LEGACY_COMMENTS`.
 - After each write, run report mode again and investigate duplicates, provider mismatches, tombstones, failures and rejected comment IDs. Reports contain summary counts only.
 - Do not treat missing Todoist tasks as successful migration: completed, moved, or deleted mappings require a separate ownership/tombstone assessment, not a blind comment creation.
+
+## Owner-authorized production migration commands
+
+To execute a vetted migration phase without exposing arbitrary code execution, the production workflow also accepts exact **top-level issue comments** from the repository owner on the merged safety PR [#61](https://github.com/antonio1000homens/todoist-calendar-sync/pull/61). This trigger is not enabled for other users, issues, or pull requests. The protected production environment and the same mutation guardrails still apply.
+
+Commands:
+
+- `/mapping-migrate all report` — read-only report across all profiles
+- `/mapping-migrate home backfill` — validate, then write project mappings for Home
+- `/mapping-migrate antonio backfill` — validate, then write project mappings for Antonio
+- `/mapping-migrate work backfill` — validate, then write project mappings for Work
+- Replace `backfill` with `report`, `cleanup-report`, or `cleanup-apply` for an individual profile as appropriate.
+
+Before issuing `cleanup-apply`, inspect the preceding cleanup report for mismatched identifiers, missing provider entities, tombstones and duplicates. Only verified application-owned task comments can be deleted.
+
+These commands are accepted as a single full-line value; no shell fragment, extra arguments, or other issue comment content is executed. Mutation runs are processed by the same audited, per-profile migration implementation.
