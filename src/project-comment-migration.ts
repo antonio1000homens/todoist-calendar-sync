@@ -47,6 +47,8 @@ export interface ProjectCommentMigrationSummary {
   legacyTaskCommentsAlreadyMissing: number;
   legacyTaskCommentsCleanupRejected: number;
   missingTasks: number;
+  completedTasks: number;
+  deletedTasks: number;
   missingCalendarEvents: number;
   tombstonedMappings: number;
   projectMismatches: number;
@@ -70,6 +72,8 @@ function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommen
     legacyTaskCommentsAlreadyMissing: 0,
     legacyTaskCommentsCleanupRejected: 0,
     missingTasks: 0,
+    completedTasks: 0,
+    deletedTasks: 0,
     missingCalendarEvents: 0,
     tombstonedMappings: 0,
     projectMismatches: 0,
@@ -133,6 +137,16 @@ async function validateMapping(
   } catch (error) {
     if (!providerMissing(error)) throw error;
     summary.missingTasks += 1;
+    return undefined;
+  }
+  // Completed tasks may retain Calendar history but must not be re-indexed as live mappings.
+  const taskState = task as TodoistTask & { checked?: boolean; completed_at?: string };
+  if (task.is_deleted) {
+    summary.deletedTasks += 1;
+    return undefined;
+  }
+  if (task.is_completed || taskState.checked || taskState.completed_at) {
+    summary.completedTasks += 1;
     return undefined;
   }
   if (task.project_id && task.project_id !== projectId) {
