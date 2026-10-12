@@ -26,7 +26,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -50,6 +50,14 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           const created = { id: `project-comment-${creates}`, project_id: projectId, content };
           comments.push(created);
           return { ...created };
+        },
+        async getComment(commentId) {
+          if (getError) throw getError;
+          return legacyComment ? { ...legacyComment } : {
+            id: commentId,
+            task_id: "task-1",
+            content: "todoist-calendar-sync\\ncalendarEventId=event-1",
+          };
         },
         async deleteComment(commentId) {
           deletes.push(commentId);
@@ -228,14 +236,53 @@ test("legacy cleanup treats an already-missing task comment as an idempotent del
   const missing = new Error("already deleted");
   missing.status = 404;
   const state = new FakeState();
-  const fake = fakeClients({ projectComments: [projectComment], deleteError: missing });
+  const fake = fakeClients({ projectComments: [projectComment], getError: missing });
 
   const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
 
   assert.equal(summary.failures, 0);
-  assert.equal(summary.legacyTaskCommentsDeleted, 1);
-  assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
+  assert.equal(summary.legacyTaskCommentsDeleted, 0);
+  assert.equal(summary.legacyTaskCommentsAlreadyMissing, 1);
+  assert.deepEqual(fake.deletes, []);
   assert.equal(state.saved.length, 1);
   assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
   assert.equal(state.saved[0].taskCommentId, undefined);
+});
+
+
+test("cleanup rejects a stored ID pointing to a user-authored comment", async () => {
+  const source = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "human-comment", mappingRevision: 2 });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment], legacyComment: { id: "human-comment", task_id: "task-1", content: "Important note written by a person" } });
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+  assert.equal(summary.legacyTaskCommentsCleanupRejected, 1);
+  assert.equal(summary.legacyTaskCommentsDeleted, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.equal(state.saved.length, 0);
+});
+
+test("cleanup rejects a legacy comment belonging to another task or event", async () => {
+  const source = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "wrong-comment", mappingRevision: 2 });
+  const projectComment = {
+    id: "project-comment-existing",
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
+  };
+  for (const legacyComment of [
+    { id: "wrong-comment", task_id: "someone-else", content: "todoist-calendar-sync\\ncalendarEventId=event-1" },
+    { id: "wrong-comment", task_id: "task-1", content: "todoist-calendar-sync\\ncalendarEventId=another-event" },
+  ]) {
+    const state = new FakeState();
+    const fake = fakeClients({ projectComments: [projectComment], legacyComment });
+    const summary = await migrateProjectComments("home", [source], state, fake.clients, true, true);
+    assert.equal(summary.legacyTaskCommentsCleanupRejected, 1);
+    assert.equal(summary.legacyTaskCommentsDeleted, 0);
+    assert.deepEqual(fake.deletes, []);
+    assert.equal(state.saved.length, 0);
+  }
 });
