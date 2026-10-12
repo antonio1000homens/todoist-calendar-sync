@@ -207,6 +207,7 @@ test("report mode validates a missing project mapping but never writes provider 
   assert.equal(summary.projectCommentsCreated, 0);
   assert.equal(fake.creates, 0);
   assert.equal(state.saved.length, 0);
+  assert.deepEqual(state.audits, [], "read-only report must not write audit items to DynamoDB");
 });
 
 test("tombstone blocks project-comment backfill so stale breadcrumbs cannot be introduced", async () => {
