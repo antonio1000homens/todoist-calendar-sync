@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   classifyLegacyAudit, inspectMappingIntegrity, expectedMappingKey,
@@ -96,4 +98,10 @@ test("conflict summary hashes provider identifiers and counts repeated pairs", (
   assert.equal(result[0].count, 2);
   assert.equal(result[0].fingerprint, fingerprint("task-secret", "event-secret"));
   assert.equal(JSON.stringify(result).includes("task-secret"), false);
+});
+
+
+test("production administration script parses without contacting AWS", () => {
+  const scriptPath = fileURLToPath(new URL("../scripts/audit-state-retention.mjs", import.meta.url));
+  assert.doesNotThrow(() => execFileSync(process.execPath, ["--check", scriptPath]));
 });
