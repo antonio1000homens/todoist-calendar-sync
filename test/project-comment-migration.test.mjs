@@ -56,7 +56,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           return legacyComment ? { ...legacyComment } : {
             id: commentId,
             task_id: "task-1",
-            content: "todoist-calendar-sync\\ncalendarEventId=event-1",
+            content: "todoist-calendar-sync\ncalendarEventId=event-1",
           };
         },
         async deleteComment(commentId) {
@@ -274,7 +274,7 @@ test("cleanup rejects a legacy comment belonging to another task or event", asyn
     content: serializeMappingComment(source, profiles.home.todoistProjectId, undefined, 2),
   };
   for (const legacyComment of [
-    { id: "wrong-comment", task_id: "someone-else", content: "todoist-calendar-sync\\ncalendarEventId=event-1" },
+    { id: "wrong-comment", task_id: "someone-else", content: "todoist-calendar-sync\ncalendarEventId=event-1" },
     { id: "wrong-comment", task_id: "task-1", content: "todoist-calendar-sync\\ncalendarEventId=another-event" },
   ]) {
     const state = new FakeState();
