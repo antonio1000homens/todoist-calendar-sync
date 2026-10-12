@@ -181,12 +181,16 @@ jobs:
             node - <<'NODE' >> "$GITHUB_STEP_SUMMARY"
           const fs = require('node:fs');
           const text = fs.readFileSync('project-comment-migration-results.json', 'utf8');
-          const match = text.match(/\{\s*"mode":\s*"(report|apply)"[\s\S]*\}\s*$/);
-          if (!match) {
+          // npm and DynamoDB progress logs precede the final pretty-printed
+          // migration JSON. Parse the *last* top-level summary, not an earlier
+          // single-line telemetry object with a "mode" field.
+          const marker = '{\n  "mode":';
+          const start = text.lastIndexOf(marker);
+          if (start < 0) {
             console.log('The runner did not produce a parsable summary; inspect workflow logs.');
             process.exit(0);
           }
-          const result = JSON.parse(match[0]);
+          const result = JSON.parse(text.slice(start).trim());
           const columns = ['mappingsScanned','projectCommentsMissing','projectCommentsCreated','legacyTaskCommentsFound','legacyTaskCommentsCleanupEligible','legacyTaskCommentsDeleted','legacyTaskCommentsAlreadyMissing','legacyTaskCommentsCleanupRejected','duplicateProjectComments','missingTasks','missingCalendarEvents','tombstonedMappings','failures'];
           console.log('| Profile | ' + columns.join(' | ') + ' |');
           console.log('| --- | ' + columns.map(() => '---:').join(' | ') + ' |');
