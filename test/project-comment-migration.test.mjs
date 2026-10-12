@@ -26,7 +26,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, completedTask = false } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -64,7 +64,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           if (deleteError) throw deleteError;
         },
         async getTask(taskId) {
-          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId };
+          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId, is_completed: completedTask };
         },
       },
       calendar: {
@@ -285,4 +285,28 @@ test("cleanup rejects a legacy comment belonging to another task or event", asyn
     assert.deepEqual(fake.deletes, []);
     assert.equal(state.saved.length, 0);
   }
+});
+
+
+test("backfill and cleanup must skip completed tasks whose Calendar history survives", async () => {
+  const source = mapping({ commentId: "old-task-comment" });
+  const state = new FakeState();
+  const fake = fakeClients({ completedTask: true });
+  const backfill = await migrateProjectComments("home", [source], state, fake.clients, true);
+  assert.equal(backfill.completedTasks, 1);
+  assert.equal(backfill.projectCommentsCreated, 0);
+  assert.equal(fake.creates, 0);
+  assert.deepEqual(state.saved, []);
+
+  const indexed = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "old-task-comment" });
+  const projectComment = {
+    id: indexed.projectCommentId,
+    project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(indexed, profiles.home.todoistProjectId),
+  };
+  const cleanupClients = fakeClients({ projectComments: [projectComment], completedTask: true });
+  const cleanup = await migrateProjectComments("home", [indexed], new FakeState(), cleanupClients.clients, true, true);
+  assert.equal(cleanup.completedTasks, 1);
+  assert.equal(cleanup.legacyTaskCommentsCleanupEligible, 0);
+  assert.deepEqual(cleanupClients.deletes, []);
 });
