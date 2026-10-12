@@ -3,6 +3,7 @@ import { profiles } from "./config.js";
 import {
   buildProjectMappingIndex,
   findProjectMappingComment,
+  isOwnedLegacyTaskMappingComment,
   nextProjectCommentMapping,
   recoverMappingFromProjectComment,
   upsertProjectMappingComment,
@@ -111,14 +112,6 @@ async function findLegacyComment(
   const explicit = legacyCommentId(mapping);
   if (explicit) return { id: explicit };
   return client.findLegacyTaskComment(mapping.taskId, mapping.eventId);
-}
-
-/** Never trust a stored legacy ID without verifying the actual Todoist comment. */
-function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, mapping: Mapping): boolean {
-  const lines = String(comment.content || "").split(/\r?\n/);
-  return comment.task_id === mapping.taskId
-    && ["gcp-app2-sync", "todoist-calendar-sync"].includes(lines[0])
-    && lines.includes(`calendarEventId=${mapping.eventId}`);
 }
 
 async function validateMapping(
