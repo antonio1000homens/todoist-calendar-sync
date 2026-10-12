@@ -3,7 +3,9 @@ name: Project comment mapping migration
 on:
   push:
     branches: [master]
-    paths: [.github/workflows/project-comment-migration.yml]
+    paths:
+      - .github/workflows/project-comment-migration.yml
+      - infrastructure/github-actions-migration-access.yaml
   workflow_dispatch:
     inputs:
       profile:

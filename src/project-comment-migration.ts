@@ -221,7 +221,7 @@ export async function migrateProjectComments(
               const legacyComment = await clients.todoist.getComment(explicitLegacyId);
               if (!isOwnedLegacyTaskMappingComment(legacyComment, mapping)) {
                 summary.legacyTaskCommentsCleanupRejected += 1;
-                await state.audit(profile, "project_comment_migration_legacy_cleanup_rejected", {
+                if (apply) await state.audit(profile, "project_comment_migration_legacy_cleanup_rejected", {
                   taskId: mapping.taskId,
                   legacyCommentId: explicitLegacyId,
                   reason: "comment_owner_or_mapping_identity_mismatch",
@@ -300,7 +300,7 @@ export async function migrateProjectComments(
       summary.migratedMappings += 1;
     } catch (error) {
       summary.failures += 1;
-      await state.audit(profile, "project_comment_migration_mapping_failed", {
+      if (apply) await state.audit(profile, "project_comment_migration_mapping_failed", {
         taskId: mapping.taskId,
         eventId: mapping.eventId,
         error: error instanceof Error ? error.message : String(error),
@@ -308,7 +308,7 @@ export async function migrateProjectComments(
     }
   }
 
-  await state.audit(profile, "project_comment_migration_completed", { summary });
+  if (apply) await state.audit(profile, "project_comment_migration_completed", { summary });
   return summary;
 }
 

@@ -207,6 +207,7 @@ test("report mode validates a missing project mapping but never writes provider 
   assert.equal(summary.projectCommentsCreated, 0);
   assert.equal(fake.creates, 0);
   assert.equal(state.saved.length, 0);
+  assert.deepEqual(state.audits, [], "read-only report must not write audit items to DynamoDB");
 });
 
 test("tombstone blocks project-comment backfill so stale breadcrumbs cannot be introduced", async () => {
@@ -309,4 +310,19 @@ test("backfill and cleanup must skip completed tasks whose Calendar history surv
   assert.equal(cleanup.completedTasks, 1);
   assert.equal(cleanup.legacyTaskCommentsCleanupEligible, 0);
   assert.deepEqual(cleanupClients.deletes, []);
+});
+
+
+test("cleanup report rejects a mismatched ID without writing any audit record", async () => {
+  const source = mapping({ projectCommentId: "project-comment-existing", taskCommentId: "human-comment" });
+  const projectComment = { id: source.projectCommentId, project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(source, profiles.home.todoistProjectId) };
+  const state = new FakeState();
+  const fake = fakeClients({ projectComments: [projectComment], legacyComment: {
+    id: "human-comment", task_id: "task-1", content: "A human note" } });
+  const summary = await migrateProjectComments("home", [source], state, fake.clients, false, true);
+  assert.equal(summary.legacyTaskCommentsCleanupRejected, 1);
+  assert.deepEqual(state.audits, []);
+  assert.deepEqual(state.saved, []);
+  assert.deepEqual(fake.deletes, []);
 });

@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 region="${AWS_REGION:-eu-west-2}"
 stack_name="${DEPLOYMENT_ROLE_STACK_NAME:-todoist-calendar-sync-github-actions-role}"
 e2e_access_stack_name="${E2E_ACCESS_STACK_NAME:-todoist-calendar-sync-github-actions-e2e-access}"
+migration_access_stack_name="${MIGRATION_ACCESS_STACK_NAME:-todoist-calendar-sync-github-actions-migration-access}"
 role_name="${DEPLOYMENT_ROLE_NAME:-GitHubActionsTodoistCalendarSyncDeployRole}"
 code_bucket="${CODE_BUCKET:-}"
 application_stack="${APPLICATION_STACK_NAME:-todoist-calendar-sync}"
@@ -44,6 +45,17 @@ aws cloudformation deploy \
   --region "$region" \
   --stack-name "$e2e_access_stack_name" \
   --template-file "$script_dir/github-actions-e2e-access.yaml" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+    "DeploymentRoleName=$role_name" \
+    "ResourceNamePrefix=$resource_name_prefix" \
+  >&2
+
+aws cloudformation deploy \
+  --region "$region" \
+  --stack-name "$migration_access_stack_name" \
+  --template-file "$script_dir/github-actions-migration-access.yaml" \
   --capabilities CAPABILITY_NAMED_IAM \
   --no-fail-on-empty-changeset \
   --parameter-overrides \

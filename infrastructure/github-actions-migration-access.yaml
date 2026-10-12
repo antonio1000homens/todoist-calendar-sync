@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Scoped DynamoDB state access for the production Todoist project-comment migration workflow.
+
+Parameters:
+  DeploymentRoleName:
+    Type: String
+    Default: GitHubActionsTodoistCalendarSyncDeployRole
+  ResourceNamePrefix:
+    Type: String
+    Default: todoist-calendar-sync
+
+Resources:
+  ProductionMigrationStatePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: TodoistCalendarSyncProductionMappingMigration
+      Roles:
+        - !Ref DeploymentRoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadMappingStateForMigration
+            Effect: Allow
+            Action:
+              - dynamodb:Scan
+              - dynamodb:GetItem
+            Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
+          - Sid: PersistVerifiedMappingMigration
+            Effect: Allow
+            Action:
+              - dynamodb:TransactWriteItems
+              - dynamodb:PutItem
+            Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
