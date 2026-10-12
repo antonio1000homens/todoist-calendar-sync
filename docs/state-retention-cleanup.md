@@ -31,7 +31,7 @@ Report includes family totals, 30-/90-day historical AUDIT TTL candidates older 
 
 Historical AUDIT deletion is optional and separate from the report. It:
 
-- Requires explicit --apply-audits, a literal confirmation, and a valid on-demand backup ARN.
+- Requires explicit --apply-audits, a literal confirmation, and a valid on-demand backup ARN created in the last 24 hours.
 - Verifies the supplied backup belongs to this table and is AVAILABLE, requires point-in-time recovery ENABLED, and verifies the expiresAt TTL configuration.
 - Defaults to a strict upper limit of **250** candidate deletions; a larger run must opt in with --max-deletes=N (maximum 1000).
 - Selects **only** AUDIT rows with a valid profile/action and timestamps, original **30-/90-day** TTL, still awaiting original TTL expiry, and at least **seven full days** since creation.
@@ -54,7 +54,7 @@ Review historical audit classification, per-action counts, repeated conflict pai
 
 ## Optional production audit deletion (separate, explicit approval)
 
-Create an on-demand backup and ensure it is AVAILABLE. Confirm DynamoDB point-in-time recovery is enabled.
+Create a fresh on-demand backup within the preceding 24 hours and ensure it is AVAILABLE. Confirm DynamoDB point-in-time recovery is enabled.
 
 ~~~bash
 export BACKUP_ARN="$(aws dynamodb create-backup \
