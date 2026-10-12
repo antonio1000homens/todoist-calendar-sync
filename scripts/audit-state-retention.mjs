@@ -64,6 +64,11 @@ async function verifyBackup() {
     || backup.BackupDescription?.SourceTableDetails?.TableName !== tableName) {
     throw new Error("Supplied backup is not AVAILABLE or does not belong to this table");
   }
+  const backupDate = backup.BackupDescription?.BackupDetails?.BackupCreationDateTime;
+  const backupMs = backupDate instanceof Date ? backupDate.getTime() : Date.parse(String(backupDate));
+  if (!Number.isFinite(backupMs) || backupMs > Date.now() || Date.now() - backupMs > 24 * 60 * 60 * 1000) {
+    throw new Error("The on-demand backup must have been created within the last 24 hours");
+  }
   if (recovery.ContinuousBackupsDescription?.PointInTimeRecoveryDescription?.PointInTimeRecoveryStatus !== "ENABLED") {
     throw new Error("Point-in-time recovery must be ENABLED before deletion");
   }
