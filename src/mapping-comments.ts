@@ -55,6 +55,7 @@ export interface ProjectCommentClient {
   upsertProjectComment(projectId: string, content: string, existingId?: string): Promise<TodoistCommentRecord>;
   findLegacyTaskComment(taskId: string, eventId: string): Promise<TodoistCommentRecord | undefined>;
   deleteComment(commentId: string): Promise<void>;
+  getComment(commentId: string): Promise<TodoistCommentRecord>;
 }
 
 function nonEmptyString(value: unknown): value is string {
