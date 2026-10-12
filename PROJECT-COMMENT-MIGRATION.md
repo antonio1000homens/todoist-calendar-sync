@@ -38,7 +38,7 @@ Review at least these counters before applying:
 - `legacyTaskCommentsAlreadyMissing`: stale IDs removed from mapping metadata when the Todoist comment is already gone.
 - `malformedProjectComments`: v1-marked comments that could not be parsed safely.
 - `duplicateProjectComments`: ambiguous exact task/event project mappings; these are not auto-migrated unless DynamoDB already points at one canonical `projectCommentId`.
-- `missingTasks`, `missingCalendarEvents`, `tombstonedMappings`, and `projectMismatches`: stale mappings that are deliberately not backfilled.
+- `missingTasks`, `completedTasks`, `deletedTasks`, `missingCalendarEvents`, `tombstonedMappings`, and `projectMismatches`: mappings not safe to backfill. Completed Todoist tasks may retain Calendar history but must not be re-indexed as live mappings.
 - `failures`: provider/state errors that require investigation.
 
 ## Phase 2: apply
