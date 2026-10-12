@@ -6,6 +6,8 @@ on:
     paths:
       - .github/workflows/project-comment-migration.yml
       - infrastructure/github-actions-migration-access.yaml
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       profile:
@@ -43,6 +45,13 @@ concurrency:
 
 jobs:
   migrate:
+    # Only the repository owner can author migration commands, and only on the
+    # merged safety PR #61 (not arbitrary issues or pull requests).
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.number == 61 &&
+       github.event.comment.user.login == github.repository_owner &&
+       startsWith(github.event.comment.body, '/mapping-migrate '))
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 45
@@ -55,7 +64,36 @@ jobs:
       MIGRATION_PROFILE: ${{ inputs.profile || 'all' }}
       MIGRATION_OPERATION: ${{ inputs.operation || 'report' }}
       MIGRATION_CONFIRMATION: ${{ inputs.confirmation }}
+      MIGRATION_REQUEST: ${{ github.event.comment.body || '' }}
     steps:
+      - name: Resolve owner-issued migration command
+        if: github.event_name == 'issue_comment'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$MIGRATION_REQUEST" == '/mapping-migrate all report' ]]; then
+            profile=all
+            operation=report
+          elif [[ "$MIGRATION_REQUEST" =~ ^/mapping-migrate[[:space:]]+(home|antonio|work)[[:space:]]+(report|backfill|cleanup-report|cleanup-apply)$ ]]; then
+            profile="${BASH_REMATCH[1]}"
+            operation="${BASH_REMATCH[2]}"
+          else
+            echo 'Unrecognized production migration command' >&2
+            exit 2
+          fi
+          confirmation=''
+          if [[ "$operation" == backfill ]]; then
+            operation=backfill-apply
+            confirmation=BACKFILL
+          elif [[ "$operation" == cleanup-apply ]]; then
+            confirmation=DELETE_VERIFIED_LEGACY_COMMENTS
+          fi
+          {
+            printf 'MIGRATION_PROFILE=%s\n' "$profile"
+            printf 'MIGRATION_OPERATION=%s\n' "$operation"
+            printf 'MIGRATION_CONFIRMATION=%s\n' "$confirmation"
+          } >> "$GITHUB_ENV"
+
       - name: Validate migration guardrails
         shell: bash
         run: |
