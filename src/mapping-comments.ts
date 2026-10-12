@@ -2,6 +2,8 @@ import type { Mapping, Profile } from "./types.js";
 
 export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v1";
 export const LEGACY_MAPPING_COMMENT_MARKER = "gcp-app2-sync:mapping:v1";
+/** Historical task-comment identities are accepted only for migration/cleanup. */
+export const LEGACY_TASK_COMMENT_MARKERS = new Set<string>(["gcp-app2-sync", "todoist-calendar-sync"]);
 const ACCEPTED_MAPPING_COMMENT_MARKERS = new Set([MAPPING_COMMENT_MARKER, LEGACY_MAPPING_COMMENT_MARKER]);
 const VALID_PROFILES = new Set<Profile>(["home", "antonio", "work"]);
 
@@ -290,7 +292,7 @@ export async function upsertProjectMappingComment(
 export function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, mapping: Mapping): boolean {
   const lines = String(comment.content || "").split(/\r?\n/);
   return comment.task_id === mapping.taskId
-    && ["gcp-app2-sync", "todoist-calendar-sync"].includes(lines[0])
+    && LEGACY_TASK_COMMENT_MARKERS.has(lines[0])
     && lines.includes(`calendarEventId=${mapping.eventId}`);
 }
 
