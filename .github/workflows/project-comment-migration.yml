@@ -1,6 +1,9 @@
 name: Project comment mapping migration
 
 on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/project-comment-migration.yml]
   workflow_dispatch:
     inputs:
       profile:
@@ -47,8 +50,8 @@ jobs:
       STACK_NAME: ${{ vars.STACK_NAME }}
       SSM_PREFIX: ${{ vars.SSM_PREFIX }}
       SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
-      MIGRATION_PROFILE: ${{ inputs.profile }}
-      MIGRATION_OPERATION: ${{ inputs.operation }}
+      MIGRATION_PROFILE: ${{ inputs.profile || 'all' }}
+      MIGRATION_OPERATION: ${{ inputs.operation || 'report' }}
       MIGRATION_CONFIRMATION: ${{ inputs.confirmation }}
     steps:
       - name: Validate migration guardrails
