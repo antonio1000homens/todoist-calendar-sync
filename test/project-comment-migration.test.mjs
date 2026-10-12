@@ -265,6 +265,7 @@ test("cleanup rejects a stored ID pointing to a user-authored comment", async ()
   assert.equal(summary.legacyTaskCommentsDeleted, 0);
   assert.deepEqual(fake.deletes, []);
   assert.equal(state.saved.length, 0);
+  assert.deepEqual(state.audits, [], "cleanup report must not create rejection audit entries");
 });
 
 test("cleanup rejects a legacy comment belonging to another task or event", async () => {
