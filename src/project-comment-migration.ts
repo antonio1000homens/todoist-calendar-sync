@@ -43,6 +43,8 @@ export interface ProjectCommentMigrationSummary {
   legacyTaskCommentsFound: number;
   legacyTaskCommentsCleanupEligible: number;
   legacyTaskCommentsDeleted: number;
+  legacyTaskCommentsAlreadyMissing: number;
+  legacyTaskCommentsCleanupRejected: number;
   missingTasks: number;
   missingCalendarEvents: number;
   tombstonedMappings: number;
@@ -64,6 +66,8 @@ function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommen
     legacyTaskCommentsFound: 0,
     legacyTaskCommentsCleanupEligible: 0,
     legacyTaskCommentsDeleted: 0,
+    legacyTaskCommentsAlreadyMissing: 0,
+    legacyTaskCommentsCleanupRejected: 0,
     missingTasks: 0,
     missingCalendarEvents: 0,
     tombstonedMappings: 0,
@@ -107,6 +111,14 @@ async function findLegacyComment(
   const explicit = legacyCommentId(mapping);
   if (explicit) return { id: explicit };
   return client.findLegacyTaskComment(mapping.taskId, mapping.eventId);
+}
+
+/** Never trust a stored legacy ID without verifying the actual Todoist comment. */
+function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, mapping: Mapping): boolean {
+  const lines = String(comment.content || "").split(/\r?\n/);
+  return comment.task_id === mapping.taskId
+    && ["gcp-app2-sync", "todoist-calendar-sync"].includes(lines[0])
+    && lines.includes(`calendarEventId=${mapping.eventId}`);
 }
 
 async function validateMapping(
@@ -194,10 +206,31 @@ export async function migrateProjectComments(
         const recovered = recoverMappingFromProjectComment(mapping, projectEntry);
 
         let cleanupValidated = false;
+        let legacyCommentPresent = false;
         if (cleanupLegacy && explicitLegacyId) {
           const valid = await validateMapping(profile, projectId, mapping, state, clients, summary);
-          cleanupValidated = Boolean(valid);
-          if (cleanupValidated) summary.legacyTaskCommentsCleanupEligible += 1;
+          if (valid) {
+            try {
+              const legacyComment = await clients.todoist.getComment(explicitLegacyId);
+              if (!isOwnedLegacyTaskMappingComment(legacyComment, mapping)) {
+                summary.legacyTaskCommentsCleanupRejected += 1;
+                await state.audit(profile, "project_comment_migration_legacy_cleanup_rejected", {
+                  taskId: mapping.taskId,
+                  legacyCommentId: explicitLegacyId,
+                  reason: "comment_owner_or_mapping_identity_mismatch",
+                });
+                continue;
+              }
+              cleanupValidated = true;
+              legacyCommentPresent = true;
+              summary.legacyTaskCommentsCleanupEligible += 1;
+            } catch (error) {
+              if (!providerMissing(error)) throw error;
+              // Nothing remains to delete; remove the stale reference in apply mode.
+              cleanupValidated = true;
+              summary.legacyTaskCommentsAlreadyMissing += 1;
+            }
+          }
         }
 
         const needsNormalization = (
@@ -208,13 +241,14 @@ export async function migrateProjectComments(
           || Boolean(cleanupLegacy && cleanupValidated && mapping.taskCommentId)
         );
 
-        if (apply && cleanupLegacy && cleanupValidated && explicitLegacyId) {
+        if (apply && cleanupLegacy && cleanupValidated && explicitLegacyId && legacyCommentPresent) {
           try {
             await clients.todoist.deleteComment(explicitLegacyId);
+            summary.legacyTaskCommentsDeleted += 1;
           } catch (error) {
             if (!providerMissing(error)) throw error;
+            summary.legacyTaskCommentsAlreadyMissing += 1;
           }
-          summary.legacyTaskCommentsDeleted += 1;
         }
 
         if (apply && needsNormalization) {
