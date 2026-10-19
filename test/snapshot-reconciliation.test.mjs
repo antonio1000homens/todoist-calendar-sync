@@ -72,12 +72,16 @@ class FakeState {
     this.mapping = mapping;
     this.tombstones = new Map();
     this.completedProjections = new Map();
+    this.eventMappings = new Map();
     this.audits = [];
     this.operations = [];
   }
   async getMode() { return "aws"; }
   async getMappingByTask(profile, taskId) {
     return this.mapping?.profile === profile && this.mapping?.taskId === taskId ? this.mapping : undefined;
+  }
+  async getMappingByEvent(profile, eventId) {
+    return this.eventMappings.get(`${profile}:${eventId}`);
   }
   async putMapping(mapping) {
     this.mapping = mapping;
@@ -446,4 +450,46 @@ test("keeps a cancelled legacy projection blocked until project-exit reset evide
   await makeReconciler({ state, store, clients, repairs }).reconcile("home");
   assert.equal(repairs.length, 1);
   assert.equal(repairs[0].event_data_extra.old_item.project_id, "reconcile-unmapped");
+});
+
+test("unmapped canonical task restores a missing TASK index from an existing exact EVENT owner without provider writes", async () => {
+  const t = task();
+  const e = event();
+  const oldMapping = mapping();
+  const state = new FakeState();
+  state.eventMappings.set("home:event-1", oldMapping);
+  const store = new FakeStore();
+  const clients = fakeClients({
+    listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]),
+  });
+  const repairs = [];
+  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  assert.equal(result.counts.baseline, 1);
+  assert.equal(state.mapping.taskId, t.id);
+  assert.equal(state.mapping.eventId, e.id);
+  assert.ok(store.baselines.get(`home:${t.id}`));
+  assert.equal(repairs.length, 0);
+  assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(clients.metrics.todoistUpdates.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_mapping_indices_restored"));
+  // A later run sees a mapped task and does not create another projection.
+  store.mappings.push(state.mapping);
+  await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  assert.equal(repairs.length, 0);
+});
+
+test("unmapped recovery will not steal a Calendar event owned by another Todoist task", async () => {
+  const t = task();
+  const e = event();
+  const state = new FakeState();
+  state.eventMappings.set("home:event-1", { ...mapping(), taskId: "other-task" });
+  const store = new FakeStore();
+  const clients = fakeClients({
+    listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]),
+  });
+  const repairs = [];
+  await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  assert.equal(state.mapping, undefined);
+  assert.equal(repairs.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_mapping_owner_conflict"));
 });
