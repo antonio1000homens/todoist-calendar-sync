@@ -18,6 +18,17 @@ export interface FutureSeriesSplitPlan {
   previousOccurrence: string;
   nextOldOccurrence: string;
   newStart: string;
+  calendarTimeZone?: string;
+  approvedAt?: string;
+}
+export function calendarLocalDay(now: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone, day: "2-digit", month: "2-digit", year: "numeric",
+  }).formatToParts(now);
+  const take = (type: string) => parts.find((part) => part.type === type)?.value;
+  const date = `${take("year")}-${take("month")}-${take("day")}`;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Calendar local date could not be determined");
+  return date;
 }
 function day(value: string): number {
   const stamp = Date.parse(value + "T00:00:00Z");
@@ -42,6 +53,7 @@ export function planFutureSeriesSplit(
   task: TodoistTask,
   old: CalendarEvent,
   now = new Date(),
+  timeZone = "UTC",
 ): FutureSeriesSplitPlan {
   if (old.status !== "confirmed" || !old.etag || !old.id || old.recurringEventId) {
     throw new Error("A live recurring master with a stable ETag is required");
@@ -59,7 +71,7 @@ export function planFutureSeriesSplit(
     throw new Error("Existing Calendar series does not prove this Todoist task's identity");
   }
   const start = old.start.date;
-  const startMs = day(start), today = now.toISOString().slice(0, 10);
+  const startMs = day(start), today = calendarLocalDay(now, timeZone);
   const due = task.due.date;
   day(due);
   if (day(due) < day(today)) throw new Error("The new Todoist occurrence is in the past");
@@ -101,6 +113,7 @@ export function planFutureSeriesSplit(
     oldMasterId: old.id, oldEtag: old.etag, newMasterId,
     originalRule, truncatedRule, newRule,
     previousOccurrence: previous, nextOldOccurrence: upcoming, newStart: due,
+    calendarTimeZone: timeZone, approvedAt: now.toISOString(),
   };
 }
 
