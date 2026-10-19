@@ -134,6 +134,34 @@ export class GoogleCalendar {
     return selectLinkedCalendarEvent(taskId, [...found.values()]);
   }
 
+  /**
+   * Read actual Calendar occurrences around a due date, including instances
+   * of older recurring masters. A shared task-ID lookup alone cannot discover
+   * an independently created duplicate series.
+   */
+  async listOccurrencesInWindow(start: string, end: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      singleEvents: "true",
+      showDeleted: "false",
+      maxResults: "2500",
+      timeMin: start,
+      timeMax: end,
+    });
+    const found = new Map<string, CalendarEvent>();
+    for (let page = 0; page < 20; page += 1) {
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const event of response.items || []) {
+        found.set(event.id, event);
+        if (found.size > 10000) throw new Error("Calendar duplicate discovery exceeded candidate limit");
+      }
+      if (!response.nextPageToken) return [...found.values()];
+      query.set("pageToken", response.nextPageToken);
+    }
+    throw new Error("Calendar duplicate discovery exceeded page limit");
+  }
+
   async getEvent(eventId: string): Promise<CalendarEvent> {
     return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`);
   }
