@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyApprovedFutureSeriesSplit } from "../dist/future-split-execution.js";
+import { planFutureSeriesSplit } from "../dist/recurrence-split.js";
 import { profiles } from "../dist/config.js";
 
 const original = () => ({
@@ -207,4 +208,104 @@ test("competing task, calendar master, ownership or tombstone each blocks before
     assert.deepEqual(f.calls, []);
     assert.equal(f.created, 0);
   }
+});
+
+test("an explicit exception in a distant future year blocks the split before Calendar mutations", async () => {
+  const f = fixture();
+  f.pair.calendar.listExplicitSeriesExceptions = async () => [{
+    id: "old-may-master_20490503", recurringEventId: "old-may-master",
+    originalStartTime: { date: "2049-05-03" }, status: "cancelled",
+  }];
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, { now: today }), /explicit Calendar recurrence exception/);
+  assert.deepEqual(f.calls, []);
+});
+
+test("future instance title-only and description-only changes are never truncated", async () => {
+  for (const field of ["summary", "description"]) {
+    const f = fixture();
+    const originalList = f.pair.calendar.listInstancesInWindow;
+    f.pair.calendar.listInstancesInWindow = async (...args) => {
+      const items = await originalList(...args);
+      return items.map((item) => item.start?.date === "2027-05-03"
+        ? { ...item, [field]: "User-customized occurrence" } : item);
+    };
+    await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+      f.events.get("old-may-master"), f.pair, f.state, { now: today }), /Upcoming old-series occurrence/);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test("Calendar instance owned by another mapping or completed history blocks before cap", async () => {
+  const f = fixture();
+  f.state.assertHistoricalSeriesUnowned = async () => {
+    throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
+  };
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, { now: today }), /instance mapping/);
+  assert.deepEqual(f.calls, []);
+});
+
+test("project mapping comments with competing owner, master or completion block first write", async () => {
+  for (const override of [
+    { recurrenceOwner: "calendar" },
+    { masterEventId: "different-master" },
+    { completedThroughOriginalStart: "2026-05-03" },
+  ]) {
+    const f = fixture();
+    const payload = {
+      schemaVersion: 1, profile: "antonio",
+      projectId: profiles.antonio.todoistProjectId,
+      taskId: "smoke-task", eventId: "old-may-master",
+      mappingRevision: 1, updatedAt: "2026-10-19T12:00:00Z", ...override,
+    };
+    f.pair.todoist.listProjectComments = async () => [{
+      id: "comment-1", content: "todoist-calendar-sync:mapping:v1\n" + JSON.stringify(payload),
+    }];
+    await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+      f.events.get("old-may-master"), f.pair, f.state, { now: today }), /project mapping comments conflict/);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test("stale Calendar ETag, adjusted cutoff or changed timezone require a new approval", async () => {
+  const f = fixture();
+  const approved = planFutureSeriesSplit("antonio", f.task, f.events.get("old-may-master"),
+    new Date("2027-05-02T10:00:00Z"), "Europe/London");
+  const opts = { now: new Date("2027-05-04T10:00:00Z"), approvedPlan: approved, approvedEtag: '"old-v1"' };
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, opts), /Approved future-series cutover changed/);
+  assert.deepEqual(f.calls, []);
+
+  f.events.get("old-may-master").etag = '"changed-etag"';
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, {
+      now: today, approvedEtag: '"old-v1"',
+    }), /ETag changed/);
+  assert.deepEqual(f.calls, []);
+
+  f.pair.calendar.getTimeZone = async () => "America/New_York";
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, {
+      now: today, approvedPlan: approved,
+    }), /timezone changed/);
+  assert.deepEqual(f.calls, []);
+});
+
+test("an interrupted split may resume across a new yearly anniversary with unchanged approved cutoff", async () => {
+  const f = fixture({ failFirstCreate: true });
+  const approved = planFutureSeriesSplit("antonio", f.task, f.events.get("old-may-master"),
+    today, "Europe/London");
+  const originalEtag = f.events.get("old-may-master").etag;
+  const options = { now: today, approvedPlan: approved, approvedEtag: originalEtag };
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, options), /Google 503/);
+  const replay = await applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, {
+      now: new Date("2027-05-04T12:00:00Z"), approvedPlan: approved,
+      approvedEtag: originalEtag,
+    });
+  assert.equal(replay.plan.previousOccurrence, "2026-05-03");
+  assert.equal(replay.resumed, true);
+  assert.equal(f.created, 1);
 });
