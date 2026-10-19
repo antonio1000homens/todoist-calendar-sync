@@ -347,3 +347,29 @@ test("resume a legacy pending decision freezes and displays an explicit series-c
   assert.equal(item.notifier.posted.length, 2);
   assert.equal(item.store.value.status, "pending");
 });
+
+test("a moved historical cutoff creates a NEW approval, never changing the original decision in place", async () => {
+  const item = setup();
+  item.events.set("event-1", {
+    ...item.events.get("event-1"), start: { date: "2025-05-03" },
+    end: { date: "2025-05-04" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-05-03";
+  const resume = () => item.service.processManualDelivery({
+    id: "resume-cutoff-change", kind: "manual", profile: "antonio", mode: "aws",
+    receivedAt: "2026-10-19T12:00:00Z", headers: {}, body: "",
+    manual: { command: "resume_decision", targetId: item.store.value.decisionId, slackChannelId: "C123" },
+  }, item.state);
+  await resume();
+  const old = item.store.value;
+  const originalPlan = old.context.futureSplitPlan;
+  old.context.futureSplitPlan = { ...originalPlan, previousOccurrence: "2025-05-03" };
+  await resume();
+  assert.equal(old.status, "stale");
+  assert.equal(item.notifier.posted.length, 2);
+  const next = item.notifier.posted[1];
+  assert.equal(next.status, "pending");
+  assert.notEqual(next.decisionId, old.decisionId);
+  assert.equal(next.context.futureSplitPlan.previousOccurrence, originalPlan.previousOccurrence);
+  assert.deepEqual(item.changes, []);
+});
