@@ -1181,8 +1181,10 @@ export class ManualInterventionService {
                   pair.todoist.getTask(taskId), pair.calendar.getEvent(eventId),
                 ]);
                 if (event.recurrence?.length) {
-                  const preview = planFutureSeriesSplit(profile, task, event);
-                  extra.futureSplitPreview = `${preview.originalRule} from ${event.start?.date}; retain through ${preview.previousOccurrence}; stop old dates from ${preview.nextOldOccurrence}; start ${preview.newStart} with ${preview.newRule}`;
+                  const calendarTimeZone = await pair.calendar.getTimeZone();
+                  const preview = planFutureSeriesSplit(profile, task, event, new Date(), calendarTimeZone);
+                  extra.futureSplitPlan = preview;
+                  extra.futureSplitPreview = `${preview.originalRule} from ${event.start?.date}; retain through ${preview.previousOccurrence}; stop old dates from ${preview.nextOldOccurrence}; start ${preview.newStart} with ${preview.newRule} (Calendar timezone ${calendarTimeZone})`;
                 }
               } catch (error) {
                 extra.futureSplitBlockedReason = error instanceof Error ? error.message : String(error);
@@ -1434,7 +1436,9 @@ export class ManualInterventionService {
     }
     if (typeof decision.context.futureSplitPreview !== "string"
       || typeof decision.context.calendarRecurrenceRule !== "string"
-      || typeof decision.context.todoistRecurrenceRule !== "string") {
+      || typeof decision.context.todoistRecurrenceRule !== "string"
+      || !decision.context.futureSplitPlan || typeof decision.context.futureSplitPlan !== "object"
+      || typeof decision.context.calendarEtag !== "string") {
       await this.notifier.updateResolution(decision,
         `A frozen recurrence cutover preview is required before approval. No provider change was made. Refresh with \`/sync resume ${decision.decisionId}\` to see the historical cutoff and new schedule.`);
       return;
@@ -1461,6 +1465,10 @@ export class ManualInterventionService {
         && normalizedText(current) !== normalizedText(decision.context[field])) {
         return refuse(`${field} changed after the original approval request. No changes made.`);
       }
+    }
+    const archived = old.extendedProperties?.shared?.syncHistoryOnly === "true";
+    if (!archived && decision.context.calendarEtag !== old.etag) {
+      return refuse("The Calendar event version changed after approval; review the new version.");
     }
     if (decision.context.todoistRecurrenceRule !== todoistRecurrenceToRrule(task)) {
       return refuse("The Todoist recurrence changed after the approved split preview.");
@@ -1818,14 +1826,15 @@ export class ManualInterventionService {
           return;
         }
         if (decision.type === "todoist_unmapped_conflict" && decision.taskId && decision.eventId
-          && typeof decision.context.futureSplitPreview !== "string") {
+          && (!decision.context.futureSplitPlan || typeof decision.context.futureSplitPreview !== "string")) {
           const pair = await this.providerClients(decision.profile);
           try {
             const [task, event] = await Promise.all([
               pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
             ]);
             if (event.recurrence?.length) {
-              const plan = planFutureSeriesSplit(decision.profile, task, event);
+              const calendarTimeZone = await pair.calendar.getTimeZone();
+              const plan = planFutureSeriesSplit(decision.profile, task, event, new Date(), calendarTimeZone);
               const current = {
                 taskTitle: task.content, calendarTitle: event.summary,
                 todoistDue: todoistDue(task), calendarStart: eventDisplayStart(event),
@@ -1842,7 +1851,8 @@ export class ManualInterventionService {
                 calendarEtag: event.etag,
                 todoistRecurrenceRule: plan.newRule,
                 calendarRecurrenceRule: plan.originalRule,
-                futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule}`,
+                futureSplitPlan: plan,
+                futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule} (Calendar timezone ${calendarTimeZone})`,
               };
               await this.store.refreshPendingContext(decision.decisionId, context);
               await this.notifier.postDecision({ ...decision, context });
