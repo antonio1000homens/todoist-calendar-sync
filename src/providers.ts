@@ -479,14 +479,30 @@ export class Todoist {
    * historical name this now writes only project comments. Existing task
    * comments are migration fallback evidence and are never updated here.
    */
-  async upsertComment(taskId: string, content: string, existingId?: string, mappingDetails?: Mapping): Promise<{ id: string }> {
+  async upsertComment(taskId: string, content: string, existingId?: string, mappingDetails?: Mapping, migrateFromEventId?: string): Promise<{ id: string }> {
     const projectId = todoistProjectForToken(this.token);
     const profile = profileForTodoistProject(projectId);
     if (!projectId || !profile) throw new Error("Todoist mapping project is not configured for this token");
     const { eventId, calendarUrl } = this.legacyCommentFields(content);
     const comments = await this.listProjectComments(projectId);
     const index = buildProjectMappingIndex(comments);
-    const existing = findProjectMappingComment(index, { taskId, eventId, projectCommentId: existingId });
+    let existing = findProjectMappingComment(index, { taskId, eventId, projectCommentId: existingId });
+    if (!existing && migrateFromEventId) {
+      // An approved series split replaces the mapping identity. Updating the
+      // same versioned project comment avoids leaving an old-master mapping
+      // breadcrumb that would later be discovered as a competing owner.
+      const oldCandidates = (index.byTaskId.get(taskId) || []).filter((item) =>
+        item.payload.eventId === migrateFromEventId
+        && item.payload.profile === profile
+        && item.payload.projectId === projectId);
+      if (oldCandidates.length > 1 || oldCandidates.some((item) =>
+        item.payload.recurrenceOwner === "calendar"
+        || item.payload.completedThroughOriginalStart
+        || item.payload.calendarProgressVersion)) {
+        throw new Error("Cannot migrate conflicting or completed historical project mapping comment");
+      }
+      existing = oldCandidates[0];
+    }
     const revision = Math.max(0, existing?.payload.mappingRevision || 0) + 1;
     const baseMapping: Mapping = {
       ...(mappingDetails || {}),
