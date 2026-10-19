@@ -20,8 +20,19 @@ const baseEvent = () => ({
 });
 
 class DecisionStore {
-  constructor(decision) { this.value = decision; }
-  async get() { return this.value; }
+  constructor(decision) {
+    this.value = decision;
+    this.decisions = new Map([[decision.decisionId, decision]]);
+  }
+  async get(id) { return this.decisions.get(id); }
+  async putPending(input) {
+    const saved = this.decisions.get(input.decisionId);
+    if (saved) return { decision: saved, created: false };
+    const decision = { ...input, status: "pending", createdAt: new Date().toISOString(),
+      decisionDeadline: "2099-03-01T00:00:00.000Z" };
+    this.decisions.set(decision.decisionId, decision);
+    return { decision, created: true };
+  }
   async finish(id, status, action) {
     assert.equal(id, this.value.decisionId);
     assert.equal(this.value.status, "pending");
@@ -30,7 +41,8 @@ class DecisionStore {
   }
 }
 class Notifier {
-  constructor() { this.messages = []; }
+  constructor() { this.messages = []; this.posted = []; }
+  async postDecision(decision) { this.posted.push(decision); }
   async updateResolution(_decision, text) { this.messages.push(text); }
   async postText(text) { this.messages.push(text); }
 }
@@ -132,7 +144,7 @@ function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefine
     mode: "aws", receivedAt: new Date().toISOString(), headers: {}, body: "",
     manual: { decisionId: decision.decisionId, action, slackUserId: "U123" },
   }, state);
-  return { state, store, notifier, tasks, events, changes, audits, run };
+  return { state, store, notifier, service, tasks, events, changes, audits, run };
 }
 
 // The only DynamoDB read in this fake-provider integration is the strongly
@@ -270,4 +282,27 @@ test("legacy persisted Ignore button remains accepted without provider mutation"
   await item.run("acknowledge");
   assert.equal(item.store.value.status, "resolved");
   assert.deepEqual(item.changes, []);
+});
+
+test("stale approval refresh creates a newly versioned decision only after provider change", async () => {
+  const item = setup();
+  item.store.value.status = "stale";
+  const resume = async () => item.service.processManualDelivery({
+    id: "manual:resume-stale", kind: "manual", profile: "antonio",
+    mode: "aws", receivedAt: new Date().toISOString(), headers: {}, body: "",
+    manual: { command: "resume_decision", targetId: item.store.value.decisionId, slackUserId: "U123" },
+  }, item.state);
+  await resume();
+  assert.equal(item.notifier.posted.length, 0, "unchanged stale approval cannot be reopened");
+  const updated = { ...item.tasks.get("task-1"), updated_at: "2026-10-19T13:00:00Z" };
+  item.tasks.set(updated.id, updated);
+  await resume();
+  assert.equal(item.notifier.posted.length, 1);
+  const refreshed = item.notifier.posted[0];
+  assert.notEqual(refreshed.decisionId, item.store.value.decisionId);
+  assert.equal(refreshed.context.todoistUpdatedAt, updated.updated_at);
+  assert.equal(refreshed.status, "pending");
+  assert.equal(item.store.value.status, "stale", "old approval remains terminal");
+  await resume();
+  assert.equal(item.notifier.posted.length, 1, "same revision must not issue duplicate approvals");
 });
