@@ -7,7 +7,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient as client } from "./dynamodb-capacity.js";
+import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
@@ -363,6 +363,50 @@ export class StateRepository {
         { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
+  }
+
+  /**
+   * Historical ownership is not necessarily indexed by the Calendar master:
+   * Calendar-owned recurrences put EVENT mappings on individual instances.
+   * Refuse if any profile owns the master/instances, an old series link exists,
+   * or completed history anywhere refers to that master.
+   */
+  async assertHistoricalSeriesUnowned(masterEventId: string, instanceIds: string[]): Promise<void> {
+    const ids = new Set([masterEventId, ...instanceIds]);
+    if (ids.size > 1000) throw new Error("Too many historical occurrences for guarded ownership inventory");
+    for (const profile of allProfiles) {
+      const [mappings, links] = await Promise.all([
+        this.listMappings(profile), this.listRecurrenceLinks(profile),
+      ]);
+      if (mappings.some((mapping) =>
+        ids.has(mapping.eventId) || mapping.masterEventId === masterEventId
+        || (mapping.activeInstanceId && ids.has(mapping.activeInstanceId)))) {
+        throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
+      }
+      if (links.some((link) =>
+        link.masterEventId === masterEventId || ids.has(link.eventId)
+        || (link.activeInstanceId && ids.has(link.activeInstanceId)))) {
+        throw new Error("An existing recurrence link owns the old Calendar master/instances");
+      }
+      for (const id of ids) {
+        if (await this.getCompletedCalendarProjectionByEvent(profile, id)) {
+          throw new Error("A historical Calendar instance is referenced by completed task history");
+        }
+      }
+    }
+    // Detect *other-task* completion records for instance IDs no longer in
+    // the finite provider window (including previously deleted exceptions).
+    const found = await pacedScan<CompletedCalendarProjection>({
+      TableName: this.ensureTable(),
+      FilterExpression: "begins_with(pk, :prefix) AND masterEventId = :master",
+      ExpressionAttributeValues: {
+        ":prefix": "COMPLETED_EVENT#", ":master": masterEventId,
+      },
+      ProjectionExpression: "pk,taskId,eventId,masterEventId",
+    }, { operation: "future_series_historical_completion_preflight" });
+    if (found.items.length) {
+      throw new Error("Another completed Calendar projection references this historical master");
+    }
   }
 
   /** One global task claim prevents concurrent splits in different profiles. */
