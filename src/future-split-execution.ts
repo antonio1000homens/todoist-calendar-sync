@@ -125,6 +125,10 @@ export async function applyApprovedFutureSeriesSplit(
     && item.recurringEventId !== old.id && item.id !== old.id);
   if (conflicts.length) throw new Error("Another nearby Calendar occurrence may represent the same reminder");
 
+  // Persist the split guard BEFORE the first provider write. If the worker
+  // crashes after capping the master, hourly reconciliation and Todoist
+  // webhooks must not create a competing recurrence while this remains pending.
+  await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId);
   if (!archived) {
     const shared = { ...(old.extendedProperties?.shared || {}) };
     delete shared.taskId; // prevents old history + new master appearing as two linked identities
@@ -201,6 +205,7 @@ export async function applyApprovedFutureSeriesSplit(
       || currentLink?.masterEventId !== future.id || currentLink.taskId !== task.id) {
       throw new Error("Ownership changed during the series split");
     }
+    await state.completeFutureSeriesSplit(profile, task.id, future.id);
     return { mapping: existing, plan, resumed: true };
   }
 
@@ -226,6 +231,7 @@ export async function applyApprovedFutureSeriesSplit(
   };
   const committed = await state.putNewRecurrenceMappingIfUnowned(mapping, link);
   if (!committed) throw new Error("A concurrent mapping or tombstone claimed the task before commit");
+  await state.completeFutureSeriesSplit(profile, task.id, future.id);
   await state.audit(profile, "manual_future_series_split_applied", {
     taskId: task.id, oldMasterId: old.id, newMasterId: future.id,
     priorOccurrence: plan.previousOccurrence, newStart: plan.newStart,
