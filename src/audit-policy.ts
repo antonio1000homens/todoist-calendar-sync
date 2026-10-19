@@ -39,3 +39,37 @@ export function classifyAuditAction(action: string): AuditDisposition {
 export function auditExpiresAt(nowMs = Date.now()): number {
   return Math.floor(nowMs / 1000) + AUDIT_RETENTION_DAYS * 24 * 60 * 60;
 }
+
+/**
+ * Repeated observation of the *same* unresolved safety state needs structured
+ * CloudWatch telemetry each time, but only one short-lived retained audit row.
+ * This is deliberately limited to repeated snapshot conflicts, not manual
+ * choices, mutation failures, deletions or other significant events.
+ */
+const DEDUPED_CONFLICT_ACTIONS = new Set([
+  "todoist_snapshot_reconcile_unmapped_conflict",
+  "todoist_snapshot_reconcile_unmapped_ambiguous",
+  "todoist_snapshot_reconcile_cancelled_projection_blocked",
+  "calendar_snapshot_recurring_identity_conflict",
+  "calendar_task_link_ambiguous_conflict",
+]);
+
+export function retainedConflictIdentity(
+  action: string,
+  detail: Record<string, unknown>,
+): string | undefined {
+  if (!DEDUPED_CONFLICT_ACTIONS.has(action)) return undefined;
+  const taskId = typeof detail.taskId === "string" ? detail.taskId : "";
+  const eventId = typeof detail.eventId === "string" ? detail.eventId : "";
+  const seriesId = typeof detail.seriesId === "string" ? detail.seriesId : "";
+  if (!taskId && !eventId && !seriesId) return undefined;
+  const array = (key: string): string[] => Array.isArray(detail[key])
+    ? (detail[key] as unknown[]).filter((value): value is string => typeof value === "string").sort()
+    : [];
+  return JSON.stringify({
+    action, taskId, eventId, seriesId,
+    calendarStatus: typeof detail.calendarStatus === "string" ? detail.calendarStatus : "",
+    candidateEventIds: array("candidateEventIds"),
+    candidateTaskIds: array("candidateTaskIds"),
+  });
+}
