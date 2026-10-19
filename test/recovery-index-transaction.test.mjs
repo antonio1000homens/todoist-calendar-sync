@@ -121,3 +121,15 @@ test("transient transaction failure is not silently treated as an ownership conf
     stub.restore();
   }
 });
+
+test("same task and event IDs with newer owner version are not overwritten", async () => {
+  const stub = stubDynamo(baseMapping, {
+    "TASKOWNER#task-1": { ...baseMapping, updatedAt: "2026-09-03T20:00:00Z" },
+  });
+  try {
+    assert.equal(await new StateRepository().restoreMappingIndexesIfOwned(baseMapping), false);
+    assert.equal(stub.calls.some((x) => x.constructor.name === "TransactWriteCommand"), false);
+  } finally {
+    stub.restore();
+  }
+});
