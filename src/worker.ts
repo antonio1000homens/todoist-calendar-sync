@@ -9,7 +9,6 @@ import {
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { AmbiguousCalendarLinkError } from "./providers.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { StateRepository } from "./repository.js";
@@ -452,26 +451,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
 
-      try {
-        await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
-      } catch (error) {
-        if (!(error instanceof AmbiguousCalendarLinkError)) throw error;
-        // Fail closed instead of retrying a provider write that has no safe
-        // uniquely linked Calendar event. This delivery has been assessed; a
-        // later snapshot or explicit user decision can resolve the conflict.
-        await state.audit(delivery.profile, "calendar_task_link_ambiguous_conflict", {
-          taskId: error.taskId,
-          candidateEventIds: error.eventIds,
-          deliveryId: delivery.id,
-        });
-        await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
-        log("calendar_task_link_ambiguous_deferred", {
-          ...deliverySummary(delivery),
-          taskId: error.taskId,
-          candidateEventIds: error.eventIds,
-        });
-        continue;
-      }
+      // An ambiguous linked Calendar identity is not resolved by this delivery.
+      // Let the existing failure/retry/quarantine flow retain the original
+      // payload (including deletes), rather than acknowledging lost work.
+      await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
 
       if (delivery.kind === "calendar" || delivery.kind === "todoist") {
         const baselineRecovery = delivery.kind === "calendar" && !hadCalendarToken;
