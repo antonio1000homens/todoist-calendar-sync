@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   DeleteCommand,
   GetCommand,
@@ -7,7 +8,7 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
-import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
+import { auditExpiresAt, classifyAuditAction, retainedConflictIdentity } from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
@@ -671,16 +672,31 @@ export class StateRepository {
     logEvent(action, { profile, auditClass: disposition, ...safeDetail }, "state-repository");
     if (disposition === "routine") return;
 
-    await client.send(new PutCommand({
-      TableName: this.ensureTable(),
-      Item: {
-        ...key(`AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`),
-        action,
-        detail: safeDetail,
-        createdAt: now(),
-        expiresAt: auditExpiresAt(),
-      },
-    }));
+    const fingerprint = retainedConflictIdentity(action, safeDetail);
+    const auditKey = fingerprint
+      ? `AUDIT#${profile}#CONFLICT#${createHash("sha256").update(fingerprint).digest("hex")}`
+      : `AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(auditKey),
+          action,
+          detail: safeDetail,
+          createdAt: now(),
+          expiresAt: auditExpiresAt(),
+        },
+        ...(fingerprint ? {
+          ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+          ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
+        } : {}),
+      }));
+    } catch (error) {
+      // The first observation has already been retained; CloudWatch still logs
+      // every re-detection. Do not suppress any other DynamoDB write failure.
+      if (fingerprint && conditionalFailure(error)) return;
+      throw error;
+    }
   }
 
 }
