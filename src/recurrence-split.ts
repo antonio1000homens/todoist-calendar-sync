@@ -117,7 +117,9 @@ export function assertUnmodifiedHistoricalOccurrences(
     const original = instance.originalStartTime?.date || instance.start?.date;
     if (!original || !instance.start?.date || instance.status !== "confirmed"
       || instance.recurringEventId !== master.id || instance.start.date !== original
-      || normalizedText(instance.summary) !== normalizedText(master.summary)) {
+      || normalizedText(instance.summary) !== normalizedText(master.summary)
+      || normalizedText(instance.description) !== normalizedText(master.description)
+      || instance.end?.date !== new Date(Date.parse(original + "T12:00:00Z") + 86400000).toISOString().slice(0, 10)) {
       throw new Error("Historical occurrence exception or change needs separate review");
     }
   }
