@@ -10,6 +10,11 @@ import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBu
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
+import { ProjectAwareSynchronizer } from "./project-sync.js";
+import { profiles } from "./config.js";
+import { normalizedText } from "./security.js";
+import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
@@ -129,7 +134,12 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Todoist task and Calendar projection cannot be safely relinked",
     severity: "warning",
     detection: "audit_conflict",
-    actions: actions(["acknowledge", "Acknowledge — leave unchanged"], ["reconcile_now", "Retry guarded reconciliation"]),
+    actions: actions(
+      ["use_todoist_recurrence", "Use Todoist recurrence", true],
+      ["use_calendar_version", "Use Calendar version", true],
+      ["keep_separate", "Keep separate / Ignore"],
+      ["reconcile_now", "Retry guarded reconciliation"],
+    ),
   },
   todoist_cancelled_projection_blocked: {
     title: "Calendar projection was cancelled — Todoist task still exists",
@@ -544,6 +554,8 @@ function actionGuidance(decision: ManualDecision): string | undefined {
   switch (decision.type) {
     case "standalone_todoist_task_deleted":
       return "*Choose one:* Delete the Calendar event if the Todoist deletion was intentional, or restore the Todoist task if the Calendar event should remain. No provider action happens until you choose.";
+    case "todoist_unmapped_conflict":
+      return "*Choose one:* Use Todoist's recurrence, use the Calendar event's one-off date, keep the records separate, or retry checks. The two 'Use' actions require confirmation and are refused if another task or recurring Calendar series could be affected. Previously posted cards can be refreshed with `/sync resume <decision ID>`.";
     case "todoist_owned_recurrence_task_deleted":
       return "*Choose one:* Delete the Calendar series if the Todoist deletion was intentional, keep it and unlink it, or restore the Todoist task. No provider action happens until you choose.";
     case "calendar_owned_recurrence_task_deleted":
@@ -722,7 +734,10 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
     id: `bind_task:${String(candidate.id)}`,
     label: `Bind ${String(candidate.content || candidate.summary || `candidate ${index + 1}`).slice(0, 45)}`,
   }));
-  const allActions = [...decision.permittedActions, ...dynamicActions];
+  const effectiveActions = decision.type === "todoist_unmapped_conflict"
+    ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
+    : decision.permittedActions;
+  const allActions = [...effectiveActions, ...dynamicActions];
   if (allActions.length) {
     blocks.push({ type: "section", text: { type: "mrkdwn", text: actionGuidance(decision) || "*What should happen next?* Choose the proposed action. Destructive choices require confirmation." } });
   }
@@ -1545,7 +1560,10 @@ export class ManualInterventionService {
     }
     if (decision.profile !== delivery.profile) throw new Error("Manual decision profile does not match delivery profile");
 
-    const actionAllowed = decision.permittedActions.some((candidate) => candidate.id === manual.action)
+    const decisionActions = decision.type === "todoist_unmapped_conflict"
+      ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
+      : decision.permittedActions;
+    const actionAllowed = decisionActions.some((candidate) => candidate.id === manual.action)
       || manual.action.startsWith("bind_task:");
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
