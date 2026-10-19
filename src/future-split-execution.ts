@@ -126,7 +126,7 @@ export async function applyApprovedFutureSeriesSplit(
     String(comment.content || "").includes(task.id) || String(comment.content || "").includes(old.id))) {
     throw new Error("Malformed project mapping comments reference the split identity");
   }
-  if (related.some(({ payload }) => payload.profile !== profile || payload.taskId !== task.id
+  if (related.length > 1 || related.some(({ payload }) => payload.profile !== profile || payload.taskId !== task.id
     || ![old.id, plan.newMasterId].includes(payload.eventId)
     || payload.recurrenceOwner === "calendar"
     || (payload.masterEventId && ![old.id, plan.newMasterId].includes(payload.masterEventId))
@@ -279,7 +279,7 @@ export async function applyApprovedFutureSeriesSplit(
     || await pair.todoist.findComment(task.id, old.id);
   const comment = await pair.todoist.upsertComment(
     task.id, `todoist-calendar-sync\ncalendarEventId=${future.id}\ncalendarUrl=${future.htmlLink || ""}`,
-    existingComment?.id, draft,
+    existingComment?.id, draft, old.id,
   );
   const reference = existingComment?.id ? { ...draft, commentId: existingComment.id } : draft;
   const mapping = attachProjectCommentReference(reference, task.project_id!, comment.id);
