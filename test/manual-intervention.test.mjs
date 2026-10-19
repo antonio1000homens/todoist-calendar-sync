@@ -544,3 +544,49 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   assert.match(notifier.updated.at(-1).text, /Delete whole Calendar series/);
   assert.ok(notifier.updated.at(-1).blocks, 'resolved prompt should offer future policy controls');
 });
+
+test('unmapped conflict creates one stable non-destructive manual decision', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: { async getTask() { return { id: 'task-1', content: 'Renew annually', due: { date: '2027-01-01', is_recurring: true } }; } },
+      calendar: { async getEvent() { return { id: 'legacy-event', status: 'confirmed', summary: 'Renew annually', start: { date: '2027-01-01' } }; } },
+    }),
+    new FakePolicyStore(),
+  );
+  const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-1' };
+  const detail = { taskId: 'task-1', eventId: 'legacy-event' };
+  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  await service.observeAudit({ ...delivery, id: 'reconcile-2' }, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  assert.equal(notifier.posted.length, 1);
+  const decision = notifier.posted[0];
+  assert.equal(decision.type, 'todoist_unmapped_conflict');
+  assert.equal(decision.context.taskTitle, 'Renew annually');
+  assert.equal(decision.context.todoistRecurring, true);
+  assert.deepEqual(decision.permittedActions.map((action) => action.id), ['acknowledge', 'reconcile_now']);
+  assert.ok(decision.permittedActions.every((action) => !action.destructive && !action.autoAllowed));
+});
+
+test('cancelled Calendar projection conflict is a distinct manual decision type', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: { async getTask() { return { id: 'task-1', content: 'Renew annually', due: { date: '2027-01-01' } }; } },
+      calendar: { async getEvent() { return { id: 'cancelled', status: 'cancelled', summary: 'Renew annually' }; } },
+    }),
+    new FakePolicyStore(),
+  );
+  const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile' };
+  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_cancelled_projection_blocked', {
+    taskId: 'task-1', eventId: 'cancelled',
+  });
+  assert.equal(notifier.posted[0].type, 'todoist_cancelled_projection_blocked');
+  assert.equal(notifier.posted[0].context.calendarStatus, 'cancelled');
+  assert.equal(notifier.posted[0].permittedActions[0].id, 'acknowledge');
+});
