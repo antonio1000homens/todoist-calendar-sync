@@ -588,6 +588,11 @@ function contextLines(decision: ManualDecision): string[] {
   const displayCalendarTitle = calendarTitle ? escapeSlackMrkdwnText(calendarTitle) : undefined;
   const displayTaskDue = taskDue ? escapeSlackMrkdwnText(taskDue) : undefined;
   const displayCalendarStart = calendarStart ? escapeSlackMrkdwnText(calendarStart) : undefined;
+  const todoistRecurring = typeof detail.todoistRecurring === "boolean"
+    ? `*Todoist recurrence:* ${detail.todoistRecurring ? "recurring" : "not recurring"}`
+    : undefined;
+  const calendarStatus = contextString(detail, "calendarStatus");
+  const displayCalendarStatus = calendarStatus ? `*Calendar status:* ${escapeSlackMrkdwnText(calendarStatus)}` : undefined;
   const lines = [
     `*Profile:* \`${decision.profile}\``,
     sameTitle && displayTaskTitle ? `*Item:* ${displayTaskTitle}` : undefined,
@@ -595,6 +600,8 @@ function contextLines(decision: ManualDecision): string[] {
     !sameTitle && displayCalendarTitle ? `*Calendar event:* ${displayCalendarTitle}` : undefined,
     displayTaskDue ? `*Todoist due:* ${displayTaskDue}` : undefined,
     displayCalendarStart ? `*Calendar start:* ${displayCalendarStart}` : undefined,
+    todoistRecurring,
+    displayCalendarStatus,
     changeSummary(decision) ? `*What changed:* ${changeSummary(decision)}` : undefined,
     ...operationalContextLines(decision),
   ].filter(Boolean) as string[];
@@ -680,6 +687,26 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
         ...(savedDefault.destructive ? { style: "danger" } : { style: "primary" }),
       }],
     });
+  }
+  const readOnlyCandidates = Array.isArray(decision.context.readOnlyCandidates)
+    ? decision.context.readOnlyCandidates as Array<Record<string, unknown>>
+    : [];
+  if (readOnlyCandidates.length) {
+    const candidateText = readOnlyCandidates.slice(0, 8).map((candidate, index) => {
+      const kind = candidate.kind === "todoist_task" ? "Todoist task" : "Calendar event";
+      const id = escapeSlackMrkdwnText(String(candidate.id || `candidate-${index + 1}`).slice(0, 120));
+      const title = typeof candidate.title === "string" ? escapeSlackMrkdwnText(candidate.title.slice(0, 120)) : undefined;
+      const date = typeof candidate.date === "string" ? escapeSlackMrkdwnText(candidate.date.slice(0, 80)) : undefined;
+      const status = typeof candidate.status === "string" ? escapeSlackMrkdwnText(candidate.status) : undefined;
+      const recurring = typeof candidate.recurring === "boolean" ? `recurring: ${candidate.recurring ? "yes" : "no"}` : undefined;
+      const fields = [date, status, recurring].filter(Boolean);
+      const unavailable = candidate.available === false ? "details unavailable" : undefined;
+      return `${index + 1}. *${kind}:* \`${id}\`${title ? ` — ${title}` : ""}${fields.length || unavailable ? ` (${[...fields, unavailable].filter(Boolean).join("; ")})` : ""}`;
+    }).join("\n");
+    const omitted = typeof decision.context.omittedCandidateCount === "number" && decision.context.omittedCandidateCount > 0
+      ? `\n…and ${decision.context.omittedCandidateCount} more candidate(s) not fetched.`
+      : "";
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*Conflicting provider objects (read-only)*\n${candidateText}${omitted}` } });
   }
   const candidates = Array.isArray(decision.context.candidates) ? decision.context.candidates as Array<Record<string, unknown>> : [];
   if (candidates.length) {
@@ -1023,11 +1050,19 @@ export class ManualInterventionService {
     }
 
     const recurringConflict = type === "todoist_unmapped_conflict" || type === "todoist_cancelled_projection_blocked";
+    const candidateEventIds = Array.isArray(detail.candidateEventIds)
+      ? [...new Set(detail.candidateEventIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+      : [];
+    const candidateTaskIds = Array.isArray(detail.candidateTaskIds)
+      ? [...new Set(detail.candidateTaskIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+      : [];
+    const canEnrichConflict = recurringConflict
+      && Boolean(taskId || eventId || candidateEventIds.length || candidateTaskIds.length);
     await this.createDecision(
       profile,
       type,
       recurringConflict
-        ? { taskId, eventId, seriesId, category: type, candidateEventIds: detail.candidateEventIds, candidateTaskIds: detail.candidateTaskIds }
+        ? { taskId, eventId, seriesId, category: type, candidateEventIds, candidateTaskIds }
         : { action, eventId, taskId, seriesId, detail },
       {
         sourceDeliveryId: delivery.id,
@@ -1039,17 +1074,19 @@ export class ManualInterventionService {
         activeInstanceId: typeof detail.activeInstanceId === "string" ? detail.activeInstanceId : undefined,
       },
       context,
-      recurringConflict && taskId
+      canEnrichConflict
         ? async () => {
             const pair = await this.providerClients(profile);
             const extra: Record<string, unknown> = {};
-            try {
-              const task = await pair.todoist.getTask(taskId);
-              extra.taskTitle = task.content;
-              extra.todoistDue = todoistDue(task);
-              extra.todoistRecurring = Boolean(task.due?.is_recurring);
-            } catch (error) {
-              extra.taskReadError = error instanceof Error ? error.message : String(error);
+            if (taskId) {
+              try {
+                const task = await pair.todoist.getTask(taskId);
+                extra.taskTitle = task.content;
+                extra.todoistDue = todoistDue(task);
+                extra.todoistRecurring = Boolean(task.due?.is_recurring);
+              } catch (error) {
+                extra.taskReadError = error instanceof Error ? error.message : String(error);
+              }
             }
             if (eventId) {
               try {
@@ -1061,6 +1098,43 @@ export class ManualInterventionService {
                 extra.calendarReadError = error instanceof Error ? error.message : String(error);
               }
             }
+            const maxCandidateDetails = 8;
+            const targets = [
+              ...candidateEventIds.map((id) => ({ kind: "calendar_event" as const, id })),
+              ...candidateTaskIds.map((id) => ({ kind: "todoist_task" as const, id })),
+            ].filter((candidate) => candidate.id !== eventId && candidate.id !== taskId);
+            const selected = targets.slice(0, maxCandidateDetails);
+            const readOnlyCandidates: Array<Record<string, unknown>> = [];
+            for (const candidate of selected) {
+              try {
+                if (candidate.kind === "calendar_event") {
+                  const event = await pair.calendar.getEvent(candidate.id);
+                  readOnlyCandidates.push({
+                    kind: candidate.kind,
+                    id: candidate.id,
+                    title: event.summary,
+                    date: eventDisplayStart(event),
+                    status: event.status,
+                    recurring: Boolean(event.recurrence?.length || event.recurringEventId),
+                    available: true,
+                  });
+                } else {
+                  const task = await pair.todoist.getTask(candidate.id);
+                  readOnlyCandidates.push({
+                    kind: candidate.kind,
+                    id: candidate.id,
+                    title: task.content,
+                    date: todoistDue(task),
+                    recurring: Boolean(task.due?.is_recurring),
+                    available: true,
+                  });
+                }
+              } catch {
+                readOnlyCandidates.push({ kind: candidate.kind, id: candidate.id, available: false });
+              }
+            }
+            if (readOnlyCandidates.length) extra.readOnlyCandidates = readOnlyCandidates;
+            if (targets.length > selected.length) extra.omittedCandidateCount = targets.length - selected.length;
             return extra;
           }
         : undefined,
@@ -1139,6 +1213,22 @@ export class ManualInterventionService {
     const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nReconciliation: ${reconcile.coalesced ? "coalesced" : reconcile.queued ? "queued" : "pending"}`;
     const policyBlocks = slackUserId === "AUTO_POLICY" ? [] : (this.resolutionPolicyBlocks(decision, resolution) || []);
     await this.notifier.updateResolution(decision, text, decisionResolutionBlocks(decision, text, policyBlocks));
+  }
+
+  private async retryConflictReconciliation(
+    decision: ManualDecision,
+    state: StateRepository,
+  ): Promise<void> {
+    const result = await requestReconciliation(state, decision.profile, "manual");
+    const outcome = result.coalesced ? "already pending/coalesced" : result.queued ? "queued" : "pending";
+    const enqueueError = result.enqueueError ? ` Queue error: ${result.enqueueError}` : "";
+    const text = `🔄 Guarded reconciliation ${outcome}.${enqueueError} This decision remains open until reconciliation verifies that the conflict is resolved; if the conflict remains, this card stays available for review.`;
+    const blocks = decisionBlocks(decision);
+    blocks.splice(Math.max(0, blocks.length - 1), 0, {
+      type: "section",
+      text: { type: "mrkdwn", text },
+    });
+    await this.notifier.updateResolution(decision, text, blocks);
   }
 
   private async markStale(decision: ManualDecision, reason: string, slackUserId?: string): Promise<void> {
@@ -1463,7 +1553,11 @@ export class ManualInterventionService {
     this.executionClientFactory = this.createManualExecutionClientFactory(state, budget);
     try {
       if (manual.action === "reconcile_now") {
-        await this.finishAndReconcile(decision, state, manual.action, manual.slackUserId);
+        if (["todoist_unmapped_conflict", "todoist_cancelled_projection_blocked"].includes(decision.type)) {
+          await this.retryConflictReconciliation(decision, state);
+        } else {
+          await this.finishAndReconcile(decision, state, manual.action, manual.slackUserId);
+        }
         return;
       }
       if (manual.action === "acknowledge" && ["todoist_unmapped_conflict", "todoist_cancelled_projection_blocked"].includes(decision.type)) {
