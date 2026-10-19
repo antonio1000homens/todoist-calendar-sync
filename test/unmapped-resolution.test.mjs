@@ -50,3 +50,14 @@ test("date-bound occurrence lookup includes surrounding timezone days", () => {
   assert.equal(start, "2027-03-04T12:00:00.000Z");
   assert.equal(end, "2027-03-08T12:00:00.000Z");
 });
+
+test("nearby matching title with different time is conservatively treated as competing recurrence", () => {
+  const nearby = {
+    ...event, id: "another_master_20270306", summary: task.content,
+    start: { dateTime: "2027-03-06T09:00:00Z" }, end: { dateTime: "2027-03-06T09:30:00Z" },
+    recurringEventId: "another_master", extendedProperties: undefined,
+  };
+  const result = competingUnmappedIdentities(task, event, [task], [event, nearby]);
+  assert.deepEqual(result.eventIds, [nearby.id]);
+  assert.equal(result.sawTarget, true);
+});
