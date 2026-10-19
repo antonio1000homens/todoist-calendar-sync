@@ -1389,9 +1389,72 @@ export class ManualInterventionService {
     return this.finishAndReconcile(decision, state, action, slackUserId);
   }
 
+  /**
+   * A stale approval is never reopened. Operators can explicitly refresh
+   * it with /sync resume <id> after changing provider state. The new decision
+   * uses a versioned identity and requires a fresh Slack approval, while
+   * unchanged stale conflicts retain their terminal history.
+   */
+  private async refreshStaleUnmappedDecision(decision: ManualDecision): Promise<boolean> {
+    if (decision.type !== "todoist_unmapped_conflict" || !decision.taskId || !decision.eventId
+      || !decision.sourceAuditAction) return false;
+    const pair = await this.providerClients(decision.profile);
+    let task: TodoistTask;
+    let event: CalendarEvent;
+    try {
+      [task, event] = await Promise.all([
+        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
+      ]);
+    } catch (error) {
+      if (providerNotFound(error)) return false;
+      throw error;
+    }
+    const current: Record<string, unknown> = {
+      taskTitle: task.content,
+      todoistDue: todoistDue(task),
+      todoistRecurring: Boolean(task.due?.is_recurring),
+      todoistDescription: task.description || "",
+      todoistUpdatedAt: task.updated_at,
+      calendarTitle: event.summary,
+      calendarStart: eventDisplayStart(event),
+      calendarStatus: event.status,
+      calendarDescription: event.description || "",
+    };
+    const changed = Object.entries(current).some(([field, value]) =>
+      decision.context[field] !== undefined
+      && (typeof value === "string" && typeof decision.context[field] === "string"
+        ? normalizedText(value) !== normalizedText(decision.context[field])
+        : value !== decision.context[field]));
+    if (!changed) return false;
+
+    const revision = fingerprint(current);
+    const key = decisionKey(decision.profile, decision.type, {
+      priorDecisionId: decision.decisionId,
+      providerRevision: revision,
+    });
+    const result = await this.store.putPending({
+      decisionId: key.decisionId,
+      fingerprint: key.fingerprint,
+      profile: decision.profile,
+      type: decision.type,
+      severity: MANUAL_DECISION_CATALOG[decision.type].severity,
+      permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions,
+      policyMode: "prompt",
+      policyScope: decision.policyScope,
+      sourceAuditAction: decision.sourceAuditAction,
+      taskId: decision.taskId,
+      eventId: decision.eventId,
+      seriesId: decision.seriesId,
+      sourceDeliveryId: decision.sourceDeliveryId,
+      context: { ...decision.context, ...current, refreshedFromDecisionId: decision.decisionId },
+    });
+    if (result.created) await this.notifier.postDecision(result.decision);
+    return result.decision.status === "pending";
+  }
+
   private async markStale(decision: ManualDecision, reason: string, slackUserId?: string): Promise<void> {
     await this.store.finish(decision.decisionId, "stale", reason, slackUserId).catch(() => undefined);
-    await this.notifier.updateResolution(decision, `⚠️ No action was taken because this request became stale.\n${reason}`);
+    await this.notifier.updateResolution(decision, `⚠️ No action was taken because this request became stale.\n${reason}\nIf the provider objects changed, run \`/sync resume ${decision.decisionId}\` to request a new approval. The old decision will not be reopened.`);
   }
 
   private async restoreTodoistFromEvent(decision: ManualDecision, mapping: Mapping, state: StateRepository): Promise<void> {
@@ -1638,6 +1701,13 @@ export class ManualInterventionService {
         if (!manual.targetId) throw new Error("resume_decision requires a decision ID");
         const decision = await this.store.get(manual.targetId);
         if (!decision || decision.status !== "pending") {
+          if (decision?.status === "stale" && decision.type === "todoist_unmapped_conflict") {
+            const refreshed = await this.refreshStaleUnmappedDecision(decision);
+            await this.notifier.postText(refreshed
+              ? "A refreshed decision is available. The old approval remains stale."
+              : "The decision is stale and no changed provider state could be verified; no new approval was issued.", channel);
+            return;
+          }
           await this.notifier.postText(`Decision \`${manual.targetId}\` is not pending.`, channel);
           return;
         }
