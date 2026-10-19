@@ -6,7 +6,8 @@ import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
-import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { logEvent } from "./observability.js";
 import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
@@ -176,6 +177,25 @@ function isStrictlyNewer(candidate: string | undefined, baseline: string): boole
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
+}
+
+
+function unmappedMismatchCategories(event: CalendarEvent, task: TodoistTask): string[] {
+  const categories: string[] = [];
+  if (normalizedText(event.summary) !== normalizedText(task.content)) categories.push("title_mismatch");
+  if (normalizedText(event.description) !== normalizedText(task.description)) categories.push("description_mismatch");
+  if (todoistRecurrenceToRrule(task)) {
+    categories.push(calendarRecurrenceMatchesTodoist(event, task)
+      ? "recurrence_anchor_mismatch"
+      : "recurrence_mismatch");
+  } else if (!startsMatch(event, task)) {
+    categories.push("start_mismatch");
+  }
+  return categories.length ? categories.sort() : ["canonical_state_mismatch"];
+}
+
+function isResolvedConflictOutcome(outcome: ReconcileOutcome): boolean {
+  return !["conflict", "blocked", "recurring_deferred"].includes(outcome);
 }
 
 function emptyCounts(): Record<ReconcileOutcome, number> {
@@ -603,6 +623,25 @@ export class SnapshotReconciler {
       return "blocked";
     }
 
+    // A retained completed occurrence is history, never a fresh active link.
+    // Check before baseline and recovery decisions; only deletion decisions
+    // may intentionally change these terminal records.
+    if (existing && existing.status !== "cancelled") {
+      const completed = await this.completedProjection(profile, existing.id);
+      if (completed?.taskId === task.id) {
+        await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
+          taskId: task.id, eventId: existing.id, completedAt: completed.completedAt,
+        });
+        return "completed_retained";
+      }
+      if (completed) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_completed_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: completed.taskId,
+        });
+        return "conflict";
+      }
+    }
+
     if (baseline && !tombstone) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_prior_projection_without_mapping_blocked", {
         taskId: task.id,
@@ -614,8 +653,55 @@ export class SnapshotReconciler {
       await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_conflict", {
         taskId: task.id,
         eventId: existing.id,
+        mismatchCategories: unmappedMismatchCategories(existing, task),
       });
       return "conflict";
+    }
+
+    if (existing && existing.status !== "cancelled") {
+      const eventMapping = await this.state.getMappingByEvent(profile, existing.id);
+      if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: eventMapping.taskId,
+        });
+        return "conflict";
+      }
+      // Tombstones take precedence over orphaned indexes. Delegate to the
+      // established timestamp/reset policy instead of reviving an old link.
+      if (eventMapping?.taskId === task.id && !tombstone) {
+        // Never invent a recurrence link or progression state. A missing or
+        // inconsistent link needs an explicit ownership decision.
+        const link = eventMapping.recurrenceOwner && eventMapping.seriesId
+          ? await this.state.getRecurrenceLink(profile, eventMapping.seriesId)
+          : undefined;
+        if (eventMapping.recurrenceOwner && (!link
+          || link.owner !== eventMapping.recurrenceOwner
+          || link.taskId !== task.id || link.eventId !== existing.id
+          || link.profile !== eventMapping.profile || link.seriesId !== eventMapping.seriesId
+          || link.masterEventId !== eventMapping.masterEventId
+          || link.activeInstanceId !== eventMapping.activeInstanceId
+          || link.originalStart !== eventMapping.originalStart
+          || link.activeEffectiveStart !== eventMapping.activeEffectiveStart
+          || link.calendarProgressVersion !== eventMapping.calendarProgressVersion
+          || link.completedThroughOriginalStart !== eventMapping.completedThroughOriginalStart)) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_recurrence_link_conflict", {
+            taskId: task.id, eventId: existing.id, seriesId: eventMapping.seriesId,
+          });
+          return "conflict";
+        }
+        const restored = await this.state.restoreMappingIndexesIfOwned(eventMapping, link);
+        if (!restored) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_ownership_conflict", {
+            taskId: task.id, eventId: existing.id,
+          });
+          return "conflict";
+        }
+        await this.store.putBaseline(profile, task.id, task, existing);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_indices_restored", {
+          taskId: task.id, eventId: existing.id,
+        });
+        return "baseline";
+      }
     }
 
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
@@ -663,7 +749,12 @@ export class SnapshotReconciler {
       const candidates = mappings.filter((mapping) => !afterTaskId || mapping.taskId > afterTaskId);
       for (let index = 0; index < candidates.length; index += 1) {
         const mapping = candidates[index];
-        counts[await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients)] += 1;
+        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients);
+        counts[outcome] += 1;
+        if (isResolvedConflictOutcome(outcome)) {
+          const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
+          await resolve?.call(this.state, profile, { taskId: mapping.taskId });
+        }
         processedCandidates += 1;
 
         if (processedCandidates >= maxCandidates) {
@@ -682,7 +773,12 @@ export class SnapshotReconciler {
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-      counts[await this.reconcileUnmappedTask(profile, task, clients)] += 1;
+      const outcome = await this.reconcileUnmappedTask(profile, task, clients);
+      counts[outcome] += 1;
+      if (isResolvedConflictOutcome(outcome)) {
+        const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
+        await resolve?.call(this.state, profile, { taskId: task.id });
+      }
       processedCandidates += 1;
 
       if (processedCandidates >= maxCandidates && index < unmappedCandidates.length - 1) {

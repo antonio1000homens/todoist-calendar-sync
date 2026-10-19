@@ -19,7 +19,7 @@ const SAFE_BOOLEAN_KEYS = new Set([
   "continued", "pending", "success", "exhausted",
 ]);
 
-const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds)$|(?:^|_)(?:changedFields|fields)$/;
+const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|mismatchCategories)$|(?:^|_)(?:changedFields|fields)$/;
 
 function safeString(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length > 200 || /[\r\n]/.test(value) || /https?:\/\//i.test(value)) return undefined;
@@ -42,7 +42,7 @@ export function sanitizeTelemetryDetail(detail: Record<string, unknown>): Record
     } else if (SAFE_BOOLEAN_KEYS.has(key) && typeof value === "boolean") {
       safe[key] = value;
     } else if (SAFE_ARRAY_KEY_RE.test(key) && Array.isArray(value)) {
-      const fields = value.filter((item): item is string => typeof item === "string" && /^[A-Za-z0-9_.-]{1,200}$/.test(item));
+      const fields = value.filter((item): item is string => typeof item === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(item));
       if (fields.length) safe[key] = fields;
     } else if ((key === "summary" || key === "mutationBudget") && value !== null && typeof value === "object" && !Array.isArray(value)) {
       const nested = sanitizeTelemetryDetail(value as Record<string, unknown>);
