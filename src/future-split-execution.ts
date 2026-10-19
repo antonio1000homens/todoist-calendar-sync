@@ -44,12 +44,34 @@ export interface FutureSplitResult {
 export async function applyApprovedFutureSeriesSplit(
   profile: Profile, task: TodoistTask, old: CalendarEvent,
   pair: ProviderClients, state: StateRepository,
-  options: { now?: Date; expectedRule?: string; expectedDue?: string } = {},
+  options: {
+    now?: Date; expectedRule?: string; expectedDue?: string;
+    approvedPlan?: FutureSeriesSplitPlan; approvedEtag?: string;
+  } = {},
 ): Promise<FutureSplitResult> {
   const now = options.now || new Date();
-  const plan = planFutureSeriesSplit(profile, task, old, now);
-  const originalTaskId = old.extendedProperties?.shared?.syncHistoryTaskId;
+  const timeZone = await pair.calendar.getTimeZone();
   const archived = old.extendedProperties?.shared?.syncHistoryOnly === "true";
+  if (options.approvedPlan?.calendarTimeZone !== undefined
+    && options.approvedPlan.calendarTimeZone !== timeZone) {
+    throw new Error("Calendar timezone changed after approval");
+  }
+  if (!archived && options.approvedEtag && options.approvedEtag !== old.etag) {
+    throw new Error("Calendar ETag changed after the approved preview");
+  }
+  const planningDate = archived && options.approvedPlan?.approvedAt
+    ? new Date(options.approvedPlan.approvedAt) : now;
+  const plan = planFutureSeriesSplit(profile, task, old, planningDate, timeZone);
+  if (options.approvedPlan) {
+    for (const field of ["oldMasterId", "newMasterId", "originalRule", "truncatedRule",
+      "newRule", "previousOccurrence", "nextOldOccurrence", "newStart",
+      "calendarTimeZone"] as const) {
+      if (plan[field] !== options.approvedPlan[field]) {
+        throw new Error(`Approved future-series cutover changed (${field}); new approval required`);
+      }
+    }
+  }
+  const originalTaskId = old.extendedProperties?.shared?.syncHistoryTaskId;
   if (task.project_id !== profiles[profile].todoistProjectId
     || task.is_deleted || task.is_completed || task.due?.date !== plan.newStart
     || (options.expectedDue && options.expectedDue !== plan.newStart)
@@ -128,7 +150,7 @@ export async function applyApprovedFutureSeriesSplit(
   // Persist the split guard BEFORE the first provider write. If the worker
   // crashes after capping the master, hourly reconciliation and Todoist
   // webhooks must not create a competing recurrence while this remains pending.
-  await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId);
+  await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId, plan.previousOccurrence);
   if (!archived) {
     const shared = { ...(old.extendedProperties?.shared || {}) };
     delete shared.taskId; // prevents old history + new master appearing as two linked identities
