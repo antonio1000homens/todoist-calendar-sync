@@ -433,6 +433,7 @@ export class ProjectAwareSynchronizer {
     destinationProfile: Profile,
     destinationTombstone: CalendarProjectionTombstone | undefined,
     explicitProjectReentry = false,
+    destinationCandidate?: { linkedEvent: CalendarEvent | undefined },
   ): Promise<Mapping | undefined> {
     if (!await this.mutationAllowed(delivery, [destinationProfile])) {
       await this.state.audit(destinationProfile, "todoist_project_create_mutation_suppressed", { taskId: task.id, mode: delivery.mode });
@@ -455,7 +456,11 @@ export class ProjectAwareSynchronizer {
       return undefined;
     }
     const clients = await this.clients(destinationProfile);
-    let existingEvent = await clients.calendar.findByTodoistTaskId(task.id);
+    // Project moves preflight destination ambiguity before deleting the source.
+    // Reuse that result instead of doing a second identity lookup after deletion.
+    let existingEvent = destinationCandidate
+      ? destinationCandidate.linkedEvent
+      : await clients.calendar.findByTodoistTaskId(task.id);
     if (existingEvent?.status === "cancelled") existingEvent = undefined;
     const stored = existingEvent && hasCanonicalState(existingEvent, task)
       ? existingEvent
@@ -603,8 +608,15 @@ export class ProjectAwareSynchronizer {
         sourceMaster = await sourceClients.calendar.getEvent(mapping.masterEventId);
       } catch (error) {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+        // Even when the source master is missing, check destination identity
+        // *before* deleting the remaining mapping and its tombstones/comments.
+        const destinationClients = await this.clients(destinationProfile);
+        const linkedEvent = await destinationClients.calendar.findByTodoistTaskId(task.id);
         await this.removeSourceProjection(delivery, task, sourceProfile, mapping, true);
-        await this.createDestinationProjection(delivery, task, lifecycle, destinationProfile, destinationTombstone);
+        await this.createDestinationProjection(
+          delivery, task, lifecycle, destinationProfile, destinationTombstone,
+          false, { linkedEvent },
+        );
         return;
       }
       preparedDestination = await this.prepareCalendarOwnedDestinationSeries(task, destinationProfile, sourceMaster, mapping);
@@ -690,6 +702,12 @@ export class ProjectAwareSynchronizer {
       ? await this.state.getCalendarProjectionTombstone(destinationProfile, task.id)
       : undefined;
 
+    // A linked-event conflict in the destination MUST be discovered before
+    // source deletion, mapping removal, or source tombstone writes.
+    const destinationCandidate = willCreateDestination && destinationProfile
+      ? { linkedEvent: await (await this.clients(destinationProfile)).calendar.findByTodoistTaskId(task.id) }
+      : undefined;
+
     await this.removeSourceProjection(
       delivery,
       task,
@@ -708,7 +726,10 @@ export class ProjectAwareSynchronizer {
       });
     }
 
-    const nextMapping = await this.createDestinationProjection(delivery, task, lifecycle, destinationProfile, destinationTombstone);
+    const nextMapping = await this.createDestinationProjection(
+      delivery, task, lifecycle, destinationProfile, destinationTombstone,
+      false, destinationCandidate,
+    );
     if (nextMapping) {
       await this.state.audit(destinationProfile, "todoist_project_projection_moved", {
         taskId: task.id,
