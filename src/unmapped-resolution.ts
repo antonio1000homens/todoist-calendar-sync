@@ -30,13 +30,16 @@ export function competingUnmappedIdentities(
   const taskIds = todoistTasks.filter((other) => other.id !== task.id
     && title(other.content) === titleKey)
     .map((other) => other.id).sort();
+  // For competing events deliberately use a broader match than the target:
+  // a separately-created timed occurrence on the same day can represent the
+  // same annual renewal even when the Todoist task is all-day. False positives
+  // safely require operator review instead of creating another recurrence.
   const matching = nearbyOccurrences.filter((other) => other.status !== "cancelled"
-    && title(other.summary) === titleKey
-    && startsMatch(other, task));
+    && title(other.summary) === titleKey);
   return {
     taskIds: [...new Set(taskIds)],
     eventIds: [...new Set(matching.filter((other) => other.id !== target.id).map((other) => other.id))].sort(),
-    sawTarget: matching.some((other) => other.id === target.id),
+    sawTarget: matching.some((other) => other.id === target.id && startsMatch(other, task)),
   };
 }
 
