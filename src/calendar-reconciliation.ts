@@ -81,6 +81,24 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
   };
 }
 
+/**
+ * Canonical matching deliberately excludes a recurring Todoist task when
+ * considering a Calendar-owned active occurrence. That exclusion must not
+ * be interpreted as permission to create a duplicate non-recurring task.
+ * This conservative identity collision check is a guard, not a rebind.
+ */
+export function recurringTaskIdentityCandidates(event: CalendarEvent, tasks: TodoistTask[]): string[] {
+  const title = (event.summary || "").trim().toLocaleLowerCase();
+  const eventDate = (event.start?.date || event.start?.dateTime || "").slice(0, 10);
+  if (!title || !eventDate) return [];
+  return tasks
+    .filter((task) => Boolean(task.due?.is_recurring)
+      && task.content.trim().toLocaleLowerCase() === title
+      && (task.due?.date || task.due?.datetime || "").slice(0, 10) === eventDate)
+    .map((task) => task.id)
+    .sort();
+}
+
 function originalStart(event: CalendarEvent): string | undefined {
   return event.originalStartTime?.dateTime
     || event.originalStartTime?.date
@@ -337,6 +355,15 @@ export async function reconcileUnmappedCalendar(
     let task = match.task;
     let created = false;
     if (!task) {
+      const competingRecurringTaskIds = recurringTaskIdentityCandidates(active, tasks);
+      if (competingRecurringTaskIds.length) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id,
+          candidateTaskIds: competingRecurringTaskIds,
+        });
+        return;
+      }
       if (!await canMutate()) return;
       if (await completionBlocksRecovery(active.id, true)) return;
       task = await pair.todoist.upsertTask(toTodoistTask(active));
