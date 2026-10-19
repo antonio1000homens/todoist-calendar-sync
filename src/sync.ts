@@ -59,7 +59,7 @@ function localDateTime(value: string, timeZone: string): string {
   return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}:${values.second}`;
 }
 
-function startsMatch(event: CalendarEvent, task: TodoistTask): boolean {
+export function startsMatch(event: CalendarEvent, task: TodoistTask): boolean {
   const eventDateTime = event.start?.dateTime;
   const eventDate = event.start?.date;
   const dueDateTime = taskDateTime(task);
