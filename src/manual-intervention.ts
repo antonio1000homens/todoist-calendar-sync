@@ -389,6 +389,18 @@ export class ManualDecisionStore {
     return { decision, created: true };
   }
 
+  /** Bind a visible future-split preview to the pending decision before approval. */
+  async refreshPendingContext(decisionId: string, context: Record<string, unknown>): Promise<void> {
+    await documentClient.send(new UpdateCommand({
+      TableName: tableName(),
+      Key: { pk: `MANUAL#${decisionId}`, sk: "STATE" },
+      UpdateExpression: "SET #context = :context",
+      ConditionExpression: "#status = :pending",
+      ExpressionAttributeNames: { "#context": "context", "#status": "status" },
+      ExpressionAttributeValues: { ":context": context, ":pending": "pending" },
+    }));
+  }
+
   async listPending(profile?: Profile): Promise<ManualDecision[]> {
     const values: Record<string, unknown> = { ":prefix": "MANUAL#", ":pending": "pending" };
     let filter = "begins_with(pk, :prefix) AND #status = :pending";
@@ -1420,6 +1432,13 @@ export class ManualInterventionService {
       || Array.isArray(decision.context.candidateTaskIds) && decision.context.candidateTaskIds.length) {
       return refuse("Only one identified linked Todoist task and recurring master can be split. No changes made.");
     }
+    if (typeof decision.context.futureSplitPreview !== "string"
+      || typeof decision.context.calendarRecurrenceRule !== "string"
+      || typeof decision.context.todoistRecurrenceRule !== "string") {
+      await this.notifier.updateResolution(decision,
+        `A frozen recurrence cutover preview is required before approval. No provider change was made. Refresh with \`/sync resume ${decision.decisionId}\` to see the historical cutoff and new schedule.`);
+      return;
+    }
     const pair = await this.providerClients(decision.profile);
     let task: TodoistTask;
     let old: CalendarEvent;
@@ -1442,6 +1461,9 @@ export class ManualInterventionService {
         && normalizedText(current) !== normalizedText(decision.context[field])) {
         return refuse(`${field} changed after the original approval request. No changes made.`);
       }
+    }
+    if (decision.context.todoistRecurrenceRule !== todoistRecurrenceToRrule(task)) {
+      return refuse("The Todoist recurrence changed after the approved split preview.");
     }
     if (decision.context.calendarStatus !== "confirmed"
       || decision.context.todoistRecurring === false
@@ -1794,6 +1816,45 @@ export class ManualInterventionService {
           }
           await this.notifier.postText(`Decision \`${manual.targetId}\` is not pending.`, channel);
           return;
+        }
+        if (decision.type === "todoist_unmapped_conflict" && decision.taskId && decision.eventId
+          && typeof decision.context.futureSplitPreview !== "string") {
+          const pair = await this.providerClients(decision.profile);
+          try {
+            const [task, event] = await Promise.all([
+              pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
+            ]);
+            if (event.recurrence?.length) {
+              const plan = planFutureSeriesSplit(decision.profile, task, event);
+              const current = {
+                taskTitle: task.content, calendarTitle: event.summary,
+                todoistDue: todoistDue(task), calendarStart: eventDisplayStart(event),
+              };
+              if (Object.entries(current).some(([field, value]) =>
+                typeof decision.context[field] === "string"
+                && normalizedText(decision.context[field]) !== normalizedText(value))) {
+                await this.notifier.postText("Provider dates/titles changed since the original decision. Do not use the old approval.", channel);
+                return;
+              }
+              const context = {
+                ...decision.context,
+                todoistUpdatedAt: task.updated_at,
+                calendarEtag: event.etag,
+                todoistRecurrenceRule: plan.newRule,
+                calendarRecurrenceRule: plan.originalRule,
+                futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule}`,
+              };
+              await this.store.refreshPendingContext(decision.decisionId, context);
+              await this.notifier.postDecision({ ...decision, context });
+              return;
+            }
+          } catch (error) {
+            await this.notifier.postText(
+              `The recurrence cutover preview could not be safely prepared: ${error instanceof Error ? error.message : String(error)}. No approval was issued.`,
+              channel,
+            );
+            return;
+          }
         }
         await this.notifier.postDecision(decision);
         return;
