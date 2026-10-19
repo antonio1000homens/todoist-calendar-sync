@@ -1857,10 +1857,10 @@ export class ManualInterventionService {
                 futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule} (Calendar timezone ${calendarTimeZone})`,
               };
               const changedApproval = Boolean(prior) && !alreadyCapped && (
-                prior.previousOccurrence !== plan.previousOccurrence
-                || prior.nextOldOccurrence !== plan.nextOldOccurrence
-                || prior.newStart !== plan.newStart
-                || prior.newRule !== plan.newRule
+                prior?.previousOccurrence !== plan.previousOccurrence
+                || prior?.nextOldOccurrence !== plan.nextOldOccurrence
+                || prior?.newStart !== plan.newStart
+                || prior?.newRule !== plan.newRule
                 || prior.calendarTimeZone !== calendarTimeZone
                 || decision.context.calendarEtag !== event.etag
                 || decision.context.todoistUpdatedAt !== task.updated_at
