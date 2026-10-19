@@ -39,6 +39,24 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
   const state = {
     owner: conflictingOwner,
     link: undefined,
+    split: undefined,
+    async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId) {
+      if (this.split && (this.split.profile !== profile || this.split.taskId !== taskId
+        || this.split.oldMasterId !== oldMasterId || this.split.newMasterId !== newMasterId)) {
+        throw new Error("another split already owns the task");
+      }
+      if (!this.split) {
+        this.split = { profile, taskId, oldMasterId, newMasterId, status: "pending" };
+        calls.push("split-pending");
+      }
+    },
+    async completeFutureSeriesSplit(profile, taskId, newMasterId) {
+      assert.equal(this.split?.profile, profile);
+      assert.equal(this.split?.taskId, taskId);
+      assert.equal(this.split?.newMasterId, newMasterId);
+      this.split.status = "completed";
+      calls.push("split-completed");
+    },
     async getMappingByTaskAnyProfile() { return this.owner; },
     async getMappingByEvent() { return undefined; },
     async getCalendarProjectionTombstone() { return tombstone; },
@@ -140,7 +158,7 @@ test("future-only approved split retains historical master and creates biennial 
   assert.equal(fixtureValue.events.get(plan.newMasterId).extendedProperties.shared.syncHistoryMasterId, plan.oldMasterId);
   assert.equal(fixtureValue.created, 1);
   assert.deepEqual(fixtureValue.calls.filter((x) => typeof x === "string"), [
-    "cap-old", "create-future", "project-comment", "atomic-mapping",
+    "split-pending", "cap-old", "create-future", "project-comment", "atomic-mapping", "split-completed",
   ]);
   const again = await applyApprovedFutureSeriesSplit("antonio", fixtureValue.task,
     fixtureValue.events.get("old-may-master"), fixtureValue.pair, fixtureValue.state, { now: today });
@@ -156,11 +174,13 @@ test("a partial failure after capping history resumes without duplicating future
   assert.equal(f.events.get("old-may-master").extendedProperties.shared.syncHistoryOnly, "true");
   assert.equal(f.created, 0);
   assert.equal(f.state.owner, undefined);
+  assert.equal(f.state.split?.status, "pending", "hourly reconciliation must see the durable guard");
   const resumed = await applyApprovedFutureSeriesSplit("antonio", f.task,
     f.events.get("old-may-master"), f.pair, f.state, { now: today });
   assert.equal(resumed.resumed, true);
   assert.equal(f.created, 1);
   assert.equal(f.state.owner.eventId, resumed.plan.newMasterId);
+  assert.equal(f.state.split.status, "completed");
 });
 
 test("changed future Calendar exception blocks all writes", async () => {
