@@ -1706,7 +1706,11 @@ export class ManualInterventionService {
     const decisionActions = decision.type === "todoist_unmapped_conflict"
       ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
       : decision.permittedActions;
-    const actionAllowed = decisionActions.some((candidate) => candidate.id === manual.action)
+    const legacyAcknowledge = decision.type === "todoist_unmapped_conflict"
+      && manual.action === "acknowledge"
+      && decision.permittedActions.some((candidate) => candidate.id === "acknowledge");
+    const actionAllowed = legacyAcknowledge
+      || decisionActions.some((candidate) => candidate.id === manual.action)
       || manual.action.startsWith("bind_task:");
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
