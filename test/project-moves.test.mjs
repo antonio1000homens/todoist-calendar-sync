@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles, profileForTodoistProject, rememberTodoistTokenProject } from "../dist/config.js";
-import { Todoist } from "../dist/providers.js";
+import { Todoist, AmbiguousCalendarLinkError } from "../dist/providers.js";
 import { ProjectAwareSynchronizer, todoistProjectTransition } from "../dist/project-sync.js";
 
 const HOME = profiles.home.todoistProjectId;
@@ -437,4 +437,85 @@ test("moved orphan writes a source tombstone before dropping ownership mapping",
   assert.ok(state.tombstones.has(`home:${task.id}`));
   assert.equal(state.mapping, undefined);
   assert.ok(state.operations.indexOf(`tombstone:home:${task.id}`) < state.operations.indexOf("delete-mapping:home:home-orphan"));
+});
+
+test("ambiguous destination project move leaves source Calendar and mapping untouched", async () => {
+  const previous = {
+    id: "task-ambiguous-move", project_id: HOME, content: "Protected move",
+    due: { date: "2026-09-06" }, updated_at: "2026-09-03T09:00:00Z",
+  };
+  const task = { ...previous, project_id: WORK, updated_at: "2026-09-03T10:00:00Z" };
+  const calendars = calendarSet();
+  const original = {
+    id: "home-original", summary: "Protected move", start: { date: "2026-09-06" },
+    extendedProperties: { shared: { taskId: task.id } },
+  };
+  calendars.home.events.set(original.id, original);
+  const initial = {
+    profile: "home", projectId: HOME, eventId: original.id, taskId: task.id,
+    updatedAt: previous.updated_at,
+  };
+  const state = new FakeState(initial);
+  const regularClients = fakeClients({ value: task }, calendars);
+  const clients = async (profile) => {
+    const pair = await regularClients(profile);
+    if (profile === "work") {
+      pair.calendar.findByTodoistTaskId = async () => {
+        throw new AmbiguousCalendarLinkError(task.id, [
+          { id: "work-confirmed", status: "confirmed" },
+          { id: "work-cancelled", status: "cancelled" },
+        ]);
+      };
+    }
+    return pair;
+  };
+  const sync = new ProjectAwareSynchronizer(state, undefined, clients);
+  await assert.rejects(
+    sync.process(delivery("ambiguous-project-move", task, previous)),
+    (error) => error instanceof AmbiguousCalendarLinkError && error.eventIds.length === 2,
+  );
+  assert.deepEqual(calendars.home.deleted, []);
+  assert.deepEqual(calendars.work.created, []);
+  assert.equal(calendars.home.events.get(original.id), original);
+  assert.deepEqual(state.mapping, initial);
+  assert.equal(state.tombstones.size, 0);
+  assert.ok(!state.operations.some((operation) => operation.startsWith("delete-mapping:")
+    || operation.startsWith("tombstone:")));
+});
+
+test("project move uses the preflighted destination event without repeating identity lookup", async () => {
+  const previous = {
+    id: "task-reuse-destination", project_id: HOME, content: "Reuse destination",
+    due: { date: "2026-09-06" }, updated_at: "2026-09-03T09:00:00Z",
+  };
+  const task = { ...previous, project_id: WORK, updated_at: "2026-09-03T10:00:00Z" };
+  const calendars = calendarSet();
+  const original = {
+    id: "home-existing", summary: "Reuse destination", start: { date: "2026-09-06" },
+    extendedProperties: { shared: { taskId: task.id } },
+  };
+  calendars.home.events.set(original.id, original);
+  const state = new FakeState({
+    profile: "home", projectId: HOME, eventId: original.id,
+    taskId: task.id, updatedAt: previous.updated_at,
+  });
+  const regularClients = fakeClients({ value: task }, calendars);
+  let destinationLookups = 0;
+  const clients = async (profile) => {
+    const pair = await regularClients(profile);
+    if (profile === "work") {
+      pair.calendar.findByTodoistTaskId = async () => {
+        destinationLookups += 1;
+        if (destinationLookups > 1) throw new Error("destination was looked up again after deletion");
+        return undefined;
+      };
+    }
+    return pair;
+  };
+  const sync = new ProjectAwareSynchronizer(state, undefined, clients);
+  await sync.process(delivery("preflight-reuse", task, previous));
+  assert.equal(destinationLookups, 1);
+  assert.deepEqual(calendars.home.deleted, [original.id]);
+  assert.equal(state.mapping?.profile, "work");
+  assert.equal(calendars.work.created.length, 1);
 });
