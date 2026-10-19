@@ -85,3 +85,13 @@ test("old modified, cancelled or missing historical instances require operator r
     good[0], { ...good[1], start: { date: "2026-05-04" } },
   ], p), /exception/);
 });
+
+test("Calendar local midnight, not UTC midnight, determines historical cutoff during BST", () => {
+  const instant = new Date("2027-05-03T23:30:00Z"); // May 4 00:30 BST
+  const local = planFutureSeriesSplit("antonio", task(), old(), instant, "Europe/London");
+  const utc = planFutureSeriesSplit("antonio", task(), old(), instant, "UTC");
+  assert.equal(local.previousOccurrence, "2027-05-03");
+  assert.equal(local.truncatedRule, "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20270503");
+  assert.equal(utc.previousOccurrence, "2026-05-03");
+  assert.equal(local.calendarTimeZone, "Europe/London");
+});
