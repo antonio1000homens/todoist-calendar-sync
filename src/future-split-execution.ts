@@ -1,4 +1,4 @@
-import { attachProjectCommentReference } from "./mapping-comments.js";
+import { attachProjectCommentReference, buildProjectMappingIndex } from "./mapping-comments.js";
 import { planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, type FutureSeriesSplitPlan } from "./recurrence-split.js";
 import { hasCanonicalState, toCalendarEvent } from "./sync.js";
 import { selectTodoistCurrentInstance } from "./todoist-recurrence.js";
@@ -116,6 +116,30 @@ export async function applyApprovedFutureSeriesSplit(
     throw new Error("Archived master has another live Todoist-linked Calendar identity");
   }
 
+  // Project-comment records are independent ownership evidence even when
+  // DynamoDB's EVENT/TASK indexes are missing. Parse before the first write.
+  const comments = buildProjectMappingIndex(await pair.todoist.listProjectComments(task.project_id!, true));
+  const related = comments.parsed.filter(({ payload }) =>
+    payload.taskId === task.id || payload.eventId === old.id
+    || payload.masterEventId === old.id || payload.eventId === plan.newMasterId);
+  if (comments.malformed.some(({ comment }) =>
+    String(comment.content || "").includes(task.id) || String(comment.content || "").includes(old.id))) {
+    throw new Error("Malformed project mapping comments reference the split identity");
+  }
+  if (related.some(({ payload }) => payload.profile !== profile || payload.taskId !== task.id
+    || ![old.id, plan.newMasterId].includes(payload.eventId)
+    || payload.recurrenceOwner === "calendar"
+    || (payload.masterEventId && ![old.id, plan.newMasterId].includes(payload.masterEventId))
+    || (payload.seriesId && payload.seriesId !== task.id)
+    || payload.completedThroughOriginalStart || payload.calendarProgressVersion)) {
+    throw new Error("Existing project mapping comments conflict with future-series ownership");
+  }
+  const legacy = await pair.todoist.listTaskComments(task.id);
+  if (legacy.some((item) => String(item.content || "").includes("sync:mapping:")
+    || String(item.content || "").includes("calendarEventId="))) {
+    throw new Error("Legacy task mapping comment requires manual ownership investigation");
+  }
+
   // Inspect explicit historical and upcoming instance ranges, not an open-ended
   // Google series expansion. A moved/cancelled occurrence needs human review.
   const historical = await pair.calendar.listInstancesInWindow(
@@ -125,7 +149,17 @@ export async function applyApprovedFutureSeriesSplit(
   // Annual recurrence exception discovery is bounded but extends a decade
   // beyond the first affected date, not only the next single occurrence.
   const nextWindowEnd = addDays(plan.nextOldOccurrence, 10 * 366) + "T00:00:00Z";
-  const oldFuture = await pair.calendar.listInstancesInWindow(old.id, now.toISOString(), nextWindowEnd);
+  const [oldFuture, explicitExceptions] = await Promise.all([
+    pair.calendar.listInstancesInWindow(old.id, now.toISOString(), nextWindowEnd),
+    pair.calendar.listExplicitSeriesExceptions(old.id),
+  ]);
+  if (explicitExceptions.length) {
+    throw new Error("An explicit Calendar recurrence exception exists; full-series split requires manual review");
+  }
+  await state.assertHistoricalSeriesUnowned(old.id, [
+    ...historical.map((item) => item.id),
+    ...oldFuture.map((item) => item.id),
+  ]);
   if (!archived && oldFuture.some((item) =>
     !isUnmodifiedInstance(item, old.id)
     || !sameTitle(item.summary, old.summary)
