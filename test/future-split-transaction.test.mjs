@@ -33,7 +33,13 @@ test("future mapping transaction conditionally claims owner, mapping indexes and
     assert.ok(checks.some((item) => item.Key.pk === "PROJECTION#antonio#TASK#smoke-task"));
     assert.ok(checks.some((item) => item.Key.pk === "COMPLETED_EVENT#antonio#new-series"));
     assert.ok(checks.some((item) => item.Key.pk === "TASK#work#smoke-task"));
-    assert.ok(checks.every((item) => item.ConditionExpression === "attribute_not_exists(pk)"));
+    assert.ok(checks.some((item) => item.Key.pk === "PROJECTION#work#TASK#smoke-task"));
+    const guard = checks.find((item) => item.Key.pk === "FUTURE_SPLIT#TASK#smoke-task");
+    assert.equal(guard.ConditionExpression, "#status = :pending AND profile = :profile AND newMasterId = :master");
+    assert.equal(guard.ExpressionAttributeValues[":pending"], "pending");
+    assert.equal(guard.ExpressionAttributeValues[":master"], mapping.eventId);
+    assert.ok(checks.filter((item) => item !== guard)
+      .every((item) => item.ConditionExpression === "attribute_not_exists(pk)"));
   } finally { documentClient.send = original; }
 });
 
@@ -58,6 +64,57 @@ test("non-conditional transaction failures propagate for operator recovery", asy
   try {
     await assert.rejects(
       new StateRepository().putNewRecurrenceMappingIfUnowned(mapping, link), /throughput/,
+    );
+  } finally { documentClient.send = original; }
+});
+
+test("existing master/instance mappings and completed history are examined before any Calendar cap", async () => {
+  const original = documentClient.send;
+  let queries = 0;
+  documentClient.send = async (cmd) => {
+    const pk = cmd.input?.Key?.pk;
+    if (cmd.constructor.name === "GetCommand") return {};
+    if (cmd.constructor.name === "ScanCommand") return { Items: [], ScannedCount: 1 };
+    if (cmd.constructor.name === "QueryCommand") {
+      queries += 1;
+      if (cmd.input.ExpressionAttributeValues[":lookupSk"] === "MAPPING#TASK#"
+        && cmd.input.ExpressionAttributeValues[":lookupPk"] === "PROFILE#work") {
+        return { Items: [{
+          profile: "work", taskId: "different-task",
+          eventId: "old-instance", masterEventId: "old-master",
+        }] };
+      }
+      return { Items: [] };
+    }
+    throw new Error("Unexpected query");
+  };
+  try {
+    await assert.rejects(
+      new StateRepository().assertHistoricalSeriesUnowned("old-master", ["old-instance"]),
+      /mapping still owns/,
+    );
+    assert.ok(queries > 0);
+  } finally { documentClient.send = original; }
+});
+
+test("completed instance history in another profile blocks historical master reuse", async () => {
+  const original = documentClient.send;
+  documentClient.send = async (cmd) => {
+    const pk = cmd.input?.Key?.pk;
+    if (cmd.constructor.name === "GetCommand") {
+      if (pk === "COMPLETED_EVENT#work#old-instance") {
+        return { Item: { completedAt: "2026-01-01", taskId: "other-task" } };
+      }
+      return {};
+    }
+    if (cmd.constructor.name === "QueryCommand") return { Items: [] };
+    if (cmd.constructor.name === "ScanCommand") return { Items: [], ScannedCount: 1 };
+    throw new Error("Unexpected query");
+  };
+  try {
+    await assert.rejects(
+      new StateRepository().assertHistoricalSeriesUnowned("old-master", ["old-instance"]),
+      /completed task history/,
     );
   } finally { documentClient.send = original; }
 });
