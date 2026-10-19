@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  decisionBlocks,
   MANUAL_DECISION_CATALOG,
   ManualInterventionService,
 } from '../dist/manual-intervention.js';
@@ -589,4 +590,86 @@ test('cancelled Calendar projection conflict is a distinct manual decision type'
   assert.equal(notifier.posted[0].type, 'todoist_cancelled_projection_blocked');
   assert.equal(notifier.posted[0].context.calendarStatus, 'cancelled');
   assert.equal(notifier.posted[0].permittedActions[0].id, 'acknowledge');
+});
+
+
+test('guarded retry keeps an unresolved unmapped decision pending and actionable', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const decision = decisionFor('todoist_unmapped_conflict', {
+    decisionId: 'antonio-unmapped-retry-test',
+  });
+  decisions.decisions.set(decision.decisionId, decision);
+  let requested = 0;
+  const state = {
+    async requestReconciliation(profile, reason) {
+      requested += 1;
+      assert.equal(profile, 'antonio');
+      assert.equal(reason, 'manual');
+      return reconciliationState();
+    },
+  };
+  const service = new ManualInterventionService(decisions, notifier, async () => ({}), new FakePolicyStore());
+
+  await service.processManualDelivery({
+    id: 'manual:unmapped-retry',
+    kind: 'manual',
+    profile: 'antonio',
+    mode: 'aws',
+    receivedAt: '2026-09-07T14:01:00.000Z',
+    headers: {},
+    body: '',
+    manual: { decisionId: decision.decisionId, action: 'reconcile_now', slackUserId: 'U123' },
+  }, state);
+
+  assert.equal(requested, 1);
+  assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
+  assert.match(notifier.updated.at(-1).text, /remains open/);
+  assert.ok(notifier.updated.at(-1).blocks.some((block) => block.type === 'actions'));
+});
+
+test('Calendar-only ambiguity enriches and renders bounded candidate details read-only', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: {
+        async getTask(id) {
+          return { id, content: 'Renewal task', due: { date: '2027-06-11', is_recurring: true } };
+        },
+      },
+      calendar: {
+        async getEvent(id) {
+          return {
+            id,
+            status: 'confirmed',
+            summary: 'Renewal series',
+            start: { date: '2027-06-11' },
+            recurrence: ['RRULE:FREQ=YEARLY'],
+          };
+        },
+      },
+    }),
+    new FakePolicyStore(),
+  );
+  await service.observeAudit(
+    { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-calendar-only' },
+    'antonio',
+    'calendar_snapshot_recurring_identity_conflict',
+    { eventId: 'series-event', seriesId: 'series-1', candidateTaskIds: ['task-a', 'task-b'] },
+  );
+
+  const decision = notifier.posted[0];
+  assert.equal(decision.type, 'todoist_unmapped_conflict');
+  assert.equal(decision.context.calendarTitle, 'Renewal series');
+  assert.equal(decision.context.calendarStart, '2027-06-11');
+  assert.deepEqual(decision.context.readOnlyCandidates.map((candidate) => candidate.id), ['task-a', 'task-b']);
+  const rendered = JSON.stringify(decisionBlocks(decision));
+  assert.match(rendered, /Conflicting provider objects \(read-only\)/);
+  assert.match(rendered, /Renewal task/);
+  assert.match(rendered, /recurring: yes/);
+  assert.doesNotMatch(rendered, /bind_task:/);
 });
