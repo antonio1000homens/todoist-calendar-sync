@@ -514,11 +514,12 @@ export class Todoist {
       updatedAt: new Date().toISOString(),
     };
     const mapping = existing && !mappingDetails ? recoverMappingFromProjectComment(baseMapping, existing) : baseMapping;
-    const projectComment = await this.upsertProjectComment(
-      projectId,
-      serializeMappingComment(mapping, projectId, calendarUrl, revision),
-      existing?.comment.id,
-    );
+    const serialized = serializeMappingComment(mapping, projectId, calendarUrl, revision);
+    // A failed migration must not fall back to creating a second mapping
+    // comment; that would leave conflicting old/new task identities.
+    const projectComment = migrateFromEventId && existing?.payload.eventId === migrateFromEventId
+      ? await this.updateComment(existing.comment.id, serialized)
+      : await this.upsertProjectComment(projectId, serialized, existing?.comment.id);
     return { id: projectComment.id };
   }
 
