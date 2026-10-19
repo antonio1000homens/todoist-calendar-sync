@@ -379,7 +379,11 @@ export class StateRepository {
     }));
     const compatible = (candidate: Mapping | undefined): boolean =>
       !candidate || (candidate.profile === mapping.profile
-        && candidate.taskId === mapping.taskId && candidate.eventId === mapping.eventId);
+        && candidate.taskId === mapping.taskId && candidate.eventId === mapping.eventId
+        && candidate.updatedAt === mapping.updatedAt
+        && candidate.recurrenceOwner === mapping.recurrenceOwner
+        && candidate.seriesId === mapping.seriesId
+        && candidate.completedThroughOriginalStart === mapping.completedThroughOriginalStart);
     if (!compatible(owner.Item as Mapping | undefined)
       || !compatible(await this.getMappingByTask(mapping.profile, mapping.taskId))) return false;
 
@@ -409,8 +413,9 @@ export class StateRepository {
     const table = this.ensureTable();
     const identityValues = {
       ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt,
     };
-    const compatibleWrite = "attribute_not_exists(pk) OR (#profile = :profile AND taskId = :task AND eventId = :event)";
+    const compatibleWrite = "attribute_not_exists(pk) OR (#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated)";
     const transactItems: Array<Record<string, unknown>> = [
       { ConditionCheck: {
         TableName: table,
