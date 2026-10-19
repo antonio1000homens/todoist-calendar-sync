@@ -608,6 +608,28 @@ export class SnapshotReconciler {
       return "conflict";
     }
 
+    // When a Calendar event still has a valid canonical representation but its
+    // DynamoDB TASK index is missing, first inspect the EVENT index. Rebuilding
+    // all three mapping copies from an exact pre-existing owner is safe;
+    // guessing a new owner or overwriting a competing one is not.
+    if (existing && existing.status !== "cancelled") {
+      const eventMapping = await this.state.getMappingByEvent(profile, existing.id);
+      if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: eventMapping.taskId,
+        });
+        return "conflict";
+      }
+      if (eventMapping?.taskId === task.id) {
+        await this.state.putMapping(eventMapping);
+        await this.store.putBaseline(profile, task.id, task, existing);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_indices_restored", {
+          taskId: task.id, eventId: existing.id,
+        });
+        return "baseline";
+      }
+    }
+
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
     const mapping = await this.state.getMappingByTask(profile, task.id);
     if (!mapping) return "blocked";
