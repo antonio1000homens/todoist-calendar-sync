@@ -635,3 +635,28 @@ test("recurring EVENT with matching persisted link permits index-only restoratio
   assert.equal(clients.metrics.calendarUpdates.length, 0);
   assert.equal(clients.metrics.todoistUpdates.length, 0);
 });
+
+test("recurring projection with divergent progression watermark blocks index restoration", async () => {
+  const t = task();
+  const e = event();
+  const m = {
+    ...mapping(), recurrenceOwner: "calendar", seriesId: "series-1",
+    masterEventId: "master-1", activeInstanceId: "event-1",
+    calendarProgressVersion: 1, completedThroughOriginalStart: "2026-09-01",
+  };
+  const link = {
+    profile: "home", owner: "calendar", seriesId: m.seriesId, masterEventId: m.masterEventId,
+    activeInstanceId: m.activeInstanceId, eventId: m.eventId, taskId: t.id, updatedAt: m.updatedAt,
+    calendarProgressVersion: 1, completedThroughOriginalStart: "2026-08-01",
+  };
+  const state = new FakeState();
+  state.eventMappings.set("home:event-1", m);
+  state.recurrenceLinks.set("home:series-1", link);
+  const store = new FakeStore();
+  const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+  assert.equal(result.counts.conflict, 1);
+  assert.equal(state.mapping, undefined);
+  assert.equal(store.baselines.size, 0);
+  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_recurrence_link_conflict"));
+});
