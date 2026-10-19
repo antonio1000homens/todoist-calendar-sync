@@ -6,7 +6,8 @@ import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
-import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { logEvent } from "./observability.js";
 import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
@@ -176,6 +177,25 @@ function isStrictlyNewer(candidate: string | undefined, baseline: string): boole
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
+}
+
+
+function unmappedMismatchCategories(event: CalendarEvent, task: TodoistTask): string[] {
+  const categories: string[] = [];
+  if (normalizedText(event.summary) !== normalizedText(task.content)) categories.push("title_mismatch");
+  if (normalizedText(event.description) !== normalizedText(task.description)) categories.push("description_mismatch");
+  if (todoistRecurrenceToRrule(task)) {
+    categories.push(calendarRecurrenceMatchesTodoist(event, task)
+      ? "recurrence_anchor_mismatch"
+      : "recurrence_mismatch");
+  } else if (!startsMatch(event, task)) {
+    categories.push("start_mismatch");
+  }
+  return categories.length ? categories.sort() : ["canonical_state_mismatch"];
+}
+
+function isResolvedConflictOutcome(outcome: ReconcileOutcome): boolean {
+  return !["conflict", "blocked", "recurring_deferred"].includes(outcome);
 }
 
 function emptyCounts(): Record<ReconcileOutcome, number> {
@@ -633,6 +653,7 @@ export class SnapshotReconciler {
       await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_conflict", {
         taskId: task.id,
         eventId: existing.id,
+        mismatchCategories: unmappedMismatchCategories(existing, task),
       });
       return "conflict";
     }
@@ -728,7 +749,12 @@ export class SnapshotReconciler {
       const candidates = mappings.filter((mapping) => !afterTaskId || mapping.taskId > afterTaskId);
       for (let index = 0; index < candidates.length; index += 1) {
         const mapping = candidates[index];
-        counts[await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients)] += 1;
+        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients);
+        counts[outcome] += 1;
+        if (isResolvedConflictOutcome(outcome)) {
+          const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
+          await resolve?.call(this.state, profile, { taskId: mapping.taskId });
+        }
         processedCandidates += 1;
 
         if (processedCandidates >= maxCandidates) {
@@ -747,7 +773,12 @@ export class SnapshotReconciler {
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-      counts[await this.reconcileUnmappedTask(profile, task, clients)] += 1;
+      const outcome = await this.reconcileUnmappedTask(profile, task, clients);
+      counts[outcome] += 1;
+      if (isResolvedConflictOutcome(outcome)) {
+        const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
+        await resolve?.call(this.state, profile, { taskId: task.id });
+      }
       processedCandidates += 1;
 
       if (processedCandidates >= maxCandidates && index < unmappedCandidates.length - 1) {

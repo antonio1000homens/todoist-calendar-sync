@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   DeleteCommand,
   GetCommand,
@@ -7,7 +8,13 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
-import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
+import {
+  auditExpiresAt,
+  classifyAuditAction,
+  retainedConflictEntity,
+  retainedConflictIdentity,
+  retainedConflictIncidentId,
+} from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
@@ -796,22 +803,96 @@ export class StateRepository {
     }));
   }
 
+
+  private async beginConflictIncident(profile: Profile, fingerprint: string, detail: Record<string, unknown>): Promise<string> {
+    const entity = retainedConflictEntity(detail);
+    if (!entity) throw new Error("A deduplicated conflict must have a stable provider identity");
+    const entityHash = createHash("sha256").update(entity).digest("hex");
+    const fingerprintHash = createHash("sha256").update(fingerprint).digest("hex");
+    const stateKey = key(`CONFLICT_STATE#${profile}#${entityHash}`);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const existing = await client.send(new GetCommand({
+        TableName: this.ensureTable(),
+        Key: stateKey,
+        ConsistentRead: true,
+      }));
+      const current = existing.Item as { active?: boolean; fingerprint?: string; incidentId?: string } | undefined;
+      const incidentId = retainedConflictIncidentId(
+        current as import("./audit-policy.js").RetainedConflictLifecycle | undefined,
+        fingerprintHash,
+        `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`,
+      );
+      if (current?.active && current.fingerprint === fingerprintHash && current.incidentId) return incidentId;
+      try {
+        await client.send(new PutCommand({
+          TableName: this.ensureTable(),
+          Item: { ...stateKey, active: true, fingerprint: fingerprintHash, incidentId, updatedAt: now() },
+          ConditionExpression: "attribute_not_exists(pk) OR #active = :false OR fingerprint <> :fingerprint",
+          ExpressionAttributeNames: { "#active": "active" },
+          ExpressionAttributeValues: { ":false": false, ":fingerprint": fingerprintHash },
+        }));
+        return incidentId;
+      } catch (error) {
+        if (!conditionalFailure(error)) throw error;
+      }
+    }
+    throw new Error("Conflict lifecycle changed repeatedly while assigning an incident");
+  }
+
+  /** End the active incident only after reconciliation has verified recovery. */
+  async resolveConflictAudits(profile: Profile, detail: Record<string, unknown>): Promise<void> {
+    const entity = retainedConflictEntity(detail);
+    if (!entity) return;
+    const entityHash = createHash("sha256").update(entity).digest("hex");
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(),
+        Key: key(`CONFLICT_STATE#${profile}#${entityHash}`),
+        UpdateExpression: "SET #active = :false, resolvedAt = :resolvedAt",
+        ConditionExpression: "attribute_exists(pk) AND #active = :true",
+        ExpressionAttributeNames: { "#active": "active" },
+        ExpressionAttributeValues: { ":false": false, ":true": true, ":resolvedAt": now() },
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+    }
+  }
+
   async audit(profile: Profile, action: string, detail: Record<string, unknown>): Promise<void> {
     const disposition = classifyAuditAction(action);
     const safeDetail = sanitizeTelemetryDetail(detail);
     logEvent(action, { profile, auditClass: disposition, ...safeDetail }, "state-repository");
     if (disposition === "routine") return;
 
-    await client.send(new PutCommand({
-      TableName: this.ensureTable(),
-      Item: {
-        ...key(`AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`),
-        action,
-        detail: safeDetail,
-        createdAt: now(),
-        expiresAt: auditExpiresAt(),
-      },
-    }));
+    // Fingerprint the original allowlisted identity before telemetry sanitization;
+    // valid Calendar IDs can exceed the log field length limit.
+    const fingerprint = retainedConflictIdentity(action, detail);
+    const incidentId = fingerprint ? await this.beginConflictIncident(profile, fingerprint, detail) : undefined;
+    const conflictHash = fingerprint ? createHash("sha256").update(fingerprint).digest("hex") : undefined;
+    const auditId = conflictHash
+      ? `AUDIT#${profile}#CONFLICT#${conflictHash}#${incidentId}`
+      : `AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(auditId),
+          action,
+          detail: safeDetail,
+          createdAt: now(),
+          expiresAt: auditExpiresAt(),
+        },
+        ...(conflictHash ? {
+          ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+          ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
+        } : {}),
+      }));
+    } catch (error) {
+      // Every observation is logged. An already-retained incident row is the
+      // only write failure that can be safely treated as a duplicate.
+      if (conflictHash && conditionalFailure(error)) return;
+      throw error;
+    }
   }
 
 }
