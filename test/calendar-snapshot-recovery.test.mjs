@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { reconcileUnmappedCalendar } from "../dist/calendar-reconciliation.js";
+import { reconcileUnmappedCalendar, recurringTaskIdentityCandidates } from "../dist/calendar-reconciliation.js";
 import { ReconciliationMutationBudget } from "../dist/mutation-budget.js";
 
 function futureEvent(id, day, summary = `Event ${id}`) {
@@ -223,4 +223,42 @@ test("rejected worst-case reservation still keeps reconciliation pending", async
   assert.equal(summary.providerMutations, 0);
   assert.equal(state.mappings.length, 0);
   assert.ok(state.audits.some((entry) => entry.action === "calendar_snapshot_reconcile_mutation_budget_exhausted"));
+});
+
+test("recurrence snapshot guard recognises a competing recurring Todoist identity", async () => {
+  const master = { ...futureEvent("annual-master", 11, "Fotmob expiry £2.60"), recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"] };
+  const occurrence = { ...futureEvent("annual-master_20990111", 11, "Fotmob expiry £2.60"), recurringEventId: master.id };
+  const original = {
+    id: "original-yearly", content: "Fotmob expiry £2.60", description: "",
+    project_id: "home-project", due: { date: "2099-01-11", is_recurring: true, string: "every year" },
+  };
+  assert.deepEqual(recurringTaskIdentityCandidates(occurrence, [original]), ["original-yearly"]);
+  const state = fakeState();
+  const clients = fakeClients([master], [original]);
+  clients.pair.calendar.listInstances = async () => [occurrence];
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(summary.conflicts, 1);
+  assert.equal(clients.created, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some((entry) =>
+    entry.action === "calendar_snapshot_recurring_identity_conflict"
+    && entry.detail.candidateTaskIds.includes("original-yearly")));
+});
+
+test("Calendar-owned recurring series still creates one active non-recurring mirror", async () => {
+  const master = { ...futureEvent("calendar-series", 12, "Calendar-owned appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
+  const occurrence = { ...futureEvent("calendar-series_20990112", 12, "Calendar-owned appointment"), recurringEventId: master.id };
+  const state = fakeState();
+  const clients = fakeClients([master]);
+  clients.pair.calendar.listInstances = async () => [occurrence];
+  const first = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(first.imported, 1);
+  assert.equal(clients.created, 1);
+  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+  assert.equal(state.mappings[0].eventId, occurrence.id);
+  // Second run should see the recorded recurrence link, not create another task.
+  state.getRecurrenceLink = async () => ({ seriesId: master.id, owner: "calendar", taskId: "created-1" });
+  const second = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(second.imported, 0);
+  assert.equal(clients.created, 1);
 });
