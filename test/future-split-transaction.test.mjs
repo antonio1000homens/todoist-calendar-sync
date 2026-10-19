@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { documentClient } from "../dist/dynamodb-capacity.js";
-import { StateRepository } from "../dist/repository.js";
-
 process.env.STATE_TABLE_NAME ||= "test-future-split-state";
+const { documentClient } = await import("../dist/dynamodb-capacity.js");
+const { StateRepository } = await import("../dist/repository.js");
 const mapping = {
   profile: "antonio", projectId: "home-project", taskId: "smoke-task",
   eventId: "new-series", recurrenceOwner: "todoist", seriesId: "smoke-task",
