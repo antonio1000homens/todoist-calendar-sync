@@ -185,6 +185,19 @@ export class GoogleCalendar {
     return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
   }
 
+  /**
+   * Manual resolution of an approved existing event must never fall back to
+   * POST or resurrect a deleted Calendar record. If the event changes or is
+   * cancelled after the approval snapshot, the If-Match update fails.
+   */
+  async upsertEventIfUnchanged(event: CalendarEvent, existingId: string, etag: string): Promise<CalendarEvent> {
+    if (!existingId || !etag) throw new Error("Manual Calendar update requires existing event ID and ETag");
+    return this.request(
+      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(existingId)}`,
+      { method: "PUT", headers: { "If-Match": etag }, body: JSON.stringify(event) },
+    );
+  }
+
   async deleteEvent(eventId: string): Promise<void> {
     await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, { method: "DELETE" });
   }
