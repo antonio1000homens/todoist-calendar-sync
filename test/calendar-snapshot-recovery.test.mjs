@@ -262,3 +262,31 @@ test("Calendar-owned recurring series still creates one active non-recurring mir
   assert.equal(second.imported, 0);
   assert.equal(clients.created, 1);
 });
+
+test("recurring collision detection shares canonical whitespace-normalized title rules", () => {
+  const occurrence = { ...futureEvent("occurrence", 16, "Pay invoice") };
+  const recurring = { id: "recurring-spaces", content: "Pay  invoice", due: { date: "2099-01-16", is_recurring: true } };
+  assert.deepEqual(recurringTaskIdentityCandidates(occurrence, [recurring]), ["recurring-spaces"]);
+});
+
+test("recurring collision detection compares offset timestamps across midnight", () => {
+  const occurrence = {
+    ...futureEvent("occurrence", 16, "Renewal"),
+    start: { dateTime: "2099-06-11T00:30:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2099-06-11T01:00:00+01:00" },
+  };
+  const matching = { id: "matching-utc", content: "Renewal", due: { date: "2099-06-10T23:30:00Z", is_recurring: true } };
+  const floating = { id: "floating-local", content: "Renewal", due: { date: "2099-06-11T00:30:00", is_recurring: true } };
+  const wrongInstant = { id: "wrong-instant", content: "Renewal", due: { date: "2099-06-11T00:30:00Z", is_recurring: true } };
+  const allDay = { id: "all-day", content: "Renewal", due: { date: "2099-06-11", is_recurring: true } };
+  assert.deepEqual(recurringTaskIdentityCandidates(occurrence, [matching, floating, wrongInstant, allDay]), [
+    "floating-local", "matching-utc",
+  ]);
+});
+
+test("recurring collision detection respects all-day versus timed events", () => {
+  const day = { ...futureEvent("day", 20, "Payment") };
+  const allDay = { id: "all-day", content: "Payment", due: { date: "2099-01-20", is_recurring: true } };
+  const timed = { id: "timed", content: "Payment", due: { date: "2099-01-20T00:00:00Z", is_recurring: true } };
+  assert.deepEqual(recurringTaskIdentityCandidates(day, [allDay, timed]), ["all-day"]);
+});
