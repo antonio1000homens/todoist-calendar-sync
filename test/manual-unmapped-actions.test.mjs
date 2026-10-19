@@ -14,7 +14,7 @@ const baseTask = () => ({
   updated_at: "2026-10-19T12:00:00Z",
 });
 const baseEvent = () => ({
-  id: "event-1", summary: "Insta360 auto-renewal", description: "",
+  id: "event-1", etag: '"version-1"', summary: "Insta360 auto-renewal", description: "",
   status: "confirmed", start: { date: "2027-03-06" }, end: { date: "2027-03-07" },
   extendedProperties: { shared: { taskId: "task-1" } },
 });
@@ -36,13 +36,15 @@ class Notifier {
 }
 
 function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefined, completion = undefined,
-  mapping = undefined, auditAction = "todoist_snapshot_reconcile_unmapped_conflict" } = {}) {
+  mapping = undefined, auditAction = "todoist_snapshot_reconcile_unmapped_conflict",
+  cancelOnRead = 0 } = {}) {
   const original = baseTask();
   const originalEvent = baseEvent();
   const tasks = new Map([[original.id, original], ...alternateTasks.map((t) => [t.id, t])]);
   const events = new Map([[originalEvent.id, originalEvent], ...alternateEvents.map((e) => [e.id, e])]);
   const changes = [];
   const audits = [];
+  let eventReads = 0;
   const state = {
     currentMapping: mapping,
     async mutationAllowed() { return true; },
@@ -77,16 +79,31 @@ function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefine
       async upsertComment() { changes.push("todoist:comment"); return { id: "project-comment-1" }; },
     },
     calendar: {
-      async getEvent(id) { if (!events.has(id)) throw new Error("event missing"); return events.get(id); },
+      async getEvent(id) {
+        if (!events.has(id)) throw new Error("event missing");
+        eventReads += 1;
+        if (eventReads === cancelOnRead) {
+          events.set(id, { ...events.get(id), status: "cancelled", etag: '"version-cancelled"' });
+        }
+        return events.get(id);
+      },
       async findByTodoistTaskId(taskId) {
         const linked = [...events.values()].filter((e) => e.extendedProperties?.shared?.taskId === taskId);
         if (linked.length !== 1) throw new Error("ambiguous task ID");
         return linked[0];
       },
       async listOccurrencesInWindow() { return [...events.values()]; },
-      async upsertEvent(payload, id) {
+      async upsertEvent() {
+        changes.push("calendar:unexpected-general-upsert");
+        throw new Error("Manual path must never use generic Calendar upsert");
+      },
+      async upsertEventIfUnchanged(payload, id, expectedEtag) {
         changes.push("calendar:upsert");
-        const saved = { ...payload, id, status: "confirmed" };
+        const old = events.get(id);
+        if (!old || old.etag !== expectedEtag || old.status !== "confirmed") {
+          throw new Error("Calendar precondition failed");
+        }
+        const saved = { ...payload, id, etag: '"version-2"', status: "confirmed" };
         events.set(id, saved);
         return saved;
       },
@@ -217,5 +234,40 @@ test("ambiguous recurrence conflict cannot use the one-pair conversion actions",
   const item = setup({ auditAction: "todoist_snapshot_reconcile_unmapped_ambiguous" });
   await item.run("use_todoist_recurrence");
   assert.equal(item.store.value.status, "stale");
+  assert.deepEqual(item.changes, []);
+});
+
+test("late cancellation after manual preflight prevents replacement creation and mapping", async () => {
+  await withNoBaseline(async () => {
+    const item = setup({ cancelOnRead: 2 });
+    await assert.rejects(item.run("use_todoist_recurrence"), /Approved Calendar event changed, cancelled or disappeared/);
+    assert.equal(item.store.value.status, "pending");
+    assert.equal(item.state.currentMapping, undefined);
+    assert.equal(item.events.size, 1);
+    assert.equal(item.events.get("event-1").status, "cancelled");
+    assert.equal(item.changes.includes("calendar:upsert"), false);
+    assert.equal(item.changes.includes("calendar:unexpected-general-upsert"), false);
+    assert.ok(item.audits.some((x) => x.action === "manual_unmapped_resolution_incomplete"));
+  });
+});
+
+test("missing event ETag blocks manual mutations", async () => {
+  await withNoBaseline(async () => {
+    const item = setup();
+    item.events.get("event-1").etag = undefined;
+    await item.run("use_todoist_recurrence");
+    assert.equal(item.store.value.status, "stale");
+    assert.deepEqual(item.changes, []);
+  });
+});
+
+test("legacy persisted Ignore button remains accepted without provider mutation", async () => {
+  const item = setup();
+  item.store.value.permittedActions = [
+    { id: "acknowledge", label: "Acknowledge" },
+    { id: "reconcile_now", label: "Retry guarded reconciliation" },
+  ];
+  await item.run("acknowledge");
+  assert.equal(item.store.value.status, "resolved");
   assert.deepEqual(item.changes, []);
 });
