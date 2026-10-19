@@ -134,6 +134,8 @@ export interface TodoistWebhookPayload {
 
 export interface CalendarEvent {
   id: string;
+  /** Provider ETag for conditional, update-only manual ownership changes. */
+  etag?: string;
   status?: string;
   summary?: string;
   description?: string;
