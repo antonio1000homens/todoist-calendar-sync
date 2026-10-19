@@ -366,6 +366,63 @@ export class StateRepository {
   }
 
   /**
+   * Install a NEW Todoist-owned recurrence mapping, all three identity indexes
+   * and the recurrence link atomically. No unconditional reassignment or
+   * resurrection of archived / completed projections is permitted.
+   */
+  async putNewRecurrenceMappingIfUnowned(mapping: Mapping, link: RecurrenceLink): Promise<boolean> {
+    if (mapping.recurrenceOwner !== "todoist" || mapping.seriesId !== mapping.taskId
+      || mapping.masterEventId !== mapping.eventId || link.owner !== "todoist"
+      || link.seriesId !== mapping.seriesId || link.masterEventId !== mapping.masterEventId
+      || link.taskId !== mapping.taskId || link.eventId !== mapping.eventId
+      || link.profile !== mapping.profile) {
+      throw new Error("Future-series mapping and recurrence ownership are inconsistent");
+    }
+    const table = this.ensureTable();
+    const tx: Array<Record<string, unknown>> = [
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    const inserts = [
+      { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+      { ...link, ...key(`RECURRENCE#${mapping.profile}#${link.seriesId}`, "STATE") },
+    ];
+    for (const item of inserts) tx.push({ Put: {
+      TableName: table, Item: item, ConditionExpression: "attribute_not_exists(pk)",
+    } });
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const reason = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (reason.name === "TransactionCanceledException"
+        && reason.CancellationReasons?.some((item) => item.Code === "ConditionalCheckFailed")
+        && reason.CancellationReasons.every((item) => item.Code === "ConditionalCheckFailed" || item.Code === "None")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Recover missing TASK / TASKOWNER indexes only from an unchanged EVENT row.
    * Ordinary putMapping() is intentionally unconditional and MUST NOT be used
    * for this path: another profile may now own the same Todoist task.
