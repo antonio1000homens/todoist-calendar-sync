@@ -21,9 +21,10 @@ test("approved future-series cutover moves the canonical project breadcrumb rath
   const api = new Todoist(token);
   api.listProjectComments = async () => [oldComment];
   let updated;
-  api.upsertProjectComment = async (_projectId, content, existingId) => {
+  api.upsertProjectComment = async () => { throw new Error("must not create a competing mapping comment"); };
+  api.updateComment = async (existingId, content) => {
     updated = { content, existingId };
-    return { id: existingId || "created-comment" };
+    return { id: existingId };
   };
   const replacement = { ...oldMapping, eventId: "new-master", masterEventId: "new-master", updatedAt: "2026-10-19T22:00:00Z" };
   const result = await api.upsertComment(
@@ -53,4 +54,19 @@ test("Calendar-owned project comment evidence cannot be migrated to Todoist recu
       oldComment.id, { ...oldMapping, eventId: "new-master" }, "old-master"),
     /Cannot migrate conflicting/,
   );
+});
+
+test("an old comment that cannot be updated is never duplicated on the successor", async () => {
+  const token = "test-split-comment-failure";
+  rememberTodoistTokenProject(token, profiles.antonio.todoistProjectId);
+  const api = new Todoist(token);
+  api.listProjectComments = async () => [oldComment];
+  api.updateComment = async () => {
+    throw Object.assign(new Error("Comment is not yours"), { status: 400 });
+  };
+  api.upsertProjectComment = async () => { throw new Error("Created a forbidden competing comment"); };
+  await assert.rejects(api.upsertComment(
+    "smoke-task", "todoist-calendar-sync\ncalendarEventId=new-master",
+    oldComment.id, { ...oldMapping, eventId: "new-master" }, "old-master",
+  ), /Comment is not yours/);
 });
