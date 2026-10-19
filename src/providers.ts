@@ -18,6 +18,31 @@ async function responseJson<T>(response: Response): Promise<T> {
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
+/**
+ * A task ID can occur on several live, legacy or cancelled Calendar
+ * projections. This is a safety boundary: callers must not mutate a guessed
+ * winner, especially if an intentional Calendar deletion is involved.
+ */
+export class AmbiguousCalendarLinkError extends Error {
+  readonly code = "ambiguous_calendar_task_link";
+  readonly eventIds: string[];
+
+  constructor(readonly taskId: string, candidates: CalendarEvent[]) {
+    super("Multiple Calendar projections reference the same Todoist task");
+    this.name = "AmbiguousCalendarLinkError";
+    this.eventIds = candidates.map((event) => event.id).sort();
+  }
+}
+
+export function selectLinkedCalendarEvent(taskId: string, candidates: CalendarEvent[]): CalendarEvent | undefined {
+  const distinct = [...new Map(candidates.map((event) => [event.id, event])).values()];
+  if (distinct.length === 0) return undefined;
+  // Even a cancelled + confirmed pair is ambiguous about user intent. Do not
+  // resurrect deleted projections or silently migrate to a different event.
+  if (distinct.length > 1) throw new AmbiguousCalendarLinkError(taskId, distinct);
+  return distinct[0];
+}
+
 export class GoogleCalendar {
   private accessToken?: string;
 
@@ -84,13 +109,29 @@ export class GoogleCalendar {
   }
 
   async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
+    // The first Google result is not necessarily the active projection. Its
+    // ordering is unspecified, and showDeleted can return old cancelled copies.
+    // Never silently pick a candidate that could delete or overwrite another.
     const query = new URLSearchParams({
       showDeleted: "true",
-      maxResults: "1",
+      maxResults: "2500",
       sharedExtendedProperty: `taskId=${taskId}`,
     });
-    const response = await this.request<{ items?: CalendarEvent[] }>(`/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`);
-    return response.items?.[0];
+    const found = new Map<string, CalendarEvent>();
+    let pages = 0;
+    while (true) {
+      if (++pages > 20) throw new Error("Calendar task link lookup exceeded page limit");
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const event of response.items || []) {
+        found.set(event.id, event);
+        if (found.size > 10000) throw new Error("Calendar task link lookup exceeded candidate limit");
+      }
+      if (!response.nextPageToken) break;
+      query.set("pageToken", response.nextPageToken);
+    }
+    return selectLinkedCalendarEvent(taskId, [...found.values()]);
   }
 
   async getEvent(eventId: string): Promise<CalendarEvent> {
