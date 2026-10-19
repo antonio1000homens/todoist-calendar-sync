@@ -3,7 +3,7 @@ import { documentClient } from "./dynamodb-capacity.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { GoogleCalendar, Todoist } from "./providers.js";
+import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
@@ -568,7 +568,17 @@ export class SnapshotReconciler {
 
     const baseline = await this.store.getBaseline(profile, task.id);
     const tombstone = await this.state.getCalendarProjectionTombstone(profile, task.id);
-    const existing = await clients.calendar.findByTodoistTaskId(task.id);
+    let existing: CalendarEvent | undefined;
+    try {
+      existing = await clients.calendar.findByTodoistTaskId(task.id);
+    } catch (error) {
+      if (!(error instanceof AmbiguousCalendarLinkError)) throw error;
+      await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_ambiguous", {
+        taskId: task.id,
+        candidateEventIds: error.eventIds,
+      });
+      return "conflict";
+    }
     const genericTombstoneRecreationAllowed = Boolean(
       tombstone
       && tombstone.reason !== "project_exit"
