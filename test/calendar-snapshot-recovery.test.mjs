@@ -290,3 +290,33 @@ test("recurring collision detection respects all-day versus timed events", () =>
   const timed = { id: "timed", content: "Payment", due: { date: "2099-01-20T00:00:00Z", is_recurring: true } };
   assert.deepEqual(recurringTaskIdentityCandidates(day, [allDay, timed]), ["all-day"]);
 });
+
+test("recurrence snapshot does not import a duplicate for normalized title and cross-midnight instant", async () => {
+  const master = {
+    ...futureEvent("series-offset", 18, "Pay invoice"),
+    start: { dateTime: "2099-06-11T00:30:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2099-06-11T01:00:00+01:00", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+  };
+  const active = {
+    ...master,
+    id: "series-offset_20990611",
+    recurringEventId: master.id,
+    recurrence: undefined,
+  };
+  const recurringTask = {
+    id: "existing-recurring", content: "Pay  invoice",
+    due: { date: "2099-06-10T23:30:00Z", is_recurring: true, string: "every year" },
+  };
+  const state = fakeState();
+  const clients = fakeClients([master], [recurringTask]);
+  clients.pair.calendar.listInstances = async () => [active];
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some(({ action, detail }) =>
+    action === "calendar_snapshot_recurring_identity_conflict"
+    && detail.candidateTaskIds.includes(recurringTask.id)));
+});
