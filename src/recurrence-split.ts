@@ -62,7 +62,12 @@ export function planFutureSeriesSplit(
   day(due);
   if (day(due) < day(today)) throw new Error("The new Todoist occurrence is in the past");
   if (startMs >= day(today)) throw new Error("No prior occurrences exist to preserve");
-  const interval = annualInterval(old.recurrence[0]);
+  const archived = old.extendedProperties?.shared?.syncHistoryOnly === "true";
+  const priorRule = archived
+    ? old.extendedProperties?.shared?.syncHistoryOriginalRule
+    : old.recurrence[0];
+  if (!priorRule) throw new Error("Cannot verify the original historical recurrence");
+  const interval = annualInterval(priorRule);
   const newRule = todoistRecurrenceToRrule(task);
   if (!newRule || !newRule.startsWith("RRULE:FREQ=YEARLY")) {
     throw new Error("The Todoist future schedule must be a supported yearly recurrence");
@@ -78,14 +83,18 @@ export function planFutureSeriesSplit(
     previous = next;
   }
   if (!upcoming) throw new Error("Unable to determine the next historical occurrence");
-  if (old.extendedProperties?.shared?.syncHistoryOnly === "true") {
-    throw new Error("Historical series was already split; requires recovery verification");
-  }
+  // An already-capped series may be resumed only when its lineage and exact
+  // cap match this same deterministic successor; no new split is inferred.
   const newMasterId = createHash("sha256")
     .update(`split-v1:${profile}:${task.id}:${old.id}:${due}:${newRule}`)
     .digest("hex").slice(0, 32);
-  const originalRule = old.recurrence[0];
+  const originalRule = priorRule;
   const truncatedRule = `${originalRule};UNTIL=${previous.replace(/-/g, "")}`;
+  if (archived && (old.recurrence[0] !== truncatedRule
+    || old.extendedProperties?.shared?.syncHistorySuccessorId !== newMasterId
+    || old.extendedProperties?.shared?.syncHistoryTaskId !== task.id)) {
+    throw new Error("Already archived Calendar master does not match this split");
+  }
   return {
     oldMasterId: old.id, oldEtag: old.etag, newMasterId,
     originalRule, truncatedRule, newRule,
