@@ -34,6 +34,8 @@ export type ManualDecisionType =
   | "standalone_todoist_task_deleted"
   | "calendar_snapshot_unmapped_ambiguous"
   | "calendar_snapshot_recurring_ambiguous"
+  | "todoist_unmapped_conflict"
+  | "todoist_cancelled_projection_blocked"
   | "both_sides_changed"
   | "mapping_owner_conflict"
   | "lost_mapping_calendar_only"
@@ -122,6 +124,18 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     severity: "warning",
     detection: "audit_conflict",
     actions: actions(["create_new_task", "Create a new Todoist mirror"]),
+  },
+  todoist_unmapped_conflict: {
+    title: "Todoist task and Calendar projection cannot be safely relinked",
+    severity: "warning",
+    detection: "audit_conflict",
+    actions: actions(["acknowledge", "Acknowledge — leave unchanged"], ["reconcile_now", "Retry guarded reconciliation"]),
+  },
+  todoist_cancelled_projection_blocked: {
+    title: "Calendar projection was cancelled — Todoist task still exists",
+    severity: "warning",
+    detection: "audit_conflict",
+    actions: actions(["acknowledge", "Keep Calendar deleted"], ["reconcile_now", "Retry guarded reconciliation"]),
   },
   both_sides_changed: {
     title: "Calendar and Todoist both changed since the baseline",
@@ -515,6 +529,10 @@ function changeSummary(decision: ManualDecision): string | undefined {
       return "This Calendar event matches more than one Todoist task, so the sync cannot safely choose a mapping.";
     case "calendar_snapshot_recurring_ambiguous":
       return "This Calendar recurrence matches more than one Todoist task, so the sync cannot safely choose a mirror.";
+    case "todoist_unmapped_conflict":
+      return "The Todoist task is unmapped but a different or ambiguous Calendar projection exists. Automatic linking is unsafe.";
+    case "todoist_cancelled_projection_blocked":
+      return "The previous Calendar projection is cancelled. The sync will not recreate it without an intentional new action.";
     case "both_sides_changed":
       return "Both Calendar and Todoist changed since the last synchronized baseline. Choose which current version should win.";
     default:
@@ -978,6 +996,8 @@ export class ManualInterventionService {
     if (action === "calendar_snapshot_unmapped_ambiguous") type = "calendar_snapshot_unmapped_ambiguous";
     else if (action === "calendar_snapshot_recurring_ambiguous") type = "calendar_snapshot_recurring_ambiguous";
     else if (action === "todoist_snapshot_reconcile_conflict_both_sides_changed") type = "both_sides_changed";
+    else if (["todoist_snapshot_reconcile_unmapped_conflict", "todoist_snapshot_reconcile_unmapped_ambiguous", "calendar_task_link_ambiguous_conflict", "calendar_snapshot_recurring_identity_conflict"].includes(action)) type = "todoist_unmapped_conflict";
+    else if (action === "todoist_snapshot_reconcile_cancelled_projection_blocked") type = "todoist_cancelled_projection_blocked";
     else if (action === "reconciliation_mutation_budget_exhausted" || action === "calendar_snapshot_reconcile_mutation_budget_exhausted") type = "operational_mutation_budget";
     else if (action.includes("circuit_open") || action.includes("circuit_deferred")) type = "operational_circuit_open";
     if (!type) return;
@@ -1002,10 +1022,13 @@ export class ManualInterventionService {
       }
     }
 
+    const recurringConflict = type === "todoist_unmapped_conflict" || type === "todoist_cancelled_projection_blocked";
     await this.createDecision(
       profile,
       type,
-      { action, eventId, taskId, seriesId, detail },
+      recurringConflict
+        ? { taskId, eventId, seriesId, category: type, candidateEventIds: detail.candidateEventIds, candidateTaskIds: detail.candidateTaskIds }
+        : { action, eventId, taskId, seriesId, detail },
       {
         sourceDeliveryId: delivery.id,
         sourceAuditAction: action,
@@ -1016,6 +1039,31 @@ export class ManualInterventionService {
         activeInstanceId: typeof detail.activeInstanceId === "string" ? detail.activeInstanceId : undefined,
       },
       context,
+      recurringConflict && taskId
+        ? async () => {
+            const pair = await this.providerClients(profile);
+            const extra: Record<string, unknown> = {};
+            try {
+              const task = await pair.todoist.getTask(taskId);
+              extra.taskTitle = task.content;
+              extra.todoistDue = todoistDue(task);
+              extra.todoistRecurring = Boolean(task.due?.is_recurring);
+            } catch (error) {
+              extra.taskReadError = error instanceof Error ? error.message : String(error);
+            }
+            if (eventId) {
+              try {
+                const event = await pair.calendar.getEvent(eventId);
+                extra.calendarTitle = event.summary;
+                extra.calendarStart = eventDisplayStart(event);
+                extra.calendarStatus = event.status;
+              } catch (error) {
+                extra.calendarReadError = error instanceof Error ? error.message : String(error);
+              }
+            }
+            return extra;
+          }
+        : undefined,
     );
   }
 
@@ -1416,6 +1464,12 @@ export class ManualInterventionService {
     try {
       if (manual.action === "reconcile_now") {
         await this.finishAndReconcile(decision, state, manual.action, manual.slackUserId);
+        return;
+      }
+      if (manual.action === "acknowledge" && ["todoist_unmapped_conflict", "todoist_cancelled_projection_blocked"].includes(decision.type)) {
+        // Acknowledgement is not a provider operation or a mapping decision.
+        await this.store.finish(decision.decisionId, "resolved", manual.action, manual.slackUserId);
+        await this.notifier.updateResolution(decision, "Acknowledged. Todoist and Calendar remain unchanged.");
         return;
       }
       if (["calendar_owned_recurrence_task_deleted", "todoist_owned_recurrence_task_deleted", "standalone_todoist_task_deleted"].includes(decision.type)) {
