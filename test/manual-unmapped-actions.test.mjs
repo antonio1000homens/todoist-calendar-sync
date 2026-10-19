@@ -146,7 +146,11 @@ test("Slack exposes confirmed owner choices, but never authorizes unattended aut
   assert.match(blocks, /Use Todoist recurrence/);
   assert.match(blocks, /Use Calendar version/);
   assert.match(blocks, /Keep separate/);
-  assert.match(blocks, /"confirmRequired":true/);
+  const actions = decisionBlocks(oldCard.store.value).filter((block) => block.type === "actions")
+    .flatMap((block) => block.elements);
+  assert.equal(JSON.parse(actions[0].value).confirmRequired, true);
+  assert.equal(JSON.parse(actions[1].value).confirmRequired, true);
+  assert.equal(JSON.parse(actions[2].value).confirmRequired, false);
 });
 
 test("Use Todoist recurrence converts only the unique existing event to an RRULE and restores mapping", async () => {
