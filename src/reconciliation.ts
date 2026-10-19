@@ -608,11 +608,23 @@ export class SnapshotReconciler {
       return "conflict";
     }
 
-    // When a Calendar event still has a valid canonical representation but its
-    // DynamoDB TASK index is missing, first inspect the EVENT index. Rebuilding
-    // all three mapping copies from an exact pre-existing owner is safe;
-    // guessing a new owner or overwriting a competing one is not.
+    // A retained completed occurrence is history, never a fresh active link.
+    // Checking before index restoration prevents a next-run mapping delete.
     if (existing && existing.status !== "cancelled") {
+      const completed = await this.completedProjection(profile, existing.id);
+      if (completed?.taskId === task.id) {
+        await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
+          taskId: task.id, eventId: existing.id, completedAt: completed.completedAt,
+        });
+        return "completed_retained";
+      }
+      if (completed) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_completed_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: completed.taskId,
+        });
+        return "conflict";
+      }
+
       const eventMapping = await this.state.getMappingByEvent(profile, existing.id);
       if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
@@ -620,8 +632,31 @@ export class SnapshotReconciler {
         });
         return "conflict";
       }
-      if (eventMapping?.taskId === task.id) {
-        await this.state.putMapping(eventMapping);
+      // Tombstones take precedence over orphaned indexes. Delegate to the
+      // established timestamp/reset policy instead of reviving an old link.
+      if (eventMapping?.taskId === task.id && !tombstone) {
+        // Never invent a recurrence link or progression state. A missing or
+        // inconsistent link needs an explicit ownership decision.
+        const link = eventMapping.recurrenceOwner && eventMapping.seriesId
+          ? await this.state.getRecurrenceLink(profile, eventMapping.seriesId)
+          : undefined;
+        if (eventMapping.recurrenceOwner && (!link
+          || link.owner !== eventMapping.recurrenceOwner
+          || link.taskId !== task.id || link.eventId !== existing.id
+          || link.masterEventId !== eventMapping.masterEventId
+          || link.activeInstanceId !== eventMapping.activeInstanceId)) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_recurrence_link_conflict", {
+            taskId: task.id, eventId: existing.id, seriesId: eventMapping.seriesId,
+          });
+          return "conflict";
+        }
+        const restored = await this.state.restoreMappingIndexesIfOwned(eventMapping, link);
+        if (!restored) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_ownership_conflict", {
+            taskId: task.id, eventId: existing.id,
+          });
+          return "conflict";
+        }
         await this.store.putBaseline(profile, task.id, task, existing);
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_indices_restored", {
           taskId: task.id, eventId: existing.id,
