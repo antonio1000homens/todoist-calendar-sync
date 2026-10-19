@@ -484,6 +484,15 @@ export class StateRepository {
     const tx: Array<Record<string, unknown>> = [
       { ConditionCheck: {
         TableName: table,
+        Key: key(`FUTURE_SPLIT#TASK#${mapping.taskId}`),
+        ConditionExpression: "#status = :pending AND profile = :profile AND newMasterId = :master",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":pending": "pending", ":profile": mapping.profile, ":master": mapping.eventId,
+        },
+      } },
+      { ConditionCheck: {
+        TableName: table,
         Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
         ConditionExpression: "attribute_not_exists(pk)",
       } },
@@ -498,6 +507,11 @@ export class StateRepository {
       tx.push({ ConditionCheck: {
         TableName: table,
         Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${other}#TASK#${mapping.taskId}`, "TOMBSTONE"),
         ConditionExpression: "attribute_not_exists(pk)",
       } });
     }
