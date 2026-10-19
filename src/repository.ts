@@ -403,7 +403,7 @@ export class StateRepository {
       { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
       { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
       { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
-      { ...link, ...key(`RECURRENCE#${mapping.profile}#${link.seriesId}`, "STATE") },
+      { ...link, ...key(`RECURRENCE#${mapping.profile}#${link.seriesId}`, "STATE"), ...recurrenceLookupAttributes(link) },
     ];
     for (const item of inserts) tx.push({ Put: {
       TableName: table, Item: item, ConditionExpression: "attribute_not_exists(pk)",
