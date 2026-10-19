@@ -25,6 +25,11 @@ class DecisionStore {
     this.decisions = new Map([[decision.decisionId, decision]]);
   }
   async get(id) { return this.decisions.get(id); }
+  async refreshPendingContext(id, context) {
+    const decision = this.decisions.get(id);
+    assert.equal(decision?.status, "pending");
+    decision.context = context;
+  }
   async putPending(input) {
     const saved = this.decisions.get(input.decisionId);
     if (saved) return { decision: saved, created: false };
@@ -308,4 +313,36 @@ test("stale approval refresh creates a newly versioned decision only after provi
   assert.equal(item.store.value.status, "stale", "old approval remains terminal");
   await resume();
   assert.equal(item.notifier.posted.length, 1, "same revision must not issue duplicate approvals");
+});
+
+test("unpreviewed legacy decision refuses future split without any provider writes", async () => {
+  const item = setup();
+  await item.run("split_future_todoist");
+  assert.equal(item.store.value.status, "pending");
+  assert.deepEqual(item.changes, []);
+  assert.ok(item.notifier.messages.some((m) => m.includes("frozen recurrence cutover preview")));
+});
+
+test("resume a legacy pending decision freezes and displays an explicit series-cutover plan", async () => {
+  const item = setup();
+  item.events.set("event-1", {
+    ...item.events.get("event-1"), start: { date: "2025-05-03" },
+    end: { date: "2025-05-04" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-05-03";
+  const runResume = () => item.service.processManualDelivery({
+    id: "manual:resume-preview", kind: "manual", profile: "antonio",
+    mode: "aws", receivedAt: "2026-10-19T12:00:00Z", headers: {}, body: "",
+    manual: { command: "resume_decision", targetId: item.store.value.decisionId, slackChannelId: "C123" },
+  }, item.state);
+  await runResume();
+  assert.equal(item.notifier.posted.length, 1);
+  const context = item.store.value.context;
+  assert.match(context.futureSplitPreview, /retain through/);
+  assert.equal(context.calendarRecurrenceRule, "RRULE:FREQ=YEARLY");
+  assert.equal(context.todoistRecurrenceRule, "RRULE:FREQ=YEARLY");
+  assert.deepEqual(item.changes, []);
+  await runResume();
+  assert.equal(item.notifier.posted.length, 2);
+  assert.equal(item.store.value.status, "pending");
 });
