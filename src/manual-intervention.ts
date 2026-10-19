@@ -1340,6 +1340,9 @@ export class ManualInterventionService {
       return refuse("A competing Todoist task or Calendar occurrence exists, or the original event could not be verified. No changes made; inspect duplicate identities first.");
     }
 
+    if (!event.etag) {
+      return refuse("The Calendar provider did not return an ETag for the approved event. Update-only resolution is unsafe.");
+    }
     let currentTask = task;
     try {
       if (action === "use_calendar_version") {
@@ -1350,20 +1353,10 @@ export class ManualInterventionService {
           throw new Error("Todoist did not accept the one-off Calendar date; mapping was not written");
         }
       }
-      const delivery: Delivery = {
-        id: `manual-unmapped:${decision.decisionId}:${action}`,
-        kind: "todoist",
-        profile: decision.profile,
-        mode: "aws",
-        receivedAt: isoNow(),
-        headers: { "x-todoist-calendar-sync-manual": "true" },
-        body: JSON.stringify({
-          event_name: "item:updated",
-          event_data: currentTask,
-          event_data_extra: { old_item: { ...currentTask, project_id: "__outside_sync_profiles__" } },
-        } satisfies TodoistWebhookPayload),
-      };
-      await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients).process(delivery);
+      // Only update this specific approved event. An event cancelled or
+      // changed after preflight must not turn into a replacement POST.
+      await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients)
+        .resolveApprovedUnmappedProjection(decision.profile, currentTask, event.id, event.etag);
       const mapped = await state.getMappingByTask(decision.profile, task.id);
       if (!mapped || mapped.eventId !== event.id
         || (action === "use_todoist_recurrence" && mapped.recurrenceOwner !== "todoist")
