@@ -646,8 +646,13 @@ export class SnapshotReconciler {
         if (eventMapping.recurrenceOwner && (!link
           || link.owner !== eventMapping.recurrenceOwner
           || link.taskId !== task.id || link.eventId !== existing.id
+          || link.profile !== eventMapping.profile || link.seriesId !== eventMapping.seriesId
           || link.masterEventId !== eventMapping.masterEventId
-          || link.activeInstanceId !== eventMapping.activeInstanceId)) {
+          || link.activeInstanceId !== eventMapping.activeInstanceId
+          || link.originalStart !== eventMapping.originalStart
+          || link.activeEffectiveStart !== eventMapping.activeEffectiveStart
+          || link.calendarProgressVersion !== eventMapping.calendarProgressVersion
+          || link.completedThroughOriginalStart !== eventMapping.completedThroughOriginalStart)) {
           await this.state.audit(profile, "todoist_snapshot_reconcile_recurrence_link_conflict", {
             taskId: task.id, eventId: existing.id, seriesId: eventMapping.seriesId,
           });
