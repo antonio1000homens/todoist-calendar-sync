@@ -585,6 +585,13 @@ export class SnapshotReconciler {
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
     if (!hasDue(task)) return "noop";
+    const split = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
+    if (split?.status === "pending") {
+      await this.state.audit(profile, "todoist_snapshot_future_series_split_pending", {
+        taskId: task.id, oldMasterId: split.oldMasterId, newMasterId: split.newMasterId,
+      });
+      return "blocked";
+    }
 
     const baseline = await this.store.getBaseline(profile, task.id);
     const tombstone = await this.state.getCalendarProjectionTombstone(profile, task.id);
