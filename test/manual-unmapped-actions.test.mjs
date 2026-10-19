@@ -96,6 +96,7 @@ function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefine
       async upsertComment() { changes.push("todoist:comment"); return { id: "project-comment-1" }; },
     },
     calendar: {
+      async getTimeZone() { return "Europe/London"; },
       async getEvent(id) {
         if (!events.has(id)) throw new Error("event missing");
         eventReads += 1;
