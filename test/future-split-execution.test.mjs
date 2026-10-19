@@ -69,9 +69,12 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
       calls.push("atomic-mapping");
       return true;
     },
+    async assertHistoricalSeriesUnowned() {},
     async audit(_profile, action, detail) { calls.push([action, detail]); },
   };
   const calendar = {
+    async getTimeZone() { return "Europe/London"; },
+    async listExplicitSeriesExceptions() { return []; },
     async findByTodoistTaskId(id) {
       const linked = [...events.values()].filter((event) => event.extendedProperties?.shared?.taskId === id);
       if (linked.length > 1) throw new Error("ambiguous event identity");
@@ -135,6 +138,8 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
     },
   };
   const todoist = {
+    async listProjectComments() { return []; },
+    async listTaskComments() { return []; },
     async listTasks() { return duplicateTask ? [task, { ...task, id: "other-smoke-task" }] : [task]; },
     async getTask() { return task; },
     async findComment() { return undefined; },
