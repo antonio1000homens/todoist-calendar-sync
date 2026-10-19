@@ -593,6 +593,25 @@ export class SnapshotReconciler {
       return "blocked";
     }
 
+    // A retained completed occurrence is history, never a fresh active link.
+    // Check before baseline and recovery decisions; only deletion decisions
+    // may intentionally change these terminal records.
+    if (existing && existing.status !== "cancelled") {
+      const completed = await this.completedProjection(profile, existing.id);
+      if (completed?.taskId === task.id) {
+        await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
+          taskId: task.id, eventId: existing.id, completedAt: completed.completedAt,
+        });
+        return "completed_retained";
+      }
+      if (completed) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_completed_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: completed.taskId,
+        });
+        return "conflict";
+      }
+    }
+
     if (baseline && !tombstone) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_prior_projection_without_mapping_blocked", {
         taskId: task.id,
@@ -608,23 +627,7 @@ export class SnapshotReconciler {
       return "conflict";
     }
 
-    // A retained completed occurrence is history, never a fresh active link.
-    // Checking before index restoration prevents a next-run mapping delete.
     if (existing && existing.status !== "cancelled") {
-      const completed = await this.completedProjection(profile, existing.id);
-      if (completed?.taskId === task.id) {
-        await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
-          taskId: task.id, eventId: existing.id, completedAt: completed.completedAt,
-        });
-        return "completed_retained";
-      }
-      if (completed) {
-        await this.state.audit(profile, "todoist_snapshot_reconcile_completed_owner_conflict", {
-          taskId: task.id, eventId: existing.id, ownerTaskId: completed.taskId,
-        });
-        return "conflict";
-      }
-
       const eventMapping = await this.state.getMappingByEvent(profile, existing.id);
       if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
