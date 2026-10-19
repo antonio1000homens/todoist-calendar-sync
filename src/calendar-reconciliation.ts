@@ -16,7 +16,8 @@ import {
   type CanonicalIdentityRepository,
 } from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
-import { hasCanonicalState, selectCalendarRecurrenceInstance, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, selectCalendarRecurrenceInstance, startsMatch, toTodoistTask } from "./sync.js";
+import { normalizedText } from "./security.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -88,13 +89,12 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
  * This conservative identity collision check is a guard, not a rebind.
  */
 export function recurringTaskIdentityCandidates(event: CalendarEvent, tasks: TodoistTask[]): string[] {
-  const title = (event.summary || "").trim().toLocaleLowerCase();
-  const eventDate = (event.start?.date || event.start?.dateTime || "").slice(0, 10);
-  if (!title || !eventDate) return [];
+  const title = normalizedText(event.summary).toLocaleLowerCase();
+  if (!title || !(event.start?.date || event.start?.dateTime)) return [];
   return tasks
     .filter((task) => Boolean(task.due?.is_recurring)
-      && task.content.trim().toLocaleLowerCase() === title
-      && (task.due?.date || task.due?.datetime || "").slice(0, 10) === eventDate)
+      && normalizedText(task.content).toLocaleLowerCase() === title
+      && startsMatch(event, task))
     .map((task) => task.id)
     .sort();
 }
