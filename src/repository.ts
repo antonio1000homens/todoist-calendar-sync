@@ -365,21 +365,18 @@ export class StateRepository {
     }));
   }
 
-  /** Durable, non-expiring guard while a manual future series split is incomplete. */
+  /** One global task claim prevents concurrent splits in different profiles. */
   async getFutureSeriesSplitAnyProfile(taskId: string): Promise<
     { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string } | undefined
   > {
-    for (const profile of allProfiles) {
-      const result = await client.send(new GetCommand({
-        TableName: this.ensureTable(),
-        Key: key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
-        ConsistentRead: true,
-      }));
-      if (result.Item) return result.Item as {
-        profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string;
-      };
-    }
-    return undefined;
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
+      ConsistentRead: true,
+    }));
+    return result.Item as {
+      profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string;
+    } | undefined;
   }
 
   async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string): Promise<void> {
@@ -395,7 +392,7 @@ export class StateRepository {
       await client.send(new PutCommand({
         TableName: this.ensureTable(),
         Item: {
-          ...key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
+          ...key(`FUTURE_SPLIT#TASK#${taskId}`),
           profile, taskId, oldMasterId, newMasterId,
           status: "pending", startedAt: now(),
           // No TTL while pending: automatic reconciliation must remain blocked
@@ -414,12 +411,12 @@ export class StateRepository {
   async completeFutureSeriesSplit(profile: Profile, taskId: string, newMasterId: string): Promise<void> {
     await client.send(new UpdateCommand({
       TableName: this.ensureTable(),
-      Key: key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
       UpdateExpression: "SET #status = :done, completedAt = :now, expiresAt = :expire",
-      ConditionExpression: "newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
+      ConditionExpression: "profile = :profile AND newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: {
-        ":done": "completed", ":pending": "pending", ":now": now(),
+        ":done": "completed", ":pending": "pending", ":profile": profile, ":now": now(),
         ":expire": ttl(90), ":newMaster": newMasterId, ":task": taskId,
       },
     }));
