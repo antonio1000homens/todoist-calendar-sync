@@ -1099,6 +1099,8 @@ export class ManualInterventionService {
                 extra.taskTitle = task.content;
                 extra.todoistDue = todoistDue(task);
                 extra.todoistRecurring = Boolean(task.due?.is_recurring);
+                extra.todoistDescription = task.description || "";
+                extra.todoistUpdatedAt = task.updated_at;
               } catch (error) {
                 extra.taskReadError = error instanceof Error ? error.message : String(error);
               }
@@ -1109,6 +1111,7 @@ export class ManualInterventionService {
                 extra.calendarTitle = event.summary;
                 extra.calendarStart = eventDisplayStart(event);
                 extra.calendarStatus = event.status;
+                extra.calendarDescription = event.description || "";
               } catch (error) {
                 extra.calendarReadError = error instanceof Error ? error.message : String(error);
               }
