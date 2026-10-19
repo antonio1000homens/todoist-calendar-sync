@@ -8,8 +8,13 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
-import { retainedConflictEntity, retainedConflictIdentity, retainedConflictIncidentId } from "./audit-policy.js";
-import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
+import {
+  auditExpiresAt,
+  classifyAuditAction,
+  retainedConflictEntity,
+  retainedConflictIdentity,
+  retainedConflictIncidentId,
+} from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
@@ -812,8 +817,12 @@ export class StateRepository {
         ConsistentRead: true,
       }));
       const current = existing.Item as { active?: boolean; fingerprint?: string; incidentId?: string } | undefined;
-      if (current?.active && current.fingerprint === fingerprintHash && current.incidentId) return current.incidentId;
-      const incidentId = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+      const incidentId = retainedConflictIncidentId(
+        current as import("./audit-policy.js").RetainedConflictLifecycle | undefined,
+        fingerprintHash,
+        `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`,
+      );
+      if (current?.active && current.fingerprint === fingerprintHash && current.incidentId) return incidentId;
       try {
         await client.send(new PutCommand({
           TableName: this.ensureTable(),
