@@ -668,6 +668,7 @@ export class StateRepository {
     const result = await client.send(new GetCommand({
       TableName: this.ensureTable(),
       Key: key(`PROJECTION#${profile}#TASK#${taskId}`, "TOMBSTONE"),
+      ConsistentRead: true,
     }));
     if (typeof result.Item?.sourceUpdatedAt !== "string") return undefined;
     return {
