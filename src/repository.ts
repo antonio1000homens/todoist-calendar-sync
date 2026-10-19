@@ -365,6 +365,66 @@ export class StateRepository {
     }));
   }
 
+  /** Durable, non-expiring guard while a manual future series split is incomplete. */
+  async getFutureSeriesSplitAnyProfile(taskId: string): Promise<
+    { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string } | undefined
+  > {
+    for (const profile of allProfiles) {
+      const result = await client.send(new GetCommand({
+        TableName: this.ensureTable(),
+        Key: key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
+        ConsistentRead: true,
+      }));
+      if (result.Item) return result.Item as {
+        profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string;
+      };
+    }
+    return undefined;
+  }
+
+  async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string): Promise<void> {
+    const previous = await this.getFutureSeriesSplitAnyProfile(taskId);
+    if (previous) {
+      if (previous.profile !== profile || previous.taskId !== taskId
+        || previous.oldMasterId !== oldMasterId || previous.newMasterId !== newMasterId) {
+        throw new Error("Another pending/completed recurrence split owns this Todoist task");
+      }
+      return;
+    }
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
+          profile, taskId, oldMasterId, newMasterId,
+          status: "pending", startedAt: now(),
+          // No TTL while pending: automatic reconciliation must remain blocked
+          // until an operator finishes or explicitly compensates the split.
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+      const raced = await this.getFutureSeriesSplitAnyProfile(taskId);
+      if (!raced || raced.profile !== profile || raced.oldMasterId !== oldMasterId
+        || raced.newMasterId !== newMasterId) throw error;
+    }
+  }
+
+  async completeFutureSeriesSplit(profile: Profile, taskId: string, newMasterId: string): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#${profile}#TASK#${taskId}`),
+      UpdateExpression: "SET #status = :done, completedAt = :now, expiresAt = :expire",
+      ConditionExpression: "newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":done": "completed", ":pending": "pending", ":now": now(),
+        ":expire": ttl(90), ":newMaster": newMasterId, ":task": taskId,
+      },
+    }));
+  }
+
   /**
    * Install a NEW Todoist-owned recurrence mapping, all three identity indexes
    * and the recurrence link atomically. No unconditional reassignment or
