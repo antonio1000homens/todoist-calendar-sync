@@ -162,6 +162,42 @@ export class GoogleCalendar {
     throw new Error("Calendar duplicate discovery exceeded page limit");
   }
 
+  async getTimeZone(): Promise<string> {
+    const calendar = await this.request<{ timeZone?: string }>(
+      `/calendars/${encodeURIComponent(this.calendarId)}`,
+    );
+    if (!calendar.timeZone) throw new Error("Calendar timezone is missing; cannot determine safe recurrence cutoff");
+    try { new Intl.DateTimeFormat("en-GB", { timeZone: calendar.timeZone }); }
+    catch { throw new Error("Calendar returned an invalid timezone"); }
+    return calendar.timeZone;
+  }
+
+  /**
+   * Google events.list(singleEvents=false,showDeleted=true) includes explicit
+   * recurring overrides, independently of a time-limited instances expansion.
+   * An incomplete or oversized calendar inventory fails closed. Only *explicit*
+   * instances for this parent are returned.
+   */
+  async listExplicitSeriesExceptions(masterId: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      singleEvents: "false", showDeleted: "true", maxResults: "2500",
+    });
+    const found = new Map<string, CalendarEvent>();
+    let examined = 0;
+    for (let page = 0; page < 20; page += 1) {
+      const result = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const item of result.items || []) {
+        if (++examined > 10000) throw new Error("Calendar exception inventory exceeds safe limit");
+        if (item.recurringEventId === masterId) found.set(item.id, item);
+      }
+      if (!result.nextPageToken) return [...found.values()];
+      query.set("pageToken", result.nextPageToken);
+    }
+    throw new Error("Calendar exception inventory exceeded page limit");
+  }
+
   async getEvent(eventId: string): Promise<CalendarEvent> {
     return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`);
   }
