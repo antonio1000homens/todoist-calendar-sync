@@ -19,6 +19,7 @@ import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
   mappingLookupAttributes,
+  mappingLookupQueryInput,
   mappingOwnerLookupAttributes,
   recurrenceLookupAttributes,
   recurrenceLookupQueryInput,
@@ -363,6 +364,14 @@ export class StateRepository {
         { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
+  }
+
+  async listMappings(profile: Profile): Promise<Mapping[]> {
+    return readProfileLookup<Mapping>({
+      client, profile, operation: "future_series_mapping_ownership",
+      component: "state-repository",
+      queryInput: mappingLookupQueryInput(this.ensureTable(), profile),
+    });
   }
 
   /**
