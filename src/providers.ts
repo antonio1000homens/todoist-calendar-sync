@@ -180,6 +180,56 @@ export class GoogleCalendar {
     } while (true);
   }
 
+  /** Bounded instance read: never expand an open-ended recurrence without limits. */
+  async listInstancesInWindow(masterId: string, start: string, end: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      showDeleted: "true", maxResults: "2500", timeMin: start, timeMax: end,
+    });
+    const found = new Map<string, CalendarEvent>();
+    for (let page = 0; page < 20; page += 1) {
+      const result = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
+      );
+      for (const item of result.items || []) {
+        found.set(item.id, item);
+        if (found.size > 10000) throw new Error("Historical instance lookup exceeded the safe limit");
+      }
+      if (!result.nextPageToken) return [...found.values()];
+      query.set("pageToken", result.nextPageToken);
+    }
+    throw new Error("Historical instance lookup exceeded the page limit");
+  }
+
+  /**
+   * An explicitly addressed CREATE avoids duplicate masters after a partial
+   * failure. An existing ID is a conflict unless it has the exact approved
+   * task identity, rule, DTSTART and history marker.
+   */
+  async createFutureMasterOnce(event: CalendarEvent, historicalMasterId: string): Promise<CalendarEvent> {
+    if (!/^[a-f0-9]{32}$/.test(event.id) || !historicalMasterId) {
+      throw new Error("Future master needs a deterministic hexadecimal ID and history marker");
+    }
+    const valid = (candidate: CalendarEvent): boolean =>
+      candidate.id === event.id && candidate.status === "confirmed"
+      && candidate.start?.date === event.start?.date
+      && JSON.stringify(candidate.recurrence) === JSON.stringify(event.recurrence)
+      && candidate.extendedProperties?.shared?.taskId === event.extendedProperties?.shared?.taskId
+      && candidate.extendedProperties?.shared?.syncHistoryMasterId === historicalMasterId;
+    try {
+      const created = await this.request<CalendarEvent>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events`,
+        { method: "POST", body: JSON.stringify(event) },
+      );
+      if (!valid(created)) throw new Error("Created Calendar master does not match the approved future schedule");
+      return created;
+    } catch (error) {
+      if (Number((error as { status?: number }).status) !== 409) throw error;
+      const existing = await this.getEvent(event.id);
+      if (!valid(existing)) throw new Error("Deterministic Calendar ID belongs to a different series");
+      return existing;
+    }
+  }
+
   async upsertEvent(event: CalendarEvent, existingId?: string): Promise<CalendarEvent> {
     const path = `/calendars/${encodeURIComponent(this.calendarId)}/events${existingId ? `/${encodeURIComponent(existingId)}` : ""}`;
     return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
