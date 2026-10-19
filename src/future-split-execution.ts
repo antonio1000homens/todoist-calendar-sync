@@ -100,9 +100,14 @@ export async function applyApprovedFutureSeriesSplit(
     old.id, old.start!.date! + "T00:00:00Z", now.toISOString(),
   );
   assertUnmodifiedHistoricalOccurrences(old, historical, plan);
-  const nextWindowEnd = addDays(plan.nextOldOccurrence, 370) + "T00:00:00Z";
+  // Annual recurrence exception discovery is bounded but extends a decade
+  // beyond the first affected date, not only the next single occurrence.
+  const nextWindowEnd = addDays(plan.nextOldOccurrence, 10 * 366) + "T00:00:00Z";
   const oldFuture = await pair.calendar.listInstancesInWindow(old.id, now.toISOString(), nextWindowEnd);
-  if (!archived && oldFuture.some((item) => !isUnmodifiedInstance(item, old.id))) {
+  if (!archived && oldFuture.some((item) =>
+    !isUnmodifiedInstance(item, old.id)
+    || !sameTitle(item.summary, old.summary)
+    || normalizedText(item.description) !== normalizedText(old.description))) {
     throw new Error("Upcoming old-series occurrence overrides must be reviewed individually");
   }
   if (archived && oldFuture.length) {
@@ -139,7 +144,9 @@ export async function applyApprovedFutureSeriesSplit(
     }, old.id, plan.oldEtag);
   }
   const capped = await pair.calendar.getEvent(old.id);
-  if (capped.status !== "confirmed" || capped.recurrence?.[0] !== plan.truncatedRule
+  if (!sameTitle(capped.summary, old.summary)
+    || normalizedText(capped.description) !== normalizedText(old.description)
+    || capped.status !== "confirmed" || capped.recurrence?.[0] !== plan.truncatedRule
     || capped.extendedProperties?.shared?.syncHistoryOnly !== "true"
     || capped.extendedProperties?.shared?.syncHistorySuccessorId !== plan.newMasterId
     || capped.extendedProperties?.shared?.taskId) {
