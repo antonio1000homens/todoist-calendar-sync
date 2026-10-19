@@ -367,7 +367,7 @@ export class StateRepository {
 
   /** One global task claim prevents concurrent splits in different profiles. */
   async getFutureSeriesSplitAnyProfile(taskId: string): Promise<
-    { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string } | undefined
+    { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string } | undefined
   > {
     const result = await client.send(new GetCommand({
       TableName: this.ensureTable(),
@@ -375,15 +375,16 @@ export class StateRepository {
       ConsistentRead: true,
     }));
     return result.Item as {
-      profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; status: string;
+      profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string;
     } | undefined;
   }
 
-  async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string): Promise<void> {
+  async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string, previousOccurrence?: string): Promise<void> {
     const previous = await this.getFutureSeriesSplitAnyProfile(taskId);
     if (previous) {
       if (previous.profile !== profile || previous.taskId !== taskId
-        || previous.oldMasterId !== oldMasterId || previous.newMasterId !== newMasterId) {
+        || previous.oldMasterId !== oldMasterId || previous.newMasterId !== newMasterId
+        || previous.previousOccurrence !== previousOccurrence) {
         throw new Error("Another pending/completed recurrence split owns this Todoist task");
       }
       return;
@@ -393,7 +394,7 @@ export class StateRepository {
         TableName: this.ensureTable(),
         Item: {
           ...key(`FUTURE_SPLIT#TASK#${taskId}`),
-          profile, taskId, oldMasterId, newMasterId,
+          profile, taskId, oldMasterId, newMasterId, previousOccurrence,
           status: "pending", startedAt: now(),
           // No TTL while pending: automatic reconciliation must remain blocked
           // until an operator finishes or explicitly compensates the split.
@@ -404,7 +405,7 @@ export class StateRepository {
       if (!conditionalFailure(error)) throw error;
       const raced = await this.getFutureSeriesSplitAnyProfile(taskId);
       if (!raced || raced.profile !== profile || raced.oldMasterId !== oldMasterId
-        || raced.newMasterId !== newMasterId) throw error;
+        || raced.newMasterId !== newMasterId || raced.previousOccurrence !== previousOccurrence) throw error;
     }
   }
 
