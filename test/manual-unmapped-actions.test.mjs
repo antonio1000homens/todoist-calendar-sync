@@ -162,10 +162,11 @@ async function withNoBaseline(callback) {
 test("Slack exposes confirmed owner choices, but never authorizes unattended auto application", () => {
   const options = MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions;
   assert.deepEqual(options.map((action) => action.id), [
-    "use_todoist_recurrence", "use_calendar_version", "keep_separate", "reconcile_now",
+    "use_todoist_recurrence", "split_future_todoist", "use_calendar_version", "keep_separate", "reconcile_now",
   ]);
   assert.equal(options[0].destructive, true);
   assert.equal(options[1].destructive, true);
+  assert.equal(options[2].destructive, true);
   assert.equal(options.every((action) => !action.autoAllowed), true);
   const oldCard = setup();
   oldCard.store.value.permittedActions = [
@@ -174,12 +175,14 @@ test("Slack exposes confirmed owner choices, but never authorizes unattended aut
   const blocks = JSON.stringify(decisionBlocks(oldCard.store.value));
   assert.match(blocks, /Use Todoist recurrence/);
   assert.match(blocks, /Use Calendar version/);
+  assert.match(blocks, /Use Todoist for future/);
   assert.match(blocks, /Keep separate/);
   const actions = decisionBlocks(oldCard.store.value).filter((block) => block.type === "actions")
     .flatMap((block) => block.elements);
   assert.equal(JSON.parse(actions[0].value).confirmRequired, true);
   assert.equal(JSON.parse(actions[1].value).confirmRequired, true);
-  assert.equal(JSON.parse(actions[2].value).confirmRequired, false);
+  assert.equal(JSON.parse(actions[2].value).confirmRequired, true);
+  assert.equal(JSON.parse(actions[3].value).confirmRequired, false);
 });
 
 test("Use Todoist recurrence converts only the unique existing event to an RRULE and restores mapping", async () => {
