@@ -595,7 +595,10 @@ export class Synchronizer {
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any mapping discovery or Todoist mutation.
     let archived = event.extendedProperties?.shared?.syncHistoryOnly === "true";
-    if (!archived && event.recurringEventId) {
+    // A cancelled instance can reference an already-deleted master. Its
+    // existing cancellation logic (including stale-instance safeguards) must
+    // still run; unbound deleted instances cannot resurrect Todoist tasks.
+    if (!archived && event.recurringEventId && event.status !== "cancelled") {
       const { calendar } = await this.clients(delivery.profile);
       const parent = await calendar.getEvent(event.recurringEventId);
       archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
