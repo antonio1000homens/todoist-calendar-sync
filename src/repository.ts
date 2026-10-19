@@ -402,8 +402,13 @@ export class StateRepository {
       if (!live || live.updatedAt !== expectedLink.updatedAt
         || live.owner !== mapping.recurrenceOwner
         || live.taskId !== mapping.taskId || live.eventId !== mapping.eventId
+        || live.profile !== mapping.profile || live.seriesId !== mapping.seriesId
         || live.masterEventId !== mapping.masterEventId
         || live.activeInstanceId !== mapping.activeInstanceId
+        || live.originalStart !== mapping.originalStart
+        || live.activeEffectiveStart !== mapping.activeEffectiveStart
+        || live.completedThroughOriginalStart !== mapping.completedThroughOriginalStart
+        || live.calendarProgressVersion !== mapping.calendarProgressVersion
         || live.completedThroughOriginalStart !== expectedLink.completedThroughOriginalStart
         || live.calendarProgressVersion !== expectedLink.calendarProgressVersion) return false;
     } else if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) {
