@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { auditExpiresAt, AUDIT_RETENTION_DAYS, classifyAuditAction } from "../dist/audit-policy.js";
+import { auditExpiresAt, AUDIT_RETENTION_DAYS, classifyAuditAction, retainedConflictIdentity } from "../dist/audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "../dist/observability.js";
 
 test("new audit expiry is seven days and does not alter the other TTL policies", () => {
@@ -66,5 +66,40 @@ test("logEvent emits one valid structured JSON record without unsafe fields", ()
     component: "reconciliation",
     profile: "antonio",
     taskId: "task-2",
+  });
+});
+
+test("retained conflict fingerprint is stable for repeats and sensitive to changed candidates", () => {
+  const action = "todoist_snapshot_reconcile_unmapped_conflict";
+  assert.equal(retainedConflictIdentity(action, { taskId: "task", eventId: "event" }),
+    retainedConflictIdentity(action, { eventId: "event", taskId: "task" }));
+  assert.notEqual(retainedConflictIdentity(action, { taskId: "task", eventId: "event" }),
+    retainedConflictIdentity(action, { taskId: "task", eventId: "other" }));
+  assert.equal(retainedConflictIdentity(action, { taskId: "task", eventId: "event", title: "secret" }),
+    retainedConflictIdentity(action, { taskId: "task", eventId: "event" }));
+  assert.equal(retainedConflictIdentity("todoist_snapshot_reconcile_completed", { taskId: "task" }), undefined);
+  assert.equal(retainedConflictIdentity(action, {}), undefined);
+  assert.equal(retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
+    taskId: "task", candidateEventIds: ["a", "b"],
+  }), retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
+    taskId: "task", candidateEventIds: ["b", "a"],
+  }));
+  assert.notEqual(retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
+    taskId: "task", candidateEventIds: ["a", "b"],
+  }), retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
+    taskId: "task", candidateEventIds: ["c", "a"],
+  }));
+});
+
+test("candidate event/task IDs survive sanitization without raw provider content", () => {
+  assert.deepEqual(sanitizeTelemetryDetail({
+    taskId: "task-1",
+    candidateEventIds: ["event_1", "event_2", "https://malicious.test/token"],
+    candidateTaskIds: ["task_1", "task_2"],
+    title: "private title",
+  }), {
+    taskId: "task-1",
+    candidateEventIds: ["event_1", "event_2"],
+    candidateTaskIds: ["task_1", "task_2"],
   });
 });
