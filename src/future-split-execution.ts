@@ -212,7 +212,11 @@ export async function applyApprovedFutureSeriesSplit(
     || capped.extendedProperties?.shared?.taskId) {
     throw new Error("Old Calendar history cap was not verified; future master will not be created");
   }
-  const remainingFuture = await pair.calendar.listInstancesInWindow(old.id, now.toISOString(), nextWindowEnd);
+  const [remainingFuture, postCapExceptions] = await Promise.all([
+    pair.calendar.listInstancesInWindow(old.id, now.toISOString(), nextWindowEnd),
+    pair.calendar.listExplicitSeriesExceptions(old.id),
+  ]);
+  if (postCapExceptions.length) throw new Error("Historical Calendar series gained a recurrence exception during the cap");
   if (remainingFuture.length) throw new Error("Historical Calendar series still projects obsolete future occurrences");
 
   // A concrete ID makes retries safe even if the first request succeeded but
