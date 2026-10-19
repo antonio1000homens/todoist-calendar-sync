@@ -73,6 +73,9 @@ class FakeState {
     this.tombstones = new Map();
     this.completedProjections = new Map();
     this.eventMappings = new Map();
+    this.recurrenceLinks = new Map();
+    this.ownerMapping = undefined;
+    this.otherProfileMappings = new Map();
     this.audits = [];
     this.operations = [];
   }
@@ -82,6 +85,27 @@ class FakeState {
   }
   async getMappingByEvent(profile, eventId) {
     return this.eventMappings.get(`${profile}:${eventId}`);
+  }
+  async getRecurrenceLink(profile, seriesId) {
+    return this.recurrenceLinks.get(`${profile}:${seriesId}`);
+  }
+  async restoreMappingIndexesIfOwned(mapping, link) {
+    const current = this.eventMappings.get(`${mapping.profile}:${mapping.eventId}`);
+    if (!current || current.taskId !== mapping.taskId || current.updatedAt !== mapping.updatedAt) return false;
+    const conflicts = (value) => value &&
+      (value.profile !== mapping.profile || value.taskId !== mapping.taskId || value.eventId !== mapping.eventId);
+    if (conflicts(this.mapping) || conflicts(this.ownerMapping)
+      || [...this.otherProfileMappings.values()].some(Boolean)) return false;
+    if (this.tombstones.has(`${mapping.profile}:${mapping.taskId}`)
+      || this.completedProjections.has(`${mapping.profile}:${mapping.eventId}`)) return false;
+    if (mapping.recurrenceOwner) {
+      const currentLink = this.recurrenceLinks.get(`${mapping.profile}:${mapping.seriesId}`);
+      if (!link || !currentLink || link !== currentLink) return false;
+    } else if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
+    this.mapping = mapping;
+    this.ownerMapping = mapping;
+    this.operations.push(`restore-mapping:${mapping.eventId}`);
+    return true;
   }
   async putMapping(mapping) {
     this.mapping = mapping;
