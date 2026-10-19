@@ -1246,6 +1246,146 @@ export class ManualInterventionService {
     await this.notifier.updateResolution(decision, text, blocks);
   }
 
+  /**
+   * Explicit one-object ownership resolution, not another blind full-profile
+   * retry. Only a live standalone event linked to an existing recurring task
+   * can enter this path. Duplicate identities require operator investigation.
+   * The normal project synchronizer performs the final mapping/comment writes
+   * so recurrence metadata is identical to normal Todoist-driven creation.
+   */
+  private async resolveUnmappedConflict(
+    decision: ManualDecision,
+    action: "use_todoist_recurrence" | "use_calendar_version",
+    state: StateRepository,
+    slackUserId?: string,
+  ): Promise<void> {
+    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
+    if (!decision.taskId || !decision.eventId
+      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_unmapped_conflict"
+      || decision.context.candidateEventIds instanceof Array
+      || decision.context.candidateTaskIds instanceof Array) {
+      return refuse("This decision does not identify one unambiguous live Todoist task and Calendar event. No changes made.");
+    }
+    const pair = await this.providerClients(decision.profile);
+    let task: TodoistTask;
+    let event: CalendarEvent;
+    try {
+      [task, event] = await Promise.all([
+        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
+      ]);
+    } catch (error) {
+      if (providerNotFound(error)) return refuse("The task or Calendar event no longer exists. No changes made.");
+      throw error;
+    }
+    if (task.project_id !== profiles[decision.profile].todoistProjectId
+      || !unresolvedStandalonePair(task, event)) {
+      return refuse("The current objects are no longer one active, same-title, same-date standalone pair with Todoist recurrence. No changes made.");
+    }
+    const snapshots: Array<[string, string | undefined]> = [
+      ["taskTitle", task.content],
+      ["calendarTitle", event.summary],
+      ["todoistDue", todoistDue(task)],
+      ["calendarStart", eventDisplayStart(event)],
+      ["todoistDescription", task.description || ""],
+      ["calendarDescription", event.description || ""],
+      ["todoistUpdatedAt", task.updated_at],
+    ];
+    for (const [field, current] of snapshots) {
+      if (typeof decision.context[field] === "string"
+        && normalizedText(decision.context[field]) !== normalizedText(current)) {
+        return refuse(`The ${field} changed after the decision was created. No changes made.`);
+      }
+    }
+    if (decision.context.todoistRecurring === false || decision.context.calendarStatus !== "confirmed") {
+      return refuse("The original decision did not confirm an active, recurring task and Calendar event. No changes made.");
+    }
+    if (action === "use_todoist_recurrence" && !todoistRecurrenceToRrule(task)) {
+      return refuse("The Todoist recurrence cannot be represented as a supported Calendar RRULE. No changes made.");
+    }
+
+    const [taskMapping, eventMapping, tombstone, completion, history, baseline, linked] = await Promise.all([
+      state.getMappingByTaskAnyProfile(task.id),
+      state.getMappingByEvent(decision.profile, event.id),
+      state.getCalendarProjectionTombstone(decision.profile, task.id),
+      state.getCompletedCalendarProjectionByEvent(decision.profile, event.id),
+      state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
+      documentClient.send(new GetCommand({
+        TableName: tableName(),
+        Key: { pk: `BASELINE#${decision.profile}#TASK#${task.id}`, sk: "RECONCILE" },
+        ConsistentRead: true,
+      })),
+      pair.calendar.findByTodoistTaskId(task.id),
+    ]);
+    if (taskMapping || eventMapping || tombstone || completion || history.length || baseline.Item
+      || !linked || linked.id !== event.id) {
+      return refuse("Ownership, a tombstone, completion history, baseline or linked Calendar identity prevents safe relinking. No changes made.");
+    }
+
+    // Enumerate actual occurrences, not only extendedProperty matches. An
+    // unrelated annual series can have a 2027 instance despite a 2024 master.
+    const { start, end } = manualConflictWindow(task);
+    const [tasks, occurrences] = await Promise.all([
+      pair.todoist.listTasks(),
+      pair.calendar.listOccurrencesInWindow(start, end),
+    ]);
+    const competing = competingUnmappedIdentities(task, event, tasks, occurrences);
+    if (competing.taskIds.length || competing.eventIds.length || !competing.sawTarget) {
+      await state.audit(decision.profile, "manual_unmapped_resolution_duplicate_blocked", {
+        taskId: task.id, eventId: event.id, action,
+        candidateTaskIds: competing.taskIds, candidateEventIds: competing.eventIds,
+      });
+      return refuse("A competing Todoist task or Calendar occurrence exists, or the original event could not be verified. No changes made; inspect duplicate identities first.");
+    }
+
+    let currentTask = task;
+    try {
+      if (action === "use_calendar_version") {
+        // Converting a recurrence to one-off changes future Todoist scheduling.
+        // This is explicit and confirmation-gated in Slack.
+        currentTask = await pair.todoist.upsertTask(toTodoistTask(event), task.id);
+        if (currentTask.due?.is_recurring || !hasCanonicalState(event, currentTask)) {
+          throw new Error("Todoist did not accept the one-off Calendar date; mapping was not written");
+        }
+      }
+      const delivery: Delivery = {
+        id: `manual-unmapped:${decision.decisionId}:${action}`,
+        kind: "todoist",
+        profile: decision.profile,
+        mode: "aws",
+        receivedAt: isoNow(),
+        headers: { "x-todoist-calendar-sync-manual": "true" },
+        body: JSON.stringify({
+          event_name: "item:updated",
+          event_data: currentTask,
+          event_data_extra: { old_item: { ...currentTask, project_id: "__outside_sync_profiles__" } },
+        } satisfies TodoistWebhookPayload),
+      };
+      await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients).process(delivery);
+      const mapped = await state.getMappingByTask(decision.profile, task.id);
+      if (!mapped || mapped.eventId !== event.id
+        || (action === "use_todoist_recurrence" && mapped.recurrenceOwner !== "todoist")
+        || (action === "use_calendar_version" && mapped.recurrenceOwner)) {
+        throw new Error("The existing synchronizer did not establish the expected mapping");
+      }
+      const [freshTask, freshEvent] = await Promise.all([
+        pair.todoist.getTask(task.id), pair.calendar.getEvent(event.id),
+      ]);
+      if (!hasCanonicalState(freshEvent, freshTask)) {
+        throw new Error("Post-action provider states are not canonical; decision remains open");
+      }
+      await state.audit(decision.profile, "manual_unmapped_resolution_applied", {
+        taskId: task.id, eventId: event.id, action,
+      });
+    } catch (error) {
+      await state.audit(decision.profile, "manual_unmapped_resolution_incomplete", {
+        taskId: task.id, eventId: event.id, action,
+        reason: error instanceof Error ? error.message : String(error),
+      }).catch(() => undefined);
+      throw error;
+    }
+    return this.finishAndReconcile(decision, state, action, slackUserId);
+  }
+
   private async markStale(decision: ManualDecision, reason: string, slackUserId?: string): Promise<void> {
     await this.store.finish(decision.decisionId, "stale", reason, slackUserId).catch(() => undefined);
     await this.notifier.updateResolution(decision, `⚠️ No action was taken because this request became stale.\n${reason}`);
@@ -1578,7 +1718,14 @@ export class ManualInterventionService {
         }
         return;
       }
-      if (manual.action === "acknowledge" && ["todoist_unmapped_conflict", "todoist_cancelled_projection_blocked"].includes(decision.type)) {
+      if (decision.type === "todoist_unmapped_conflict"
+        && (manual.action === "use_todoist_recurrence" || manual.action === "use_calendar_version")) {
+        await this.resolveUnmappedConflict(decision, manual.action, state, manual.slackUserId);
+        return;
+      }
+      if ((manual.action === "acknowledge" && decision.type === "todoist_cancelled_projection_blocked")
+        || (manual.action === "keep_separate" && decision.type === "todoist_unmapped_conflict")
+        || (manual.action === "acknowledge" && decision.type === "todoist_unmapped_conflict")) {
         // Acknowledgement is not a provider operation or a mapping decision.
         await this.store.finish(decision.decisionId, "resolved", manual.action, manual.slackUserId);
         await this.notifier.updateResolution(decision, "Acknowledged. Todoist and Calendar remain unchanged.");
