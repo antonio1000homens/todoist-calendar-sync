@@ -328,17 +328,17 @@ export class StateRepository {
   }
 
   async getMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {
-    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`EVENT#${profile}#${eventId}`, "MAP") }));
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`EVENT#${profile}#${eventId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;
   }
 
   async getMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
-    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP") }));
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;
   }
 
   async getMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
-    const owner = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP") }));
+    const owner = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP"), ConsistentRead: true }));
     if (owner.Item) return owner.Item as Mapping;
     for (const profile of allProfiles) {
       const mapping = await this.getMappingByTask(profile, taskId);
@@ -356,6 +356,136 @@ export class StateRepository {
         { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
+  }
+
+  /**
+   * Recover missing TASK / TASKOWNER indexes only from an unchanged EVENT row.
+   * Ordinary putMapping() is intentionally unconditional and MUST NOT be used
+   * for this path: another profile may now own the same Todoist task.
+   *
+   * The read-side preflight makes errors actionable; the transaction remains
+   * authoritative if ownership, recurrence, completion or tombstone state
+   * changes between the reads and the repair.
+   */
+  async restoreMappingIndexesIfOwned(mapping: Mapping, expectedLink?: RecurrenceLink): Promise<boolean> {
+    const current = await this.getMappingByEvent(mapping.profile, mapping.eventId);
+    if (!current || current.taskId !== mapping.taskId || current.updatedAt !== mapping.updatedAt
+      || current.profile !== mapping.profile) return false;
+
+    const owner = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+      ConsistentRead: true,
+    }));
+    const compatible = (candidate: Mapping | undefined): boolean =>
+      !candidate || (candidate.profile === mapping.profile
+        && candidate.taskId === mapping.taskId && candidate.eventId === mapping.eventId
+        && candidate.updatedAt === mapping.updatedAt
+        && candidate.recurrenceOwner === mapping.recurrenceOwner
+        && candidate.seriesId === mapping.seriesId
+        && candidate.completedThroughOriginalStart === mapping.completedThroughOriginalStart);
+    if (!compatible(owner.Item as Mapping | undefined)
+      || !compatible(await this.getMappingByTask(mapping.profile, mapping.taskId))) return false;
+
+    // A stale non-owner TASK row is still an unresolved split-brain, not
+    // permission to overwrite the global owner index.
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      if (await this.getMappingByTask(other, mapping.taskId)) return false;
+    }
+    if (await this.getCalendarProjectionTombstone(mapping.profile, mapping.taskId)
+      || await this.getCompletedCalendarProjectionByEvent(mapping.profile, mapping.eventId)) return false;
+
+    if (mapping.recurrenceOwner) {
+      if (!mapping.seriesId || !expectedLink) return false;
+      const live = await this.getRecurrenceLink(mapping.profile, mapping.seriesId);
+      if (!live || live.updatedAt !== expectedLink.updatedAt
+        || live.owner !== mapping.recurrenceOwner
+        || live.taskId !== mapping.taskId || live.eventId !== mapping.eventId
+        || live.profile !== mapping.profile || live.seriesId !== mapping.seriesId
+        || live.masterEventId !== mapping.masterEventId
+        || live.activeInstanceId !== mapping.activeInstanceId
+        || live.originalStart !== mapping.originalStart
+        || live.activeEffectiveStart !== mapping.activeEffectiveStart
+        || live.completedThroughOriginalStart !== mapping.completedThroughOriginalStart
+        || live.calendarProgressVersion !== mapping.calendarProgressVersion
+        || live.completedThroughOriginalStart !== expectedLink.completedThroughOriginalStart
+        || live.calendarProgressVersion !== expectedLink.calendarProgressVersion) return false;
+    } else if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) {
+      return false;
+    }
+
+    const table = this.ensureTable();
+    const identityValues = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt,
+    };
+    const compatibleWrite = "attribute_not_exists(pk) OR (#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated)";
+    const transactItems: Array<Record<string, unknown>> = [
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: { ...identityValues, ":updated": mapping.updatedAt },
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+        ConditionExpression: compatibleWrite,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: identityValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+        ConditionExpression: compatibleWrite,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: identityValues,
+      } },
+    ];
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      transactItems.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    if (expectedLink && mapping.seriesId) {
+      transactItems.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
+        ConditionExpression: "taskId = :task AND eventId = :event AND #owner = :owner AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#owner": "owner" },
+        ExpressionAttributeValues: {
+          ":task": mapping.taskId, ":event": mapping.eventId,
+          ":owner": mapping.recurrenceOwner, ":updated": expectedLink.updatedAt,
+        },
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: transactItems as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   private async deleteProfileMappingIndexes(mapping: Mapping): Promise<void> {
@@ -538,6 +668,7 @@ export class StateRepository {
     const result = await client.send(new GetCommand({
       TableName: this.ensureTable(),
       Key: key(`PROJECTION#${profile}#TASK#${taskId}`, "TOMBSTONE"),
+      ConsistentRead: true,
     }));
     if (typeof result.Item?.sourceUpdatedAt !== "string") return undefined;
     return {
