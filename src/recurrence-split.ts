@@ -51,7 +51,9 @@ export function planFutureSeriesSplit(
     || !task.due?.date || task.due.datetime || !task.due.is_recurring) {
     throw new Error("Future-only split supports all-day recurring task and Calendar master only");
   }
-  if (old.extendedProperties?.shared?.taskId !== task.id
+  if ((old.extendedProperties?.shared?.taskId !== task.id
+      && !(old.extendedProperties?.shared?.syncHistoryOnly === "true"
+        && old.extendedProperties?.shared?.syncHistoryTaskId === task.id))
     || old.extendedProperties?.shared?.syncRecurrenceOwner === "calendar"
     || normalizedText(old.summary).toLowerCase() !== normalizedText(task.content).toLowerCase()) {
     throw new Error("Existing Calendar series does not prove this Todoist task's identity");
