@@ -451,6 +451,9 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
 
+      // An ambiguous linked Calendar identity is not resolved by this delivery.
+      // Let the existing failure/retry/quarantine flow retain the original
+      // payload (including deletes), rather than acknowledging lost work.
       await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
 
       if (delivery.kind === "calendar" || delivery.kind === "todoist") {
