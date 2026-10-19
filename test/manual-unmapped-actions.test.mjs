@@ -373,3 +373,26 @@ test("a moved historical cutoff creates a NEW approval, never changing the origi
   assert.equal(next.context.futureSplitPlan.previousOccurrence, originalPlan.previousOccurrence);
   assert.deepEqual(item.changes, []);
 });
+
+test("Slack split refuses a Calendar ETag changed after its frozen preview", async () => {
+  const item = setup();
+  const e = item.events.get("event-1");
+  item.events.set("event-1", {
+    ...e, start: { date: "2025-03-06" }, end: { date: "2025-03-07" },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-03-06";
+  item.store.value.context.calendarStatus = "confirmed";
+  item.store.value.context.calendarEtag = '"earlier-version"';
+  item.store.value.context.calendarRecurrenceRule = "RRULE:FREQ=YEARLY";
+  item.store.value.context.todoistRecurrenceRule = "RRULE:FREQ=YEARLY";
+  item.store.value.context.futureSplitPlan = {
+    oldMasterId: "event-1", newMasterId: "irrelevant-plan-id",
+    previousOccurrence: "2026-03-06", nextOldOccurrence: "2027-03-06",
+    newStart: "2027-03-06", calendarTimeZone: "Europe/London",
+  };
+  item.store.value.context.futureSplitPreview = "A frozen preview";
+  await item.run("split_future_todoist");
+  assert.equal(item.store.value.status, "stale");
+  assert.deepEqual(item.changes, []);
+});
