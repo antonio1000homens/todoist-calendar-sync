@@ -1825,8 +1825,7 @@ export class ManualInterventionService {
           await this.notifier.postText(`Decision \`${manual.targetId}\` is not pending.`, channel);
           return;
         }
-        if (decision.type === "todoist_unmapped_conflict" && decision.taskId && decision.eventId
-          && (!decision.context.futureSplitPlan || typeof decision.context.futureSplitPreview !== "string")) {
+        if (decision.type === "todoist_unmapped_conflict" && decision.taskId && decision.eventId) {
           const pair = await this.providerClients(decision.profile);
           try {
             const [task, event] = await Promise.all([
@@ -1834,7 +1833,10 @@ export class ManualInterventionService {
             ]);
             if (event.recurrence?.length) {
               const calendarTimeZone = await pair.calendar.getTimeZone();
-              const plan = planFutureSeriesSplit(decision.profile, task, event, new Date(), calendarTimeZone);
+              const prior = decision.context.futureSplitPlan as ReturnType<typeof planFutureSeriesSplit> | undefined;
+              const alreadyCapped = event.extendedProperties?.shared?.syncHistoryOnly === "true";
+              const planningNow = alreadyCapped && prior?.approvedAt ? new Date(prior.approvedAt) : new Date();
+              const plan = planFutureSeriesSplit(decision.profile, task, event, planningNow, calendarTimeZone);
               const current = {
                 taskTitle: task.content, calendarTitle: event.summary,
                 todoistDue: todoistDue(task), calendarStart: eventDisplayStart(event),
@@ -1854,8 +1856,45 @@ export class ManualInterventionService {
                 futureSplitPlan: plan,
                 futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule} (Calendar timezone ${calendarTimeZone})`,
               };
-              await this.store.refreshPendingContext(decision.decisionId, context);
-              await this.notifier.postDecision({ ...decision, context });
+              const changedApproval = Boolean(prior) && !alreadyCapped && (
+                prior.previousOccurrence !== plan.previousOccurrence
+                || prior.nextOldOccurrence !== plan.nextOldOccurrence
+                || prior.newStart !== plan.newStart
+                || prior.newRule !== plan.newRule
+                || prior.calendarTimeZone !== calendarTimeZone
+                || decision.context.calendarEtag !== event.etag
+                || decision.context.todoistUpdatedAt !== task.updated_at
+              );
+              if (changedApproval) {
+                // Never revise an already approved plan in place. Generate a
+                // new revision-keyed decision and make the old action terminal.
+                const revision = decisionKey(decision.profile, decision.type, {
+                  previousDecisionId: decision.decisionId,
+                  approvedPlan: plan,
+                  calendarEtag: event.etag,
+                  taskVersion: task.updated_at,
+                });
+                const { status: _oldStatus, createdAt: _oldCreatedAt,
+                  decisionDeadline: _oldDeadline, ...retained } = decision;
+                const refreshed = await this.store.putPending({
+                  ...retained, decisionId: revision.decisionId,
+                  fingerprint: revision.fingerprint, context,
+                  permittedActions: MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions,
+                  slackMessageTs: undefined,
+                });
+                await this.store.finish(decision.decisionId, "stale",
+                  "Recurrence cutoff or approved provider version changed; fresh consent needed");
+                await this.notifier.updateResolution(decision,
+                  "The approved recurrence cutoff or provider version has changed. This approval is stale; review the newly issued decision.");
+                if (refreshed.decision.status === "pending") {
+                  await this.notifier.postDecision(refreshed.decision);
+                }
+                return;
+              }
+              if (!prior) {
+                await this.store.refreshPendingContext(decision.decisionId, context);
+              }
+              await this.notifier.postDecision({ ...decision, context: prior ? decision.context : context });
               return;
             }
           } catch (error) {
