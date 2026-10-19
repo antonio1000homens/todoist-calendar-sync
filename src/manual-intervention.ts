@@ -14,6 +14,8 @@ import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { profiles } from "./config.js";
 import { normalizedText } from "./security.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { planFutureSeriesSplit } from "./recurrence-split.js";
+import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -21,7 +23,9 @@ import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, Todoist
 const DEFAULT_DECISION_RETENTION_DAYS = 30;
 const DEFAULT_DECISION_DEADLINE_DAYS = 7;
 const MAX_MANUAL_BULK_MUTATIONS = 10;
-const MANUAL_CALENDAR_MUTATIONS = new Set(["upsertEvent", "deleteEvent"]);
+const MANUAL_CALENDAR_MUTATIONS = new Set([
+  "upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "deleteEvent",
+]);
 const MANUAL_TODOIST_MUTATIONS = new Set(["upsertTask", "updateRecurringOccurrence", "deleteTask", "upsertComment", "deleteComment"]);
 
 class ManualCircuitOpenError extends Error {
@@ -136,6 +140,7 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     detection: "audit_conflict",
     actions: actions(
       ["use_todoist_recurrence", "Use Todoist recurrence", true],
+      ["split_future_todoist", "Use Todoist for future — keep Calendar history", true],
       ["use_calendar_version", "Use Calendar version", true],
       ["keep_separate", "Keep separate / Ignore"],
       ["reconcile_now", "Retry guarded reconciliation"],
@@ -555,7 +560,7 @@ function actionGuidance(decision: ManualDecision): string | undefined {
     case "standalone_todoist_task_deleted":
       return "*Choose one:* Delete the Calendar event if the Todoist deletion was intentional, or restore the Todoist task if the Calendar event should remain. No provider action happens until you choose.";
     case "todoist_unmapped_conflict":
-      return "*Choose one:* Use Todoist's recurrence, use the Calendar event's one-off date, keep the records separate, or retry checks. The two 'Use' actions require confirmation and are refused if another task or recurring Calendar series could be affected. Previously posted cards can be refreshed with `/sync resume <decision ID>`.";
+      return "*Choose one:* For a changed recurring Calendar master, *Use Todoist for future — keep Calendar history* cuts off only its old future dates and creates a new Todoist-owned recurrence; past Calendar occurrences stay intact. For standalone mismatches, use the original choices. Both require explicit confirmation and fresh ownership/duplicate checks. Existing cards: `/sync resume <decision ID>`.";
     case "todoist_owned_recurrence_task_deleted":
       return "*Choose one:* Delete the Calendar series if the Todoist deletion was intentional, keep it and unlink it, or restore the Todoist task. No provider action happens until you choose.";
     case "calendar_owned_recurrence_task_deleted":
@@ -614,6 +619,9 @@ function contextLines(decision: ManualDecision): string[] {
     displayCalendarStart ? `*Calendar start:* ${displayCalendarStart}` : undefined,
     todoistRecurring,
     displayCalendarStatus,
+    typeof detail.futureSplitPreview === "string"
+      ? `*Future-only plan:* ${escapeSlackMrkdwnText(detail.futureSplitPreview)}`
+      : undefined,
     changeSummary(decision) ? `*What changed:* ${changeSummary(decision)}` : undefined,
     ...operationalContextLines(decision),
   ].filter(Boolean) as string[];
@@ -1101,6 +1109,8 @@ export class ManualInterventionService {
                 extra.todoistRecurring = Boolean(task.due?.is_recurring);
                 extra.todoistDescription = task.description || "";
                 extra.todoistUpdatedAt = task.updated_at;
+                extra.todoistRecurrenceRule = todoistRecurrenceToRrule(task);
+                extra.todoistRecurrenceText = task.due?.string;
               } catch (error) {
                 extra.taskReadError = error instanceof Error ? error.message : String(error);
               }
@@ -1112,6 +1122,8 @@ export class ManualInterventionService {
                 extra.calendarStart = eventDisplayStart(event);
                 extra.calendarStatus = event.status;
                 extra.calendarDescription = event.description || "";
+                extra.calendarRecurrenceRule = event.recurrence?.[0];
+                extra.calendarEtag = event.etag;
               } catch (error) {
                 extra.calendarReadError = error instanceof Error ? error.message : String(error);
               }
@@ -1149,6 +1161,19 @@ export class ManualInterventionService {
                 }
               } catch {
                 readOnlyCandidates.push({ kind: candidate.kind, id: candidate.id, available: false });
+              }
+            }
+            if (taskId && eventId && !extra.taskReadError && !extra.calendarReadError) {
+              try {
+                const [task, event] = await Promise.all([
+                  pair.todoist.getTask(taskId), pair.calendar.getEvent(eventId),
+                ]);
+                if (event.recurrence?.length) {
+                  const preview = planFutureSeriesSplit(profile, task, event);
+                  extra.futureSplitPreview = `${preview.originalRule} from ${event.start?.date}; retain through ${preview.previousOccurrence}; stop old dates from ${preview.nextOldOccurrence}; start ${preview.newStart} with ${preview.newRule}`;
+                }
+              } catch (error) {
+                extra.futureSplitBlockedReason = error instanceof Error ? error.message : String(error);
               }
             }
             if (readOnlyCandidates.length) extra.readOnlyCandidates = readOnlyCandidates;
@@ -1380,6 +1405,72 @@ export class ManualInterventionService {
       throw error;
     }
     return this.finishAndReconcile(decision, state, action, slackUserId);
+  }
+
+  /** User-confirmed, future-only recurrence ownership change (#84). */
+  private async resolveFutureRecurringConflict(
+    decision: ManualDecision,
+    state: StateRepository,
+    slackUserId?: string,
+  ): Promise<void> {
+    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
+    if (!decision.taskId || !decision.eventId
+      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_unmapped_conflict"
+      || Array.isArray(decision.context.candidateEventIds) && decision.context.candidateEventIds.length
+      || Array.isArray(decision.context.candidateTaskIds) && decision.context.candidateTaskIds.length) {
+      return refuse("Only one identified linked Todoist task and recurring master can be split. No changes made.");
+    }
+    const pair = await this.providerClients(decision.profile);
+    let task: TodoistTask;
+    let old: CalendarEvent;
+    try {
+      [task, old] = await Promise.all([
+        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
+      ]);
+    } catch (error) {
+      if (providerNotFound(error)) return refuse("The approved task or historical Calendar master is missing");
+      throw error;
+    }
+    for (const [field, current] of [
+      ["taskTitle", task.content], ["todoistDue", todoistDue(task)],
+      ["calendarTitle", old.summary], ["calendarStart", eventDisplayStart(old)],
+      ["todoistDescription", task.description || ""],
+      ["calendarDescription", old.description || ""],
+      ["todoistUpdatedAt", task.updated_at],
+    ] as Array<[string, string | undefined]>) {
+      if (typeof decision.context[field] === "string"
+        && normalizedText(current) !== normalizedText(decision.context[field])) {
+        return refuse(`${field} changed after the original approval request. No changes made.`);
+      }
+    }
+    if (decision.context.calendarStatus !== "confirmed"
+      || decision.context.todoistRecurring === false
+      || decision.context.calendarRecurrenceRule && decision.context.calendarRecurrenceRule !== old.recurrence?.[0]
+        && old.extendedProperties?.shared?.syncHistoryOriginalRule !== decision.context.calendarRecurrenceRule) {
+      return refuse("The original recurring Calendar series changed since notification.");
+    }
+    try {
+      const result = await applyApprovedFutureSeriesSplit(
+        decision.profile, task, old, pair, state, {
+          expectedDue: typeof decision.context.todoistDue === "string" ? decision.context.todoistDue : undefined,
+          expectedRule: typeof decision.context.calendarRecurrenceRule === "string"
+            ? decision.context.calendarRecurrenceRule : undefined,
+        },
+      );
+      await this.finishAndReconcile(decision, state, "split_future_todoist", slackUserId);
+      await this.notifier.postText(
+        `✅ Calendar history was retained through *${result.plan.previousOccurrence}*. The old yearly series now ends before ${result.plan.nextOldOccurrence}; the future ${result.plan.newRule} recurrence starts on *${result.plan.newStart}*. Old master \`${result.plan.oldMasterId}\`, new master \`${result.plan.newMasterId}\`.`,
+        decision.slackChannelId,
+      );
+    } catch (error) {
+      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+      await state.audit(decision.profile, "manual_future_series_split_incomplete", {
+        taskId: task.id, oldMasterId: old.id, decisionId: decision.decisionId,
+        reason: error instanceof Error ? error.message : String(error),
+      }).catch(() => undefined);
+      await this.notifier.updateResolution(decision,
+        `⚠️ Future-only series change was *not* confirmed complete: ${error instanceof Error ? error.message : String(error)}. The decision remains pending. No historical Calendar occurrences were intentionally deleted. An incomplete split can be retried only after the current provider state and ownership are rechecked.`);
+    }
   }
 
   /**
@@ -1786,6 +1877,10 @@ export class ManualInterventionService {
         } else {
           await this.finishAndReconcile(decision, state, manual.action, manual.slackUserId);
         }
+        return;
+      }
+      if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
+        await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);
         return;
       }
       if (decision.type === "todoist_unmapped_conflict"
