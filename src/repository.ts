@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   DeleteCommand,
   GetCommand,
@@ -6,12 +7,19 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient as client } from "./dynamodb-capacity.js";
-import { auditExpiresAt, classifyAuditAction } from "./audit-policy.js";
+import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
+import {
+  auditExpiresAt,
+  classifyAuditAction,
+  retainedConflictEntity,
+  retainedConflictIdentity,
+  retainedConflictIncidentId,
+} from "./audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
   mappingLookupAttributes,
+  mappingLookupQueryInput,
   mappingOwnerLookupAttributes,
   recurrenceLookupAttributes,
   recurrenceLookupQueryInput,
@@ -328,17 +336,17 @@ export class StateRepository {
   }
 
   async getMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {
-    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`EVENT#${profile}#${eventId}`, "MAP") }));
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`EVENT#${profile}#${eventId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;
   }
 
   async getMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
-    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP") }));
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;
   }
 
   async getMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
-    const owner = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP") }));
+    const owner = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP"), ConsistentRead: true }));
     if (owner.Item) return owner.Item as Mapping;
     for (const profile of allProfiles) {
       const mapping = await this.getMappingByTask(profile, taskId);
@@ -356,6 +364,317 @@ export class StateRepository {
         { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
+  }
+
+  async listMappings(profile: Profile): Promise<Mapping[]> {
+    return readProfileLookup<Mapping>({
+      client, profile, operation: "future_series_mapping_ownership",
+      component: "state-repository",
+      queryInput: mappingLookupQueryInput(this.ensureTable(), profile),
+    });
+  }
+
+  /**
+   * Historical ownership is not necessarily indexed by the Calendar master:
+   * Calendar-owned recurrences put EVENT mappings on individual instances.
+   * Refuse if any profile owns the master/instances, an old series link exists,
+   * or completed history anywhere refers to that master.
+   */
+  async assertHistoricalSeriesUnowned(masterEventId: string, instanceIds: string[]): Promise<void> {
+    const ids = new Set([masterEventId, ...instanceIds]);
+    if (ids.size > 1000) throw new Error("Too many historical occurrences for guarded ownership inventory");
+    for (const profile of allProfiles) {
+      const [mappings, links] = await Promise.all([
+        this.listMappings(profile), this.listRecurrenceLinks(profile),
+      ]);
+      if (mappings.some((mapping) =>
+        ids.has(mapping.eventId) || mapping.masterEventId === masterEventId
+        || (mapping.activeInstanceId && ids.has(mapping.activeInstanceId)))) {
+        throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
+      }
+      if (links.some((link) =>
+        link.masterEventId === masterEventId || ids.has(link.eventId)
+        || (link.activeInstanceId && ids.has(link.activeInstanceId)))) {
+        throw new Error("An existing recurrence link owns the old Calendar master/instances");
+      }
+      for (const id of ids) {
+        if (await this.getCompletedCalendarProjectionByEvent(profile, id)) {
+          throw new Error("A historical Calendar instance is referenced by completed task history");
+        }
+      }
+    }
+    // Detect *other-task* completion records for instance IDs no longer in
+    // the finite provider window (including previously deleted exceptions).
+    const found = await pacedScan<CompletedCalendarProjection>({
+      TableName: this.ensureTable(),
+      FilterExpression: "begins_with(pk, :prefix) AND masterEventId = :master",
+      ExpressionAttributeValues: {
+        ":prefix": "COMPLETED_EVENT#", ":master": masterEventId,
+      },
+      ProjectionExpression: "pk,taskId,eventId,masterEventId",
+    }, { operation: "future_series_historical_completion_preflight" });
+    if (found.items.length) {
+      throw new Error("Another completed Calendar projection references this historical master");
+    }
+  }
+
+  /** One global task claim prevents concurrent splits in different profiles. */
+  async getFutureSeriesSplitAnyProfile(taskId: string): Promise<
+    { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string } | undefined
+  > {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
+      ConsistentRead: true,
+    }));
+    return result.Item as {
+      profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string;
+    } | undefined;
+  }
+
+  async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string, previousOccurrence?: string): Promise<void> {
+    const previous = await this.getFutureSeriesSplitAnyProfile(taskId);
+    if (previous) {
+      if (previous.profile !== profile || previous.taskId !== taskId
+        || previous.oldMasterId !== oldMasterId || previous.newMasterId !== newMasterId
+        || previous.previousOccurrence !== previousOccurrence) {
+        throw new Error("Another pending/completed recurrence split owns this Todoist task");
+      }
+      return;
+    }
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(`FUTURE_SPLIT#TASK#${taskId}`),
+          profile, taskId, oldMasterId, newMasterId, previousOccurrence,
+          status: "pending", startedAt: now(),
+          // No TTL while pending: automatic reconciliation must remain blocked
+          // until an operator finishes or explicitly compensates the split.
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+      const raced = await this.getFutureSeriesSplitAnyProfile(taskId);
+      if (!raced || raced.profile !== profile || raced.oldMasterId !== oldMasterId
+        || raced.newMasterId !== newMasterId || raced.previousOccurrence !== previousOccurrence) throw error;
+    }
+  }
+
+  async completeFutureSeriesSplit(profile: Profile, taskId: string, newMasterId: string): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
+      UpdateExpression: "SET #status = :done, completedAt = :now, expiresAt = :expire",
+      ConditionExpression: "profile = :profile AND newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":done": "completed", ":pending": "pending", ":profile": profile, ":now": now(),
+        ":expire": ttl(90), ":newMaster": newMasterId, ":task": taskId,
+      },
+    }));
+  }
+
+  /**
+   * Install a NEW Todoist-owned recurrence mapping, all three identity indexes
+   * and the recurrence link atomically. No unconditional reassignment or
+   * resurrection of archived / completed projections is permitted.
+   */
+  async putNewRecurrenceMappingIfUnowned(mapping: Mapping, link: RecurrenceLink): Promise<boolean> {
+    if (mapping.recurrenceOwner !== "todoist" || mapping.seriesId !== mapping.taskId
+      || mapping.masterEventId !== mapping.eventId || link.owner !== "todoist"
+      || link.seriesId !== mapping.seriesId || link.masterEventId !== mapping.masterEventId
+      || link.taskId !== mapping.taskId || link.eventId !== mapping.eventId
+      || link.profile !== mapping.profile) {
+      throw new Error("Future-series mapping and recurrence ownership are inconsistent");
+    }
+    const table = this.ensureTable();
+    const tx: Array<Record<string, unknown>> = [
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`FUTURE_SPLIT#TASK#${mapping.taskId}`),
+        ConditionExpression: "#status = :pending AND profile = :profile AND newMasterId = :master",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":pending": "pending", ":profile": mapping.profile, ":master": mapping.eventId,
+        },
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${other}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    const inserts = [
+      { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+      { ...link, ...key(`RECURRENCE#${mapping.profile}#${link.seriesId}`, "STATE"), ...recurrenceLookupAttributes(link) },
+    ];
+    for (const item of inserts) tx.push({ Put: {
+      TableName: table, Item: item, ConditionExpression: "attribute_not_exists(pk)",
+    } });
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const reason = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (reason.name === "TransactionCanceledException"
+        && reason.CancellationReasons?.some((item) => item.Code === "ConditionalCheckFailed")
+        && reason.CancellationReasons.every((item) => item.Code === "ConditionalCheckFailed" || item.Code === "None")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Recover missing TASK / TASKOWNER indexes only from an unchanged EVENT row.
+   * Ordinary putMapping() is intentionally unconditional and MUST NOT be used
+   * for this path: another profile may now own the same Todoist task.
+   *
+   * The read-side preflight makes errors actionable; the transaction remains
+   * authoritative if ownership, recurrence, completion or tombstone state
+   * changes between the reads and the repair.
+   */
+  async restoreMappingIndexesIfOwned(mapping: Mapping, expectedLink?: RecurrenceLink): Promise<boolean> {
+    const current = await this.getMappingByEvent(mapping.profile, mapping.eventId);
+    if (!current || current.taskId !== mapping.taskId || current.updatedAt !== mapping.updatedAt
+      || current.profile !== mapping.profile) return false;
+
+    const owner = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+      ConsistentRead: true,
+    }));
+    const compatible = (candidate: Mapping | undefined): boolean =>
+      !candidate || (candidate.profile === mapping.profile
+        && candidate.taskId === mapping.taskId && candidate.eventId === mapping.eventId
+        && candidate.updatedAt === mapping.updatedAt
+        && candidate.recurrenceOwner === mapping.recurrenceOwner
+        && candidate.seriesId === mapping.seriesId
+        && candidate.completedThroughOriginalStart === mapping.completedThroughOriginalStart);
+    if (!compatible(owner.Item as Mapping | undefined)
+      || !compatible(await this.getMappingByTask(mapping.profile, mapping.taskId))) return false;
+
+    // A stale non-owner TASK row is still an unresolved split-brain, not
+    // permission to overwrite the global owner index.
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      if (await this.getMappingByTask(other, mapping.taskId)) return false;
+    }
+    if (await this.getCalendarProjectionTombstone(mapping.profile, mapping.taskId)
+      || await this.getCompletedCalendarProjectionByEvent(mapping.profile, mapping.eventId)) return false;
+
+    if (mapping.recurrenceOwner) {
+      if (!mapping.seriesId || !expectedLink) return false;
+      const live = await this.getRecurrenceLink(mapping.profile, mapping.seriesId);
+      if (!live || live.updatedAt !== expectedLink.updatedAt
+        || live.owner !== mapping.recurrenceOwner
+        || live.taskId !== mapping.taskId || live.eventId !== mapping.eventId
+        || live.profile !== mapping.profile || live.seriesId !== mapping.seriesId
+        || live.masterEventId !== mapping.masterEventId
+        || live.activeInstanceId !== mapping.activeInstanceId
+        || live.originalStart !== mapping.originalStart
+        || live.activeEffectiveStart !== mapping.activeEffectiveStart
+        || live.completedThroughOriginalStart !== mapping.completedThroughOriginalStart
+        || live.calendarProgressVersion !== mapping.calendarProgressVersion
+        || live.completedThroughOriginalStart !== expectedLink.completedThroughOriginalStart
+        || live.calendarProgressVersion !== expectedLink.calendarProgressVersion) return false;
+    } else if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) {
+      return false;
+    }
+
+    const table = this.ensureTable();
+    const identityValues = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt,
+    };
+    const compatibleWrite = "attribute_not_exists(pk) OR (#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated)";
+    const transactItems: Array<Record<string, unknown>> = [
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: { ...identityValues, ":updated": mapping.updatedAt },
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+        ConditionExpression: compatibleWrite,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: identityValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+        ConditionExpression: compatibleWrite,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: identityValues,
+      } },
+    ];
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      transactItems.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    if (expectedLink && mapping.seriesId) {
+      transactItems.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
+        ConditionExpression: "taskId = :task AND eventId = :event AND #owner = :owner AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#owner": "owner" },
+        ExpressionAttributeValues: {
+          ":task": mapping.taskId, ":event": mapping.eventId,
+          ":owner": mapping.recurrenceOwner, ":updated": expectedLink.updatedAt,
+        },
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: transactItems as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   private async deleteProfileMappingIndexes(mapping: Mapping): Promise<void> {
@@ -538,6 +857,7 @@ export class StateRepository {
     const result = await client.send(new GetCommand({
       TableName: this.ensureTable(),
       Key: key(`PROJECTION#${profile}#TASK#${taskId}`, "TOMBSTONE"),
+      ConsistentRead: true,
     }));
     if (typeof result.Item?.sourceUpdatedAt !== "string") return undefined;
     return {
@@ -665,22 +985,96 @@ export class StateRepository {
     }));
   }
 
+
+  private async beginConflictIncident(profile: Profile, fingerprint: string, detail: Record<string, unknown>): Promise<string> {
+    const entity = retainedConflictEntity(detail);
+    if (!entity) throw new Error("A deduplicated conflict must have a stable provider identity");
+    const entityHash = createHash("sha256").update(entity).digest("hex");
+    const fingerprintHash = createHash("sha256").update(fingerprint).digest("hex");
+    const stateKey = key(`CONFLICT_STATE#${profile}#${entityHash}`);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const existing = await client.send(new GetCommand({
+        TableName: this.ensureTable(),
+        Key: stateKey,
+        ConsistentRead: true,
+      }));
+      const current = existing.Item as { active?: boolean; fingerprint?: string; incidentId?: string } | undefined;
+      const incidentId = retainedConflictIncidentId(
+        current as import("./audit-policy.js").RetainedConflictLifecycle | undefined,
+        fingerprintHash,
+        `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`,
+      );
+      if (current?.active && current.fingerprint === fingerprintHash && current.incidentId) return incidentId;
+      try {
+        await client.send(new PutCommand({
+          TableName: this.ensureTable(),
+          Item: { ...stateKey, active: true, fingerprint: fingerprintHash, incidentId, updatedAt: now() },
+          ConditionExpression: "attribute_not_exists(pk) OR #active = :false OR fingerprint <> :fingerprint",
+          ExpressionAttributeNames: { "#active": "active" },
+          ExpressionAttributeValues: { ":false": false, ":fingerprint": fingerprintHash },
+        }));
+        return incidentId;
+      } catch (error) {
+        if (!conditionalFailure(error)) throw error;
+      }
+    }
+    throw new Error("Conflict lifecycle changed repeatedly while assigning an incident");
+  }
+
+  /** End the active incident only after reconciliation has verified recovery. */
+  async resolveConflictAudits(profile: Profile, detail: Record<string, unknown>): Promise<void> {
+    const entity = retainedConflictEntity(detail);
+    if (!entity) return;
+    const entityHash = createHash("sha256").update(entity).digest("hex");
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(),
+        Key: key(`CONFLICT_STATE#${profile}#${entityHash}`),
+        UpdateExpression: "SET #active = :false, resolvedAt = :resolvedAt",
+        ConditionExpression: "attribute_exists(pk) AND #active = :true",
+        ExpressionAttributeNames: { "#active": "active" },
+        ExpressionAttributeValues: { ":false": false, ":true": true, ":resolvedAt": now() },
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+    }
+  }
+
   async audit(profile: Profile, action: string, detail: Record<string, unknown>): Promise<void> {
     const disposition = classifyAuditAction(action);
     const safeDetail = sanitizeTelemetryDetail(detail);
     logEvent(action, { profile, auditClass: disposition, ...safeDetail }, "state-repository");
     if (disposition === "routine") return;
 
-    await client.send(new PutCommand({
-      TableName: this.ensureTable(),
-      Item: {
-        ...key(`AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`),
-        action,
-        detail: safeDetail,
-        createdAt: now(),
-        expiresAt: auditExpiresAt(),
-      },
-    }));
+    // Fingerprint the original allowlisted identity before telemetry sanitization;
+    // valid Calendar IDs can exceed the log field length limit.
+    const fingerprint = retainedConflictIdentity(action, detail);
+    const incidentId = fingerprint ? await this.beginConflictIncident(profile, fingerprint, detail) : undefined;
+    const conflictHash = fingerprint ? createHash("sha256").update(fingerprint).digest("hex") : undefined;
+    const auditId = conflictHash
+      ? `AUDIT#${profile}#CONFLICT#${conflictHash}#${incidentId}`
+      : `AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(auditId),
+          action,
+          detail: safeDetail,
+          createdAt: now(),
+          expiresAt: auditExpiresAt(),
+        },
+        ...(conflictHash ? {
+          ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+          ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
+        } : {}),
+      }));
+    } catch (error) {
+      // Every observation is logged. An already-retained incident row is the
+      // only write failure that can be safely treated as a duplicate.
+      if (conflictHash && conditionalFailure(error)) return;
+      throw error;
+    }
   }
 
 }

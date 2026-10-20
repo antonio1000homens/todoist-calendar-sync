@@ -39,3 +39,59 @@ export function classifyAuditAction(action: string): AuditDisposition {
 export function auditExpiresAt(nowMs = Date.now()): number {
   return Math.floor(nowMs / 1000) + AUDIT_RETENTION_DAYS * 24 * 60 * 60;
 }
+
+
+/** Only these recurring snapshot conflicts are collapsed while the same
+ * provider state remains unresolved. Their CloudWatch observations are never deduplicated. */
+const DEDUPED_CONFLICT_ACTIONS = new Set([
+  "todoist_snapshot_reconcile_unmapped_conflict",
+  "todoist_snapshot_reconcile_unmapped_ambiguous",
+  "todoist_snapshot_reconcile_cancelled_projection_blocked",
+  "calendar_snapshot_recurring_identity_conflict",
+  "calendar_task_link_ambiguous_conflict",
+]);
+
+export function retainedConflictEntity(detail: Record<string, unknown>): string | undefined {
+  for (const field of ["taskId", "eventId", "seriesId"] as const) {
+    const value = detail[field];
+    if (typeof value === "string" && value.length > 0 && value.length <= 10_000) return `${field}:${value}`;
+  }
+  return undefined;
+}
+
+export function retainedConflictIdentity(action: string, detail: Record<string, unknown>): string | undefined {
+  if (!DEDUPED_CONFLICT_ACTIONS.has(action) || !retainedConflictEntity(detail)) return undefined;
+  const ids = (field: string): string[] => Array.isArray(detail[field])
+    ? [...new Set((detail[field] as unknown[]).filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 10_000 && /^[A-Za-z0-9_.-]+$/.test(value)))].sort()
+    : [];
+  const categories = Array.isArray(detail.mismatchCategories)
+    ? [...new Set((detail.mismatchCategories as unknown[]).filter((value): value is string => typeof value === "string" && /^[a-z0-9_.-]{1,80}$/.test(value)))].sort()
+    : [];
+  return JSON.stringify({
+    action,
+    taskId: typeof detail.taskId === "string" ? detail.taskId : "",
+    eventId: typeof detail.eventId === "string" ? detail.eventId : "",
+    seriesId: typeof detail.seriesId === "string" ? detail.seriesId : "",
+    calendarStatus: typeof detail.calendarStatus === "string" ? detail.calendarStatus : "",
+    mismatchCategories: categories,
+    candidateEventIds: ids("candidateEventIds"),
+    candidateTaskIds: ids("candidateTaskIds"),
+  });
+}
+
+export interface RetainedConflictLifecycle {
+  active: boolean;
+  fingerprint: string;
+  incidentId: string;
+}
+
+/** Reuse an incident only while the same fingerprint is still active. */
+export function retainedConflictIncidentId(
+  current: RetainedConflictLifecycle | undefined,
+  fingerprint: string,
+  nextIncidentId: string,
+): string {
+  return current?.active && current.fingerprint === fingerprint && current.incidentId
+    ? current.incidentId
+    : nextIncidentId;
+}

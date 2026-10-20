@@ -19,7 +19,7 @@ const SAFE_BOOLEAN_KEYS = new Set([
   "continued", "pending", "success", "exhausted",
 ]);
 
-const SAFE_ARRAY_KEY_RE = /(?:^|_)(?:changedFields|fields)$/;
+const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|mismatchCategories)$|(?:^|_)(?:changedFields|fields)$/;
 
 function safeString(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length > 200 || /[\r\n]/.test(value) || /https?:\/\//i.test(value)) return undefined;
