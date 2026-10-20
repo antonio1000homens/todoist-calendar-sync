@@ -11,9 +11,9 @@ function queueUrl(): string {
   return value;
 }
 
-/** SQS FIFO deduplication IDs must be printable ASCII and at most 128 chars. */
-export function messageDeduplicationId(id: string): string {
-  return /^[\x21-\x7e]{1,128}$/.test(id) ? id : `sha256:${sha256(id)}`;
+/** Bound transport IDs without changing logical delivery IDs or completion keys. */
+export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kind" | "id">): string {
+  return sha256(JSON.stringify(["sqs-dedup-v1", delivery.profile, delivery.kind, delivery.id]));
 }
 
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
@@ -21,7 +21,7 @@ export async function enqueueDelivery(delivery: Delivery): Promise<void> {
     QueueUrl: queueUrl(),
     MessageBody: JSON.stringify(delivery),
     MessageGroupId: syncMessageGroupId(delivery.profile),
-    MessageDeduplicationId: messageDeduplicationId(delivery.id),
+    MessageDeduplicationId: messageDeduplicationId(delivery),
   }));
 }
 
