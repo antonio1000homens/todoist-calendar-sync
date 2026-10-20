@@ -117,7 +117,7 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
       calls.push("cap-old");
       const normalized = normalizeCappedRule && event.recurrence?.[0]
         ? event.recurrence[0].replace(
-          /^(RRULE:FREQ=YEARLY);INTERVAL=(\\d+);UNTIL=(\\d{8})$/,
+          /^(RRULE:FREQ=YEARLY);INTERVAL=(\d+);UNTIL=(\d{8})$/,
           "$1;UNTIL=$3;INTERVAL=$2",
         ) : event.recurrence?.[0];
       const updated = {
