@@ -1,5 +1,5 @@
 import { attachProjectCommentReference, buildProjectMappingIndex } from "./mapping-comments.js";
-import { planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, type FutureSeriesSplitPlan } from "./recurrence-split.js";
+import { planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule, type FutureSeriesSplitPlan } from "./recurrence-split.js";
 import { hasCanonicalState, toCalendarEvent } from "./sync.js";
 import { selectTodoistCurrentInstance } from "./todoist-recurrence.js";
 import { normalizedText } from "./security.js";
@@ -206,7 +206,8 @@ export async function applyApprovedFutureSeriesSplit(
   const capped = await pair.calendar.getEvent(old.id);
   if (!sameTitle(capped.summary, old.summary)
     || normalizedText(capped.description) !== normalizedText(old.description)
-    || capped.status !== "confirmed" || capped.recurrence?.[0] !== plan.truncatedRule
+    || capped.status !== "confirmed" || capped.recurrence?.length !== 1
+    || !sameSafeYearlyRecurrenceRule(capped.recurrence[0], plan.truncatedRule)
     || capped.extendedProperties?.shared?.syncHistoryOnly !== "true"
     || capped.extendedProperties?.shared?.syncHistorySuccessorId !== plan.newMasterId
     || capped.extendedProperties?.shared?.taskId) {
