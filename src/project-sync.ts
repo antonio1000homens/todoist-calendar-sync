@@ -318,6 +318,20 @@ export class ProjectAwareSynchronizer {
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!lifecycle) return;
 
+    // A future-only manual split can sit between old-master capping and
+    // creating the new recurrence. Never allow an unrelated webhook to
+    // synthesize another Calendar master during this recoverable interval.
+    if (!mapping) {
+      const pendingSplit = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
+      if (pendingSplit?.status === "pending") {
+        await this.state.audit(pendingSplit.profile, "todoist_webhook_future_series_split_pending", {
+          taskId: task.id, oldMasterId: pendingSplit.oldMasterId,
+          newMasterId: pendingSplit.newMasterId,
+        });
+        return;
+      }
+    }
+
     // Completed projections remain terminal even after their active mapping is
     // removed. Resolve the durable owner before project-transition handling so
     // a later item:updated/project move cannot rediscover and delete history.

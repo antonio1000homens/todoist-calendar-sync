@@ -200,6 +200,12 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
         taskUrl: task.url || `https://app.todoist.com/app/task/${task.id}`,
         originalSummary: normalizedText(task.content),
         syncSource: "todoist-calendar-sync",
+        // An ordinary Todoist edit must not sever the archived history.
+        ...(existingShared?.syncHistoryMasterId ? {
+          syncHistoryMasterId: existingShared.syncHistoryMasterId,
+          ...(existingShared.syncHistoryCutoff ? { syncHistoryCutoff: existingShared.syncHistoryCutoff } : {}),
+          ...(existingShared.syncSplitVersion ? { syncSplitVersion: existingShared.syncSplitVersion } : {}),
+        } : {}),
         ...(rrule && recurrenceKey ? {
           syncRecurrenceOwner: "todoist",
           todoistRecurrence: recurrenceKey,
@@ -585,6 +591,23 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, todoist: Todoist): Promise<void> {
+    // Historical masters and ALL their instances are immutable history. Google
+    // instance deltas do not always inherit the parent's shared properties;
+    // resolve that identity before any mapping discovery or Todoist mutation.
+    let archived = event.extendedProperties?.shared?.syncHistoryOnly === "true";
+    // A cancelled instance can reference an already-deleted master. Its
+    // existing cancellation logic (including stale-instance safeguards) must
+    // still run; unbound deleted instances cannot resurrect Todoist tasks.
+    if (!archived && event.recurringEventId && event.status !== "cancelled") {
+      const { calendar } = await this.clients(delivery.profile);
+      const parent = await calendar.getEvent(event.recurringEventId);
+      archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
+    }
+    if (archived) {
+      return this.state.audit(delivery.profile, "calendar_archived_series_delta_ignored", {
+        eventId: event.id, masterEventId: event.recurringEventId || event.id,
+      });
+    }
     const completedProjection = await this.getCompletedProjection(delivery.profile, event.id);
     if (completedProjection) {
       return this.state.audit(delivery.profile, "calendar_completed_projection_ignored", {

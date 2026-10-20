@@ -519,3 +519,22 @@ test("project move uses the preflighted destination event without repeating iden
   assert.equal(state.mapping?.profile, "work");
   assert.equal(calendars.work.created.length, 1);
 });
+
+test("pending approved future split blocks ordinary Todoist webhook projection creation", async () => {
+  const task = {
+    id: "split-task", project_id: HOME, content: "Replace battery smoke alarm",
+    due: { date: "2027-07-01", string: "every 2 years", is_recurring: true },
+    updated_at: "2026-10-19T12:00:00Z",
+  };
+  const state = new FakeState();
+  state.getFutureSeriesSplitAnyProfile = async () => ({
+    profile: "home", taskId: task.id, oldMasterId: "old-may", newMasterId: "new-july", status: "pending",
+  });
+  const calendars = calendarSet();
+  const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
+  await sync.process(delivery("split-pending-webhook", task, { ...task, project_id: "inbox" }));
+  assert.deepEqual(calendars.home.created, []);
+  assert.deepEqual(calendars.home.deleted, []);
+  assert.equal(state.mapping, undefined);
+  assert.ok(state.audits.some((x) => x.action === "todoist_webhook_future_series_split_pending"));
+});

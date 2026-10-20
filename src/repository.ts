@@ -7,7 +7,7 @@ import {
   TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient as client } from "./dynamodb-capacity.js";
+import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
@@ -19,6 +19,7 @@ import { logEvent, sanitizeTelemetryDetail } from "./observability.js";
 import {
   mappingEventLookupAttributes,
   mappingLookupAttributes,
+  mappingLookupQueryInput,
   mappingOwnerLookupAttributes,
   recurrenceLookupAttributes,
   recurrenceLookupQueryInput,
@@ -363,6 +364,187 @@ export class StateRepository {
         { Put: { TableName: this.ensureTable(), Item: { ...item, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) } } },
       ],
     }));
+  }
+
+  async listMappings(profile: Profile): Promise<Mapping[]> {
+    return readProfileLookup<Mapping>({
+      client, profile, operation: "future_series_mapping_ownership",
+      component: "state-repository",
+      queryInput: mappingLookupQueryInput(this.ensureTable(), profile),
+    });
+  }
+
+  /**
+   * Historical ownership is not necessarily indexed by the Calendar master:
+   * Calendar-owned recurrences put EVENT mappings on individual instances.
+   * Refuse if any profile owns the master/instances, an old series link exists,
+   * or completed history anywhere refers to that master.
+   */
+  async assertHistoricalSeriesUnowned(masterEventId: string, instanceIds: string[]): Promise<void> {
+    const ids = new Set([masterEventId, ...instanceIds]);
+    if (ids.size > 1000) throw new Error("Too many historical occurrences for guarded ownership inventory");
+    for (const profile of allProfiles) {
+      const [mappings, links] = await Promise.all([
+        this.listMappings(profile), this.listRecurrenceLinks(profile),
+      ]);
+      if (mappings.some((mapping) =>
+        ids.has(mapping.eventId) || mapping.masterEventId === masterEventId
+        || (mapping.activeInstanceId && ids.has(mapping.activeInstanceId)))) {
+        throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
+      }
+      if (links.some((link) =>
+        link.masterEventId === masterEventId || ids.has(link.eventId)
+        || (link.activeInstanceId && ids.has(link.activeInstanceId)))) {
+        throw new Error("An existing recurrence link owns the old Calendar master/instances");
+      }
+      for (const id of ids) {
+        if (await this.getCompletedCalendarProjectionByEvent(profile, id)) {
+          throw new Error("A historical Calendar instance is referenced by completed task history");
+        }
+      }
+    }
+    // Detect *other-task* completion records for instance IDs no longer in
+    // the finite provider window (including previously deleted exceptions).
+    const found = await pacedScan<CompletedCalendarProjection>({
+      TableName: this.ensureTable(),
+      FilterExpression: "begins_with(pk, :prefix) AND masterEventId = :master",
+      ExpressionAttributeValues: {
+        ":prefix": "COMPLETED_EVENT#", ":master": masterEventId,
+      },
+      ProjectionExpression: "pk,taskId,eventId,masterEventId",
+    }, { operation: "future_series_historical_completion_preflight" });
+    if (found.items.length) {
+      throw new Error("Another completed Calendar projection references this historical master");
+    }
+  }
+
+  /** One global task claim prevents concurrent splits in different profiles. */
+  async getFutureSeriesSplitAnyProfile(taskId: string): Promise<
+    { profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string } | undefined
+  > {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
+      ConsistentRead: true,
+    }));
+    return result.Item as {
+      profile: Profile; taskId: string; oldMasterId: string; newMasterId: string; previousOccurrence?: string; status: string;
+    } | undefined;
+  }
+
+  async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string, previousOccurrence?: string): Promise<void> {
+    const previous = await this.getFutureSeriesSplitAnyProfile(taskId);
+    if (previous) {
+      if (previous.profile !== profile || previous.taskId !== taskId
+        || previous.oldMasterId !== oldMasterId || previous.newMasterId !== newMasterId
+        || previous.previousOccurrence !== previousOccurrence) {
+        throw new Error("Another pending/completed recurrence split owns this Todoist task");
+      }
+      return;
+    }
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: {
+          ...key(`FUTURE_SPLIT#TASK#${taskId}`),
+          profile, taskId, oldMasterId, newMasterId, previousOccurrence,
+          status: "pending", startedAt: now(),
+          // No TTL while pending: automatic reconciliation must remain blocked
+          // until an operator finishes or explicitly compensates the split.
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+      const raced = await this.getFutureSeriesSplitAnyProfile(taskId);
+      if (!raced || raced.profile !== profile || raced.oldMasterId !== oldMasterId
+        || raced.newMasterId !== newMasterId || raced.previousOccurrence !== previousOccurrence) throw error;
+    }
+  }
+
+  async completeFutureSeriesSplit(profile: Profile, taskId: string, newMasterId: string): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(),
+      Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
+      UpdateExpression: "SET #status = :done, completedAt = :now, expiresAt = :expire",
+      ConditionExpression: "profile = :profile AND newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":done": "completed", ":pending": "pending", ":profile": profile, ":now": now(),
+        ":expire": ttl(90), ":newMaster": newMasterId, ":task": taskId,
+      },
+    }));
+  }
+
+  /**
+   * Install a NEW Todoist-owned recurrence mapping, all three identity indexes
+   * and the recurrence link atomically. No unconditional reassignment or
+   * resurrection of archived / completed projections is permitted.
+   */
+  async putNewRecurrenceMappingIfUnowned(mapping: Mapping, link: RecurrenceLink): Promise<boolean> {
+    if (mapping.recurrenceOwner !== "todoist" || mapping.seriesId !== mapping.taskId
+      || mapping.masterEventId !== mapping.eventId || link.owner !== "todoist"
+      || link.seriesId !== mapping.seriesId || link.masterEventId !== mapping.masterEventId
+      || link.taskId !== mapping.taskId || link.eventId !== mapping.eventId
+      || link.profile !== mapping.profile) {
+      throw new Error("Future-series mapping and recurrence ownership are inconsistent");
+    }
+    const table = this.ensureTable();
+    const tx: Array<Record<string, unknown>> = [
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`FUTURE_SPLIT#TASK#${mapping.taskId}`),
+        ConditionExpression: "#status = :pending AND profile = :profile AND newMasterId = :master",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":pending": "pending", ":profile": mapping.profile, ":master": mapping.eventId,
+        },
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table,
+        Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const other of allProfiles) {
+      if (other === mapping.profile) continue;
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`TASK#${other}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+      tx.push({ ConditionCheck: {
+        TableName: table,
+        Key: key(`PROJECTION#${other}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    const inserts = [
+      { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+      { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+      { ...link, ...key(`RECURRENCE#${mapping.profile}#${link.seriesId}`, "STATE"), ...recurrenceLookupAttributes(link) },
+    ];
+    for (const item of inserts) tx.push({ Put: {
+      TableName: table, Item: item, ConditionExpression: "attribute_not_exists(pk)",
+    } });
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const reason = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (reason.name === "TransactionCanceledException"
+        && reason.CancellationReasons?.some((item) => item.Code === "ConditionalCheckFailed")
+        && reason.CancellationReasons.every((item) => item.Code === "ConditionalCheckFailed" || item.Code === "None")) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   /**

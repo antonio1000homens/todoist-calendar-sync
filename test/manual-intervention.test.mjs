@@ -568,11 +568,12 @@ test('unmapped conflict creates one stable non-destructive manual decision', asy
   assert.equal(decision.context.taskTitle, 'Renew annually');
   assert.equal(decision.context.todoistRecurring, true);
   assert.deepEqual(decision.permittedActions.map((action) => action.id), [
-    'use_todoist_recurrence', 'use_calendar_version', 'keep_separate', 'reconcile_now',
+    'use_todoist_recurrence', 'split_future_todoist', 'use_calendar_version', 'keep_separate', 'reconcile_now',
   ]);
   assert.equal(decision.permittedActions[0].destructive, true);
   assert.equal(decision.permittedActions[1].destructive, true);
-  assert.equal(decision.permittedActions[2].destructive, undefined);
+  assert.equal(decision.permittedActions[2].destructive, true);
+  assert.equal(decision.permittedActions[3].destructive, undefined);
   assert.ok(decision.permittedActions.every((action) => !action.autoAllowed));
 });
 

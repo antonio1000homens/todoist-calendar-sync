@@ -25,6 +25,11 @@ class DecisionStore {
     this.decisions = new Map([[decision.decisionId, decision]]);
   }
   async get(id) { return this.decisions.get(id); }
+  async refreshPendingContext(id, context) {
+    const decision = this.decisions.get(id);
+    assert.equal(decision?.status, "pending");
+    decision.context = context;
+  }
   async putPending(input) {
     const saved = this.decisions.get(input.decisionId);
     if (saved) return { decision: saved, created: false };
@@ -91,6 +96,7 @@ function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefine
       async upsertComment() { changes.push("todoist:comment"); return { id: "project-comment-1" }; },
     },
     calendar: {
+      async getTimeZone() { return "Europe/London"; },
       async getEvent(id) {
         if (!events.has(id)) throw new Error("event missing");
         eventReads += 1;
@@ -162,10 +168,11 @@ async function withNoBaseline(callback) {
 test("Slack exposes confirmed owner choices, but never authorizes unattended auto application", () => {
   const options = MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions;
   assert.deepEqual(options.map((action) => action.id), [
-    "use_todoist_recurrence", "use_calendar_version", "keep_separate", "reconcile_now",
+    "use_todoist_recurrence", "split_future_todoist", "use_calendar_version", "keep_separate", "reconcile_now",
   ]);
   assert.equal(options[0].destructive, true);
   assert.equal(options[1].destructive, true);
+  assert.equal(options[2].destructive, true);
   assert.equal(options.every((action) => !action.autoAllowed), true);
   const oldCard = setup();
   oldCard.store.value.permittedActions = [
@@ -174,12 +181,14 @@ test("Slack exposes confirmed owner choices, but never authorizes unattended aut
   const blocks = JSON.stringify(decisionBlocks(oldCard.store.value));
   assert.match(blocks, /Use Todoist recurrence/);
   assert.match(blocks, /Use Calendar version/);
+  assert.match(blocks, /Use Todoist for future/);
   assert.match(blocks, /Keep separate/);
   const actions = decisionBlocks(oldCard.store.value).filter((block) => block.type === "actions")
     .flatMap((block) => block.elements);
   assert.equal(JSON.parse(actions[0].value).confirmRequired, true);
   assert.equal(JSON.parse(actions[1].value).confirmRequired, true);
-  assert.equal(JSON.parse(actions[2].value).confirmRequired, false);
+  assert.equal(JSON.parse(actions[2].value).confirmRequired, true);
+  assert.equal(JSON.parse(actions[3].value).confirmRequired, false);
 });
 
 test("Use Todoist recurrence converts only the unique existing event to an RRULE and restores mapping", async () => {
@@ -305,4 +314,85 @@ test("stale approval refresh creates a newly versioned decision only after provi
   assert.equal(item.store.value.status, "stale", "old approval remains terminal");
   await resume();
   assert.equal(item.notifier.posted.length, 1, "same revision must not issue duplicate approvals");
+});
+
+test("unpreviewed legacy decision refuses future split without any provider writes", async () => {
+  const item = setup();
+  await item.run("split_future_todoist");
+  assert.equal(item.store.value.status, "pending");
+  assert.deepEqual(item.changes, []);
+  assert.ok(item.notifier.messages.some((m) => m.includes("frozen recurrence cutover preview")));
+});
+
+test("resume a legacy pending decision freezes and displays an explicit series-cutover plan", async () => {
+  const item = setup();
+  item.events.set("event-1", {
+    ...item.events.get("event-1"), start: { date: "2025-05-03" },
+    end: { date: "2025-05-04" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-05-03";
+  const runResume = () => item.service.processManualDelivery({
+    id: "manual:resume-preview", kind: "manual", profile: "antonio",
+    mode: "aws", receivedAt: "2026-10-19T12:00:00Z", headers: {}, body: "",
+    manual: { command: "resume_decision", targetId: item.store.value.decisionId, slackChannelId: "C123" },
+  }, item.state);
+  await runResume();
+  assert.equal(item.notifier.posted.length, 1);
+  const context = item.store.value.context;
+  assert.match(context.futureSplitPreview, /retain through/);
+  assert.equal(context.calendarRecurrenceRule, "RRULE:FREQ=YEARLY");
+  assert.equal(context.todoistRecurrenceRule, "RRULE:FREQ=YEARLY");
+  assert.deepEqual(item.changes, []);
+  await runResume();
+  assert.equal(item.notifier.posted.length, 2);
+  assert.equal(item.store.value.status, "pending");
+});
+
+test("a moved historical cutoff creates a NEW approval, never changing the original decision in place", async () => {
+  const item = setup();
+  item.events.set("event-1", {
+    ...item.events.get("event-1"), start: { date: "2025-05-03" },
+    end: { date: "2025-05-04" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-05-03";
+  const resume = () => item.service.processManualDelivery({
+    id: "resume-cutoff-change", kind: "manual", profile: "antonio", mode: "aws",
+    receivedAt: "2026-10-19T12:00:00Z", headers: {}, body: "",
+    manual: { command: "resume_decision", targetId: item.store.value.decisionId, slackChannelId: "C123" },
+  }, item.state);
+  await resume();
+  const old = item.store.value;
+  const originalPlan = old.context.futureSplitPlan;
+  old.context.futureSplitPlan = { ...originalPlan, previousOccurrence: "2025-05-03" };
+  await resume();
+  assert.equal(old.status, "stale");
+  assert.equal(item.notifier.posted.length, 2);
+  const next = item.notifier.posted[1];
+  assert.equal(next.status, "pending");
+  assert.notEqual(next.decisionId, old.decisionId);
+  assert.equal(next.context.futureSplitPlan.previousOccurrence, originalPlan.previousOccurrence);
+  assert.deepEqual(item.changes, []);
+});
+
+test("Slack split refuses a Calendar ETag changed after its frozen preview", async () => {
+  const item = setup();
+  const e = item.events.get("event-1");
+  item.events.set("event-1", {
+    ...e, start: { date: "2025-03-06" }, end: { date: "2025-03-07" },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+  });
+  item.store.value.context.calendarStart = "2025-03-06";
+  item.store.value.context.calendarStatus = "confirmed";
+  item.store.value.context.calendarEtag = '"earlier-version"';
+  item.store.value.context.calendarRecurrenceRule = "RRULE:FREQ=YEARLY";
+  item.store.value.context.todoistRecurrenceRule = "RRULE:FREQ=YEARLY";
+  item.store.value.context.futureSplitPlan = {
+    oldMasterId: "event-1", newMasterId: "irrelevant-plan-id",
+    previousOccurrence: "2026-03-06", nextOldOccurrence: "2027-03-06",
+    newStart: "2027-03-06", calendarTimeZone: "Europe/London",
+  };
+  item.store.value.context.futureSplitPreview = "A frozen preview";
+  await item.run("split_future_todoist");
+  assert.equal(item.store.value.status, "stale");
+  assert.deepEqual(item.changes, []);
 });

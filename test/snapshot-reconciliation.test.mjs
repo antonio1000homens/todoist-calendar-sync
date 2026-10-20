@@ -660,3 +660,22 @@ test("recurring projection with divergent progression watermark blocks index res
   assert.equal(store.baselines.size, 0);
   assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_recurrence_link_conflict"));
 });
+
+test("pending future-only split prevents hourly reconciliation creating a competing Calendar master", async () => {
+  const t = task({ id: "split-task", due: { date: "2027-07-01", string: "every 2 years", is_recurring: true } });
+  const state = new FakeState();
+  state.getFutureSeriesSplitAnyProfile = async () => ({
+    profile: "home", taskId: t.id, oldMasterId: "old-may", newMasterId: "new-july", status: "pending",
+  });
+  const store = new FakeStore();
+  const clients = fakeClients({
+    listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map(),
+  });
+  const repairs = [];
+  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  assert.equal(result.counts.blocked, 1);
+  assert.deepEqual(repairs, []);
+  assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(store.putBaselineCalls, 0);
+  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_future_series_split_pending"));
+});
