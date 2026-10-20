@@ -1,5 +1,6 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
+import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
 const queue = new SQSClient({});
@@ -10,12 +11,17 @@ function queueUrl(): string {
   return value;
 }
 
+/** SQS FIFO deduplication IDs must be printable ASCII and at most 128 chars. */
+export function messageDeduplicationId(id: string): string {
+  return /^[\x21-\x7e]{1,128}$/.test(id) ? id : `sha256:${sha256(id)}`;
+}
+
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   await queue.send(new SendMessageCommand({
     QueueUrl: queueUrl(),
     MessageBody: JSON.stringify(delivery),
     MessageGroupId: syncMessageGroupId(delivery.profile),
-    MessageDeduplicationId: delivery.id,
+    MessageDeduplicationId: messageDeduplicationId(delivery.id),
   }));
 }
 
