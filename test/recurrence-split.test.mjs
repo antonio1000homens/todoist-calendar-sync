@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences,
+  planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule,
 } from "../dist/recurrence-split.js";
 
 const task = () => ({
@@ -40,6 +40,42 @@ test("exact archived cap and lineage permits an idempotent retry", () => {
   assert.deepEqual(planFutureSeriesSplit("antonio", task(), e, new Date("2026-10-19T12:00:00Z")), {
     ...p, oldEtag: '"old-1"',
   });
+});
+
+test("Google canonicalizes DATE UNTIL before INTERVAL without changing yearly recurrence semantics", () => {
+  const submitted = "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20260503";
+  const fromGoogle = "RRULE:FREQ=YEARLY;UNTIL=20260503;INTERVAL=1";
+  assert.equal(sameSafeYearlyRecurrenceRule(submitted, fromGoogle), true);
+  assert.equal(sameSafeYearlyRecurrenceRule(fromGoogle, submitted), true);
+  assert.equal(sameSafeYearlyRecurrenceRule(
+    "RRULE:FREQ=YEARLY;UNTIL=20260503", submitted,
+  ), true, "an omitted default yearly interval is equivalent to one");
+  for (const unsafe of [
+    "RRULE:FREQ=YEARLY;INTERVAL=2;UNTIL=20260503",
+    "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20270503",
+    "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20260503;COUNT=3",
+    "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20260503;BYMONTH=5",
+    "RRULE:FREQ=YEARLY;INTERVAL=1;INTERVAL=1;UNTIL=20260503",
+    "RRULE:FREQ=YEARLY;INTERVAL=1;UNTIL=20260230",
+  ]) {
+    assert.equal(sameSafeYearlyRecurrenceRule(submitted, unsafe), false, unsafe);
+  }
+});
+
+test("an already-capped Google master with reordered RRULE components can be resumed", () => {
+  const p = plan();
+  const e = old();
+  e.recurrence = ["RRULE:FREQ=YEARLY;UNTIL=20260503;INTERVAL=1"];
+  e.extendedProperties.shared = {
+    syncHistoryTaskId: task().id,
+    syncHistoryOnly: "true",
+    syncHistoryOriginalRule: p.originalRule,
+    syncHistorySuccessorId: p.newMasterId,
+  };
+  assert.deepEqual(
+    planFutureSeriesSplit("antonio", task(), e, new Date("2026-10-19T12:00:00Z")),
+    p,
+  );
 });
 
 test("archived master cannot be silently claimed for a different Todoist task or successor", () => {
