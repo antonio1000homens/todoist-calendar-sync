@@ -16,7 +16,8 @@ import {
   type CanonicalIdentityRepository,
 } from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
-import { hasCanonicalState, selectCalendarRecurrenceInstance, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, selectCalendarRecurrenceInstance, startsMatch, toTodoistTask } from "./sync.js";
+import { normalizedText } from "./security.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -79,6 +80,23 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
     eventId: mapping.eventId,
     updatedAt: mapping.updatedAt,
   };
+}
+
+/**
+ * Canonical matching deliberately excludes a recurring Todoist task when
+ * considering a Calendar-owned active occurrence. That exclusion must not
+ * be interpreted as permission to create a duplicate non-recurring task.
+ * This conservative identity collision check is a guard, not a rebind.
+ */
+export function recurringTaskIdentityCandidates(event: CalendarEvent, tasks: TodoistTask[]): string[] {
+  const title = normalizedText(event.summary).toLocaleLowerCase();
+  if (!title || !(event.start?.date || event.start?.dateTime)) return [];
+  return tasks
+    .filter((task) => Boolean(task.due?.is_recurring)
+      && normalizedText(task.content).toLocaleLowerCase() === title
+      && startsMatch(event, task))
+    .map((task) => task.id)
+    .sort();
 }
 
 function originalStart(event: CalendarEvent): string | undefined {
@@ -337,6 +355,15 @@ export async function reconcileUnmappedCalendar(
     let task = match.task;
     let created = false;
     if (!task) {
+      const competingRecurringTaskIds = recurringTaskIdentityCandidates(active, tasks);
+      if (competingRecurringTaskIds.length) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id,
+          candidateTaskIds: competingRecurringTaskIds,
+        });
+        return;
+      }
       if (!await canMutate()) return;
       if (await completionBlocksRecovery(active.id, true)) return;
       task = await pair.todoist.upsertTask(toTodoistTask(active));

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { auditExpiresAt, AUDIT_RETENTION_DAYS, classifyAuditAction } from "../dist/audit-policy.js";
+import { auditExpiresAt, AUDIT_RETENTION_DAYS, classifyAuditAction, retainedConflictIdentity, retainedConflictIncidentId } from "../dist/audit-policy.js";
 import { logEvent, sanitizeTelemetryDetail } from "../dist/observability.js";
 
 test("new audit expiry is seven days and does not alter the other TTL policies", () => {
@@ -67,4 +67,38 @@ test("logEvent emits one valid structured JSON record without unsafe fields", ()
     profile: "antonio",
     taskId: "task-2",
   });
+});
+
+
+test("conflict fingerprints distinguish mismatch categories and preserve long candidate IDs", () => {
+  const action = "todoist_snapshot_reconcile_unmapped_conflict";
+  const base = { taskId: "task", eventId: "event" };
+  assert.notEqual(
+    retainedConflictIdentity(action, { ...base, mismatchCategories: ["title_mismatch"] }),
+    retainedConflictIdentity(action, { ...base, mismatchCategories: ["start_mismatch"] }),
+  );
+  const longIdA = "a".repeat(260);
+  const longIdB = "b".repeat(260);
+  assert.notEqual(
+    retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdA] }),
+    retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdB] }),
+  );
+});
+
+test("a resolved conflict reappearing unchanged receives a new retained incident ID", () => {
+  const fingerprint = retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_conflict", {
+    taskId: "task-1", eventId: "event-1", mismatchCategories: ["title_mismatch"],
+  });
+  assert.ok(fingerprint);
+  const first = retainedConflictIncidentId(undefined, fingerprint, "incident-1");
+  const repeatedWhileActive = retainedConflictIncidentId({
+    active: true, fingerprint, incidentId: first,
+  }, fingerprint, "incident-ignored");
+  assert.equal(repeatedWhileActive, first);
+
+  const afterResolution = retainedConflictIncidentId({
+    active: false, fingerprint, incidentId: first,
+  }, fingerprint, "incident-2");
+  assert.equal(afterResolution, "incident-2");
+  assert.notEqual(afterResolution, first);
 });

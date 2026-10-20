@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Keep checks for the newest revision of each PR/ref. Older queued or running
+# checks are superseded as soon as another commit arrives.
+concurrency:
+  group: todoist-calendar-sync-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
