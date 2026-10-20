@@ -1,5 +1,6 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
+import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
 const queue = new SQSClient({});
@@ -10,12 +11,17 @@ function queueUrl(): string {
   return value;
 }
 
+/** Bound transport IDs without changing logical delivery IDs or completion keys. */
+export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kind" | "id">): string {
+  return sha256(JSON.stringify(["sqs-dedup-v1", delivery.profile, delivery.kind, delivery.id]));
+}
+
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   await queue.send(new SendMessageCommand({
     QueueUrl: queueUrl(),
     MessageBody: JSON.stringify(delivery),
     MessageGroupId: syncMessageGroupId(delivery.profile),
-    MessageDeduplicationId: delivery.id,
+    MessageDeduplicationId: messageDeduplicationId(delivery),
   }));
 }
 
