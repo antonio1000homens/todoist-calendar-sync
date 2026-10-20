@@ -255,6 +255,97 @@ function todoistOwnedLink(master, active, taskId = "task-recurring") {
   };
 }
 
+test("Todoist yearly task restores the Calendar recurrence rule on its legacy projection", async () => {
+  const task = {
+    id: "task-yearly-todoist",
+    content: "Bitwarden renewal $40",
+    description: "",
+    project_id: "home-project",
+    due: { date: "2027-01-25", string: "every year", is_recurring: true },
+  };
+  const legacyProjection = {
+    id: "legacy-annual-projection",
+    status: "confirmed",
+    summary: task.content,
+    description: "",
+    start: { date: "2026-01-25" },
+    end: { date: "2026-01-26" },
+    extendedProperties: { shared: { taskId: task.id, syncSource: "todoist-calendar-sync" } },
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, [], new Map([[task.id, task]]), undefined, [legacyProjection]);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "todoist-yearly-create",
+    kind: "todoist",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt: "2026-10-19T12:00:00Z",
+    headers: {},
+    body: JSON.stringify({ event_name: "item:added", event_data: task }),
+  });
+
+  assert.equal(clients.calendarUpserts.length, 1);
+  assert.equal(clients.calendarUpserts[0].existingId, legacyProjection.id);
+  const projection = clients.calendarUpserts[0].payload;
+  assert.equal(projection.summary, task.content);
+  assert.deepEqual(projection.start, { date: "2027-01-25" });
+  assert.deepEqual(projection.recurrence, ["RRULE:FREQ=YEARLY"]);
+  assert.equal(projection.extendedProperties.shared.taskId, task.id);
+  assert.equal(projection.extendedProperties.shared.syncRecurrenceOwner, "todoist");
+  assert.equal(projection.extendedProperties.shared.todoistRecurrence, "every year");
+
+  const mapping = await state.getMappingByTask(PROFILE, task.id);
+  assert.equal(mapping?.eventId, clients.calendarUpserts[0].id);
+  assert.equal(mapping?.recurrenceOwner, "todoist");
+  assert.equal(mapping?.masterEventId, clients.calendarUpserts[0].id);
+  assert.equal(state.links.length, 1);
+  assert.equal(state.links[0].owner, "todoist");
+});
+
+test("Calendar yearly series creates a Todoist task for its next occurrence", async () => {
+  const next = { ...instance("annual-2099", "2099-01-25", "2099-01-26"), summary: "Annual renewal" };
+  const following = { ...instance("annual-2100", "2100-01-25", "2100-01-26"), summary: "Annual renewal" };
+  const master = {
+    id: MASTER,
+    iCalUID: SERIES,
+    summary: "Annual renewal",
+    description: "",
+    status: "confirmed",
+    start: { date: "2098-01-25" },
+    end: { date: "2098-01-26" },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, [next, following], new Map(), master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "calendar-yearly-create",
+    kind: "calendar",
+    profile: PROFILE,
+    mode: "aws",
+    receivedAt: "2098-01-25T12:00:00Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.equal(clients.todoistUpserts.length, 1);
+  assert.equal(clients.todoistUpserts[0].payload.content, master.summary);
+  assert.deepEqual(clients.todoistUpserts[0].payload.due, { date: "2099-01-25" });
+  assert.equal(clients.todoistUpserts[0].payload.due.is_recurring, undefined);
+
+  const mapping = await state.getMappingByEvent(PROFILE, next.id);
+  assert.equal(mapping?.taskId, clients.todoistUpserts[0].id);
+  assert.equal(mapping?.recurrenceOwner, "calendar");
+  assert.equal(mapping?.masterEventId, master.id);
+  assert.equal(mapping?.activeInstanceId, next.id);
+  assert.equal(state.links.length, 1);
+  assert.equal(state.links[0].owner, "calendar");
+  assert.equal(state.links[0].masterEventId, master.id);
+});
+
 test("selector keeps the linked occurrence until it actually ends", () => {
   const current = instance("current", "2099-01-01", "2099-01-02");
   const next = instance("next", "2100-01-01", "2100-01-02");
