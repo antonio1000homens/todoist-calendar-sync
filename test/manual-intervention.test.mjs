@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  decisionBlocks,
   MANUAL_DECISION_CATALOG,
   ManualInterventionService,
 } from '../dist/manual-intervention.js';
@@ -543,4 +544,138 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'resolved');
   assert.match(notifier.updated.at(-1).text, /Delete whole Calendar series/);
   assert.ok(notifier.updated.at(-1).blocks, 'resolved prompt should offer future policy controls');
+});
+
+test('unmapped conflict creates one stable non-destructive manual decision', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: { async getTask() { return { id: 'task-1', content: 'Renew annually', due: { date: '2027-01-01', is_recurring: true } }; } },
+      calendar: { async getEvent() { return { id: 'legacy-event', status: 'confirmed', summary: 'Renew annually', start: { date: '2027-01-01' } }; } },
+    }),
+    new FakePolicyStore(),
+  );
+  const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-1' };
+  const detail = { taskId: 'task-1', eventId: 'legacy-event' };
+  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  await service.observeAudit({ ...delivery, id: 'reconcile-2' }, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  assert.equal(notifier.posted.length, 1);
+  const decision = notifier.posted[0];
+  assert.equal(decision.type, 'todoist_unmapped_conflict');
+  assert.equal(decision.context.taskTitle, 'Renew annually');
+  assert.equal(decision.context.todoistRecurring, true);
+  assert.deepEqual(decision.permittedActions.map((action) => action.id), [
+    'use_todoist_recurrence', 'split_future_todoist', 'use_calendar_version', 'keep_separate', 'reconcile_now',
+  ]);
+  assert.equal(decision.permittedActions[0].destructive, true);
+  assert.equal(decision.permittedActions[1].destructive, true);
+  assert.equal(decision.permittedActions[2].destructive, true);
+  assert.equal(decision.permittedActions[3].destructive, undefined);
+  assert.ok(decision.permittedActions.every((action) => !action.autoAllowed));
+});
+
+test('cancelled Calendar projection conflict is a distinct manual decision type', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: { async getTask() { return { id: 'task-1', content: 'Renew annually', due: { date: '2027-01-01' } }; } },
+      calendar: { async getEvent() { return { id: 'cancelled', status: 'cancelled', summary: 'Renew annually' }; } },
+    }),
+    new FakePolicyStore(),
+  );
+  const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile' };
+  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_cancelled_projection_blocked', {
+    taskId: 'task-1', eventId: 'cancelled',
+  });
+  assert.equal(notifier.posted[0].type, 'todoist_cancelled_projection_blocked');
+  assert.equal(notifier.posted[0].context.calendarStatus, 'cancelled');
+  assert.equal(notifier.posted[0].permittedActions[0].id, 'acknowledge');
+});
+
+
+test('guarded retry keeps an unresolved unmapped decision pending and actionable', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const decision = decisionFor('todoist_unmapped_conflict', {
+    decisionId: 'antonio-unmapped-retry-test',
+  });
+  decisions.decisions.set(decision.decisionId, decision);
+  let requested = 0;
+  const state = {
+    async requestReconciliation(profile, reason) {
+      requested += 1;
+      assert.equal(profile, 'antonio');
+      assert.equal(reason, 'manual');
+      return reconciliationState();
+    },
+  };
+  const service = new ManualInterventionService(decisions, notifier, async () => ({}), new FakePolicyStore());
+
+  await service.processManualDelivery({
+    id: 'manual:unmapped-retry',
+    kind: 'manual',
+    profile: 'antonio',
+    mode: 'aws',
+    receivedAt: '2026-09-07T14:01:00.000Z',
+    headers: {},
+    body: '',
+    manual: { decisionId: decision.decisionId, action: 'reconcile_now', slackUserId: 'U123' },
+  }, state);
+
+  assert.equal(requested, 1);
+  assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
+  assert.match(notifier.updated.at(-1).text, /remains open/);
+  assert.ok(notifier.updated.at(-1).blocks.some((block) => block.type === 'actions'));
+});
+
+test('Calendar-only ambiguity enriches and renders bounded candidate details read-only', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(
+    decisions, notifier,
+    async () => ({
+      todoist: {
+        async getTask(id) {
+          return { id, content: 'Renewal task', due: { date: '2027-06-11', is_recurring: true } };
+        },
+      },
+      calendar: {
+        async getEvent(id) {
+          return {
+            id,
+            status: 'confirmed',
+            summary: 'Renewal series',
+            start: { date: '2027-06-11' },
+            recurrence: ['RRULE:FREQ=YEARLY'],
+          };
+        },
+      },
+    }),
+    new FakePolicyStore(),
+  );
+  await service.observeAudit(
+    { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-calendar-only' },
+    'antonio',
+    'calendar_snapshot_recurring_identity_conflict',
+    { eventId: 'series-event', seriesId: 'series-1', candidateTaskIds: ['task-a', 'task-b'] },
+  );
+
+  const decision = notifier.posted[0];
+  assert.equal(decision.type, 'todoist_unmapped_conflict');
+  assert.equal(decision.context.calendarTitle, 'Renewal series');
+  assert.equal(decision.context.calendarStart, '2027-06-11');
+  assert.deepEqual(decision.context.readOnlyCandidates.map((candidate) => candidate.id), ['task-a', 'task-b']);
+  const rendered = JSON.stringify(decisionBlocks(decision));
+  assert.match(rendered, /Conflicting provider objects \(read-only\)/);
+  assert.match(rendered, /Renewal task/);
+  assert.match(rendered, /recurring: yes/);
+  assert.doesNotMatch(rendered, /bind_task:/);
 });

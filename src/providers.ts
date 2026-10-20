@@ -18,6 +18,31 @@ async function responseJson<T>(response: Response): Promise<T> {
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
+/**
+ * A task ID can occur on several live, legacy or cancelled Calendar
+ * projections. This is a safety boundary: callers must not mutate a guessed
+ * winner, especially if an intentional Calendar deletion is involved.
+ */
+export class AmbiguousCalendarLinkError extends Error {
+  readonly code = "ambiguous_calendar_task_link";
+  readonly eventIds: string[];
+
+  constructor(readonly taskId: string, candidates: CalendarEvent[]) {
+    super("Multiple Calendar projections reference the same Todoist task");
+    this.name = "AmbiguousCalendarLinkError";
+    this.eventIds = candidates.map((event) => event.id).sort();
+  }
+}
+
+export function selectLinkedCalendarEvent(taskId: string, candidates: CalendarEvent[]): CalendarEvent | undefined {
+  const distinct = [...new Map(candidates.map((event) => [event.id, event])).values()];
+  if (distinct.length === 0) return undefined;
+  // Even a cancelled + confirmed pair is ambiguous about user intent. Do not
+  // resurrect deleted projections or silently migrate to a different event.
+  if (distinct.length > 1) throw new AmbiguousCalendarLinkError(taskId, distinct);
+  return distinct[0];
+}
+
 export class GoogleCalendar {
   private accessToken?: string;
 
@@ -84,13 +109,93 @@ export class GoogleCalendar {
   }
 
   async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
+    // The first Google result is not necessarily the active projection. Its
+    // ordering is unspecified, and showDeleted can return old cancelled copies.
+    // Never silently pick a candidate that could delete or overwrite another.
     const query = new URLSearchParams({
       showDeleted: "true",
-      maxResults: "1",
+      maxResults: "2500",
       sharedExtendedProperty: `taskId=${taskId}`,
     });
-    const response = await this.request<{ items?: CalendarEvent[] }>(`/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`);
-    return response.items?.[0];
+    const found = new Map<string, CalendarEvent>();
+    let pages = 0;
+    while (true) {
+      if (++pages > 20) throw new Error("Calendar task link lookup exceeded page limit");
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const event of response.items || []) {
+        found.set(event.id, event);
+        if (found.size > 10000) throw new Error("Calendar task link lookup exceeded candidate limit");
+      }
+      if (!response.nextPageToken) break;
+      query.set("pageToken", response.nextPageToken);
+    }
+    return selectLinkedCalendarEvent(taskId, [...found.values()]);
+  }
+
+  /**
+   * Read actual Calendar occurrences around a due date, including instances
+   * of older recurring masters. A shared task-ID lookup alone cannot discover
+   * an independently created duplicate series.
+   */
+  async listOccurrencesInWindow(start: string, end: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      singleEvents: "true",
+      showDeleted: "false",
+      maxResults: "2500",
+      timeMin: start,
+      timeMax: end,
+    });
+    const found = new Map<string, CalendarEvent>();
+    for (let page = 0; page < 20; page += 1) {
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const event of response.items || []) {
+        found.set(event.id, event);
+        if (found.size > 10000) throw new Error("Calendar duplicate discovery exceeded candidate limit");
+      }
+      if (!response.nextPageToken) return [...found.values()];
+      query.set("pageToken", response.nextPageToken);
+    }
+    throw new Error("Calendar duplicate discovery exceeded page limit");
+  }
+
+  async getTimeZone(): Promise<string> {
+    const calendar = await this.request<{ timeZone?: string }>(
+      `/calendars/${encodeURIComponent(this.calendarId)}`,
+    );
+    if (!calendar.timeZone) throw new Error("Calendar timezone is missing; cannot determine safe recurrence cutoff");
+    try { new Intl.DateTimeFormat("en-GB", { timeZone: calendar.timeZone }); }
+    catch { throw new Error("Calendar returned an invalid timezone"); }
+    return calendar.timeZone;
+  }
+
+  /**
+   * Google events.list(singleEvents=false,showDeleted=true) includes explicit
+   * recurring overrides, independently of a time-limited instances expansion.
+   * An incomplete or oversized calendar inventory fails closed. Only *explicit*
+   * instances for this parent are returned.
+   */
+  async listExplicitSeriesExceptions(masterId: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      singleEvents: "false", showDeleted: "true", maxResults: "2500",
+    });
+    const found = new Map<string, CalendarEvent>();
+    let examined = 0;
+    for (let page = 0; page < 20; page += 1) {
+      const result = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      for (const item of result.items || []) {
+        if (++examined > 10000) throw new Error("Calendar exception inventory exceeds safe limit");
+        if (item.recurringEventId === masterId) found.set(item.id, item);
+      }
+      if (!result.nextPageToken) return [...found.values()];
+      query.set("pageToken", result.nextPageToken);
+    }
+    throw new Error("Calendar exception inventory exceeded page limit");
   }
 
   async getEvent(eventId: string): Promise<CalendarEvent> {
@@ -111,9 +216,72 @@ export class GoogleCalendar {
     } while (true);
   }
 
+  /** Bounded instance read: never expand an open-ended recurrence without limits. */
+  async listInstancesInWindow(masterId: string, start: string, end: string): Promise<CalendarEvent[]> {
+    const query = new URLSearchParams({
+      showDeleted: "true", maxResults: "2500", timeMin: start, timeMax: end,
+    });
+    const found = new Map<string, CalendarEvent>();
+    for (let page = 0; page < 20; page += 1) {
+      const result = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
+      );
+      for (const item of result.items || []) {
+        found.set(item.id, item);
+        if (found.size > 10000) throw new Error("Historical instance lookup exceeded the safe limit");
+      }
+      if (!result.nextPageToken) return [...found.values()];
+      query.set("pageToken", result.nextPageToken);
+    }
+    throw new Error("Historical instance lookup exceeded the page limit");
+  }
+
+  /**
+   * An explicitly addressed CREATE avoids duplicate masters after a partial
+   * failure. An existing ID is a conflict unless it has the exact approved
+   * task identity, rule, DTSTART and history marker.
+   */
+  async createFutureMasterOnce(event: CalendarEvent, historicalMasterId: string): Promise<CalendarEvent> {
+    if (!/^[a-f0-9]{32}$/.test(event.id) || !historicalMasterId) {
+      throw new Error("Future master needs a deterministic hexadecimal ID and history marker");
+    }
+    const valid = (candidate: CalendarEvent): boolean =>
+      candidate.id === event.id && candidate.status === "confirmed"
+      && candidate.start?.date === event.start?.date
+      && JSON.stringify(candidate.recurrence) === JSON.stringify(event.recurrence)
+      && candidate.extendedProperties?.shared?.taskId === event.extendedProperties?.shared?.taskId
+      && candidate.extendedProperties?.shared?.syncHistoryMasterId === historicalMasterId;
+    try {
+      const created = await this.request<CalendarEvent>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events`,
+        { method: "POST", body: JSON.stringify(event) },
+      );
+      if (!valid(created)) throw new Error("Created Calendar master does not match the approved future schedule");
+      return created;
+    } catch (error) {
+      if (Number((error as { status?: number }).status) !== 409) throw error;
+      const existing = await this.getEvent(event.id);
+      if (!valid(existing)) throw new Error("Deterministic Calendar ID belongs to a different series");
+      return existing;
+    }
+  }
+
   async upsertEvent(event: CalendarEvent, existingId?: string): Promise<CalendarEvent> {
     const path = `/calendars/${encodeURIComponent(this.calendarId)}/events${existingId ? `/${encodeURIComponent(existingId)}` : ""}`;
     return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
+  }
+
+  /**
+   * Manual resolution of an approved existing event must never fall back to
+   * POST or resurrect a deleted Calendar record. If the event changes or is
+   * cancelled after the approval snapshot, the If-Match update fails.
+   */
+  async upsertEventIfUnchanged(event: CalendarEvent, existingId: string, etag: string): Promise<CalendarEvent> {
+    if (!existingId || !etag) throw new Error("Manual Calendar update requires existing event ID and ETag");
+    return this.request(
+      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(existingId)}`,
+      { method: "PUT", headers: { "If-Match": etag }, body: JSON.stringify(event) },
+    );
   }
 
   async deleteEvent(eventId: string): Promise<void> {
@@ -311,14 +479,30 @@ export class Todoist {
    * historical name this now writes only project comments. Existing task
    * comments are migration fallback evidence and are never updated here.
    */
-  async upsertComment(taskId: string, content: string, existingId?: string, mappingDetails?: Mapping): Promise<{ id: string }> {
+  async upsertComment(taskId: string, content: string, existingId?: string, mappingDetails?: Mapping, migrateFromEventId?: string): Promise<{ id: string }> {
     const projectId = todoistProjectForToken(this.token);
     const profile = profileForTodoistProject(projectId);
     if (!projectId || !profile) throw new Error("Todoist mapping project is not configured for this token");
     const { eventId, calendarUrl } = this.legacyCommentFields(content);
     const comments = await this.listProjectComments(projectId);
     const index = buildProjectMappingIndex(comments);
-    const existing = findProjectMappingComment(index, { taskId, eventId, projectCommentId: existingId });
+    let existing = findProjectMappingComment(index, { taskId, eventId, projectCommentId: existingId });
+    if (!existing && migrateFromEventId) {
+      // An approved series split replaces the mapping identity. Updating the
+      // same versioned project comment avoids leaving an old-master mapping
+      // breadcrumb that would later be discovered as a competing owner.
+      const oldCandidates = (index.byTaskId.get(taskId) || []).filter((item) =>
+        item.payload.eventId === migrateFromEventId
+        && item.payload.profile === profile
+        && item.payload.projectId === projectId);
+      if (oldCandidates.length > 1 || oldCandidates.some((item) =>
+        item.payload.recurrenceOwner === "calendar"
+        || item.payload.completedThroughOriginalStart
+        || item.payload.calendarProgressVersion)) {
+        throw new Error("Cannot migrate conflicting or completed historical project mapping comment");
+      }
+      existing = oldCandidates[0];
+    }
     const revision = Math.max(0, existing?.payload.mappingRevision || 0) + 1;
     const baseMapping: Mapping = {
       ...(mappingDetails || {}),
@@ -330,11 +514,12 @@ export class Todoist {
       updatedAt: new Date().toISOString(),
     };
     const mapping = existing && !mappingDetails ? recoverMappingFromProjectComment(baseMapping, existing) : baseMapping;
-    const projectComment = await this.upsertProjectComment(
-      projectId,
-      serializeMappingComment(mapping, projectId, calendarUrl, revision),
-      existing?.comment.id,
-    );
+    const serialized = serializeMappingComment(mapping, projectId, calendarUrl, revision);
+    // A failed migration must not fall back to creating a second mapping
+    // comment; that would leave conflicting old/new task identities.
+    const projectComment = migrateFromEventId && existing?.payload.eventId === migrateFromEventId
+      ? await this.updateComment(existing.comment.id, serialized)
+      : await this.upsertProjectComment(projectId, serialized, existing?.comment.id);
     return { id: projectComment.id };
   }
 

@@ -318,6 +318,20 @@ export class ProjectAwareSynchronizer {
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!lifecycle) return;
 
+    // A future-only manual split can sit between old-master capping and
+    // creating the new recurrence. Never allow an unrelated webhook to
+    // synthesize another Calendar master during this recoverable interval.
+    if (!mapping) {
+      const pendingSplit = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
+      if (pendingSplit?.status === "pending") {
+        await this.state.audit(pendingSplit.profile, "todoist_webhook_future_series_split_pending", {
+          taskId: task.id, oldMasterId: pendingSplit.oldMasterId,
+          newMasterId: pendingSplit.newMasterId,
+        });
+        return;
+      }
+    }
+
     // Completed projections remain terminal even after their active mapping is
     // removed. Resolve the durable owner before project-transition handling so
     // a later item:updated/project move cannot rediscover and delete history.
@@ -426,6 +440,35 @@ export class ProjectAwareSynchronizer {
     return this.delegate.process(routed);
   }
 
+  /**
+   * Manual approvals authorize updating one specific Calendar event, not
+   * creating a replacement. Bypass the synthetic project-reentry path so
+   * stale task versions and missing linked events cannot turn an approval into
+   * an unbounded CREATE. This path is update-only with provider ETag guards.
+   */
+  async resolveApprovedUnmappedProjection(
+    profile: Profile,
+    task: TodoistTask,
+    approvedEventId: string,
+    approvedEtag: string,
+  ): Promise<Mapping | undefined> {
+    if (!approvedEventId || !approvedEtag) throw new Error("Approved Calendar ID and ETag required");
+    if (task.project_id !== profiles[profile].todoistProjectId) throw new Error("Approved task moved out of project");
+    const tombstone = await this.state.getCalendarProjectionTombstone(profile, task.id);
+    if (tombstone) throw new Error("Approved task has a projection tombstone");
+    const delivery: Delivery = {
+      id: `manual-approved:${profile}:${task.id}:${approvedEventId}`,
+      kind: "todoist",
+      profile, mode: "aws", receivedAt: new Date().toISOString(),
+      headers: {}, body: "",
+    };
+    return this.createDestinationProjection(
+      delivery, task, { action: "upsert", reason: "eligible", dueAdded: false },
+      profile, undefined, false,
+      { linkedEvent: undefined, approvedExisting: { id: approvedEventId, etag: approvedEtag } },
+    );
+  }
+
   private async createDestinationProjection(
     delivery: Delivery,
     task: TodoistTask,
@@ -433,6 +476,10 @@ export class ProjectAwareSynchronizer {
     destinationProfile: Profile,
     destinationTombstone: CalendarProjectionTombstone | undefined,
     explicitProjectReentry = false,
+    destinationCandidate?: {
+      linkedEvent: CalendarEvent | undefined;
+      approvedExisting?: { id: string; etag: string };
+    },
   ): Promise<Mapping | undefined> {
     if (!await this.mutationAllowed(delivery, [destinationProfile])) {
       await this.state.audit(destinationProfile, "todoist_project_create_mutation_suppressed", { taskId: task.id, mode: delivery.mode });
@@ -455,11 +502,40 @@ export class ProjectAwareSynchronizer {
       return undefined;
     }
     const clients = await this.clients(destinationProfile);
-    let existingEvent = await clients.calendar.findByTodoistTaskId(task.id);
-    if (existingEvent?.status === "cancelled") existingEvent = undefined;
+    // Project moves preflight destination ambiguity before deleting the source.
+    // Reuse that result instead of doing a second identity lookup after deletion.
+    const approved = destinationCandidate?.approvedExisting;
+    let existingEvent = approved
+      ? await clients.calendar.getEvent(approved.id)
+      : destinationCandidate
+        ? destinationCandidate.linkedEvent
+        : await clients.calendar.findByTodoistTaskId(task.id);
+    if (approved && (!existingEvent || existingEvent.id !== approved.id
+      || existingEvent.status !== "confirmed"
+      || existingEvent.etag !== approved.etag
+      || existingEvent.extendedProperties?.shared?.taskId !== task.id
+      || existingEvent.recurringEventId || existingEvent.recurrence?.length)) {
+      throw new Error("Approved Calendar event changed, cancelled or disappeared; no replacement permitted");
+    }
+    if (!approved && existingEvent?.status === "cancelled") existingEvent = undefined;
     const stored = existingEvent && hasCanonicalState(existingEvent, task)
       ? existingEvent
-      : await clients.calendar.upsertEvent(toCalendarEvent(task, existingEvent), existingEvent?.id);
+      : approved
+        ? await clients.calendar.upsertEventIfUnchanged(
+          toCalendarEvent(task, existingEvent), approved.id, approved.etag,
+        )
+        : await clients.calendar.upsertEvent(toCalendarEvent(task, existingEvent), existingEvent?.id);
+    if (approved) {
+      if (stored.id !== approved.id || stored.status === "cancelled") {
+        throw new Error("Approved Calendar update did not retain the same live event ID");
+      }
+      const live = await clients.calendar.getEvent(approved.id);
+      if (live.status !== "confirmed" || live.id !== approved.id
+        || live.etag !== stored.etag
+        || live.extendedProperties?.shared?.taskId !== task.id) {
+        throw new Error("Approved Calendar event changed before mapping; no mapping written");
+      }
+    }
     const existingComment = await clients.todoist.findComment(task.id, stored.id);
     const todoistRecurring = Boolean(task.due?.is_recurring);
     const todoistRrule = Boolean(todoistRecurring && todoistRecurrenceToRrule(task) && stored.recurrence?.length);
@@ -603,8 +679,15 @@ export class ProjectAwareSynchronizer {
         sourceMaster = await sourceClients.calendar.getEvent(mapping.masterEventId);
       } catch (error) {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+        // Even when the source master is missing, check destination identity
+        // *before* deleting the remaining mapping and its tombstones/comments.
+        const destinationClients = await this.clients(destinationProfile);
+        const linkedEvent = await destinationClients.calendar.findByTodoistTaskId(task.id);
         await this.removeSourceProjection(delivery, task, sourceProfile, mapping, true);
-        await this.createDestinationProjection(delivery, task, lifecycle, destinationProfile, destinationTombstone);
+        await this.createDestinationProjection(
+          delivery, task, lifecycle, destinationProfile, destinationTombstone,
+          false, { linkedEvent },
+        );
         return;
       }
       preparedDestination = await this.prepareCalendarOwnedDestinationSeries(task, destinationProfile, sourceMaster, mapping);
@@ -690,6 +773,12 @@ export class ProjectAwareSynchronizer {
       ? await this.state.getCalendarProjectionTombstone(destinationProfile, task.id)
       : undefined;
 
+    // A linked-event conflict in the destination MUST be discovered before
+    // source deletion, mapping removal, or source tombstone writes.
+    const destinationCandidate = willCreateDestination && destinationProfile
+      ? { linkedEvent: await (await this.clients(destinationProfile)).calendar.findByTodoistTaskId(task.id) }
+      : undefined;
+
     await this.removeSourceProjection(
       delivery,
       task,
@@ -708,7 +797,10 @@ export class ProjectAwareSynchronizer {
       });
     }
 
-    const nextMapping = await this.createDestinationProjection(delivery, task, lifecycle, destinationProfile, destinationTombstone);
+    const nextMapping = await this.createDestinationProjection(
+      delivery, task, lifecycle, destinationProfile, destinationTombstone,
+      false, destinationCandidate,
+    );
     if (nextMapping) {
       await this.state.audit(destinationProfile, "todoist_project_projection_moved", {
         taskId: task.id,
