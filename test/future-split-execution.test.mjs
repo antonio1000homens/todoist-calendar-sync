@@ -30,7 +30,7 @@ const instance = (master, date) => ({
 });
 
 function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFuture = false,
-  failFirstCreate = false, tombstone = undefined, conflictingOwner = undefined } = {}) {
+  failFirstCreate = false, normalizeCappedRule = false, tombstone = undefined, conflictingOwner = undefined } = {}) {
   const task = todo();
   const master = original();
   const events = new Map([[master.id, master]]);
@@ -115,7 +115,15 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
       const existing = events.get(id);
       if (existing?.etag !== etag) throw new Error("ETag precondition failed");
       calls.push("cap-old");
-      const updated = { ...event, status: "confirmed", etag: '"old-v2"' };
+      const normalized = normalizeCappedRule && event.recurrence?.[0]
+        ? event.recurrence[0].replace(
+          /^(RRULE:FREQ=YEARLY);INTERVAL=(\\d+);UNTIL=(\\d{8})$/,
+          "$1;UNTIL=$3;INTERVAL=$2",
+        ) : event.recurrence?.[0];
+      const updated = {
+        ...event, ...(normalized ? { recurrence: [normalized] } : {}),
+        status: "confirmed", etag: '"old-v2"',
+      };
       events.set(id, updated);
       return updated;
     },
@@ -187,6 +195,35 @@ test("a partial failure after capping history resumes without duplicating future
   assert.equal(f.created, 1);
   assert.equal(f.state.owner.eventId, resumed.plan.newMasterId);
   assert.equal(f.state.split.status, "completed");
+});
+
+test("Google reorders UNTIL before INTERVAL but the split verifies and completes", async () => {
+  const f = fixture({ normalizeCappedRule: true });
+  const { plan, mapping } = await applyApprovedFutureSeriesSplit(
+    "antonio", f.task, f.events.get("old-may-master"), f.pair, f.state, { now: today },
+  );
+  assert.equal(f.events.get("old-may-master").recurrence[0],
+    "RRULE:FREQ=YEARLY;UNTIL=20260503;INTERVAL=1");
+  assert.equal(mapping.eventId, plan.newMasterId);
+  assert.equal(f.created, 1);
+  assert.equal(f.state.split.status, "completed");
+});
+
+test("an already-capped Google-normalized master resumes without repeating historical PUT", async () => {
+  const f = fixture({ normalizeCappedRule: true, failFirstCreate: true });
+  await assert.rejects(applyApprovedFutureSeriesSplit(
+    "antonio", f.task, f.events.get("old-may-master"), f.pair, f.state, { now: today },
+  ), /Google 503/);
+  assert.equal(f.events.get("old-may-master").recurrence[0],
+    "RRULE:FREQ=YEARLY;UNTIL=20260503;INTERVAL=1");
+  assert.equal(f.state.split.status, "pending");
+  const result = await applyApprovedFutureSeriesSplit(
+    "antonio", f.task, f.events.get("old-may-master"), f.pair, f.state, { now: today },
+  );
+  assert.equal(result.resumed, true);
+  assert.equal(f.created, 1);
+  assert.equal(f.state.split.status, "completed");
+  assert.equal(f.calls.filter((entry) => entry === "cap-old").length, 1);
 });
 
 test("changed future Calendar exception blocks all writes", async () => {
