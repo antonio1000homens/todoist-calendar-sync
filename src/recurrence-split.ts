@@ -43,6 +43,38 @@ function yearlyOccurrence(anchor: string, year: number): string {
   day(candidate); // Reject leap-day shifts rather than guessing.
   return candidate;
 }
+/**
+ * Google Calendar may reorder RRULE components on a successful PUT. Compare
+ * only the supported all-day YEARLY subset semantically; unknown clauses,
+ * duplicate keys and malformed values must fail closed, not be ignored.
+ *
+ * FREQ=YEARLY and INTERVAL=1 (implicit or explicit) are equivalent, as are
+ * distinct serialisations of a rule with exactly the same DATE UNTIL.
+ */
+export function sameSafeYearlyRecurrenceRule(left: string | undefined, right: string | undefined): boolean {
+  const parse = (input: string | undefined): string | undefined => {
+    if (!input?.startsWith("RRULE:")) return undefined;
+    const parameters = new Map<string, string>();
+    for (const component of input.slice("RRULE:".length).split(";")) {
+      const match = /^(FREQ|INTERVAL|UNTIL)=([^;=]+)$/.exec(component);
+      if (!match || parameters.has(match[1])) return undefined;
+      parameters.set(match[1], match[2]);
+    }
+    if (parameters.get("FREQ") !== "YEARLY") return undefined;
+    const rawInterval = parameters.get("INTERVAL") || "1";
+    if (!/^[1-9]\d{0,2}$/.test(rawInterval)) return undefined;
+    const until = parameters.get("UNTIL") || "";
+    if (until && !/^\d{8}$/.test(until)) return undefined;
+    if (until) {
+      const value = `${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6)}`;
+      try { day(value); } catch { return undefined; }
+    }
+    return `FREQ=YEARLY;INTERVAL=${Number(rawInterval)};UNTIL=${until}`;
+  };
+  const normalizedLeft = parse(left);
+  return normalizedLeft !== undefined && normalizedLeft === parse(right);
+}
+
 function annualInterval(rule: string): number {
   const match = /^RRULE:FREQ=YEARLY(?:;INTERVAL=([1-9]\d{0,2}))?$/.exec(rule);
   if (!match) throw new Error("Future-only split supports only plain yearly RRULEs without COUNT, UNTIL, RDATE or EXDATE");
@@ -104,7 +136,7 @@ export function planFutureSeriesSplit(
     .digest("hex").slice(0, 32);
   const originalRule = priorRule;
   const truncatedRule = `${originalRule};UNTIL=${previous.replace(/-/g, "")}`;
-  if (archived && (old.recurrence[0] !== truncatedRule
+  if (archived && (!sameSafeYearlyRecurrenceRule(old.recurrence[0], truncatedRule)
     || old.extendedProperties?.shared?.syncHistorySuccessorId !== newMasterId
     || old.extendedProperties?.shared?.syncHistoryTaskId !== task.id)) {
     throw new Error("Already archived Calendar master does not match this split");
