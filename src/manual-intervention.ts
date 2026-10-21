@@ -34,6 +34,9 @@ class ManualCircuitOpenError extends Error {
     this.name = "ManualCircuitOpenError";
   }
 }
+class ManualSyncBlockedError extends Error {
+  constructor() { super("An affected item or pairing is protected by a repair, exclusion, or rejected link. Use the review page to resolve it."); this.name = "ManualSyncBlockedError"; }
+}
 
 export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled" | "expired";
 export type ManualDecisionSeverity = "info" | "warning" | "destructive";
@@ -936,6 +939,10 @@ export class ManualInterventionService {
         const operation = String(property);
         if (!mutatingMethods.has(operation)) return value.bind(current);
         return async (...args: unknown[]) => {
+          const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
+            ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
+            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
+          if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
           if (!await state.mutationAllowed(profile)) throw new ManualCircuitOpenError(profile, operation);
           const result = await Reflect.apply(value, current, args);
           // Count every successful provider write, including each item in a bounded bulk action.
@@ -1588,7 +1595,7 @@ export class ManualInterventionService {
         decision.slackChannelId,
       );
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) throw error;
       await state.audit(decision.profile, "manual_future_series_split_incomplete", {
         taskId: task.id, oldMasterId: old.id, decisionId: decision.decisionId,
         reason: error instanceof Error ? error.message : String(error),
@@ -2093,6 +2100,16 @@ export class ManualInterventionService {
         await this.retryConflictReconciliation(decision, state, manual.slackUserId);
         return;
       }
+      if (!["acknowledge","keep_separate"].includes(manual.action)) {
+        const mapping = decision.mappingSnapshot;
+        const taskIds = new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)));
+        const eventIds = new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)));
+        for (const taskId of taskIds) {
+          if (await state.syncBlocked(decision.profile, { taskId })) throw new ManualSyncBlockedError();
+          for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { taskId, eventId })) throw new ManualSyncBlockedError();
+        }
+        for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { eventId })) throw new ManualSyncBlockedError();
+      }
       if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
         await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);
         return;
@@ -2124,7 +2141,7 @@ export class ManualInterventionService {
       }
       throw new Error(`Decision type ${decision.type} does not yet have an execution handler`);
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) {
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) {
         await state.audit(decision.profile, "manual_action_deferred_safety", {
           decisionId: decision.decisionId,
           action: manual.action,

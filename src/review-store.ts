@@ -3,7 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
-import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type ReviewActor, type ReviewCase } from "./review-types.js";
+import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -64,7 +64,41 @@ export class ReviewStore {
   async saveOperation(operation: RepairOperation): Promise<void> {
     operation.updatedAt = new Date().toISOString();
     await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
-      lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` } }));
+      lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
+      ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded" : "attribute_not_exists(pk) OR #status <> :succeeded",
+      ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} }));
+  }
+  async finalizeOperation(operation: RepairOperation, releases: RepairRelease[]): Promise<RepairOperation> {
+    const current = await this.getCase(operation.preview.intent.caseId);
+    if (!current) throw new Error("Conflict no longer exists");
+    const now = new Date().toISOString();
+    const completed: RepairOperation = { ...operation, status:"succeeded", updatedAt:now, error:undefined, nextAction:undefined,
+      notificationPending:true, notificationText:"Succeeded: repair verified" };
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: [
+        ...[...new Map(releases.map(item => [entityKey(item.ref), item])).values()].map(item => ({ Update: {
+          TableName:reviewTable(), Key:key(`SYNC_CONTROL#${entityKey(item.ref)}`),
+          UpdateExpression:`SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair, pendingRefresh`,
+          ConditionExpression:"activeRepair = :id", ExpressionAttributeValues:{ ":id":operation.id, ":now":now, ":version":item.providerUpdatedAt || "", ...(item.clearExclusion ? {":false":false} : {}) },
+        } })),
+        { Put:{ TableName:reviewTable(), Item:{ ...completed, ...key(`REPAIR#${operation.id}`),
+          lookupPk:`PROFILE#${operation.preview.intent.profile}`, lookupSk:`REPAIR#NOTIFY#${operation.id}` },
+          ConditionExpression:"#status <> :succeeded", ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} } },
+        { Update:{ TableName:reviewTable(), Key:key(`REVIEW_CASE#${current.id}`),
+          UpdateExpression:"SET #status = :status, #result = :result, updatedAt = :now, operationId = :id, lookupSk = :lookup",
+          ExpressionAttributeNames:{"#status":"status","#result":"result"}, ExpressionAttributeValues:{
+            ":status":operation.preview.intent.action === "exclude" ? "excluded" : "resolved", ":result":"Repair verified against current provider state",
+            ":now":now, ":id":operation.id, ":lookup":`REVIEW#CLOSED#${current.createdAt}#${current.id}`,
+          } } },
+      ] }));
+      return completed;
+    } catch (error) {
+      // A lost response must not turn an already committed success into a
+      // failed run that reclaims its freshly released barriers.
+      const saved = await this.getOperation(operation.id);
+      if (saved?.status === "succeeded") return saved;
+      throw error;
+    }
   }
   async pendingNotifications(profile: Profile): Promise<RepairOperation[]> {
     const items: RepairOperation[] = []; let cursor: Record<string, unknown> | undefined;

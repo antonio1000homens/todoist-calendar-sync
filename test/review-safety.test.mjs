@@ -77,7 +77,7 @@ test("Create counterpart previews include the selected source without requiring 
     async getCase() { return { id: "case", profile: "home" }; },
     async putPreview(preview) { saved.push(preview); },
   });
-  engine.collect = async () => [{ ref: { profile: "home", side: "todoist", id: "task" }, object: { id: "task", content: "Task" } }];
+  engine.collect = async () => [{ ref: { profile: "home", side: "todoist", id: "task" }, object: { id: "task", content: "Task", due:{date:"2099-12-18"} } }];
   const preview = await engine.preview({ subject: "operator", email: "operator@example.test" }, {
     caseId: "case", profile: "home", action: "create", taskId: "task", winner: "none", scope: "occurrence", leftovers: {},
   });
@@ -88,8 +88,8 @@ test("Create counterpart previews include the selected source without requiring 
 test("relinking cannot silently discard a displaced live counterpart", async () => {
   const engine = new ReviewEngine({ async getCase() { return { id: "case", profile: "home" }; } });
   engine.collect = async () => [
-    { ref: { profile: "home", side: "todoist", id: "task" }, object: { id: "task", content: "Task" } },
-    { ref: { profile: "home", side: "calendar", id: "chosen" }, object: { id: "chosen", summary: "Chosen" } },
+    { ref: { profile: "home", side: "todoist", id: "task" }, object: { id: "task", content: "Task",due:{date:"2099-12-18"} } },
+    { ref: { profile: "home", side: "calendar", id: "chosen" }, object: { id: "chosen", summary: "Chosen",status:"confirmed" } },
     { ref: { profile: "home", side: "calendar", id: "displaced" }, object: { id: "displaced", summary: "Displaced" } },
   ];
   await assert.rejects(engine.preview({ subject: "operator", email: "operator@example.test" }, {

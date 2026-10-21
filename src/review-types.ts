@@ -37,6 +37,9 @@ export interface RepairOperation {
   error?: string; nextAction?: string; notificationPending: boolean; notificationReplyTs?: string;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
   outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded"; checkedAt: string }>;
+  expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;
+  recurrenceBindings?: Mapping[];
 }
+export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }
 export const REVIEW_PROFILES: Profile[] = ["home", "antonio", "work"];
