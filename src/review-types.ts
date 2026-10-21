@@ -1,4 +1,4 @@
-import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
+import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } from "./types.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { FutureSeriesSplitPlan } from "./recurrence-split.js";
 export type Side = "todoist" | "calendar";
@@ -22,6 +22,7 @@ export interface RepairIntent {
 export interface ReviewSnapshot {
   ref: EntityRef; object: TodoistTask | CalendarEvent | null;
   mapping?: Mapping; control?: Record<string, unknown>;
+  recurrence?: RecurrenceLink; calendarProjectionId?: string;
 }
 export interface RepairPreview {
   id: string; actor: ReviewActor; intent: RepairIntent; case: ReviewCase;

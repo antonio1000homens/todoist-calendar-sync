@@ -796,6 +796,9 @@ export class Synchronizer {
       try { task = await todoist.getTask(linkedTaskId); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; }
     }
     if (!task) task = matchingTask(event, await todoist.listTasks());
+    if (task && await this.state.syncBlocked(delivery.profile, { taskId:task.id, eventId:event.id })) {
+      return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:event.id, taskId:task.id });
+    }
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "calendar_mutation_suppressed", { eventId: event.id, taskId: task?.id, mode: delivery.mode });
     }
@@ -909,6 +912,9 @@ export class Synchronizer {
     }
     const active = selectCalendarRecurrenceInstance(instances, existing);
     if (!active) return this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
+    if (await this.state.syncBlocked(delivery.profile, { taskId:existing?.taskId, eventId:active.id })) {
+      return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:active.id, taskId:existing?.taskId, masterEventId:master.id });
+    }
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "calendar_recurrence_mutation_suppressed", { seriesId, mode: delivery.mode });
     }

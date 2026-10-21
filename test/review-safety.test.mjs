@@ -33,28 +33,34 @@ test("a blocked webhook records a pending refresh without taking over the repair
   assert.equal(commands[0].UpdateExpression, "SET pendingRefresh = :true");
 });
 
-test("a stale repair preview fails before acquiring barriers or writing to providers", async () => {
+test("a stale repair preview releases its acquired barriers without writing to providers", async () => {
   const ref = { profile: "home", side: "todoist", id: "task" };
   const snapshots = [{ ref, object: { id: "task", content: "Original", updated_at: "version-1" } }];
   const operation = {
     id: "repair", status: "queued", steps: {},
-    preview: { intent: { caseId: "case", profile: "home" }, snapshots, fingerprint: snapshotFingerprint(snapshots) },
+    preview: { intent: { caseId: "case", profile: "home" }, case: {}, snapshots, fingerprint: snapshotFingerprint(snapshots) },
   };
   const saved = [];
+  const calls = [];
   const store = {
     async getOperation() { return operation; },
     async saveOperation(value) { saved.push(structuredClone(value)); },
     async updateCase() {},
   };
   const engine = new ReviewEngine(store, {}, async () => { throw new Error("Provider writes must not run"); }, {
-    async claim() { assert.fail("A stale preview must not acquire barriers"); },
+    async claim(refs) { calls.push(["claim", refs]); },
+    async release(ref, operationId) { calls.push(["release", ref, operationId]); },
   });
-  engine.collect = async () => [{ ref, object: { ...snapshots[0].object, content: "Changed", updated_at: "version-2" } }];
+  engine.collect = async () => {
+    assert.equal(calls[0]?.[0], "claim");
+    return [{ ref, object: { ...snapshots[0].object, content: "Changed", updated_at: "version-2" } }];
+  };
   const result = await engine.execute("repair");
   assert.equal(result.status, "failed");
   assert.match(result.error, /changed after preview/);
   assert.deepEqual(result.steps, {});
   assert.equal(saved.length, 1);
+  assert.deepEqual(calls, [["claim", [ref]], ["release", ref, "repair"]]);
 });
 
 test("provider modification versions and exclusions invalidate repair previews", () => {
