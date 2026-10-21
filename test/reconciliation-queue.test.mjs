@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { requestReconciliation } from "../dist/queue.js";
 
-function reconciliationState(generation, reason = "webhook") {
+function reconciliationState(generation, reason = "manual") {
   const now = new Date().toISOString();
   return {
     profile: "home",
@@ -25,7 +25,7 @@ test("initial reconciliation request enqueues exactly one durable generation", a
     async markReconciliationEnqueued(profile, value) { marked.push([profile, value]); },
   };
 
-  const result = await requestReconciliation(state, "home", "webhook", async (delivery) => {
+  const result = await requestReconciliation(state, "home", "manual", async (delivery) => {
     deliveries.push(delivery);
   });
 
@@ -49,7 +49,7 @@ test("already-pending reconciliation coalesces without another queue send", asyn
     async markReconciliationEnqueued() { throw new Error("must not mark coalesced request as newly enqueued"); },
   };
 
-  const result = await requestReconciliation(state, "home", "webhook", async () => {
+  const result = await requestReconciliation(state, "home", "manual", async () => {
     enqueueCalls += 1;
   });
 
@@ -72,7 +72,7 @@ test("failed enqueue preserves and later reuses the same generation", async () =
     async markReconciliationEnqueued(profile, value) { marked.push([profile, value]); },
   };
 
-  const first = await requestReconciliation(state, "home", "webhook", async (delivery) => {
+  const first = await requestReconciliation(state, "home", "manual", async (delivery) => {
     attemptedIds.push(delivery.id);
     throw new Error("synthetic SQS outage");
   });
@@ -81,7 +81,7 @@ test("failed enqueue preserves and later reuses the same generation", async () =
   assert.equal(first.enqueueError, "synthetic SQS outage");
   assert.equal(marked.length, 0);
 
-  const second = await requestReconciliation(state, "home", "scheduled", async (delivery) => {
+  const second = await requestReconciliation(state, "home", "manual", async (delivery) => {
     attemptedIds.push(delivery.id);
   });
 
@@ -90,4 +90,19 @@ test("failed enqueue preserves and later reuses the same generation", async () =
   assert.equal(second.generation, generation);
   assert.deepEqual(attemptedIds, [`reconcile:home:${generation}`, `reconcile:home:${generation}`]);
   assert.deepEqual(marked, [["home", generation]]);
+});
+
+test("explicit retry uses a fresh generation and delivery ID after a failed run", async () => {
+  const generations = ["gen-failed", "gen-retry"];
+  const attempts = [];
+  const state = {
+    async requestReconciliation(profile, reason) {
+      const generation = generations.shift();
+      return { state: reconciliationState(generation, reason), shouldEnqueue: true, created: true };
+    },
+    async markReconciliationEnqueued() {},
+  };
+  await requestReconciliation(state, "home", "manual", async (delivery) => attempts.push(delivery.id));
+  await requestReconciliation(state, "home", "manual", async (delivery) => attempts.push(delivery.id));
+  assert.deepEqual(attempts, ["reconcile:home:gen-failed", "reconcile:home:gen-retry"]);
 });

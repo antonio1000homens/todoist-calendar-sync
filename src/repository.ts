@@ -32,7 +32,6 @@ const allProfiles: Profile[] = ["home", "antonio", "work"];
 const CIRCUIT_MUTATION_LIMIT = 20;
 const CIRCUIT_WINDOW_MS = 20_000;
 const CIRCUIT_OPEN_MS = 5 * 60_000;
-const RECONCILE_REENQUEUE_MS = 5 * 60_000;
 
 export type CalendarProjectionTombstoneReason = "project_exit";
 
@@ -53,6 +52,23 @@ export interface ReconciliationState {
   lastCompletedAt?: string;
   lastFailedAt?: string;
   lastError?: string;
+  status?: "queued" | "running" | "succeeded" | "needs_review" | "failed";
+  requester?: string;
+  slackChannelId?: string;
+  slackMessageTs?: string;
+  slackThreadTs?: string;
+  slackDecisionId?: string;
+  lastProgressAt?: string;
+  result?: Record<string, number>;
+  unresolved?: number;
+  notificationPending?: boolean;
+  notificationText?: string;
+  notificationReplyTs?: string;
+  lastHealthAlertAt?: string;
+}
+
+export function reconciliationRunStatus(run: ReconciliationState): NonNullable<ReconciliationState["status"]> {
+  return run.status || (run.lastFailedAt ? "failed" : run.pending ? "queued" : "succeeded");
 }
 
 function key(pk: string, sk = "STATE"): { pk: string; sk: string } {
@@ -187,23 +203,31 @@ export class StateRepository {
   async requestReconciliation(
     profile: Profile,
     reason: ReconciliationReason,
+    context: { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string } = {},
   ): Promise<{ state: ReconciliationState; shouldEnqueue: boolean; created: boolean }> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const current = await this.getReconciliationState(profile);
       const requestedAt = now();
-      if (current?.pending) {
-        const lastEnqueued = current.lastEnqueuedAt ? Date.parse(current.lastEnqueuedAt) : Number.NaN;
-        const staleOrNeverEnqueued = !Number.isFinite(lastEnqueued) || Date.now() - lastEnqueued >= RECONCILE_REENQUEUE_MS;
+      const stalledAt = current?.lastProgressAt || current?.lastStartedAt || current?.lastEnqueuedAt;
+      const explicitlyRetryable = Boolean(current?.pending && (current.lastFailedAt
+        || (stalledAt && Date.now() - Date.parse(stalledAt) >= 15 * 60_000)));
+      if (current?.pending && !explicitlyRetryable) {
+        const staleOrNeverEnqueued = !current.lastEnqueuedAt;
         const next: ReconciliationState = {
           ...current,
           reason,
           lastRequestedAt: requestedAt,
+          ...((current.requester || context.requester) ? { requester: current.requester || context.requester } : {}),
+          ...((current.slackChannelId || context.slackChannelId) ? { slackChannelId: current.slackChannelId || context.slackChannelId } : {}),
+          ...((current.slackMessageTs || context.slackMessageTs) ? { slackMessageTs: current.slackMessageTs || context.slackMessageTs } : {}),
+          ...((current.slackThreadTs || context.slackThreadTs) ? { slackThreadTs: current.slackThreadTs || context.slackThreadTs } : {}),
+          ...((current.slackDecisionId || context.slackDecisionId) ? { slackDecisionId: current.slackDecisionId || context.slackDecisionId } : {}),
         };
         try {
           await client.send(new UpdateCommand({
             TableName: this.ensureTable(),
             Key: key(`RECONCILE#${profile}`),
-            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, expiresAt = :expiresAt",
+            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, requester = :requester, slackChannelId = :channel, slackMessageTs = :messageTs, slackThreadTs = :thread, slackDecisionId = :decisionId, expiresAt = :expiresAt",
             ConditionExpression: "#pending = :true AND generation = :generation",
             ExpressionAttributeNames: { "#pending": "pending" },
             ExpressionAttributeValues: {
@@ -211,6 +235,11 @@ export class StateRepository {
               ":generation": current.generation,
               ":reason": reason,
               ":lastRequestedAt": requestedAt,
+              ":requester": current.requester || context.requester || "operator",
+              ":channel": current.slackChannelId || context.slackChannelId || "",
+              ":messageTs": current.slackMessageTs || context.slackMessageTs || "",
+              ":thread": current.slackThreadTs || context.slackThreadTs || "",
+              ":decisionId": current.slackDecisionId || context.slackDecisionId || "",
               ":expiresAt": ttl(30),
             },
           }));
@@ -229,8 +258,41 @@ export class StateRepository {
         reason,
         requestedAt,
         lastRequestedAt: requestedAt,
+        status: "queued",
+        lastProgressAt: requestedAt,
+        ...context,
         ...(current?.lastCompletedAt ? { lastCompletedAt: current.lastCompletedAt } : {}),
       };
+      if (current && (current.lastFailedAt || explicitlyRetryable)) {
+        try {
+          await client.send(new PutCommand({
+            TableName: this.ensureTable(),
+            Item: { ...current, ...key(`RECONCILE_RUN#${profile}#${current.generation}`), archivedAt: requestedAt, expiresAt: ttl(90) },
+            ConditionExpression: "attribute_not_exists(pk)",
+          }));
+        } catch (error) { if (!conditionalFailure(error)) throw error; }
+      }
+      // Keep outcomes independent of the latest profile generation, including
+      // records written before the durable notification outbox was introduced.
+      if (current?.notificationPending) await this.preserveReconciliationOutcome(current);
+      const names: Record<string, string> = { "#pending": "pending" };
+      const values: Record<string, unknown> = {};
+      let condition = "attribute_not_exists(pk)";
+      if (current) {
+        values[":previousGeneration"] = current.generation;
+        values[":previousPending"] = current.pending;
+        condition = "generation = :previousGeneration AND #pending = :previousPending";
+        // Compare the same timestamp precedence used to determine staleness.
+        // A resumed run must invalidate the replacement even for legacy rows.
+        for (const attribute of ["lastProgressAt", "lastStartedAt", "lastEnqueuedAt", "lastFailedAt"] as const) {
+          if (current[attribute]) {
+            values[`:${attribute}`] = current[attribute];
+            condition += ` AND ${attribute} = :${attribute}`;
+          } else {
+            condition += ` AND attribute_not_exists(${attribute})`;
+          }
+        }
+      }
       try {
         await client.send(new PutCommand({
           TableName: this.ensureTable(),
@@ -239,9 +301,8 @@ export class StateRepository {
             ...state,
             expiresAt: ttl(30),
           },
-          ConditionExpression: "attribute_not_exists(pk) OR #pending = :false",
-          ExpressionAttributeNames: { "#pending": "pending" },
-          ExpressionAttributeValues: { ":false": false },
+          ConditionExpression: condition,
+          ...(current ? { ExpressionAttributeNames: names, ExpressionAttributeValues: values } : {}),
         }));
         return { state, shouldEnqueue: true, created: true };
       } catch (error) {
@@ -276,12 +337,13 @@ export class StateRepository {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET lastStartedAt = :now, expiresAt = :expiresAt",
-        ConditionExpression: "#pending = :true AND generation = :generation",
-        ExpressionAttributeNames: { "#pending": "pending" },
+        UpdateExpression: "SET lastStartedAt = :now, lastProgressAt = :now, #status = :running, expiresAt = :expiresAt REMOVE lastHealthAlertAt",
+        ConditionExpression: "#pending = :true AND generation = :generation AND attribute_not_exists(lastFailedAt)",
+        ExpressionAttributeNames: { "#pending": "pending", "#status": "status" },
         ExpressionAttributeValues: {
           ":true": true,
           ":generation": generation,
+          ":running": "running",
           ":now": now(),
           ":expiresAt": ttl(30),
         },
@@ -293,46 +355,162 @@ export class StateRepository {
     }
   }
 
-  async completeReconciliation(profile: Profile, generation: string): Promise<void> {
+  async addReconciliationProgress(profile: Profile, generation: string, counts: Record<string, number>): Promise<void> {
+    const current = await this.getReconciliationState(profile);
+    if (!current || current.generation !== generation || !current.pending) return;
+    const aggregate = { ...(current.result || {}) };
+    for (const [name, count] of Object.entries(counts)) aggregate[name] = (aggregate[name] || 0) + count;
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
+      UpdateExpression: "SET #result = :result, lastProgressAt = :now, expiresAt = :expiresAt REMOVE lastHealthAlertAt",
+      ConditionExpression: "#pending = :true AND generation = :generation",
+      ExpressionAttributeNames: { "#pending": "pending", "#result": "result" },
+      ExpressionAttributeValues: { ":result": aggregate, ":now": now(), ":expiresAt": ttl(30), ":true": true, ":generation": generation },
+    }));
+  }
+
+  async preserveReconciliationOutcome(run: ReconciliationState): Promise<void> {
     try {
-      await client.send(new UpdateCommand({
+      await client.send(new PutCommand({
         TableName: this.ensureTable(),
-        Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET #pending = :false, lastCompletedAt = :now, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
-        ConditionExpression: "#pending = :true AND generation = :generation",
-        ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":false": false,
-          ":generation": generation,
-          ":now": now(),
-          ":expiresAt": ttl(30),
-        },
+        Item: { ...run, ...key(`RECONCILE_OUTCOME#${run.profile}`, run.generation), expiresAt: ttl(90) },
+        ConditionExpression: "attribute_not_exists(pk)",
       }));
+    } catch (error) { if (!conditionalFailure(error)) throw error; }
+  }
+
+  async getReconciliationOutcome(profile: Profile, generation: string): Promise<ReconciliationState | undefined> {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(), Key: key(`RECONCILE_OUTCOME#${profile}`, generation), ConsistentRead: true,
+    }));
+    return result.Item as ReconciliationState | undefined;
+  }
+
+  async listPendingReconciliationOutcomes(profile: Profile): Promise<ReconciliationState[]> {
+    const runs: ReconciliationState[] = [];
+    let cursor: Record<string, unknown> | undefined;
+    do {
+      const page = await client.send(new QueryCommand({
+        TableName: this.ensureTable(), ConsistentRead: true,
+        KeyConditionExpression: "pk = :pk", FilterExpression: "notificationPending = :true",
+        ExpressionAttributeValues: { ":pk": `RECONCILE_OUTCOME#${profile}`, ":true": true },
+        ExclusiveStartKey: cursor,
+      }));
+      runs.push(...(page.Items || []) as ReconciliationState[]);
+      cursor = page.LastEvaluatedKey;
+    } while (cursor);
+    return runs;
+  }
+
+  private async saveReconciliationOutcome(
+    profile: Profile, generation: string, terminal: Partial<ReconciliationState>,
+    update: { UpdateExpression: string; ExpressionAttributeNames: Record<string, string>; ExpressionAttributeValues: Record<string, unknown> },
+  ): Promise<void> {
+    const current = await this.getReconciliationState(profile);
+    if (!current?.pending || current.generation !== generation) return;
+    const outcome = { ...current, ...terminal, notificationPending: true };
+    if (terminal.status !== "failed") {
+      delete outcome.lastFailedAt;
+      delete outcome.lastError;
+    }
+    try {
+      // The terminal result and its notification become durable together.
+      await client.send(new TransactWriteCommand({ TransactItems: [
+        { Update: {
+          TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`), ...update,
+          ConditionExpression: "#pending = :true AND generation = :generation",
+        } },
+        { Put: { TableName: this.ensureTable(), Item: {
+          ...outcome, ...key(`RECONCILE_OUTCOME#${profile}`, generation), expiresAt: ttl(90),
+        } } },
+      ] }));
     } catch (error) {
-      if (!conditionalFailure(error)) throw error;
+      const transaction = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (transaction.name === "TransactionCanceledException"
+        && transaction.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")) return;
+      throw error;
     }
   }
 
+  async completeReconciliation(profile: Profile, generation: string, unresolved = 0, counts: Record<string, number> = {}): Promise<void> {
+    const completedAt = now();
+    const status = unresolved > 0 ? "needs_review" : "succeeded";
+    const notificationText = unresolved > 0 ? `Needs review: ${unresolved} unresolved reconciliation item(s).` : "Succeeded: reconciliation completed.";
+    await this.saveReconciliationOutcome(profile, generation, {
+      pending: false, status, unresolved, result: counts, lastCompletedAt: completedAt,
+      lastProgressAt: completedAt, notificationText,
+    }, {
+      UpdateExpression: "SET #pending = :false, #status = :status, unresolved = :unresolved, #result = :result, lastCompletedAt = :now, lastProgressAt = :now, notificationPending = :true, notificationText = :notification, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
+      ExpressionAttributeNames: { "#pending": "pending", "#status": "status", "#result": "result" },
+      ExpressionAttributeValues: {
+        ":true": true, ":false": false, ":status": status, ":unresolved": unresolved, ":result": counts,
+        ":notification": notificationText, ":generation": generation, ":now": completedAt, ":expiresAt": ttl(30),
+      },
+    });
+  }
+
   async recordReconciliationFailure(profile: Profile, generation: string, message: string): Promise<void> {
+    const failedAt = now();
+    const lastError = message.slice(0, 1000);
+    await this.saveReconciliationOutcome(profile, generation, {
+      status: "failed", lastFailedAt: failedAt, lastProgressAt: failedAt, lastError, notificationText: lastError,
+    }, {
+      UpdateExpression: "SET lastFailedAt = :now, lastProgressAt = :now, #status = :failed, lastError = :message, notificationPending = :true, notificationText = :message, expiresAt = :expiresAt",
+      ExpressionAttributeNames: { "#pending": "pending", "#status": "status" },
+      ExpressionAttributeValues: {
+        ":true": true, ":generation": generation, ":now": failedAt, ":message": lastError, ":failed": "failed", ":expiresAt": ttl(30),
+      },
+    });
+  }
+
+  private async updateReconciliationNotification(
+    profile: Profile, generation: string, UpdateExpression: string, values: Record<string, unknown>,
+  ): Promise<void> {
+    const input = {
+      TableName: this.ensureTable(), UpdateExpression,
+      ConditionExpression: "generation = :generation",
+      ExpressionAttributeValues: { ...values, ":generation": generation },
+    };
+    await client.send(new UpdateCommand({ ...input, Key: key(`RECONCILE_OUTCOME#${profile}`, generation) }));
+    // Keep the latest-run view up to date without depending on it for delivery.
     try {
-      await client.send(new UpdateCommand({
-        TableName: this.ensureTable(),
-        Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET lastFailedAt = :now, lastError = :message, expiresAt = :expiresAt",
-        ConditionExpression: "#pending = :true AND generation = :generation",
-        ExpressionAttributeNames: { "#pending": "pending" },
-        ExpressionAttributeValues: {
-          ":true": true,
-          ":generation": generation,
-          ":now": now(),
-          ":message": message.slice(0, 1000),
-          ":expiresAt": ttl(30),
-        },
-      }));
+      await client.send(new UpdateCommand({ ...input, Key: key(`RECONCILE#${profile}`) }));
     } catch (error) {
-      if (!conditionalFailure(error)) throw error;
+      if (!conditionalFailure(error)) logEvent("reconciliation_notification_view_update_failed", { profile, generation });
     }
+  }
+
+  async markReconciliationNotified(profile: Profile, generation: string, replyTs?: string): Promise<void> {
+    await this.updateReconciliationNotification(profile, generation,
+      "SET notificationPending = :false, notificationReplyTs = :reply", { ":false": false, ":reply": replyTs || "" });
+  }
+
+  async storeReconciliationReply(profile: Profile, generation: string, replyTs: string): Promise<void> {
+    await this.updateReconciliationNotification(profile, generation,
+      "SET notificationReplyTs = :replyTs", { ":replyTs": replyTs });
+  }
+
+  async recordReconciliationNotification(profile: Profile, generation: string, message: string): Promise<void> {
+    await this.updateReconciliationNotification(profile, generation,
+      "SET notificationPending = :true, notificationText = :message", { ":true": true, ":message": message.slice(0, 1000) });
+  }
+
+  async markReconciliationHealthAlert(profile: Profile, generation: string): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
+      UpdateExpression: "SET lastHealthAlertAt = :now",
+      ConditionExpression: "generation = :generation",
+      ExpressionAttributeValues: { ":now": now(), ":generation": generation },
+    }));
+  }
+
+  async clearReconciliationHealthAlert(profile: Profile, generation: string): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
+      UpdateExpression: "REMOVE lastHealthAlertAt",
+      ConditionExpression: "generation = :generation",
+      ExpressionAttributeValues: { ":generation": generation },
+    }));
   }
 
   async getMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {

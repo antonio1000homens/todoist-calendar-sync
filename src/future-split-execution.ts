@@ -182,7 +182,7 @@ export async function applyApprovedFutureSeriesSplit(
   if (conflicts.length) throw new Error("Another nearby Calendar occurrence may represent the same reminder");
 
   // Persist the split guard BEFORE the first provider write. If the worker
-  // crashes after capping the master, hourly reconciliation and Todoist
+  // crashes after capping the master, manual reconciliation and Todoist
   // webhooks must not create a competing recurrence while this remains pending.
   await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId, plan.previousOccurrence);
   if (!archived) {
