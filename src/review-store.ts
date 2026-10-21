@@ -95,7 +95,7 @@ export class SyncControls {
         await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET pendingRefresh = :true", ExpressionAttributeValues: { ":true": true } }));
         return true;
       }
-      if (control?.excluded && control.activeRepair !== operationId) return true;
+      if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;
     }
     return Boolean(!operationId && ids.taskId && ids.eventId && await this.rejected(profile, ids.taskId, ids.eventId));
   }

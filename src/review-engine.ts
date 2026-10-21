@@ -107,7 +107,7 @@ export class ReviewEngine {
       const selected = chosen.has(`${s.ref.side}:${s.ref.id}`);
       const masterOfSelected = s.ref.side === "calendar" && event?.recurringEventId === s.ref.id;
       if (intent.action === "link" && selected || ["decision","verify","move"].includes(intent.action) || masterOfSelected) continue;
-      const disposition = intent.action === "exclude" && selected ? "exclude" : intent.leftovers[entityKey(s.ref)];
+      const disposition = intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
       if (s.object && !disposition) throw new Error(`Choose Create counterpart or Exclude for ${entityKey(s.ref)}`);
       if (s.object) changes.push(`${disposition} counterpart handling for ${s.ref.side} ${(s.object as TodoistTask).content || (s.object as CalendarEvent).summary || s.ref.id}`);
     }
@@ -190,7 +190,8 @@ export class ReviewEngine {
         await step("decision",async()=> {
           const source=operation.preview.case.decision!;
           const decisions=new ManualDecisionStore();
-          const {decision}=await decisions.putPending({...source,decisionId:`review-${id}`,decisionDeadline:new Date(Date.now()+86400000).toISOString()});
+          const { status: _status, createdAt: _createdAt, decisionDeadline: _deadline, ...pending } = source;
+          const {decision}=await decisions.putPending({...pending,decisionId:`review-${id}`});
           await new ManualInterventionService(decisions,undefined,factory).processManualDelivery({id:`review-action:${id}`,kind:"manual",profile:intent.profile,mode:"aws",receivedAt:at(),headers:{},body:"",manual:{decisionId:decision.decisionId,action:intent.decisionAction,slackUserId:undefined}},state);
           const after=await decisions.get(decision.decisionId); if(after?.status!=="resolved")throw new Error("Guarded action requires further review; inspect the decision result");
           return after;
@@ -234,7 +235,7 @@ export class ReviewEngine {
           if(intent.action==="link"&&selected)continue;
           if(!snapshot.object||bindings.has(entityKey(snapshot.ref)))continue;
           if(originalEvent?.recurringEventId===snapshot.ref.id)continue;
-          const disposition=intent.action==="exclude"&&selected?"exclude":intent.leftovers[entityKey(snapshot.ref)];
+          const disposition=intent.action==="exclude"&&selected?"exclude":intent.action==="create"&&selected?"create":intent.leftovers[entityKey(snapshot.ref)];
           if(disposition==="exclude")await this.controls.exclude(snapshot.ref,true,id);
           if(disposition==="create") {
             const clients=await factory(snapshot.ref.profile);

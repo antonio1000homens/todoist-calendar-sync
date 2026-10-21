@@ -142,6 +142,8 @@ export interface CalendarEvent {
   id: string;
   /** Provider ETag for conditional, update-only manual ownership changes. */
   etag?: string;
+  /** Provider modification timestamp retained for repair version fences. */
+  updated?: string;
   status?: string;
   summary?: string;
   description?: string;

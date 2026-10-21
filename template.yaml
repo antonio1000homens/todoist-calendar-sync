@@ -282,7 +282,7 @@ Resources:
     Properties:
       FunctionName: !Sub ${ResourceNamePrefix}-worker-${Stage}
       Handler: worker.handler
-      ReservedConcurrentExecutions: 2
+      ReservedConcurrentExecutions: 1
       # Reconciliation is intentionally chunked through this worker's SQS
       # trigger. Each continuation advances a cursor and sequence so large
       # snapshots can finish beyond Lambda's default 16-invocation loop guard.
@@ -318,8 +318,6 @@ Resources:
             Queue: !GetAtt SyncQueue.Arn
             BatchSize: 1
             Enabled: true
-            ScalingConfig:
-              MaximumConcurrency: 2
             FunctionResponseTypes: [ReportBatchItemFailures]
     Metadata:
       BuildMethod: esbuild

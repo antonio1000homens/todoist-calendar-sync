@@ -271,12 +271,9 @@ export class GoogleCalendar {
     return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
   }
 
-  /**
-   * Manual resolution of an approved existing event must never fall back to
-   * POST or resurrect a deleted Calendar record. If the event changes or is
-   * cancelled after the approval snapshot, the If-Match update fails.
-   */
+  /** Retry creation only for a deterministic event ID owned by this repair. */
   async createRepairEventOnce(event: CalendarEvent, operationId: string): Promise<CalendarEvent> {
+    if (!event.id || !operationId) throw new Error("Repair creation requires a deterministic event ID and operation ID");
     const desired = { ...event, extendedProperties: { ...event.extendedProperties, shared: { ...event.extendedProperties?.shared, syncRepairId: operationId } } };
     try { return await this.upsertEvent(desired); }
     catch (error) {
@@ -287,6 +284,10 @@ export class GoogleCalendar {
     }
   }
 
+  /**
+   * Manual resolution must never fall back to POST or resurrect a deleted
+   * event. If it changes after approval, the If-Match update fails.
+   */
   async upsertEventIfUnchanged(event: CalendarEvent, existingId: string, etag: string): Promise<CalendarEvent> {
     if (!existingId || !etag) throw new Error("Manual Calendar update requires existing event ID and ETag");
     return this.request(
