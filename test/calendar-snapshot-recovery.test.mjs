@@ -25,6 +25,7 @@ function fakeState() {
     completedProjections,
     audits,
     get mutations() { return mutations; },
+    async syncBlocked() { return false; },
     async mutationAllowed() { return true; },
     async getMappingByEvent(profile, eventId) { return mappings.find((mapping) => mapping.profile === profile && mapping.eventId === eventId); },
     async getMappingByTaskAnyProfile(taskId) { return mappings.find((mapping) => mapping.taskId === taskId); },
@@ -65,6 +66,33 @@ function fakeClients(events, initialTasks = []) {
     get listInstancesCalls() { return listInstancesCalls; },
   };
 }
+
+for (const [series,control] of [[false,"event"],[false,"task"],[false,"pair"],[true,"master"],[true,"instance"],[true,"task"],[true,"pair"]]) {
+  test(`Calendar import respects ${control} controls for ${series ? "a series" : "a standalone event"}`,async()=>{
+    const state=fakeState(),master=futureEvent("master",10,"Calendar item");
+    if(series)master.recurrence=["RRULE:FREQ=WEEKLY"];
+    const active={...futureEvent("active",10,"Calendar item"),recurringEventId:master.id,originalStartTime:{date:master.start.date}};
+    const projection=series?active:master;
+    const candidate={id:"candidate",content:projection.summary,description:"",due:{date:projection.start.date}};
+    const clients=fakeClients([master],[candidate]);
+    clients.pair.calendar.listInstances=async()=>[active];
+    state.syncBlocked=async(_profile,ids)=>control==="task"?ids.taskId==="candidate":control==="pair"?ids.taskId==="candidate"&&ids.eventId===projection.id
+      :ids.eventId===(control==="instance"?active.id:master.id);
+    const summary=await reconcileUnmappedCalendar("home",state,async()=>clients.pair);
+    assert.equal(summary.blocked,1);assert.equal(summary.imported,0);assert.equal(summary.rebound,0);
+    assert.equal(state.mappings.length,0);assert.equal(clients.created,0);assert.equal(clients.comments,0);
+  });
+}
+
+test("Calendar import rechecks a resolved pair after comment lookup before writing",async()=>{
+  const state=fakeState(),source=futureEvent("event",10,"Calendar item");
+  const clients=fakeClients([source],[{id:"candidate",content:source.summary,description:"",due:{date:source.start.date}}]);
+  let blocked=false;
+  state.syncBlocked=async(_profile,ids)=>blocked&&ids.taskId==="candidate";
+  clients.pair.todoist.findComment=async()=>{blocked=true;return undefined;};
+  const summary=await reconcileUnmappedCalendar("home",state,async()=>clients.pair);
+  assert.equal(summary.blocked,1);assert.equal(state.mappings.length,0);assert.equal(clients.comments,0);
+});
 
 test("snapshot recovery imports one future unmapped Calendar event and binds it", async () => {
   const event = futureEvent("calendar-1", 10, "Recovered appointment");

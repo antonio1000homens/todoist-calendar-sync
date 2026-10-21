@@ -188,6 +188,14 @@ export async function reconcileUnmappedCalendar(
     }
     return true;
   };
+  const controlsBlockRecovery = async (eventIds: string[], taskId?: string): Promise<boolean> => {
+    for (const eventId of eventIds) if (await state.syncBlocked(profile,{eventId,taskId})) {
+      summary.blocked += 1;
+      await state.audit(profile,"calendar_snapshot_sync_control_blocked",{eventId,taskId});
+      return true;
+    }
+    return false;
+  };
 
   const completionBlocksRecovery = async (eventId: string, recheckedBeforeMutation = false): Promise<boolean> => {
     const completed = await completedProjection(state, profile, eventId);
@@ -202,10 +210,11 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
 
-  const eligibleUniqueTask = async (matches: TodoistTask[]): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
+  const eligibleUniqueTask = async (matches: TodoistTask[], eventIds: string[]): Promise<{ task?: TodoistTask; ambiguous: boolean; blocked?:boolean; candidateTaskIds: string[] }> => {
     const eligible: TodoistTask[] = [];
     let ownershipConflict = false;
     for (const candidate of matches) {
+      if (await controlsBlockRecovery(eventIds,candidate.id)) return {ambiguous:false,blocked:true,candidateTaskIds:matches.map(task=>task.id)};
       if (reservedTaskIds.has(candidate.id)) {
         ownershipConflict = true;
         continue;
@@ -224,12 +233,12 @@ export async function reconcileUnmappedCalendar(
     };
   };
 
-  const findCanonicalTask = async (event: CalendarEvent): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
-    return eligibleUniqueTask(tasks.filter((task) => hasCanonicalState(event, task)));
+  const findCanonicalTask = async (event: CalendarEvent, eventIds = [event.id]) => {
+    return eligibleUniqueTask(tasks.filter((task) => hasCanonicalState(event, task)),eventIds);
   };
 
-  const findIdentityTask = async (identity: CanonicalIdentity): Promise<{ task?: TodoistTask; ambiguous: boolean; candidateTaskIds: string[] }> => {
-    return eligibleUniqueTask(tasks.filter((task) => sameCanonicalIdentity(todoistCanonicalIdentity(task), identity)));
+  const findIdentityTask = async (identity: CanonicalIdentity, eventIds: string[]) => {
+    return eligibleUniqueTask(tasks.filter((task) => sameCanonicalIdentity(todoistCanonicalIdentity(task), identity)),eventIds);
   };
 
   const rememberStandaloneIdentity = async (event: CalendarEvent, task: TodoistTask): Promise<void> => {
@@ -241,12 +250,14 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
+    if (await controlsBlockRecovery([event.id])) return;
     if (await completionBlocksRecovery(event.id)) return;
     if (await state.getMappingByEvent(profile, event.id)) {
       summary.skipped += 1;
       return;
     }
     const match = await findCanonicalTask(event);
+    if (match.blocked) return;
     if (match.ambiguous) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", { eventId: event.id, candidateTaskIds: match.candidateTaskIds });
@@ -261,7 +272,8 @@ export async function reconcileUnmappedCalendar(
     if (!task && currentIdentity && identities) {
       const previousIdentity = (await identities.get(profile, "calendar", event.id))?.identity;
       if (previousIdentity && !sameCanonicalIdentity(previousIdentity, currentIdentity)) {
-        const historical = await findIdentityTask(previousIdentity);
+        const historical = await findIdentityTask(previousIdentity,[event.id]);
+        if (historical.blocked) return;
         if (historical.ambiguous) {
           summary.conflicts += 1;
           await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", {
@@ -274,8 +286,10 @@ export async function reconcileUnmappedCalendar(
           return;
         }
         if (historical.task) {
+          if (await controlsBlockRecovery([event.id],historical.task.id)) return;
           if (!await canMutate()) return;
           if (await completionBlocksRecovery(event.id, true)) return;
+          if (await controlsBlockRecovery([event.id],historical.task.id)) return;
           task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
           await state.recordMutation(profile);
           recoveredPreviousIdentity = true;
@@ -284,14 +298,17 @@ export async function reconcileUnmappedCalendar(
     }
 
     if (!task) {
+      if (await controlsBlockRecovery([event.id])) return;
       if (!await canMutate()) return;
       if (await completionBlocksRecovery(event.id, true)) return;
+      if (await controlsBlockRecovery([event.id])) return;
       task = await pair.todoist.upsertTask(toTodoistTask(event));
       tasks.push(task);
       await state.recordMutation(profile);
       created = true;
     }
     reservedTaskIds.add(task.id);
+    if (await controlsBlockRecovery([event.id],task.id)) return;
 
     const projectId = task.project_id || profiles[profile].todoistProjectId;
     const draftMapping: Mapping = {
@@ -305,12 +322,14 @@ export async function reconcileUnmappedCalendar(
     if (await canMutate()) {
       if (await completionBlocksRecovery(event.id, true)) return;
       const existingComment = await pair.todoist.findComment(task.id, event.id);
+      if (await controlsBlockRecovery([event.id],task.id)) return;
       const comment = await pair.todoist.upsertComment(task.id, taskComment(event), existingComment?.id, draftMapping);
       const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
       mapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
       await state.recordMutation(profile);
     }
 
+    if (await controlsBlockRecovery([event.id],task.id)) return;
     await state.putMapping(mapping);
     await rememberStandaloneIdentity(event, task);
     if (created) summary.imported += 1;
@@ -328,6 +347,7 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindSeries = async (master: CalendarEvent): Promise<void> => {
+    if (await controlsBlockRecovery([master.id])) return;
     const seriesId = master.iCalUID || master.id;
     if (await state.getRecurrenceLink(profile, seriesId)) {
       summary.skipped += 1;
@@ -339,13 +359,15 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
+    if (await controlsBlockRecovery([master.id,active.id])) return;
     if (await state.getMappingByEvent(profile, active.id)) {
       summary.skipped += 1;
       return;
     }
     if (await completionBlocksRecovery(active.id)) return;
 
-    const match = await findCanonicalTask(active);
+    const match = await findCanonicalTask(active,[master.id,active.id]);
+    if (match.blocked) return;
     if (match.ambiguous) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_recurring_ambiguous", { seriesId, masterEventId: master.id, eventId: active.id });
@@ -364,14 +386,17 @@ export async function reconcileUnmappedCalendar(
         });
         return;
       }
+      if (await controlsBlockRecovery([master.id,active.id])) return;
       if (!await canMutate()) return;
       if (await completionBlocksRecovery(active.id, true)) return;
+      if (await controlsBlockRecovery([master.id,active.id])) return;
       task = await pair.todoist.upsertTask(toTodoistTask(active));
       tasks.push(task);
       await state.recordMutation(profile);
       created = true;
     }
     reservedTaskIds.add(task.id);
+    if (await controlsBlockRecovery([master.id,active.id],task.id)) return;
 
     const start = originalStart(active);
     const mapping: Mapping = {

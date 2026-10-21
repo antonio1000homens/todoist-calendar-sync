@@ -23,6 +23,7 @@ export interface ReviewSnapshot {
   ref: EntityRef; object: TodoistTask | CalendarEvent | null;
   mapping?: Mapping; control?: Record<string, unknown>;
   recurrence?: RecurrenceLink; calendarProjectionId?: string;
+  destination?: { profile:Profile; eventId?:string };
 }
 export interface RepairPreview {
   id: string; actor: ReviewActor; intent: RepairIntent; case: ReviewCase;
@@ -39,6 +40,7 @@ export interface RepairOperation {
   outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded"; checkedAt: string }>;
   expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;
   recurrenceBindings?: Mapping[];
+  creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;
 }
 export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }

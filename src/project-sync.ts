@@ -106,7 +106,7 @@ function todoistOwnedOccurrenceIsException(master: CalendarEvent, occurrence: Ca
     || (occurrence.description || "") !== (master.description || "");
 }
 
-function todoistOccurrenceProjection(task: TodoistTask, existing: CalendarEvent): CalendarEvent {
+export function todoistOccurrenceProjection(task: TodoistTask, existing: CalendarEvent): CalendarEvent {
   // The Todoist task remains recurring, but this write targets one Google
   // instance. Strip recurrence from the projection so Google never interprets
   // an active-occurrence edit as an RRULE/master rewrite.

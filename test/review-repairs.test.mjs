@@ -31,10 +31,13 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const mappingMap = new Map(mappings.map(value => [value.taskId, clone(value)]));
   const recurrences = new Map(recurrence ? [[recurrence.seriesId, clone(recurrence)]] : []);
   const controlsMap = new Map(), versions = new Map(), operations = new Map(), writes = [], calls = [], baselines = [];
+  const taskRequests = new Map();
   const get = (map, id) => { if (!map.has(id)) throw Object.assign(new Error("Not found"), { status: 404 }); return clone(map.get(id)); };
   const stateMethods = {
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async getCalendarProjectionTombstone() { return undefined; },
+    async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
     async getMappingByTaskAnyProfile(id) { return clone(mappingMap.get(id)); },
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone([...mappingMap.values()].find(value => value.profile === profile && value.eventId === id)); },
@@ -71,13 +74,19 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const clients = {
     calendar: {
       async getEvent(id) { return get(eventMap, id); },
+      async findByTodoistTaskId(taskId) { return clone([...eventMap.values()].find(value=>value.extendedProperties?.shared?.taskId===taskId)); },
       async listDelta() { return { items: clone([...eventMap.values()]) }; },
       async listInstances(id) { return clone([...eventMap.values()].filter(value => value.recurringEventId === id)); },
       async upsertEventIfUnchanged(value, id, etag) {
         assert.equal(eventMap.get(id)?.etag, etag);
         const next = { ...clone(value), id, etag: `etag-repair-${writes.length}` }; eventMap.set(id, next); writes.push(["event", id]); return clone(next);
       },
-      async createRepairEventOnce(value) { eventMap.set(value.id, clone(value)); writes.push(["create-event", value.id]); return clone(value); },
+      async createRepairEventOnce(value,operationId) {
+        if(eventMap.has(value.id))return get(eventMap,value.id);
+        const next={...clone(value),status:"confirmed",etag:"created-etag",extendedProperties:{...value.extendedProperties,shared:{...value.extendedProperties?.shared,syncRepairId:operationId}}};
+        eventMap.set(value.id,next); writes.push(["create-event", value.id]); return clone(next);
+      },
+      async upsertEvent() { assert.fail("Unexpected anonymous Calendar write"); },
     },
     todoist: {
       async getTask(id) { return get(taskMap, id); },
@@ -86,7 +95,11 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
         id ||= "created-task"; const next = { project_id:profiles.home.todoistProjectId, ...taskMap.get(id), ...clone(value), id, updated_at: "2026-10-21T14:00:00Z" };
         taskMap.set(id, next); writes.push(["task", id]); return clone(next);
       },
-      async createTaskOnce(value) { const next = task("created-task", value); taskMap.set(next.id, next); writes.push(["create-task", next.id]); return clone(next); },
+      async createTaskOnce(value,key) {
+        if(taskRequests.has(key))return get(taskMap,taskRequests.get(key));
+        const next = task(taskRequests.size ? `created-task-${taskRequests.size+1}` : "created-task", value);
+        taskRequests.set(key,next.id);taskMap.set(next.id, next); writes.push(["create-task", next.id]); return clone(next);
+      },
       async listProjectComments() { return []; },
       async upsertProjectComment(_project, content) { writes.push(["comment"]); return { id: "comment", content }; },
     },
@@ -119,6 +132,65 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   return { engine, execute, clients, eventMap, taskMap, mappingMap, recurrences, controls, controlsMap, versions, operations, writes, calls, baselines };
 }
 
+function moveHarness(t,{existing=true}={}) {
+  const h=harness(t,{events:[event("event",{extendedProperties:{shared:{taskId:"task"}}})],mappings:[{profile:"home",taskId:"task",eventId:"event"}]});
+  const destinationEvents=new Map(existing?[["destination",event("destination",{summary:"Old destination",extendedProperties:{shared:{taskId:"task"}}})]]:[]);
+  const get=async id=>{if(!destinationEvents.has(id))throw Object.assign(new Error("Not found"),{status:404});return clone(destinationEvents.get(id));};
+  const write=async(value,id)=>{
+    const next={...clone(value),id,status:"confirmed",etag:`destination-${h.writes.length}`};destinationEvents.set(id,next);h.writes.push(["destination-event",id]);return clone(next);
+  };
+  const destination={todoist:h.clients.todoist,calendar:{
+    getEvent:get,
+    async findByTodoistTaskId(taskId){const matches=[...destinationEvents.values()].filter(e=>e.extendedProperties?.shared?.taskId===taskId);assert.ok(matches.length<=1);return clone(matches[0]);},
+    async listDelta(){return {items:clone([...destinationEvents.values()])};},async listInstances(){return [];},
+    async upsertEvent(value,id){assert.ok(id);return write(value,id);},
+    async upsertEventIfUnchanged(value,id,etag){assert.equal(destinationEvents.get(id).etag,etag);return write(value,id);},
+    async createRepairEventOnce(value,operationId){
+      if(destinationEvents.has(value.id))return get(value.id);
+      return write({...value,extendedProperties:{...value.extendedProperties,shared:{...value.extendedProperties?.shared,syncRepairId:operationId}}},value.id);
+    },
+  }};
+  h.clients.calendar.deleteEvent=async id=>{h.writes.push(["delete-source",id]);h.eventMap.delete(id);};
+  h.clients.todoist.moveTask=async(id,projectId)=>{Object.assign(h.taskMap.get(id),{project_id:projectId,updated_at:"2026-10-22T00:00:00Z"});h.writes.push(["move-task",id]);};
+  h.clients.todoist.findComment=async()=>undefined;
+  h.clients.todoist.upsertComment=async()=>({id:"projection-comment"});
+  const engine=new ReviewEngine(h.engine.store,new StateRepository(),async profile=>profile==="home"?h.clients:destination,h.controls);
+  const input=intent({action:"move",targetProfile:"work"});
+  const execute=async()=>{const preview=await engine.preview(actor,input);h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});return engine.execute("repair");};
+  return {...h,engine,execute,input,destination,destinationEvents};
+}
+
+test("a move previews, claims, and verifies its existing destination Calendar projection",async t=>{
+  const h=moveHarness(t),preview=await h.engine.preview(actor,h.input);
+  assert.ok(preview.snapshots.some(s=>s.ref.profile==="work"&&s.ref.id==="destination"));
+  assert.deepEqual(preview.snapshots.find(s=>s.ref.side==="todoist").destination,{profile:"work",eventId:"destination"});
+  const result=await h.execute();assert.equal(result.status,"succeeded",result.error);
+  assert.ok(h.calls.find(c=>c[0]==="claim")[1].some(ref=>ref.profile==="work"&&ref.id==="destination"));
+  assert.equal(h.destinationEvents.get("destination").summary,"Portugal");
+  assert.equal(h.mappingMap.get("task").profile,"work");assert.ok(!h.eventMap.has("event"));
+});
+
+for(const change of ["edit","new projection"]) test(`a destination ${change} after validation stops a move before source mutations`,async t=>{
+  const h=moveHarness(t,{existing:change==="edit"}),save=h.engine.store.saveOperation;
+  h.engine.store.saveOperation=async operation=>{
+    await save(operation);
+    if(operation.steps.validated?.status==="done"){
+      if(change==="edit")h.destinationEvents.get("destination").summary="Unapproved edit";
+      else h.destinationEvents.set("new",event("new",{extendedProperties:{shared:{taskId:"task"}}}));
+    }
+  };
+  const result=await h.execute();assert.notEqual(result.status,"succeeded");assert.match(result.error,/destination.*changed/i);
+  assert.equal(h.taskMap.get("task").project_id,profiles.home.todoistProjectId);
+  assert.ok(h.eventMap.has("event"));assert.deepEqual(h.writes,[]);
+});
+
+test("an unpreviewed destination discovered after task movement cannot delete the source projection",async t=>{
+  const h=moveHarness(t,{existing:false}),move=h.clients.todoist.moveTask;
+  h.clients.todoist.moveTask=async(...args)=>{await move(...args);h.destinationEvents.set("new",event("new",{extendedProperties:{shared:{taskId:"task"}}}));};
+  const result=await h.execute();assert.equal(result.status,"needs_review");assert.match(result.error,/destination projection changed/);
+  assert.ok(h.eventMap.has("event"));assert.ok(!h.writes.some(w=>w[0]==="delete-source"));
+});
+
 function seriesFixture() {
   const master = event("master", { iCalUID: "calendar-series", recurrence: ["RRULE:FREQ=WEEKLY"] });
   const active = event("active", { recurringEventId: master.id, originalStartTime: { date: "2099-12-18" } });
@@ -127,6 +199,68 @@ function seriesFixture() {
     originalStart: "2099-12-18", completedThroughOriginalStart: "2099-12-11" };
   return { events: [master, active], mappings: [mapping], recurrence: { ...mapping, owner: "calendar" } };
 }
+
+function todoistSeriesFixture({moved=false}={}) {
+  const add=(date,days)=>new Date(Date.parse(`${date}T12:00:00Z`)+days*86400000).toISOString().slice(0,10);
+  const fixture=seriesFixture(),due="2026-09-14",effective=moved?add(due,2):due;
+  const liveTask=task("task",{due:{date:due,is_recurring:true,string:"every week"}});
+  const shared={taskId:"task",syncRecurrenceOwner:"todoist",todoistRecurrence:todoistRecurrenceKey(liveTask),todoistAnchorStart:due,todoistAnchorEnd:add(due,3),todoistAnchorAllDay:"true"};
+  fixture.events[0]={...fixture.events[0],start:{date:due},end:{date:add(due,3)},recurrence:[todoistRecurrenceToRrule(liveTask)],extendedProperties:{shared}};
+  fixture.events[1]={...fixture.events[1],start:{date:effective},end:{date:add(effective,3)},originalStartTime:{date:due},extendedProperties:{shared:{...shared,unrelated:"retained"},private:{note:"retained"}}};
+  fixture.events.push(event("future",{recurringEventId:"master",start:{date:"2026-12-01"},end:{date:"2026-12-04"},originalStartTime:{date:"2026-12-01"}}));
+  fixture.mappings[0]={...fixture.mappings[0],recurrenceOwner:"todoist",eventId:"master",seriesId:"task",originalStart:due,activeEffectiveStart:effective};
+  fixture.recurrence={...fixture.mappings[0],owner:"todoist"};
+  return {...fixture,tasks:[liveTask]};
+}
+
+test("Todoist-owned snapshots and Verify retain the overdue mapped occurrence instead of a future iteration",async t=>{
+  const h=harness(t,todoistSeriesFixture());
+  const preview=await h.engine.preview(actor,intent({action:"verify",eventId:"master",owner:"todoist",scope:"series"}));
+  const master=preview.snapshots.find(s=>s.ref.id==="master");
+  assert.equal(master.recurrence.seriesId,"task");assert.equal(master.calendarProjectionId,"active");
+  assert.ok(!preview.snapshots.some(s=>s.ref.id==="future"));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",result.error);assert.ok([...h.controlsMap.values()].every(c=>!c.activeRepair));
+});
+
+test("Todoist-wins repairs an owned occurrence without sending an RRULE or altering its parent rule",async t=>{
+  const fixture=todoistSeriesFixture({moved:true}),h=harness(t,fixture);
+  const upsert=h.clients.calendar.upsertEventIfUnchanged;
+  h.clients.calendar.upsertEventIfUnchanged=async(value,id,etag)=>{
+    if(id==="active"){
+      assert.equal(value.recurrence,undefined);
+      assert.equal(value.extendedProperties.private.note,"retained");
+      assert.equal(value.extendedProperties.shared.unrelated,"retained");
+    }
+    return upsert(value,id,etag);
+  };
+  const result=await h.execute(intent({eventId:"active",owner:"todoist",winner:"todoist"}));
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.eventMap.get("active").start.date,"2026-09-14");
+  assert.deepEqual(h.eventMap.get("master").recurrence,fixture.events[0].recurrence);
+  assert.equal(h.eventMap.get("master").extendedProperties.shared.todoistAnchorStart,"2026-09-14");
+});
+
+test("excluding a mapped Calendar occurrence accepts only its own recorded recurrence detachment",async t=>{
+  const h=harness(t,seriesFixture());
+  h.eventMap.set("earlier",event("earlier",{recurringEventId:"master",start:{date:"2099-12-10"},originalStartTime:{date:"2099-12-10"}}));
+  const result=await h.execute(intent({action:"exclude",taskId:undefined,eventId:"active",leftovers:{"home:todoist:task":"exclude"}}));
+  assert.equal(result.status,"succeeded",result.error);assert.equal(h.recurrences.size,0);
+  assert.ok(h.controlsMap.get("home:calendar:active").excluded);assert.ok(h.controlsMap.get("home:todoist:task").excluded);
+  assert.ok([...h.controlsMap.values()].every(c=>!c.activeRepair));
+});
+
+for(const boundary of ["outcomes","release"]) test(`occurrence exclusion rejects an unexpected recurrence owner at ${boundary}`,async t=>{
+  const h=harness(t,seriesFixture()),save=h.engine.store.saveOperation;
+  h.engine.store.saveOperation=async operation=>{
+    await save(operation);
+    if(operation.steps["detach:home:task"]?.status==="done"&&(boundary==="outcomes"||operation.outcomes))h.recurrences.set("calendar-series",{...seriesFixture().recurrence,taskId:"unexpected-owner"});
+  };
+  const result=await h.execute(intent({action:"exclude",taskId:undefined,eventId:"active",leftovers:{"home:todoist:task":"exclude"}}));
+  assert.equal(result.status,"needs_review");assert.match(result.error,/Context master|Retained history/);
+  assert.ok(h.controlsMap.get("home:calendar:master").activeRepair);
+});
 
 test("selecting a Calendar master previews its existing task and active instance before replacement", async (t) => {
   const h = harness(t, seriesFixture());
@@ -487,4 +621,48 @@ test("an unpreviewed active occurrence cannot become the target during a series 
   assert.equal(result.status,"needs_review");assert.match(result.error,/active occurrence changed after preview/);
   assert.ok(!h.writes.some(value=>value[0]==="task"));
   assert.ok(h.controlsMap.get("home:calendar:master").activeRepair);
+});
+
+for (const kind of ["snapshot-task","replacement-task","replacement-event"]) {
+  for (const committed of [false,true]) test(`delegated ${kind} recovers a ${committed ? "committed" : "rejected"} mapping write without duplicate creation`, async t => {
+    const snapshot=kind==="snapshot-task", calendarCreation=kind==="replacement-event";
+    const action=snapshot?"create_new_task":calendarCreation?"todoist_wins":"calendar_wins";
+    const mapping={profile:"home",taskId:calendarCreation?"task":"deleted-task",eventId:calendarCreation?"deleted-event":"event"};
+    const decision={decisionId:"original",profile:"home",type:snapshot?"calendar_snapshot_unmapped_ambiguous":"both_sides_changed",taskId:snapshot?undefined:mapping.taskId,eventId:mapping.eventId,mappingSnapshot:snapshot?undefined:mapping,context:{},permittedActions:[{id:action}]};
+    const h=harness(t,{tasks:calendarCreation?[task()]:[],events:calendarCreation?[]:[event()],mappings:snapshot?[]:[mapping],decision});
+    const decisions=new Map();
+    t.mock.method(ManualDecisionStore.prototype,"putPending",async input=>{
+      if(decisions.has(input.decisionId))return {decision:decisions.get(input.decisionId)};
+      const saved={...input,status:"pending",decisionDeadline:"2099-12-31T00:00:00Z"};decisions.set(input.decisionId,saved);return {decision:saved};
+    });
+    t.mock.method(ManualDecisionStore.prototype,"get",async id=>decisions.get(id));
+    t.mock.method(ManualDecisionStore.prototype,"finish",async(id,status)=>{if(decisions.has(id))decisions.get(id).status=status;});
+    t.mock.method(ManualInterventionService.prototype,"finishReconciliationDecision",async id=>{if(decisions.has(id))decisions.get(id).status="resolved";});
+    const putMapping=StateRepository.prototype.putMapping;
+    let failed=false;
+    t.mock.method(StateRepository.prototype,"putMapping",async function(value){
+      if(!failed){failed=true;if(committed)await putMapping.call(this,value);throw new Error("Mapping response interrupted");}
+      return putMapping.call(this,value);
+    });
+    const first=await h.execute(intent({action:"decision",taskId:undefined,eventId:undefined,decisionAction:action}));
+    assert.equal(first.status,"needs_review",first.error);
+    assert.match(first.error,/Mapping response interrupted/);
+    assert.equal(Object.values(first.creations).filter(c=>c.result).length,1);
+    const second=await h.engine.execute("repair");
+    assert.equal(second.status,"succeeded",second.error);
+    assert.equal(h.writes.filter(w=>w[0]===(calendarCreation?"create-event":"create-task")).length,1);
+    assert.equal(h.mappingMap.size,1);
+    assert.equal(second.verified.length,1);
+    assert.equal(decisions.get("review-repair").status,"resolved");
+    assert.ok([...h.controlsMap.values()].every(v=>!v.activeRepair));
+  });
+}
+
+test("a move into an empty destination creates and verifies exactly one approved projection",async t=>{
+  const h=moveHarness(t,{existing:false});
+  const result=await h.execute();assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.destinationEvents.size,1);assert.equal(h.mappingMap.get("task").profile,"work");
+  assert.ok(!h.eventMap.has("event"));
+  const second=await h.engine.execute("repair");assert.equal(second.status,"succeeded");
+  assert.equal(h.destinationEvents.size,1);
 });
