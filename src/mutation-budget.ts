@@ -73,6 +73,7 @@ const TODOIST_MUTATIONS = new Set([
   "updateRecurringOccurrence",
   "deleteTask",
   "upsertComment",
+  "upsertProjectComment",
   "deleteComment",
 ]);
 
@@ -81,7 +82,7 @@ function mutationReservation(provider: "calendar" | "todoist", operation: string
   // existing comment is not owned by this token, can fall back to a create.
   // Reserve both possible writes up front. Other exposed mutation methods issue
   // at most one provider write (any additional calls are reads).
-  if (provider === "todoist" && operation === "upsertComment" && Boolean(args[2])) return 2;
+  if (provider === "todoist" && ["upsertComment", "upsertProjectComment"].includes(operation) && Boolean(args[2])) return 2;
   return 1;
 }
 

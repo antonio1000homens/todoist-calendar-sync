@@ -487,6 +487,7 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) return "blocked";
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
     if (mapping.recurrenceOwner) return "recurring_deferred";
@@ -584,6 +585,7 @@ export class SnapshotReconciler {
   }
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
+    if (await this.state.syncBlocked(profile, { taskId: task.id })) return "blocked";
     if (!hasDue(task)) return "noop";
     const split = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
     if (split?.status === "pending") {
@@ -606,6 +608,7 @@ export class SnapshotReconciler {
       });
       return "conflict";
     }
+    if (existing && await this.state.syncBlocked(profile, { taskId: task.id, eventId: existing.id })) return "blocked";
     const genericTombstoneRecreationAllowed = Boolean(
       tombstone
       && tombstone.reason !== "project_exit"

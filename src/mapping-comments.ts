@@ -297,7 +297,8 @@ export function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, m
 }
 
 /** Delete only comments whose provider payload proves they belong to this mapping. */
-export async function deleteMappingComments(client: ProjectCommentClient, mapping: Mapping): Promise<void> {
+export async function deleteMappingComments(client: ProjectCommentClient, mapping: Mapping): Promise<number> {
+  let deleted = 0;
   const ids = mappingCommentIds(mapping);
   if (ids.project) {
     try {
@@ -308,13 +309,15 @@ export async function deleteMappingComments(client: ProjectCommentClient, mappin
         && parsed.payload.taskId === mapping.taskId
         && parsed.payload.eventId === mapping.eventId) {
         await client.deleteComment(ids.project);
+        deleted += 1;
       }
     } catch { /* Missing or inaccessible provider comments must not break mapping deletion. */ }
   }
   if (ids.legacyTask && ids.legacyTask !== ids.project) {
     try {
       const comment = await client.getComment(ids.legacyTask);
-      if (isOwnedLegacyTaskMappingComment(comment, mapping)) await client.deleteComment(ids.legacyTask);
+      if (isOwnedLegacyTaskMappingComment(comment, mapping)) { await client.deleteComment(ids.legacyTask); deleted += 1; }
     } catch { /* Preserve legacy best-effort deletion semantics. */ }
   }
+  return deleted;
 }

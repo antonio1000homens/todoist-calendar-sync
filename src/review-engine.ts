@@ -6,9 +6,9 @@ import { StateRepository } from "./repository.js";
 import { DynamoReconciliationStore } from "./reconciliation.js";
 import { ReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { entityKey, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
-import { hasCanonicalState, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, occurrenceStateMatches, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { upsertProjectMappingComment, deleteMappingComments } from "./mapping-comments.js";
-import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { calendarRecurrenceMatchesTodoist, selectTodoistCurrentInstance, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
 import { ManualDecisionStore, ManualInterventionService } from "./manual-intervention.js";
@@ -16,6 +16,12 @@ import { ProjectAwareSynchronizer } from "./project-sync.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 const missing = (e: unknown) => [404, 410].includes(Number((e as { status?: number }).status));
 const at = () => new Date().toISOString();
+function recurrenceAnchorMatches(event: CalendarEvent): boolean {
+  const shared = event.extendedProperties?.shared;
+  return Boolean(shared?.todoistAnchorStart && shared.todoistAnchorEnd
+    && (event.start?.dateTime || event.start?.date) === shared.todoistAnchorStart
+    && (event.end?.dateTime || event.end?.date) === shared.todoistAnchorEnd);
+}
 export function snapshotFingerprint(snapshots: ReviewSnapshot[]): string {
   return reviewHash(snapshots.map(s => ({ ref: s.ref, object: s.object, mapping: s.mapping,
     control: { excluded: s.control?.excluded, fencedAt: s.control?.fencedAt } })));
@@ -77,7 +83,11 @@ export class ReviewEngine {
     const preview: RepairPreview = { id: randomUUID(), actor, intent, case: record, snapshots, fingerprint: snapshotFingerprint(snapshots),
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings };
     if (intent.action === "link" && (!task || !event)) throw new Error("Linking requires a live task and event");
+    if (intent.action === "link" && event?.recurringEventId && !intent.owner) throw new Error("Choose which provider owns the recurrence for this Calendar occurrence");
+    if (intent.action === "link" && intent.owner === "todoist" && !task?.due?.is_recurring) throw new Error("Todoist recurrence ownership requires a recurring Todoist task");
     if (intent.action === "create" && Boolean(task) === Boolean(event)) throw new Error("Select just the item whose counterpart should be created");
+    if (intent.action === "create" && event?.recurrence?.length && intent.owner !== "calendar") throw new Error("Creating a counterpart for a Calendar series requires Calendar recurrence ownership");
+    if (intent.action === "create" && event?.recurringEventId && intent.owner !== "calendar") throw new Error("Creating a counterpart for a Calendar occurrence requires Calendar recurrence ownership");
     if (intent.action === "decision") {
       if (!record.decision || !record.decision.permittedActions.some(a => a.id === intent.decisionAction) || intent.decisionAction === "reconcile_now") throw new Error("Select a permitted repair action; reconciliation is a separate explicit request");
       changes.push(`Apply ${intent.decisionAction} with the existing guarded executor`);
@@ -123,6 +133,7 @@ export class ReviewEngine {
     const rawFactory = this.clients;
     const budget = new ReconciliationMutationBudget(20);
     const factory = createBudgetedClientFactory(budget, rawFactory);
+    let claimed = false;
     const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
       const saved = operation.steps[name];
       if (saved?.status === "done") return saved.result as T;
@@ -131,12 +142,16 @@ export class ReviewEngine {
       const result = await run(); operation.steps[name] = { ...operation.steps[name], status: "done", result: result ?? null, completedAt: at() }; await this.store.saveOperation(operation); return result;
     };
     try {
+      const targetTaskRef: EntityRef | undefined = intent.action === "move" && intent.targetProfile && intent.taskId
+        ? { profile:intent.targetProfile, side:"todoist", id:intent.taskId } : undefined;
+      await this.controls.claim([...operation.preview.snapshots.map(s=>s.ref), ...(targetTaskRef?[targetTaskRef]:[])], id);
+      claimed = true;
       if (!operation.steps.validated) {
         const current = await this.collect(intent);
         if (snapshotFingerprint(current) !== operation.preview.fingerprint) throw new Error("Provider state or ownership changed after preview. Refresh the preview; no repair was applied.");
         operation.steps.validated = { id:"validated", status:"done", startedAt:at(), completedAt:at() };
+        await this.store.saveOperation(operation);
       }
-      await this.controls.claim(operation.preview.snapshots.map(s=>s.ref), id);
       operation.status = "running"; await this.store.saveOperation(operation);
       await this.store.updateCase(intent.caseId, "repairing", "Repair in progress", id);
       const verified: NonNullable<RepairOperation["verified"]> = [];
@@ -147,41 +162,59 @@ export class ReviewEngine {
       const originalTask = taskSnapshot?.object as TodoistTask | undefined;
       const originalEvent = eventSnapshot?.object as CalendarEvent | undefined;
       const writeGate = async (profile: Profile) => { if (!await state.mutationAllowed(profile)) throw new Error("Mutation circuit is open. Wait for it to cool down, then resume this repair."); };
+      const trackedWrite = async <T>(profile: Profile, run: () => Promise<T>, count: number | ((result: T) => number) = 1): Promise<T> => {
+        await writeGate(profile);
+        const result = await run();
+        const writes=typeof count==="function"?count(result):count;
+        for (let i = 0; i < writes; i += 1) await state.recordMutation(profile);
+        return result;
+      };
       const bind = async (profile: Profile, task: TodoistTask, event: CalendarEvent, owner?: "todoist"|"calendar") => {
         let mapping: Mapping = { profile, taskId: task.id, eventId: event.id, projectId: task.project_id || profiles[profile].todoistProjectId, updatedAt: at() };
         let projection = event;
         const clients = await factory(profile);
-        if (event.recurrence?.length && owner === "calendar") {
-          projection = selectCalendarRecurrenceInstance(await clients.calendar.listInstances(event.id))!;
+        if ((event.recurrence?.length || event.recurringEventId) && owner === "calendar") {
+          const master=event.recurringEventId?await clients.calendar.getEvent(event.recurringEventId):event;
+          const seriesId = master.iCalUID || master.id;
+          const existing = await state.getRecurrenceLink(profile, seriesId);
+          projection = selectCalendarRecurrenceInstance(await clients.calendar.listInstances(master.id), existing)!;
           if (!projection) throw new Error("Calendar series has no verifiable active occurrence");
-          mapping = { ...mapping, eventId: projection.id, recurrenceOwner:"calendar", seriesId:event.id, masterEventId:event.id, activeInstanceId:projection.id,
+          mapping = { ...mapping, eventId: projection.id, recurrenceOwner:"calendar", seriesId, masterEventId:master.id, activeInstanceId:projection.id,
             originalStart:projection.originalStartTime?.dateTime || projection.originalStartTime?.date || projection.start?.dateTime || projection.start?.date,
             activeEffectiveStart:projection.start?.dateTime || projection.start?.date, calendarProgressVersion:1 };
-          task = await step(`series-task:${task.id}`, async()=> { await writeGate(profile); return clients.todoist.upsertTask(toTodoistTask(projection),task.id); });
+          task = await step(`series-task:${task.id}`, async()=> trackedWrite(profile, () => clients.todoist.upsertTask(toTodoistTask(projection),task.id)));
         } else if (task.due?.is_recurring) {
-          mapping = { ...mapping, recurrenceOwner:"todoist", seriesId:task.id, masterEventId:event.recurrence?.length ? event.id : undefined };
-          if(event.recurrence?.length) {
-            projection = selectCalendarRecurrenceInstance(await clients.calendar.listInstances(event.id))!;
+          const master=(event.recurringEventId?await clients.calendar.getEvent(event.recurringEventId):event);
+          const hasMasterRecurrence=Boolean(master.recurrence?.length);
+          mapping = { ...mapping, recurrenceOwner:"todoist", seriesId:task.id, masterEventId:hasMasterRecurrence ? master.id : undefined };
+          if(hasMasterRecurrence) {
+            const instances = await clients.calendar.listInstances(master.id);
+            projection = selectTodoistCurrentInstance(instances, task, (await state.getRecurrenceLink(profile, task.id))?.activeInstanceId)!;
             if(!projection) throw new Error("Todoist-owned Calendar series has no active occurrence");
             mapping.activeInstanceId=projection.id; mapping.originalStart=projection.originalStartTime?.dateTime || projection.originalStartTime?.date || projection.start?.dateTime || projection.start?.date;
             mapping.activeEffectiveStart=projection.start?.dateTime || projection.start?.date;
           }
         }
         const stored = await step(`metadata:${profile}:${event.id}`, async()=> {
-          await writeGate(profile);
-          const live=await clients.calendar.getEvent(event.id);
-          return clients.calendar.upsertEventIfUnchanged({ ...live, extendedProperties:{...live.extendedProperties,shared:{...live.extendedProperties?.shared,taskId:task.id,taskUrl:`https://app.todoist.com/app/task/${task.id}`,syncSource:"todoist-calendar-sync",...(mapping.recurrenceOwner?{syncRecurrenceOwner:mapping.recurrenceOwner}:{})}} },live.id,live.etag!);
+          const metadataEventId=mapping.masterEventId||event.id;
+          const live=await clients.calendar.getEvent(metadataEventId);
+          return trackedWrite(profile, () => clients.calendar.upsertEventIfUnchanged({ ...live, extendedProperties:{...live.extendedProperties,shared:{...live.extendedProperties?.shared,taskId:task.id,taskUrl:`https://app.todoist.com/app/task/${task.id}`,syncSource:"todoist-calendar-sync",...(mapping.recurrenceOwner?{syncRecurrenceOwner:mapping.recurrenceOwner}:{})}} },live.id,live.etag!));
         });
-        mapping = await step(`comments:${profile}:${task.id}`, async()=> { await writeGate(profile); return upsertProjectMappingComment(clients.todoist,mapping,mapping.projectId!,stored.htmlLink); });
+        mapping = await step(`comments:${profile}:${task.id}`, async()=> trackedWrite(profile, () => upsertProjectMappingComment(clients.todoist,mapping,mapping.projectId!,stored.htmlLink), 2));
         await this.controls.allow(profile,task.id,event.id);
         await state.putMapping(mapping);
         if(mapping.seriesId && mapping.recurrenceOwner) await state.putRecurrenceLink({profile,owner:mapping.recurrenceOwner,seriesId:mapping.seriesId,taskId:mapping.taskId,eventId:mapping.eventId,masterEventId:mapping.masterEventId,activeInstanceId:mapping.activeInstanceId,originalStart:mapping.originalStart,activeEffectiveStart:mapping.activeEffectiveStart,calendarProgressVersion:mapping.calendarProgressVersion,updatedAt:at()});
-        bindings.set(entityKey({profile,side:"todoist",id:task.id}),event.id);bindings.set(entityKey({profile,side:"calendar",id:event.id}),task.id);
+        bindings.set(entityKey({profile,side:"todoist",id:task.id}),event.id);bindings.set(entityKey({profile,side:"calendar",id:event.id}),task.id);bindings.set(entityKey({profile,side:"calendar",id:projection.id}),task.id);
         const [liveTask,liveEvent] = await Promise.all([clients.todoist.getTask(task.id),clients.calendar.getEvent(projection.id)]);
-        if(!hasCanonicalState(liveEvent,liveTask)) throw new Error("Provider fields changed during repair; review the live values before continuing");
+        if (mapping.recurrenceOwner === "todoist" && mapping.masterEventId) {
+          const master = await clients.calendar.getEvent(mapping.masterEventId);
+          if (!calendarRecurrenceMatchesTodoist(master, liveTask) || !recurrenceAnchorMatches(master) || !occurrenceStateMatches(liveEvent, liveTask)) {
+            throw new Error("Todoist recurrence, Calendar master, or active occurrence changed during repair; review the live values before continuing");
+          }
+        } else if(!hasCanonicalState(liveEvent,liveTask)) throw new Error("Provider fields changed during repair; review the live values before continuing");
         await new DynamoReconciliationStore().putBaseline(profile,task.id,liveTask,liveEvent);
         const identities=new CanonicalIdentityStore(); const ti=todoistCanonicalIdentity(liveTask),ei=calendarCanonicalIdentity(liveEvent);
-        if(ti)await identities.put(profile,"todoist",task.id,ti);if(ei)await identities.put(profile,"calendar",event.id,ei);
+        if(ti)await identities.put(profile,"todoist",task.id,ti);if(ei)await identities.put(profile,"calendar",projection.id,ei);
         await state.deleteCalendarProjectionTombstone(profile,task.id);
         await state.resolveConflictAudits(profile,{taskId:task.id,eventId:event.id});
         verified.push({profile,taskId:task.id,eventId:event.id});
@@ -199,7 +232,7 @@ export class ReviewEngine {
         const mapping=intent.taskId?await state.getMappingByTask(intent.profile,intent.taskId):undefined;
         if(mapping)await bind(intent.profile,await pair.todoist.getTask(mapping.taskId),await pair.calendar.getEvent(mapping.masterEventId||mapping.eventId),mapping.recurrenceOwner);
       } else if(intent.action==="move") {
-        await step("move-project",async()=> {await writeGate(intent.profile);return pair.todoist.moveTask(originalTask!.id,profiles[intent.targetProfile!].todoistProjectId);});
+        await step("move-project",async()=> trackedWrite(intent.profile, () => pair.todoist.moveTask(originalTask!.id,profiles[intent.targetProfile!].todoistProjectId)));
         await step("move-projection",async()=> {
           const moved=await pair.todoist.getTask(originalTask!.id);
           await new ProjectAwareSynchronizer(state,undefined,factory).process({id:`review-move:${id}`,kind:"todoist",profile:intent.profile,mode:"aws",receivedAt:at(),headers:{},body:JSON.stringify({event_name:"item:updated",event_data:moved,event_data_extra:{old_item:originalTask}})});return true;
@@ -207,27 +240,32 @@ export class ReviewEngine {
         const mapping=await state.getMappingByTaskAnyProfile(originalTask!.id);if(!mapping||mapping.profile!==intent.targetProfile)throw new Error("Project move is not verified");
         const destination=await factory(mapping.profile);await bind(mapping.profile,await destination.todoist.getTask(mapping.taskId),await destination.calendar.getEvent(mapping.masterEventId||mapping.eventId),mapping.recurrenceOwner);
       } else if(operation.preview.splitPlan) {
-        const split=await step("future-split",async()=> {await writeGate(intent.profile);return applyApprovedFutureSeriesSplit(intent.profile,originalTask!,await pair.calendar.getEvent(originalEvent!.id),pair,state,{approvedPlan:operation.preview.splitPlan,approvedEtag:originalEvent!.etag});});
+        const split=await step("future-split",async()=> {
+          const old=await pair.calendar.getEvent(originalEvent!.id);
+          return trackedWrite(intent.profile, () => applyApprovedFutureSeriesSplit(intent.profile,originalTask!,old,pair,state,{approvedPlan:operation.preview.splitPlan,approvedEtag:originalEvent!.etag}), 2);
+        });
         await bind(intent.profile,await pair.todoist.getTask(originalTask!.id),await pair.calendar.getEvent(split.mapping.masterEventId||split.mapping.eventId),"todoist");
       } else if(intent.action!=="verify") {
         const mappings=new Map(operation.preview.snapshots.filter(s=>s.mapping).map(s=>[`${s.mapping!.profile}:${s.mapping!.taskId}`,s.mapping!]));
         for(const mapping of mappings.values()) await step(`detach:${mapping.profile}:${mapping.taskId}`,async()=> {
-          const clients=await factory(mapping.profile);await this.controls.reject(mapping.profile,mapping.taskId,mapping.eventId,id);
-          await deleteMappingComments(clients.todoist,mapping);await state.deleteMapping(mapping);await new DynamoReconciliationStore().deleteBaseline(mapping.profile,mapping.taskId);
+          const clients=await factory(mapping.profile);await writeGate(mapping.profile);await this.controls.reject(mapping.profile,mapping.taskId,mapping.eventId,id);
+          await trackedWrite(mapping.profile, () => deleteMappingComments(clients.todoist,mapping), count => count);
+          await state.deleteMapping(mapping);await new DynamoReconciliationStore().deleteBaseline(mapping.profile,mapping.taskId);
           if(mapping.seriesId)await state.deleteRecurrenceLink(mapping.profile,mapping.seriesId);return true;
         });
-        for(const snapshot of operation.preview.snapshots.filter(s=>s.ref.side==="calendar" && s.object))await step(`unlink-metadata:${snapshot.ref.id}`,async()=> {
+        for(const snapshot of operation.preview.snapshots.filter(s=>s.ref.side==="calendar" && s.object
+          && (s.ref.id===intent.eventId || [...mappings.values()].some(mapping=>mapping.eventId===s.ref.id))))await step(`unlink-metadata:${snapshot.ref.id}`,async()=> {
           const clients=await factory(snapshot.ref.profile),live=await clients.calendar.getEvent(snapshot.ref.id);
           const linked=live.extendedProperties?.shared?.taskId;
-          if(linked){await this.controls.reject(snapshot.ref.profile,linked,live.id,id);await writeGate(snapshot.ref.profile);
+          if(linked){await writeGate(snapshot.ref.profile);await this.controls.reject(snapshot.ref.profile,linked,live.id,id);
             const shared={...live.extendedProperties?.shared};for(const name of Object.keys(shared))if(name==="taskId"||name==="taskUrl"||name==="originalSummary"||name.startsWith("sync")||name.startsWith("todoist"))delete shared[name];
-            await clients.calendar.upsertEventIfUnchanged({...live,extendedProperties:{...live.extendedProperties,shared}},live.id,live.etag!);
+            await trackedWrite(snapshot.ref.profile, () => clients.calendar.upsertEventIfUnchanged({...live,extendedProperties:{...live.extendedProperties,shared}},live.id,live.etag!));
           }return true;
         });
         if(intent.action==="link") {
           let task=await pair.todoist.getTask(originalTask!.id),event=await pair.calendar.getEvent(originalEvent!.id);
-          if(intent.winner==="todoist")event=await step(`align-event:${event.id}`,async()=> {await writeGate(intent.profile);const desired=toCalendarEvent(task,event);return pair.calendar.upsertEventIfUnchanged({...event,...desired,id:event.id,extendedProperties:{...event.extendedProperties,shared:{...event.extendedProperties?.shared,...desired.extendedProperties?.shared}}},event.id,event.etag!);});
-          if(intent.winner==="calendar"&&!event.recurrence?.length)task=await step(`align-task:${task.id}`,async()=> {await writeGate(intent.profile);return task.due?.is_recurring?pair.todoist.updateRecurringOccurrence(task,toTodoistTask(event)):pair.todoist.upsertTask(toTodoistTask(event),task.id);});
+          if(intent.winner==="todoist")event=await step(`align-event:${event.id}`,async()=> {const desired=toCalendarEvent(task,event);return trackedWrite(intent.profile, () => pair.calendar.upsertEventIfUnchanged({...event,...desired,id:event.id,extendedProperties:{...event.extendedProperties,shared:{...event.extendedProperties?.shared,...desired.extendedProperties?.shared}}},event.id,event.etag!));});
+          if(intent.winner==="calendar"&&!event.recurrence?.length)task=await step(`align-task:${task.id}`,async()=> trackedWrite(intent.profile, () => task.due?.is_recurring?pair.todoist.updateRecurringOccurrence(task,toTodoistTask(event)):pair.todoist.upsertTask(toTodoistTask(event),task.id)));
           await bind(intent.profile,task,event,intent.owner);
         }
         for(const snapshot of operation.preview.snapshots) {
@@ -240,33 +278,117 @@ export class ReviewEngine {
           if(disposition==="create") {
             const clients=await factory(snapshot.ref.profile);
             if(snapshot.ref.side==="todoist") {
-              const task=await clients.todoist.getTask(snapshot.ref.id),event=await step(`create-event:${task.id}`,async()=> {await writeGate(snapshot.ref.profile);return clients.calendar.createRepairEventOnce({...toCalendarEvent(task),id:reviewHash([id,task.id]).slice(0,32)},id);});
+              const task=await clients.todoist.getTask(snapshot.ref.id),event=await step(`create-event:${task.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.calendar.createRepairEventOnce({...toCalendarEvent(task),id:reviewHash([id,task.id]).slice(0,32)},id)));
               await bind(snapshot.ref.profile,task,event,task.due?.is_recurring?"todoist":undefined);
             } else {
               const event=await clients.calendar.getEvent(snapshot.ref.id);let source=event;
               if(event.recurrence?.length){source=selectCalendarRecurrenceInstance(await clients.calendar.listInstances(event.id))!;if(!source)throw new Error("No active occurrence to mirror");}
-              const task=await step(`create-task:${event.id}`,async()=> {await writeGate(snapshot.ref.profile);return clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id);});
+              const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id)));
               await bind(snapshot.ref.profile,task,event,event.recurrence?.length?"calendar":undefined);
             }
           }
         }
       } else {
-        if(!originalTask||!originalEvent||!hasCanonicalState(originalEvent,originalTask))throw new Error("The selected pair is not currently synchronized");
-        const mapping=await state.getMappingByTask(intent.profile,originalTask.id);if(mapping?.eventId!==originalEvent.id)throw new Error("Mapping does not match the selected pair");
-        await bind(intent.profile,originalTask,originalEvent,mapping.recurrenceOwner);
+        if(!originalTask||!originalEvent)throw new Error("Verification requires both selected provider items");
+        const mapping=await state.getMappingByTask(intent.profile,originalTask.id);
+        if(!mapping)throw new Error("Mapping does not match the selected pair");
+        if(mapping.recurrenceOwner==="calendar"&&mapping.masterEventId){
+          const pairClients=await factory(intent.profile),active=await pairClients.calendar.getEvent(mapping.activeInstanceId||mapping.eventId);
+          if((originalEvent.id!==mapping.masterEventId&&originalEvent.id!==mapping.eventId)||!hasCanonicalState(active,originalTask))throw new Error("Calendar-owned recurrence is not currently synchronized");
+        }else if(mapping.recurrenceOwner==="todoist"&&mapping.masterEventId){
+          const pairClients=await factory(intent.profile),master=await pairClients.calendar.getEvent(mapping.masterEventId),active=await pairClients.calendar.getEvent(mapping.activeInstanceId||mapping.eventId);
+          if(!calendarRecurrenceMatchesTodoist(master,originalTask)||!recurrenceAnchorMatches(master)||!occurrenceStateMatches(active,originalTask))throw new Error("Todoist-owned recurrence is not currently synchronized");
+        }else if(mapping.eventId!==originalEvent.id||!hasCanonicalState(originalEvent,originalTask))throw new Error("Mapping does not match the selected pair");
+        verified.push({profile:mapping.profile,taskId:mapping.taskId,eventId:mapping.eventId});
       }
+      const outcomes: NonNullable<RepairOperation["outcomes"]> = [];
       for(const snapshot of operation.preview.snapshots) {
         const excluded=await this.controls.control(snapshot.ref);
-        if(!excluded?.excluded && !verified.some(v=>v.profile===snapshot.ref.profile&&(snapshot.ref.side==="todoist"?v.taskId===snapshot.ref.id:v.eventId===snapshot.ref.id)) && !["decision","move"].includes(intent.action))throw new Error(`Unverified leftover ${entityKey(snapshot.ref)}; repair barrier retained`);
+        if(excluded?.excluded){outcomes.push({entity:entityKey(snapshot.ref),outcome:"excluded",checkedAt:at()});continue;}
+        if(verified.some(v=>v.profile===snapshot.ref.profile&&(snapshot.ref.side==="todoist"?v.taskId===snapshot.ref.id:v.eventId===snapshot.ref.id))||["decision","move"].includes(intent.action))continue;
+        if(!snapshot.object){
+          const current=await this.snapshot(snapshot.ref);
+          if(current.object||snapshotFingerprint([snapshot])!==snapshotFingerprint([current]))throw new Error(`Missing item ${entityKey(snapshot.ref)} changed during repair`);
+          outcomes.push({entity:entityKey(snapshot.ref),outcome:"missing",checkedAt:at()});continue;
+        }
+        const isSelectedRecurringMaster=snapshot.ref.side==="calendar"&&originalEvent?.recurrence?.length&&intent.eventId===snapshot.ref.id&&intent.owner==="calendar";
+        const contextMaster=snapshot.ref.side==="calendar"&&(originalEvent?.recurringEventId===snapshot.ref.id||Boolean(isSelectedRecurringMaster));
+        const splitHistory=Boolean(operation.preview.splitPlan&&snapshot.ref.side==="calendar"&&snapshot.ref.id===intent.eventId);
+        if(contextMaster||splitHistory){
+          const current=await this.snapshot(snapshot.ref);
+          if(splitHistory){
+            const master=current.object as CalendarEvent|null;
+            if(!master||master.extendedProperties?.shared?.syncHistoryOnly!=="true")throw new Error(`Future split history ${entityKey(snapshot.ref)} is not verified`);
+          } else if(isSelectedRecurringMaster){
+            const master=current.object as CalendarEvent|null;
+            const linkedTaskId=originalTask?.id||verified.find(item=>item.profile===snapshot.ref.profile)?.taskId;
+            const mapping=linkedTaskId?await state.getMappingByTask(snapshot.ref.profile,linkedTaskId):undefined;
+            const seriesId=master?.iCalUID||master?.id;
+            const recurrence=seriesId?await state.getRecurrenceLink(snapshot.ref.profile,seriesId):undefined;
+            if(!master?.recurrence?.length||mapping?.recurrenceOwner!=="calendar"||mapping.masterEventId!==master.id||mapping.seriesId!==seriesId||!recurrence||recurrence.taskId!==linkedTaskId||recurrence.masterEventId!==master.id)throw new Error(`Calendar-owned series master ${entityKey(snapshot.ref)} is not verified`);
+          } else if(snapshotFingerprint([snapshot])!==snapshotFingerprint([current]))throw new Error(`Context master ${entityKey(snapshot.ref)} changed during repair`);
+          outcomes.push({entity:entityKey(snapshot.ref),outcome:"history",checkedAt:at()});continue;
+        }
+        throw new Error(`Unverified leftover ${entityKey(snapshot.ref)}; repair barrier retained`);
       }
+      operation.outcomes=outcomes;
+      await this.store.saveOperation(operation);
       // Re-read every affected entity before releasing barriers; external edits
       // become a review outcome rather than being overwritten by delayed events.
-      for(const binding of verified){const clients=await factory(binding.profile),mapping=await state.getMappingByTask(binding.profile,binding.taskId);const [t,e]=await Promise.all([clients.todoist.getTask(binding.taskId),clients.calendar.getEvent(mapping?.activeInstanceId||binding.eventId)]);if(!hasCanonicalState(e,t))throw new Error("A provider changed before verification completed; resume after reviewing the live data");}
-      for(const snapshot of operation.preview.snapshots){if(bindings.has(entityKey(snapshot.ref)))await this.controls.exclude(snapshot.ref,false,id);const live=await this.snapshot(snapshot.ref);await this.controls.release(snapshot.ref,id,(live.object as TodoistTask)?.updated_at || (live.object as CalendarEvent)?.updated);}
+      for(const binding of verified){
+        const clients=await factory(binding.profile),mapping=await state.getMappingByTask(binding.profile,binding.taskId);
+        const [t,e]=await Promise.all([clients.todoist.getTask(binding.taskId),clients.calendar.getEvent(mapping?.activeInstanceId||binding.eventId)]);
+        if (mapping?.recurrenceOwner === "todoist" && mapping.masterEventId) {
+          const master=await clients.calendar.getEvent(mapping.masterEventId);
+          if(!calendarRecurrenceMatchesTodoist(master,t)||!recurrenceAnchorMatches(master)||!occurrenceStateMatches(e,t))throw new Error("A provider changed before recurrence verification completed; resume after reviewing the live data");
+        } else if(!hasCanonicalState(e,t))throw new Error("A provider changed before verification completed; resume after reviewing the live data");
+      }
+      for(const outcome of outcomes){
+        const snapshot=operation.preview.snapshots.find(item=>entityKey(item.ref)===outcome.entity);
+        if(!snapshot)throw new Error(`Recorded outcome ${outcome.entity} is missing its preview reference`);
+        if(outcome.outcome==="excluded"){
+          if(!(await this.controls.control(snapshot.ref))?.excluded)throw new Error(`Exclusion for ${outcome.entity} changed before release`);
+          continue;
+        }
+        const current=await this.snapshot(snapshot.ref);
+        if(outcome.outcome==="missing"){
+          if(current.object||snapshotFingerprint([snapshot])!==snapshotFingerprint([current]))throw new Error(`Missing item ${outcome.entity} changed before release`);
+          continue;
+        }
+        const splitHistory=Boolean(operation.preview.splitPlan&&snapshot.ref.side==="calendar"&&snapshot.ref.id===intent.eventId);
+        if(splitHistory){
+          if((current.object as CalendarEvent|null)?.extendedProperties?.shared?.syncHistoryOnly!=="true")throw new Error(`Future split history ${outcome.entity} changed before release`);
+          continue;
+        }
+        const isSelectedMaster=snapshot.ref.side==="calendar"&&originalEvent?.recurrence?.length&&intent.eventId===snapshot.ref.id&&intent.owner==="calendar";
+        if(isSelectedMaster){
+          const master=current.object as CalendarEvent|null, linkedTaskId=originalTask?.id||verified.find(item=>item.profile===snapshot.ref.profile)?.taskId;
+          const mapping=linkedTaskId?await state.getMappingByTask(snapshot.ref.profile,linkedTaskId):undefined;
+          const seriesId=master?.iCalUID||master?.id, recurrence=seriesId?await state.getRecurrenceLink(snapshot.ref.profile,seriesId):undefined;
+          if(!master?.recurrence?.length||mapping?.recurrenceOwner!=="calendar"||mapping.masterEventId!==master.id||mapping.seriesId!==seriesId||!recurrence||recurrence.taskId!==linkedTaskId||recurrence.masterEventId!==master.id)throw new Error(`Calendar-owned series master ${outcome.entity} changed before release`);
+        } else if(snapshotFingerprint([snapshot])!==snapshotFingerprint([current]))throw new Error(`Retained history ${outcome.entity} changed before release`);
+      }
+      for(const snapshot of operation.preview.snapshots){
+        if(bindings.has(entityKey(snapshot.ref)))await this.controls.exclude(snapshot.ref,false,id);
+        if(intent.action==="move"&&snapshot.ref.side==="todoist"&&snapshot.ref.id===intent.taskId){
+          const moved=await(await factory(intent.targetProfile!)).todoist.getTask(snapshot.ref.id);
+          await this.controls.release(snapshot.ref,id,moved.updated_at);continue;
+        }
+        const live=await this.snapshot(snapshot.ref);await this.controls.release(snapshot.ref,id,(live.object as TodoistTask)?.updated_at || (live.object as CalendarEvent)?.updated);
+      }
+      if(targetTaskRef){
+        const moved=await this.snapshot(targetTaskRef);
+        await this.controls.exclude(targetTaskRef,false,id);
+        await this.controls.release(targetTaskRef,id,(moved.object as TodoistTask|null)?.updated_at);
+      }
       operation.status="succeeded";operation.error=undefined;operation.nextAction=undefined;operation.verified=verified;
       await this.store.updateCase(intent.caseId,intent.action==="exclude"?"excluded":"resolved","Repair verified against current provider state",id);
       if(operation.preview.case.decision)await new ManualInterventionService().finishReconciliationDecision(operation.preview.case.decision.decisionId,"Resolved and verified in the review page");
     } catch(e) {
+      if (claimed && !operation.steps.validated && !Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")) {
+        for (const ref of operation.preview.snapshots.map(s=>s.ref)) await this.controls.release(ref,id).catch(()=>undefined);
+        if (intent.action==="move"&&intent.targetProfile&&intent.taskId) await this.controls.release({profile:intent.targetProfile,side:"todoist",id:intent.taskId},id).catch(()=>undefined);
+      }
       operation.status=Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")?"needs_review":"failed";
       operation.error=e instanceof Error?e.message:String(e);operation.nextAction="Review live state. Resume this operation for an interrupted write, or refresh an unapplied stale preview.";
       await this.store.updateCase(intent.caseId,"open",operation.error,id);

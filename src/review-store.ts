@@ -25,7 +25,7 @@ export class ReviewStore {
       createdAt: decision.createdAt, updatedAt: new Date().toISOString(),
     };
     try { await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
-      lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#OPEN#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
+      lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "dismissed" ? "CLOSED" : "OPEN"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
     catch (e) { if (!conditional(e)) throw e; }
   }
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
@@ -41,7 +41,7 @@ export class ReviewStore {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
       UpdateExpression: "SET #s = :s, #r = :r, updatedAt = :now, operationId = :op, lookupSk = :lookup",
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: { ":s": status, ":r": result,
-        ":now": new Date().toISOString(), ":op": operationId || "", ":lookup": `REVIEW#${["resolved", "excluded"].includes(status) ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
+        ":now": new Date().toISOString(), ":op": operationId || "", ":lookup": `REVIEW#${["resolved", "excluded", "dismissed"].includes(status) ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
     await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
