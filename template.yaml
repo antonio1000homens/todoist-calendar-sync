@@ -57,8 +57,8 @@ Parameters:
     Description: Access application audience tag protecting /review and /review/api.
   ReviewOperatorEmail:
     Type: String
-    Default: antonio1000homens@gmail.com
-    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
   StateTableReadCapacity:
     Type: Number
     Default: 25

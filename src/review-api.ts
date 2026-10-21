@@ -39,7 +39,7 @@ async function authenticate(event: LambdaFunctionURLEvent): Promise<ReviewActor>
   try { ({ payload } = await jwtVerify(token, jwks, { issuer:"https://" + team, audience, clockTolerance:5 })); }
   catch { throw Object.assign(new Error("Review access token is invalid or expired"), { status:401 }); }
   const email = typeof payload.email === "string" ? payload.email.toLowerCase() : "";
-  const allowed = (process.env.REVIEW_OPERATOR_EMAIL || "antonio1000homens@gmail.com").toLowerCase();
+  const allowed = (process.env.REVIEW_OPERATOR_EMAIL || "").toLowerCase();
   if (!email || email !== allowed || typeof payload.sub !== "string") throw Object.assign(new Error("Review access is limited to the configured operator"), { status:403 });
   return { subject:payload.sub, email };
 }
