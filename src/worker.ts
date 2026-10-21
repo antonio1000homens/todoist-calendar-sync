@@ -6,12 +6,14 @@ import {
   defaultProviderClientFactory,
   isMutationBudgetExhausted,
   ReconciliationMutationBudget,
+  type ProviderClientFactory,
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { enqueueDelivery } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { StateRepository } from "./repository.js";
+import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
@@ -126,16 +128,17 @@ async function enqueueReconciliationContinuation(
   return next;
 }
 
-async function processReconciliation(
+export async function processReconciliation(
   delivery: Delivery,
   state: StateRepository,
+  clientFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): Promise<ReconciliationProcessingResult> {
   const mutationBudget = new ReconciliationMutationBudget();
   if (!delivery.reconcile?.generation) {
     log("legacy_reconciliation_delivery_skipped", { deliveryId: delivery.id, profile: delivery.profile, reason: "automatic legacy reconciliation is disabled; request a manual run in Slack" });
     return { continuationRequired: false };
   }
-  const budgetedClientFactory = createBudgetedClientFactory(mutationBudget, defaultProviderClientFactory);
+  const budgetedClientFactory = createBudgetedClientFactory(mutationBudget, clientFactory);
   const reconciler = new SnapshotReconciler(
     state,
     budgetedClientFactory,
@@ -238,9 +241,9 @@ async function processReconciliation(
   const calendarRecovery = await reconcileUnmappedCalendar(
     delivery.profile,
     state,
-    defaultProviderClientFactory,
+    clientFactory,
     mutationBudget,
-    continuation?.phase === "calendar" ? continuation : undefined,
+    continuation?.phase === "calendar" ? continuation : { phase: "calendar", sequence: continuation?.sequence || 0 },
   );
   await state.addReconciliationProgress(delivery.profile, generation, {
     calendar_scanned: calendarRecovery.scanned,
@@ -290,22 +293,11 @@ async function processReconciliation(
 }
 
 async function deliverReconciliationOutcome(state: StateRepository, manual: ManualInterventionService, profile: Profile, generation: string): Promise<void> {
-  const current = await state.getReconciliationState(profile);
-  if (!current || current.generation !== generation || !current.notificationPending || !manual.enabled) return;
-  const status = current.status === "needs_review" ? "⚠️ Needs review" : current.status === "failed" ? "❌ Failed" : "✅ Succeeded";
-  const counts = Object.entries(current.result || {}).map(([name, count]) => `${name}: ${count}`).join(" · ") || "No changes needed";
-  const unresolved = current.unresolved || 0;
-  const reason = current.lastError ? `\nReason: ${current.lastError}\nNext action: fix the reported provider/data issue, then request reconciliation again in Slack.` : "";
-  const text = `*${status} — ${profile}*\n${counts}\nUnresolved: ${unresolved}${reason}`;
+  const current = await state.getReconciliationOutcome(profile, generation);
+  if (!current?.notificationPending || !manual.enabled) return;
   try {
-    const replyTs = await manual.deliverReconciliationOutcome(current.slackChannelId, current.slackThreadTs, current.notificationReplyTs, text);
-    if (replyTs && !current.notificationReplyTs) await state.storeReconciliationReply(profile, generation, replyTs);
-    const succeeded = current.status === "succeeded";
-    await manual.updateReconciliationIncident(current.slackChannelId, current.slackMessageTs, text, succeeded);
-    if (succeeded && current.slackDecisionId) await manual.finishReconciliationDecision(current.slackDecisionId, text);
-    if (replyTs) await state.markReconciliationNotified(profile, generation, replyTs);
+    await deliverPendingReconciliationOutcome(state, manual, current);
   } catch (error) {
-    await state.recordReconciliationNotification(profile, generation, text).catch(() => undefined);
     log("reconciliation_outcome_notification_failed", { profile, generation, error: serializeError(error) });
   }
 }

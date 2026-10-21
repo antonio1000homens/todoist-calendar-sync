@@ -7,7 +7,7 @@ import {
 import { documentClient, pacedScan } from "./dynamodb-capacity.js";
 import { secureParameter } from "./config.js";
 import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBudgetExhausted, ReconciliationMutationBudget, type ProviderClientFactory } from "./mutation-budget.js";
-import { enqueueDelivery, requestReconciliation } from "./queue.js";
+import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResult } from "./queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -213,13 +213,13 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Reconciliation reached the provider mutation cap",
     severity: "info",
     detection: "operational",
-    actions: actions(["reconcile_now", "Request another reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Request another reconciliation"]),
   },
   operational_circuit_open: {
     title: "Sync circuit breaker is open",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Retry through normal reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Retry through normal reconciliation"]),
   },
   operational_reconciliation_stuck: {
     title: "Reconciliation needed",
@@ -231,13 +231,13 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Reconciliation needed — a sync delivery was quarantined",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Request fresh reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Request fresh reconciliation"]),
   },
   operational_provider_auth: {
     title: "Provider authentication or authorization failed",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Retry after credentials are fixed", false, true]),
+    actions: actions(["reconcile_now", "Retry after credentials are fixed"]),
   },
   operational_partial_mutation: {
     title: "Provider and mapping state may be partially applied",
@@ -457,6 +457,7 @@ interface SlackApiResponse {
   error?: string;
   channel?: string;
   ts?: string;
+  permalink?: string;
 }
 
 function slackEnabled(): boolean {
@@ -471,7 +472,7 @@ function defaultSlackChannel(): string {
   return process.env.TODOIST_CALENDAR_SYNC_SLACK_CHANNEL || "#aws-slack-alerts";
 }
 
-async function slackApi(method: "chat.postMessage" | "chat.update", payload: Record<string, unknown>): Promise<SlackApiResponse> {
+async function slackApi(method: "chat.postMessage" | "chat.update" | "chat.getPermalink", payload: Record<string, unknown>): Promise<SlackApiResponse> {
   const response = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
@@ -785,15 +786,17 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
 export class SlackManualNotifier {
   constructor(private readonly store = new ManualDecisionStore()) {}
 
-  async postDecision(decision: ManualDecision): Promise<void> {
-    if (!slackEnabled()) return;
+  async postDecision(decision: ManualDecision): Promise<boolean> {
+    if (!slackEnabled()) return false;
     try {
       const result = await slackApi("chat.postMessage", {
         channel: decision.slackChannelId || defaultSlackChannel(),
         text: MANUAL_DECISION_CATALOG[decision.type].title,
         blocks: decisionBlocks(decision),
       });
-      if (result.channel && result.ts) await this.store.setSlackLocation(decision.decisionId, result.channel, result.ts);
+      if (!result.channel || !result.ts) return false;
+      await this.store.setSlackLocation(decision.decisionId, result.channel, result.ts);
+      return true;
     } catch (error) {
       console.error(JSON.stringify({
         service: "todoist-calendar-sync-manual",
@@ -801,6 +804,7 @@ export class SlackManualNotifier {
         decisionId: decision.decisionId,
         error: error instanceof Error ? error.message : String(error),
       }));
+      return false;
     }
   }
 
@@ -819,9 +823,18 @@ export class SlackManualNotifier {
     return this.postText(text, channel, threadTs);
   }
 
-  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false): Promise<void> {
+  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false, decision?: ManualDecision): Promise<void> {
     if (!slackEnabled() || !channel || !messageTs) return;
-    await slackApi("chat.update", { channel, ts: messageTs, text, ...(close ? { blocks: [] } : {}) });
+    const blocks = !close && decision
+      ? [{ type: "section", text: { type: "mrkdwn", text } }, ...decisionBlocks(decision)]
+      : [];
+    await slackApi("chat.update", { channel, ts: messageTs, text, blocks });
+  }
+
+  async reconciliationLocation(channel: string, threadTs: string): Promise<string> {
+    const result = await slackApi("chat.getPermalink", { channel, message_ts: threadTs });
+    if (!result.permalink) throw new Error("Slack did not return the active reconciliation permalink");
+    return `<${result.permalink}|active reconciliation thread>`;
   }
 
   async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
@@ -870,24 +883,31 @@ export class ManualInterventionService {
     return this.notifier.reconciliationOutcome(channel, threadTs, text);
   }
 
-  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false): Promise<void> {
-    return this.notifier.updateReconciliationIncident(channel, messageTs, text, close);
+  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false, decisionId?: string): Promise<void> {
+    const decision = decisionId ? await this.store.get(decisionId) : undefined;
+    return this.notifier.updateReconciliationIncident(channel, messageTs, text, close, decision);
   }
 
   async finishReconciliationDecision(decisionId: string, text: string): Promise<void> {
-    await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
+    try {
+      await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
+    } catch (error) {
+      if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
+      const existing = await this.store.get(decisionId);
+      if (existing?.status !== "resolved") throw error;
+    }
   }
 
   async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
     return this.notifier.deliverReconciliationOutcome(channel, threadTs, replyTs, text);
   }
 
-  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string): Promise<void> {
+  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string): Promise<boolean> {
     const decisionId = `${profile}-operational_reconciliation_stuck-${fingerprint({ identity })}`;
     const existing = await this.store.get(decisionId);
     if (existing) {
-      if (existing.status === "pending") await this.notifier.postDecision({ ...existing, slackChannelId: channel || existing.slackChannelId });
-      return;
+      if (existing.status !== "pending" || existing.slackMessageTs) return true;
+      return this.notifier.postDecision({ ...existing, slackChannelId: channel || existing.slackChannelId });
     }
     const now = isoNow();
     const decision: ManualDecision = {
@@ -897,7 +917,7 @@ export class ManualInterventionService {
       ...(channel ? { slackChannelId: channel } : {}),
     };
     await this.store.putPending(decision);
-    await this.notifier.postDecision(decision);
+    return this.notifier.postDecision(decision);
   }
 
   private async providerClients(profile: Profile) {
@@ -985,7 +1005,10 @@ export class ManualInterventionService {
       context: decisionContext,
       ...fields,
     });
-    if (mode === "prompt" && result.created) await this.notifier.postDecision(result.decision);
+    if (mode === "prompt" && (result.created
+      || (effective.mode === "auto" && result.decision.status === "pending" && !result.decision.slackMessageTs))) {
+      await this.notifier.postDecision(result.decision);
+    }
     if (mode === "auto" && defaultAction && result.decision.status === "pending") {
       await enqueueDelivery({
         id: `manual:${profile}:${result.decision.decisionId}:${defaultAction}:auto:${Date.now()}`,
@@ -1333,6 +1356,11 @@ export class ManualInterventionService {
     state: StateRepository,
     slackUserId?: string,
   ): Promise<void> {
+    // Old queued policy deliveries must not bypass explicit Slack consent.
+    if (slackUserId === "AUTO_POLICY") {
+      await this.notifier.postDecision({ ...decision, permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions });
+      return;
+    }
     const result = await requestReconciliation(state, decision.profile, "manual", undefined, {
       requester: slackUserId || "operator",
       slackChannelId: decision.slackChannelId,
@@ -1340,12 +1368,19 @@ export class ManualInterventionService {
       slackThreadTs: decision.slackMessageTs,
       slackDecisionId: decision.decisionId,
     });
-    const outcome = result.coalesced ? "already pending/coalesced" : result.queued ? "queued" : "pending";
-    const enqueueError = result.enqueueError ? ` Queue error: ${result.enqueueError}` : "";
-    const text = result.enqueueError
-      ? `❌ Reconciliation could not be queued: ${result.enqueueError}`
-      : `🔄 Reconciliation queued. I’ll post the final outcome in this thread. (${outcome})`;
+    const text = await this.reconciliationAcknowledgement(result);
     await this.notifier.reconciliationOutcome(decision.slackChannelId, decision.slackMessageTs, text);
+  }
+
+  private async reconciliationAcknowledgement(result: ReconciliationRequestResult): Promise<string> {
+    if (result.enqueueError) return `Reconciliation could not be queued: ${result.enqueueError}`;
+    if (result.coalesced) {
+      const location = result.slackChannelId && result.slackThreadTs
+        ? await this.notifier.reconciliationLocation(result.slackChannelId, result.slackThreadTs)
+        : "status command";
+      return `Reconciliation already active. This request joined generation ${result.generation}. Follow its progress and final outcome in the ${location}.`;
+    }
+    return "Reconciliation queued. I’ll post the final outcome in this thread.";
   }
 
   /**
@@ -1842,13 +1877,21 @@ export class ManualInterventionService {
     if (manual.command) {
       const channel = manual.slackChannelId;
       if (manual.command === "reconcile_now" || manual.command === "resume_pending_reconciliation") {
-        const threadTs = await this.notifier.postText(`🔄 Reconciliation queued for *${delivery.profile}*. I’ll post the final outcome in this thread.`, channel, manual.slackMessageTs);
+        if (manual.slackUserId === "AUTO_POLICY") {
+          await this.notifier.postText("Reconciliation requires an explicit request in Slack.", channel);
+          return;
+        }
+        const threadTs = await this.notifier.postText(`Reconciliation queued for *${delivery.profile}*. I’ll post the final outcome in this thread.`, channel, manual.slackMessageTs);
         const result = await requestReconciliation(state, delivery.profile, "manual", undefined, {
           requester: manual.slackUserId || "operator", slackChannelId: channel,
           slackMessageTs: threadTs || manual.slackMessageTs,
           slackThreadTs: manual.slackMessageTs || threadTs,
         });
-        if (result.enqueueError) await this.notifier.reconciliationOutcome(channel, manual.slackMessageTs || threadTs, `❌ Reconciliation failed to queue for *${delivery.profile}*: ${result.enqueueError}`);
+        if (result.enqueueError || result.coalesced) {
+          const text = await this.reconciliationAcknowledgement(result);
+          await this.notifier.updateReconciliationIncident(channel, threadTs, text);
+          await this.notifier.reconciliationOutcome(channel, manual.slackMessageTs || threadTs, text);
+        }
         return;
       }
       if (manual.command === "show_status") {

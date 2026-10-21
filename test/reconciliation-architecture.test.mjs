@@ -67,7 +67,7 @@ test("webhooks never start full reconciliation and the scheduled health check is
 
 test("Calendar snapshot continuations run to exhaustion before terminal reconciliation status", () => {
   assert.match(workerSource, /continuation\?\.phase === "calendar" \? undefined : await reconciler\.reconcile/);
-  assert.match(workerSource, /continuation\?\.phase === "calendar" \? continuation : undefined/);
+  assert.match(workerSource, /continuation\?\.phase === "calendar" \? continuation : \{ phase: "calendar", sequence: continuation\?\.sequence \|\| 0 \}/);
   assert.match(workerSource, /if \(calendarRecovery\.continuation\)/);
   assert.match(workerSource, /await state\.completeReconciliation\(delivery\.profile, generation, unresolved, aggregate\)/);
   assert.match(workerSource, /return \{ continuationRequired: false, continuationQueued: true \}/);

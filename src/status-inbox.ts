@@ -1,6 +1,6 @@
 import { ManualDecisionStore, SlackManualNotifier, type ManualDecision } from "./manual-intervention.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
-import { StateRepository } from "./repository.js";
+import { reconciliationRunStatus, StateRepository } from "./repository.js";
 import type { Delivery, Profile } from "./types.js";
 
 interface DecisionStoreForStatus {
@@ -10,7 +10,7 @@ interface DecisionStoreForStatus {
 }
 
 interface DecisionNotifierForStatus {
-  postDecision(decision: ManualDecision): Promise<void>;
+  postDecision(decision: ManualDecision): Promise<unknown>;
   postText(text: string, channel?: string): Promise<void | string | undefined>;
 }
 
@@ -168,7 +168,7 @@ export async function processStatusInbox(delivery: Delivery, state: StateReposit
     : "";
   const reconciliationLine = !reconcile
     ? "Reconciliation: no run recorded"
-    : `Reconciliation: ${reconcile.status || (reconcile.pending ? "queued" : "succeeded")}${reconcile.lastError ? ` — ${reconcile.lastError}` : ""} (last completed ${reconcile.lastCompletedAt || "never"})`;
+    : `Reconciliation: ${reconciliationRunStatus(reconcile)}${reconcile.lastError ? ` — ${reconcile.lastError}` : ""} (last completed ${reconcile.lastCompletedAt || "never"})`;
   const decisionLine = actionable.length
     ? `Action required: ${actionable.length} manual decision${actionable.length === 1 ? "" : "s"} pending — interactive cards follow.`
     : "Action required: none.";

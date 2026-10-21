@@ -63,10 +63,12 @@ class FakeNotifier {
     this.updated = [];
     this.text = [];
   }
-  async postDecision(decision) { this.posted.push(decision); }
+  async postDecision(decision) { this.posted.push(decision); return true; }
   async updateResolution(decision, text, blocks) { this.updated.push({ decision, text, blocks }); }
   async postText(text) { this.text.push(text); }
   async reconciliationOutcome(_channel, _thread, text) { this.text.push(text); }
+  async reconciliationLocation(channel, ts) { return `<https://example.slack.com/archives/${channel}/p${ts.replace('.', '')}|active reconciliation thread>`; }
+  async updateReconciliationIncident(channel, ts, text) { this.updated.push({ channel, ts, text }); }
 }
 
 function mappedCalendarRecurrence() {
@@ -632,7 +634,7 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
 
   assert.equal(requested, 1);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
-  assert.match(notifier.text.at(-1), /final outcome in this thread/);
+  assert.match(notifier.text.at(-1), /Reconciliation already active/);
   assert.equal(notifier.updated.length, 0, 'the originating incident card stays open during reconciliation');
 });
 
@@ -680,3 +682,69 @@ test('Calendar-only ambiguity enriches and renders bounded candidate details rea
   assert.match(rendered, /recurring: yes/);
   assert.doesNotMatch(rendered, /bind_task:/);
 });
+
+test('reconciliation actions cannot be saved as automatic policies', async () => {
+  for (const policy of Object.values(MANUAL_DECISION_CATALOG)) {
+    for (const action of policy.actions.filter((candidate) => candidate.id === 'reconcile_now')) {
+      assert.notEqual(action.autoAllowed, true);
+    }
+  }
+});
+
+test('saved automatic reconciliation policies fall back to an explicit decision', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(decisions, notifier, async () => {
+    throw new Error('provider clients must not be read');
+  }, new FakePolicyStore({ mode: 'auto', defaultAction: 'reconcile_now', source: 'profile' }));
+  await service.observeAudit({ ...todoistDeleteDelivery(), kind: 'reconcile' }, 'antonio', 'reconciliation_circuit_open_deferred', {});
+  assert.equal(notifier.posted.length, 1);
+  assert.equal(notifier.posted[0].policyMode, 'prompt');
+  assert.equal(notifier.posted[0].status, 'pending');
+});
+
+test('old queued AUTO_POLICY reconciliation actions require a new Slack click', async () => {
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const decision = decisionFor('operational_dlq', {
+    permittedActions: [{ id: 'reconcile_now', label: 'Reconcile', autoAllowed: true }],
+  });
+  decisions.decisions.set(decision.decisionId, decision);
+  const service = new ManualInterventionService(decisions, notifier);
+  await service.processManualDelivery({
+    ...todoistDeleteDelivery(), kind: 'manual',
+    manual: { decisionId: decision.decisionId, action: 'reconcile_now', slackUserId: 'AUTO_POLICY' },
+  }, { async requestReconciliation() { throw new Error('automatic reconciliation must not run'); } });
+  assert.equal(notifier.posted.length, 1);
+  assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
+  assert.equal(notifier.posted[0].permittedActions[0].autoAllowed, undefined);
+});
+
+for (const entry of ['decision', 'command']) {
+  test(`coalesced ${entry} requests point to the active run instead of promising another outcome`, async () => {
+    const decisions = new FakeDecisionStore();
+    const notifier = new FakeNotifier();
+    notifier.postText = async (text) => { notifier.text.push(text); return '2.000'; };
+    const decision = decisionFor('operational_dlq', { slackChannelId: 'CSECOND', slackMessageTs: '2.000' });
+    decisions.decisions.set(decision.decisionId, decision);
+    const service = new ManualInterventionService(decisions, notifier);
+    const state = {
+      async requestReconciliation() {
+        const result = reconciliationState();
+        result.state.slackChannelId = 'CFIRST';
+        result.state.slackThreadTs = '1.000';
+        return result;
+      },
+    };
+    await service.processManualDelivery({
+      ...todoistDeleteDelivery(), kind: 'manual',
+      manual: { slackUserId: 'U123', slackChannelId: 'CSECOND', ...(entry === 'command'
+        ? { command: 'reconcile_now' } : { decisionId: decision.decisionId, action: 'reconcile_now' }) },
+    }, state);
+    assert.match(notifier.text.at(-1), /already active/);
+    assert.match(notifier.text.at(-1), /https:\/\/example.slack.com\/archives\/CFIRST\/p1000/);
+    assert.doesNotMatch(notifier.text.at(-1), /final outcome in this thread/);
+    if (entry === 'command') assert.match(notifier.updated.at(-1).text, /already active/);
+  });
+}

@@ -1,6 +1,7 @@
 import type { Handler } from "aws-lambda";
 import { ManualInterventionService } from "./manual-intervention.js";
-import { StateRepository } from "./repository.js";
+import { reconciliationRunStatus, StateRepository } from "./repository.js";
+import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import type { Profile } from "./types.js";
 
 const profileList: Profile[] = ["home", "antonio", "work"];
@@ -12,33 +13,27 @@ function log(event: string, detail: Record<string, unknown> = {}): void {
 }
 
 /** Read-only provider health watchdog. It never enqueues reconciliation work. */
-export const handler: Handler = async (_event, context) => {
-  const state = new StateRepository();
-  const manual = new ManualInterventionService();
-  log("reconciliation_health_check", { awsRequestId: context.awsRequestId, profiles: profileList });
-
+export async function checkReconciliationHealth(
+  state: StateRepository, manual: ManualInterventionService, profiles: Profile[] = profileList,
+): Promise<void> {
   for (const profile of profileList) {
     try {
       const current = await state.getReconciliationState(profile);
-      if (!current) continue;
-      const runStatus = current.status || (current.lastFailedAt ? "failed" : current.pending ? "queued" : "succeeded");
-
-      if (current.notificationPending && manual.enabled) {
-        const status = runStatus === "needs_review" ? "⚠️ Needs review" : runStatus === "failed" ? "❌ Failed" : "✅ Succeeded";
-        const details = Object.entries(current.result || {}).map(([key, value]) => `${key}: ${value}`).join(" · ") || "No changes needed";
-        const failure = current.lastError ? `\nReason: ${current.lastError}\nFix the reported issue, then request a fresh reconciliation in Slack.` : "";
-        const text = `*${status} — ${profile}*\n${details}\nUnresolved: ${current.unresolved || 0}${failure}`;
-        try {
-          const replyTs = await manual.deliverReconciliationOutcome(current.slackChannelId, current.slackThreadTs, current.notificationReplyTs, text);
-          if (replyTs && !current.notificationReplyTs) await state.storeReconciliationReply(profile, current.generation, replyTs);
-          const succeeded = runStatus === "succeeded";
-          await manual.updateReconciliationIncident(current.slackChannelId, current.slackMessageTs, text, succeeded);
-          if (succeeded && current.slackDecisionId) await manual.finishReconciliationDecision(current.slackDecisionId, text);
-          if (replyTs) await state.markReconciliationNotified(profile, current.generation, replyTs);
-        } catch (error) {
-          log("outcome_notification_retry_failed", { profile, generation: current.generation, error: error instanceof Error ? error.message : String(error) });
+      // Notifications belong to generations, so a new run cannot hide an
+      // undelivered outcome from an earlier one.
+      if (manual.enabled) {
+        if (current?.notificationPending) await state.preserveReconciliationOutcome(current);
+        const outcomes = await state.listPendingReconciliationOutcomes(profile);
+        for (const outcome of outcomes) {
+          try {
+            await deliverPendingReconciliationOutcome(state, manual, outcome);
+          } catch (error) {
+            log("outcome_notification_retry_failed", { profile, generation: outcome.generation, error: error instanceof Error ? error.message : String(error) });
+          }
         }
       }
+      if (!current) continue;
+      const runStatus = reconciliationRunStatus(current);
 
       if (!current.pending || !["queued", "running", "failed"].includes(runStatus)) continue;
       const last = runStatus === "running"
@@ -56,8 +51,9 @@ export const handler: Handler = async (_event, context) => {
 
       const detail = runStatus === "failed"
         ? `The previous run failed: ${current.lastError || "unknown error"}. Click to start a fresh generation after addressing the cause.`
-        : `${current.status} for ${Math.floor(ageMs / 60_000)} minutes without progress. Click to request a fresh manual reconciliation.`;
-      await manual.alertReconciliationNeeded(profile, current.generation, current.slackChannelId, detail);
+        : `${runStatus} for ${Math.floor(ageMs / 60_000)} minutes without progress. Click to request a fresh manual reconciliation.`;
+      const delivered = await manual.alertReconciliationNeeded(profile, current.generation, current.slackChannelId, detail);
+      if (!delivered) continue;
       await state.markReconciliationHealthAlert(profile, current.generation);
       log("reconciliation_health_alerted", { profile, generation: current.generation, status: runStatus, ageMs });
     } catch (error) {
@@ -67,4 +63,9 @@ export const handler: Handler = async (_event, context) => {
       }));
     }
   }
+}
+
+export const handler: Handler = async (_event, context) => {
+  log("reconciliation_health_check", { awsRequestId: context.awsRequestId, profiles: profileList });
+  await checkReconciliationHealth(new StateRepository(), new ManualInterventionService());
 };
