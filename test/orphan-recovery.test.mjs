@@ -27,6 +27,7 @@ class FakeIdentityStore {
 }
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor() {
     this.token = "sync-token";
     this.mappings = [];

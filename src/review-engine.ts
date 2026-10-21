@@ -144,6 +144,10 @@ export class ReviewEngine {
     try {
       const targetTaskRef: EntityRef | undefined = intent.action === "move" && intent.targetProfile && intent.taskId
         ? { profile:intent.targetProfile, side:"todoist", id:intent.taskId } : undefined;
+      if (!operation.steps.validated) {
+        const current = await this.collect(intent);
+        if (snapshotFingerprint(current) !== operation.preview.fingerprint) throw new Error("Provider state or ownership changed after preview. Refresh the preview; no repair was applied.");
+      }
       await this.controls.claim([...operation.preview.snapshots.map(s=>s.ref), ...(targetTaskRef?[targetTaskRef]:[])], id);
       claimed = true;
       if (!operation.steps.validated) {

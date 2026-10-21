@@ -68,6 +68,7 @@ function baseline(todoistTask, calendarEvent) {
 }
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor(mapping) {
     this.mapping = mapping;
     this.tombstones = new Map();
