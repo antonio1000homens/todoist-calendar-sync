@@ -90,6 +90,7 @@ export class OrphanRecoveringSynchronizer {
     const matching = tasks.filter((task) => standaloneTodoistCandidate(task) && sameCanonicalIdentity(todoistCanonicalIdentity(task), identity));
     const eligible: TodoistTask[] = [];
     for (const task of matching) {
+      if (await this.state.syncBlocked(profile, { taskId: task.id })) continue;
       const existing = await this.state.getMappingByTaskAnyProfile(task.id);
       if (!existing) eligible.push(task);
     }
@@ -100,6 +101,7 @@ export class OrphanRecoveringSynchronizer {
     const matching = events.filter((event) => standaloneCalendarOrphanCandidate(event) && sameCanonicalIdentity(calendarCanonicalIdentity(event), identity));
     const eligible: CalendarEvent[] = [];
     for (const event of matching) {
+      if (await this.state.syncBlocked(profile, { eventId: event.id })) continue;
       const existing = await this.state.getMappingByEvent(profile, event.id);
       if (!existing) eligible.push(event);
     }
@@ -157,6 +159,11 @@ export class OrphanRecoveringSynchronizer {
     const blockedEventIds = new Set<string>();
 
     for (const event of delta.items) {
+      const currentMapping = await this.state.getMappingByEvent(delivery.profile, event.id);
+      if (await this.state.syncBlocked(delivery.profile, { eventId: event.id, taskId: currentMapping?.taskId || event.extendedProperties?.shared?.taskId })) {
+        blockedEventIds.add(event.id);
+        continue;
+      }
       if (!standaloneCalendarSource(event)) continue;
       const mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (mapping) {
@@ -181,6 +188,7 @@ export class OrphanRecoveringSynchronizer {
       }
       if (currentMatches.length === 1) {
         const task = currentMatches[0];
+        if (await this.state.syncBlocked(delivery.profile, { taskId: task.id, eventId: event.id })) continue;
         await this.state.putMapping({
           profile: delivery.profile,
           eventId: event.id,
@@ -212,6 +220,7 @@ export class OrphanRecoveringSynchronizer {
       }
       if (historicalMatches.length === 1) {
         const task = historicalMatches[0];
+        if (await this.state.syncBlocked(delivery.profile, { taskId: task.id, eventId: event.id })) continue;
         await this.state.putMapping({
           profile: delivery.profile,
           eventId: event.id,
@@ -281,6 +290,9 @@ export class OrphanRecoveringSynchronizer {
       return;
     }
 
+    const directMapping = await this.state.getMappingByTaskAnyProfile(task.id);
+    if (await this.state.syncBlocked(directMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile, { taskId: task.id })) return;
+
     let mapping = await this.state.getMappingByTaskAnyProfile(task.id);
     const targetProfile = mapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
     const clients = await this.clientFactory(targetProfile);
@@ -290,6 +302,7 @@ export class OrphanRecoveringSynchronizer {
     } else if (standaloneTodoistCandidate(task)) {
       const exact = await clients.calendar.findByTodoistTaskId(task.id);
       if (exact?.status !== "cancelled" && exact) {
+        if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: exact.id })) return;
         mapping = {
           profile: targetProfile,
           eventId: exact.id,
@@ -317,6 +330,7 @@ export class OrphanRecoveringSynchronizer {
         }
         if (currentMatches.length === 1) {
           const event = currentMatches[0];
+          if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: event.id })) return;
           mapping = {
             profile: targetProfile,
             eventId: event.id,
@@ -347,6 +361,7 @@ export class OrphanRecoveringSynchronizer {
             }
             if (historicalMatches.length === 1) {
               const event = historicalMatches[0];
+              if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: event.id })) return;
               mapping = {
                 profile: targetProfile,
                 eventId: event.id,

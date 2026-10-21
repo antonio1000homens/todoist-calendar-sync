@@ -62,6 +62,7 @@ test("Todoist task creation sends project_id but updates do not move projects", 
 });
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor(mapping) {
     this.mapping = mapping;
     this.tombstones = new Map();

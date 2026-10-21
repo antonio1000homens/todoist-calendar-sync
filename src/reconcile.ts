@@ -1,54 +1,91 @@
 import type { Handler } from "aws-lambda";
-import { requestReconciliation } from "./queue.js";
-import { StateRepository } from "./repository.js";
+import { ManualInterventionService } from "./manual-intervention.js";
+import { reconciliationRunStatus, StateRepository } from "./repository.js";
+import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
+import { ManualDecisionStore } from "./manual-intervention.js";
+import { ReviewStore } from "./review-store.js";
 import type { Profile } from "./types.js";
 
 const profileList: Profile[] = ["home", "antonio", "work"];
+const QUEUED_ALERT_MS = 10 * 60_000;
+const RUNNING_ALERT_MS = 15 * 60_000;
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
-  console.log(JSON.stringify({ service: "todoist-calendar-sync-reconciler", event, ...detail }));
+  console.log(JSON.stringify({ service: "todoist-calendar-sync-health", event, ...detail }));
 }
 
-/**
- * Hourly safety net. Each profile gets its own durable reconciliation request
- * and FIFO lane so one broken provider/profile cannot prevent the remaining
- * profiles from being assessed. Existing pending work is coalesced/recovered.
- */
-export const handler: Handler = async (_event, context) => {
-  const state = new StateRepository();
-  log("scheduled_reconciliation_tick", { awsRequestId: context.awsRequestId, profiles: profileList });
-
+/** Read-only provider health watchdog. It never enqueues reconciliation work. */
+export async function checkReconciliationHealth(
+  state: StateRepository, manual: ManualInterventionService, profiles: Profile[] = profileList,
+): Promise<void> {
   for (const profile of profileList) {
     try {
-      const result = await requestReconciliation(state, profile, "scheduled");
-      if (result.enqueueError) {
-        console.error(JSON.stringify({
-          service: "todoist-calendar-sync-reconciler",
-          event: "scheduled_reconciliation_enqueue_deferred",
-          awsRequestId: context.awsRequestId,
-          profile,
-          result,
-          note: "Pending DynamoDB state is retained and will be retried by the next webhook or scheduled tick.",
-        }));
-      } else {
-        log(result.coalesced ? "scheduled_reconciliation_coalesced" : "scheduled_reconciliation_requested", {
-          awsRequestId: context.awsRequestId,
-          profile,
-          result,
-        });
+      const current = await state.getReconciliationState(profile);
+      // Notifications belong to generations, so a new run cannot hide an
+      // undelivered outcome from an earlier one.
+      if (manual.enabled) {
+        if (current?.notificationPending) await state.preserveReconciliationOutcome(current);
+        const outcomes = await state.listPendingReconciliationOutcomes(profile);
+        for (const outcome of outcomes) {
+          try {
+            await deliverPendingReconciliationOutcome(state, manual, outcome);
+          } catch (error) {
+            log("outcome_notification_retry_failed", { profile, generation: outcome.generation, error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        const reviewStore = new ReviewStore();
+        for (const operation of await reviewStore.pendingNotifications(profile)) {
+          try {
+            const reviewCase = await reviewStore.getCase(operation.preview.intent.caseId);
+            const decisionId = reviewCase?.decision?.decisionId;
+            const decision = decisionId ? await new ManualDecisionStore().get(decisionId) : undefined;
+            const status = operation.status === "succeeded" ? "Succeeded"
+              : operation.status === "needs_review" ? "Needs review" : "Failed";
+            const text = operation.notificationText || status + ": " + (operation.verified?.length || 0) + " pairs verified"
+              + (operation.error ? ". " + operation.error : "");
+            const replyTs = await manual.deliverReconciliationOutcome(
+              decision?.slackChannelId, decision?.slackMessageTs, operation.notificationReplyTs, text,
+            );
+            await reviewStore.completeNotification(operation.id, replyTs);
+          } catch (error) {
+            log("repair_outcome_notification_retry_failed", { profile, operationId:operation.id, error:error instanceof Error ? error.message : String(error) });
+          }
+        }
       }
+      if (!current) continue;
+      const runStatus = reconciliationRunStatus(current);
+
+      if (!current.pending || !["queued", "running", "failed"].includes(runStatus)) continue;
+      const last = runStatus === "running"
+        ? current.lastProgressAt || current.lastStartedAt
+        : current.lastEnqueuedAt || current.requestedAt;
+      const ageMs = last ? Date.now() - Date.parse(last) : Number.POSITIVE_INFINITY;
+      const threshold = runStatus === "running" ? RUNNING_ALERT_MS : QUEUED_ALERT_MS;
+      const stale = runStatus === "failed" || ageMs >= threshold;
+
+      if (!stale) {
+        if (current.lastHealthAlertAt) await state.clearReconciliationHealthAlert(profile, current.generation);
+        continue;
+      }
+      if (current.lastHealthAlertAt || !manual.enabled) continue;
+
+      const detail = runStatus === "failed"
+        ? `The previous run failed: ${current.lastError || "unknown error"}. Click to start a fresh generation after addressing the cause.`
+        : `${runStatus} for ${Math.floor(ageMs / 60_000)} minutes without progress. Click to request a fresh manual reconciliation.`;
+      const delivered = await manual.alertReconciliationNeeded(profile, current.generation, current.slackChannelId, detail);
+      if (!delivered) continue;
+      await state.markReconciliationHealthAlert(profile, current.generation);
+      log("reconciliation_health_alerted", { profile, generation: current.generation, status: runStatus, ageMs });
     } catch (error) {
       console.error(JSON.stringify({
-        service: "todoist-calendar-sync-reconciler",
-        event: "scheduled_reconciliation_profile_failed",
-        awsRequestId: context.awsRequestId,
-        profile,
-        error: {
-          name: error instanceof Error ? error.name : "Error",
-          message: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        },
+        service: "todoist-calendar-sync-health", event: "profile_health_check_failed", profile,
+        error: error instanceof Error ? error.message : String(error),
       }));
     }
   }
+}
+
+export const handler: Handler = async (_event, context) => {
+  log("reconciliation_health_check", { awsRequestId: context.awsRequestId, profiles: profileList });
+  await checkReconciliationHealth(new StateRepository(), new ManualInterventionService());
 };

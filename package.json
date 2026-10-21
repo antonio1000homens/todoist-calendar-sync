@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:review": "mkdir -p cloudflare/calendar-sync/public/review && cp review-ui/index.html cloudflare/calendar-sync/public/review/index.html && cp review-ui/review.css cloudflare/calendar-sync/public/review/review.css && esbuild review-ui/main.tsx --bundle --minify --format=esm --target=es2022 --outfile=cloudflare/calendar-sync/public/review/review.js",
     "test": "npm run build && node --import ./test/setup-env.mjs --test test/**/*.test.mjs",
     "e2e:production": "npm run build --silent && node scripts/production-e2e.mjs",
     "migrate:project-comments": "npm run build --silent && node scripts/project-comment-migration.mjs",
@@ -17,14 +18,19 @@
     "check:public": "bash scripts/check-public-source.sh"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1141.0",
+    "@aws-sdk/client-dynamodb": "^3.1152.0",
     "@aws-sdk/client-sqs": "^3.1152.0",
-    "@aws-sdk/client-ssm": "^3.1149.0",
-    "@aws-sdk/lib-dynamodb": "^3.1141.0"
+    "@aws-sdk/client-ssm": "^3.1152.0",
+    "@aws-sdk/lib-dynamodb": "^3.1141.0",
+    "jose": "^6.2.13",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.164",
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
     "wrangler": "^4.151.0"

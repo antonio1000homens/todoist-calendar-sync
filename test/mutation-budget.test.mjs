@@ -15,12 +15,15 @@ function mockClients(calls) {
       async getEvent() { calls.push("calendar.getEvent"); return { id: "event" }; },
       async listInstances() { calls.push("calendar.listInstances"); return []; },
       async upsertEvent(event) { calls.push("calendar.upsertEvent"); return { ...event, id: event.id || "event" }; },
+      async createRepairEventOnce(event) { calls.push("calendar.createRepairEventOnce"); return event; },
       async deleteEvent() { calls.push("calendar.deleteEvent"); },
     },
     todoist: {
       async listTasks() { calls.push("todoist.listTasks"); return []; },
       async getTask() { calls.push("todoist.getTask"); return { id: "task", content: "Task" }; },
       async upsertTask(task) { calls.push("todoist.upsertTask"); return { ...task, id: "task" }; },
+      async createTaskOnce(task) { calls.push("todoist.createTaskOnce"); return { ...task, id: "task" }; },
+      async moveTask() { calls.push("todoist.moveTask"); },
       async updateRecurringOccurrence(task) { calls.push("todoist.updateRecurringOccurrence"); return task; },
       async deleteTask() { calls.push("todoist.deleteTask"); },
       async upsertComment() { calls.push("todoist.upsertComment"); return { id: "comment" }; },
@@ -104,10 +107,29 @@ test("methods with an internal write fallback reserve their worst-case cost befo
 test("worker uses the same budgeted client factory for every reconciliation mutation path", async () => {
   const workerSource = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
   assert.match(workerSource, /const mutationBudget = new ReconciliationMutationBudget\(\)/);
-  assert.match(workerSource, /const budgetedClientFactory = createBudgetedClientFactory\(mutationBudget, defaultProviderClientFactory\)/);
+  assert.match(workerSource, /clientFactory: ProviderClientFactory = defaultProviderClientFactory/);
+  assert.match(workerSource, /const budgetedClientFactory = createBudgetedClientFactory\(mutationBudget, clientFactory\)/);
   assert.match(workerSource, /new SnapshotReconciler\([\s\S]*?budgetedClientFactory/);
   assert.match(workerSource, /new ProjectAwareSynchronizer\(state, undefined, budgetedClientFactory\)/);
   assert.match(workerSource, /new Synchronizer\(state, undefined, budgetedClientFactory\)/);
-  assert.match(workerSource, /reconcileUnmappedCalendar\([\s\S]*?defaultProviderClientFactory,[\s\S]*?mutationBudget/);
+  assert.match(workerSource, /reconcileUnmappedCalendar\([\s\S]*?clientFactory,[\s\S]*?mutationBudget/);
   assert.match(workerSource, /if \(mutationBudget\.exhausted\) return deferForMutationBudget\("mapped_state"\)/);
+});
+
+test("repair creation and project moves cannot bypass the shared mutation ceiling", async () => {
+  const calls = [];
+  const budget = new ReconciliationMutationBudget(3);
+  const clients = await createBudgetedClientFactory(budget, async () => mockClients(calls))("home");
+  await clients.calendar.createRepairEventOnce({ id: "event" }, "repair");
+  await clients.todoist.createTaskOnce({ content: "Task" }, "request");
+  await clients.todoist.moveTask("task", "project");
+  assert.equal(budget.used, 3);
+  for (const write of [
+    () => clients.calendar.createRepairEventOnce({ id: "other" }, "repair"),
+    () => clients.todoist.createTaskOnce({ content: "Other" }, "other-request"),
+    () => clients.todoist.moveTask("other", "other-project"),
+  ]) {
+    await assert.rejects(async () => write(), MutationBudgetExhaustedError);
+  }
+  assert.deepEqual(calls, ["calendar.createRepairEventOnce", "todoist.createTaskOnce", "todoist.moveTask"]);
 });

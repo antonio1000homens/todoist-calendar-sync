@@ -106,6 +106,8 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
   let deltaItems = [];
 
   const state = {
+    async syncBlocked() { return false; },
+    async getMappingByTaskAnyProfile(taskId) { return activeMapping?.taskId === taskId ? structuredClone(activeMapping) : undefined; },
     async getMappingByTask(_profile, taskId) { return activeMapping?.taskId === taskId ? structuredClone(activeMapping) : undefined; },
     async getMappingByEvent(_profile, eventId) { return activeMapping?.eventId === eventId ? structuredClone(activeMapping) : undefined; },
     async deleteMapping(value) { if (activeMapping?.taskId === value.taskId && activeMapping?.eventId === value.eventId) activeMapping = undefined; },
@@ -181,6 +183,8 @@ test("rechecks completion immediately before Calendar-to-Todoist mutation", asyn
   const audits = [];
 
   const state = {
+    async syncBlocked() { return false; },
+    async getMappingByTaskAnyProfile() { return mapping; },
     async getCompletedCalendarProjectionByEvent() {
       completionReads += 1;
       return completionReads === 1 ? undefined : marker;
@@ -369,6 +373,8 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   };
   let saved;
   const state = {
+    async syncBlocked() { return false; },
+    async getMappingByTaskAnyProfile() { return structuredClone(original); },
     async acceptTaskVersion() { return true; },
     async getCalendarProjectionTombstone() { return undefined; },
     async getMappingByTask() { return structuredClone(original); },

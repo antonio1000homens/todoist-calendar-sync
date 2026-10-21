@@ -7,7 +7,7 @@ import {
 import { documentClient, pacedScan } from "./dynamodb-capacity.js";
 import { secureParameter } from "./config.js";
 import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBudgetExhausted, ReconciliationMutationBudget, type ProviderClientFactory } from "./mutation-budget.js";
-import { enqueueDelivery, requestReconciliation } from "./queue.js";
+import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResult } from "./queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -16,6 +16,7 @@ import { normalizedText } from "./security.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
+import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -33,6 +34,9 @@ class ManualCircuitOpenError extends Error {
     super(`Manual intervention blocked by the mutation circuit for ${profile} before ${operation}`);
     this.name = "ManualCircuitOpenError";
   }
+}
+class ManualSyncBlockedError extends Error {
+  constructor() { super("An affected item or pairing is protected by a repair, exclusion, or rejected link. Use the review page to resolve it."); this.name = "ManualSyncBlockedError"; }
 }
 
 export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled" | "expired";
@@ -213,31 +217,31 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Reconciliation reached the provider mutation cap",
     severity: "info",
     detection: "operational",
-    actions: actions(["reconcile_now", "Request another reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Request another reconciliation"]),
   },
   operational_circuit_open: {
     title: "Sync circuit breaker is open",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Retry through normal reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Retry through normal reconciliation"]),
   },
   operational_reconciliation_stuck: {
-    title: "Reconciliation has remained pending too long",
+    title: "Reconciliation needed",
     severity: "warning",
     detection: "future",
     actions: actions(["reconcile_now", "Resume reconciliation"]),
   },
   operational_dlq: {
-    title: "A sync delivery was quarantined",
+    title: "Reconciliation needed — a sync delivery was quarantined",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Request fresh reconciliation", false, true]),
+    actions: actions(["reconcile_now", "Request fresh reconciliation"]),
   },
   operational_provider_auth: {
     title: "Provider authentication or authorization failed",
     severity: "warning",
     detection: "operational",
-    actions: actions(["reconcile_now", "Retry after credentials are fixed", false, true]),
+    actions: actions(["reconcile_now", "Retry after credentials are fixed"]),
   },
   operational_partial_mutation: {
     title: "Provider and mapping state may be partially applied",
@@ -325,7 +329,11 @@ function decisionKey(profile: Profile, type: ManualDecisionType, identity: Recor
 }
 
 function providerNotFound(error: unknown): boolean {
-  return [404, 410].includes(Number((error as { status?: number }).status));
+  const provider = error as { status?: number; body?: string };
+  if (Number(provider.status) === 404) return true;
+  if (Number(provider.status) !== 410) return false;
+  try { return JSON.parse(provider.body || "").error?.errors?.[0]?.reason === "deleted"; }
+  catch { return false; }
 }
 
 function eventStart(event: CalendarEvent): string | undefined {
@@ -370,7 +378,10 @@ export class ManualDecisionStore {
     const current = await this.get(input.decisionId);
     // Deterministic decisions are one-shot history. A repeated detector with the
     // same state fingerprint must never overwrite a terminal decision.
-    if (current) return { decision: current, created: false };
+    if (current) {
+      await new ReviewStore().observeDecision(current);
+      return { decision: current, created: false };
+    }
     const decision: ManualDecision = {
       ...input,
       status: "pending",
@@ -386,6 +397,7 @@ export class ManualDecisionStore {
         expiresAt: epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    await new ReviewStore().observeDecision(decision);
     return { decision, created: true };
   }
 
@@ -445,6 +457,12 @@ export class ManualDecisionStore {
         ":expiresAt": epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    const decision = await this.get(decisionId);
+    if (decision) {
+      const reviewStatus = status === "resolved" ? "resolved" : status === "expired" ? "dismissed" : "open";
+      try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
+      catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
+    }
   }
 }
 
@@ -453,6 +471,7 @@ interface SlackApiResponse {
   error?: string;
   channel?: string;
   ts?: string;
+  permalink?: string;
 }
 
 function slackEnabled(): boolean {
@@ -467,7 +486,7 @@ function defaultSlackChannel(): string {
   return process.env.TODOIST_CALENDAR_SYNC_SLACK_CHANNEL || "#aws-slack-alerts";
 }
 
-async function slackApi(method: "chat.postMessage" | "chat.update", payload: Record<string, unknown>): Promise<SlackApiResponse> {
+async function slackApi(method: "chat.postMessage" | "chat.update" | "chat.getPermalink", payload: Record<string, unknown>): Promise<SlackApiResponse> {
   const response = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
@@ -774,6 +793,11 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
       })),
     });
   }
+  blocks.push({ type:"actions", elements:[{
+    type:"button", action_id:"gcp_sync_decision_open_review",
+    text:{type:"plain_text",text:"Open review"},
+    url:"https://calendar-sync.alf-broadcast.co.uk/review/?case=" + encodeURIComponent(decision.decisionId),
+  }] });
   blocks.push(technicalContextBlock(decision));
   return blocks;
 }
@@ -781,15 +805,17 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
 export class SlackManualNotifier {
   constructor(private readonly store = new ManualDecisionStore()) {}
 
-  async postDecision(decision: ManualDecision): Promise<void> {
-    if (!slackEnabled()) return;
+  async postDecision(decision: ManualDecision): Promise<boolean> {
+    if (!slackEnabled()) return false;
     try {
       const result = await slackApi("chat.postMessage", {
         channel: decision.slackChannelId || defaultSlackChannel(),
         text: MANUAL_DECISION_CATALOG[decision.type].title,
         blocks: decisionBlocks(decision),
       });
-      if (result.channel && result.ts) await this.store.setSlackLocation(decision.decisionId, result.channel, result.ts);
+      if (!result.channel || !result.ts) return false;
+      await this.store.setSlackLocation(decision.decisionId, result.channel, result.ts);
+      return true;
     } catch (error) {
       console.error(JSON.stringify({
         service: "todoist-calendar-sync-manual",
@@ -797,16 +823,45 @@ export class SlackManualNotifier {
         decisionId: decision.decisionId,
         error: error instanceof Error ? error.message : String(error),
       }));
+      return false;
     }
   }
 
-  async postText(text: string, channel?: string): Promise<void> {
-    if (!slackEnabled()) return;
+  async postText(text: string, channel?: string, threadTs?: string): Promise<string | undefined> {
+    if (!slackEnabled()) return undefined;
     try {
-      await slackApi("chat.postMessage", { channel: channel || defaultSlackChannel(), text });
+      const result = await slackApi("chat.postMessage", { channel: channel || defaultSlackChannel(), text, ...(threadTs ? { thread_ts: threadTs } : {}) });
+      return result.ts;
     } catch (error) {
       console.error(JSON.stringify({ service: "todoist-calendar-sync-manual", event: "slack_status_post_failed", error: error instanceof Error ? error.message : String(error) }));
+      throw error;
     }
+  }
+
+  async reconciliationOutcome(channel: string | undefined, threadTs: string | undefined, text: string): Promise<string | undefined> {
+    return this.postText(text, channel, threadTs);
+  }
+
+  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false, decision?: ManualDecision): Promise<void> {
+    if (!slackEnabled() || !channel || !messageTs) return;
+    const blocks = !close && decision
+      ? [{ type: "section", text: { type: "mrkdwn", text } }, ...decisionBlocks(decision)]
+      : [];
+    await slackApi("chat.update", { channel, ts: messageTs, text, blocks });
+  }
+
+  async reconciliationLocation(channel: string, threadTs: string): Promise<string> {
+    const result = await slackApi("chat.getPermalink", { channel, message_ts: threadTs });
+    if (!result.permalink) throw new Error("Slack did not return the active reconciliation permalink");
+    return `<${result.permalink}|active reconciliation thread>`;
+  }
+
+  async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
+    if (replyTs && channel) {
+      await slackApi("chat.update", { channel, ts: replyTs, text });
+      return replyTs;
+    }
+    return this.postText(text, channel, threadTs);
   }
 
   async updateResolution(decision: ManualDecision, text: string, blocks?: unknown[]): Promise<void> {
@@ -843,6 +898,47 @@ export class ManualInterventionService {
     return slackEnabled();
   }
 
+  async reconciliationOutcome(channel: string | undefined, threadTs: string | undefined, text: string): Promise<string | undefined> {
+    return this.notifier.reconciliationOutcome(channel, threadTs, text);
+  }
+
+  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false, decisionId?: string): Promise<void> {
+    const decision = decisionId ? await this.store.get(decisionId) : undefined;
+    return this.notifier.updateReconciliationIncident(channel, messageTs, text, close, decision);
+  }
+
+  async finishReconciliationDecision(decisionId: string, text: string): Promise<void> {
+    try {
+      await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
+    } catch (error) {
+      if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
+      const existing = await this.store.get(decisionId);
+      if (existing?.status !== "resolved") throw error;
+    }
+  }
+
+  async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
+    return this.notifier.deliverReconciliationOutcome(channel, threadTs, replyTs, text);
+  }
+
+  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string): Promise<boolean> {
+    const decisionId = `${profile}-operational_reconciliation_stuck-${fingerprint({ identity })}`;
+    const existing = await this.store.get(decisionId);
+    if (existing) {
+      if (existing.status !== "pending" || existing.slackMessageTs) return true;
+      return this.notifier.postDecision({ ...existing, slackChannelId: channel || existing.slackChannelId });
+    }
+    const now = isoNow();
+    const decision: ManualDecision = {
+      decisionId, profile, type: "operational_reconciliation_stuck", severity: "warning", status: "pending",
+      createdAt: now, decisionDeadline: plusDays(DEFAULT_DECISION_DEADLINE_DAYS), context: { identity, detail },
+      fingerprint: fingerprint({ identity }), permittedActions: MANUAL_DECISION_CATALOG.operational_reconciliation_stuck.actions,
+      ...(channel ? { slackChannelId: channel } : {}),
+    };
+    await this.store.putPending(decision);
+    return this.notifier.postDecision(decision);
+  }
+
   private async providerClients(profile: Profile) {
     return (this.executionClientFactory || this.clients)(profile);
   }
@@ -850,7 +946,32 @@ export class ManualInterventionService {
   private createManualExecutionClientFactory(
     state: StateRepository,
     budget: ReconciliationMutationBudget,
+    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision },
   ): ProviderClientFactory {
+    const recheckProtectedItems = async (profile: Profile) => {
+      const current = await this.store.get(protectedItems.decision.decisionId);
+      if (!current || current.status !== "pending" || current.fingerprint !== protectedItems.decision.fingerprint
+        || current.taskId !== protectedItems.decision.taskId || current.eventId !== protectedItems.decision.eventId) {
+        throw new ManualSyncBlockedError();
+      }
+      const sourceTaskId = protectedItems.decision.taskId;
+      const sourceEventId = protectedItems.decision.eventId;
+      if (sourceTaskId && sourceEventId) {
+        const lookupByEvent = typeof state.getMappingByEvent === "function"
+          ? state.getMappingByEvent.bind(state) : async () => undefined;
+        const [byTask, byEvent] = await Promise.all([
+          state.getMappingByTask(profile, sourceTaskId), lookupByEvent(profile, sourceEventId),
+        ]);
+        if ((byTask && byTask.eventId !== sourceEventId) || (byEvent && byEvent.taskId !== sourceTaskId)) {
+          throw new ManualSyncBlockedError();
+        }
+      }
+      for (const taskId of protectedItems.taskIds) {
+        if (await state.syncBlocked(profile, { taskId })) throw new ManualSyncBlockedError();
+        for (const eventId of protectedItems.eventIds) if (await state.syncBlocked(profile, { taskId, eventId })) throw new ManualSyncBlockedError();
+      }
+      for (const eventId of protectedItems.eventIds) if (await state.syncBlocked(profile, { eventId })) throw new ManualSyncBlockedError();
+    };
     const budgeted = createBudgetedClientFactory(budget, this.clients);
     const circuitWrapped = <T extends object>(target: T, profile: Profile, mutatingMethods: Set<string>): T => new Proxy(target, {
       get(current, property, receiver) {
@@ -859,6 +980,11 @@ export class ManualInterventionService {
         const operation = String(property);
         if (!mutatingMethods.has(operation)) return value.bind(current);
         return async (...args: unknown[]) => {
+          const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
+            ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
+            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
+          await recheckProtectedItems(profile);
+          if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
           if (!await state.mutationAllowed(profile)) throw new ManualCircuitOpenError(profile, operation);
           const result = await Reflect.apply(value, current, args);
           // Count every successful provider write, including each item in a bounded bulk action.
@@ -928,7 +1054,10 @@ export class ManualInterventionService {
       context: decisionContext,
       ...fields,
     });
-    if (mode === "prompt" && result.created) await this.notifier.postDecision(result.decision);
+    if (mode === "prompt" && (result.created
+      || (effective.mode === "auto" && result.decision.status === "pending" && !result.decision.slackMessageTs))) {
+      await this.notifier.postDecision(result.decision);
+    }
     if (mode === "auto" && defaultAction && result.decision.status === "pending") {
       await enqueueDelivery({
         id: `manual:${profile}:${result.decision.decisionId}:${defaultAction}:auto:${Date.now()}`,
@@ -1258,16 +1387,15 @@ export class ManualInterventionService {
     ];
   }
 
-  private async finishAndReconcile(
+  private async finishResolutionWithoutReconciliation(
     decision: ManualDecision,
     state: StateRepository,
     resolution: string,
     slackUserId?: string,
   ): Promise<void> {
     await this.store.finish(decision.decisionId, "resolved", resolution, slackUserId);
-    const reconcile = await requestReconciliation(state, decision.profile, "manual");
     const resolvedBy = slackUserId === "AUTO_POLICY" ? "saved intervention policy" : slackUserId ? `<@${slackUserId}>` : "operator";
-    const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nReconciliation: ${reconcile.coalesced ? "coalesced" : reconcile.queued ? "queued" : "pending"}`;
+    const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nA full reconciliation was not started. Use the reconciliation action when you are ready to verify provider state.`;
     const policyBlocks = slackUserId === "AUTO_POLICY" ? [] : (this.resolutionPolicyBlocks(decision, resolution) || []);
     await this.notifier.updateResolution(decision, text, decisionResolutionBlocks(decision, text, policyBlocks));
   }
@@ -1275,17 +1403,33 @@ export class ManualInterventionService {
   private async retryConflictReconciliation(
     decision: ManualDecision,
     state: StateRepository,
+    slackUserId?: string,
   ): Promise<void> {
-    const result = await requestReconciliation(state, decision.profile, "manual");
-    const outcome = result.coalesced ? "already pending/coalesced" : result.queued ? "queued" : "pending";
-    const enqueueError = result.enqueueError ? ` Queue error: ${result.enqueueError}` : "";
-    const text = `🔄 Guarded reconciliation ${outcome}.${enqueueError} This decision remains open until reconciliation verifies that the conflict is resolved; if the conflict remains, this card stays available for review.`;
-    const blocks = decisionBlocks(decision);
-    blocks.splice(Math.max(0, blocks.length - 1), 0, {
-      type: "section",
-      text: { type: "mrkdwn", text },
+    // Old queued policy deliveries must not bypass explicit Slack consent.
+    if (slackUserId === "AUTO_POLICY") {
+      await this.notifier.postDecision({ ...decision, permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions });
+      return;
+    }
+    const result = await requestReconciliation(state, decision.profile, "manual", undefined, {
+      requester: slackUserId || "operator",
+      slackChannelId: decision.slackChannelId,
+      slackMessageTs: decision.slackMessageTs,
+      slackThreadTs: decision.slackMessageTs,
+      slackDecisionId: decision.decisionId,
     });
-    await this.notifier.updateResolution(decision, text, blocks);
+    const text = await this.reconciliationAcknowledgement(result);
+    await this.notifier.reconciliationOutcome(decision.slackChannelId, decision.slackMessageTs, text);
+  }
+
+  private async reconciliationAcknowledgement(result: ReconciliationRequestResult): Promise<string> {
+    if (result.enqueueError) return `Reconciliation could not be queued: ${result.enqueueError}`;
+    if (result.coalesced) {
+      const location = result.slackChannelId && result.slackThreadTs
+        ? await this.notifier.reconciliationLocation(result.slackChannelId, result.slackThreadTs)
+        : "status command";
+      return `Reconciliation already active. This request joined generation ${result.generation}. Follow its progress and final outcome in the ${location}.`;
+    }
+    return "Reconciliation queued. I’ll post the final outcome in this thread.";
   }
 
   /**
@@ -1418,7 +1562,7 @@ export class ManualInterventionService {
       }).catch(() => undefined);
       throw error;
     }
-    return this.finishAndReconcile(decision, state, action, slackUserId);
+    return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
   }
 
   /** User-confirmed, future-only recurrence ownership change (#84). */
@@ -1487,13 +1631,13 @@ export class ManualInterventionService {
             ? decision.context.calendarRecurrenceRule : undefined,
         },
       );
-      await this.finishAndReconcile(decision, state, "split_future_todoist", slackUserId);
+      await this.finishResolutionWithoutReconciliation(decision, state, "split_future_todoist", slackUserId);
       await this.notifier.postText(
         `✅ Calendar history was retained through *${result.plan.previousOccurrence}*. The old yearly series now ends before ${result.plan.nextOldOccurrence}; the future ${result.plan.newRule} recurrence starts on *${result.plan.newStart}*. Old master \`${result.plan.oldMasterId}\`, new master \`${result.plan.newMasterId}\`.`,
         decision.slackChannelId,
       );
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) throw error;
       await state.audit(decision.profile, "manual_future_series_split_incomplete", {
         taskId: task.id, oldMasterId: old.id, decisionId: decision.decisionId,
         reason: error instanceof Error ? error.message : String(error),
@@ -1600,13 +1744,13 @@ export class ManualInterventionService {
 
     if (action === "restore_todoist_task") {
       await this.restoreTodoistFromEvent(decision, mapping, state);
-      return this.finishAndReconcile(decision, state, "restore_todoist_task", slackUserId);
+      return this.finishResolutionWithoutReconciliation(decision, state, "restore_todoist_task", slackUserId);
     }
 
     if (decision.type === "standalone_todoist_task_deleted" && action === "delete_calendar_event") {
       await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
       await state.deleteMapping(mapping);
-      return this.finishAndReconcile(decision, state, action, slackUserId);
+      return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
     }
 
     if (decision.type === "todoist_owned_recurrence_task_deleted") {
@@ -1614,12 +1758,12 @@ export class ManualInterventionService {
         await pair.calendar.deleteEvent(mapping.masterEventId || mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         await state.deleteMapping(mapping);
         if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
-        return this.finishAndReconcile(decision, state, action, slackUserId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
       if (action === "keep_calendar_unlinked") {
         await state.deleteMapping(mapping);
         if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
-        return this.finishAndReconcile(decision, state, action, slackUserId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
     }
 
@@ -1628,7 +1772,7 @@ export class ManualInterventionService {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         await state.deleteMapping(mapping);
         if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
-        return this.finishAndReconcile(decision, state, action, slackUserId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "delete_this_and_future") {
@@ -1652,7 +1796,7 @@ export class ManualInterventionService {
         }
         await state.deleteMapping(mapping);
         if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
-        return this.finishAndReconcile(decision, state, action, slackUserId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "skip_occurrence") {
@@ -1683,7 +1827,7 @@ export class ManualInterventionService {
         } else if (mapping.seriesId) {
           await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         }
-        return this.finishAndReconcile(decision, state, action, slackUserId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
     }
 
@@ -1732,7 +1876,7 @@ export class ManualInterventionService {
     };
     await state.putMapping(mapping);
     if (recurring && mapping.seriesId) await state.putRecurrenceLink(recurrenceLink(mapping));
-    return this.finishAndReconcile(decision, state, action, slackUserId);
+    return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
   }
 
   private async resolveBothSidesChanged(
@@ -1772,7 +1916,7 @@ export class ManualInterventionService {
         await state.putMapping({ ...mapping, eventId: recreated.id, updatedAt: isoNow() });
       }
     } else throw new Error(`Unsupported conflict action ${action}`);
-    return this.finishAndReconcile(decision, state, action, slackUserId);
+    return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
   }
 
   async processManualDelivery(delivery: Delivery, state: StateRepository): Promise<void> {
@@ -1782,8 +1926,21 @@ export class ManualInterventionService {
     if (manual.command) {
       const channel = manual.slackChannelId;
       if (manual.command === "reconcile_now" || manual.command === "resume_pending_reconciliation") {
-        const result = await requestReconciliation(state, delivery.profile, "manual");
-        await this.notifier.postText(`🔄 Reconciliation for *${delivery.profile}*: ${result.coalesced ? "already pending/coalesced" : result.queued ? "queued" : "pending"}${result.enqueueError ? ` — enqueue error: ${result.enqueueError}` : ""}`, channel);
+        if (manual.slackUserId === "AUTO_POLICY") {
+          await this.notifier.postText("Reconciliation requires an explicit request in Slack.", channel);
+          return;
+        }
+        const threadTs = await this.notifier.postText(`Reconciliation queued for *${delivery.profile}*. I’ll post the final outcome in this thread.`, channel, manual.slackMessageTs);
+        const result = await requestReconciliation(state, delivery.profile, "manual", undefined, {
+          requester: manual.slackUserId || "operator", slackChannelId: channel,
+          slackMessageTs: threadTs || manual.slackMessageTs,
+          slackThreadTs: manual.slackMessageTs || threadTs,
+        });
+        if (result.enqueueError || result.coalesced) {
+          const text = await this.reconciliationAcknowledgement(result);
+          await this.notifier.updateReconciliationIncident(channel, threadTs, text);
+          await this.notifier.reconciliationOutcome(channel, manual.slackMessageTs || threadTs, text);
+        }
         return;
       }
       if (manual.command === "show_status") {
@@ -1979,15 +2136,21 @@ export class ManualInterventionService {
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
     const budget = new ReconciliationMutationBudget(MAX_MANUAL_BULK_MUTATIONS);
-    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget);
+    const mapping = decision.mappingSnapshot;
+    const taskIds = [...new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)))];
+    const eventIds = [...new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)))];
+    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget, { taskIds, eventIds, decision });
     try {
       if (manual.action === "reconcile_now") {
-        if (["todoist_unmapped_conflict", "todoist_cancelled_projection_blocked"].includes(decision.type)) {
-          await this.retryConflictReconciliation(decision, state);
-        } else {
-          await this.finishAndReconcile(decision, state, manual.action, manual.slackUserId);
-        }
+        await this.retryConflictReconciliation(decision, state, manual.slackUserId);
         return;
+      }
+      if (!["acknowledge","keep_separate"].includes(manual.action)) {
+        for (const taskId of taskIds) {
+          if (await state.syncBlocked(decision.profile, { taskId })) throw new ManualSyncBlockedError();
+          for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { taskId, eventId })) throw new ManualSyncBlockedError();
+        }
+        for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { eventId })) throw new ManualSyncBlockedError();
       }
       if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
         await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);
@@ -2020,7 +2183,7 @@ export class ManualInterventionService {
       }
       throw new Error(`Decision type ${decision.type} does not yet have an execution handler`);
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) {
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) {
         await state.audit(decision.profile, "manual_action_deferred_safety", {
           decisionId: decision.decisionId,
           action: manual.action,

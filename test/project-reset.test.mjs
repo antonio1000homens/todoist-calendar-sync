@@ -8,6 +8,7 @@ const TASK_ID = "6hCr44chgHx8Qr2f";
 const CANCELLED_EVENT_ID = "5nu5jid0nm3b6970lf7i8cqs6o";
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor() {
     this.mapping = undefined;
     this.tombstones = new Map([[`home:${TASK_ID}`, { sourceUpdatedAt: "2026-09-03T13:09:00Z" }]]);

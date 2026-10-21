@@ -6,6 +6,7 @@ import { ProjectAwareSynchronizer } from "../dist/project-sync.js";
 const HOME = profiles.home.todoistProjectId;
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor(mapping) {
     this.mapping = mapping;
     this.audits = [];

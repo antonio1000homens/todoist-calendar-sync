@@ -106,7 +106,7 @@ function todoistOwnedOccurrenceIsException(master: CalendarEvent, occurrence: Ca
     || (occurrence.description || "") !== (master.description || "");
 }
 
-function todoistOccurrenceProjection(task: TodoistTask, existing: CalendarEvent): CalendarEvent {
+export function todoistOccurrenceProjection(task: TodoistTask, existing: CalendarEvent): CalendarEvent {
   // The Todoist task remains recurring, but this write targets one Google
   // instance. Strip recurrence from the projection so Google never interprets
   // an active-occurrence edit as an RRULE/master rewrite.
@@ -313,6 +313,10 @@ export class ProjectAwareSynchronizer {
     if (!rawPayload.event_data?.id) return;
 
     const mapping = await this.state.getMappingByTaskAnyProfile(rawPayload.event_data.id);
+    const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
+    if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {
+      return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: rawPayload.event_data.id });
+    }
     const task = await this.authoritativeTask(delivery, rawPayload, mapping);
     const payload: TodoistWebhookPayload = { ...rawPayload, event_data: task };
     const lifecycle = todoistCalendarLifecycle(payload);
@@ -510,6 +514,10 @@ export class ProjectAwareSynchronizer {
       : destinationCandidate
         ? destinationCandidate.linkedEvent
         : await clients.calendar.findByTodoistTaskId(task.id);
+    if (await this.state.syncBlocked(destinationProfile, { taskId: task.id, eventId: existingEvent?.id || approved?.id })) {
+      await this.state.audit(destinationProfile, "todoist_project_create_sync_control_blocked", { taskId: task.id, eventId: existingEvent?.id });
+      return undefined;
+    }
     if (approved && (!existingEvent || existingEvent.id !== approved.id
       || existingEvent.status !== "confirmed"
       || existingEvent.etag !== approved.etag
@@ -590,6 +598,9 @@ export class ProjectAwareSynchronizer {
       const linked = await sourceClients.calendar.findByTodoistTaskId(task.id);
       if (linked?.status !== "cancelled") eventId = deleteCalendarMaster && linked?.recurringEventId ? linked.recurringEventId : linked?.id;
     }
+    if (eventId && await this.state.syncBlocked(sourceProfile, { taskId: task.id, eventId })) {
+      throw new Error("Source projection is protected by an active repair, exclusion, or rejected-pair decision");
+    }
     await this.state.putCalendarProjectionTombstone(sourceProfile, task.id, task.updated_at || delivery.receivedAt, tombstoneReason);
     if (eventId) {
       await sourceClients.calendar.deleteEvent(eventId).catch((error: unknown) => {
@@ -609,7 +620,9 @@ export class ProjectAwareSynchronizer {
     sourceMapping: Mapping,
   ): Promise<Mapping> {
     const destinationClients = await this.clients(destinationProfile);
+    if (await this.state.syncBlocked(destinationProfile, { taskId: task.id })) throw new Error("Destination item is protected by an active repair or exclusion");
     const existing = await destinationClients.calendar.findByTodoistTaskId(task.id);
+    if (existing && await this.state.syncBlocked(destinationProfile, { taskId: task.id, eventId: existing.id })) throw new Error("Destination pair was explicitly rejected or is protected by a repair");
     let destinationMaster: CalendarEvent | undefined;
     if (existing?.recurringEventId) {
       try {

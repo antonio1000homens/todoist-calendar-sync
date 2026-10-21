@@ -24,6 +24,7 @@ function fakeState() {
     mappings,
     audits,
     get mutations() { return mutations; },
+    async syncBlocked() { return false; },
     async mutationAllowed() { return true; },
     async getMappingByEvent(profile, eventId) { return mappings.find((mapping) => mapping.profile === profile && mapping.eventId === eventId); },
     async getMappingByTaskAnyProfile(taskId) { return mappings.find((mapping) => mapping.taskId === taskId); },

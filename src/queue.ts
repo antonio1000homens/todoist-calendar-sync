@@ -34,14 +34,17 @@ export interface ReconciliationRequestResult {
   coalesced: boolean;
   recoveredPending: boolean;
   enqueueError?: string;
+  slackChannelId?: string;
+  slackThreadTs?: string;
 }
 
 type EnqueueReconciliation = (delivery: Delivery) => Promise<void>;
+export interface ReconciliationRequestContext { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string; }
 
 /**
  * Durably marks a profile dirty before attempting SQS delivery. If the SQS
  * send fails the pending marker remains without a fresh lastEnqueuedAt value;
- * a later webhook or scheduled tick can safely re-enqueue the same generation.
+ * a later explicit Slack request can safely re-enqueue the same generation.
  *
  * enqueue is injectable for behavioral tests; production callers use the FIFO
  * SQS implementation above.
@@ -51,8 +54,13 @@ export async function requestReconciliation(
   profile: Profile,
   reason: ReconciliationReason,
   enqueue: EnqueueReconciliation = enqueueDelivery,
+  context: ReconciliationRequestContext = {},
 ): Promise<ReconciliationRequestResult> {
-  const request = await state.requestReconciliation(profile, reason);
+  const request = await state.requestReconciliation(profile, reason, context);
+  const location = {
+    slackChannelId: request.state.slackChannelId,
+    slackThreadTs: request.state.slackThreadTs || request.state.slackMessageTs,
+  };
   if (!request.shouldEnqueue) {
     return {
       profile,
@@ -62,6 +70,7 @@ export async function requestReconciliation(
       queued: false,
       coalesced: true,
       recoveredPending: false,
+      ...location,
     };
   }
 
@@ -76,6 +85,7 @@ export async function requestReconciliation(
     reconcile: {
       reason,
       generation: request.state.generation,
+      ...context,
     },
   };
 
@@ -90,6 +100,7 @@ export async function requestReconciliation(
       queued: true,
       coalesced: false,
       recoveredPending: !request.created,
+      ...location,
     };
   } catch (error) {
     return {
@@ -100,6 +111,7 @@ export async function requestReconciliation(
       queued: false,
       coalesced: false,
       recoveredPending: !request.created,
+      ...location,
       enqueueError: error instanceof Error ? error.message : String(error),
     };
   }

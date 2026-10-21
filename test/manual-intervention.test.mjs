@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { StateRepository } from '../dist/repository.js';
+import { ReviewStore, SyncControls } from '../dist/review-store.js';
+import { documentClient } from '../dist/dynamodb-capacity.js';
 import {
   decisionBlocks,
   MANUAL_DECISION_CATALOG,
@@ -63,9 +66,12 @@ class FakeNotifier {
     this.updated = [];
     this.text = [];
   }
-  async postDecision(decision) { this.posted.push(decision); }
+  async postDecision(decision) { this.posted.push(decision); return true; }
   async updateResolution(decision, text, blocks) { this.updated.push({ decision, text, blocks }); }
   async postText(text) { this.text.push(text); }
+  async reconciliationOutcome(_channel, _thread, text) { this.text.push(text); }
+  async reconciliationLocation(channel, ts) { return `<https://example.slack.com/archives/${channel}/p${ts.replace('.', '')}|active reconciliation thread>`; }
+  async updateReconciliationIncident(channel, ts, text) { this.updated.push({ channel, ts, text }); }
 }
 
 function mappedCalendarRecurrence() {
@@ -154,6 +160,7 @@ test('mapped explicit Todoist deletion is intercepted before provider mutation i
   const mapping = mappedCalendarRecurrence();
   const audits = [];
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask(profile, taskId) {
       assert.equal(profile, 'antonio');
       assert.equal(taskId, 'task-1');
@@ -193,6 +200,7 @@ test('stale Todoist deletion webhook does not create a prompt when the task alre
   const audits = [];
   const mapping = mappedCalendarRecurrence();
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
@@ -214,6 +222,7 @@ test('terminal deterministic decision is not reopened by the same detector state
   const policies = new FakePolicyStore();
   const mapping = mappedCalendarRecurrence();
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async audit() {},
   };
@@ -251,6 +260,7 @@ test('observe mode detects and blocks a pre-mutation ambiguity without posting S
   const mapping = mappedCalendarRecurrence();
   const audits = [];
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
@@ -272,6 +282,7 @@ test('off mode disconnects the detector and allows the legacy synchronizer path'
   const mapping = mappedCalendarRecurrence();
   const audits = [];
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
@@ -393,6 +404,7 @@ test('manual provider mutation is deferred while normal mutation circuit is open
   const audits = [];
   let calendarWrites = 0;
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async mutationAllowed() { return false; },
     async recordMutation() { throw new Error('recordMutation must not run when circuit is open'); },
@@ -443,6 +455,7 @@ test('calendar_wins recreates a missing Todoist side instead of DLQing the confl
   decisions.decisions.set(decision.decisionId, decision);
   const operations = [];
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async mutationAllowed() { return true; },
     async recordMutation() { operations.push('state:recordMutation'); },
@@ -503,6 +516,7 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   decisions.decisions.set(decision.decisionId, decision);
 
   const state = {
+    async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
     async mutationAllowed() { return true; },
     async deleteMapping() { operations.push('state:deleteMapping'); },
@@ -609,6 +623,7 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
   decisions.decisions.set(decision.decisionId, decision);
   let requested = 0;
   const state = {
+    async syncBlocked() { return false; },
     async requestReconciliation(profile, reason) {
       requested += 1;
       assert.equal(profile, 'antonio');
@@ -631,8 +646,8 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
 
   assert.equal(requested, 1);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
-  assert.match(notifier.updated.at(-1).text, /remains open/);
-  assert.ok(notifier.updated.at(-1).blocks.some((block) => block.type === 'actions'));
+  assert.match(notifier.text.at(-1), /Reconciliation already active/);
+  assert.equal(notifier.updated.length, 0, 'the originating incident card stays open during reconciliation');
 });
 
 test('Calendar-only ambiguity enriches and renders bounded candidate details read-only', async () => {
@@ -678,4 +693,124 @@ test('Calendar-only ambiguity enriches and renders bounded candidate details rea
   assert.match(rendered, /Renewal task/);
   assert.match(rendered, /recurring: yes/);
   assert.doesNotMatch(rendered, /bind_task:/);
+});
+
+test('reconciliation actions cannot be saved as automatic policies', async () => {
+  for (const policy of Object.values(MANUAL_DECISION_CATALOG)) {
+    for (const action of policy.actions.filter((candidate) => candidate.id === 'reconcile_now')) {
+      assert.notEqual(action.autoAllowed, true);
+    }
+  }
+});
+
+test('saved automatic reconciliation policies fall back to an explicit decision', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(decisions, notifier, async () => {
+    throw new Error('provider clients must not be read');
+  }, new FakePolicyStore({ mode: 'auto', defaultAction: 'reconcile_now', source: 'profile' }));
+  await service.observeAudit({ ...todoistDeleteDelivery(), kind: 'reconcile' }, 'antonio', 'reconciliation_circuit_open_deferred', {});
+  assert.equal(notifier.posted.length, 1);
+  assert.equal(notifier.posted[0].policyMode, 'prompt');
+  assert.equal(notifier.posted[0].status, 'pending');
+});
+
+test('old queued AUTO_POLICY reconciliation actions require a new Slack click', async () => {
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const decision = decisionFor('operational_dlq', {
+    permittedActions: [{ id: 'reconcile_now', label: 'Reconcile', autoAllowed: true }],
+  });
+  decisions.decisions.set(decision.decisionId, decision);
+  const service = new ManualInterventionService(decisions, notifier);
+  await service.processManualDelivery({
+    ...todoistDeleteDelivery(), kind: 'manual',
+    manual: { decisionId: decision.decisionId, action: 'reconcile_now', slackUserId: 'AUTO_POLICY' },
+  }, { async requestReconciliation() { throw new Error('automatic reconciliation must not run'); } });
+  assert.equal(notifier.posted.length, 1);
+  assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
+  assert.equal(notifier.posted[0].permittedActions[0].autoAllowed, undefined);
+});
+
+for (const entry of ['decision', 'command']) {
+  test(`coalesced ${entry} requests point to the active run instead of promising another outcome`, async () => {
+    const decisions = new FakeDecisionStore();
+    const notifier = new FakeNotifier();
+    notifier.postText = async (text) => { notifier.text.push(text); return '2.000'; };
+    const decision = decisionFor('operational_dlq', { slackChannelId: 'CSECOND', slackMessageTs: '2.000' });
+    decisions.decisions.set(decision.decisionId, decision);
+    const service = new ManualInterventionService(decisions, notifier);
+    const state = {
+    async syncBlocked() { return false; },
+      async requestReconciliation() {
+        const result = reconciliationState();
+        result.state.slackChannelId = 'CFIRST';
+        result.state.slackThreadTs = '1.000';
+        return result;
+      },
+    };
+    await service.processManualDelivery({
+      ...todoistDeleteDelivery(), kind: 'manual',
+      manual: { slackUserId: 'U123', slackChannelId: 'CSECOND', ...(entry === 'command'
+        ? { command: 'reconcile_now' } : { decisionId: decision.decisionId, action: 'reconcile_now' }) },
+    }, state);
+    assert.match(notifier.text.at(-1), /already active/);
+    assert.match(notifier.text.at(-1), /https:\/\/example.slack.com\/archives\/CFIRST\/p1000/);
+    assert.doesNotMatch(notifier.text.at(-1), /final outcome in this thread/);
+    if (entry === 'command') assert.match(notifier.updated.at(-1).text, /already active/);
+  });
+}
+
+for (const protection of ['activeRepair','excluded','rejectedPair']) {
+  for (const ownRepair of [false,true]) test(`Slack Calendar-wins action respects ${protection} with ownRepair=${ownRepair}`,async t=>{
+    process.env.STATE_TABLE_NAME ||= 'test-state';
+    const decisions=new FakeDecisionStore(),notifier=new FakeNotifier(),writes=[];
+    const decision=decisionFor('both_sides_changed',{decisionId:'protected-pair',taskId:'task-1',eventId:'event-1'});
+    decisions.decisions.set(decision.decisionId,decision);
+    t.mock.method(documentClient,'send',async()=>({}));
+    t.mock.method(ReviewStore.prototype,'get',async pk=>pk.startsWith('REJECTED_PAIR#')&&protection==='rejectedPair'
+      ?{operationId:ownRepair?'repair':'another-repair'}:undefined);
+    t.mock.method(SyncControls.prototype,'control',async()=>({
+      activeRepair:ownRepair?'repair':protection==='activeRepair'?'other-repair':undefined,
+      excluded:protection==='excluded',
+    }));
+    t.mock.method(SyncControls.prototype,'rejected',async()=>protection==='rejectedPair');
+    const state={
+      repairOperationId:ownRepair?'repair':undefined,
+      syncBlocked:StateRepository.prototype.syncBlocked,
+      async getMappingByTask(){return {profile:'antonio',taskId:'task-1',eventId:'event-1'};},
+      async mutationAllowed(){return true;},async recordMutation(){},async audit(){},
+    };
+    const service=new ManualInterventionService(decisions,notifier,async()=>({
+      calendar:{async getEvent(){return {id:'event-1',summary:'Calendar title',status:'confirmed',start:{date:'2099-12-18'}};}},
+      todoist:{async getTask(){return {id:'task-1',content:'Old title'};},async upsertTask(value){writes.push(value);return {id:'task-1',...value};}},
+    }),new FakePolicyStore());
+    await service.processManualDelivery({id:'manual-protected',kind:'manual',profile:'antonio',mode:'aws',headers:{},body:'',
+      manual:{decisionId:decision.decisionId,action:'calendar_wins'}},state);
+    assert.equal(writes.length,ownRepair?1:0);
+    assert.equal(decision.status,ownRepair?'resolved':'pending');
+    if(!ownRepair)assert.match(notifier.updated[0].text,/protected by a repair, exclusion, or rejected link/);
+  });
+}
+
+test('manual provider writes recheck a barrier established after initial decision validation',async t=>{
+  process.env.STATE_TABLE_NAME ||= 'test-state';
+  const decisions=new FakeDecisionStore(),notifier=new FakeNotifier();let barrier=false,writes=0;
+  const decision=decisionFor('both_sides_changed',{decisionId:'new-barrier',taskId:'task-1',eventId:'event-1'});
+  decisions.decisions.set(decision.decisionId,decision);
+  t.mock.method(documentClient,'send',async()=>({}));
+  t.mock.method(SyncControls.prototype,'control',async()=>barrier?{activeRepair:'another-repair'}:undefined);
+  t.mock.method(SyncControls.prototype,'rejected',async()=>false);
+  const state={syncBlocked:StateRepository.prototype.syncBlocked,
+    async getMappingByTask(){return {profile:'antonio',taskId:'task-1',eventId:'event-1'};},
+    async mutationAllowed(){return true;},async recordMutation(){},async audit(){},
+  };
+  const service=new ManualInterventionService(decisions,notifier,async()=>({
+    calendar:{async getEvent(){barrier=true;return {id:'event-1',summary:'Calendar title',status:'confirmed',start:{date:'2099-12-18'}};}},
+    todoist:{async getTask(){return {id:'task-1',content:'Old title'};},async upsertTask(){writes++;}},
+  }),new FakePolicyStore());
+  await service.processManualDelivery({id:'late-barrier',kind:'manual',profile:'antonio',mode:'aws',headers:{},body:'',
+    manual:{decisionId:decision.decisionId,action:'calendar_wins'}},state);
+  assert.ok(barrier);assert.equal(writes,0);assert.equal(decision.status,'pending');
 });

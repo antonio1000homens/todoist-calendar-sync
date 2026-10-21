@@ -1,5 +1,6 @@
 node_modules/
 dist/
+cloudflare/calendar-sync/public/
 .aws-sam*/
 .env
 .env.*

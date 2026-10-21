@@ -28,6 +28,16 @@ export interface FutureSplitResult {
   mapping: Mapping;
   resumed: boolean;
 }
+export function assertApprovedHistoryCap(master: CalendarEvent | null, plan: FutureSeriesSplitPlan, taskId: string): void {
+  const shared = master?.extendedProperties?.shared;
+  if (!master || master.id !== plan.oldMasterId || master.status !== "confirmed" || master.recurrence?.length !== 1
+    || !sameSafeYearlyRecurrenceRule(master.recurrence[0], plan.truncatedRule)
+    || shared?.syncHistoryOnly !== "true" || shared.syncHistorySuccessorId !== plan.newMasterId
+    || shared.syncHistoryTaskId !== taskId || shared.syncHistoryCutoff !== plan.previousOccurrence
+    || !sameSafeYearlyRecurrenceRule(shared.syncHistoryOriginalRule, plan.originalRule) || shared.taskId) {
+    throw new Error("Old Calendar history cap or approved lineage changed; review the future split before releasing its barriers");
+  }
+}
 /**
  * This operation is explicitly requested by a destructive, confirmed Slack
  * action. It never updates the old master DTSTART or deletes an occurrence.
@@ -182,7 +192,7 @@ export async function applyApprovedFutureSeriesSplit(
   if (conflicts.length) throw new Error("Another nearby Calendar occurrence may represent the same reminder");
 
   // Persist the split guard BEFORE the first provider write. If the worker
-  // crashes after capping the master, hourly reconciliation and Todoist
+  // crashes after capping the master, manual reconciliation and Todoist
   // webhooks must not create a competing recurrence while this remains pending.
   await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId, plan.previousOccurrence);
   if (!archived) {
@@ -204,6 +214,7 @@ export async function applyApprovedFutureSeriesSplit(
     }, old.id, plan.oldEtag);
   }
   const capped = await pair.calendar.getEvent(old.id);
+  assertApprovedHistoryCap(capped, plan, task.id);
   if (!sameTitle(capped.summary, old.summary)
     || normalizedText(capped.description) !== normalizedText(old.description)
     || capped.status !== "confirmed" || capped.recurrence?.length !== 1

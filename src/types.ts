@@ -1,7 +1,7 @@
 export type Profile = "home" | "antonio" | "work";
 export type CutoverMode = "aws";
-export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual";
-export type ReconciliationReason = "webhook" | "scheduled" | "baseline_recovery" | "manual";
+export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual" | "repair";
+export type ReconciliationReason = "manual";
 export type CalendarWatchStatus = "active" | "replaced" | "missing";
 
 export interface CalendarWatchState {
@@ -55,6 +55,8 @@ export interface ManualControlDelivery {
   slackUserId?: string;
   slackChannelId?: string;
   slackMessageTs?: string;
+  slackThreadTs?: string;
+  slackDecisionId?: string;
   policy?: ManualPolicyControl;
 }
 
@@ -81,8 +83,13 @@ export interface Delivery {
     reason: ReconciliationReason;
     generation: string;
     continuation?: ReconciliationContinuation;
+    slackChannelId?: string;
+    slackMessageTs?: string;
+    slackThreadTs?: string;
+    slackDecisionId?: string;
   };
   manual?: ManualControlDelivery;
+  repair?: { operationId:string };
   /** @deprecated Compatibility for any pre-deployment queued reconcile message. */
   reconcileProfiles?: readonly Profile[];
 }
@@ -136,6 +143,8 @@ export interface CalendarEvent {
   id: string;
   /** Provider ETag for conditional, update-only manual ownership changes. */
   etag?: string;
+  /** Provider modification timestamp retained for repair version fences. */
+  updated?: string;
   status?: string;
   summary?: string;
   description?: string;
