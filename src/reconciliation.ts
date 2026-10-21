@@ -215,7 +215,7 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
   };
 }
 
-class DynamoReconciliationStore implements ReconciliationStore {
+export class DynamoReconciliationStore implements ReconciliationStore {
   private ensureTable(): string {
     if (!tableName) throw new Error("STATE_TABLE_NAME is not configured");
     return tableName;

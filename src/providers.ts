@@ -276,6 +276,17 @@ export class GoogleCalendar {
    * POST or resurrect a deleted Calendar record. If the event changes or is
    * cancelled after the approval snapshot, the If-Match update fails.
    */
+  async createRepairEventOnce(event: CalendarEvent, operationId: string): Promise<CalendarEvent> {
+    const desired = { ...event, extendedProperties: { ...event.extendedProperties, shared: { ...event.extendedProperties?.shared, syncRepairId: operationId } } };
+    try { return await this.upsertEvent(desired); }
+    catch (error) {
+      if (Number((error as {status?: number}).status) !== 409) throw error;
+      const existing = await this.getEvent(event.id);
+      if (existing.extendedProperties?.shared?.syncRepairId !== operationId || existing.status === "cancelled") throw new Error("Deterministic repair event ID is owned by another object");
+      return existing;
+    }
+  }
+
   async upsertEventIfUnchanged(event: CalendarEvent, existingId: string, etag: string): Promise<CalendarEvent> {
     if (!existingId || !etag) throw new Error("Manual Calendar update requires existing event ID and ETag");
     return this.request(
@@ -356,6 +367,18 @@ export class Todoist {
     const payload = todoistTaskPayload(existingId ? task : { ...task, ...(task.project_id || !projectId ? {} : { project_id: projectId }) });
     if (existingId) delete payload.project_id;
     return this.request<TodoistTask>(path, { method: "POST", body: JSON.stringify(payload) });
+  }
+
+  async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string): Promise<TodoistTask> {
+    const { createHash } = await import("node:crypto");
+    const h = createHash("sha256").update(requestKey).digest("hex");
+    const uuid = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+    return this.request<TodoistTask>("/tasks", { method: "POST", headers: { "X-Request-Id": uuid },
+      body: JSON.stringify(todoistTaskPayload({ ...task, project_id: task.project_id || todoistProjectForToken(this.token) })) });
+  }
+
+  async moveTask(taskId: string, projectId: string): Promise<void> {
+    await this.syncCommand("item_move", { id: taskId, project_id: projectId });
   }
 
   async updateRecurringOccurrence(task: TodoistTask, occurrence: Omit<TodoistTask, "id">): Promise<TodoistTask> {

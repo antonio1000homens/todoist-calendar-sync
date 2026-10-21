@@ -1,3 +1,4 @@
+import { SyncControls } from "./review-store.js";
 import { createHash } from "node:crypto";
 import {
   DeleteCommand,
@@ -98,6 +99,12 @@ function latestOriginalStart(...values: Array<string | undefined>): string | und
 }
 
 export class StateRepository {
+  constructor(readonly repairOperationId?: string) {}
+
+  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
+    return new SyncControls().blocked(profile, ids, this.repairOperationId);
+  }
+
   private readonly table = tableName;
 
   private ensureTable(): string {

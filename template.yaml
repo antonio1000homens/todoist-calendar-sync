@@ -282,7 +282,11 @@ Resources:
     Properties:
       FunctionName: !Sub ${ResourceNamePrefix}-worker-${Stage}
       Handler: worker.handler
-      ReservedConcurrentExecutions: 1
+      ReservedConcurrentExecutions: 2
+      # Reconciliation is intentionally chunked through this worker's SQS
+      # trigger. Each continuation advances a cursor and sequence so large
+      # snapshots can finish beyond Lambda's default 16-invocation loop guard.
+      RecursiveLoop: Allow
       # A bounded full-table reconciliation scan can exceed two minutes on the
       # production state table; the queue visibility timeout is set above this.
       Timeout: 300
@@ -314,6 +318,8 @@ Resources:
             Queue: !GetAtt SyncQueue.Arn
             BatchSize: 1
             Enabled: true
+            ScalingConfig:
+              MaximumConcurrency: 2
             FunctionResponseTypes: [ReportBatchItemFailures]
     Metadata:
       BuildMethod: esbuild
