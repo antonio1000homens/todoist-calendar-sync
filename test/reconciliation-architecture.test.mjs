@@ -9,6 +9,7 @@ const handlerSource = await readFile(new URL("../src/handler.ts", import.meta.ur
 const repositorySource = await readFile(new URL("../src/repository.ts", import.meta.url), "utf8");
 const reconciliationSource = await readFile(new URL("../src/reconciliation.ts", import.meta.url), "utf8");
 const queueSource = await readFile(new URL("../src/queue.ts", import.meta.url), "utf8");
+const healthSource = await readFile(new URL("../src/reconcile.ts", import.meta.url), "utf8");
 const typesSource = await readFile(new URL("../src/types.ts", import.meta.url), "utf8");
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const deployPolicy = await readFile(new URL("../infrastructure/github-actions-deploy-role.yaml", import.meta.url), "utf8");
@@ -50,14 +51,26 @@ test("capped or circuit-blocked reconciliation keeps its durable generation pend
   assert.match(workerSource, /continuationRequired/);
 });
 
-test("webhook-triggered reconciliation ignores echoes but retains uncertain Calendar work", () => {
+test("webhooks never start full reconciliation and the scheduled health check is read-only", () => {
   assert.match(workerSource, /let meaningfulMutation = false/);
   assert.match(workerSource, /meaningfulMutation = true/);
   assert.match(workerSource, /let calendarMutationBlocked = false/);
   assert.match(workerSource, /calendarMutationBlocked = true/);
-  assert.match(workerSource, /if \(meaningfulMutation \|\| baselineRecovery \|\| calendarMutationBlocked\)/);
+  assert.doesNotMatch(workerSource, /requestReconciliation\(/);
   assert.match(workerSource, /calendar_sync_token_withheld_circuit_block/);
-  assert.match(workerSource, /reconciliation_not_requested_for_noop_delivery/);
+  assert.match(workerSource, /incremental_sync_completed/);
+  assert.doesNotMatch(healthSource, /requestReconciliation|enqueueDelivery|listDelta|listTasks/);
+  assert.match(template, /ScheduleExpression:\s*rate\(5 minutes\)/);
+  const healthBlock = template.match(/ReconcilerFunction:[\s\S]*?ReconcilerFunctionEveryFifteenMinutes:/)?.[0] || "";
+  assert.doesNotMatch(healthBlock, /SQSSendMessagePolicy/);
+});
+
+test("Calendar snapshot continuations run to exhaustion before terminal reconciliation status", () => {
+  assert.match(workerSource, /continuation\?\.phase === "calendar" \? undefined : await reconciler\.reconcile/);
+  assert.match(workerSource, /continuation\?\.phase === "calendar" \? continuation : undefined/);
+  assert.match(workerSource, /if \(calendarRecovery\.continuation\)/);
+  assert.match(workerSource, /await state\.completeReconciliation\(delivery\.profile, generation, unresolved, aggregate\)/);
+  assert.match(workerSource, /return \{ continuationRequired: false, continuationQueued: true \}/);
 });
 
 test("stale mapping cleanup cannot delete a newer counterpart index", () => {

@@ -1,7 +1,7 @@
 export type Profile = "home" | "antonio" | "work";
 export type CutoverMode = "aws";
 export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual";
-export type ReconciliationReason = "webhook" | "scheduled" | "baseline_recovery" | "manual";
+export type ReconciliationReason = "manual";
 export type CalendarWatchStatus = "active" | "replaced" | "missing";
 
 export interface CalendarWatchState {
@@ -55,6 +55,8 @@ export interface ManualControlDelivery {
   slackUserId?: string;
   slackChannelId?: string;
   slackMessageTs?: string;
+  slackThreadTs?: string;
+  slackDecisionId?: string;
   policy?: ManualPolicyControl;
 }
 
@@ -81,6 +83,10 @@ export interface Delivery {
     reason: ReconciliationReason;
     generation: string;
     continuation?: ReconciliationContinuation;
+    slackChannelId?: string;
+    slackMessageTs?: string;
+    slackThreadTs?: string;
+    slackDecisionId?: string;
   };
   manual?: ManualControlDelivery;
   /** @deprecated Compatibility for any pre-deployment queued reconcile message. */

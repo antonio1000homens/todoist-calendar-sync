@@ -66,6 +66,7 @@ class FakeNotifier {
   async postDecision(decision) { this.posted.push(decision); }
   async updateResolution(decision, text, blocks) { this.updated.push({ decision, text, blocks }); }
   async postText(text) { this.text.push(text); }
+  async reconciliationOutcome(_channel, _thread, text) { this.text.push(text); }
 }
 
 function mappedCalendarRecurrence() {
@@ -631,8 +632,8 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
 
   assert.equal(requested, 1);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
-  assert.match(notifier.updated.at(-1).text, /remains open/);
-  assert.ok(notifier.updated.at(-1).blocks.some((block) => block.type === 'actions'));
+  assert.match(notifier.text.at(-1), /final outcome in this thread/);
+  assert.equal(notifier.updated.length, 0, 'the originating incident card stays open during reconciliation');
 });
 
 test('Calendar-only ambiguity enriches and renders bounded candidate details read-only', async () => {

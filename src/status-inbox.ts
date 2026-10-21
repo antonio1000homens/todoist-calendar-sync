@@ -11,7 +11,7 @@ interface DecisionStoreForStatus {
 
 interface DecisionNotifierForStatus {
   postDecision(decision: ManualDecision): Promise<void>;
-  postText(text: string, channel?: string): Promise<void>;
+  postText(text: string, channel?: string): Promise<void | string | undefined>;
 }
 
 export interface DecisionRenderSummary {
@@ -167,10 +167,8 @@ export async function processStatusInbox(delivery: Delivery, state: StateReposit
     ? `\nRecovered provider-auth alerts cleared: ${retiredAuthDecisions}`
     : "";
   const reconciliationLine = !reconcile
-    ? "Reconciliation: no state available"
-    : reconcile.pending
-      ? `Reconciliation: ${reconcile.reason === "scheduled" ? "scheduled sync queued/in progress — no action required" : `${reconcile.reason || "sync"} queued/in progress`} (last completed ${reconcile.lastCompletedAt || "never"})`
-      : `Reconciliation: up to date (last completed ${reconcile.lastCompletedAt || "never"})`;
+    ? "Reconciliation: no run recorded"
+    : `Reconciliation: ${reconcile.status || (reconcile.pending ? "queued" : "succeeded")}${reconcile.lastError ? ` — ${reconcile.lastError}` : ""} (last completed ${reconcile.lastCompletedAt || "never"})`;
   const decisionLine = actionable.length
     ? `Action required: ${actionable.length} manual decision${actionable.length === 1 ? "" : "s"} pending — interactive cards follow.`
     : "Action required: none.";

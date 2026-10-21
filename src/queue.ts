@@ -37,6 +37,7 @@ export interface ReconciliationRequestResult {
 }
 
 type EnqueueReconciliation = (delivery: Delivery) => Promise<void>;
+export interface ReconciliationRequestContext { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string; }
 
 /**
  * Durably marks a profile dirty before attempting SQS delivery. If the SQS
@@ -51,8 +52,9 @@ export async function requestReconciliation(
   profile: Profile,
   reason: ReconciliationReason,
   enqueue: EnqueueReconciliation = enqueueDelivery,
+  context: ReconciliationRequestContext = {},
 ): Promise<ReconciliationRequestResult> {
-  const request = await state.requestReconciliation(profile, reason);
+  const request = await state.requestReconciliation(profile, reason, context);
   if (!request.shouldEnqueue) {
     return {
       profile,
@@ -76,6 +78,7 @@ export async function requestReconciliation(
     reconcile: {
       reason,
       generation: request.state.generation,
+      ...context,
     },
   };
 

@@ -15,6 +15,14 @@ import {
 } from "./todoist-recurrence.js";
 import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
+export function calendarResourceAlreadyDeleted(error: unknown): boolean {
+  const provider = error as { status?: number; body?: string };
+  if (Number(provider.status) === 404) return true;
+  if (Number(provider.status) !== 410) return false;
+  try { return JSON.parse(provider.body || "").error?.errors?.[0]?.reason === "deleted"; }
+  catch { return false; }
+}
+
 function taskDateTime(task: TodoistTask): string | undefined {
   const due = task.due;
   return due?.datetime || (due?.date && due.date.includes("T") ? due.date : undefined);
@@ -572,6 +580,7 @@ export class Synchronizer {
       delta = await calendar.listDelta(token);
     } catch (error) {
       if ((error as { status?: number }).status !== 410) throw error;
+      delivery.headers["x-calendar-sync-cursor-expired"] = "true";
       if (token) await this.state.deleteSyncToken(delivery.profile);
       delta = await calendar.listDelta();
       baseline = true;
@@ -1396,7 +1405,9 @@ export class Synchronizer {
     }
     const mapping = await this.state.getMappingByEvent(delivery.profile, orphan.eventId);
     if (!mapping || mapping.taskId !== orphan.taskId) return;
-    await calendar.deleteEvent(orphan.eventId).catch((error: unknown) => { if ((error as { status?: number }).status !== 404) throw error; });
+    await calendar.deleteEvent(orphan.eventId).catch((error: unknown) => {
+      if (!calendarResourceAlreadyDeleted(error)) throw error;
+    });
     await this.state.deleteMapping(mapping);
     await this.state.audit(delivery.profile, "orphan_confirmed_deleted", orphan);
   }
