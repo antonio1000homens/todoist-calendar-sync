@@ -6,15 +6,17 @@ import {
   defaultProviderClientFactory,
   isMutationBudgetExhausted,
   ReconciliationMutationBudget,
+  type ProviderClientFactory,
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { enqueueDelivery, requestReconciliation } from "./queue.js";
+import { enqueueDelivery } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { StateRepository } from "./repository.js";
+import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
-import type { Delivery, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
+import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-worker", event, ...detail }));
@@ -126,12 +128,17 @@ async function enqueueReconciliationContinuation(
   return next;
 }
 
-async function processReconciliation(
+export async function processReconciliation(
   delivery: Delivery,
   state: StateRepository,
+  clientFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): Promise<ReconciliationProcessingResult> {
   const mutationBudget = new ReconciliationMutationBudget();
-  const budgetedClientFactory = createBudgetedClientFactory(mutationBudget, defaultProviderClientFactory);
+  if (!delivery.reconcile?.generation) {
+    log("legacy_reconciliation_delivery_skipped", { deliveryId: delivery.id, profile: delivery.profile, reason: "automatic legacy reconciliation is disabled; request a manual run in Slack" });
+    return { continuationRequired: false };
+  }
+  const budgetedClientFactory = createBudgetedClientFactory(mutationBudget, clientFactory);
   const reconciler = new SnapshotReconciler(
     state,
     budgetedClientFactory,
@@ -139,67 +146,6 @@ async function processReconciliation(
     (repairDelivery) => new ProjectAwareSynchronizer(state, undefined, budgetedClientFactory).process(repairDelivery),
     (profile) => new Synchronizer(state, undefined, budgetedClientFactory).reconcile(profile),
   );
-
-  if (!delivery.reconcile?.generation) {
-    const profiles = delivery.reconcileProfiles || [delivery.profile];
-    log("legacy_reconciliation_started", { deliveryId: delivery.id, profiles, mutationBudget: mutationBudget.snapshot() });
-    for (const profile of profiles) {
-      if (mutationBudget.exhausted) {
-        log("legacy_reconciliation_mutation_budget_exhausted", {
-          deliveryId: delivery.id,
-          profile,
-          mutationBudget: mutationBudget.snapshot(),
-          continuation: "hourly reconciliation will continue remaining work",
-        });
-        break;
-      }
-      if (!await state.mutationAllowed(profile)) {
-        log("legacy_reconciliation_circuit_open_skipped", { deliveryId: delivery.id, profile });
-        continue;
-      }
-      try {
-        // Legacy queued messages predate resumable chunks. Preserve their old
-        // single-invocation behavior rather than generating continuation state
-        // that an old producer cannot recover.
-        await reconciler.reconcile(profile, undefined, Number.MAX_SAFE_INTEGER);
-        if (mutationBudget.exhausted) {
-          log("legacy_reconciliation_mutation_budget_exhausted", {
-            deliveryId: delivery.id,
-            profile,
-            stage: "mapped_state",
-            mutationBudget: mutationBudget.snapshot(),
-            continuation: "hourly reconciliation will continue remaining work",
-          });
-          break;
-        }
-        const calendarRecovery = await reconcileUnmappedCalendar(
-          profile,
-          state,
-          defaultProviderClientFactory,
-          mutationBudget,
-        );
-        log("legacy_reconciliation_profile_completed", {
-          deliveryId: delivery.id,
-          profile,
-          calendarRecovery,
-          mutationBudget: mutationBudget.snapshot(),
-        });
-        if (calendarRecovery.mutationCapReached || mutationBudget.exhausted) break;
-      } catch (error) {
-        if (!isMutationBudgetExhausted(error)) throw error;
-        log("legacy_reconciliation_mutation_budget_exhausted", {
-          deliveryId: delivery.id,
-          profile,
-          error: serializeError(error),
-          mutationBudget: mutationBudget.snapshot(),
-          continuation: "hourly reconciliation will continue remaining work",
-        });
-        break;
-      }
-    }
-    log("legacy_reconciliation_completed", { deliveryId: delivery.id, profiles, mutationBudget: mutationBudget.snapshot() });
-    return { continuationRequired: false };
-  }
 
   const { generation, reason, continuation } = delivery.reconcile;
   if (!await state.beginReconciliation(delivery.profile, generation)) {
@@ -215,6 +161,8 @@ async function processReconciliation(
     stage: "mapped_state" | "calendar_snapshot",
     detail: Record<string, unknown> = {},
   ): Promise<ReconciliationProcessingResult> => {
+    const message = `${action}: ${stage}; reconciliation stopped and needs a fresh manual request`;
+    await state.recordReconciliationFailure(delivery.profile, generation, message);
     await state.audit(delivery.profile, action, {
       deliveryId: delivery.id,
       generation,
@@ -230,7 +178,7 @@ async function processReconciliation(
       action,
       mutationBudget: mutationBudget.snapshot(),
       durationMs: Date.now() - startedAt,
-      continuation: "pending generation retained for later scheduled/profile-triggered retry",
+      continuation: "stopped; request a fresh reconciliation manually after addressing the cause",
       ...detail,
     });
     return { continuationRequired: true };
@@ -251,14 +199,15 @@ async function processReconciliation(
 
   let snapshot;
   try {
-    snapshot = await reconciler.reconcile(delivery.profile, continuation);
+    snapshot = continuation?.phase === "calendar" ? undefined : await reconciler.reconcile(delivery.profile, continuation);
   } catch (error) {
     if (!isMutationBudgetExhausted(error)) throw error;
     return deferForMutationBudget("mapped_state", { budgetError: serializeError(error) });
   }
 
-  if (snapshot.continuation) {
+  if (snapshot?.continuation) {
     try {
+      await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts);
       const next = await enqueueReconciliationContinuation(delivery, state, snapshot.continuation);
       await state.audit(delivery.profile, "reconciliation_chunk_queued", {
         deliveryId: delivery.id,
@@ -286,14 +235,41 @@ async function processReconciliation(
     }
   }
 
+  if (snapshot) await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts);
   if (mutationBudget.exhausted) return deferForMutationBudget("mapped_state");
 
   const calendarRecovery = await reconcileUnmappedCalendar(
     delivery.profile,
     state,
-    defaultProviderClientFactory,
+    clientFactory,
     mutationBudget,
+    continuation?.phase === "calendar" ? continuation : { phase: "calendar", sequence: continuation?.sequence || 0 },
   );
+  await state.addReconciliationProgress(delivery.profile, generation, {
+    calendar_scanned: calendarRecovery.scanned,
+    calendar_imported: calendarRecovery.imported,
+    calendar_rebound: calendarRecovery.rebound,
+    calendar_conflicts: calendarRecovery.conflicts,
+    calendar_blocked: calendarRecovery.blocked,
+    calendar_skipped: calendarRecovery.skipped,
+    provider_mutations: calendarRecovery.providerMutations,
+  });
+
+  if (calendarRecovery.continuation) {
+    try {
+      const continuation = { ...calendarRecovery.continuation, phase: "calendar" as const };
+      const next = await enqueueReconciliationContinuation(delivery, state, continuation);
+      await state.audit(delivery.profile, "reconciliation_chunk_queued", {
+        deliveryId: delivery.id, generation, reason, continuation,
+        nextDeliveryId: next.id, phase: "calendar", calendarRecovery,
+      });
+      return { continuationRequired: false, continuationQueued: true };
+    } catch (error) {
+      return deferContinuation("reconciliation_calendar_chunk_enqueue_deferred", "calendar_snapshot", {
+        calendarRecovery, enqueueError: serializeError(error),
+      });
+    }
+  }
 
   if (calendarRecovery.mutationCapReached || mutationBudget.exhausted) {
     return deferForMutationBudget("calendar_snapshot", { calendarRecovery });
@@ -302,7 +278,10 @@ async function processReconciliation(
     return deferContinuation("reconciliation_calendar_snapshot_circuit_deferred", "calendar_snapshot", { calendarRecovery });
   }
 
-  await state.completeReconciliation(delivery.profile, generation);
+  const aggregate = (await state.getReconciliationState(delivery.profile))?.result || {};
+  const unresolved = (aggregate.conflict || 0) + (aggregate.blocked || 0)
+    + (aggregate.calendar_conflicts || 0) + (aggregate.calendar_blocked || 0);
+  await state.completeReconciliation(delivery.profile, generation, unresolved, aggregate);
   log("reconciliation_completed", {
     ...deliverySummary(delivery),
     reason,
@@ -311,6 +290,16 @@ async function processReconciliation(
     durationMs: Date.now() - startedAt,
   });
   return { continuationRequired: false };
+}
+
+async function deliverReconciliationOutcome(state: StateRepository, manual: ManualInterventionService, profile: Profile, generation: string): Promise<void> {
+  const current = await state.getReconciliationOutcome(profile, generation);
+  if (!current?.notificationPending || !manual.enabled) return;
+  try {
+    await deliverPendingReconciliationOutcome(state, manual, current);
+  } catch (error) {
+    log("reconciliation_outcome_notification_failed", { profile, generation, error: serializeError(error) });
+  }
 }
 
 export const handler: SQSHandler = async (event, context: Context) => {
@@ -402,6 +391,9 @@ export const handler: SQSHandler = async (event, context: Context) => {
 
       if (delivery.kind === "reconcile") {
         const reconciliation = await processReconciliation(delivery, state);
+        if (!reconciliation.continuationRequired && !reconciliation.continuationQueued && delivery.reconcile?.generation) {
+          await deliverReconciliationOutcome(state, manual, delivery.profile, delivery.reconcile.generation);
+        }
         if (!reconciliation.continuationRequired) {
           await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
           log(reconciliation.continuationQueued ? "delivery_completed_with_queued_continuation" : "delivery_completed", {
@@ -440,13 +432,16 @@ export const handler: SQSHandler = async (event, context: Context) => {
           deliveryId: delivery.id,
           providerMetadata: delivery.headers,
         });
-        const reconciliation = await requestReconciliation(state, delivery.profile, "webhook");
         log("calendar_delivery_deferred_circuit_open", {
           awsRequestId: context.awsRequestId,
           delivery: deliverySummary(delivery),
-          reconciliation,
+          reconciliationRequired: true,
           syncTokenAdvanced: false,
         });
+        await manual.alertReconciliationNeeded(
+          delivery.profile, `circuit:${delivery.id}`, undefined,
+          "Calendar changes were deferred because the mutation circuit is open. Request reconciliation manually after the circuit cools down.",
+        );
         await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
         continue;
       }
@@ -456,37 +451,27 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // payload (including deletes), rather than acknowledging lost work.
       await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
 
-      if (delivery.kind === "calendar" || delivery.kind === "todoist") {
-        const baselineRecovery = delivery.kind === "calendar" && !hadCalendarToken;
-        if (meaningfulMutation || baselineRecovery || calendarMutationBlocked) {
-          const reason = baselineRecovery ? "baseline_recovery" as const : "webhook" as const;
-          const reconciliation = await requestReconciliation(state, delivery.profile, reason);
-          if (reconciliation.enqueueError) {
-            console.error(JSON.stringify({
-              service: "todoist-calendar-sync-worker",
-              event: "reconciliation_enqueue_deferred",
-              awsRequestId: context.awsRequestId,
-              delivery: deliverySummary(delivery),
-              reconciliation,
-              note: "Durable pending state is retained; a later webhook or hourly scheduler will retry enqueue.",
-            }));
-          } else {
-            log(reconciliation.coalesced ? "reconciliation_coalesced" : "reconciliation_requested", {
-              awsRequestId: context.awsRequestId,
-              triggerDeliveryId: delivery.id,
-              reconciliation,
-              calendarMutationBlocked,
-            });
-          }
-        } else {
-          log("reconciliation_not_requested_for_noop_delivery", {
-            awsRequestId: context.awsRequestId,
-            triggerDeliveryId: delivery.id,
-            kind: delivery.kind,
-            profile: delivery.profile,
-          });
-        }
+      if (delivery.kind === "calendar" && delivery.headers["x-calendar-sync-cursor-expired"] === "true") {
+        await state.audit(delivery.profile, "calendar_sync_cursor_expired_reconciliation_needed", { deliveryId: delivery.id });
+        await manual.alertReconciliationNeeded(
+          delivery.profile,
+          `cursor:${delivery.id}`,
+          undefined,
+          "The Calendar incremental sync cursor expired. The event batch was baselined, which cannot detect earlier missed changes. Request a guarded reconciliation manually.",
+        );
       }
+
+      if (delivery.kind === "calendar" && calendarMutationBlocked) {
+        await manual.alertReconciliationNeeded(
+          delivery.profile, `blocked:${delivery.id}`, undefined,
+          "A Calendar event could not be repaired because the mutation circuit opened, and the sync cursor was withheld. Request a guarded reconciliation manually after the circuit cools down.",
+        );
+      }
+
+      if (delivery.kind === "calendar" || delivery.kind === "todoist") log("incremental_sync_completed", {
+        awsRequestId: context.awsRequestId, delivery: deliverySummary(delivery), meaningfulMutation,
+        baselineRecovery: delivery.kind === "calendar" && !hadCalendarToken, calendarMutationBlocked,
+      });
 
       await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
       log("delivery_completed", {
@@ -508,9 +493,12 @@ export const handler: SQSHandler = async (event, context: Context) => {
             error: serializeError(stateError),
           }));
         });
+        if (manual) await deliverReconciliationOutcome(state, manual, delivery.profile, delivery.reconcile.generation).catch((notifyError: unknown) => {
+          log("reconciliation_outcome_notification_retry_deferred", { profile: delivery?.profile, generation: delivery?.reconcile?.generation, error: serializeError(notifyError) });
+        });
       }
 
-      await manual?.reportDeliveryFailure(delivery, error).catch((manualError: unknown) => {
+      if (delivery?.kind !== "reconcile") await manual?.reportDeliveryFailure(delivery, error).catch((manualError: unknown) => {
         console.error(JSON.stringify({
           service: "todoist-calendar-sync-worker",
           event: "manual_failure_notification_failed",

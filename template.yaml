@@ -330,11 +330,18 @@ Resources:
       Handler: reconcile.handler
       ReservedConcurrentExecutions: 1
       CodeUri: .
+      Environment:
+        Variables:
+          TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED: !Ref ManualInterventionEnabled
+          TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: !Ref TodoistCalendarSyncSlackChannel
+          SLACK_BOT_TOKEN_PARAMETER: !Ref SlackBotTokenParameter
       Policies:
-        - SQSSendMessagePolicy:
-            QueueName: !GetAtt SyncQueue.QueueName
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackBotTokenParameter}
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -347,7 +354,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: !Sub ${ResourceNamePrefix}-reconcile-${Stage}
-      ScheduleExpression: rate(1 hour)
+      ScheduleExpression: rate(5 minutes)
       State: ENABLED
       Targets:
         - Arn: !GetAtt ReconcilerFunction.Arn

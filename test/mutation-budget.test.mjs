@@ -104,10 +104,11 @@ test("methods with an internal write fallback reserve their worst-case cost befo
 test("worker uses the same budgeted client factory for every reconciliation mutation path", async () => {
   const workerSource = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
   assert.match(workerSource, /const mutationBudget = new ReconciliationMutationBudget\(\)/);
-  assert.match(workerSource, /const budgetedClientFactory = createBudgetedClientFactory\(mutationBudget, defaultProviderClientFactory\)/);
+  assert.match(workerSource, /clientFactory: ProviderClientFactory = defaultProviderClientFactory/);
+  assert.match(workerSource, /const budgetedClientFactory = createBudgetedClientFactory\(mutationBudget, clientFactory\)/);
   assert.match(workerSource, /new SnapshotReconciler\([\s\S]*?budgetedClientFactory/);
   assert.match(workerSource, /new ProjectAwareSynchronizer\(state, undefined, budgetedClientFactory\)/);
   assert.match(workerSource, /new Synchronizer\(state, undefined, budgetedClientFactory\)/);
-  assert.match(workerSource, /reconcileUnmappedCalendar\([\s\S]*?defaultProviderClientFactory,[\s\S]*?mutationBudget/);
+  assert.match(workerSource, /reconcileUnmappedCalendar\([\s\S]*?clientFactory,[\s\S]*?mutationBudget/);
   assert.match(workerSource, /if \(mutationBudget\.exhausted\) return deferForMutationBudget\("mapped_state"\)/);
 });
