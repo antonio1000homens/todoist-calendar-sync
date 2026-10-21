@@ -16,6 +16,9 @@ import { StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
+import { ReviewEngine } from "./review-engine.js";
+import { ReviewStore } from "./review-store.js";
+import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
@@ -302,6 +305,26 @@ async function deliverReconciliationOutcome(state: StateRepository, manual: Manu
   }
 }
 
+async function deliverRepairOutcome(manual: ManualInterventionService, operationId: string): Promise<void> {
+  const store = new ReviewStore();
+  const operation = await store.getOperation(operationId);
+  if (!operation?.notificationPending) return;
+  const reviewCase = await store.getCase(operation.preview.intent.caseId);
+  const decisionId = reviewCase?.decision?.decisionId;
+  const decision = decisionId ? await new ManualDecisionStore().get(decisionId) : undefined;
+  const status = operation.status === "succeeded" ? "Succeeded"
+    : operation.status === "needs_review" ? "Needs review" : "Failed";
+  const text = operation.notificationText || status + ": " + (operation.verified?.length || 0) + " pairs verified"
+    + (operation.error ? ". " + operation.error : "");
+  const replyTs = await manual.deliverReconciliationOutcome(
+    decision?.slackChannelId,
+    decision?.slackMessageTs,
+    operation.notificationReplyTs,
+    text,
+  );
+  await store.completeNotification(operation.id, replyTs);
+}
+
 export const handler: SQSHandler = async (event, context: Context) => {
   const failures: { itemIdentifier: string }[] = [];
   for (const record of event.Records) {
@@ -410,6 +433,17 @@ export const handler: SQSHandler = async (event, context: Context) => {
             completedDeliveryMarkerWritten: false,
           });
         }
+        continue;
+      }
+
+      if (delivery.kind === "repair") {
+        if (!delivery.repair?.operationId) throw new Error("Repair delivery is missing its operation ID");
+        const result = await new ReviewEngine().execute(delivery.repair.operationId);
+        if (result.status === "succeeded" || result.status === "needs_review" || result.status === "failed") {
+          await deliverRepairOutcome(manual, result.id);
+          await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+        }
+        log("repair_delivery_completed", { awsRequestId:context.awsRequestId, status:result.status, operationId:result.id });
         continue;
       }
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { StateRepository } from '../dist/repository.js';
-import { SyncControls } from '../dist/review-store.js';
+import { ReviewStore, SyncControls } from '../dist/review-store.js';
 import { documentClient } from '../dist/dynamodb-capacity.js';
 import {
   decisionBlocks,
@@ -769,6 +769,8 @@ for (const protection of ['activeRepair','excluded','rejectedPair']) {
     const decision=decisionFor('both_sides_changed',{decisionId:'protected-pair',taskId:'task-1',eventId:'event-1'});
     decisions.decisions.set(decision.decisionId,decision);
     t.mock.method(documentClient,'send',async()=>({}));
+    t.mock.method(ReviewStore.prototype,'get',async pk=>pk.startsWith('REJECTED_PAIR#')&&protection==='rejectedPair'
+      ?{operationId:ownRepair?'repair':'another-repair'}:undefined);
     t.mock.method(SyncControls.prototype,'control',async()=>({
       activeRepair:ownRepair?'repair':protection==='activeRepair'?'other-repair':undefined,
       excluded:protection==='excluded',

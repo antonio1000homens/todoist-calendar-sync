@@ -6,7 +6,7 @@ import { StateRepository } from "../dist/repository.js";
 import { DynamoReconciliationStore } from "../dist/reconciliation.js";
 import { CanonicalIdentityStore } from "../dist/canonical-identity.js";
 import { Synchronizer } from "../dist/sync.js";
-import { SyncControls } from "../dist/review-store.js";
+import { ReviewStore, SyncControls } from "../dist/review-store.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { todoistRecurrenceKey, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { ManualDecisionStore, ManualInterventionService } from "../dist/manual-intervention.js";
@@ -100,6 +100,8 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
         const next = task(taskRequests.size ? `created-task-${taskRequests.size+1}` : "created-task", value);
         taskRequests.set(key,next.id);taskMap.set(next.id, next); writes.push(["create-task", next.id]); return clone(next);
       },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id:"comment" }; },
       async listProjectComments() { return []; },
       async upsertProjectComment(_project, content) { writes.push(["comment"]); return { id: "comment", content }; },
     },
@@ -452,6 +454,8 @@ for (const reason of ["excluded", "activeRepair", "rejectedPair"]) {
       controls.control = async ref => ref.side === "todoist" ? { [reason]: reason === "activeRepair" ? "other-repair" : true } : undefined;
       controls.rejected = async (_profile, taskId, eventId) => reason === "rejectedPair" && taskId === "task" && eventId === "event";
       t.mock.method(documentClient, "send", async () => ({}));
+      t.mock.method(ReviewStore.prototype, "get", async pk => pk.startsWith("REJECTED_PAIR#") && reason === "rejectedPair"
+        ? { operationId:"someone-else" } : undefined);
       t.mock.method(StateRepository.prototype, "syncBlocked", (profile, ids) => controls.blocked(profile, ids));
       await new Synchronizer(new StateRepository(), undefined, async () => h.clients).process({
         id: "calendar-change", kind: "calendar", profile: "home", mode: "aws", headers: {}, body: "",

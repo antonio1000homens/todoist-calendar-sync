@@ -42,6 +42,7 @@ function fakeClients(events, initialTasks = []) {
   const tasks = initialTasks.map((task) => ({ ...task }));
   let created = 0;
   let comments = 0;
+  let deletions = 0;
   let listInstancesCalls = 0;
   return {
     pair: {
@@ -54,15 +55,17 @@ function fakeClients(events, initialTasks = []) {
         async upsertTask(task) {
           created += 1;
           const createdTask = { id: `created-${created}`, project_id: "home-project", ...task };
-          tasks.push(createdTask);
           return createdTask;
         },
+        async deleteTask(id) { deletions += 1; const index = tasks.findIndex(task => task.id === id); if (index >= 0) tasks.splice(index,1); },
         async findComment() { return undefined; },
         async upsertComment() { comments += 1; return { id: `comment-${comments}` }; },
       },
     },
     get created() { return created; },
     get comments() { return comments; },
+    get deletions() { return deletions; },
+    get tasks() { return tasks; },
     get listInstancesCalls() { return listInstancesCalls; },
   };
 }
@@ -347,4 +350,14 @@ test("recurrence snapshot does not import a duplicate for normalized title and c
   assert.ok(state.audits.some(({ action, detail }) =>
     action === "calendar_snapshot_recurring_identity_conflict"
     && detail.candidateTaskIds.includes(recurringTask.id)));
+});
+
+
+test("Calendar import rolls back a newly created task when controls change before comment write",async()=>{
+  const state=fakeState(),source=futureEvent("event",10,"Calendar item"),clients=fakeClients([source]);
+  let created=false;state.syncBlocked=async(_profile,ids)=>created&&ids.eventId==="event";
+  const upsert=clients.pair.todoist.upsertTask;clients.pair.todoist.upsertTask=async(...args)=>{const task=await upsert(...args);created=true;return task;};
+  const summary=await reconcileUnmappedCalendar("home",state,async()=>clients.pair);
+  assert.equal(summary.blocked,1);assert.equal(clients.created,1);assert.equal(clients.deletions,1);
+  assert.equal(clients.tasks.length,0);assert.equal(clients.comments,0);assert.equal(state.mappings.length,0);
 });

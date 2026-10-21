@@ -196,6 +196,18 @@ export async function reconcileUnmappedCalendar(
     }
     return false;
   };
+  const rollbackCreatedTask = async (event: CalendarEvent, task: TodoistTask, fallback: Mapping, stage: string): Promise<void> => {
+    try {
+      if (!await canMutate()) throw new Error("Mutation circuit is open; task rollback is deferred");
+      await pair.todoist.deleteTask(task.id);
+      await state.recordMutation(profile);
+    } catch (error) {
+      // Keep a durable association when cleanup itself is unavailable so a
+      // later sync or operator review can find the object instead of losing it.
+      await state.putMapping(fallback);
+      await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,stage,error:error instanceof Error?error.message:String(error)});
+    }
+  };
 
   const completionBlocksRecovery = async (eventId: string, recheckedBeforeMutation = false): Promise<boolean> => {
     const completed = await completedProjection(state, profile, eventId);
@@ -308,7 +320,10 @@ export async function reconcileUnmappedCalendar(
       created = true;
     }
     reservedTaskIds.add(task.id);
-    if (await controlsBlockRecovery([event.id],task.id)) return;
+    if (await controlsBlockRecovery([event.id],task.id)) {
+      if (created) await rollbackCreatedTask(event,task,{profile,eventId:event.id,taskId:task.id,projectId:task.project_id,updatedAt:new Date().toISOString()},"after_task_create");
+      return;
+    }
 
     const projectId = task.project_id || profiles[profile].todoistProjectId;
     const draftMapping: Mapping = {
@@ -322,14 +337,28 @@ export async function reconcileUnmappedCalendar(
     if (await canMutate()) {
       if (await completionBlocksRecovery(event.id, true)) return;
       const existingComment = await pair.todoist.findComment(task.id, event.id);
-      if (await controlsBlockRecovery([event.id],task.id)) return;
+      if (await controlsBlockRecovery([event.id],task.id)) {
+        if (created) await rollbackCreatedTask(event,task,draftMapping,"before_comment_write");
+        return;
+      }
       const comment = await pair.todoist.upsertComment(task.id, taskComment(event), existingComment?.id, draftMapping);
       const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
       mapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
       await state.recordMutation(profile);
+      if (await controlsBlockRecovery([event.id],task.id)) {
+        if (created) await rollbackCreatedTask(event,task,mapping,"after_comment_write");
+        else if (!existingComment) {
+          try { if (!await canMutate()) throw new Error("Mutation circuit is open; comment rollback is deferred"); await pair.todoist.deleteComment(comment.id); await state.recordMutation(profile); }
+          catch (error) { await state.putMapping(mapping); await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,commentId:comment.id,stage:"after_comment_write",error:error instanceof Error?error.message:String(error)}); }
+        } else await state.putMapping(mapping);
+        return;
+      }
     }
 
-    if (await controlsBlockRecovery([event.id],task.id)) return;
+    if (await controlsBlockRecovery([event.id],task.id)) {
+      if (created) await rollbackCreatedTask(event,task,mapping,"before_mapping_write");
+      return;
+    }
     await state.putMapping(mapping);
     await rememberStandaloneIdentity(event, task);
     if (created) summary.imported += 1;
@@ -396,7 +425,6 @@ export async function reconcileUnmappedCalendar(
       created = true;
     }
     reservedTaskIds.add(task.id);
-    if (await controlsBlockRecovery([master.id,active.id],task.id)) return;
 
     const start = originalStart(active);
     const mapping: Mapping = {
@@ -413,6 +441,10 @@ export async function reconcileUnmappedCalendar(
       calendarProgressVersion: 1,
       updatedAt: new Date().toISOString(),
     };
+    if (await controlsBlockRecovery([master.id,active.id],task.id)) {
+      if (created) await rollbackCreatedTask(active,task,mapping,"after_series_task_create");
+      return;
+    }
     await state.putMapping(mapping);
     await state.putRecurrenceLink(recurrenceLink(mapping));
     if (created) summary.imported += 1;

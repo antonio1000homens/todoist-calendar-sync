@@ -1,6 +1,6 @@
 export type Profile = "home" | "antonio" | "work";
 export type CutoverMode = "aws";
-export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual";
+export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual" | "repair";
 export type ReconciliationReason = "manual";
 export type CalendarWatchStatus = "active" | "replaced" | "missing";
 
@@ -89,6 +89,7 @@ export interface Delivery {
     slackDecisionId?: string;
   };
   manual?: ManualControlDelivery;
+  repair?: { operationId:string };
   /** @deprecated Compatibility for any pre-deployment queued reconcile message. */
   reconcileProfiles?: readonly Profile[];
 }

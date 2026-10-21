@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 28444)
+Total output lines: 2204
+
 import { createHash } from "node:crypto";
 import {
   GetCommand,
@@ -16,6 +19,7 @@ import { normalizedText } from "./security.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
+import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -377,7 +381,10 @@ export class ManualDecisionStore {
     const current = await this.get(input.decisionId);
     // Deterministic decisions are one-shot history. A repeated detector with the
     // same state fingerprint must never overwrite a terminal decision.
-    if (current) return { decision: current, created: false };
+    if (current) {
+      await new ReviewStore().observeDecision(current);
+      return { decision: current, created: false };
+    }
     const decision: ManualDecision = {
       ...input,
       status: "pending",
@@ -393,6 +400,7 @@ export class ManualDecisionStore {
         expiresAt: epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    await new ReviewStore().observeDecision(decision);
     return { decision, created: true };
   }
 
@@ -452,6 +460,12 @@ export class ManualDecisionStore {
         ":expiresAt": epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    const decision = await this.get(decisionId);
+    if (decision) {
+      const reviewStatus = status === "resolved" ? "resolved" : status === "expired" ? "dismissed" : "open";
+      try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
+      catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
+    }
   }
 }
 
@@ -782,6 +796,11 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
       })),
     });
   }
+  blocks.push({ type:"actions", elements:[{
+    type:"button", action_id:"gcp_sync_decision_open_review",
+    text:{type:"plain_text",text:"Open review"},
+    url:"https://calendar-sync.alf-broadcast.co.uk/review/?case=" + encodeURIComponent(decision.decisionId),
+  }] });
   blocks.push(technicalContextBlock(decision));
   return blocks;
 }
@@ -845,637 +864,7 @@ export class SlackManualNotifier {
       await slackApi("chat.update", { channel, ts: replyTs, text });
       return replyTs;
     }
-    return this.postText(text, channel, threadTs);
-  }
-
-  async updateResolution(decision: ManualDecision, text: string, blocks?: unknown[]): Promise<void> {
-    if (!slackEnabled()) return;
-    const fresh = await this.store.get(decision.decisionId) || decision;
-    if (!fresh.slackChannelId || !fresh.slackMessageTs) {
-      await this.postText(`${MANUAL_DECISION_CATALOG[fresh.type].title}\n${contextLines(fresh).join("\n")}\n${text}\n${technicalContextText(fresh)}`);
-      return;
-    }
-    try {
-      await slackApi("chat.update", {
-        channel: fresh.slackChannelId,
-        ts: fresh.slackMessageTs,
-        text,
-        blocks: blocks || decisionResolutionBlocks(fresh, text),
-      });
-    } catch (error) {
-      console.error(JSON.stringify({ service: "todoist-calendar-sync-manual", event: "slack_resolution_update_failed", decisionId: decision.decisionId, error: error instanceof Error ? error.message : String(error) }));
-    }
-  }
-}
-
-export class ManualInterventionService {
-  constructor(
-    private readonly store = new ManualDecisionStore(),
-    private readonly notifier = new SlackManualNotifier(store),
-    private readonly clients: ProviderClientFactory = defaultProviderClientFactory,
-    private readonly policies = new InterventionPolicyStore(),
-  ) {}
-
-  private executionClientFactory?: ProviderClientFactory;
-
-  get enabled(): boolean {
-    return slackEnabled();
-  }
-
-  async reconciliationOutcome(channel: string | undefined, threadTs: string | undefined, text: string): Promise<string | undefined> {
-    return this.notifier.reconciliationOutcome(channel, threadTs, text);
-  }
-
-  async updateReconciliationIncident(channel: string | undefined, messageTs: string | undefined, text: string, close = false, decisionId?: string): Promise<void> {
-    const decision = decisionId ? await this.store.get(decisionId) : undefined;
-    return this.notifier.updateReconciliationIncident(channel, messageTs, text, close, decision);
-  }
-
-  async finishReconciliationDecision(decisionId: string, text: string): Promise<void> {
-    try {
-      await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
-    } catch (error) {
-      if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
-      const existing = await this.store.get(decisionId);
-      if (existing?.status !== "resolved") throw error;
-    }
-  }
-
-  async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
-    return this.notifier.deliverReconciliationOutcome(channel, threadTs, replyTs, text);
-  }
-
-  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string): Promise<boolean> {
-    const decisionId = `${profile}-operational_reconciliation_stuck-${fingerprint({ identity })}`;
-    const existing = await this.store.get(decisionId);
-    if (existing) {
-      if (existing.status !== "pending" || existing.slackMessageTs) return true;
-      return this.notifier.postDecision({ ...existing, slackChannelId: channel || existing.slackChannelId });
-    }
-    const now = isoNow();
-    const decision: ManualDecision = {
-      decisionId, profile, type: "operational_reconciliation_stuck", severity: "warning", status: "pending",
-      createdAt: now, decisionDeadline: plusDays(DEFAULT_DECISION_DEADLINE_DAYS), context: { identity, detail },
-      fingerprint: fingerprint({ identity }), permittedActions: MANUAL_DECISION_CATALOG.operational_reconciliation_stuck.actions,
-      ...(channel ? { slackChannelId: channel } : {}),
-    };
-    await this.store.putPending(decision);
-    return this.notifier.postDecision(decision);
-  }
-
-  private async providerClients(profile: Profile) {
-    return (this.executionClientFactory || this.clients)(profile);
-  }
-
-  private createManualExecutionClientFactory(
-    state: StateRepository,
-    budget: ReconciliationMutationBudget,
-  ): ProviderClientFactory {
-    const budgeted = createBudgetedClientFactory(budget, this.clients);
-    const circuitWrapped = <T extends object>(target: T, profile: Profile, mutatingMethods: Set<string>): T => new Proxy(target, {
-      get(current, property, receiver) {
-        const value = Reflect.get(current, property, receiver);
-        if (typeof value !== "function") return value;
-        const operation = String(property);
-        if (!mutatingMethods.has(operation)) return value.bind(current);
-        return async (...args: unknown[]) => {
-          const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
-            ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
-            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
-          if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
-          if (!await state.mutationAllowed(profile)) throw new ManualCircuitOpenError(profile, operation);
-          const result = await Reflect.apply(value, current, args);
-          // Count every successful provider write, including each item in a bounded bulk action.
-          await state.recordMutation(profile);
-          return result;
-        };
-      },
-    });
-    return async (profile) => {
-      const pair = await budgeted(profile);
-      return {
-        calendar: circuitWrapped(pair.calendar, profile, MANUAL_CALENDAR_MUTATIONS),
-        todoist: circuitWrapped(pair.todoist, profile, MANUAL_TODOIST_MUTATIONS),
-      };
-    };
-  }
-
-  private async createDecision(
-    profile: Profile,
-    type: ManualDecisionType,
-    identity: Record<string, unknown>,
-    fields: Partial<ManualDecision>,
-    context: Record<string, unknown>,
-    contextEnricher?: () => Promise<Record<string, unknown>>,
-  ): Promise<{ decision?: ManualDecision; mode: InterventionResponseMode }> {
-    const catalog = MANUAL_DECISION_CATALOG[type];
-    const seriesId = typeof fields.seriesId === "string" ? fields.seriesId : undefined;
-    const effective = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
-    if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
-
-    let mode = effective.mode;
-    let defaultAction = effective.defaultAction;
-    const savedAction = defaultAction ? catalog.actions.find((action) => action.id === defaultAction) : undefined;
-    if (defaultAction && !savedAction) {
-      console.warn(JSON.stringify({ service: "todoist-calendar-sync-manual", event: "intervention_policy_default_invalid", profile, type, defaultAction }));
-      defaultAction = undefined;
-      mode = "prompt";
-    }
-    if (mode === "auto" && (!savedAction?.autoAllowed || !defaultAction)) {
-      console.warn(JSON.stringify({ service: "todoist-calendar-sync-manual", event: "intervention_policy_auto_not_allowed", profile, type, defaultAction }));
-      mode = "prompt";
-    }
-
-    const key = decisionKey(profile, type, identity);
-    let decisionContext = context;
-    if (mode === "prompt" && contextEnricher) {
-      // Avoid provider reads for disabled/observe/auto policies and repeated deterministic decisions.
-      const existing = await this.store.get(key.decisionId);
-      if (existing) return { decision: existing, mode };
-      try {
-        decisionContext = { ...context, ...await contextEnricher() };
-      } catch (error) {
-        decisionContext = { ...context, enrichmentError: error instanceof Error ? error.message : String(error) };
-      }
-    }
-
-    const result = await this.store.putPending({
-      decisionId: key.decisionId,
-      profile,
-      type,
-      severity: catalog.severity,
-      fingerprint: key.fingerprint,
-      permittedActions: catalog.actions,
-      policyMode: mode,
-      policyScope: effective.source,
-      defaultAction,
-      context: decisionContext,
-      ...fields,
-    });
-    if (mode === "prompt" && (result.created
-      || (effective.mode === "auto" && result.decision.status === "pending" && !result.decision.slackMessageTs))) {
-      await this.notifier.postDecision(result.decision);
-    }
-    if (mode === "auto" && defaultAction && result.decision.status === "pending") {
-      await enqueueDelivery({
-        id: `manual:${profile}:${result.decision.decisionId}:${defaultAction}:auto:${Date.now()}`,
-        kind: "manual",
-        profile,
-        mode: "aws",
-        receivedAt: isoNow(),
-        headers: { source: "intervention-policy" },
-        body: "",
-        manual: {
-          decisionId: result.decision.decisionId,
-          action: defaultAction,
-          slackUserId: "AUTO_POLICY",
-        },
-      });
-    }
-    return { decision: result.decision, mode };
-  }
-
-  async interceptTodoistDeletion(delivery: Delivery, state: StateRepository): Promise<boolean> {
-    if (!this.enabled || delivery.kind !== "todoist") return false;
-    let payload: TodoistWebhookPayload;
-    try { payload = JSON.parse(delivery.body) as TodoistWebhookPayload; } catch { return false; }
-    const task = payload.event_data;
-    const explicitDelete = Boolean(task?.id && (/deleted/i.test(payload.event_name || "") || task.is_deleted));
-    if (!task?.id || !explicitDelete) return false;
-    const mapping = await state.getMappingByTask(delivery.profile, task.id);
-    if (!mapping) return false;
-
-    const type: ManualDecisionType = mapping.recurrenceOwner === "calendar" && mapping.masterEventId
-      ? "calendar_owned_recurrence_task_deleted"
-      : mapping.recurrenceOwner === "todoist"
-        ? "todoist_owned_recurrence_task_deleted"
-        : "standalone_todoist_task_deleted";
-    const identity = {
-      taskId: task.id,
-      eventId: mapping.eventId,
-      masterEventId: mapping.masterEventId,
-      activeInstanceId: mapping.activeInstanceId,
-      mappingUpdatedAt: mapping.updatedAt,
-    };
-    const effective = await this.policies.resolve(delivery.profile, type, mapping.seriesId, MANUAL_DECISION_CATALOG[type].defaultMode || "prompt");
-    if (effective.mode === "prompt") {
-      const existing = await this.store.get(decisionKey(delivery.profile, type, identity).decisionId);
-      if (existing) return true;
-      const pair = await this.providerClients(delivery.profile);
-      try {
-        await pair.todoist.getTask(task.id);
-        await state.audit(delivery.profile, "manual_decision_suppressed_current_task_exists", {
-          type,
-          taskId: task.id,
-          eventId: mapping.eventId,
-          sourceDeliveryId: delivery.id,
-        });
-        return true;
-      } catch (error) {
-        if (!providerNotFound(error)) throw error;
-      }
-    }
-    const context: Record<string, unknown> = {
-      taskTitle: task.content,
-      todoistDue: todoistDue(task),
-      calendarStart: mapping.activeEffectiveStart || mapping.originalStart,
-      eventName: payload.event_name,
-    };
-    const routed = await this.createDecision(
-      delivery.profile,
-      type,
-      identity,
-      {
-        sourceDeliveryId: delivery.id,
-        taskId: task.id,
-        eventId: mapping.eventId,
-        seriesId: mapping.seriesId,
-        masterEventId: mapping.masterEventId,
-        activeInstanceId: mapping.activeInstanceId,
-        mappingSnapshot: mapping,
-      },
-      context,
-      async () => {
-        const pair = await this.providerClients(delivery.profile);
-        const preferredEventId = mapping.activeInstanceId || mapping.eventId;
-        let event: CalendarEvent;
-        let usingActiveOccurrence = preferredEventId !== mapping.eventId;
-        try {
-          event = await pair.calendar.getEvent(preferredEventId);
-        } catch (error) {
-          if (!usingActiveOccurrence || !providerNotFound(error)) throw error;
-          event = await pair.calendar.getEvent(mapping.eventId);
-          usingActiveOccurrence = false;
-        }
-        return {
-          calendarTitle: event.summary,
-          calendarStart: usingActiveOccurrence
-            ? eventDisplayStart(event) || context.calendarStart
-            : context.calendarStart || eventDisplayStart(event),
-        };
-      },
-    );
-    if (routed.mode === "off") {
-      await state.audit(delivery.profile, "manual_detector_disabled", { type, taskId: task.id, eventId: mapping.eventId, sourceDeliveryId: delivery.id });
-      return false;
-    }
-    if (routed.mode === "observe") {
-      await state.audit(delivery.profile, "manual_detector_observed_no_mutation", { type, taskId: task.id, eventId: mapping.eventId, sourceDeliveryId: delivery.id });
-      return true;
-    }
-    await state.audit(delivery.profile, "manual_decision_requested", {
-      decisionId: routed.decision?.decisionId,
-      type,
-      handlingMode: routed.mode,
-      taskId: task.id,
-      eventId: mapping.eventId,
-      sourceDeliveryId: delivery.id,
-    });
-    return true;
-  }
-
-  async observeAudit(
-    delivery: Delivery,
-    profile: Profile,
-    action: string,
-    detail: Record<string, unknown>,
-  ): Promise<void> {
-    if (!this.enabled || delivery.kind === "manual") return;
-    let type: ManualDecisionType | undefined;
-    if (action === "calendar_snapshot_unmapped_ambiguous") type = "calendar_snapshot_unmapped_ambiguous";
-    else if (action === "calendar_snapshot_recurring_ambiguous") type = "calendar_snapshot_recurring_ambiguous";
-    else if (action === "todoist_snapshot_reconcile_conflict_both_sides_changed") type = "both_sides_changed";
-    else if (["todoist_snapshot_reconcile_unmapped_conflict", "todoist_snapshot_reconcile_unmapped_ambiguous", "calendar_task_link_ambiguous_conflict", "calendar_snapshot_recurring_identity_conflict"].includes(action)) type = "todoist_unmapped_conflict";
-    else if (action === "todoist_snapshot_reconcile_cancelled_projection_blocked") type = "todoist_cancelled_projection_blocked";
-    else if (action === "reconciliation_mutation_budget_exhausted" || action === "calendar_snapshot_reconcile_mutation_budget_exhausted") type = "operational_mutation_budget";
-    else if (action.includes("circuit_open") || action.includes("circuit_deferred")) type = "operational_circuit_open";
-    if (!type) return;
-
-    const eventId = typeof detail.eventId === "string" ? detail.eventId : undefined;
-    const taskId = typeof detail.taskId === "string" ? detail.taskId : undefined;
-    const seriesId = typeof detail.seriesId === "string" ? detail.seriesId : undefined;
-    const context: Record<string, unknown> = { ...detail };
-
-    if ((type === "calendar_snapshot_unmapped_ambiguous" || type === "calendar_snapshot_recurring_ambiguous") && eventId) {
-      try {
-        const pair = await this.providerClients(profile);
-        const event = await pair.calendar.getEvent(eventId);
-        const candidates = (await pair.todoist.listTasks()).filter((candidate) => hasCanonicalState(event, candidate));
-        context.title = event.summary;
-        context.start = eventStart(event);
-        context.calendarTitle = event.summary;
-        context.calendarStart = eventDisplayStart(event);
-        context.candidates = candidates.map((candidate) => ({ id: candidate.id, content: candidate.content, due: candidate.due }));
-      } catch (error) {
-        context.enrichmentError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
-    const recurringConflict = type === "todoist_unmapped_conflict" || type === "todoist_cancelled_projection_blocked";
-    const candidateEventIds = Array.isArray(detail.candidateEventIds)
-      ? [...new Set(detail.candidateEventIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
-      : [];
-    const candidateTaskIds = Array.isArray(detail.candidateTaskIds)
-      ? [...new Set(detail.candidateTaskIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
-      : [];
-    const canEnrichConflict = recurringConflict
-      && Boolean(taskId || eventId || candidateEventIds.length || candidateTaskIds.length);
-    await this.createDecision(
-      profile,
-      type,
-      recurringConflict
-        ? { taskId, eventId, seriesId, category: type, candidateEventIds, candidateTaskIds }
-        : { action, eventId, taskId, seriesId, detail },
-      {
-        sourceDeliveryId: delivery.id,
-        sourceAuditAction: action,
-        eventId,
-        taskId,
-        seriesId,
-        masterEventId: typeof detail.masterEventId === "string" ? detail.masterEventId : undefined,
-        activeInstanceId: typeof detail.activeInstanceId === "string" ? detail.activeInstanceId : undefined,
-      },
-      context,
-      canEnrichConflict
-        ? async () => {
-            const pair = await this.providerClients(profile);
-            const extra: Record<string, unknown> = {};
-            if (taskId) {
-              try {
-                const task = await pair.todoist.getTask(taskId);
-                extra.taskTitle = task.content;
-                extra.todoistDue = todoistDue(task);
-                extra.todoistRecurring = Boolean(task.due?.is_recurring);
-                extra.todoistDescription = task.description || "";
-                extra.todoistUpdatedAt = task.updated_at;
-                extra.todoistRecurrenceRule = todoistRecurrenceToRrule(task);
-                extra.todoistRecurrenceText = task.due?.string;
-              } catch (error) {
-                extra.taskReadError = error instanceof Error ? error.message : String(error);
-              }
-            }
-            if (eventId) {
-              try {
-                const event = await pair.calendar.getEvent(eventId);
-                extra.calendarTitle = event.summary;
-                extra.calendarStart = eventDisplayStart(event);
-                extra.calendarStatus = event.status;
-                extra.calendarDescription = event.description || "";
-                extra.calendarRecurrenceRule = event.recurrence?.[0];
-                extra.calendarEtag = event.etag;
-              } catch (error) {
-                extra.calendarReadError = error instanceof Error ? error.message : String(error);
-              }
-            }
-            const maxCandidateDetails = 8;
-            const targets = [
-              ...candidateEventIds.map((id) => ({ kind: "calendar_event" as const, id })),
-              ...candidateTaskIds.map((id) => ({ kind: "todoist_task" as const, id })),
-            ].filter((candidate) => candidate.id !== eventId && candidate.id !== taskId);
-            const selected = targets.slice(0, maxCandidateDetails);
-            const readOnlyCandidates: Array<Record<string, unknown>> = [];
-            for (const candidate of selected) {
-              try {
-                if (candidate.kind === "calendar_event") {
-                  const event = await pair.calendar.getEvent(candidate.id);
-                  readOnlyCandidates.push({
-                    kind: candidate.kind,
-                    id: candidate.id,
-                    title: event.summary,
-                    date: eventDisplayStart(event),
-                    status: event.status,
-                    recurring: Boolean(event.recurrence?.length || event.recurringEventId),
-                    available: true,
-                  });
-                } else {
-                  const task = await pair.todoist.getTask(candidate.id);
-                  readOnlyCandidates.push({
-                    kind: candidate.kind,
-                    id: candidate.id,
-                    title: task.content,
-                    date: todoistDue(task),
-                    recurring: Boolean(task.due?.is_recurring),
-                    available: true,
-                  });
-                }
-              } catch {
-                readOnlyCandidates.push({ kind: candidate.kind, id: candidate.id, available: false });
-              }
-            }
-            if (taskId && eventId && !extra.taskReadError && !extra.calendarReadError) {
-              try {
-                const [task, event] = await Promise.all([
-                  pair.todoist.getTask(taskId), pair.calendar.getEvent(eventId),
-                ]);
-                if (event.recurrence?.length) {
-                  const calendarTimeZone = await pair.calendar.getTimeZone();
-                  const preview = planFutureSeriesSplit(profile, task, event, new Date(), calendarTimeZone);
-                  extra.futureSplitPlan = preview;
-                  extra.futureSplitPreview = `${preview.originalRule} from ${event.start?.date}; retain through ${preview.previousOccurrence}; stop old dates from ${preview.nextOldOccurrence}; start ${preview.newStart} with ${preview.newRule} (Calendar timezone ${calendarTimeZone})`;
-                }
-              } catch (error) {
-                extra.futureSplitBlockedReason = error instanceof Error ? error.message : String(error);
-              }
-            }
-            if (readOnlyCandidates.length) extra.readOnlyCandidates = readOnlyCandidates;
-            if (targets.length > selected.length) extra.omittedCandidateCount = targets.length - selected.length;
-            return extra;
-          }
-        : undefined,
-    );
-  }
-
-  async reportDeliveryFailure(delivery: Delivery | undefined, error: unknown): Promise<void> {
-    if (!this.enabled || !delivery) return;
-    const status = Number((error as { status?: number }).status);
-    if (delivery.kind === "manual" && delivery.manual?.decisionId) {
-      const original = await this.store.get(delivery.manual.decisionId);
-      if (original?.status === "pending") {
-        const failedAction = delivery.manual.action ? actionLabel(original, delivery.manual.action) : "Unknown action";
-        await this.notifier.updateResolution(
-          original,
-          `⚠️ *${failedAction}* failed and may be quarantined. The decision remains pending.\n${error instanceof Error ? error.message : String(error)}\nAfter correcting the cause, use \`/sync resume\` with the decision ID shown in *Technical details*.`,
-        );
-      }
-    }
-    const type: ManualDecisionType = [401, 403].includes(status) ? "operational_provider_auth" : "operational_dlq";
-    await this.createDecision(
-      delivery.profile,
-      type,
-      { deliveryId: delivery.id, status, message: error instanceof Error ? error.message : String(error) },
-      { sourceDeliveryId: delivery.id },
-      operationalFailureContext(delivery, error),
-    );
-  }
-
-  private async validateMappedDecision(decision: ManualDecision, state: StateRepository): Promise<Mapping | undefined> {
-    if (!decision.taskId || !decision.mappingSnapshot) return undefined;
-    const current = await state.getMappingByTask(decision.profile, decision.taskId);
-    if (!current
-      || current.eventId !== decision.mappingSnapshot.eventId
-      || current.masterEventId !== decision.mappingSnapshot.masterEventId
-      || current.activeInstanceId !== decision.mappingSnapshot.activeInstanceId) return undefined;
-    return current;
-  }
-
-  private resolutionPolicyBlocks(decision: ManualDecision, resolution: string): unknown[] | undefined {
-    const action = MANUAL_DECISION_CATALOG[decision.type].actions.find((candidate) => candidate.id === resolution);
-    if (!action) return undefined;
-    const value = (mode: "prompt" | "auto", scope: InterventionPolicyScope) => JSON.stringify({
-      realm: "gcp-sync",
-      profile: decision.profile,
-      decisionId: decision.decisionId,
-      decisionType: decision.type,
-      policyOperation: "set",
-      policyScope: scope,
-      policyMode: mode,
-      policyAction: resolution,
-      seriesId: decision.seriesId,
-    });
-  const elements: unknown[] = [
-      { type: "button", action_id: "gcp_sync_policy_profile_prompt", text: { type: "plain_text", text: "Default for profile" }, value: value("prompt", "profile") },
-      ...(decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy_series_prompt", text: { type: "plain_text", text: "Default for series" }, value: value("prompt", "series") }] : []),
-      ...(action.autoAllowed ? [{ type: "button", action_id: "gcp_sync_policy_profile_auto", style: "primary", text: { type: "plain_text", text: "Auto-apply for profile" }, value: value("auto", "profile") }] : []),
-      ...(action.autoAllowed && decision.seriesId ? [{ type: "button", action_id: "gcp_sync_policy_series_auto", style: "primary", text: { type: "plain_text", text: "Auto for series" }, value: value("auto", "series") }] : []),
-      { type: "button", action_id: "gcp_sync_policy_always_ask", text: { type: "plain_text", text: "Always ask" }, value: JSON.stringify({ realm: "gcp-sync", profile: decision.profile, decisionId: decision.decisionId, decisionType: decision.type, policyOperation: "set", policyScope: "profile", policyMode: "prompt" }) },
-    ];
-    return [
-      { type: "section", text: { type: "mrkdwn", text: "*Future handling*\nSave this choice as a suggested default, or auto-apply it when the action is explicitly auto-safe." } },
-      { type: "actions", block_id: `gcp_sync_policy_${decision.decisionId.slice(-24)}`, elements: elements.slice(0, 5) },
-    ];
-  }
-
-  private async finishResolutionWithoutReconciliation(
-    decision: ManualDecision,
-    state: StateRepository,
-    resolution: string,
-    slackUserId?: string,
-  ): Promise<void> {
-    await this.store.finish(decision.decisionId, "resolved", resolution, slackUserId);
-    const resolvedBy = slackUserId === "AUTO_POLICY" ? "saved intervention policy" : slackUserId ? `<@${slackUserId}>` : "operator";
-    const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nA full reconciliation was not started. Use the reconciliation action when you are ready to verify provider state.`;
-    const policyBlocks = slackUserId === "AUTO_POLICY" ? [] : (this.resolutionPolicyBlocks(decision, resolution) || []);
-    await this.notifier.updateResolution(decision, text, decisionResolutionBlocks(decision, text, policyBlocks));
-  }
-
-  private async retryConflictReconciliation(
-    decision: ManualDecision,
-    state: StateRepository,
-    slackUserId?: string,
-  ): Promise<void> {
-    // Old queued policy deliveries must not bypass explicit Slack consent.
-    if (slackUserId === "AUTO_POLICY") {
-      await this.notifier.postDecision({ ...decision, permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions });
-      return;
-    }
-    const result = await requestReconciliation(state, decision.profile, "manual", undefined, {
-      requester: slackUserId || "operator",
-      slackChannelId: decision.slackChannelId,
-      slackMessageTs: decision.slackMessageTs,
-      slackThreadTs: decision.slackMessageTs,
-      slackDecisionId: decision.decisionId,
-    });
-    const text = await this.reconciliationAcknowledgement(result);
-    await this.notifier.reconciliationOutcome(decision.slackChannelId, decision.slackMessageTs, text);
-  }
-
-  private async reconciliationAcknowledgement(result: ReconciliationRequestResult): Promise<string> {
-    if (result.enqueueError) return `Reconciliation could not be queued: ${result.enqueueError}`;
-    if (result.coalesced) {
-      const location = result.slackChannelId && result.slackThreadTs
-        ? await this.notifier.reconciliationLocation(result.slackChannelId, result.slackThreadTs)
-        : "status command";
-      return `Reconciliation already active. This request joined generation ${result.generation}. Follow its progress and final outcome in the ${location}.`;
-    }
-    return "Reconciliation queued. I’ll post the final outcome in this thread.";
-  }
-
-  /**
-   * Explicit one-object ownership resolution, not another blind full-profile
-   * retry. Only a live standalone event linked to an existing recurring task
-   * can enter this path. Duplicate identities require operator investigation.
-   * The normal project synchronizer performs the final mapping/comment writes
-   * so recurrence metadata is identical to normal Todoist-driven creation.
-   */
-  private async resolveUnmappedConflict(
-    decision: ManualDecision,
-    action: "use_todoist_recurrence" | "use_calendar_version",
-    state: StateRepository,
-    slackUserId?: string,
-  ): Promise<void> {
-    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
-    if (!decision.taskId || !decision.eventId
-      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_unmapped_conflict"
-      || decision.context.candidateEventIds instanceof Array
-      || decision.context.candidateTaskIds instanceof Array) {
-      return refuse("This decision does not identify one unambiguous live Todoist task and Calendar event. No changes made.");
-    }
-    const pair = await this.providerClients(decision.profile);
-    let task: TodoistTask;
-    let event: CalendarEvent;
-    try {
-      [task, event] = await Promise.all([
-        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
-      ]);
-    } catch (error) {
-      if (providerNotFound(error)) return refuse("The task or Calendar event no longer exists. No changes made.");
-      throw error;
-    }
-    if (task.project_id !== profiles[decision.profile].todoistProjectId
-      || !unresolvedStandalonePair(task, event)) {
-      return refuse("The current objects are no longer one active, same-title, same-date standalone pair with Todoist recurrence. No changes made.");
-    }
-    const snapshots: Array<[string, string | undefined]> = [
-      ["taskTitle", task.content],
-      ["calendarTitle", event.summary],
-      ["todoistDue", todoistDue(task)],
-      ["calendarStart", eventDisplayStart(event)],
-      ["todoistDescription", task.description || ""],
-      ["calendarDescription", event.description || ""],
-      ["todoistUpdatedAt", task.updated_at],
-    ];
-    for (const [field, current] of snapshots) {
-      if (typeof decision.context[field] === "string"
-        && normalizedText(decision.context[field]) !== normalizedText(current)) {
-        return refuse(`The ${field} changed after the decision was created. No changes made.`);
-      }
-    }
-    if (decision.context.todoistRecurring === false || decision.context.calendarStatus !== "confirmed") {
-      return refuse("The original decision did not confirm an active, recurring task and Calendar event. No changes made.");
-    }
-    if (action === "use_todoist_recurrence" && !todoistRecurrenceToRrule(task)) {
-      return refuse("The Todoist recurrence cannot be represented as a supported Calendar RRULE. No changes made.");
-    }
-
-    const [taskMapping, eventMapping, tombstone, completion, history, baseline, linked] = await Promise.all([
-      state.getMappingByTaskAnyProfile(task.id),
-      state.getMappingByEvent(decision.profile, event.id),
-      state.getCalendarProjectionTombstone(decision.profile, task.id),
-      state.getCompletedCalendarProjectionByEvent(decision.profile, event.id),
-      state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
-      documentClient.send(new GetCommand({
-        TableName: tableName(),
-        Key: { pk: `BASELINE#${decision.profile}#TASK#${task.id}`, sk: "RECONCILE" },
-        ConsistentRead: true,
-      })),
-      pair.calendar.findByTodoistTaskId(task.id),
-    ]);
-    if (taskMapping || eventMapping || tombstone || completion || history.length || baseline.Item
-      || !linked || linked.id !== event.id) {
-      return refuse("Ownership, a tombstone, completion history, baseline or linked Calendar identity prevents safe relinking. No changes made.");
-    }
-
-    // Enumerate actual occurrences, not only extendedProperty matches. An
-    // unrelated annual series can have a 2027 instance despite a 2024 master.
-    const { start, end } = manualConflictWindow(task);
-    const [tasks, occurrences] = await Promise.all([
-      pair.todoist.listTasks(),
-      pair.calendar.listOccurrencesInWindow(start, end),
-    ]);
-    const competing = competingUnmappedIdentities(task, event, tasks, occurrences);
-    if (competing.taskIds.length || competing.eventIds.length || !competing.sawTarget) {
-      await state.audit(decision.profile, "manual_unmapped_resolution_duplicate_blocked", {
-        taskId: task.id, eventId: event.id, action,
+    return this.postText(text, channe…8444 tokens truncated…,
         candidateTaskIds: competing.taskIds, candidateEventIds: competing.eventIds,
       });
       return refuse("A competing Todoist task or Calendar occurrence exists, or the original event could not be verified. No changes made; inspect duplicate identities first.");
@@ -2094,16 +1483,16 @@ export class ManualInterventionService {
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
     const budget = new ReconciliationMutationBudget(MAX_MANUAL_BULK_MUTATIONS);
-    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget);
+    const mapping = decision.mappingSnapshot;
+    const taskIds = [...new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)))];
+    const eventIds = [...new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)))];
+    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget, { taskIds, eventIds, decision });
     try {
       if (manual.action === "reconcile_now") {
         await this.retryConflictReconciliation(decision, state, manual.slackUserId);
         return;
       }
       if (!["acknowledge","keep_separate"].includes(manual.action)) {
-        const mapping = decision.mappingSnapshot;
-        const taskIds = new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)));
-        const eventIds = new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)));
         for (const taskId of taskIds) {
           if (await state.syncBlocked(decision.profile, { taskId })) throw new ManualSyncBlockedError();
           for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { taskId, eventId })) throw new ManualSyncBlockedError();

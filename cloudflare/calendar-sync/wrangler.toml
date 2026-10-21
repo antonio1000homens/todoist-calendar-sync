@@ -10,3 +10,10 @@ routes = [
 
 [vars]
 TODOIST_CALENDAR_SYNC_AWS_INGRESS_URL = "https://t4gxew4vz5a3dwc4u6dqntckim0lpcfb.lambda-url.eu-west-2.on.aws/"
+TODOIST_CALENDAR_SYNC_REVIEW_API_URL = "https://review-api-not-configured.invalid/"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/calendar", "/review/api/*"]

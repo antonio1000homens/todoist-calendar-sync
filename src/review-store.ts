@@ -38,10 +38,18 @@ export class ReviewStore {
   }
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
+    const terminal = ["resolved", "excluded", "dismissed"].includes(status);
+    const condition = status === "repairing"
+      ? "#s = :open OR (#s = :repairing AND operationId = :op)"
+      : status === "open"
+        ? "#s = :repairing AND operationId = :op"
+        : "#s = :current AND (attribute_not_exists(operationId) OR operationId = :op)";
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
       UpdateExpression: "SET #s = :s, #r = :r, updatedAt = :now, operationId = :op, lookupSk = :lookup",
+      ConditionExpression: condition,
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: { ":s": status, ":r": result,
-        ":now": new Date().toISOString(), ":op": operationId || "", ":lookup": `REVIEW#${["resolved", "excluded", "dismissed"].includes(status) ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
+        ":now": new Date().toISOString(), ":op": operationId || "", ":current": current.status, ":open":"open", ":repairing":"repairing",
+        ":lookup": `REVIEW#${terminal ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
     await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
@@ -67,6 +75,13 @@ export class ReviewStore {
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
       ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded" : "attribute_not_exists(pk) OR #status <> :succeeded",
       ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} }));
+  }
+  async completeNotification(operationId: string, replyTs?: string): Promise<void> {
+    await client.send(new UpdateCommand({ TableName:reviewTable(), Key:key(`REPAIR#${operationId}`),
+      UpdateExpression:"SET notificationPending = :false, updatedAt = :now, lookupSk = :lookup" + (replyTs ? ", notificationReplyTs = :reply" : ""),
+      ConditionExpression:"#status IN (:succeeded, :needsReview, :failed)",
+      ExpressionAttributeNames:{"#status":"status"},
+      ExpressionAttributeValues:{":false":false,":now":new Date().toISOString(),":lookup":"REPAIR#HISTORY#"+operationId,":succeeded":"succeeded",":needsReview":"needs_review",":failed":"failed",...(replyTs?{":reply":replyTs}:{})} }));
   }
   async finalizeOperation(operation: RepairOperation, releases: RepairRelease[]): Promise<RepairOperation> {
     const current = await this.getCase(operation.preview.intent.caseId);
@@ -131,7 +146,11 @@ export class SyncControls {
       }
       if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;
     }
-    return Boolean(!operationId && ids.taskId && ids.eventId && await this.rejected(profile, ids.taskId, ids.eventId));
+    if (ids.taskId && ids.eventId) {
+      const rejection = await new ReviewStore().get<{ operationId?: string }>(`REJECTED_PAIR#${profile}#${ids.taskId}#${ids.eventId}`);
+      if (rejection && rejection.operationId !== operationId) return true;
+    }
+    return false;
   }
   async claim(refs: EntityRef[], operationId: string): Promise<void> {
     if (!refs.length) return;

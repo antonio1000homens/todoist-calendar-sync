@@ -1,5 +1,6 @@
 const ALLOWED_HOST = "calendar-sync.alf-broadcast.co.uk";
 const CALENDAR_PATH = "/calendar";
+const REVIEW_API_PREFIX = "/review/api/";
 const PROXY_AUTH_HEADER = "x-gcp-proxy-auth";
 
 const STATIC_CHANNEL_PROFILES = new Map([
@@ -40,7 +41,32 @@ function forwardedHeaders(request, url, secret) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.host !== ALLOWED_HOST || url.pathname !== CALENDAR_PATH) return errorResponse("not_found", 404);
+    if (url.host !== ALLOWED_HOST) return errorResponse("not_found", 404);
+
+    if (url.pathname.startsWith(REVIEW_API_PREFIX)) {
+      if (!["GET", "POST"].includes(request.method)) return errorResponse("method_not_allowed", 405);
+      if (!env.TODOIST_CALENDAR_SYNC_REVIEW_API_URL) return errorResponse("review_api_not_configured", 503);
+      const target = new URL(env.TODOIST_CALENDAR_SYNC_REVIEW_API_URL);
+      target.pathname = url.pathname;
+      target.search = url.search;
+      const headers = new Headers(request.headers);
+      headers.delete("host");
+      headers.set("x-forwarded-host", url.host);
+      headers.set("x-forwarded-proto", "https");
+      try {
+        return await fetch(target, { method:request.method, headers, ...(request.method === "GET" ? {} : { body:await request.arrayBuffer() }), redirect:"manual" });
+      } catch {
+        return errorResponse("review_api_unreachable", 502);
+      }
+    }
+
+    if (url.pathname === "/review") return Response.redirect(url.origin + "/review/", 308);
+    if (url.pathname.startsWith("/review/")) {
+      if (!["GET", "HEAD"].includes(request.method)) return errorResponse("method_not_allowed", 405);
+      return env.ASSETS.fetch(request);
+    }
+
+    if (url.pathname !== CALENDAR_PATH) return errorResponse("not_found", 404);
     if (request.method !== "POST") return errorResponse("method_not_allowed", 405);
 
     const channelId = request.headers.get("x-goog-channel-id") || "";

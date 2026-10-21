@@ -16,6 +16,9 @@ todoist_prefix="${TODOIST_TOKEN_PARAMETER_PREFIX:-${ssm_prefix%/}/todoist}"
 slack_bot_token_parameter="${SLACK_BOT_TOKEN_PARAMETER:-/lambdas/shared/slack-bot-token}"
 todoist_calendar_sync_slack_channel="${TODOIST_CALENDAR_SYNC_SLACK_CHANNEL:-}"
 sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
+cf_access_team_domain="${CF_ACCESS_TEAM_DOMAIN:-}"
+cf_access_audience="${CF_ACCESS_AUDIENCE:-}"
+review_operator_email="${REVIEW_OPERATOR_EMAIL:-antonio1000homens@gmail.com}"
 # SAM's key=value parameter parser consumes JSON quotes unless they are escaped.
 # Keep the value JSON for validation, but escape quotes only at the CLI boundary.
 sam_profile_config_json="${sync_profile_config_json//\"/\\\"}"
@@ -51,6 +54,8 @@ validate_parameter_name() {
 require_value STACK_NAME
 require_value TODOIST_CALENDAR_SYNC_SLACK_CHANNEL
 require_value SYNC_PROFILE_CONFIG_JSON
+require_value CF_ACCESS_TEAM_DOMAIN
+require_value CF_ACCESS_AUDIENCE
 
 if [[ ! "$stack_name" =~ ^[a-zA-Z][-a-zA-Z0-9]*$ ]]; then
   echo "STACK_NAME is not a valid CloudFormation stack name: $stack_name" >&2
@@ -137,4 +142,7 @@ sam deploy \
     "SlackBotTokenParameter=$slack_bot_token_parameter" \
     "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel" \
     "ProfileConfigJson=$sam_profile_config_json" \
+    "CloudflareAccessTeamDomain=$cf_access_team_domain" \
+    "CloudflareAccessAudience=$cf_access_audience" \
+    "ReviewOperatorEmail=$review_operator_email" \
     ${BILLING_ALARM_EMAIL:+"BillingAlarmEmail=$BILLING_ALARM_EMAIL"}
