@@ -63,6 +63,7 @@ function setup({ alternateTasks = [], alternateEvents = [], tombstone = undefine
   const audits = [];
   let eventReads = 0;
   const state = {
+    async syncBlocked() { return false; },
     currentMapping: mapping,
     async mutationAllowed() { return true; },
     async recordMutation() { changes.push("recordMutation"); },

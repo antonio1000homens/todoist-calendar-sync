@@ -16,6 +16,7 @@ import { normalizedText } from "./security.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
+import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -33,6 +34,9 @@ class ManualCircuitOpenError extends Error {
     super(`Manual intervention blocked by the mutation circuit for ${profile} before ${operation}`);
     this.name = "ManualCircuitOpenError";
   }
+}
+class ManualSyncBlockedError extends Error {
+  constructor() { super("An affected item or pairing is protected by a repair, exclusion, or rejected link. Use the review page to resolve it."); this.name = "ManualSyncBlockedError"; }
 }
 
 export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled" | "expired";
@@ -374,7 +378,10 @@ export class ManualDecisionStore {
     const current = await this.get(input.decisionId);
     // Deterministic decisions are one-shot history. A repeated detector with the
     // same state fingerprint must never overwrite a terminal decision.
-    if (current) return { decision: current, created: false };
+    if (current) {
+      await new ReviewStore().observeDecision(current);
+      return { decision: current, created: false };
+    }
     const decision: ManualDecision = {
       ...input,
       status: "pending",
@@ -390,6 +397,7 @@ export class ManualDecisionStore {
         expiresAt: epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    await new ReviewStore().observeDecision(decision);
     return { decision, created: true };
   }
 
@@ -449,6 +457,12 @@ export class ManualDecisionStore {
         ":expiresAt": epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
+    const decision = await this.get(decisionId);
+    if (decision) {
+      const reviewStatus = status === "resolved" ? "resolved" : status === "expired" ? "dismissed" : "open";
+      try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
+      catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
+    }
   }
 }
 
@@ -779,6 +793,11 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
       })),
     });
   }
+  blocks.push({ type:"actions", elements:[{
+    type:"button", action_id:"gcp_sync_decision_open_review",
+    text:{type:"plain_text",text:"Open review"},
+    url:"https://calendar-sync.alf-broadcast.co.uk/review/?case=" + encodeURIComponent(decision.decisionId),
+  }] });
   blocks.push(technicalContextBlock(decision));
   return blocks;
 }
@@ -927,7 +946,32 @@ export class ManualInterventionService {
   private createManualExecutionClientFactory(
     state: StateRepository,
     budget: ReconciliationMutationBudget,
+    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision },
   ): ProviderClientFactory {
+    const recheckProtectedItems = async (profile: Profile) => {
+      const current = await this.store.get(protectedItems.decision.decisionId);
+      if (!current || current.status !== "pending" || current.fingerprint !== protectedItems.decision.fingerprint
+        || current.taskId !== protectedItems.decision.taskId || current.eventId !== protectedItems.decision.eventId) {
+        throw new ManualSyncBlockedError();
+      }
+      const sourceTaskId = protectedItems.decision.taskId;
+      const sourceEventId = protectedItems.decision.eventId;
+      if (sourceTaskId && sourceEventId) {
+        const lookupByEvent = typeof state.getMappingByEvent === "function"
+          ? state.getMappingByEvent.bind(state) : async () => undefined;
+        const [byTask, byEvent] = await Promise.all([
+          state.getMappingByTask(profile, sourceTaskId), lookupByEvent(profile, sourceEventId),
+        ]);
+        if ((byTask && byTask.eventId !== sourceEventId) || (byEvent && byEvent.taskId !== sourceTaskId)) {
+          throw new ManualSyncBlockedError();
+        }
+      }
+      for (const taskId of protectedItems.taskIds) {
+        if (await state.syncBlocked(profile, { taskId })) throw new ManualSyncBlockedError();
+        for (const eventId of protectedItems.eventIds) if (await state.syncBlocked(profile, { taskId, eventId })) throw new ManualSyncBlockedError();
+      }
+      for (const eventId of protectedItems.eventIds) if (await state.syncBlocked(profile, { eventId })) throw new ManualSyncBlockedError();
+    };
     const budgeted = createBudgetedClientFactory(budget, this.clients);
     const circuitWrapped = <T extends object>(target: T, profile: Profile, mutatingMethods: Set<string>): T => new Proxy(target, {
       get(current, property, receiver) {
@@ -936,6 +980,11 @@ export class ManualInterventionService {
         const operation = String(property);
         if (!mutatingMethods.has(operation)) return value.bind(current);
         return async (...args: unknown[]) => {
+          const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
+            ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
+            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
+          await recheckProtectedItems(profile);
+          if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
           if (!await state.mutationAllowed(profile)) throw new ManualCircuitOpenError(profile, operation);
           const result = await Reflect.apply(value, current, args);
           // Count every successful provider write, including each item in a bounded bulk action.
@@ -1588,7 +1637,7 @@ export class ManualInterventionService {
         decision.slackChannelId,
       );
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) throw error;
       await state.audit(decision.profile, "manual_future_series_split_incomplete", {
         taskId: task.id, oldMasterId: old.id, decisionId: decision.decisionId,
         reason: error instanceof Error ? error.message : String(error),
@@ -2087,11 +2136,21 @@ export class ManualInterventionService {
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
     const budget = new ReconciliationMutationBudget(MAX_MANUAL_BULK_MUTATIONS);
-    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget);
+    const mapping = decision.mappingSnapshot;
+    const taskIds = [...new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)))];
+    const eventIds = [...new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)))];
+    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget, { taskIds, eventIds, decision });
     try {
       if (manual.action === "reconcile_now") {
         await this.retryConflictReconciliation(decision, state, manual.slackUserId);
         return;
+      }
+      if (!["acknowledge","keep_separate"].includes(manual.action)) {
+        for (const taskId of taskIds) {
+          if (await state.syncBlocked(decision.profile, { taskId })) throw new ManualSyncBlockedError();
+          for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { taskId, eventId })) throw new ManualSyncBlockedError();
+        }
+        for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { eventId })) throw new ManualSyncBlockedError();
       }
       if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
         await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);
@@ -2124,7 +2183,7 @@ export class ManualInterventionService {
       }
       throw new Error(`Decision type ${decision.type} does not yet have an execution handler`);
     } catch (error) {
-      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) {
+      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) {
         await state.audit(decision.profile, "manual_action_deferred_safety", {
           decisionId: decision.decisionId,
           action: manual.action,

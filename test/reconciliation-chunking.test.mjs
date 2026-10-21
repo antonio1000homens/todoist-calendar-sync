@@ -63,6 +63,7 @@ test("snapshot reconciliation resumes after the last processed task id and does 
   let recurrenceRuns = 0;
 
   const state = {
+    async syncBlocked() { return false; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
   const store = {

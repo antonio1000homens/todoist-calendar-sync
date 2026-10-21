@@ -2,6 +2,8 @@ import type { Handler } from "aws-lambda";
 import { ManualInterventionService } from "./manual-intervention.js";
 import { reconciliationRunStatus, StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
+import { ManualDecisionStore } from "./manual-intervention.js";
+import { ReviewStore } from "./review-store.js";
 import type { Profile } from "./types.js";
 
 const profileList: Profile[] = ["home", "antonio", "work"];
@@ -29,6 +31,24 @@ export async function checkReconciliationHealth(
             await deliverPendingReconciliationOutcome(state, manual, outcome);
           } catch (error) {
             log("outcome_notification_retry_failed", { profile, generation: outcome.generation, error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        const reviewStore = new ReviewStore();
+        for (const operation of await reviewStore.pendingNotifications(profile)) {
+          try {
+            const reviewCase = await reviewStore.getCase(operation.preview.intent.caseId);
+            const decisionId = reviewCase?.decision?.decisionId;
+            const decision = decisionId ? await new ManualDecisionStore().get(decisionId) : undefined;
+            const status = operation.status === "succeeded" ? "Succeeded"
+              : operation.status === "needs_review" ? "Needs review" : "Failed";
+            const text = operation.notificationText || status + ": " + (operation.verified?.length || 0) + " pairs verified"
+              + (operation.error ? ". " + operation.error : "");
+            const replyTs = await manual.deliverReconciliationOutcome(
+              decision?.slackChannelId, decision?.slackMessageTs, operation.notificationReplyTs, text,
+            );
+            await reviewStore.completeNotification(operation.id, replyTs);
+          } catch (error) {
+            log("repair_outcome_notification_retry_failed", { profile, operationId:operation.id, error:error instanceof Error ? error.message : String(error) });
           }
         }
       }

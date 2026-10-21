@@ -6,6 +6,7 @@ import { SnapshotReconciler } from "../dist/reconciliation.js";
 const HOME = profiles.home.todoistProjectId;
 
 class FakeState {
+  async syncBlocked() { return false; }
   constructor(tombstone) {
     this.tombstone = tombstone;
     this.audits = [];

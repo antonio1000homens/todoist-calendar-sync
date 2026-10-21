@@ -84,6 +84,8 @@ function mapping() {
 }
 
 class FakeState {
+  async getMappingByTaskAnyProfile() { return this.mapping; }
+  async syncBlocked() { return false; }
   constructor(initialMapping) {
     this.mapping = structuredClone(initialMapping);
     this.links = [];

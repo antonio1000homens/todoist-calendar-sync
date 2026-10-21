@@ -45,6 +45,20 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  CloudflareAccessTeamDomain:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9.-]+$"
+    Description: Cloudflare Access team domain used to validate review session JWTs.
+  CloudflareAccessAudience:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[A-Za-z0-9_-]+$"
+    Description: Access application audience tag protecting /review and /review/api.
+  ReviewOperatorEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
   StateTableReadCapacity:
     Type: Number
     Default: 25
@@ -111,6 +125,9 @@ Globals:
         TODOIST_CALENDAR_SYNC_DYNAMODB_SCAN_RCU_BUDGET_PER_SECOND: !Ref DynamoDbScanRcuBudgetPerSecond
         TODOIST_CALENDAR_SYNC_DYNAMODB_SCAN_PAGE_ITEM_LIMIT: !Ref DynamoDbScanPageItemLimit
         TODOIST_CALENDAR_SYNC_RECONCILIATION_CANDIDATE_LIMIT: !Ref ReconciliationCandidateLimit
+        CF_ACCESS_TEAM_DOMAIN: !Ref CloudflareAccessTeamDomain
+        CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
+        REVIEW_OPERATOR_EMAIL: !Ref ReviewOperatorEmail
 
 Resources:
   SyncState:
@@ -261,6 +278,64 @@ Resources:
         Target: es2022
         Minify: true
 
+  ReviewApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-review-api-${Stage}
+      RetentionInDays: 14
+
+  ReviewApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-review-api-${Stage}
+      Handler: review-api.handler
+      ReservedConcurrentExecutions: 2
+      CodeUri: .
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncState
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SyncQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt SyncState.Arn
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterPrefix}/*
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TodoistTokenParameterPrefix}/*
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: BUFFERED
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: AllAtOnce
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/review-api.ts]
+        Format: cjs
+        Target: es2022
+        Minify: true
+
+  ReviewApiUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReviewApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ReviewApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReviewApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
   IngressUrlPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -283,6 +358,10 @@ Resources:
       FunctionName: !Sub ${ResourceNamePrefix}-worker-${Stage}
       Handler: worker.handler
       ReservedConcurrentExecutions: 1
+      # Reconciliation is intentionally chunked through this worker's SQS
+      # trigger. Each continuation advances a cursor and sequence so large
+      # snapshots can finish beyond Lambda's default 16-invocation loop guard.
+      RecursiveLoop: Allow
       # A bounded full-table reconciliation scan can exceed two minutes on the
       # production state table; the queue visibility timeout is set above this.
       Timeout: 300
@@ -809,6 +888,8 @@ Resources:
 Outputs:
   IngressFunctionUrl:
     Value: !GetAtt IngressFunctionUrl.FunctionUrl
+  ReviewApiFunctionUrl:
+    Value: !GetAtt ReviewApiFunctionUrl.FunctionUrl
   StateTableName:
     Value: !Ref SyncState
   StateTableReadCapacity:

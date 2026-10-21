@@ -62,6 +62,8 @@ function mappingFromLink(link) {
 }
 
 class FakeState {
+  async syncBlocked() { return false; }
+  async getMappingByTaskAnyProfile(taskId) { return this.mappingsByTask.get(taskId); }
   constructor(link) {
     this.operations = [];
     this.audits = [];
