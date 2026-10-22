@@ -30,6 +30,8 @@ export interface RepairPreview {
   id: string; actor: ReviewActor; intent: RepairIntent; case: ReviewCase;
   snapshots: ReviewSnapshot[]; fingerprint: string; createdAt: string; expiresAt: number;
   changes: string[]; warnings: string[]; splitPlan?: FutureSeriesSplitPlan;
+  /** Exact provider refs and per-object planned effects, matched to frozen snapshots. */
+  itemPlan: Array<{ ref:EntityRef; operation:string; result:string }>;
 }
 export interface RepairStep { id: string; status: "running" | "done"; result?: unknown; startedAt: string; completedAt?: string }
 export interface RepairOperation {

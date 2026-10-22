@@ -2,18 +2,29 @@ import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, isAbortError } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
+import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
-type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; splitPlan?:FutureSplitPreview };
+type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
 const api = createReviewApiClient();
+function IdentityDetails({value,scope}:{value:any;scope?:string}) {
+  const identity=providerIdentity(value);
+  return <div className="item-identity">
+    <strong>{identity.title}</strong>
+    <span>{identity.profile} · {identity.side} · {identity.status} · {identity.date}</span>
+    <span>{identity.recurrence}</span>
+    {scope&&<span>Selected recurrence scope: {scopeLabel(scope)}</span>}
+    <span className="provider-id">Provider ID: <code>{identity.id||"Unavailable"}</code>{identity.id&&<button type="button" className="secondary copy-id" aria-label={`Copy provider ID ${identity.id}`} onClick={()=>{void navigator.clipboard.writeText(identity.id);}}>Copy ID</button>}</span>
+    {!identity.identified&&<span className="warning">Identity not verified. Refresh affected items before assigning a disposition.</span>}
+  </div>;
+}
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
-  const [validationError,setValidationError] = useState<{field:string; message:string}>();
   const [action,setAction] = useState("link"), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
   const [leftovers,setLeftovers] = useState<Record<string,string>>({});
@@ -24,6 +35,7 @@ function App() {
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
   const [detailRetry,setDetailRetry] = useState(0);
+  const [validationError,setValidationError] = useState<{field:string; message:string}>();
   const detailKey=selected ? `${selected.profile}:${selected.id}` : "";
   const currentDetailState=detailState?.key===detailKey ? detailState : undefined;
   const retryDetails=()=>{
@@ -44,7 +56,10 @@ function App() {
       : ownerRequirement === "todoist-task"
         ? "This Todoist task repeats. Select Todoist as recurrence owner unless repairing a Calendar-owned series."
         : undefined;
-  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner);
+  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
+    && Object.entries(leftovers).every(([key,disposition]) => (details?.snapshots||[]).some((s:any)=>
+      `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key
+      && dispositionOptions(s).length>0 && (!disposition || dispositionOptions(s).includes(disposition))));
   const validPreview=canPreview && preview?.intent?.caseId===selected?.id && preview?.intent?.profile===selected?.profile
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
@@ -123,7 +138,7 @@ function App() {
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
     const recurrence=sideName==="todoist"?(item.due?.is_recurring?item.due.string||"Recurring":"None"):(item.recurrence?.join(" · ")||(item.recurringEventId?"Part of a recurring series":"None"));
     const href=providerLink(item);
-    return <><h4>{item.content||item.summary||item.id}</h4>{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
+    return <><IdentityDetails value={current} />{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
@@ -230,7 +245,7 @@ function App() {
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
-  const snapshots=(details?.snapshots||[]).filter((item:any)=>item.object);
+  const snapshots=details?.snapshots||[];
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
   return <main>
@@ -284,15 +299,15 @@ function App() {
             {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
-          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
+          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
-          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Choose what happens to each live item left outside the selected repair.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;return <div className="leftover" key={key}><span><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)}</span><label>Disposition<select value={leftovers[key]||""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option><option value="create">Create a new counterpart</option><option value="exclude">Exclude from syncing</option></select></label></div>;})}</div>}
+          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const options=dispositionOptions(item);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}</select></label>}</div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
-        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><h4>Affected provider items</h4><ul>{validPreview.snapshots.map((item:any)=><li key={choiceKey(item)}><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)||"Missing provider item"}{item.mapping&&<> · currently linked as {item.mapping.taskId} ↔ {item.mapping.eventId}</>}{item.control?.excluded&&" · currently excluded"}{item.checkedAt&&<> · checked {new Date(item.checkedAt).toLocaleString()}</>}</li>)}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
+        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} /><div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{!operation.abandoned&&["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>
