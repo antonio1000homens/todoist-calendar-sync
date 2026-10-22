@@ -49,7 +49,8 @@ export function editRepairSelection(previous, side, id, verified = false) {
 // Only derive recurrence requirements from the *selected*, live provider snapshot.
 // A different case's recurrence must not accidentally block the current repair.
 export function repairRecurrenceOwnerRequirement(form, details, action) {
-  if (!["link","create"].includes(action) || !form?.profile || details?.item?.profile !== form.profile) return undefined;
+  if (!["link","create"].includes(action) || !form?.profile || details?.item?.profile !== form.profile
+    || details?.item?.id !== form.caseId) return undefined;
   const current = (side, id) => (details.snapshots || []).find(snapshot => snapshot.ref?.profile === form.profile
     && snapshot.ref.side === side && snapshot.ref.id === id && snapshot.object?.id === id)?.object;
   const event = current("calendar", form.eventId);
