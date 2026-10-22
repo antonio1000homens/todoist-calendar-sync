@@ -36,7 +36,7 @@ function App() {
     setMessage(""); setPreview(undefined); setOperation(undefined); setSubmitKey("");
     setTaskId(selected.taskId||selected.decision?.context?.providerTaskId||"");
     setEventId(selected.eventId||selected.decision?.context?.providerEventId||"");
-    setLeftovers({}); setReconcileProfile(selected.profile);
+    setLeftovers({}); setSearchText(""); setSearchResults([]); setSearchSide("todoist"); setReconcileProfile(selected.profile);
     let cancelled=false;
     api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
       if(cancelled)return;
@@ -72,7 +72,12 @@ function App() {
     return <><h4>{item.content||item.summary||item.id}</h4>{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
-  const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping)?.mapping;
+  const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
+  const mappedEventIds=[liveMapping?.eventId,liveMapping?.masterEventId,liveMapping?.activeInstanceId].filter((id:any):id is string=>typeof id==="string"&&id.length>0);
+  const selectedPairIsStale=action==="verify"&&Boolean(liveMapping)&&(
+    taskId!==liveMapping.taskId||!mappedEventIds.includes(eventId)
+  );
+  const currentMappedEventId=liveMapping?.activeInstanceId||liveMapping?.eventId||liveMapping?.masterEventId;
   const mappingChanges=originalMapping&&liveMapping?["taskId","eventId","masterEventId","activeInstanceId","seriesId","recurrenceOwner"].filter(key=>originalMapping[key]!==liveMapping[key]):[];
   const alertContext=details?.item?.decision?.context||{};
   const hasProviderIds=Boolean(selected?.taskId||selected?.eventId||alertContext.providerTaskId||alertContext.providerEventId);
@@ -179,6 +184,8 @@ function App() {
             ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
             <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" /></label>
             <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" /></label>
+            {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
+            {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{setTaskId(liveMapping.taskId);setEventId(currentMappedEventId);setPreview(undefined);}}>Use current mapped pair</button>}
             {action==="create"&&<div className="source-choice"><span>Choose which item should get a new counterpart:</span><div><button className="secondary" onClick={()=>setEventId("")}>Create Calendar event from this Todoist task</button><button className="secondary" onClick={()=>setTaskId("")}>Create Todoist task from this Calendar event</button></div></div>}
             {action==="link"&&<label>Fields to use<select value={winner} onChange={e=>setWinner(e.target.value)}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select></label>}
             {["link","create"].includes(action)&&<label>Recurrence owner<select value={owner} onChange={e=>setOwner(e.target.value)}><option value="">No recurrence / leave unchanged</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select></label>}
