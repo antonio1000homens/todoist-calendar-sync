@@ -33,7 +33,7 @@ test("untrusted provider messages and malformed error bodies are not retained in
     stage: "calendar", taskId: undefined, eventId: "event-2", seriesId: undefined,
     providerStatus: 400, providerReason: undefined,
   });
-  assert.equal(reconciliationFailureDetails(new Error("other")), {});
+  assert.deepEqual(reconciliationFailureDetails(new Error("other")), {});
   const malformed = new ReconciliationItemError(
     Object.assign(new Error("HTTP 400"), { status: 400, body: "<html>wrong</html>" }),
     { stage: "unmapped", taskId: "task-1" },
