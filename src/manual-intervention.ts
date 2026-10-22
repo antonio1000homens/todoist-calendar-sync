@@ -1514,7 +1514,13 @@ export class ManualInterventionService {
       delivery.profile,
       type,
       { deliveryId: delivery.id, status, message: error instanceof Error ? error.message : String(error) },
-      { sourceDeliveryId: delivery.id },
+      {
+        sourceDeliveryId: delivery.id,
+        ...(delivery.kind === "orphan" && delivery.orphan ? {
+          taskId: delivery.orphan.taskId,
+          eventId: delivery.orphan.eventId,
+        } : {}),
+      },
       operationalFailureContext(delivery, error),
     );
   }
