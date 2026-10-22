@@ -522,6 +522,20 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     failure: error instanceof Error ? error.message : String(error),
     deliveryId: delivery.id,
   };
+  // Keep the provider identifiers from the failed delivery itself. Provider
+  // errors often omit these, even though the queued webhook has them.
+  if (delivery.orphan) {
+    context.providerTaskId = delivery.orphan.taskId;
+    context.providerEventId = delivery.orphan.eventId;
+  }
+  if (delivery.kind === "todoist") {
+    try {
+      const payload = JSON.parse(delivery.body) as { event_data?: { id?: unknown } };
+      if (typeof payload.event_data?.id === "string" && payload.event_data.id) context.providerTaskId = payload.event_data.id;
+    } catch {
+      // The failure record remains useful even when a legacy webhook is malformed.
+    }
+  }
   if (delivery.reconcile) {
     context.reconcileReason = delivery.reconcile.reason;
     context.reconcileGeneration = delivery.reconcile.generation;
@@ -543,7 +557,7 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     }
   }
   const taskMatch = (error instanceof Error ? error.message : String(error)).match(/\/tasks\/([^\s/?]+)/);
-  if (taskMatch) context.providerTaskId = taskMatch[1];
+  if (taskMatch) context.providerTaskId ||= taskMatch[1];
   return Object.fromEntries(Object.entries(context).filter(([, value]) => value !== undefined));
 }
 

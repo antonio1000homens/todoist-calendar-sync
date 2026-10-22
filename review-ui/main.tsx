@@ -66,6 +66,12 @@ function App() {
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping)?.mapping;
   const mappingChanges=originalMapping&&liveMapping?["taskId","eventId","masterEventId","activeInstanceId","seriesId","recurrenceOwner"].filter(key=>originalMapping[key]!==liveMapping[key]):[];
   const alertContext=details?.item?.decision?.context||{};
+  const hasProviderIds=Boolean(selected?.taskId||selected?.eventId||alertContext.providerTaskId||alertContext.providerEventId);
+  const emptyOperationalExplanation=selected?.decision?.type==="operational_dlq"&&!hasProviderIds
+    ? alertContext.kind==="reconcile"
+      ? "This was a profile-wide reconciliation delivery, so it has no single Todoist task or Calendar event attached. The empty panels are expected; inspect the failure details and request a fresh reconciliation after addressing the cause."
+      : "This failure record has no provider item IDs, so the dashboard cannot look up a specific task or event. Search by title or description to find the current items, or request a fresh reconciliation."
+    : undefined;
   const liveTask=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.ref.side==="todoist")?.object;
   const liveEvent=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.ref.side==="calendar")?.object;
   const alertChanges=[
@@ -142,6 +148,7 @@ function App() {
           {selected.decision.context?.deliveryId&&<><dt>Delivery ID</dt><dd>{selected.decision.context.deliveryId}</dd></>}
           {selected.decision.context?.providerErrorTag&&<><dt>Provider error</dt><dd>{selected.decision.context.providerErrorTag}</dd></>}
         </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
+        {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
         <div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
