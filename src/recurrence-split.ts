@@ -15,11 +15,18 @@ export interface FutureSeriesSplitPlan {
   originalRule: string;
   truncatedRule: string;
   newRule: string;
-  previousOccurrence: string;
+  /** Last actual Calendar occurrence kept; absent if the expired rule generated none. */
+  previousOccurrence?: string;
   nextOldOccurrence: string;
   newStart: string;
   calendarTimeZone?: string;
   approvedAt?: string;
+  /** Expired DATE UNTIL on the original series; never extend this historical rule. */
+  expiredUntil?: string;
+  /** Last actually generated occurrence when the original RRULE has expired. */
+  historicalLastOccurrence?: string;
+  /** Binds a proposal to the approved Todoist task, including full due shape. */
+  approvedTaskFingerprint: string;
 }
 export function calendarLocalDay(now: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -75,11 +82,30 @@ export function sameSafeYearlyRecurrenceRule(left: string | undefined, right: st
   return normalizedLeft !== undefined && normalizedLeft === parse(right);
 }
 
-function annualInterval(rule: string): number {
-  const match = /^RRULE:FREQ=YEARLY(?:;INTERVAL=([1-9]\d{0,2}))?$/.exec(rule);
-  if (!match) throw new Error("Future-only split supports only plain yearly RRULEs without COUNT, UNTIL, RDATE or EXDATE");
-  return Number(match[1] || 1);
+function annualRule(rule: string): { interval: number; until?: string } {
+  // Reject any component whose semantics we cannot preserve (COUNT, BYxxx,
+  // RDATE, EXDATE, duplicate keys, timed UNTIL, etc). DATE UNTIL is safe
+  // only when it has already expired: the existing master is left unchanged.
+  if (!sameSafeYearlyRecurrenceRule(rule, rule)) {
+    throw new Error("Future-only split requires a plain YEARLY RRULE with optional INTERVAL and expired DATE UNTIL; COUNT, BYxxx, RDATE and EXDATE need manual review");
+  }
+  const components = new Map(rule.slice("RRULE:".length).split(";").map(part => part.split("=") as [string, string]));
+  const untilValue = components.get("UNTIL");
+  return {
+    interval: Number(components.get("INTERVAL") || 1),
+    ...(untilValue ? { until: `${untilValue.slice(0, 4)}-${untilValue.slice(4, 6)}-${untilValue.slice(6)}` } : {}),
+  };
 }
+function approvedTaskFingerprint(task: TodoistTask): string {
+  const due = task.due;
+  return createHash("sha256").update(JSON.stringify([
+    task.id, task.project_id ?? null, task.content, task.description ?? null,
+    task.updated_at ?? null, task.is_completed ?? false, task.is_deleted ?? false,
+    due ? [due.date ?? null, due.datetime ?? null, due.timezone ?? null,
+      due.string ?? null, due.lang ?? null, due.is_recurring ?? false] : null,
+  ])).digest("hex");
+}
+
 export function planFutureSeriesSplit(
   profile: Profile,
   task: TodoistTask,
@@ -91,7 +117,7 @@ export function planFutureSeriesSplit(
   if (old.status !== "confirmed" || !old.etag || !old.id || old.recurringEventId) {
     throw new Error("A live recurring master with a stable ETag is required");
   }
-  if (old.recurrence?.length !== 1) throw new Error("Only a single unchanged Calendar recurrence can be split");
+  if (old.recurrence?.length !== 1) throw new Error("Future-only split requires exactly one Calendar RRULE; RDATE, EXDATE and extra recurrence entries need manual review");
   if (!old.start?.date || old.start.dateTime || !old.end?.date || old.end.dateTime
     || !task.due?.date || task.due.datetime || !task.due.is_recurring) {
     throw new Error("Future-only split supports all-day recurring task and Calendar master only");
@@ -118,7 +144,10 @@ export function planFutureSeriesSplit(
     ? old.extendedProperties?.shared?.syncHistoryOriginalRule
     : old.recurrence[0];
   if (!priorRule) throw new Error("Cannot verify the original historical recurrence");
-  const interval = annualInterval(priorRule);
+  const { interval, until } = annualRule(priorRule);
+  if (until && day(until) >= day(today)) {
+    throw new Error("Calendar UNTIL is not yet expired; review the still-active series and its occurrences separately");
+  }
   const newRule = todoistRecurrenceToRrule(task);
   if (!newRule || !newRule.startsWith("RRULE:FREQ=YEARLY")) {
     throw new Error("The Todoist future schedule must be a supported yearly recurrence");
@@ -140,7 +169,19 @@ export function planFutureSeriesSplit(
     .update(`split-v1:${profile}:${task.id}:${old.id}:${due}:${newRule}`)
     .digest("hex").slice(0, 32);
   const originalRule = priorRule;
-  const truncatedRule = `${originalRule};UNTIL=${previous.replace(/-/g, "")}`;
+  // An expired Calendar rule is already historical. Replacing UNTIL with a
+  // later cutoff would CREATE old occurrences that never existed (including
+  // when UNTIL precedes DTSTART); leave it byte-for-byte unchanged.
+  const truncatedRule = until ? originalRule
+    : `${originalRule};UNTIL=${previous.replace(/-/g, "")}`;
+  let historicalLastOccurrence: string | undefined;
+  if (until) {
+    for (let i = 0; i <= 300; i++) {
+      const candidate = yearlyOccurrence(start, startYear + i * interval);
+      if (day(candidate) > day(until)) break;
+      historicalLastOccurrence = candidate;
+    }
+  }
   if (archived && (!sameSafeYearlyRecurrenceRule(old.recurrence[0], truncatedRule)
     || old.extendedProperties?.shared?.syncHistorySuccessorId !== newMasterId
     || old.extendedProperties?.shared?.syncHistoryTaskId !== task.id)) {
@@ -149,8 +190,12 @@ export function planFutureSeriesSplit(
   return {
     oldMasterId: old.id, oldEtag: old.etag, newMasterId,
     originalRule, truncatedRule, newRule,
-    previousOccurrence: previous, nextOldOccurrence: upcoming, newStart: due,
+    ...(until ? (historicalLastOccurrence ? { previousOccurrence: historicalLastOccurrence } : {})
+      : { previousOccurrence: previous }),
+    nextOldOccurrence: upcoming, newStart: due,
     calendarTimeZone: timeZone, approvedAt: now.toISOString(),
+    approvedTaskFingerprint: approvedTaskFingerprint(task),
+    ...(until ? { expiredUntil: until, ...(historicalLastOccurrence ? { historicalLastOccurrence } : {}) } : {}),
   };
 }
 
@@ -160,7 +205,9 @@ export function assertUnmodifiedHistoricalOccurrences(
   instances: CalendarEvent[],
   plan: FutureSeriesSplitPlan,
 ): void {
-  if (!instances.some((item) => (item.originalStartTime?.date || item.start?.date) === plan.previousOccurrence)) {
+  const last = plan.expiredUntil ? plan.historicalLastOccurrence : plan.previousOccurrence;
+  if (last ? !instances.some((item) => (item.originalStartTime?.date || item.start?.date) === last)
+    : instances.length !== 0) {
     throw new Error("Last historical occurrence could not be verified");
   }
   for (const instance of instances) {
