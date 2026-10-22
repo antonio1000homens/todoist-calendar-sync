@@ -49,6 +49,17 @@ test("blocks shared records, cross-profile references, and other events",()=>{
  assert.equal(plan.blockers.some(x=>x.includes("different profile")),true);
  assert.equal(plan.blockers.some(x=>x.includes("another Calendar")),true);
 });
+test("partition-key scope and rejected-pair ownership block shared erasure",()=>{
+ const rows=[
+   record("AUDIT#work#99","STATE",{detail:{taskId:"task-123"}}),
+   record("REJECTED_PAIR#home#task-123#other-event"),
+   record("SYNC_CONTROL#work:todoist:task-123"),
+ ];
+ const result=planPurge(rows,target);
+ assert.equal(result.records.length,3);
+ assert.match(result.blockers.join(" "),/different profile/);
+ assert.match(result.blockers.join(" "),/shared with another task\/event/);
+});
 test("recurring mappings refuse automatically, including master ownership",()=>{
  const row=record("TASK#home#task-123","MAP",{profile:"home",taskId:"task-123",eventId:"evt_123",
   seriesId:"cal-series",masterEventId:"cal-master",recurrenceOwner:"calendar"});
