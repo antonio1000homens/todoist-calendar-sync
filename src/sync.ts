@@ -14,6 +14,7 @@ import {
   todoistRecurrenceKey,
   todoistRecurrenceToRrule,
 } from "./todoist-recurrence.js";
+import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 export function calendarResourceAlreadyDeleted(error: unknown): boolean {
@@ -1181,7 +1182,13 @@ export class Synchronizer {
         });
       }
 
-      const retained = completedCalendarProjection(mapping, delivery.receivedAt);
+      const retained: CompletedCalendarProjection = {
+        ...completedCalendarProjection(mapping, delivery.receivedAt),
+        // Only a fresh, explicitly completed provider task with no further
+        // recurrence can prove the rolling series was terminal.
+        ...(current?.is_completed === true && !current.due?.is_recurring
+          ? { terminalVerified: true as const } : {}),
+      };
       await this.putCompletedProjection(retained);
       await this.state.audit(delivery.profile, "todoist_recurrence_completed_calendar_retained", {
         taskId: task.id,
@@ -1277,6 +1284,17 @@ export class Synchronizer {
     }
     if (deleted) {
       if (!mapping) {
+        const history = await this.listCompletedProjections(delivery.profile, task.id);
+        // Todoist plan pruning arrives as an ordinary item:deleted webhook.
+        // After seven full days historical events must never be deleted, even
+        // when the maintenance worker has not yet retired COMPLETED_TASK.
+        // Ambiguous recurrence history also fails safe when no live mapping
+        // exists; it must not be interpreted as permission to erase history.
+        if (lifecycle.reason === "deleted" && protectUnmappedCompletedHistory(history)) {
+          return this.state.audit(delivery.profile, "todoist_late_completed_deletion_ignored", {
+            taskId: task.id, retainedHistory: history.length,
+          });
+        }
         const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, task.id, calendar);
         if (!removedHistory) return;
         return this.state.audit(delivery.profile, "todoist_deleted_completed_calendar_history", { taskId: task.id, removedHistory });
