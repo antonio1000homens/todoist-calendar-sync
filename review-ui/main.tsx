@@ -144,7 +144,8 @@ function App() {
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
-      <label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);setSelected(undefined);setDetails(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
+      <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);setSelected(undefined);setDetails(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
+        <a className="logout" href="/cdn-cgi/access/logout">Sign out</a></div>
     </header>
     {message && <p className="notice" role="status">{message}</p>}
     <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>setSelected(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
