@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number };
-type RepairOperation = { id:string; status:string; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
+type RepairOperation = { id:string; attempt:number; status:string; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
 const api = async (path:string, init?:RequestInit) => {
   const response = await fetch("/review/api/" + path, { ...init, headers:{ "content-type":"application/json", ...(init?.headers || {}) } });
@@ -124,7 +124,11 @@ function App() {
   const resume=async () => {
     if (!operation) return;
     setBusy(true);setMessage("");
-    try { const result=await api(`operations/${encodeURIComponent(operation.id)}/resume`,{method:"POST",body:"{}"});setOperation(result.operation); }
+    try {
+      const result=await api(`operations/${encodeURIComponent(operation.id)}/resume`,{method:"POST",body:"{}"});
+      setOperation(result.operation);
+      setMessage(`Repair attempt ${result.queueDelivery.attempt} accepted by the queue. It will run after earlier work for ${selected?.profile||"this profile"} completes.`);
+    }
     catch(e:any){if(e.data?.operation)setOperation(e.data.operation);setMessage(e.message);} finally{setBusy(false);}
   };
   const runReconciliation=async () => {
@@ -188,7 +192,7 @@ function App() {
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
         {preview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(preview.expiresAt*1000).toLocaleString()}.</p><h4>Affected provider items</h4><ul>{preview.snapshots.map((item:any)=><li key={choiceKey(item)}><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)||"Missing provider item"}{item.mapping&&<> · currently linked as {item.mapping.taskId} ↔ {item.mapping.eventId}</>}{item.control?.excluded&&" · currently excluded"}{item.checkedAt&&<> · checked {new Date(item.checkedAt).toLocaleString()}</>}</li>)}</ul><h4>Planned changes</h4><ul>{preview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul><h4>Warnings</h4><ul>{preview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
-        {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
+        {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>
   </main>;

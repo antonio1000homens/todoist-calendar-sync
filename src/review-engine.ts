@@ -18,6 +18,9 @@ import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 const missing = (e: unknown) => [404, 410].includes(Number((e as { status?: number }).status));
 const at = () => new Date().toISOString();
+function invalidRepairIntent(message: string): never {
+  throw Object.assign(new Error(message), { status: 400 });
+}
 function recurrenceAnchorMatches(event: CalendarEvent): boolean {
   const shared = event.extendedProperties?.shared;
   return Boolean(shared?.todoistAnchorStart && shared.todoistAnchorEnd
@@ -159,7 +162,7 @@ export class ReviewEngine {
     const preview: RepairPreview = { id: randomUUID(), actor, intent, case: record, snapshots, fingerprint: snapshotFingerprint(snapshots),
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings };
     if (intent.action === "link" && (!task || !event)) throw new Error("Linking requires a live task and event");
-    if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") throw new Error("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
+    if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
     if (intent.action === "link" && intent.winner === "todoist") {
       if(event?.recurringEventId && intent.owner === "todoist") todoistOccurrenceProjection(task!,event!);
       else toCalendarEvent(task!, event!);
