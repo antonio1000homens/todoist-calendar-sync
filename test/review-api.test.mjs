@@ -20,7 +20,7 @@ function event(path, method = "GET", headers = {}, body) {
     requestContext:{http:{method}},
   };
 }
-async function token(privateKey, email = "antonio1000homens@gmail.com", {aud = audience, expired = false} = {}) {
+async function token(privateKey, email = "review-owner@example.test", {aud = audience, expired = false} = {}) {
   const now=Math.floor(Date.now()/1000);
   return new SignJWT({email})
     .setProtectedHeader({alg:"RS256",kid:"review-test-key"})
@@ -45,7 +45,7 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
     : new Response("unexpected fetch",{status:500});
   Object.assign(process.env,{
     CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,
-    REVIEW_OPERATOR_EMAILS:"antonio1000homens@gmail.com",QUEUE_URL:"https://sqs.eu-west-2.amazonaws.com/123/review.fifo",
+    REVIEW_OPERATOR_EMAILS:"review-owner@example.test",QUEUE_URL:"https://sqs.eu-west-2.amazonaws.com/123/review.fifo",
   });
   t.after(() => {
     globalThis.fetch=originalFetch;
@@ -63,25 +63,26 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
 
   const allowedToken = await token(privateKey);
   const headers = {"cf-access-jwt-assertion":allowedToken};
-  const badSignature = await token(privateKey);
+  const [header,payload,signature] = allowedToken.split(".");
+  const badSignature = [header,payload,(signature[0] === "A" ? "B" : "A") + signature.slice(1)].join(".");
   const invalid = await jsonResponse(await handler(event("/review/api/cases","GET",{
-    "cf-access-jwt-assertion":badSignature.replace(/.$/,"x"),
+    "cf-access-jwt-assertion":badSignature,
   })));
   assert.equal(invalid.status,401,JSON.stringify(invalid.body));
   const wrongAudience = await jsonResponse(await handler(event("/review/api/cases","GET",{
-    "cf-access-jwt-assertion":await token(privateKey,"antonio1000homens@gmail.com",{aud:"wrong-audience"}),
+    "cf-access-jwt-assertion":await token(privateKey,"review-owner@example.test",{aud:"wrong-audience"}),
   })));
   assert.equal(wrongAudience.status,401);
   const expired = await jsonResponse(await handler(event("/review/api/cases","GET",{
-    "cf-access-jwt-assertion":await token(privateKey,"antonio1000homens@gmail.com",{expired:true}),
+    "cf-access-jwt-assertion":await token(privateKey,"review-owner@example.test",{expired:true}),
   })));
   assert.equal(expired.status,401);
-  const wrongOperator = await token(privateKey,"other@example.com");
+  const wrongOperator = await token(privateKey,"other@example.test");
   const nonOwner = await jsonResponse(await handler(event("/review/api/cases","GET",{"cf-access-jwt-assertion":wrongOperator})));
   assert.equal(nonOwner.status,403);
 
   const caseItem={id:"case-1",profile:"home",title:"Conflict",reason:"changed",status:"open",createdAt:"2026-10-22T10:00:00.000Z",updatedAt:"2026-10-22T10:00:00.000Z"};
-  const preview={id:"preview-1",actor:{subject:"access-user-123",email:"antonio1000homens@gmail.com"},intent:{caseId:"case-1",profile:"home",action:"exclude"},expiresAt:Math.floor(Date.now()/1000)+600};
+  const preview={id:"preview-1",actor:{subject:"access-user-123",email:"review-owner@example.test"},intent:{caseId:"case-1",profile:"home",action:"exclude"},expiresAt:Math.floor(Date.now()/1000)+600};
   const operation={id:"operation-1",preview,actor:preview.actor,status:"queued",steps:{},notificationPending:false};
   t.mock.method(ReviewStore.prototype,"listCases",async profile=>({items:profile==="home"?[caseItem]:[],cursor:undefined}));
   t.mock.method(ReviewStore.prototype,"getCase",async id=>id==="case-1"?caseItem:undefined);
