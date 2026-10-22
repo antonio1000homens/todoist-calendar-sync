@@ -62,7 +62,7 @@ test("a stale repair preview releases its acquired barriers without writing to p
   };
   const engine = new ReviewEngine(store, {}, async () => { throw new Error("Provider writes must not run"); }, {
     async claim(refs) { calls.push(["claim", refs]); },
-    async release(ref, operationId) { calls.push(["release", ref, operationId]); },
+    async releaseUnapplied(refs, operationId) { calls.push(["release-unapplied", refs, operationId]); },
     async pendingRefreshRefs() { return []; },
   });
   engine.collect = async () => {
@@ -74,7 +74,8 @@ test("a stale repair preview releases its acquired barriers without writing to p
   assert.match(result.error, /changed after preview/);
   assert.deepEqual(result.steps, {});
   assert.equal(saved.length, 1);
-  assert.deepEqual(calls, [["claim", [ref]], ["release", ref, "repair"]]);
+  assert.deepEqual(calls, [["claim", [ref]], ["release-unapplied", [ref], "repair"]]);
+  assert.equal(result.abandoned,true);
 });
 
 test("provider modification versions and exclusions invalidate repair previews", () => {
