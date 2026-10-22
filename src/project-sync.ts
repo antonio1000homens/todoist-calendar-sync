@@ -611,6 +611,18 @@ export class ProjectAwareSynchronizer {
     if (eventId && await this.state.syncBlocked(sourceProfile, { taskId: task.id, eventId })) {
       throw new Error("Source projection is protected by an active repair, exclusion, or rejected-pair decision");
     }
+    // A task-side completed lookup can already be gone after seven days.
+    // Always check the permanent event-side history marker before deleting a
+    // provider event discovered from Calendar shared taskId properties.
+    if (eventId) {
+      const completed = await this.state.getCompletedCalendarProjectionByEvent(sourceProfile, eventId);
+      if (completed?.taskId === task.id) {
+        await this.state.audit(sourceProfile, "todoist_project_removal_historical_calendar_retained", {
+          taskId: task.id, eventId, completedAt: completed.completedAt,
+        });
+        return;
+      }
+    }
     await this.state.putCalendarProjectionTombstone(sourceProfile, task.id, task.updated_at || delivery.receivedAt, tombstoneReason);
     if (eventId) {
       await sourceClients.calendar.deleteEvent(eventId).catch((error: unknown) => {
