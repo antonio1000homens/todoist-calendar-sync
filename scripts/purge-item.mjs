@@ -91,10 +91,10 @@ async function providers() {
   if (task) {
     const comments = await clients.todoist.listTaskComments(taskId);
     legacy = comments.filter(comment => {
-      const lines = String(comment.content || "").split(/\\r?\\n/);
+      const lines = String(comment.content || "").split(/\r?\n/);
       return LEGACY_TASK_COMMENT_MARKERS.has(lines[0]);
     }).map(comment => ({id:comment.id,content:comment.content,taskId,
-      eventId:String(comment.content || "").split(/\\r?\\n/).find(line => line.startsWith("calendarEventId="))?.slice("calendarEventId=".length)}));
+      eventId:String(comment.content || "").split(/\r?\n/).find(line => line.startsWith("calendarEventId="))?.slice("calendarEventId=".length)}));
   }
   return {
     task,event,linked:linked?.status === "cancelled" ? null : linked,
