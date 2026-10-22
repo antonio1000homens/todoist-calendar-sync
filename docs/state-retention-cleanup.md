@@ -110,7 +110,11 @@ remove a strictly older baseline with a timestamp condition. It checks all
 three profiles' task mapping indexes, the global TASKOWNER, event mapping
 indexes, and recurrence ownership before writing. A missing/changed guard,
 unverified recurrence, more than 12 history rows, or an active owner is a
-*safety skip*, never permission to delete. Version, canonical, tombstone,
+*safety skip*, never permission to delete. A verified exhausted recurrence
+uses an immutable `COMPLETED_SERIES#profile#seriesId` certificate (no Todoist
+task reference) to retire older occurrences in safe transactional batches of
+at most 12 event references; without the certificate a truncated multi-row
+history query is always skipped. Version, canonical, tombstone,
 audit, delivery and other state are untouched.
 
 Eligibility starts at **seven full 24-hour periods** since the latest
@@ -119,9 +123,11 @@ or lack of an available next occurrence does **not** establish terminality.
 Calendar-owned finite COUNT/UNTIL series can be marked terminal only after
 confirming the current master and absence of a successor and atomically
 retiring its unchanged recurrence link. Todoist-owned rolling series require
-a freshly returned completed provider task with no recurring due. All other
-recurring histories deliberately remain in `skipped_ambiguous` for human
-review. The worker does not modify live providers or remove project mapping
+a freshly returned completed provider task with no recurring due. Finality
+is recorded as a permanent series certificate, which allows cleanup of older
+occurrences only after the latest terminal completion's seven-day grace.
+All other recurring histories deliberately remain in `skipped_ambiguous`
+for human review. The worker does not modify live providers or remove project mapping
 comments; comment references, if still present, require a separate
 provider-aware ownership-checked operation. This conservative limitation
 must be resolved before declaring complete project-comment retention.
