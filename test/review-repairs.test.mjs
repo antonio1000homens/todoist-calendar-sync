@@ -812,3 +812,39 @@ test("a move into an empty destination creates and verifies exactly one approved
   const second=await h.engine.execute("repair");assert.equal(second.status,"succeeded");
   assert.equal(h.destinationEvents.size,1);
 });
+
+test("review preview displays exact expired-rule preservation and new future series", async t => {
+  const master = event("old-expired", {
+    summary:"Portugal", description:"Plan",
+    start:{date:"2025-05-02"},end:{date:"2025-05-03"},
+    recurrence:["RRULE:FREQ=YEARLY;UNTIL=20231231"],
+    extendedProperties:{shared:{taskId:"task"}},
+  });
+  const recurring = task("task", {
+    due:{date:"2027-05-02",is_recurring:true,string:"every year"},
+  });
+  const h = harness(t,{events:[master],tasks:[recurring]});
+  h.clients.calendar.getTimeZone = async () => "Europe/London";
+  const p = await h.engine.preview(actor, intent({
+    eventId:master.id, winner:"todoist", owner:"todoist", scope:"future",
+  }));
+  assert.equal(p.splitPlan.expiredUntil,"2023-12-31");
+  assert.equal(p.splitPlan.truncatedRule,master.recurrence[0]);
+  assert.ok(p.changes.some(value=>value.includes("2027-05-02")&&value.includes("RRULE:FREQ=YEARLY")));
+  assert.ok(p.changes.some(value=>value.includes("2023-12-31")&&value.includes("unchanged")));
+  assert.deepEqual(h.writes,[]);
+});
+
+test("unsupported Calendar recurrence returns an actionable preview validation error", async t => {
+  const master = event("old-expired", {
+    start:{date:"2025-05-02"},end:{date:"2025-05-03"},
+    recurrence:["RRULE:FREQ=YEARLY;UNTIL=20231231;COUNT=3"],
+    extendedProperties:{shared:{taskId:"task"}},
+  });
+  const h = harness(t,{events:[master],tasks:[task("task",{due:{date:"2027-05-02",is_recurring:true,string:"every year"}})]});
+  h.clients.calendar.getTimeZone = async () => "Europe/London";
+  await assert.rejects(h.engine.preview(actor, intent({
+    eventId:master.id,winner:"todoist",owner:"todoist",scope:"future",
+  })), error=>error.status===400 && /COUNT.*manual review/.test(error.message));
+  assert.deepEqual(h.writes,[]);
+});
