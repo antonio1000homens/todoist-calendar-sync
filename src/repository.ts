@@ -1299,23 +1299,39 @@ export class StateRepository {
   }
 
   async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    // Once the event-side marker exists it is immutable. A retry must neither
+    // reset the seven-day clock nor recreate a task-side index retired by
+    // maintenance. Atomic creation avoids half-written history pairs.
     const item = { ...projection, updatedAt: now() };
-    await client.send(new TransactWriteCommand({
-      TransactItems: [
-        {
-          Put: {
-            TableName: this.ensureTable(),
-            Item: { ...item, ...key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) },
+    try {
+      await client.send(new TransactWriteCommand({
+        TransactItems: [
+          {
+            Put: {
+              TableName: this.ensureTable(),
+              Item: { ...item, ...key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) },
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
           },
-        },
-        {
-          Put: {
-            TableName: this.ensureTable(),
-            Item: { ...item, ...key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) },
+          {
+            Put: {
+              TableName: this.ensureTable(),
+              Item: { ...item, ...key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) },
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
           },
-        },
-      ],
-    }));
+        ],
+      }));
+    } catch (error) {
+      if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
+      const saved = await this.getCompletedCalendarProjectionByEvent(projection.profile, projection.eventId);
+      if (!saved || saved.taskId !== projection.taskId || saved.completedAt !== projection.completedAt) {
+        // A replay can legitimately have a different delivery timestamp. The
+        // existing immutable event-side identity is sufficient to dedupe it.
+        if (saved?.taskId === projection.taskId && saved.profile === projection.profile) return;
+        throw error;
+      }
+    }
   }
 
   async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
