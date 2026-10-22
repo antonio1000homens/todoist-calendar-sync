@@ -10,9 +10,11 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const error = new Error(`Provider request failed: ${response.status} ${response.url}`) as Error & { status: number; body: string };
+    const body = await response.text();
+    const detail = body.trim().replace(/\s+/g, " ").slice(0, 500);
+    const error = new Error(`Provider request failed: ${response.status} ${response.url}${detail ? ` — ${detail}` : ""}`) as Error & { status: number; body: string };
     error.status = response.status;
-    error.body = await response.text();
+    error.body = body;
     throw error;
   }
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
@@ -324,7 +326,18 @@ export class Todoist {
     const headers = new Headers(init.headers);
     headers.set("authorization", `Bearer ${this.token}`);
     if (init.body) headers.set("content-type", "application/json");
-    return responseJson<T>(await fetch(`${comments ? TODOIST_COMMENTS_ROOT : TODOIST_ROOT}${path}`, { ...init, headers }));
+    const url = `${comments ? TODOIST_COMMENTS_ROOT : TODOIST_ROOT}${path}`;
+    const readOnly = (init.method || "GET").toUpperCase() === "GET";
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await responseJson<T>(await fetch(url, { ...init, headers }));
+      } catch (error) {
+        const status = Number((error as { status?: number }).status);
+        const transient = !status || status === 408 || status === 429 || status >= 500;
+        if (!readOnly || !transient || attempt >= 2) throw error;
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 250 : 750));
+      }
+    }
   }
 
   private async syncCommand(type: string, args: Record<string, unknown>): Promise<void> {
