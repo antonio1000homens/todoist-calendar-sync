@@ -10,6 +10,13 @@ function actionIds(blocks) {
     .filter(Boolean);
 }
 
+function actionLabels(blocks) {
+  return blocks.filter((block) => block?.type === 'actions')
+    .flatMap((block) => block.elements || [])
+    .map((element) => element.text?.text)
+    .filter(Boolean);
+}
+
 function mrkdwnText(blocks) {
   return blocks
     .filter((block) => block?.type === 'section' && block.text?.type === 'mrkdwn')
@@ -51,6 +58,33 @@ test('multi-action decision cards use unique Slack action IDs', () => {
   assert.ok(ids.length >= 3);
   assert.equal(new Set(ids).size, ids.length);
   assert.ok(ids.every((id) => id.startsWith('gcp_sync_decision_')));
+});
+
+test('duplicate consolidation is destructive and shown only with a verified proposal', () => {
+  const type = 'todoist_cancelled_projection_blocked';
+  const decision = {
+    decisionId: 'antonio-todoist_cancelled_projection_blocked-test',
+    profile: 'antonio', type, status: 'pending',
+    severity: MANUAL_DECISION_CATALOG[type].severity,
+    createdAt: '2026-10-20T12:00:00.000Z',
+    decisionDeadline: '2026-10-27T12:00:00.000Z',
+    taskId: 'recurring-task', eventId: 'cancelled-event',
+    context: { taskTitle: 'Fotmob expiry £2.60' },
+    fingerprint: 'test', permittedActions: MANUAL_DECISION_CATALOG[type].actions,
+  };
+  const consolidation = MANUAL_DECISION_CATALOG[type].actions.find((action) => action.id === 'consolidate_duplicate');
+  assert.equal(consolidation.destructive, true);
+  assert.equal(actionLabels(decisionBlocks(decision)).some((label) => label.includes('remove duplicate task')), false);
+
+  decision.context = {
+    ...decision.context,
+    consolidationDuplicateTaskId: 'one-off-task',
+    consolidationMasterEventId: 'calendar-master',
+    consolidationPreview: 'Keep recurring task recurring-task; remove one-off task one-off-task.',
+  };
+  const blocks = decisionBlocks(decision);
+  assert.equal(actionLabels(blocks).some((label) => label.includes('remove duplicate task')), true);
+  assert.match(mrkdwnText(blocks), /Keep recurring task recurring-task; remove one-off task one-off-task/);
 });
 
 test('saved-default button does not reuse a normal decision action ID', () => {

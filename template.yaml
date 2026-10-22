@@ -41,6 +41,19 @@ Parameters:
     NoEcho: true
     MinLength: 2
     Description: JSON profile routing configuration supplied from protected deployment configuration.
+  CloudflareAccessIssuer:
+    Type: String
+    MinLength: 8
+    AllowedPattern: "^https://[a-zA-Z0-9.-]+$"
+    Description: Cloudflare Access team issuer used to verify review API assertions.
+  CloudflareAccessAudience:
+    Type: String
+    MinLength: 16
+    Description: Access application audience tag for the protected review dashboard.
+  ReviewOperatorEmails:
+    Type: String
+    MinLength: 3
+    Description: Comma-separated email allowlist for review API operators.
   ManualInterventionEnabled:
     Type: String
     Default: "true"
@@ -274,6 +287,11 @@ Resources:
       Handler: review-api.handler
       ReservedConcurrentExecutions: 2
       CodeUri: .
+      Environment:
+        Variables:
+          CF_ACCESS_ISSUER: !Ref CloudflareAccessIssuer
+          CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
+          REVIEW_OPERATOR_EMAILS: !Ref ReviewOperatorEmails
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState

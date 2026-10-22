@@ -18,3 +18,8 @@ process.env.SYNC_PROFILE_CONFIG_JSON ||= JSON.stringify({
     todoistProjectId: 'test-work-project',
   },
 });
+
+// Repository modules capture the state table name during import. Set a test
+// value in the preload step so tests that exercise newly added repository
+// methods never fall through to a missing production configuration.
+process.env.STATE_TABLE_NAME ||= 'test-state';

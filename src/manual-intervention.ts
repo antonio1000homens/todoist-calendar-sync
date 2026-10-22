@@ -13,9 +13,10 @@ import { StateRepository } from "./repository.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { profiles } from "./config.js";
 import { normalizedText } from "./security.js";
+import { deleteMappingComments } from "./mapping-comments.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
-import { applyApprovedFutureSeriesSplit } from "./future-split-execution.js";
+import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
@@ -154,7 +155,11 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Calendar projection was cancelled — Todoist task still exists",
     severity: "warning",
     detection: "audit_conflict",
-    actions: actions(["acknowledge", "Keep Calendar deleted"], ["reconcile_now", "Retry guarded reconciliation"]),
+    actions: actions(
+      ["acknowledge", "Keep Calendar deleted"],
+      ["reconcile_now", "Retry guarded reconciliation"],
+      ["consolidate_duplicate", "Keep yearly task; remove duplicate task and cancelled event", true],
+    ),
   },
   both_sides_changed: {
     title: "Calendar and Todoist both changed since the baseline",
@@ -320,6 +325,27 @@ function fingerprint(value: unknown): string {
   return createHash("sha256").update(stableStringify(value)).digest("hex").slice(0, 20);
 }
 
+function consolidationMasterFingerprint(event: CalendarEvent, plan: ReturnType<typeof planFutureSeriesSplit>, taskId: string): string {
+  const normalized = { ...event } as Record<string, unknown>;
+  delete normalized.etag;
+  delete normalized.updated;
+  // The approved cap intentionally changes only these recurrence ownership
+  // fields. Exclude RRULE formatting here; assertApprovedHistoryCap validates it.
+  delete normalized.recurrence;
+  const properties = (event.extendedProperties || {}) as { shared?:Record<string,string>; [key:string]:unknown };
+  const shared = { ...(properties.shared || {}) };
+  delete shared.taskId;
+  delete shared.syncRecurrenceOwner;
+  delete shared.todoistRecurrence;
+  Object.assign(shared, {
+    syncSource:"todoist-calendar-sync", syncHistoryOnly:"true", syncHistoryTaskId:taskId,
+    syncHistoryOriginalRule:plan.originalRule, syncHistorySuccessorId:plan.newMasterId,
+    syncHistoryCutoff:plan.previousOccurrence,
+  });
+  normalized.extendedProperties = { ...properties, shared };
+  return fingerprint(normalized);
+}
+
 function decisionKey(profile: Profile, type: ManualDecisionType, identity: Record<string, unknown>): { decisionId: string; fingerprint: string } {
   const stateFingerprint = fingerprint(identity);
   return {
@@ -459,7 +485,8 @@ export class ManualDecisionStore {
     }));
     const decision = await this.get(decisionId);
     if (decision) {
-      const reviewStatus = status === "resolved" ? "resolved" : status === "expired" ? "dismissed" : "open";
+      const dismissal = ["acknowledge","keep_separate","ignore","dismiss","dismissed"].includes(resolution.toLowerCase());
+      const reviewStatus = status === "resolved" ? dismissal ? "dismissed" : "resolved" : status === "expired" ? "dismissed" : "open";
       try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
       catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
     }
@@ -516,6 +543,20 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     failure: error instanceof Error ? error.message : String(error),
     deliveryId: delivery.id,
   };
+  // Keep the provider identifiers from the failed delivery itself. Provider
+  // errors often omit these, even though the queued webhook has them.
+  if (delivery.orphan) {
+    context.providerTaskId = delivery.orphan.taskId;
+    context.providerEventId = delivery.orphan.eventId;
+  }
+  if (delivery.kind === "todoist") {
+    try {
+      const payload = JSON.parse(delivery.body) as { event_data?: { id?: unknown } };
+      if (typeof payload.event_data?.id === "string" && payload.event_data.id) context.providerTaskId = payload.event_data.id;
+    } catch {
+      // The failure record remains useful even when a legacy webhook is malformed.
+    }
+  }
   if (delivery.reconcile) {
     context.reconcileReason = delivery.reconcile.reason;
     context.reconcileGeneration = delivery.reconcile.generation;
@@ -537,7 +578,7 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     }
   }
   const taskMatch = (error instanceof Error ? error.message : String(error)).match(/\/tasks\/([^\s/?]+)/);
-  if (taskMatch) context.providerTaskId = taskMatch[1];
+  if (taskMatch) context.providerTaskId ||= taskMatch[1];
   return Object.fromEntries(Object.entries(context).filter(([, value]) => value !== undefined));
 }
 
@@ -592,6 +633,8 @@ function actionGuidance(decision: ManualDecision): string | undefined {
       return "*Choose one:* Delete the Calendar event if the Todoist deletion was intentional, or restore the Todoist task if the Calendar event should remain. No provider action happens until you choose.";
     case "todoist_unmapped_conflict":
       return "*Choose one:* For a changed recurring Calendar master, *Use Todoist for future — keep Calendar history* cuts off only its old future dates and creates a new Todoist-owned recurrence; past Calendar occurrences stay intact. For standalone mismatches, use the original choices. Both require explicit confirmation and fresh ownership/duplicate checks. Existing cards: `/sync resume <decision ID>`.";
+    case "todoist_cancelled_projection_blocked":
+      return "*Choose one:* Consolidation keeps the recurring Todoist task, preserves past Calendar occurrences, starts its Todoist-owned recurrence on the next due date, then removes the matched one-off Todoist task and cancelled Calendar event. It requires confirmation and fresh ownership checks.";
     case "todoist_owned_recurrence_task_deleted":
       return "*Choose one:* Delete the Calendar series if the Todoist deletion was intentional, keep it and unlink it, or restore the Todoist task. No provider action happens until you choose.";
     case "calendar_owned_recurrence_task_deleted":
@@ -652,6 +695,12 @@ function contextLines(decision: ManualDecision): string[] {
     displayCalendarStatus,
     typeof detail.futureSplitPreview === "string"
       ? `*Future-only plan:* ${escapeSlackMrkdwnText(detail.futureSplitPreview)}`
+      : undefined,
+    typeof detail.consolidationPreview === "string"
+      ? `*Duplicate consolidation:* ${escapeSlackMrkdwnText(detail.consolidationPreview)}`
+      : undefined,
+    typeof detail.consolidationUnavailableReason === "string"
+      ? `*Consolidation unavailable:* ${escapeSlackMrkdwnText(detail.consolidationUnavailableReason)}`
       : undefined,
     changeSummary(decision) ? `*What changed:* ${changeSummary(decision)}` : undefined,
     ...operationalContextLines(decision),
@@ -775,6 +824,12 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
   }));
   const effectiveActions = decision.type === "todoist_unmapped_conflict"
     ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
+    : decision.type === "todoist_cancelled_projection_blocked"
+      ? MANUAL_DECISION_CATALOG.todoist_cancelled_projection_blocked.actions.filter((action) =>
+        action.id !== "consolidate_duplicate" || (
+          typeof decision.context.consolidationDuplicateTaskId === "string"
+          && typeof decision.context.consolidationMasterEventId === "string"
+          && typeof decision.context.consolidationPreview === "string"))
     : decision.permittedActions;
   const allActions = [...effectiveActions, ...dynamicActions];
   if (allActions.length) {
@@ -946,7 +1001,7 @@ export class ManualInterventionService {
   private createManualExecutionClientFactory(
     state: StateRepository,
     budget: ReconciliationMutationBudget,
-    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision },
+    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision; consolidation?: { duplicateTaskId:string; oldMasterId:string; newMasterId:string; previousOccurrence:string } },
   ): ProviderClientFactory {
     const recheckProtectedItems = async (profile: Profile) => {
       const current = await this.store.get(protectedItems.decision.decisionId);
@@ -962,7 +1017,32 @@ export class ManualInterventionService {
         const [byTask, byEvent] = await Promise.all([
           state.getMappingByTask(profile, sourceTaskId), lookupByEvent(profile, sourceEventId),
         ]);
-        if ((byTask && byTask.eventId !== sourceEventId) || (byEvent && byEvent.taskId !== sourceTaskId)) {
+        let approvedCutover = false;
+        const cutover = protectedItems.consolidation;
+        const currentPlan = current.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined;
+        if (cutover && profile === protectedItems.decision.profile && current.type === "todoist_cancelled_projection_blocked"
+          && current.context.consolidationDuplicateTaskId === cutover.duplicateTaskId
+          && currentPlan?.oldMasterId === cutover.oldMasterId && currentPlan.newMasterId === cutover.newMasterId
+          && currentPlan.previousOccurrence === cutover.previousOccurrence) {
+          const [split, alias, futureByEvent, link] = await Promise.all([
+            state.getFutureSeriesSplitAnyProfile(sourceTaskId),
+            state.getConsolidatedTask(profile, cutover.duplicateTaskId),
+            lookupByEvent(profile, cutover.newMasterId),
+            state.getRecurrenceLink(profile, sourceTaskId),
+          ]);
+          approvedCutover = split?.profile === profile && split.taskId === sourceTaskId
+            && split.oldMasterId === cutover.oldMasterId && split.newMasterId === cutover.newMasterId
+            && split.previousOccurrence === cutover.previousOccurrence && split.status === "pending"
+            && alias?.retainedTaskId === sourceTaskId && alias.decisionId === current.decisionId
+            && alias.previousMapping?.taskId === cutover.duplicateTaskId
+            && alias.previousMapping.masterEventId === cutover.oldMasterId
+            && byTask?.taskId === sourceTaskId && byTask.eventId === cutover.newMasterId
+            && byTask.masterEventId === cutover.newMasterId && byTask.recurrenceOwner === "todoist"
+            && futureByEvent?.taskId === sourceTaskId && futureByEvent.eventId === cutover.newMasterId
+            && futureByEvent.recurrenceOwner === "todoist"
+            && link?.owner === "todoist" && link.taskId === sourceTaskId && link.masterEventId === cutover.newMasterId;
+        }
+        if (((byTask && byTask.eventId !== sourceEventId) || (byEvent && byEvent.taskId !== sourceTaskId)) && !approvedCutover) {
           throw new ManualSyncBlockedError();
         }
       }
@@ -1082,6 +1162,17 @@ export class ManualInterventionService {
     let payload: TodoistWebhookPayload;
     try { payload = JSON.parse(delivery.body) as TodoistWebhookPayload; } catch { return false; }
     const task = payload.event_data;
+    if (task?.id) {
+      const consolidated = await state.getConsolidatedTask?.(delivery.profile, task.id);
+      if (consolidated) {
+        await state.audit(delivery.profile, "todoist_consolidated_duplicate_webhook_ignored", {
+          discardedTaskId: task.id,
+          retainedTaskId: consolidated.retainedTaskId,
+          decisionId: consolidated.decisionId,
+        });
+        return true;
+      }
+    }
     const explicitDelete = Boolean(task?.id && (/deleted/i.test(payload.event_name || "") || task.is_deleted));
     if (!task?.id || !explicitDelete) return false;
     const mapping = await state.getMappingByTask(delivery.profile, task.id);
@@ -1174,6 +1265,76 @@ export class ManualInterventionService {
       sourceDeliveryId: delivery.id,
     });
     return true;
+  }
+
+  private async buildConsolidationPreview(
+    profile: Profile, taskId: string, cancelledEventId: string,
+    priorPlan?: ReturnType<typeof planFutureSeriesSplit>,
+  ): Promise<Record<string, unknown>> {
+    const pair = await this.providerClients(profile);
+    const state = new StateRepository();
+    const [task, cancelled, tasks] = await Promise.all([
+      pair.todoist.getTask(taskId),
+      pair.calendar.getEvent(cancelledEventId),
+      pair.todoist.listTasks(),
+    ]);
+    const day = todoistDue(task);
+    if (!task.due?.is_recurring || !day || cancelled.status !== "cancelled"
+      || cancelled.extendedProperties?.shared?.taskId !== task.id
+      || normalizedText(cancelled.summary).toLowerCase() !== normalizedText(task.content).toLowerCase()
+      || eventDisplayStart(cancelled)?.slice(0, 10) !== day.slice(0, 10)) {
+      throw new Error("The cancelled projection no longer matches the recurring Todoist task");
+    }
+    const matchingTasks = tasks.filter((candidate) => candidate.id !== task.id
+      && !candidate.is_deleted && !candidate.is_completed
+      && normalizedText(candidate.content).toLowerCase() === normalizedText(task.content).toLowerCase()
+      && todoistDue(candidate)?.slice(0, 10) === day.slice(0, 10));
+    if (matchingTasks.length !== 1 || matchingTasks[0].due?.is_recurring) {
+      throw new Error("There is not exactly one matching active one-off Todoist duplicate");
+    }
+    const duplicate = matchingTasks[0];
+    const mapping = await state.getMappingByTask(profile, duplicate.id);
+    if (!mapping?.masterEventId || mapping.recurrenceOwner !== "calendar"
+      || !mapping.activeInstanceId || mapping.eventId !== mapping.activeInstanceId) {
+      throw new Error("The one-off task is not the active mirror of a Calendar-owned recurrence");
+    }
+    const [link, master, duplicateHistory, taskOwner] = await Promise.all([
+      state.getRecurrenceLink(profile, mapping.seriesId || ""),
+      pair.calendar.getEvent(mapping.masterEventId),
+      state.listCompletedCalendarProjectionsByTaskAnyProfile(duplicate.id),
+      state.getMappingByTaskAnyProfile(task.id),
+    ]);
+    const archived = master.extendedProperties?.shared?.syncHistoryOnly === "true";
+    const active = archived ? undefined : await pair.calendar.getEvent(mapping.activeInstanceId);
+    if (taskOwner || duplicateHistory.length || !link || link.owner !== "calendar"
+      || link.taskId !== duplicate.id || link.masterEventId !== master.id
+      || link.seriesId !== mapping.seriesId || link.activeInstanceId !== mapping.activeInstanceId
+      || (!archived && (!active || active.status !== "confirmed" || active.start?.date !== day))
+      || master.status !== "confirmed" || !master.recurrence?.length
+      || master.recurringEventId || master.id !== mapping.masterEventId) {
+      throw new Error("The current recurrence owner or occurrence changed; consolidation is unsafe");
+    }
+    const calendarTimeZone = await pair.calendar.getTimeZone();
+    const plan = planFutureSeriesSplit(
+      profile, task, master,
+      archived && priorPlan?.approvedAt ? new Date(priorPlan.approvedAt) : new Date(),
+      calendarTimeZone, duplicate.id,
+    );
+    const tombstone = await state.getCalendarProjectionTombstone(profile, task.id);
+    return {
+      consolidationDuplicateTaskId: duplicate.id,
+      consolidationMasterEventId: master.id,
+      consolidationCancelledEventId: cancelled.id,
+      consolidationTaskUpdatedAt: task.updated_at,
+      consolidationDuplicateUpdatedAt: duplicate.updated_at,
+      consolidationMappingUpdatedAt: mapping.updatedAt,
+      consolidationLinkUpdatedAt: link.updatedAt,
+      consolidationCalendarEtag: master.etag,
+      consolidationMasterFingerprint: consolidationMasterFingerprint(master,plan,task.id),
+      consolidationTombstoneUpdatedAt: tombstone?.sourceUpdatedAt,
+      consolidationFuturePlan: plan,
+      consolidationPreview: `Keep recurring task ${task.id}; remove one-off task ${duplicate.id} and cancelled event ${cancelled.id}. Preserve Calendar master ${master.id} through ${plan.previousOccurrence}, end its old series before ${plan.nextOldOccurrence}, then start the Todoist yearly recurrence on ${plan.newStart} (${calendarTimeZone}).`,
+    };
   }
 
   async observeAudit(
@@ -1319,6 +1480,13 @@ export class ManualInterventionService {
                 extra.futureSplitBlockedReason = error instanceof Error ? error.message : String(error);
               }
             }
+            if (type === "todoist_cancelled_projection_blocked" && taskId && eventId) {
+              try {
+                Object.assign(extra, await this.buildConsolidationPreview(profile, taskId, eventId));
+              } catch (error) {
+                extra.consolidationUnavailableReason = error instanceof Error ? error.message : String(error);
+              }
+            }
             if (readOnlyCandidates.length) extra.readOnlyCandidates = readOnlyCandidates;
             if (targets.length > selected.length) extra.omittedCandidateCount = targets.length - selected.length;
             return extra;
@@ -1385,6 +1553,20 @@ export class ManualInterventionService {
       { type: "section", text: { type: "mrkdwn", text: "*Future handling*\nSave this choice as a suggested default, or auto-apply it when the action is explicitly auto-safe." } },
       { type: "actions", block_id: `gcp_sync_policy_${decision.decisionId.slice(-24)}`, elements: elements.slice(0, 5) },
     ];
+  }
+
+  private async finishAndReconcile(
+    decision: ManualDecision,
+    state: StateRepository,
+    resolution: string,
+    slackUserId?: string,
+  ): Promise<void> {
+    await this.store.finish(decision.decisionId, "resolved", resolution, slackUserId);
+    const reconcile = await requestReconciliation(state, decision.profile, "manual");
+    const resolvedBy = slackUserId === "AUTO_POLICY" ? "saved intervention policy" : slackUserId ? `<@${slackUserId}>` : "operator";
+    const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nReconciliation: ${reconcile.coalesced ? "coalesced" : reconcile.queued ? "queued" : "pending"}`;
+    const policyBlocks = slackUserId === "AUTO_POLICY" ? [] : (this.resolutionPolicyBlocks(decision, resolution) || []);
+    await this.notifier.updateResolution(decision, text, decisionResolutionBlocks(decision, text, policyBlocks));
   }
 
   private async finishResolutionWithoutReconciliation(
@@ -1647,6 +1829,170 @@ export class ManualInterventionService {
     }
   }
 
+  private async resolveDuplicateConsolidation(
+    decision: ManualDecision,
+    state: StateRepository,
+    slackUserId?: string,
+  ): Promise<void> {
+    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
+    const duplicateId = decision.context.consolidationDuplicateTaskId;
+    const masterId = decision.context.consolidationMasterEventId;
+    const cancelledId = decision.context.consolidationCancelledEventId;
+    const approvedPlan = decision.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined;
+    if (!decision.taskId || !decision.eventId || typeof duplicateId !== "string"
+      || typeof masterId !== "string" || typeof cancelledId !== "string" || !approvedPlan
+      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_cancelled_projection_blocked") {
+      return refuse("This card has no verified duplicate consolidation proposal. No changes made; resume it for a fresh proposal.");
+    }
+    const pair = await this.providerClients(decision.profile);
+    const alias = await state.getConsolidatedTask(decision.profile, duplicateId);
+    if (alias && (alias.retainedTaskId !== decision.taskId || alias.decisionId !== decision.decisionId)) {
+      return refuse("The duplicate task is reserved by a different consolidation. No changes made.");
+    }
+    if (alias) {
+      const [mapping, link, split] = await Promise.all([
+        state.getMappingByTask(decision.profile, decision.taskId),
+        state.getRecurrenceLink(decision.profile, decision.taskId),
+        state.getFutureSeriesSplitAnyProfile(decision.taskId),
+      ]);
+      const mappingInstalled = mapping?.recurrenceOwner === "todoist"
+        && mapping.masterEventId === approvedPlan.newMasterId && mapping.eventId === approvedPlan.newMasterId
+        && link?.owner === "todoist" && link.masterEventId === approvedPlan.newMasterId
+        && split?.profile === decision.profile && split.newMasterId === approvedPlan.newMasterId
+        && Boolean(alias.previousMapping);
+      if (mappingInstalled) {
+        const master = await pair.calendar.getEvent(approvedPlan.newMasterId);
+        const task = await pair.todoist.getTask(decision.taskId);
+        if (!hasCanonicalState(master, task)) {
+          return refuse("The new recurring Calendar series does not match the retained Todoist task. No duplicate was removed.");
+        }
+        try {
+          await deleteMappingComments(pair.todoist, alias.previousMapping!);
+          const oldProjectionComment = await pair.todoist.findComment(decision.taskId, alias.cancelledEventId || cancelledId);
+          if (oldProjectionComment) {
+            const record = await pair.todoist.getComment(oldProjectionComment.id).catch(() => undefined);
+            await deleteMappingComments(pair.todoist, {
+              profile: decision.profile, taskId: decision.taskId,
+              eventId: alias.cancelledEventId || cancelledId,
+              updatedAt: new Date().toISOString(),
+              ...(record?.project_id ? { projectCommentId: oldProjectionComment.id } : { taskCommentId: oldProjectionComment.id }),
+            });
+          }
+          await pair.calendar.deleteEvent(alias.cancelledEventId || cancelledId).catch((error: unknown) => {
+            if (!providerNotFound(error)) throw error;
+          });
+          await pair.todoist.deleteTask(duplicateId).catch((error: unknown) => {
+            if (Number((error as { status?: number }).status) !== 404) throw error;
+          });
+          await state.completeFutureSeriesSplit(decision.profile, decision.taskId, approvedPlan.newMasterId);
+          await state.audit(decision.profile, "manual_duplicate_consolidation_completed", {
+            decisionId: decision.decisionId, retainedTaskId: decision.taskId,
+            discardedTaskId: duplicateId, cancelledEventId: alias.cancelledEventId || cancelledId,
+            oldMasterId: approvedPlan.oldMasterId, newMasterId: approvedPlan.newMasterId,
+          });
+          await this.finishAndReconcile(decision, state, "consolidate_duplicate", slackUserId);
+        } catch (error) {
+          if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+          await this.notifier.updateResolution(decision,
+            `⚠️ The recurrence mapping is installed, but duplicate cleanup is incomplete: ${error instanceof Error ? error.message : String(error)}. The decision remains pending and can be resumed safely.`);
+        }
+        return;
+      }
+      if (split && (split.profile !== decision.profile || split.newMasterId !== approvedPlan.newMasterId)) {
+        return refuse("A different recurrence split owns the retained task. No duplicate was removed.");
+      }
+    }
+
+    let fresh: Record<string, unknown>;
+    try {
+      fresh = await this.buildConsolidationPreview(
+        decision.profile, decision.taskId, cancelledId, approvedPlan,
+      );
+    } catch (error) {
+      return refuse(`${error instanceof Error ? error.message : String(error)}. No provider changes were made.`);
+    }
+    const snapshotFields = [
+      "consolidationDuplicateTaskId", "consolidationMasterEventId", "consolidationCancelledEventId",
+      "consolidationTaskUpdatedAt", "consolidationDuplicateUpdatedAt", "consolidationMappingUpdatedAt",
+      "consolidationLinkUpdatedAt", "consolidationMasterFingerprint", "consolidationTombstoneUpdatedAt",
+    ];
+    if (snapshotFields.some((field) => fresh[field] !== decision.context[field])) {
+      return refuse("The proposed task, Calendar series, mapping, or tombstone changed after approval. Resume for a fresh proposal.");
+    }
+    const livePlan = fresh.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit>;
+    if (["oldMasterId", "newMasterId", "previousOccurrence", "nextOldOccurrence", "newStart", "newRule", "calendarTimeZone"]
+      .some((field) => livePlan[field as keyof typeof livePlan] !== approvedPlan[field as keyof typeof approvedPlan])) {
+      return refuse("The recurrence cutoff changed after approval. Resume for a fresh proposal.");
+    }
+    if (fresh.consolidationCalendarEtag !== decision.context.consolidationCalendarEtag) {
+      const [cappedMaster, split, guard] = await Promise.all([
+        pair.calendar.getEvent(masterId),
+        state.getFutureSeriesSplitAnyProfile(decision.taskId),
+        state.getConsolidatedTask(decision.profile, duplicateId),
+      ]);
+      let ownApprovedCap = false;
+      try {
+        assertApprovedHistoryCap(cappedMaster, approvedPlan, decision.taskId);
+        ownApprovedCap = split?.profile === decision.profile && split.taskId === decision.taskId
+          && split.oldMasterId === masterId && split.newMasterId === approvedPlan.newMasterId
+          && split.previousOccurrence === approvedPlan.previousOccurrence && split.status === "pending"
+          && guard?.retainedTaskId === decision.taskId && guard.decisionId === decision.decisionId
+          && guard.previousMapping?.masterEventId === masterId
+          && fresh.consolidationMasterFingerprint === decision.context.consolidationMasterFingerprint;
+      } catch {
+        ownApprovedCap = false;
+      }
+      if (!ownApprovedCap) return refuse("The Calendar master changed after approval and is not the verified history cap from this consolidation. Resume for a fresh proposal.");
+    }
+    const [task, duplicate, old, previousMapping] = await Promise.all([
+      pair.todoist.getTask(decision.taskId),
+      pair.todoist.getTask(duplicateId),
+      pair.calendar.getEvent(masterId),
+      state.getMappingByTask(decision.profile, duplicateId),
+    ]);
+    if (!previousMapping || previousMapping.masterEventId !== masterId) {
+      return refuse("The one-off task no longer owns the Calendar series mirror. No changes made.");
+    }
+    const previousLink = await state.getRecurrenceLink(decision.profile, previousMapping.seriesId || "");
+    if (!previousLink) return refuse("The Calendar recurrence link is missing. No changes made.");
+    const cancelled = await pair.calendar.getEvent(cancelledId);
+    if (cancelled.status !== "cancelled") return refuse("The old Calendar projection is no longer cancelled. No changes made.");
+    const tombstone = await state.getCalendarProjectionTombstone(decision.profile, task.id);
+    const expectedTombstoneAt = decision.context.consolidationTombstoneUpdatedAt;
+    if ((tombstone?.sourceUpdatedAt) !== expectedTombstoneAt) {
+      return refuse("The retained task's projection tombstone changed after approval. Resume for a fresh proposal.");
+    }
+    try {
+      const result = await applyApprovedFutureSeriesSplit(decision.profile, task, old, pair, state, {
+        expectedDue: todoistDue(task),
+        expectedRule: approvedPlan.originalRule,
+        approvedPlan,
+        approvedEtag: approvedPlan.oldEtag,
+        consolidation: {
+          retainedTaskId: task.id,
+          discardedTask: duplicate,
+          previousMapping,
+          previousLink,
+          cancelledEventId: cancelledId,
+          decisionId: decision.decisionId,
+          tombstone,
+        },
+      });
+      await this.finishAndReconcile(decision, state, "consolidate_duplicate", slackUserId);
+      await this.notifier.updateResolution(decision,
+        `✅ Kept recurring Todoist task \`${task.id}\`; removed one-off task \`${duplicate.id}\` and cancelled Calendar event \`${cancelledId}\`. Calendar history was retained through *${result.plan.previousOccurrence}*; the Todoist-owned yearly series now starts on *${result.plan.newStart}* with master \`${result.plan.newMasterId}\`.`);
+    } catch (error) {
+      if (error instanceof ManualCircuitOpenError || isMutationBudgetExhausted(error)) throw error;
+      await state.audit(decision.profile, "manual_duplicate_consolidation_incomplete", {
+        decisionId: decision.decisionId, retainedTaskId: task.id,
+        discardedTaskId: duplicate.id, oldMasterId: old.id,
+        reason: error instanceof Error ? error.message : String(error),
+      }).catch(() => undefined);
+      await this.notifier.updateResolution(decision,
+        `⚠️ Consolidation did not finish: ${error instanceof Error ? error.message : String(error)}. The decision remains pending; resume it to recheck the series, mapping and duplicate before retrying.`);
+    }
+  }
+
   /**
    * A stale approval is never reopened. Operators can explicitly refresh
    * it with /sync resume <id> after changing provider state. The new decision
@@ -1708,6 +2054,47 @@ export class ManualInterventionService {
     });
     if (result.created) await this.notifier.postDecision(result.decision);
     return result.decision.status === "pending";
+  }
+
+  private async refreshStaleConsolidationDecision(decision: ManualDecision): Promise<boolean> {
+    if (decision.type !== "todoist_cancelled_projection_blocked" || !decision.taskId || !decision.eventId
+      || !decision.sourceAuditAction || typeof decision.context.consolidationDuplicateTaskId !== "string") return false;
+    let fresh: Record<string, unknown>;
+    try {
+      fresh = await this.buildConsolidationPreview(
+        decision.profile, decision.taskId, decision.eventId,
+        decision.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined,
+      );
+    } catch {
+      return false;
+    }
+    const fields = ["consolidationDuplicateTaskId", "consolidationMasterEventId", "consolidationCancelledEventId",
+      "consolidationTaskUpdatedAt", "consolidationDuplicateUpdatedAt", "consolidationMappingUpdatedAt",
+      "consolidationLinkUpdatedAt", "consolidationCalendarEtag", "consolidationMasterFingerprint",
+      "consolidationTombstoneUpdatedAt", "consolidationFuturePlan"];
+    if (!fields.some((field) => stableStringify(fresh[field]) !== stableStringify(decision.context[field]))) return false;
+    const key = decisionKey(decision.profile, decision.type, {
+      priorDecisionId: decision.decisionId,
+      proposalRevision: fingerprint(Object.fromEntries(fields.map((field) => [field, fresh[field]]))),
+    });
+    const next = await this.store.putPending({
+      decisionId: key.decisionId,
+      fingerprint: key.fingerprint,
+      profile: decision.profile,
+      type: decision.type,
+      severity: MANUAL_DECISION_CATALOG[decision.type].severity,
+      permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions,
+      policyMode: "prompt",
+      policyScope: decision.policyScope,
+      sourceAuditAction: decision.sourceAuditAction,
+      taskId: decision.taskId,
+      eventId: decision.eventId,
+      seriesId: decision.seriesId,
+      sourceDeliveryId: decision.sourceDeliveryId,
+      context: { ...decision.context, ...fresh, refreshedFromDecisionId: decision.decisionId },
+    });
+    if (next.created) await this.notifier.postDecision(next.decision);
+    return next.decision.status === "pending";
   }
 
   private async markStale(decision: ManualDecision, reason: string, slackUserId?: string): Promise<void> {
@@ -1979,7 +2366,50 @@ export class ManualInterventionService {
               : "The decision is stale and no changed provider state could be verified; no new approval was issued.", channel);
             return;
           }
+          if (decision?.status === "stale" && decision.type === "todoist_cancelled_projection_blocked") {
+            const refreshed = await this.refreshStaleConsolidationDecision(decision);
+            await this.notifier.postText(refreshed
+              ? "A refreshed consolidation proposal is available and requires fresh approval. The old approval remains stale."
+              : "The decision is stale and no changed, safe consolidation proposal could be verified; no new approval was issued.", channel);
+            return;
+          }
           await this.notifier.postText(`Decision \`${manual.targetId}\` is not pending.`, channel);
+          return;
+        }
+        if (decision.type === "todoist_cancelled_projection_blocked" && decision.taskId && decision.eventId) {
+          const duplicateId = typeof decision.context.consolidationDuplicateTaskId === "string"
+            ? decision.context.consolidationDuplicateTaskId : undefined;
+          const approvedPlan = decision.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined;
+          if (duplicateId && approvedPlan) {
+            const [guard, split] = await Promise.all([
+              state.getConsolidatedTask(decision.profile, duplicateId),
+              state.getFutureSeriesSplitAnyProfile(decision.taskId),
+            ]);
+            if (guard?.retainedTaskId === decision.taskId && guard.decisionId === decision.decisionId
+              && guard.previousMapping?.masterEventId === approvedPlan.oldMasterId
+              && split?.profile === decision.profile && split.taskId === decision.taskId
+              && split.oldMasterId === approvedPlan.oldMasterId && split.newMasterId === approvedPlan.newMasterId
+              && split.previousOccurrence === approvedPlan.previousOccurrence && split.status === "pending") {
+              // The guard and frozen plan identify an operation already in
+              // progress. Keep its approved phase data intact for a safe retry.
+              await this.notifier.postDecision(decision);
+              return;
+            }
+          }
+          const context = { ...decision.context };
+          for (const key of Object.keys(context)) {
+            if (key.startsWith("consolidation")) delete context[key];
+          }
+          try {
+            Object.assign(context, await this.buildConsolidationPreview(
+              decision.profile, decision.taskId, decision.eventId,
+              decision.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined,
+            ));
+          } catch (error) {
+            context.consolidationUnavailableReason = error instanceof Error ? error.message : String(error);
+          }
+          await this.store.refreshPendingContext(decision.decisionId, context);
+          await this.notifier.postDecision({ ...decision, context });
           return;
         }
         if (decision.type === "todoist_unmapped_conflict" && decision.taskId && decision.eventId) {
@@ -2126,6 +2556,8 @@ export class ManualInterventionService {
 
     const decisionActions = decision.type === "todoist_unmapped_conflict"
       ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
+      : decision.type === "todoist_cancelled_projection_blocked"
+        ? MANUAL_DECISION_CATALOG.todoist_cancelled_projection_blocked.actions
       : decision.permittedActions;
     const legacyAcknowledge = decision.type === "todoist_unmapped_conflict"
       && manual.action === "acknowledge"
@@ -2139,7 +2571,15 @@ export class ManualInterventionService {
     const mapping = decision.mappingSnapshot;
     const taskIds = [...new Set([decision.taskId, mapping?.taskId, manual.action.startsWith("bind_task:") ? manual.action.slice("bind_task:".length) : undefined].filter((value): value is string => Boolean(value)))];
     const eventIds = [...new Set([decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((value): value is string => Boolean(value)))];
-    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget, { taskIds, eventIds, decision });
+    const consolidationPlan = decision.type === "todoist_cancelled_projection_blocked" && manual.action === "consolidate_duplicate"
+      ? decision.context.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit> | undefined : undefined;
+    const consolidationDuplicateTaskId = typeof decision.context.consolidationDuplicateTaskId === "string"
+      ? decision.context.consolidationDuplicateTaskId : undefined;
+    const consolidation = consolidationPlan && consolidationDuplicateTaskId ? {
+      duplicateTaskId:consolidationDuplicateTaskId, oldMasterId:consolidationPlan.oldMasterId,
+      newMasterId:consolidationPlan.newMasterId, previousOccurrence:consolidationPlan.previousOccurrence,
+    } : undefined;
+    this.executionClientFactory = this.createManualExecutionClientFactory(state, budget, { taskIds, eventIds, decision, consolidation });
     try {
       if (manual.action === "reconcile_now") {
         await this.retryConflictReconciliation(decision, state, manual.slackUserId);
@@ -2151,6 +2591,10 @@ export class ManualInterventionService {
           for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { taskId, eventId })) throw new ManualSyncBlockedError();
         }
         for (const eventId of eventIds) if (await state.syncBlocked(decision.profile, { eventId })) throw new ManualSyncBlockedError();
+      }
+      if (decision.type === "todoist_cancelled_projection_blocked" && manual.action === "consolidate_duplicate") {
+        await this.resolveDuplicateConsolidation(decision, state, manual.slackUserId);
+        return;
       }
       if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
         await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);

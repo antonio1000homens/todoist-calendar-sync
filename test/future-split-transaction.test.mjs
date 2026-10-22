@@ -43,6 +43,51 @@ test("future mapping transaction conditionally claims owner, mapping indexes and
   } finally { documentClient.send = original; }
 });
 
+test("duplicate consolidation atomically transfers mapping ownership and installs webhook guard", async () => {
+  const original = documentClient.send;
+  let captured;
+  documentClient.send = async (command) => {
+    if (command.constructor.name === "GetCommand") return { Item: {
+      profile: "antonio", taskId: "smoke-task", oldMasterId: "old-series",
+      newMasterId: "new-series", status: "pending",
+    } };
+    captured = command;
+    return {};
+  };
+  const previousMapping = {
+    profile: "antonio", projectId: "home-project", taskId: "duplicate-task",
+    eventId: "old-series_20270611", recurrenceOwner: "calendar", seriesId: "old-series",
+    masterEventId: "old-series", activeInstanceId: "old-series_20270611",
+    activeEffectiveStart: "2027-06-11", updatedAt: "2026-10-19T20:00:00Z",
+  };
+  const previousLink = {
+    profile: "antonio", owner: "calendar", seriesId: "old-series",
+    masterEventId: "old-series", activeInstanceId: previousMapping.activeInstanceId,
+    taskId: "duplicate-task", eventId: previousMapping.eventId, updatedAt: previousMapping.updatedAt,
+  };
+  try {
+    assert.equal(await new StateRepository().commitRecurrenceConsolidation({
+      mapping, link, previousMapping, previousLink,
+      discardedTaskId: "duplicate-task", decisionId: "decision-1",
+      cancelledEventId: "cancelled-projection",
+    }), true);
+    assert.equal(captured.constructor.name, "TransactWriteCommand");
+    const writes = captured.input.TransactItems;
+    const deletes = writes.filter((item) => item.Delete).map((item) => item.Delete);
+    assert.deepEqual(deletes.map((item) => item.Key.pk), [
+      "EVENT#antonio#old-series_20270611", "TASK#antonio#duplicate-task",
+      "TASKOWNER#duplicate-task", "RECURRENCE#antonio#old-series",
+    ]);
+    const puts = writes.filter((item) => item.Put).map((item) => item.Put);
+    assert.ok(puts.some((item) => item.Item.pk === "CONSOLIDATED_TASK#antonio#duplicate-task"
+      && item.Item.retainedTaskId === "smoke-task" && item.Item.decisionId === "decision-1"
+      && item.Item.cancelledEventId === "cancelled-projection"));
+    assert.ok(puts.every((item) => item.ConditionExpression.startsWith("attribute_not_exists(pk)")));
+    assert.ok(writes.some((item) => item.ConditionCheck?.Key.pk === "FUTURE_SPLIT#TASK#smoke-task"));
+    assert.ok(writes.some((item) => item.ConditionCheck?.Key.pk === "PROJECTION#antonio#TASK#smoke-task"));
+  } finally { documentClient.send = original; }
+});
+
 test("split transaction treats concurrent ownership race as refusal, not a success", async () => {
   const original = documentClient.send;
   documentClient.send = async () => {

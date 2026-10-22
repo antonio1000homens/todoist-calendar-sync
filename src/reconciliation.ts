@@ -587,6 +587,14 @@ export class SnapshotReconciler {
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
     if (await this.state.syncBlocked(profile, { taskId: task.id })) return "blocked";
     if (!hasDue(task)) return "noop";
+    const consolidation = await this.state.getConsolidatedTask?.(profile, task.id);
+    if (consolidation) {
+      await this.state.audit(profile, "todoist_snapshot_consolidated_duplicate_ignored", {
+        discardedTaskId: task.id, retainedTaskId: consolidation.retainedTaskId,
+        decisionId: consolidation.decisionId,
+      });
+      return "blocked";
+    }
     const split = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
     if (split?.status === "pending") {
       await this.state.audit(profile, "todoist_snapshot_future_series_split_pending", {

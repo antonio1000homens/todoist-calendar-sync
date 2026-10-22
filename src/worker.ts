@@ -10,7 +10,7 @@ import {
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { enqueueDelivery } from "./queue.js";
+import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
@@ -124,6 +124,7 @@ async function enqueueReconciliationContinuation(
       reason: delivery.reconcile.reason,
       generation: delivery.reconcile.generation,
       continuation,
+      pendingRefreshRefs: delivery.reconcile.pendingRefreshRefs,
     },
   };
   await enqueueDelivery(next);
@@ -415,6 +416,25 @@ export const handler: SQSHandler = async (event, context: Context) => {
       if (delivery.kind === "reconcile") {
         const reconciliation = await processReconciliation(delivery, state);
         if (!reconciliation.continuationRequired && !reconciliation.continuationQueued && delivery.reconcile?.generation) {
+          const current = await state.getReconciliationState(delivery.profile);
+          if (current?.generation === delivery.reconcile.generation) {
+            const pending = current.pendingRefreshRefs || [];
+            const followUp = current.followUpRefreshRefs || [];
+            const followUpKeys = new Set(followUp.map(ref => `${ref.profile}:${ref.side}:${ref.id}`));
+            // A ref requested after this reconciliation started may also be in
+            // this generation. Keep its marker intact so the required fresh
+            // pass can observe it even if this run already passed its cursor.
+            const clearNow = pending.filter(ref => !followUpKeys.has(`${ref.profile}:${ref.side}:${ref.id}`));
+            if(clearNow.length) await state.clearPendingRefresh(clearNow);
+            const refreshCandidates = [...new Map([...pending,...followUp].map(ref=>[`${ref.profile}:${ref.side}:${ref.id}`,ref])).values()];
+            const stillPending = refreshCandidates.length ? await state.pendingRefreshRefs(refreshCandidates) : [];
+            const byProfile = new Map<Profile,typeof stillPending>();
+            for(const ref of stillPending){const group=byProfile.get(ref.profile)||[];group.push(ref);byProfile.set(ref.profile,group);}
+            for(const [profile,refs] of byProfile){
+              const requested=await queuePendingRefresh(state,profile,refs);
+              if(requested.enqueueError) log("pending_refresh_enqueue_deferred",{profile,enqueueError:requested.enqueueError,generation:requested.generation,referenceCount:refs.length});
+            }
+          }
           await deliverReconciliationOutcome(state, manual, delivery.profile, delivery.reconcile.generation);
         }
         if (!reconciliation.continuationRequired) {
