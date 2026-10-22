@@ -59,6 +59,7 @@ test("manual typed IDs stay unverified until they appear in a subsequent live re
   assert.equal(repairPreviewAllowed(checked,item,detailsFor(item,[]),"link"),true);
   const gone=reconcileRepairSelection(item,[live("home","calendar","event")],checked);
   assert.equal(gone.verifiedTaskId,"");
+  assert.equal(gone.taskId,"");
   assert.equal(repairPreviewAllowed(gone,item,detailsFor(item,[]),"link"),false);
 });
 
