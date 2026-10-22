@@ -35,6 +35,9 @@ jobs:
       - name: Build and test
         run: npm test
 
+      - name: Build review UI
+        run: npm run build:review
+
       - name: Check public-source boundary
         run: bash scripts/check-public-source.sh
 
