@@ -16,6 +16,7 @@
     "seed:review-inbox": "npm run build --silent && node scripts/seed-review-inbox.mjs",
     "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",
     "state:inspect": "npm run build --silent && node scripts/audit-state-retention.mjs",
+    "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
     "check:public": "bash scripts/check-public-source.sh"
   },
   "dependencies": {
