@@ -5,3 +5,4 @@
 @media(max-width:650px){.leftover{grid-template-columns:1fr}.reconcile-button{margin:8px 0 0}}
 
 .detail-load{margin:18px 0;padding:16px}.detail-load p{margin-bottom:8px}.detail-load p:last-child{margin-bottom:0}
+.field-error{color:#b42318;font-weight:600}input[aria-invalid="true"],select[aria-invalid="true"]{border-color:#b42318}label>small{line-height:1.35}

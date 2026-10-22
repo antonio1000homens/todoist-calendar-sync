@@ -5,6 +5,7 @@ export function emptyRepairSelection(item) {
     caseId: item?.id || "", profile: item?.profile || "",
     taskId: "", eventId: "", verifiedTaskId: "", verifiedEventId: "",
     manualTask: false, manualEvent: false,
+    searchedTask: undefined, searchedEvent: undefined,
   };
 }
 
@@ -36,19 +37,67 @@ export function reconcileRepairSelection(item, snapshots, previous) {
       item.decision?.activeInstanceId, mapping?.activeInstanceId,
       mapping?.eventId, item.decision?.masterEventId, mapping?.masterEventId]);
   return { ...current, taskId:task.id, verifiedTaskId:task.verified,
-    eventId:event.id, verifiedEventId:event.verified };
+    eventId:event.id, verifiedEventId:event.verified,
+    // A provider refresh takes precedence over earlier search evidence. Never
+    // retain search metadata for an ID that was cleared or became unverified.
+    searchedTask:task.verified && current.searchedTask?.id === task.id ? current.searchedTask : undefined,
+    searchedEvent:event.verified && current.searchedEvent?.id === event.id ? current.searchedEvent : undefined };
 }
 
-export function editRepairSelection(previous, side, id, verified = false) {
+export function editRepairSelection(previous, side, id, verified = false, searchResult = undefined) {
+  // Search responses carry recurrence data, but aren't part of case snapshots.
+  // Bind their metadata to the selected ID and case to prevent stale leakage.
+  const searched = verified && searchResult?.id === id ? {
+    id, caseId:previous.caseId, profile:previous.profile,
+    due:searchResult.due, recurrence:searchResult.recurrence,
+    recurringEventId:searchResult.recurringEventId, status:searchResult.status,
+  } : undefined;
   if (side === "todoist") return {
-    ...previous, taskId:id, verifiedTaskId:verified ? id : "", manualTask:true,
+    ...previous, taskId:id, verifiedTaskId:verified ? id : "", manualTask:true, searchedTask:searched,
   };
-  return { ...previous, eventId:id, verifiedEventId:verified ? id : "", manualEvent:true };
+  return { ...previous, eventId:id, verifiedEventId:verified ? id : "", manualEvent:true, searchedEvent:searched };
 }
 
-export function repairPreviewAllowed(form, selected, details, action, decisionAction) {
+// Only derive recurrence requirements from the *selected*, live provider snapshot.
+// A different case's recurrence must not accidentally block the current repair.
+export function repairRecurrenceOwnerRequirement(form, details, action) {
+  if (!["link","create"].includes(action) || !form?.profile || details?.item?.profile !== form.profile
+    || details?.item?.id !== form.caseId) return undefined;
+  const current = (side, id) => {
+    if (!id) return undefined;
+    const snapshot = (details.snapshots || []).find(snapshot => snapshot.ref?.profile === form.profile
+      && snapshot.ref.side === side && snapshot.ref.id === id && snapshot.object?.id === id);
+    if (snapshot) return snapshot.object;
+    // A searched item was verified live by the provider's search endpoint,
+    // although the case detail has not yet collected it into snapshots.
+    const searched = side === "calendar" ? form.searchedEvent : form.searchedTask;
+    const verifiedId = side === "calendar" ? form.verifiedEventId : form.verifiedTaskId;
+    return verifiedId === id && searched?.id === id && searched.caseId === form.caseId
+      && searched.profile === form.profile ? searched : undefined;
+  };
+  const event = current("calendar", form.eventId);
+  const task = current("todoist", form.taskId);
+  if ((action === "link" || action === "create" && !form.taskId) && event?.recurringEventId) return "calendar-occurrence";
+  if ((action === "link" || action === "create" && !form.taskId) && event?.recurrence?.length) return "calendar-series";
+  if (action === "link" && task?.due?.is_recurring) return "todoist-task";
+  return undefined;
+}
+
+// Map actionable API validation to the adjacent form control, not just the page notice.
+export function repairValidationField(message) {
+  if (/^Changing a Calendar series to Todoist ownership requires a future-only preview|^Choose the Calendar master to repair a whole series|^Select the Calendar master for a future-only repair|^Use a master-level recurrence repair/.test(message || "")) return "scope";
+  if (/^Choose which provider owns the recurrence|^Choose Todoist recurrence ownership|^Creating a counterpart for a Calendar (series|occurrence) requires Calendar recurrence ownership|^Todoist recurrence ownership requires/.test(message || "")) return "owner";
+  if (/^Fields differ:|^Use Calendar fields for/.test(message || "")) return "winner";
+  if (/^Verification requires live Todoist/.test(message || "")) return "taskId";
+  if (/^Verification requires live Calendar|^Selected pair does not match/.test(message || "")) return "eventId";
+  if (/^Calendar series has no active occurrence|^Choose the active Calendar occurrence|^Calendar repair sources must be confirmed/.test(message || "")) return "eventId";
+  return undefined;
+}
+
+export function repairPreviewAllowed(form, selected, details, action, decisionAction, owner = "") {
   if (!selected || !details || form.caseId !== selected.id || form.profile !== selected.profile
       || details.item?.id !== selected.id || details.item?.profile !== selected.profile) return false;
+  if (repairRecurrenceOwnerRequirement(form, details, action) && !["todoist","calendar"].includes(owner)) return false;
   // A typed or outdated ID cannot be silently included in a different repair.
   if (form.taskId && form.taskId !== form.verifiedTaskId
       || form.eventId && form.eventId !== form.verifiedEventId) return false;
