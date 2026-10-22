@@ -22,6 +22,47 @@ test("converts Calendar all-day and timed representations into Todoist", () => {
   assert.deepEqual(timed.due, { datetime: "2026-09-01T09:30:00+01:00", timezone: "Europe/London" });
 });
 
+test("multi-day Calendar events use only their first day as the Todoist due date", () => {
+  const original = {
+    id: "leave-event", status: "confirmed", summary: "Leave Approved",
+    start: { date: "2026-12-21" }, end: { date: "2026-12-26" },
+  };
+  const task = { id: "leave-task", content: "Leave Approved", due: { date: "2026-12-21" } };
+  assert.deepEqual(toTodoistTask(original).due, { date: "2026-12-21" });
+  assert.equal(hasCanonicalState(original, task), true);
+
+  const extended = { ...original, end: { date: "2026-12-30" } };
+  assert.deepEqual(toTodoistTask(extended).due, { date: "2026-12-21" });
+  assert.equal(hasCanonicalState(extended, task), true);
+  const renamed = toCalendarEvent({ ...task, content: "Leave Approved (updated)" }, extended);
+  assert.deepEqual(renamed.end, extended.end, "Todoist cannot overwrite an independently edited multi-day span");
+  assert.deepEqual(renamed.start, extended.start);
+  assert.equal(extended.summary, "Leave Approved");
+
+  const moved = toCalendarEvent({ ...task, due: { date: "2026-12-22" } }, original);
+  assert.deepEqual(moved.start, { date: "2026-12-22" });
+  assert.deepEqual(moved.end, { date: "2026-12-27" }, "a start edit shifts the original five-day span");
+});
+
+test("timed Calendar events project the start only and preserve existing end offsets", () => {
+  const original = {
+    id: "timed-event", status: "confirmed", summary: "Long meeting",
+    start: { dateTime: "2026-09-01T09:30:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2026-09-01T10:45:00+01:00", timeZone: "Europe/London" },
+  };
+  const task = { id: "timed-task", content: "Long meeting", due: { datetime: "2026-09-01T08:30:00Z", timezone: "Europe/London" } };
+  assert.deepEqual(toTodoistTask(original).due, {
+    datetime: "2026-09-01T09:30:00+01:00", timezone: "Europe/London",
+  });
+  assert.equal(hasCanonicalState({ ...original, end: { dateTime: "2026-09-01T13:00:00+01:00" } }, task), true);
+  const updated = toCalendarEvent({ ...task, description: "Edited in Todoist" }, original);
+  assert.deepEqual(updated.end, original.end, "preserve the exact end instead of converting it to UTC");
+  assert.deepEqual(updated.start, { dateTime: task.due.datetime, timeZone: "Europe/London" });
+
+  const moved = toCalendarEvent({ ...task, due: { datetime: "2026-09-01T09:00:00Z", timezone: "Europe/London" } }, original);
+  assert.equal(Date.parse(moved.end.dateTime) - Date.parse(moved.start.dateTime), 75 * 60_000);
+});
+
 test("converts Todoist all-day and timed representations into valid Calendar spans", () => {
   const allDay = toCalendarEvent({ id: "task-all-day", content: "All day", due: { date: "2026-09-01" } });
   assert.deepEqual(allDay.start, { date: "2026-09-01" });
