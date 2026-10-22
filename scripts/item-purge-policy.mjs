@@ -122,6 +122,19 @@ export function planPurge(rows, target) {
     if (!PURGE_FAMILIES.has(family)) hazards.push("unrecognised/shared state family");
     if (SHARED_FAMILIES.has(family)) hazards.push("profile-wide state must be repaired manually");
     if (row.profile && row.profile !== profile) hazards.push("belongs to a different profile");
+    const scoped = new Set(["EVENT","TASK","BASELINE","RECURRENCE","CANONICAL","CONFLICT_STATE",
+      "PROJECTION","COMPLETED_EVENT","COMPLETED_TASK","CONSOLIDATED_TASK","REJECTED_PAIR","AUDIT"]);
+    if (scoped.has(family) && !row.pk.startsWith(family + "#" + profile + "#"))
+      hazards.push("key belongs to a different profile");
+    if (family === "REJECTED_PAIR") {
+      const [, , rejectedTask, rejectedEvent] = row.pk.split("#");
+      if (rejectedTask !== taskId || rejectedEvent !== eventId)
+        hazards.push("rejected pair is shared with another task/event");
+    }
+    if (family === "SYNC_CONTROL" && !row.pk.startsWith("SYNC_CONTROL#" + profile + ":"))
+      hazards.push("sync control belongs to a different profile");
+    if (family === "CANONICAL" && row.providerId && row.providerId !== taskId && row.providerId !== eventId)
+      hazards.push("canonical alias points to another provider identity");
     if ([...refs.tasks].some(id => id !== taskId)) hazards.push("references another Todoist task");
     if ([...refs.events].some(id => id !== eventId)) hazards.push("references another Calendar item");
     if (refs.series.size || row.recurrenceOwner || row.owner === "calendar" || row.owner === "todoist")
