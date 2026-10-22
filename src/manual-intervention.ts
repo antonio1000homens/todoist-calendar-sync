@@ -17,7 +17,14 @@ import { profiles } from "./config.js";
 import { normalizedText } from "./security.js";
 import { deleteMappingComments } from "./mapping-comments.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
-import { planFutureSeriesSplit } from "./recurrence-split.js";
+import { planFutureSeriesSplit, type FutureSeriesSplitPlan } from "./recurrence-split.js";
+
+function futureSplitDescription(plan: FutureSeriesSplitPlan, anchor?: string): string {
+  const history = plan.expiredUntil
+    ? `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"} expired on ${plan.expiredUntil}; keep it unchanged`
+    : `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"}; retain through ${plan.previousOccurrence} and stop old dates from ${plan.nextOldOccurrence}`;
+  return `${history}; new master starts ${plan.newStart} with ${plan.newRule} (Calendar timezone ${plan.calendarTimeZone})`;
+}
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
@@ -1483,7 +1490,7 @@ export class ManualInterventionService {
                   const calendarTimeZone = await pair.calendar.getTimeZone();
                   const preview = planFutureSeriesSplit(profile, task, event, new Date(), calendarTimeZone);
                   extra.futureSplitPlan = preview;
-                  extra.futureSplitPreview = `${preview.originalRule} from ${event.start?.date}; retain through ${preview.previousOccurrence}; stop old dates from ${preview.nextOldOccurrence}; start ${preview.newStart} with ${preview.newRule} (Calendar timezone ${calendarTimeZone})`;
+                  extra.futureSplitPreview = futureSplitDescription(preview, event.start?.date);
                 }
               } catch (error) {
                 extra.futureSplitBlockedReason = error instanceof Error ? error.message : String(error);
@@ -1835,11 +1842,13 @@ export class ManualInterventionService {
           expectedDue: typeof decision.context.todoistDue === "string" ? decision.context.todoistDue : undefined,
           expectedRule: typeof decision.context.calendarRecurrenceRule === "string"
             ? decision.context.calendarRecurrenceRule : undefined,
+          approvedPlan: decision.context.futureSplitPlan as FutureSeriesSplitPlan,
+          approvedEtag: decision.context.calendarEtag as string,
         },
       );
       await this.finishResolutionWithoutReconciliation(decision, state, "split_future_todoist", slackUserId);
       await this.notifier.postText(
-        `✅ Calendar history was retained through *${result.plan.previousOccurrence}*. The old yearly series now ends before ${result.plan.nextOldOccurrence}; the future ${result.plan.newRule} recurrence starts on *${result.plan.newStart}*. Old master \`${result.plan.oldMasterId}\`, new master \`${result.plan.newMasterId}\`.`,
+        `✅ ${futureSplitDescription(result.plan)}. Old master \`${result.plan.oldMasterId}\`, new master \`${result.plan.newMasterId}\`.`,
         decision.slackChannelId,
       );
     } catch (error) {
@@ -2472,7 +2481,7 @@ export class ManualInterventionService {
                 todoistRecurrenceRule: plan.newRule,
                 calendarRecurrenceRule: plan.originalRule,
                 futureSplitPlan: plan,
-                futureSplitPreview: `${plan.originalRule} from ${event.start?.date}; retain through ${plan.previousOccurrence}; stop old dates from ${plan.nextOldOccurrence}; start ${plan.newStart} with ${plan.newRule} (Calendar timezone ${calendarTimeZone})`,
+                futureSplitPreview: futureSplitDescription(plan, event.start?.date),
               };
               const changedApproval = Boolean(prior) && !alreadyCapped && (
                 prior?.previousOccurrence !== plan.previousOccurrence
