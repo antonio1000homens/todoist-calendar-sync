@@ -1105,14 +1105,12 @@ export class StateRepository {
     }));
     if (!staleMapping && !canonical.Item) return false;
 
-    const values = {
-      ":profile": link.profile,
+    const baseValues = {
       ":owner": "calendar",
       ":series": link.seriesId,
       ":master": link.masterEventId,
       ":active": link.activeInstanceId,
       ":task": link.taskId,
-      ":oldEvent": occurrenceId,
     };
     const activeGuard = "eventId = :active AND taskId = :task AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master";
     const items: Record<string, unknown>[] = [
@@ -1120,21 +1118,21 @@ export class StateRepository {
         TableName: table, Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
         ConditionExpression: "#owner = :owner AND masterEventId = :master AND activeInstanceId = :active AND eventId = :active AND taskId = :task",
         ExpressionAttributeNames: { "#owner": "owner" },
-        ExpressionAttributeValues: values,
+        ExpressionAttributeValues: { ":owner": "calendar", ":master": link.masterEventId, ":active": link.activeInstanceId, ":task": link.taskId },
       } },
       { ConditionCheck: {
         TableName: table, Key: key(`EVENT#${link.profile}#${link.activeInstanceId}`, "MAP"),
-        ConditionExpression: activeGuard, ExpressionAttributeValues: values,
+        ConditionExpression: activeGuard, ExpressionAttributeValues: baseValues,
       } },
       { ConditionCheck: {
         TableName: table, Key: key(`TASK#${link.profile}#${link.taskId}`, "MAP"),
-        ConditionExpression: activeGuard, ExpressionAttributeValues: values,
+        ConditionExpression: activeGuard, ExpressionAttributeValues: baseValues,
       } },
       { ConditionCheck: {
         TableName: table, Key: key(`TASKOWNER#${link.taskId}`, "MAP"),
         ConditionExpression: `#profile = :profile AND ${activeGuard}`,
         ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: values,
+        ExpressionAttributeValues: { ...baseValues, ":profile": link.profile },
       } },
       { Delete: {
         TableName: table, Key: key(`EVENT#${link.profile}#${occurrenceId}`, "MAP"),
@@ -1142,7 +1140,7 @@ export class StateRepository {
           ? "taskId = :oldTask AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master AND updatedAt = :oldUpdated"
           : "attribute_not_exists(pk)",
         ExpressionAttributeValues: staleMapping
-          ? { ...values, ":oldTask": staleMapping.taskId, ":oldUpdated": staleMapping.updatedAt }
+          ? { ":oldTask": staleMapping.taskId, ":owner": "calendar", ":series": link.seriesId, ":master": link.masterEventId, ":oldUpdated": staleMapping.updatedAt }
           : undefined,
       } },
       { Delete: { TableName: table, Key: canonicalKey } },
@@ -1156,7 +1154,7 @@ export class StateRepository {
           TableName: table, Key: index,
           ConditionExpression: "attribute_not_exists(pk) OR (#profile = :profile AND eventId = :oldEvent AND taskId = :oldTask)",
           ExpressionAttributeNames: { "#profile": "profile" },
-          ExpressionAttributeValues: { ...values, ":oldTask": staleMapping.taskId },
+          ExpressionAttributeValues: { ":profile": link.profile, ":oldEvent": occurrenceId, ":oldTask": staleMapping.taskId },
         } });
       }
     }
