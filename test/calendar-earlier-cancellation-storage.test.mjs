@@ -25,9 +25,29 @@ async function withDynamo(mock, run) {
     if (command.constructor.name === "GetCommand") {
       assert.equal(command.input.ConsistentRead, true);
       assert.equal(command.input.Key.pk, `CANONICAL#home#calendar#${olderId}`);
-      return mock.canonical ? { Item: { pk: command.input.Key.pk } } : {};
+      return mock.canonical ? { Item: {
+        pk: command.input.Key.pk, sk: "STATE", profile: "home", side: "calendar",
+        providerId: olderId,
+        identity: { normalizedTitle: "old reminder", normalizedStart: "2099-10-20", allDay: true },
+        updatedAt: "2099-10-20T00:00:00.000Z",
+        ...(typeof mock.canonical === "object" ? mock.canonical : {}),
+      } } : {};
     }
     if (command.constructor.name === "TransactWriteCommand") {
+      if (mock.changedCanonical) {
+        const canonicalDelete = command.input.TransactItems
+          .find((item) => item.Delete?.Key.pk === `CANONICAL#home#calendar#${olderId}`).Delete;
+        assert.match(canonicalDelete.ConditionExpression, /updatedAt = :canonicalUpdated/);
+        assert.match(canonicalDelete.ConditionExpression, /#identity = :canonicalIdentity/);
+        const observed = canonicalDelete.ExpressionAttributeValues;
+        if (mock.changedCanonical.updatedAt !== observed[":canonicalUpdated"]
+          || JSON.stringify(mock.changedCanonical.identity) !== JSON.stringify(observed[":canonicalIdentity"])) {
+          throw Object.assign(new Error("concurrent canonical identity replacement"), {
+            name: "TransactionCanceledException",
+            CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
+          });
+        }
+      }
       if (mock.error) throw mock.error;
       return {};
     }
@@ -54,6 +74,14 @@ test("earlier cancellation protects all live indexes and removes only old occurr
     const oldEventDelete = items.find((x) => x.Delete?.Key.pk === `EVENT#home#${olderId}`).Delete;
     assert.equal(oldEventDelete.ExpressionAttributeValues[":oldUpdated"], stale.updatedAt);
     assert.match(oldEventDelete.ConditionExpression, /recurrenceOwner = :owner/);
+    const canonicalDelete = items.find((x) => x.Delete?.Key.pk === `CANONICAL#home#calendar#${olderId}`).Delete;
+    assert.match(canonicalDelete.ConditionExpression, /updatedAt = :canonicalUpdated/);
+    assert.match(canonicalDelete.ConditionExpression, /#identity = :canonicalIdentity/);
+    assert.equal(canonicalDelete.ExpressionAttributeValues[":canonicalProvider"], olderId);
+    assert.equal(canonicalDelete.ExpressionAttributeValues[":canonicalUpdated"], "2099-10-20T00:00:00.000Z");
+    assert.deepEqual(canonicalDelete.ExpressionAttributeValues[":canonicalIdentity"], {
+      normalizedTitle: "old reminder", normalizedStart: "2099-10-20", allDay: true,
+    });
     const oldTaskDeletes = items.filter((x) => x.Delete?.Key.pk.includes("task-old"));
     assert.ok(oldTaskDeletes.every((x) => x.Delete.ConditionExpression.includes("eventId = :oldEvent")));
   });
@@ -67,6 +95,9 @@ test("an old EVENT row for the same task never deletes the active TASK and TASKO
     const deletes = calls.find((c) => c.constructor.name === "TransactWriteCommand")
       .input.TransactItems.filter((item) => item.Delete).map((item) => item.Delete.Key.pk);
     assert.deepEqual(deletes, [`EVENT#home#${olderId}`, `CANONICAL#home#calendar#${olderId}`]);
+    const canonicalDelete = calls.find((c) => c.constructor.name === "TransactWriteCommand")
+      .input.TransactItems.find((item) => item.Delete?.Key.pk === `CANONICAL#home#calendar#${olderId}`).Delete;
+    assert.equal(canonicalDelete.ConditionExpression, "attribute_not_exists(pk)");
   });
 });
 
@@ -83,6 +114,27 @@ test("identity-only cleanup requires that the obsolete EVENT row is still absent
     const oldEventDelete = calls.find((item) => item.constructor.name === "TransactWriteCommand")
       .input.TransactItems.find((item) => item.Delete?.Key.pk === `EVENT#home#${olderId}`).Delete;
     assert.equal(oldEventDelete.ConditionExpression, "attribute_not_exists(pk)");
+    const canonicalDelete = calls.find((item) => item.constructor.name === "TransactWriteCommand")
+      .input.TransactItems.find((item) => item.Delete?.Key.pk === `CANONICAL#home#calendar#${olderId}`).Delete;
+    assert.match(canonicalDelete.ConditionExpression, /updatedAt = :canonicalUpdated/);
+  });
+});
+
+test("changed canonical identity or version aborts the entire stale-occurrence purge", async () => {
+  const newer = {
+    updatedAt: "2099-10-21T01:00:00.000Z",
+    identity: { normalizedTitle: "new reminder", normalizedStart: "2099-10-21", allDay: true },
+  };
+  await withDynamo({ canonical: true, changedCanonical: newer }, async (calls) => {
+    assert.equal(await new StateRepository().purgeEarlierCancelledCalendarOccurrence(link, olderId, stale), false);
+    assert.equal(calls.filter((c) => c.constructor.name === "TransactWriteCommand").length, 1);
+  });
+});
+
+test("canonical row with unverified ownership fails closed before any transaction", async () => {
+  await withDynamo({ canonical: { providerId: "other-event" } }, async (calls) => {
+    assert.equal(await new StateRepository().purgeEarlierCancelledCalendarOccurrence(link, olderId, stale), false);
+    assert.equal(calls.filter((c) => c.constructor.name === "TransactWriteCommand").length, 0);
   });
 });
 
