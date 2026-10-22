@@ -129,7 +129,7 @@ function App() {
   };
   const runReconciliation=async () => {
     setBusy(true);setMessage("");
-    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:reconcileProfile})});setReconciliation(result.reconciliation);setMessage(`Reconciliation requested for ${reconcileProfile}.`); }
+    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:reconcileProfile})});setReconciliation(result.reconciliation);const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${reconcileProfile}. Reconciliation requested.`); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const dismissAlert=async () => {

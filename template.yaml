@@ -292,12 +292,19 @@ Resources:
           CF_ACCESS_ISSUER: !Ref CloudflareAccessIssuer
           CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
           REVIEW_OPERATOR_EMAILS: !Ref ReviewOperatorEmails
+          DLQ_URL: !Ref SyncDlq
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
         - SQSSendMessagePolicy:
             QueueName: !GetAtt SyncQueue.QueueName
         - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:ChangeMessageVisibility
+              Resource: !GetAtt SyncDlq.Arn
             - Effect: Allow
               Action:
                 - dynamodb:TransactWriteItems
@@ -372,12 +379,19 @@ Resources:
           TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED: !Ref ManualInterventionEnabled
           TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: !Ref TodoistCalendarSyncSlackChannel
           SLACK_BOT_TOKEN_PARAMETER: !Ref SlackBotTokenParameter
+          DLQ_URL: !Ref SyncDlq
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt SyncQueue.QueueName
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
         - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:ChangeMessageVisibility
+              Resource: !GetAtt SyncDlq.Arn
             - Effect: Allow
               Action: dynamodb:TransactWriteItems
               Resource: !GetAtt SyncState.Arn

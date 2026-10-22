@@ -8,6 +8,7 @@ import { documentClient, pacedScan } from "./dynamodb-capacity.js";
 import { secureParameter } from "./config.js";
 import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBudgetExhausted, ReconciliationMutationBudget, type ProviderClientFactory } from "./mutation-budget.js";
 import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResult } from "./queue.js";
+import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -1592,6 +1593,14 @@ export class ManualInterventionService {
       await this.notifier.postDecision({ ...decision, permittedActions: MANUAL_DECISION_CATALOG[decision.type].actions });
       return;
     }
+    let clearedDlq: Awaited<ReturnType<typeof clearDeadLetterMessagesForProfile>>;
+    try {
+      clearedDlq = await clearDeadLetterMessagesForProfile(decision.profile);
+    } catch (error) {
+      await this.notifier.reconciliationOutcome(decision.slackChannelId, decision.slackMessageTs,
+        `Reconciliation was not started because the ${decision.profile} DLQ could not be cleared: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     const result = await requestReconciliation(state, decision.profile, "manual", undefined, {
       requester: slackUserId || "operator",
       slackChannelId: decision.slackChannelId,
@@ -1599,19 +1608,20 @@ export class ManualInterventionService {
       slackThreadTs: decision.slackMessageTs,
       slackDecisionId: decision.decisionId,
     });
-    const text = await this.reconciliationAcknowledgement(result);
+    const text = await this.reconciliationAcknowledgement(result, clearedDlq.deleted);
     await this.notifier.reconciliationOutcome(decision.slackChannelId, decision.slackMessageTs, text);
   }
 
-  private async reconciliationAcknowledgement(result: ReconciliationRequestResult): Promise<string> {
-    if (result.enqueueError) return `Reconciliation could not be queued: ${result.enqueueError}`;
+  private async reconciliationAcknowledgement(result: ReconciliationRequestResult, clearedDlqCount = 0): Promise<string> {
+    const cleared = `Cleared ${clearedDlqCount} quarantined ${clearedDlqCount === 1 ? "delivery" : "deliveries"} for ${result.profile}. `;
+    if (result.enqueueError) return `${cleared}Reconciliation could not be queued: ${result.enqueueError}`;
     if (result.coalesced) {
       const location = result.slackChannelId && result.slackThreadTs
         ? await this.notifier.reconciliationLocation(result.slackChannelId, result.slackThreadTs)
         : "status command";
-      return `Reconciliation already active. This request joined generation ${result.generation}. Follow its progress and final outcome in the ${location}.`;
+      return `${cleared}Reconciliation already active. This request joined generation ${result.generation}. Follow its progress and final outcome in the ${location}.`;
     }
-    return "Reconciliation queued. I’ll post the final outcome in this thread.";
+    return `${cleared}Reconciliation queued. I’ll post the final outcome in this thread.`;
   }
 
   /**
@@ -2317,14 +2327,21 @@ export class ManualInterventionService {
           await this.notifier.postText("Reconciliation requires an explicit request in Slack.", channel);
           return;
         }
-        const threadTs = await this.notifier.postText(`Reconciliation queued for *${delivery.profile}*. I’ll post the final outcome in this thread.`, channel, manual.slackMessageTs);
+        let clearedDlq: Awaited<ReturnType<typeof clearDeadLetterMessagesForProfile>>;
+        try {
+          clearedDlq = await clearDeadLetterMessagesForProfile(delivery.profile);
+        } catch (error) {
+          await this.notifier.postText(`Reconciliation was not started because the ${delivery.profile} DLQ could not be cleared: ${error instanceof Error ? error.message : String(error)}`, channel, manual.slackMessageTs);
+          return;
+        }
+        const threadTs = await this.notifier.postText(`Cleared ${clearedDlq.deleted} quarantined ${clearedDlq.deleted === 1 ? "delivery" : "deliveries"} for *${delivery.profile}*. Reconciliation queued; I’ll post the final outcome in this thread.`, channel, manual.slackMessageTs);
         const result = await requestReconciliation(state, delivery.profile, "manual", undefined, {
           requester: manual.slackUserId || "operator", slackChannelId: channel,
           slackMessageTs: threadTs || manual.slackMessageTs,
           slackThreadTs: manual.slackMessageTs || threadTs,
         });
         if (result.enqueueError || result.coalesced) {
-          const text = await this.reconciliationAcknowledgement(result);
+          const text = await this.reconciliationAcknowledgement(result, clearedDlq.deleted);
           await this.notifier.updateReconciliationIncident(channel, threadTs, text);
           await this.notifier.reconciliationOutcome(channel, manual.slackMessageTs || threadTs, text);
         }
