@@ -768,7 +768,11 @@ export class Synchronizer {
           .find((link) => link.owner === "calendar" && link.masterEventId === event.recurringEventId);
       }
       if (existingRecurrence?.owner === "calendar" && existingRecurrence.masterEventId) {
-        if (event.recurringEventId && event.id !== existingRecurrence.activeInstanceId) {
+        // Deltas for cancelled exceptions may omit recurringEventId/iCalUID.
+        // Classify strictly by the persisted active/master IDs before allowing
+        // any path that deletes or rolls the live Todoist task.
+        if (event.id !== existingRecurrence.activeInstanceId
+          && event.id !== existingRecurrence.masterEventId) {
           const activeInstanceId = existingRecurrence.activeInstanceId;
           if (!activeInstanceId) {
             return this.state.audit(delivery.profile, "calendar_recurrence_stale_instance_cancellation_ignored", {
