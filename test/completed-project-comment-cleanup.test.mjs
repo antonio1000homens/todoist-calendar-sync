@@ -62,7 +62,7 @@ test("no event-side guard, malformed/human/foreign comment or missing project id
     {history:null},
     {content:"human note"},
     {content:commentContent({eventId:"wrong"})},
-    {commentProject:undefined},
+    {commentProject:null},
     {content:commentContent({profile:"work"})},
   ]){
     const s=scenario(opts);
