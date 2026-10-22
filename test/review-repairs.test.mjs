@@ -233,7 +233,7 @@ test("a confirmed multi-day Calendar event and matching Todoist task produce a p
   assert.equal(keepFieldsPreview.intent.winner,"none");
   const preview=await h.engine.preview(actor,{...base,winner:"calendar"});
   assert.equal(preview.intent.winner,"calendar");
-  assert.ok(preview.changes.some(change=>change.includes("Todoist due date")));
+  assert.ok(preview.changes.some(change=>change.includes("Link Todoist task")&&change.includes("use calendar fields")));
   assert.equal(preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar").object.status,"confirmed");
 });
 
