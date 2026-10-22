@@ -231,6 +231,12 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     return response(404,{error:"not_found"});
   } catch(error) {
     const status=errorStatus(error);
+    if (status >= 500) console.error(JSON.stringify({
+      service:"todoist-calendar-sync-review-api", event:"request_failed", method:event.requestContext.http.method,
+      route:(event.rawPath||"/").split("/").filter(Boolean).slice(0,3).join("/"),
+      error:error instanceof Error?error.message:String(error),
+      stack:error instanceof Error?error.stack:undefined,
+    }));
     return response(status,{error:status<500?error instanceof Error?error.message:"request_rejected":"review_api_failed"});
   }
 }
