@@ -149,3 +149,60 @@ test("Todoist counterpart creation reuses the request ID only for the same repai
   assert.notEqual(ids[0], ids[2]);
   assert.equal(JSON.parse(requests[0].body).project_id, "test-project");
 });
+
+
+test("yearly repair preview names the master, occurrence, stale deleted task and same-title standalone", async () => {
+  const yearly = { id:"yearly-current",content:"Write letter for Gabriel and Lennox",
+    due:{date:"2027-03-01",string:"every year",is_recurring:true} };
+  const master = { id:"annual-master",summary:yearly.content,status:"confirmed",
+    start:{date:"2027-03-01"},end:{date:"2027-03-08"},recurrence:["RRULE:FREQ=YEARLY"] };
+  const occurrence = { id:"annual-2027",summary:yearly.content,status:"confirmed",
+    recurringEventId:master.id,originalStartTime:{date:"2027-03-01"},
+    start:{date:"2027-03-01"},end:{date:"2027-03-08"} };
+  const standalone = { id:"standalone-2026",summary:yearly.content,status:"confirmed",
+    start:{date:"2026-03-01"},end:{date:"2026-03-08"} };
+  const ref=(side,id)=>({profile:"home",side,id});
+  const snapshots=[
+    {ref:ref("todoist",yearly.id),object:yearly},
+    {ref:ref("todoist","legacy-404"),object:null,mapping:{profile:"home",taskId:"legacy-404",eventId:master.id}},
+    {ref:ref("calendar",master.id),object:master,calendarProjectionId:occurrence.id,
+      mapping:{profile:"home",taskId:"legacy-404",eventId:master.id}},
+    {ref:ref("calendar",occurrence.id),object:occurrence},
+    {ref:ref("calendar",standalone.id),object:standalone},
+  ];
+  const engine=new ReviewEngine({
+    async getCase() { return {id:"case",profile:"home"}; },
+    async putPreview() {},
+  });
+  engine.collect=async()=>snapshots;
+  const input={caseId:"case",profile:"home",action:"link",taskId:yearly.id,eventId:master.id,
+    winner:"none",owner:"calendar",scope:"series",leftovers:{"home:calendar:standalone-2026":"exclude"}};
+  const preview=await engine.preview({subject:"owner",email:"owner@example.test"},input);
+  assert.equal(preview.itemPlan.length,5);
+  const plan=id=>preview.itemPlan.find(row=>row.ref.id===id);
+  assert.match(plan("standalone-2026").operation,/Exclude/);
+  assert.match(plan("standalone-2026").result,/displaced mapping/);
+  assert.match(plan("annual-2027").operation,/active Calendar occurrence/);
+  assert.match(plan("annual-master").result,/yearly-current/);
+  assert.match(plan("legacy-404").operation,/Missing provider object/);
+  assert.equal(preview.intent.scope,"series");
+  assert.deepEqual(preview.snapshots.map(s=>s.ref.id),snapshots.map(s=>s.ref.id));
+});
+
+test("backend blocks stale, unknown and unidentified Calendar disposition rows", async () => {
+  const engine=new ReviewEngine({
+    async getCase() { return {id:"case",profile:"home"}; },
+    async putPreview() { assert.fail("Ambiguous disposition must not be saved"); },
+  });
+  engine.collect=async()=>[
+    {ref:{profile:"home",side:"todoist",id:"selected"},object:{id:"selected",content:"Task",due:{date:"2027-03-01"}}},
+    {ref:{profile:"home",side:"calendar",id:"missing-date"},object:{id:"missing-date",summary:"Title",status:"confirmed"}},
+    {ref:{profile:"home",side:"todoist",id:"stale"},object:null},
+  ];
+  const input={caseId:"case",profile:"home",action:"create",taskId:"selected",winner:"none",scope:"occurrence",leftovers:{}};
+  const actor={subject:"owner",email:"owner@example.test"};
+  for (const id of ["home:calendar:missing-date","home:todoist:stale","home:calendar:not-in-snapshots"]) {
+    await assert.rejects(engine.preview(actor,{...input,leftovers:{[id]:"exclude"}}),
+      /Cannot identify the live item|lacks a verified start or status/);
+  }
+});
