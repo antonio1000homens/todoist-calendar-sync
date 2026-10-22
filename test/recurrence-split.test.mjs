@@ -146,6 +146,8 @@ test("an RRULE with UNTIL before DTSTART stays expired; the 2027 successor never
   assert.equal(p.truncatedRule, p.originalRule, "never expand the expired Calendar series");
   assert.equal(p.expiredUntil, "2023-12-31");
   assert.equal(p.historicalLastOccurrence, undefined, "original rule never produced an instance");
+  assert.equal(p.previousOccurrence, undefined, "do not persist a phantom pre-repair anniversary");
+  assert.ok(p.approvedTaskFingerprint, "bind approval to the entire Todoist task and due shape");
   assert.equal(p.newStart, "2027-05-02");
   assert.equal(p.newRule, "RRULE:FREQ=YEARLY");
   assert.doesNotThrow(() => assertUnmodifiedHistoricalOccurrences(master, [], p));
@@ -164,6 +166,7 @@ test("expired UNTIL after DTSTART verifies actual history and preserves the old 
   assert.equal(p.truncatedRule, master.recurrence[0]);
   assert.equal(p.expiredUntil, "2025-12-31");
   assert.equal(p.historicalLastOccurrence, "2025-05-03");
+  assert.equal(p.previousOccurrence, "2025-05-03", "history cutoff must respect the expired UNTIL");
   assert.throws(() => assertUnmodifiedHistoricalOccurrences(master, [], p), /Last historical/);
 });
 
