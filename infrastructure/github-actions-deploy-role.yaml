@@ -95,7 +95,10 @@ Resources:
               - lambda:DeleteFunction
               - lambda:GetFunction
               - lambda:GetFunctionConfiguration
+              - lambda:GetFunctionCodeSigningConfig
               - lambda:GetFunctionConcurrency
+              - lambda:GetFunctionRecursionConfig
+              - lambda:GetRuntimeManagementConfig
               - lambda:GetPolicy
               - lambda:UpdateFunctionCode
               - lambda:UpdateFunctionConfiguration
@@ -113,6 +116,7 @@ Resources:
               - lambda:DeleteFunctionUrlConfig
               - lambda:GetFunctionUrlConfig
               - lambda:PutFunctionConcurrency
+              - lambda:PutFunctionRecursionConfig
               - lambda:DeleteFunctionConcurrency
               - lambda:CreateEventSourceMapping
               - lambda:UpdateEventSourceMapping
