@@ -73,9 +73,9 @@ export function planPurge(rows, target) {
     if (pk.startsWith("CONFLICT_STATE#" + profile + "#") && conflictHashes.has(pk.split("#").at(-1))) reasons.push("conflict identity hash");
     visit(row, (value, path) => {
       if (path === "pk" || path === "sk") return;
-      const taskPath = /(^|\\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|candidateTaskIds)(\\[\\d+\\])?$/.test(path)
-        || /(^|\\.)ref\\.id$/.test(path) && path.includes("todoist");
-      const eventPath = /(^|\\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|candidateEventIds)(\\[\\d+\\])?$/.test(path);
+      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|candidateTaskIds)(\[\d+\])?$/.test(path)
+        || /(^|\.)ref\.id$/.test(path) && path.includes("todoist");
+      const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|candidateEventIds)(\[\d+\])?$/.test(path);
       if (value === taskId && taskPath) reasons.push("task ID at " + path);
       if (eventId && value === eventId && eventPath) reasons.push("event ID at " + path);
       if (/(^|\.)(sourceAuditKey|decisionId|caseId|previewId|operationId)$/.test(path) && presentKeys.has(value)) reasons.push("linked record at " + path);
