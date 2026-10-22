@@ -15,7 +15,8 @@ export interface FutureSeriesSplitPlan {
   originalRule: string;
   truncatedRule: string;
   newRule: string;
-  previousOccurrence: string;
+  /** Last actual Calendar occurrence kept; absent if the expired rule generated none. */
+  previousOccurrence?: string;
   nextOldOccurrence: string;
   newStart: string;
   calendarTimeZone?: string;
@@ -24,6 +25,8 @@ export interface FutureSeriesSplitPlan {
   expiredUntil?: string;
   /** Last actually generated occurrence when the original RRULE has expired. */
   historicalLastOccurrence?: string;
+  /** Binds a proposal to the approved Todoist task, including full due shape. */
+  approvedTaskFingerprint: string;
 }
 export function calendarLocalDay(now: Date, timeZone: string): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
@@ -93,6 +96,16 @@ function annualRule(rule: string): { interval: number; until?: string } {
     ...(untilValue ? { until: `${untilValue.slice(0, 4)}-${untilValue.slice(4, 6)}-${untilValue.slice(6)}` } : {}),
   };
 }
+function approvedTaskFingerprint(task: TodoistTask): string {
+  const due = task.due;
+  return createHash("sha256").update(JSON.stringify([
+    task.id, task.project_id ?? null, task.content, task.description ?? null,
+    task.updated_at ?? null, task.is_completed ?? false, task.is_deleted ?? false,
+    due ? [due.date ?? null, due.datetime ?? null, due.timezone ?? null,
+      due.string ?? null, due.lang ?? null, due.is_recurring ?? false] : null,
+  ])).digest("hex");
+}
+
 export function planFutureSeriesSplit(
   profile: Profile,
   task: TodoistTask,
@@ -177,8 +190,11 @@ export function planFutureSeriesSplit(
   return {
     oldMasterId: old.id, oldEtag: old.etag, newMasterId,
     originalRule, truncatedRule, newRule,
-    previousOccurrence: previous, nextOldOccurrence: upcoming, newStart: due,
+    ...(until ? (historicalLastOccurrence ? { previousOccurrence: historicalLastOccurrence } : {})
+      : { previousOccurrence: previous }),
+    nextOldOccurrence: upcoming, newStart: due,
     calendarTimeZone: timeZone, approvedAt: now.toISOString(),
+    approvedTaskFingerprint: approvedTaskFingerprint(task),
     ...(until ? { expiredUntil: until, ...(historicalLastOccurrence ? { historicalLastOccurrence } : {}) } : {}),
   };
 }
