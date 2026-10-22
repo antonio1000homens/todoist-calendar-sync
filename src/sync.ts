@@ -164,6 +164,9 @@ export function matchingTask(event: CalendarEvent, tasks: TodoistTask[]): Todois
 }
 
 export function toTodoistTask(event: CalendarEvent): Omit<TodoistTask, "id"> {
+  // Todoist has no duration: a Calendar event contributes its start only.
+  // In particular, Google all-day end dates are exclusive and must never
+  // become the Todoist due date, even for multi-day events.
   const start = event.start || {};
   const due = start.dateTime
     ? { datetime: start.dateTime, timezone: start.timeZone || "Europe/London" }
@@ -189,9 +192,16 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
   const taskStart = isAllDay
     ? { date: due.date! }
     : { dateTime: dueDateTime!, timeZone: due.timezone || "Europe/London" };
-  const taskEnd = isAllDay
-    ? { date: addDays(due.date!, Math.max(1, Math.round(duration / (24 * 60 * 60_000)))) }
-    : { dateTime: addMilliseconds(dueDateTime!, duration), timeZone: due.timezone || "Europe/London" };
+  // Todoist does not carry a Calendar end/duration. Preserve the exact live
+  // end (including all-day multi-day spans and timed offsets) if the logical
+  // start has not changed; otherwise shift the previous duration with the
+  // newly requested start. Only synthesize a default end for new events or
+  // representation changes.
+  const taskEnd = existing && (existing.end?.date || existing.end?.dateTime) && startsMatch(existing, task)
+    ? existing.end!
+    : isAllDay
+      ? { date: addDays(due.date!, Math.max(1, Math.round(duration / (24 * 60 * 60_000)))) }
+      : { dateTime: addMilliseconds(dueDateTime!, duration), timeZone: due.timezone || "Europe/London" };
 
   const rrule = todoistRecurrenceToRrule(task);
   const recurrenceKey = todoistRecurrenceKey(task);

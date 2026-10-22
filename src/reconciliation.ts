@@ -25,6 +25,9 @@ interface TodoistCanonicalState {
   } | null;
 }
 
+// The reconciled Calendar projection deliberately excludes end/duration:
+// Todoist has no equivalent, so end-only edits cannot count as Calendar-side
+// changes or trigger a both-sides-changed conflict.
 interface CalendarCanonicalState {
   status: string;
   summary: string;
