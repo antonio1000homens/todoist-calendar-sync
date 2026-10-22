@@ -127,10 +127,51 @@ a freshly returned completed provider task with no recurring due. Finality
 is recorded as a permanent series certificate, which allows cleanup of older
 occurrences only after the latest terminal completion's seven-day grace.
 All other recurring histories deliberately remain in `skipped_ambiguous`
-for human review. The worker does not modify live providers or remove project mapping
-comments; comment references, if still present, require a separate
-provider-aware ownership-checked operation. This conservative limitation
-must be resolved before declaring complete project-comment retention.
+for human review. The **scheduled worker never modifies live providers**.
+Project mapping comments require a separate provider-aware, human-reviewed
+operation; they are never removed merely because a task lookup row vanished.
+
+### Operator-only project-comment retirement
+
+The optional `state:cleanup-completed-comment` CLI examines **one explicit
+Todoist project comment** with a strict profile/task/event/comment identity.
+It is dry-run by default and requires Todoist read access, read-only DynamoDB
+inspection and an event-side immutable `COMPLETED_EVENT` guard. It requires
+seven full days from the preserved completion timestamp, a Todoist 404,
+absence of mapping and recurrence ownership **across all three profiles**,
+and, for recurring histories, a matching terminal-series certificate.
+Provider API failures, ambiguous ownership, legacy task comments, foreign
+projects, and missing identifiers **skip or fail**, never delete.
+It rechecks the provider comment, completion guard and current mappings
+immediately before a confirmed delete. Because Todoist's comment delete API
+has no conditional ETag and is outside DynamoDB transactions, concurrent
+provider edits in the final milliseconds cannot be excluded absolutely.
+Run only during a quiescent maintenance window and verify the recorded
+comment ID has not been reassigned. No automation is enabled for this CLI.
+
+Dry-run example (repeat for a specifically verified remaining comment):
+
+```bash
+npm run state:cleanup-completed-comment -- \
+  --profile=home --task-id="<completed Todoist ID>" \
+  --event-id="<historical Calendar event ID>" \
+  --comment-id="<Todoist project mapping comment ID>"
+```
+
+After independent operator approval, run the **same exact identity** with
+`--apply --confirm-comment-id="<Todoist project mapping comment ID>"`.
+This deletes only that one verified project comment. It never deletes
+a Todoist task, a Calendar event, any DynamoDB record, or any event-side
+completion guard. CLI returns a nonzero exit code on safety skips.
+A missing/ambiguous comment requires investigation rather than removal.
+Provider-side cleanup is intentionally **not** included in the scheduled
+Lambda permissions or the automatic seven-day maintenance apply workflow.
+
+The CLI closes the project-comment gap for specifically identified, verified
+records, but does not enumerate all comments automatically. Broader
+bulk automation and exact provider-write race coordination require a
+separately reviewed design; until then do not claim that *all* legacy
+project comments have been retired.
 
 ### Verification and staged activation
 
