@@ -475,6 +475,69 @@ test("explicit cancellation of an earlier occurrence purges only its stale index
   assert.deepEqual(clients.todoistUpserts, []);
 });
 
+test("missing recurringEventId and iCalUID on an earlier cancellation cannot roll the active task", async () => {
+  const earlier = instance("day-20", "2099-10-20", "2099-10-21", "cancelled");
+  const active = instance("day-21", "2099-10-21", "2099-10-22");
+  const delta = { ...earlier };
+  delete delta.recurringEventId;
+  delete delta.iCalUID;
+  const link = linkFor(active);
+  const state = new FakeState(link);
+  const stale = { ...mappingFromLink(link), eventId: earlier.id, taskId: "stale-task",
+    originalStart: earlier.start.date };
+  state.storeMapping(stale);
+  state.canonicalByEvent.add(earlier.id);
+  const tasks = new Map([[link.taskId, {
+    id: link.taskId, content: active.summary, due: { date: active.start.date },
+  }]]);
+  const clients = fakeClients(state, [earlier, active], tasks, delta);
+  // Google direct read can still return complete instance metadata despite
+  // omitting it from the webhook/delta. The persisted mapping resolves the link.
+  clients.events.set(earlier.id, structuredClone(earlier));
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await sync.process({
+    id: "metadata-free-cancelled-delta", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2099-10-21T09:00:00Z", headers: {}, body: "",
+  });
+  assert.equal(state.links[0].activeInstanceId, active.id);
+  assert.equal(state.links[0].taskId, link.taskId);
+  assert.equal(state.mappingsByEvent.has(earlier.id), false);
+  assert.equal(state.mappingsByEvent.get(active.id).taskId, link.taskId);
+  assert.equal(tasks.has(link.taskId), true);
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.audits.some((entry) =>
+    entry.action === "calendar_recurrence_earlier_instance_cancellation_honored"), true);
+});
+
+test("missing recurrence metadata on both delta and direct read must not delete the active task", async () => {
+  const earlier = instance("day-20", "2099-10-20", "2099-10-21", "cancelled");
+  const active = instance("day-21", "2099-10-21", "2099-10-22");
+  const delta = { ...earlier };
+  delete delta.recurringEventId;
+  delete delta.iCalUID;
+  const link = linkFor(active);
+  const state = new FakeState(link);
+  state.storeMapping({ ...mappingFromLink(link), eventId: earlier.id, taskId: "stale-task" });
+  const tasks = new Map([[link.taskId, {
+    id: link.taskId, content: active.summary, due: { date: active.start.date },
+  }]]);
+  const clients = fakeClients(state, [earlier, active], tasks, delta);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await sync.process({
+    id: "unverified-metadata-free-delta", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2099-10-21T09:00:00Z", headers: {}, body: "",
+  });
+  assert.equal(state.links[0].activeInstanceId, active.id);
+  assert.equal(tasks.has(link.taskId), true);
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.mappingsByEvent.has(earlier.id), true);
+  assert.equal(state.audits.some((entry) =>
+    entry.action === "calendar_recurrence_stale_instance_cancellation_ignored"
+    && entry.detail.reason === "provider_or_identity_unverified"), true);
+});
+
 test("an earlier cancelled event-side duplicate for the active task never removes TASK or TASKOWNER", async () => {
   const earlier = instance("day-20", "2099-10-20", "2099-10-21", "cancelled");
   const active = instance("day-21", "2099-10-21", "2099-10-22");
