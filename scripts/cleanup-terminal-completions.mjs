@@ -30,11 +30,12 @@ if (cursorArg) {
 }
 if (apply) {
   const dynamodb = new DynamoDBClient({ maxAttempts: 5 });
-  const backup = (await dynamodb.send(new DescribeBackupCommand({ BackupArn: backupArn }))).BackupDescription?.BackupDetails;
+  const description = (await dynamodb.send(new DescribeBackupCommand({ BackupArn: backupArn }))).BackupDescription;
+  const backup = description?.BackupDetails;
   if (backup?.BackupStatus !== "AVAILABLE" || backup.BackupArn !== backupArn
     || backup.BackupCreationDateTime === undefined
     || Date.now() - backup.BackupCreationDateTime.getTime() > 24 * 60 * 60 * 1000
-    || backup.SourceTableDetails?.TableName !== process.env.STATE_TABLE_NAME) {
+    || description?.SourceTableDetails?.TableName !== process.env.STATE_TABLE_NAME) {
     throw new Error("Apply requires an AVAILABLE backup from this exact table created in the last 24 hours");
   }
   const pitr = await dynamodb.send(new DescribeContinuousBackupsCommand({ TableName: process.env.STATE_TABLE_NAME }));
