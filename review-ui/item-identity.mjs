@@ -5,7 +5,7 @@ export function providerIdentity(value) {
   const ref = value?.ref || { profile:value?._profile, side:value?._side, id:value?.id };
   const object = value && Object.hasOwn(value, "object") ? value.object : value;
   const side = ref?.side, id = ref?.id;
-  const title = object?.content || object?.summary || "(Untitled)";
+  const title = object?.content || object?.summary || object?.title || "(Untitled)";
   const start = side === "todoist"
     ? object?.due?.datetime || object?.due?.date
     : object?.start?.dateTime || object?.start?.date;
