@@ -45,20 +45,6 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
-  CloudflareAccessTeamDomain:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^[a-z0-9.-]+$"
-    Description: Cloudflare Access team domain used to validate review session JWTs.
-  CloudflareAccessAudience:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^[A-Za-z0-9_-]+$"
-    Description: Access application audience tag protecting /review and /review/api.
-  ReviewOperatorEmail:
-    Type: String
-    Default: ""
-    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
   StateTableReadCapacity:
     Type: Number
     Default: 25
@@ -125,9 +111,6 @@ Globals:
         TODOIST_CALENDAR_SYNC_DYNAMODB_SCAN_RCU_BUDGET_PER_SECOND: !Ref DynamoDbScanRcuBudgetPerSecond
         TODOIST_CALENDAR_SYNC_DYNAMODB_SCAN_PAGE_ITEM_LIMIT: !Ref DynamoDbScanPageItemLimit
         TODOIST_CALENDAR_SYNC_RECONCILIATION_CANDIDATE_LIMIT: !Ref ReconciliationCandidateLimit
-        CF_ACCESS_TEAM_DOMAIN: !Ref CloudflareAccessTeamDomain
-        CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
-        REVIEW_OPERATOR_EMAIL: !Ref ReviewOperatorEmail
 
 Resources:
   SyncState:

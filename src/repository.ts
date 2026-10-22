@@ -1,4 +1,4 @@
-import { SyncControls } from "./review-store.js";
+import { ReviewStore as SyncReviewStore, SyncControls } from "./review-store.js";
 import { createHash } from "node:crypto";
 import {
   DeleteCommand,
@@ -1239,16 +1239,17 @@ export class StateRepository {
     const auditId = conflictHash
       ? `AUDIT#${profile}#CONFLICT#${conflictHash}#${incidentId}`
       : `AUDIT#${profile}#${Date.now()}#${Math.random().toString(36).slice(2, 8)}`;
+    const auditRecord = {
+      ...key(auditId),
+      action,
+      detail: safeDetail,
+      createdAt: now(),
+      expiresAt: auditExpiresAt(),
+    };
     try {
       await client.send(new PutCommand({
         TableName: this.ensureTable(),
-        Item: {
-          ...key(auditId),
-          action,
-          detail: safeDetail,
-          createdAt: now(),
-          expiresAt: auditExpiresAt(),
-        },
+        Item: auditRecord,
         ...(conflictHash ? {
           ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
           ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
@@ -1257,8 +1258,17 @@ export class StateRepository {
     } catch (error) {
       // Every observation is logged. An already-retained incident row is the
       // only write failure that can be safely treated as a duplicate.
-      if (conflictHash && conditionalFailure(error)) return;
-      throw error;
+      if (!(conflictHash && conditionalFailure(error))) throw error;
+    }
+    if (fingerprint && incidentId) {
+      try {
+        await new SyncReviewStore().observeConflictIncident(profile, fingerprint, incidentId, auditRecord);
+      } catch (error) {
+        // Inbox indexing is secondary to the durable audit record. The seeder
+        // can repair an indexing failure without losing the conflict audit.
+        console.warn(JSON.stringify({ service: "todoist-calendar-sync", event: "review_case_index_failed", profile,
+          action, error: error instanceof Error ? error.name : "unknown" }));
+      }
     }
   }
 

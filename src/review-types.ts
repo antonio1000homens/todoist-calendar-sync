@@ -21,6 +21,7 @@ export interface RepairIntent {
 }
 export interface ReviewSnapshot {
   ref: EntityRef; object: TodoistTask | CalendarEvent | null;
+  checkedAt?: string;
   mapping?: Mapping; control?: Record<string, unknown>;
   recurrence?: RecurrenceLink; calendarProjectionId?: string;
   destination?: { profile:Profile; eventId?:string };

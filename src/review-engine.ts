@@ -47,7 +47,7 @@ export class ReviewEngine {
     const mapping = ref.side === "todoist" ? await this.state.getMappingByTaskAnyProfile(ref.id) : await this.state.getMappingByEvent(ref.profile, ref.id);
     if (mapping && mapping.profile !== ref.profile) throw new Error(`Item belongs to ${mapping.profile}; use Move to profile instead`);
     if (ref.side === "todoist" && object && (object as TodoistTask).project_id !== profiles[ref.profile].todoistProjectId) throw new Error("Task is outside the selected profile's project");
-    const snapshot: ReviewSnapshot = { ref, object, mapping, control: await this.controls.control(ref) as Record<string, unknown> | undefined };
+    const snapshot: ReviewSnapshot = { ref, object, mapping, checkedAt: at(), control: await this.controls.control(ref) as Record<string, unknown> | undefined };
     if (ref.side === "calendar" && (object as CalendarEvent|null)?.recurrence?.length) {
       const event = object as CalendarEvent;
       const taskId = mapping?.taskId || event.extendedProperties?.shared?.taskId;
