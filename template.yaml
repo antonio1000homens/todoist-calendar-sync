@@ -177,7 +177,7 @@ Resources:
       QueueName: !Sub ${ResourceNamePrefix}-dlq-${Stage}.fifo
       FifoQueue: true
       ContentBasedDeduplication: false
-      MessageRetentionPeriod: 604800
+      MessageRetentionPeriod: 86400
       SqsManagedSseEnabled: true
 
   SyncQueue:
