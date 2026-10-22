@@ -104,3 +104,19 @@ test("unapplied release compares preview control state in one conditional transa
   await assert.rejects(controls.releaseUnapplied([{profile:"home",side:"calendar",id:"unknown"}],"repair",[],{error:"failed",nextAction:"new preview"}),/No preview control snapshot/);
   assert.equal(commands.length,1);
 });
+
+test("atomic abandonment rejects concurrent late pending-refresh changes",async t=>{
+  const { SyncControls }=await import("../dist/review-store.js");
+  const controls=new SyncControls(),captured=[];
+  t.mock.method(documentClient,"send",async cmd=>{captured.push(cmd);return {};});
+  const ref={profile:"home",side:"todoist",id:"task"},snapshots=[{ref,object:null}];
+  await controls.releaseUnapplied([ref],"repair",snapshots,{error:"validation failed",nextAction:"fresh preview"},[]);
+  const noPending=captured[0].input.TransactItems[0].Update;
+  assert.match(noPending.ConditionExpression,/attribute_not_exists\(pendingRefreshAt\)/);
+  assert.match(noPending.ConditionExpression,/attribute_not_exists\(pendingRefresh\)/);
+  await controls.releaseUnapplied([ref],"repair",snapshots,{error:"validation failed",nextAction:"fresh preview"},[{...ref,pendingRefreshAt:"generation-1"}]);
+  const pending=captured[1].input.TransactItems[0].Update;
+  assert.match(pending.ConditionExpression,/pendingRefreshAt = :pendingAt/);
+  assert.equal(pending.ExpressionAttributeValues[":pendingAt"],"generation-1");
+  assert.equal(pending.ExpressionAttributeValues[":pendingTrue"],true);
+});

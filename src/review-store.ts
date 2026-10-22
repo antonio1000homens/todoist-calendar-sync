@@ -196,8 +196,12 @@ export class SyncControls {
     } })) }));
   }
   // Atomically release an unapplied failed repair, checking the controls from its preview.
-  async releaseUnapplied(refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[], failure: { error: string; nextAction: string }): Promise<void> {
+  async releaseUnapplied(
+    refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[], failure: { error: string; nextAction: string },
+    queuedRefresh: Array<EntityRef & {pendingRefreshAt: string}> = [],
+  ): Promise<void> {
     const previous = new Map(snapshots.map(s => [entityKey(s.ref), s.control || {}]));
+    const queued = new Map(queuedRefresh.map(ref => [entityKey(ref), ref.pendingRefreshAt]));
     const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
     if (!unique.length) return;
     const items = unique.map(ref => {
@@ -209,6 +213,17 @@ export class SyncControls {
         const value = before[name];
         if (value === undefined) conditions.push(`attribute_not_exists(${name})`);
         else { values[`:${name}`] = value; conditions.push(`${name} = :${name}`); }
+      }
+      // A webhook arriving after pendingRefreshRefs() but before this transaction
+      // changes the token and rejects the entire release. No refresh is lost.
+      if (queued.has(entityKey(ref))) {
+        values[':pendingTrue'] = true;
+        values[':pendingAt'] = queued.get(entityKey(ref));
+        conditions.push('pendingRefresh = :pendingTrue', 'pendingRefreshAt = :pendingAt');
+      } else {
+        values[':pendingFalse'] = false;
+        conditions.push('(attribute_not_exists(pendingRefresh) OR pendingRefresh = :pendingFalse)',
+          'attribute_not_exists(pendingRefreshAt)');
       }
       return { Update: { TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
         UpdateExpression: 'SET fencedAt = :now REMOVE activeRepair',
