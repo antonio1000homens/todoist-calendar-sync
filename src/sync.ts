@@ -24,6 +24,28 @@ export function calendarResourceAlreadyDeleted(error: unknown): boolean {
   catch { return false; }
 }
 
+/**
+ * A 410 from a direct events.get for the same event is evidence of a gone
+ * resource, even when Google omits the structured "deleted" reason. Never use
+ * this for events.list / expired sync tokens, or for an unverified DELETE.
+ */
+function calendarEventGoneOnDirectRead(error: unknown): boolean {
+  if (calendarResourceAlreadyDeleted(error)) return true;
+  const provider = error as { status?: number; body?: string };
+  if (Number(provider.status) !== 410) return false;
+  if (!provider.body?.trim()) return true;
+  try {
+    const parsed = JSON.parse(provider.body) as {
+      error?: { message?: string; errors?: Array<{ reason?: string }> };
+    };
+    const reasons = parsed.error?.errors?.map((entry) => entry.reason).filter(Boolean) || [];
+    if (reasons.length) return reasons.every((reason) => reason === "deleted" || reason === "gone");
+    return /(?:deleted|gone|not found)/i.test(parsed.error?.message || "");
+  } catch {
+    return /(?:deleted|gone|not found)/i.test(provider.body);
+  }
+}
+
 function taskDateTime(task: TodoistTask): string | undefined {
   const due = task.due;
   return due?.datetime || (due?.date && due.date.includes("T") ? due.date : undefined);
@@ -1436,11 +1458,42 @@ export class Synchronizer {
       if ((error as { status?: number }).status !== 404) throw error;
     }
     const mapping = await this.state.getMappingByEvent(delivery.profile, orphan.eventId);
-    if (!mapping || mapping.taskId !== orphan.taskId) return;
-    await calendar.deleteEvent(orphan.eventId).catch((error: unknown) => {
-      if (!calendarResourceAlreadyDeleted(error)) throw error;
-    });
+    if (!mapping || mapping.taskId !== orphan.taskId) {
+      await this.state.audit(delivery.profile, "orphan_recheck_mapping_changed", {
+        ...orphan,
+        mappedTaskId: mapping?.taskId,
+      });
+      return;
+    }
+
+    let alreadyDeleted = false;
+    try {
+      await calendar.deleteEvent(orphan.eventId);
+    } catch (error) {
+      if (calendarResourceAlreadyDeleted(error)) {
+        alreadyDeleted = true;
+      } else {
+        // An unclassified 410 on DELETE is not by itself proof of deletion.
+        // Read exactly this event: 404, a deleted/cancelled resource, or 410
+        // from events.get confirms it is gone without replaying a mutation.
+        if (Number((error as { status?: number }).status) !== 410) throw error;
+        let existing: CalendarEvent | undefined;
+        try {
+          existing = await calendar.getEvent(orphan.eventId);
+        } catch (readError) {
+          if (!calendarEventGoneOnDirectRead(readError)) throw readError;
+          alreadyDeleted = true;
+        }
+        // A still-live event (or any other unexpected state) must not have
+        // its mapping silently discarded; quarantine it for operator review.
+        if (existing?.status === "cancelled") alreadyDeleted = true;
+        else if (existing) throw error;
+      }
+    }
     await this.state.deleteMapping(mapping);
-    await this.state.audit(delivery.profile, "orphan_confirmed_deleted", orphan);
+    await this.state.audit(delivery.profile, "orphan_confirmed_deleted", {
+      ...orphan,
+      alreadyDeleted,
+    });
   }
 }
