@@ -268,7 +268,7 @@ export class ReviewEngine {
       for(const ref of pending){const group=byProfile.get(ref.profile)||[];group.push(ref);byProfile.set(ref.profile,group);}
       for(const [profile,profileRefs] of byProfile){
         const request=await requestReconciliation(state,profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:profileRefs});
-        if(!request.queued&&!request.coalesced)throw new Error(`Provider updates arrived during this repair, but reconciliation for ${profile} could not be queued; the repair barrier remains active. Resume this operation to retry.`);
+        if(!request.queued&&!request.coalesced)throw new Error(`Provider updates arrived during this repair, but reconciliation could not be queued for ${profile}; the repair barrier remains active. Resume this operation to retry.`);
       }
       return true;
     };
