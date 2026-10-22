@@ -19,18 +19,18 @@ import { deleteMappingComments } from "./mapping-comments.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit, type FutureSeriesSplitPlan } from "./recurrence-split.js";
 
-function futureSplitDescription(plan: FutureSeriesSplitPlan, anchor?: string): string {
-  const history = plan.expiredUntil
-    ? `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"} expired on ${plan.expiredUntil}; keep it unchanged`
-    : `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"}; retain through ${plan.previousOccurrence} and stop old dates from ${plan.nextOldOccurrence}`;
-  return `${history}; new master starts ${plan.newStart} with ${plan.newRule} (Calendar timezone ${plan.calendarTimeZone})`;
-}
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { ReviewStore } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
+function futureSplitDescription(plan: FutureSeriesSplitPlan, anchor?: string): string {
+  const history = plan.expiredUntil
+    ? `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"} expired on ${plan.expiredUntil}; keep it unchanged`
+    : `Calendar RRULE ${plan.originalRule} from ${anchor || "(historical master)"}; retain through ${plan.previousOccurrence} and stop old dates from ${plan.nextOldOccurrence}`;
+  return `${history}; new master starts ${plan.newStart} with ${plan.newRule} (Calendar timezone ${plan.calendarTimeZone})`;
+}
 const DEFAULT_DECISION_RETENTION_DAYS = 30;
 const DEFAULT_DECISION_DEADLINE_DAYS = 7;
 const MAX_MANUAL_BULK_MUTATIONS = 10;
