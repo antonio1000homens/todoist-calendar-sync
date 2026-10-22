@@ -5,7 +5,7 @@
  */
 import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as db } from "./dynamodb-capacity.js";
-import { terminalCompletionDecision } from "./completed-history-policy.js";
+import { terminalCompletionDecision, type VerifiedTerminalSeries } from "./completed-history-policy.js";
 import type { CompletedCalendarProjection, Profile } from "./types.js";
 
 const profiles: Profile[] = ["home", "antonio", "work"];
@@ -39,14 +39,25 @@ async function processTask(
     TableName: table, ConsistentRead: true,
     KeyConditionExpression: "pk = :pk AND begins_with(sk, :event)",
     ExpressionAttributeValues: { ":pk": `COMPLETED_TASK#${profile}#${taskId}`, ":event": "EVENT#" },
-    Limit: MAX_HISTORY_ROWS + 1,
+    Limit: MAX_HISTORY_ROWS,
   }));
   const rows = (queried.Items || []) as Row[];
   if (!rows.length) return "skipped_ambiguous"; // another cleanup already won
-  if (queried.LastEvaluatedKey || rows.length > MAX_HISTORY_ROWS
-    || rows.some((p) => p.pk !== `COMPLETED_TASK#${profile}#${taskId}`
+  if (rows.some((p) => p.pk !== `COMPLETED_TASK#${profile}#${taskId}`
       || p.sk !== `EVENT#${p.eventId}`)) return "skipped_ambiguous";
-  const decision = terminalCompletionDecision(rows, nowMs);
+
+  // The series certificate is immutable and names no Todoist task. It proves
+  // the *whole* series ended, allowing older tasks/occurrence batches to retire
+  // without mistaking an individual historical occurrence for the final one.
+  const seriesId = rows[0]?.seriesId;
+  const seriesRow = seriesId && rows[0].recurrenceOwner
+    ? await strongGet(table, `COMPLETED_SERIES#${profile}#${seriesId}`)
+    : undefined;
+  const certificate = seriesRow as unknown as VerifiedTerminalSeries | undefined;
+  // A partially returned task history is never safe to retire without a
+  // terminal series certificate. Repeat bounded batches on later scan passes.
+  if (queried.LastEvaluatedKey && !certificate) return "skipped_ambiguous";
+  const decision = terminalCompletionDecision(rows, nowMs, certificate);
   if (decision !== "eligible") return decision === "too_recent" ? "too_recent" : "skipped_ambiguous";
 
   // The preflight is a courtesy for diagnostics. Conditions in the transaction
@@ -75,13 +86,28 @@ async function processTask(
   // observed timestamp; never erase a newer reconciliation baseline.
   const baselineKey = key(`BASELINE#${profile}#TASK#${taskId}`, "RECONCILE");
   const baseline = await strongGet(table, baselineKey.pk, baselineKey.sk);
-  const latest = Math.max(...rows.map((r) => Date.parse(r.completedAt)));
+  const latest = Math.max(...rows.map((r) => Date.parse(r.completedAt)),
+    ...(certificate && Number.isFinite(Date.parse(certificate.terminalCompletedAt))
+      ? [Date.parse(certificate.terminalCompletedAt)] : []));
   if (baseline && (typeof baseline.updatedAt !== "string"
     || !Number.isFinite(Date.parse(baseline.updatedAt))
     || Date.parse(baseline.updatedAt) > latest)) return "skipped_ambiguous";
 
   if (!apply) return "eligible";
   const tx: Array<Record<string, unknown>> = [];
+  if (certificate && seriesId) {
+    const condition = "#profile = :profile AND seriesId = :series AND recurrenceOwner = :owner AND terminalCompletedAt = :time";
+    tx.push({ ConditionCheck: {
+      TableName: table, Key: key(`COMPLETED_SERIES#${profile}#${seriesId}`),
+      ConditionExpression: certificate.masterEventId ? condition + " AND masterEventId = :master" : condition + " AND attribute_not_exists(masterEventId)",
+      ExpressionAttributeNames: { "#profile": "profile" },
+      ExpressionAttributeValues: {
+        ":profile": profile, ":series": seriesId,
+        ":owner": certificate.recurrenceOwner, ":time": certificate.terminalCompletedAt,
+        ...(certificate.masterEventId ? { ":master": certificate.masterEventId } : {}),
+      },
+    } });
+  }
   for (const reference of absent) {
     const separator = reference.lastIndexOf("|");
     tx.push({ ConditionCheck: {
