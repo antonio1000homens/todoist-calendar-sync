@@ -20,11 +20,23 @@ const key = (pk,sk="STATE")=>pk+"|"+sk;
 function scenario({content=commentContent(),commentProject=target.projectId,history=marker,taskAbsent=true}={}) {
   const rows=new Map();
   if(history)rows.set(key("COMPLETED_EVENT#home#historical-1"),history);
-  const calls={reads:[],comments:0,deleted:[]};
+  const calls={reads:[],comments:0,scans:0,deleted:[]};
   const providerComment={id:target.commentId,project_id:commentProject,content};
   const adapter={
     async get(pk,sk="STATE"){calls.reads.push(key(pk,sk));return rows.get(key(pk,sk));},
     async getComment(){calls.comments++;return structuredClone(providerComment);},
+    async findRelatedRecurrenceLink(taskId,eventIds,seriesIds){
+      calls.scans++;
+      const events=new Set(eventIds),series=new Set(seriesIds);
+      for(const [storedKey,row] of rows) {
+        if(!storedKey.startsWith("RECURRENCE#"))continue;
+        if(row.taskId===taskId || series.has(row.seriesId)
+          || [row.eventId,row.masterEventId,row.activeInstanceId].some(id=>events.has(id))) {
+          return storedKey;
+        }
+      }
+      return undefined;
+    },
     async taskAbsent(){return taskAbsent;},
     async deleteComment(id){calls.deleted.push(id);},
   };
@@ -130,5 +142,58 @@ test("provider read failures abort rather than pretending the Todoist task is ab
   const s=scenario();
   s.adapter.taskAbsent=async()=>{throw new Error("Todoist API unavailable");};
   await assert.rejects(retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true}),/Todoist API unavailable/);
+  assert.deepEqual(s.calls.deleted,[]);
+});
+
+test("provider response comment ID must match explicit approval on BOTH preflights",async()=>{
+  const first=scenario();
+  first.providerComment.id="different-comment-id";
+  assert.equal((await retireCompletedProjectMappingComment(target,first.adapter,{nowMs:t0+week+1,apply:true})).status,"skipped_ambiguous");
+  assert.deepEqual(first.calls.deleted,[]);
+  assert.equal(first.calls.comments,1);
+
+  const second=scenario();
+  const original=second.adapter.getComment;
+  second.adapter.getComment=async id=>{
+    const response=await original(id);
+    return second.calls.comments===2?{...response,id:"different-comment-id"}:response;
+  };
+  assert.equal((await retireCompletedProjectMappingComment(target,second.adapter,{nowMs:t0+week+1,apply:true})).status,"skipped_ambiguous");
+  assert.deepEqual(second.calls.deleted,[]);
+  assert.equal(second.calls.comments,2);
+});
+
+test("a live recurrence rebound to another series ID or linked Calendar event blocks deletion",async()=>{
+  for(const row of [
+    {taskId:target.taskId,seriesId:"unrelated-series",eventId:"new-event"},
+    {taskId:"other-task",seriesId:"unrelated-series",eventId:target.eventId},
+    {taskId:"other-task",seriesId:"unrelated-series",eventId:"new-event",masterEventId:target.eventId},
+    {taskId:"other-task",seriesId:"unrelated-series",eventId:"new-event",activeInstanceId:target.eventId},
+  ]) {
+    const s=scenario();
+    s.rows.set(key("RECURRENCE#work#unrelated-series"),row);
+    const result=await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true});
+    assert.equal(result.status,"skipped_active",JSON.stringify(row));
+    assert.deepEqual(s.calls.deleted,[]);
+    assert.equal(s.calls.scans,1);
+  }
+});
+
+test("recurrence-enumeration failures abort without any provider deletion",async()=>{
+  const s=scenario();
+  s.adapter.findRelatedRecurrenceLink=async()=>{throw new Error("DynamoDB recurrence scan incomplete");};
+  await assert.rejects(retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true}),/DynamoDB recurrence scan incomplete/);
+  assert.deepEqual(s.calls.deleted,[]);
+});
+
+test("apply re-enumerates recurrence links and aborts if one appears between checks",async()=>{
+  const s=scenario();
+  const original=s.adapter.findRelatedRecurrenceLink;
+  s.adapter.findRelatedRecurrenceLink=async(...args)=>{
+    if(s.calls.scans===1) s.rows.set(key("RECURRENCE#antonio#newly-bound"),{taskId:target.taskId,seriesId:"newly-bound"});
+    return original(...args);
+  };
+  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true})).status,"skipped_active");
+  assert.equal(s.calls.scans,2);
   assert.deepEqual(s.calls.deleted,[]);
 });
