@@ -5,7 +5,8 @@ import { createRoot } from "react-dom/client";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
-type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number };
+type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
+type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
 const api = createReviewApiClient();
