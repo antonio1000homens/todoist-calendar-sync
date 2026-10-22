@@ -2,6 +2,7 @@ import { profileForTodoistProject, profiles, googleCredentials, todoistToken } f
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
+import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedStart, normalizedText } from "./security.js";
 import {
   calendarRecurrenceMatchesTodoist,
@@ -527,7 +528,15 @@ export class Synchronizer {
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
       if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: link.activeInstanceId || link.masterEventId })) continue;
-      const instances = await calendar.listInstances(link.masterEventId);
+      let instances: CalendarEvent[];
+      try {
+        instances = await calendar.listInstances(link.masterEventId);
+      } catch (error) {
+        throw new ReconciliationItemError(error, {
+          stage: "recurrence", taskId: link.taskId,
+          eventId: link.activeInstanceId || link.masterEventId, seriesId: link.seriesId,
+        });
+      }
       const suppressed = suppressedLegacyCalendarRecurrenceCandidate(instances, link);
       if (suppressed) {
         await this.state.audit(profile, "calendar_recurrence_backward_shift_suppressed_legacy_state", {
