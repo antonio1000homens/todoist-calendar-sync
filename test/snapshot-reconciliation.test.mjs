@@ -318,6 +318,104 @@ test("ignores Calendar end-only drift because end is not a synchronized canonica
   assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_conflict_both_sides_changed"), false);
 });
 
+test("existing linked multi-day pair ignores end-only Calendar edits without changing names or providers", async () => {
+  const m = mapping();
+  const t = task({ id: "task-1", content: "Leave Approved", description: "", due: { date: "2026-12-21" } });
+  const original = event({
+    summary: "Leave Approved", description: "", start: { date: "2026-12-21" }, end: { date: "2026-12-26" },
+  });
+  const edited = { ...original, end: { date: "2026-12-30" } };
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(t, original));
+  const eventMap = new Map([[edited.id, edited]]);
+  const taskMap = new Map([[t.id, t]]);
+  const clients = fakeClients({ listedTasks: [t], taskById: taskMap, calendarEvents: eventMap });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+  assert.equal(result.counts.noop, 1);
+  assert.equal(store.putBaselineCalls, 0);
+  assert.deepEqual(clients.metrics.todoistUpdates, []);
+  assert.deepEqual(clients.metrics.calendarUpdates, []);
+  assert.deepEqual(clients.metrics.todoistDeletes, []);
+  assert.deepEqual(clients.metrics.calendarDeletes, []);
+  assert.strictEqual(eventMap.get(original.id), edited);
+  assert.strictEqual(taskMap.get(t.id), t);
+  assert.equal(t.content, "Leave Approved");
+  assert.equal(edited.end.date, "2026-12-30");
+  assert.equal(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_conflict_both_sides_changed"), false);
+});
+
+test("Todoist date change alongside Calendar end-only edit keeps the edited multi-day duration", async () => {
+  const m = mapping();
+  const oldTask = task({ content: "Leave Approved", description: "", due: { date: "2026-12-21" } });
+  const oldEvent = event({
+    summary: "Leave Approved", description: "", start: { date: "2026-12-21" }, end: { date: "2026-12-26" },
+  });
+  const movedTask = task({ content: "Leave Approved", description: "", due: { date: "2026-12-22" } });
+  const extendedEvent = { ...oldEvent, end: { date: "2026-12-30" } };
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(oldTask, oldEvent));
+  const clients = fakeClients({
+    listedTasks: [movedTask], taskById: new Map([[movedTask.id, movedTask]]),
+    calendarEvents: new Map([[extendedEvent.id, extendedEvent]]),
+  });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+  assert.equal(result.counts.todoist_to_calendar, 1);
+  assert.equal(clients.metrics.todoistUpdates.length, 0);
+  assert.equal(clients.metrics.calendarUpdates.length, 1);
+  assert.deepEqual(clients.metrics.calendarUpdates[0].next.start, { date: "2026-12-22" });
+  assert.deepEqual(clients.metrics.calendarUpdates[0].next.end, { date: "2026-12-31" });
+  assert.equal(clients.metrics.calendarUpdates[0].next.summary, "Leave Approved");
+  assert.equal(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_conflict_both_sides_changed"), false);
+});
+
+test("Calendar multi-day start edits move the Todoist due date without truncating the Calendar event", async () => {
+  const m = mapping();
+  const t = task({ content: "Leave Approved", description: "", due: { date: "2026-12-21" } });
+  const original = event({ summary: "Leave Approved", description: "", start: { date: "2026-12-21" }, end: { date: "2026-12-26" } });
+  const shifted = { ...original, start: { date: "2026-12-23" } };
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(t, original));
+  const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[shifted.id, shifted]]) });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+  assert.equal(result.counts.calendar_to_todoist, 1);
+  assert.deepEqual(clients.metrics.todoistUpdates[0].next.due, { date: "2026-12-23" });
+  assert.equal(clients.metrics.todoistUpdates[0].next.content, "Leave Approved");
+  assert.deepEqual(clients.metrics.calendarUpdates, []);
+  assert.deepEqual(shifted.end, { date: "2026-12-26" });
+});
+
+test("timed Calendar end-only edits are ignored while start changes update Todoist", async () => {
+  const m = mapping();
+  const t = task({ due: { datetime: "2026-09-10T08:00:00Z", timezone: "Europe/London" } });
+  const original = event({
+    start: { dateTime: "2026-09-10T09:00:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2026-09-10T10:00:00+01:00", timeZone: "Europe/London" },
+  });
+  const endEdited = { ...original, end: { dateTime: "2026-09-10T13:00:00+01:00", timeZone: "Europe/London" } };
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(t, original));
+  const calendarEvents = new Map([[endEdited.id, endEdited]]);
+  const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents });
+  const reconciler = makeReconciler({ state, store, clients });
+
+  const first = await reconciler.reconcile("home");
+  assert.equal(first.counts.noop, 1);
+  assert.deepEqual(clients.metrics.todoistUpdates, []);
+  assert.deepEqual(clients.metrics.calendarUpdates, []);
+
+  calendarEvents.set(original.id, { ...endEdited, start: { dateTime: "2026-09-10T11:00:00+01:00", timeZone: "Europe/London" } });
+  const second = await reconciler.reconcile("home");
+  assert.equal(second.counts.calendar_to_todoist, 1);
+  assert.deepEqual(clients.metrics.todoistUpdates[0].next.due, {
+    datetime: "2026-09-10T11:00:00+01:00", timezone: "Europe/London",
+  });
+  assert.deepEqual(clients.metrics.calendarUpdates, []);
+  assert.deepEqual(calendarEvents.get(original.id).end, endEdited.end);
+});
+
 test("blocks non-confirmed mapped Calendar state instead of baselining or mutating it", async () => {
   const m = mapping();
   const t = task();
