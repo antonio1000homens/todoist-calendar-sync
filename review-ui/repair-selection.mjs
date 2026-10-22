@@ -25,7 +25,7 @@ export function reconcileRepairSelection(item, snapshots, previous) {
     const ids = liveIds(item, snapshots, side);
     // An explicit selection (including intentionally clearing an ID for Create)
     // is not replaced by an unrelated item discovered during refresh.
-    if (manual) return { id: value, verified: value && ids.includes(value) ? value : "" };
+    if (manual) { const id = value && ids.includes(value) ? value : ""; return { id, verified: id }; }
     const id = hints.find(hint => ids.includes(hint)) || (ids.length === 1 ? ids[0] : "");
     return { id, verified: id };
   };
