@@ -26,10 +26,10 @@ test("worker remains single-concurrency while project moves lack cross-profile c
   assert.match(workerBlock, /ReservedConcurrentExecutions:\s*1/);
 });
 
-test("DLQ quarantines after one receive and retains messages for seven days", () => {
+test("DLQ quarantines after one receive and retains messages for 24 hours", () => {
   const dlqBlock = template.match(/SyncDlq:[\s\S]*?SyncQueue:/)?.[0] || "";
   const queueBlock = template.match(/SyncQueue:[\s\S]*?AlertTopic:/)?.[0] || "";
-  assert.match(dlqBlock, /MessageRetentionPeriod:\s*604800/);
+  assert.match(dlqBlock, /MessageRetentionPeriod:\s*86400/);
   assert.match(queueBlock, /maxReceiveCount:\s*1/);
 });
 

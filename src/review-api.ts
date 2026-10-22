@@ -4,6 +4,7 @@ import { StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
+import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import type { Delivery, Profile } from "./types.js";
 import { REVIEW_PROFILES, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 
@@ -217,8 +218,15 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     }
     if (method === "POST" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected = profile(typeof body?.profile === "string" ? body.profile : null);
+      let clearedDlq: Awaited<ReturnType<typeof clearDeadLetterMessagesForProfile>>;
+      try {
+        clearedDlq = await clearDeadLetterMessagesForProfile(selected);
+      } catch (error) {
+        console.error(JSON.stringify({ event:"profile_dlq_clear_failed", profile:selected, error:error instanceof Error ? error.message : String(error) }));
+        return response(503,{error:"dlq_clear_failed",message:"The profile DLQ could not be cleared; reconciliation was not started."});
+      }
       const result = await requestReconciliation(new StateRepository(),selected,"manual",enqueueDelivery,{requester:actor.email});
-      return response(result.enqueueError?503:202,{reconciliation:result});
+      return response(result.enqueueError?503:202,{reconciliation:result,clearedDlq});
     }
     return response(404,{error:"not_found"});
   } catch(error) {
