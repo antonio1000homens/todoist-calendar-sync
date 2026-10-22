@@ -140,6 +140,13 @@ inspection and an event-side immutable `COMPLETED_EVENT` guard. It requires
 seven full days from the preserved completion timestamp, a Todoist 404,
 absence of mapping and recurrence ownership **across all three profiles**,
 and, for recurring histories, a matching terminal-series certificate.
+In addition to keyed lookups, each preflight fully paginates a **strongly
+consistent, full-table DynamoDB scan** of canonical recurrence links to
+catch any link rebinding under a previously unknown series ID. This can
+consume significant read capacity on large tables. Check table capacity
+and execute during a quiescent maintenance window. A failed or incomplete
+scan aborts without deleting anything; a GSI-only query is not a safe
+substitute because GSI reads are eventually consistent.
 Provider API failures, ambiguous ownership, legacy task comments, foreign
 projects, and missing identifiers **skip or fail**, never delete.
 It rechecks the provider comment, completion guard and current mappings
