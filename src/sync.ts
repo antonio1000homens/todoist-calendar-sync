@@ -1290,7 +1290,7 @@ export class Synchronizer {
         // when the maintenance worker has not yet retired COMPLETED_TASK.
         // Ambiguous recurrence history also fails safe when no live mapping
         // exists; it must not be interpreted as permission to erase history.
-        if (lifecycle.reason === "deleted" && protectUnmappedCompletedHistory(history)) {
+        if (lifecycle.reason === "deleted" && protectUnmappedCompletedHistory(history, Number.isFinite(Date.parse(delivery.receivedAt)) ? Date.parse(delivery.receivedAt) : Date.now())) {
           return this.state.audit(delivery.profile, "todoist_late_completed_deletion_ignored", {
             taskId: task.id, retainedHistory: history.length,
           });
