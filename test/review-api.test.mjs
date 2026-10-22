@@ -88,7 +88,16 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   t.mock.method(ReviewStore.prototype,"getCase",async id=>id==="case-1"?caseItem:undefined);
   const caseUpdates=[];
   t.mock.method(ReviewStore.prototype,"updateCase",async(...args)=>{caseUpdates.push(args);});
-  t.mock.method(ReviewEngine.prototype,"preview",async actor=>({...preview,actor}));
+  const previewWithValidation = ReviewEngine.prototype.preview;
+  t.mock.method(ReviewEngine.prototype,"collect",async intent=>intent.eventId === "cancelled-event" ? [
+    {ref:{profile:"home",side:"todoist",id:"task-1"},object:{id:"task-1",content:"Test task",project_id:"test-home-project"}},
+    {ref:{profile:"home",side:"calendar",id:"cancelled-event"},object:{id:"cancelled-event",summary:"Cancelled event",status:"cancelled"}},
+  ] : []);
+  t.mock.method(ReviewEngine.prototype,"preview",async function(actor,intent) {
+    return intent.eventId === "cancelled-event"
+      ? previewWithValidation.call(this,actor,intent)
+      : {...preview,actor};
+  });
   t.mock.method(ReviewStore.prototype,"getPreview",async id=>id==="preview-1"?preview:undefined);
   t.mock.method(ReviewStore.prototype,"submit",async()=>operation);
   const queueCalls=[];
@@ -102,6 +111,12 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
   },{action:"exclude",winner:"none",scope:"occurrence",leftovers:{}})));
   assert.equal(previewResult.status,200);
+
+  const cancelledPreview=await jsonResponse(await handler(event("/review/api/cases/case-1/previews","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+  },{action:"link",taskId:"task-1",eventId:"cancelled-event",winner:"none",scope:"occurrence",leftovers:{}})));
+  assert.equal(cancelledPreview.status,400);
+  assert.equal(cancelledPreview.body.error,"Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
 
   const dismissed=await jsonResponse(await handler(event("/review/api/cases/case-1/dismiss","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
