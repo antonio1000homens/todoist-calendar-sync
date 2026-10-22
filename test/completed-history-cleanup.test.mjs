@@ -12,10 +12,25 @@ const eventKey = "COMPLETED_EVENT#home#event-1|STATE";
 const taskKey = "COMPLETED_TASK#home#one|EVENT#event-1";
 const k = ({ pk, sk }) => pk + "|" + sk;
 
-async function simulate({ active = false, partial = false, race = false, recurrence = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
+async function simulate({ active = false, partial = false, race = false, recurrence = false, certifiedSeries = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
   const store = new Map([[taskKey, { ...history }], [eventKey, { ...history, pk: "COMPLETED_EVENT#home#event-1", sk: "STATE" }]]);
   if (active) store.set("TASKOWNER#one|MAP", { profile: "home", taskId: "one", eventId: "new-event" });
   if (partial) store.set("EVENT#home#event-1|MAP", { profile: "home", taskId: "one", eventId: "event-1" });
+  if (certifiedSeries) {
+    for (let n = 1; n <= 13; n++) {
+      const id = "event-" + n;
+      const row = { ...history, sk: "EVENT#" + id, eventId: id,
+        recurrenceOwner: "todoist", seriesId: "one", masterEventId: "master" };
+      store.set(k(row), row);
+      store.set("COMPLETED_EVENT#home#" + id + "|STATE",
+        { ...row, pk: "COMPLETED_EVENT#home#" + id, sk: "STATE" });
+    }
+    store.set("COMPLETED_SERIES#home#one|STATE", {
+      pk: "COMPLETED_SERIES#home#one", sk: "STATE",
+      profile: "home", seriesId: "one", recurrenceOwner: "todoist",
+      masterEventId: "master", terminalCompletedAt: "2026-10-02T12:00:00Z",
+    });
+  }
   if (recurrence) {
     const row = store.get(taskKey);
     row.recurrenceOwner = "todoist";
@@ -33,9 +48,12 @@ async function simulate({ active = false, partial = false, race = false, recurre
     if (command instanceof ScanCommand) return {
       ScannedCount: 1, Items: store.has(taskKey) ? [store.get(taskKey)] : [],
     };
-    if (command instanceof QueryCommand) return {
-      Items: store.has(taskKey) ? [store.get(taskKey)] : [],
-    };
+    if (command instanceof QueryCommand) {
+      const all = [...store.values()].filter((item) =>
+        item.pk === "COMPLETED_TASK#home#one").sort((a, b) => a.sk.localeCompare(b.sk));
+      return { Items: all.slice(0, q.Limit), ...(all.length > q.Limit
+        ? { LastEvaluatedKey: { pk: all[q.Limit - 1].pk, sk: all[q.Limit - 1].sk } } : {}) };
+    }
     if (command instanceof GetCommand) return { Item: store.get(k(q.Key)) };
     if (command instanceof TransactWriteCommand) {
       writes++;
@@ -114,4 +132,13 @@ test("reopened mapping during transactional cleanup skips instead of losing hist
   assert.equal(result.counts.skipped_active, 1);
   assert.equal(result.store.has(taskKey), true);
   assert.equal(result.store.has(eventKey), true);
+});
+
+test("certified exhausted recurrence is safely retired in bounded batches", async () => {
+  const result = await simulate({ certifiedSeries: true, apply: true });
+  assert.equal(result.counts.retired, 1);
+  assert.equal(result.store.has("COMPLETED_SERIES#home#one|STATE"), true);
+  assert.equal(result.store.has("COMPLETED_EVENT#home#event-13|STATE"), true);
+  const remaining = [...result.store.values()].filter((i) => i.pk === "COMPLETED_TASK#home#one");
+  assert.equal(remaining.length, 1);
 });
