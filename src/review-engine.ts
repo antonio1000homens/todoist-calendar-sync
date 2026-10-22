@@ -142,9 +142,10 @@ export class ReviewEngine {
       if (!task || !event) invalidRepairIntent(`Verification requires live Todoist task ${intent.taskId || "(not selected)"} and Calendar event ${intent.eventId || "(not selected)"}; refresh affected items and select the current pair`);
       const mapping = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId)?.mapping
         || snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId)?.mapping;
+      if (!mapping) invalidRepairIntent(`Selected pair does not match the current mapping: Todoist task ${task.id}, selected Calendar event ${event.id}; expected Calendar event none (no mapping found). Refresh affected items and use the current mapped pair.`);
       const expectedEventIds = [...new Set([mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((id): id is string => Boolean(id)))];
       const mismatch = () => invalidRepairIntent(`Selected pair does not match the current mapping: Todoist task ${task.id}, selected Calendar event ${event.id}; expected Calendar event ${expectedEventIds.join(", ") || "none (no mapping found)"}. Refresh affected items and use the current mapped pair.`);
-      if (!mapping || mapping.taskId !== task.id || !expectedEventIds.includes(event.id)) mismatch();
+      if (mapping.taskId !== task.id || !expectedEventIds.includes(event.id)) mismatch();
       if (mapping.recurrenceOwner === "calendar" && mapping.masterEventId) {
         const active = await (await this.clients(intent.profile)).calendar.getEvent(mapping.activeInstanceId || mapping.eventId);
         if (!hasCanonicalState(active, task)) mismatch();
