@@ -103,7 +103,7 @@ test("standalone deployment role scopes SNS and cannot write application secrets
   assert.doesNotMatch(deployPolicy, /ssm:PutParameter/);
   assert.match(deployPolicy, /ssm:GetParameter/);
   assert.match(deployPolicy, /parameter\/todoist-calendar-sync\/\*/);
-  assert.match(deployPolicy, /repo:antonio1000homens\/todoist-calendar-sync:environment:production/);
+  assert.match(deployPolicy, /repo:antonio1000homens@36929120\/todoist-calendar-sync@1370572332:environment:production/);
 });
 
 test("ingress no longer claims DynamoDB delivery state before SQS enqueue", () => {
