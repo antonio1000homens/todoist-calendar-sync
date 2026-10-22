@@ -1104,6 +1104,16 @@ export class StateRepository {
       TableName: table, Key: canonicalKey, ConsistentRead: true,
     }));
     if (!staleMapping && !canonical.Item) return false;
+    // Canonical identities are independently rewritten by reconciliation.
+    // Never remove a row whose identity or write version has changed since
+    // this strongly consistent read, even if the EVENT mapping is still old.
+    const canonicalSnapshot = canonical.Item;
+    if (canonicalSnapshot && (canonicalSnapshot.profile !== link.profile
+      || canonicalSnapshot.side !== "calendar" || canonicalSnapshot.providerId !== occurrenceId
+      || typeof canonicalSnapshot.updatedAt !== "string" || !canonicalSnapshot.updatedAt
+      || !canonicalSnapshot.identity || typeof canonicalSnapshot.identity !== "object")) {
+      return false;
+    }
 
     const baseValues = {
       ":owner": "calendar",
@@ -1143,7 +1153,20 @@ export class StateRepository {
           ? { ":oldTask": staleMapping.taskId, ":owner": "calendar", ":series": link.seriesId, ":master": link.masterEventId, ":oldUpdated": staleMapping.updatedAt }
           : undefined,
       } },
-      { Delete: { TableName: table, Key: canonicalKey } },
+      { Delete: {
+        TableName: table, Key: canonicalKey,
+        ConditionExpression: canonicalSnapshot
+          ? "#profile = :canonicalProfile AND #side = :canonicalSide AND providerId = :canonicalProvider AND updatedAt = :canonicalUpdated AND #identity = :canonicalIdentity"
+          : "attribute_not_exists(pk)",
+        ExpressionAttributeNames: canonicalSnapshot
+          ? { "#profile": "profile", "#side": "side", "#identity": "identity" }
+          : undefined,
+        ExpressionAttributeValues: canonicalSnapshot
+          ? { ":canonicalProfile": link.profile, ":canonicalSide": "calendar",
+            ":canonicalProvider": occurrenceId, ":canonicalUpdated": canonicalSnapshot.updatedAt,
+            ":canonicalIdentity": canonicalSnapshot.identity }
+          : undefined,
+      } },
     ];
     if (staleMapping && staleMapping.taskId !== link.taskId) {
       for (const index of [
