@@ -12,9 +12,10 @@ const eventKey = "COMPLETED_EVENT#home#event-1|STATE";
 const taskKey = "COMPLETED_TASK#home#one|EVENT#event-1";
 const k = ({ pk, sk }) => pk + "|" + sk;
 
-async function simulate({ active = false, recurrence = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
+async function simulate({ active = false, partial = false, race = false, recurrence = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
   const store = new Map([[taskKey, { ...history }], [eventKey, { ...history, pk: "COMPLETED_EVENT#home#event-1", sk: "STATE" }]]);
   if (active) store.set("TASKOWNER#one|MAP", { profile: "home", taskId: "one", eventId: "new-event" });
+  if (partial) store.set("EVENT#home#event-1|MAP", { profile: "home", taskId: "one", eventId: "event-1" });
   if (recurrence) {
     const row = store.get(taskKey);
     row.recurrenceOwner = "todoist";
@@ -38,6 +39,14 @@ async function simulate({ active = false, recurrence = false, apply = false, clo
     if (command instanceof GetCommand) return { Item: store.get(k(q.Key)) };
     if (command instanceof TransactWriteCommand) {
       writes++;
+      if (race) {
+        // Simulate another writer reintroducing an active mapping after the
+        // strongly consistent preflight but before the transactional delete.
+        const error = new Error("conditional mapping race");
+        error.name = "TransactionCanceledException";
+        error.CancellationReasons = [{ Code: "ConditionalCheckFailed" }];
+        throw error;
+      }
       for (const op of q.TransactItems) {
         if (op.ConditionCheck && op.ConditionCheck.ConditionExpression === "attribute_not_exists(pk)") {
           assert.equal(store.has(k(op.ConditionCheck.Key)), false);
@@ -93,4 +102,16 @@ test("6d23h59m never purges a completed task", async () => {
   const r = await simulate({ apply: true, clock: "2026-10-08T11:59:00Z" });
   assert.equal(r.counts.too_recent, 1);
   assert.equal(r.store.has(taskKey), true);
+});
+
+test("partial EVENT mapping triplet blocks cleanup even without TASK/TASKOWNER", async () => {
+  const result = await simulate({ partial: true, apply: true });
+  assert.equal(result.counts.skipped_active, 1);
+  assert.equal(result.store.has(taskKey), true);
+});
+test("reopened mapping during transactional cleanup skips instead of losing history", async () => {
+  const result = await simulate({ race: true, apply: true });
+  assert.equal(result.counts.skipped_active, 1);
+  assert.equal(result.store.has(taskKey), true);
+  assert.equal(result.store.has(eventKey), true);
 });
