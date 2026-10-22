@@ -145,11 +145,11 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       const needle = query.toLocaleLowerCase();
       if (side === "todoist") {
         const items = (await pair.todoist.listTasks()).filter(item => `${item.content} ${item.description || ""}`.toLocaleLowerCase().includes(needle)).slice(0,40)
-          .map(item=>({id:item.id,title:item.content,description:item.description,due:item.due,url:`https://app.todoist.com/app/task/${item.id}`}));
+          .map(item=>({id:item.id,title:item.content,description:item.description,due:item.due,is_completed:item.is_completed,is_deleted:item.is_deleted,url:`https://app.todoist.com/app/task/${item.id}`}));
         return response(200,{items});
       }
       const items = (await pair.calendar.listDelta()).items.filter(item => `${item.summary || ""} ${item.description || ""}`.toLocaleLowerCase().includes(needle)).slice(0,40)
-        .map(item=>({id:item.id,title:item.summary,description:item.description,start:item.start,recurrence:item.recurrence,recurringEventId:item.recurringEventId,url:item.htmlLink,status:item.status}));
+        .map(item=>({id:item.id,title:item.summary,summary:item.summary,description:item.description,start:item.start,end:item.end,recurrence:item.recurrence,recurringEventId:item.recurringEventId,originalStartTime:item.originalStartTime,url:item.htmlLink,status:item.status}));
       return response(200,{items});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "previews" && segments.length === 3) {
