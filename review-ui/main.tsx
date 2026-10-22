@@ -37,8 +37,17 @@ function App() {
     setTaskId(selected.taskId||selected.decision?.context?.providerTaskId||"");
     setEventId(selected.eventId||selected.decision?.context?.providerEventId||"");
     setLeftovers({}); setReconcileProfile(selected.profile);
-    api(`cases/${encodeURIComponent(selected.id)}`).then(data=>{ setDetails(data); })
-      .catch(e=>setMessage(e.message));
+    let cancelled=false;
+    api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
+      if(cancelled)return;
+      setDetails(data);
+      const operationId=data.item?.operationId||selected.operationId;
+      if(operationId){
+        try { const result=await api(`operations/${encodeURIComponent(operationId)}`); if(!cancelled)setOperation(result.operation); }
+        catch(e:any){if(!cancelled)setMessage(e.message);}
+      }
+    }).catch(e=>{if(!cancelled)setMessage(e.message);});
+    return ()=>{cancelled=true;};
   },[selected]);
   useEffect(() => {
     refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));

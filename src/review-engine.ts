@@ -136,6 +136,10 @@ export class ReviewEngine {
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
     const masterSnapshot = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === (event?.recurringEventId || event?.id));
+    const approvedCalendarOccurrence = event?.recurrence?.length && intent.owner === "calendar"
+      ? snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === masterSnapshot?.calendarProjectionId)?.object as CalendarEvent | undefined
+      : undefined;
+    const calendarFieldSource = approvedCalendarOccurrence || event;
     if (intent.action === "link" && event?.recurringEventId && intent.owner === "todoist") {
       const parent = masterSnapshot?.object as CalendarEvent|undefined;
       const existingOwner = masterSnapshot?.recurrence?.owner || masterSnapshot?.mapping?.recurrenceOwner || parent?.extendedProperties?.shared?.syncRecurrenceOwner;
@@ -156,7 +160,10 @@ export class ReviewEngine {
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings };
     if (intent.action === "link" && (!task || !event)) throw new Error("Linking requires a live task and event");
     if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") throw new Error("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
-    if (intent.action === "link" && intent.winner === "todoist") toCalendarEvent(task!, event!);
+    if (intent.action === "link" && intent.winner === "todoist") {
+      if(event?.recurringEventId && intent.owner === "todoist") todoistOccurrenceProjection(task!,event!);
+      else toCalendarEvent(task!, event!);
+    }
     if (intent.action === "link" && event?.recurringEventId && !intent.owner) throw new Error("Choose which provider owns the recurrence for this Calendar occurrence");
     if (intent.action === "link" && intent.owner === "todoist" && !task?.due?.is_recurring) throw new Error("Todoist recurrence ownership requires a recurring Todoist task");
     if (intent.action === "create" && Boolean(task) === Boolean(event)) throw new Error("Select just the item whose counterpart should be created");
@@ -187,13 +194,14 @@ export class ReviewEngine {
       }
       changes.push(`Link Todoist task ${task!.id} to Calendar event ${event!.id}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
       if (intent.winner === "todoist") {
-        const desired=toCalendarEvent(task!,event!);
+        const desired=event?.recurringEventId && intent.owner === "todoist"
+          ? todoistOccurrenceProjection(task!,event!) : toCalendarEvent(task!,event!);
         fieldChange("Calendar title",event!.summary,desired.summary);
         fieldChange("Calendar description",event!.description,desired.description);
         fieldChange("Calendar start",event!.start,desired.start);
         fieldChange("Calendar end (duration / multi-day span)",event!.end,desired.end);
       } else if (intent.winner === "calendar") {
-        const desired=toTodoistTask(event!);
+        const desired=toTodoistTask(calendarFieldSource!);
         fieldChange("Todoist title",task!.content,desired.content);
         fieldChange("Todoist description",task!.description,desired.description);
         fieldChange("Todoist due date",task!.due,desired.due);
@@ -205,7 +213,7 @@ export class ReviewEngine {
         const desired=toCalendarEvent(task);
         changes.push(`New Calendar fields: title ${show(desired.summary)}, description ${show(desired.description)}, start ${show(desired.start)}, end ${show(desired.end)}`);
       } else {
-        const desired=toTodoistTask(source as CalendarEvent);
+        const desired=toTodoistTask(calendarFieldSource as CalendarEvent);
         changes.push(`New Todoist fields: title ${show(desired.content)}, description ${show(desired.description)}, due ${show(desired.due)}`);
       }
     } else if (intent.action === "separate") changes.push(`Keep the selected Todoist task ${intent.taskId || "(none)"} and Calendar event ${intent.eventId || "(none)"} unlinked`);
@@ -256,8 +264,12 @@ export class ReviewEngine {
     const queueDeferredRefresh = async (refs:EntityRef[]) => {
       const pending=await this.controls.pendingRefreshRefs(refs);
       if(!pending.length)return false;
-      const request=await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:pending});
-      if(!request.queued&&!request.coalesced)throw new Error("Provider updates arrived during this repair, but their reconciliation could not be queued; the repair barrier remains active. Resume this operation to retry.");
+      const byProfile = new Map<Profile, typeof pending>();
+      for(const ref of pending){const group=byProfile.get(ref.profile)||[];group.push(ref);byProfile.set(ref.profile,group);}
+      for(const [profile,profileRefs] of byProfile){
+        const request=await requestReconciliation(state,profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:profileRefs});
+        if(!request.queued&&!request.coalesced)throw new Error(`Provider updates arrived during this repair, but reconciliation for ${profile} could not be queued; the repair barrier remains active. Resume this operation to retry.`);
+      }
       return true;
     };
     const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {

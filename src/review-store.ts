@@ -68,12 +68,15 @@ export class ReviewStore {
       : status === "open"
         ? "#s = :repairing AND operationId = :op"
         : "#s = :current AND (attribute_not_exists(operationId) OR operationId = :op)";
+    const values: Record<string, unknown> = { ":s":status, ":r":result, ":now":new Date().toISOString(), ":op":operationId || "",
+      ":lookup":`REVIEW#${terminal ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` };
+    if (status === "repairing") Object.assign(values,{ ":open":"open", ":dismissed":"dismissed", ":empty":"", ":repairing":"repairing" });
+    else if (status === "open") values[":repairing"]="repairing";
+    else values[":current"]=current.status;
     await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
       UpdateExpression: "SET #s = :s, #r = :r, updatedAt = :now, operationId = :op, lookupSk = :lookup",
       ConditionExpression: condition,
-      ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: { ":s": status, ":r": result,
-        ":now": new Date().toISOString(), ":op": operationId || "", ":current": current.status, ":open":"open", ":dismissed":"dismissed", ":empty":"", ":repairing":"repairing",
-        ":lookup": `REVIEW#${terminal ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
+      ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: values }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));

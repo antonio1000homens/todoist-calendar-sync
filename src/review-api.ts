@@ -100,8 +100,8 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
 function assertOwned(subject: string, owner: string): void {
   if (subject !== owner) fail(403, "This record belongs to another review operator");
 }
-async function enqueueRepair(operationId: string, selectedProfile: Profile): Promise<void> {
-  const delivery: Delivery = { id:`repair:${operationId}`, kind:"repair", profile:selectedProfile, mode:"aws",
+async function enqueueRepair(operationId: string, selectedProfile: Profile, attempt: number): Promise<void> {
+  const delivery: Delivery = { id:`repair:${operationId}:attempt:${attempt}`, kind:"repair", profile:selectedProfile, mode:"aws",
     receivedAt:new Date().toISOString(), headers:{}, body:"", repair:{operationId} };
   await enqueueDelivery(delivery);
 }
@@ -181,7 +181,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       assertOwned(actor.subject,preview.actor.subject);
       const operation = await store.submit(preview,actor,idempotencyKey);
       if (operation.status === "queued") {
-        try { await enqueueRepair(operation.id,operation.preview.intent.profile); }
+        try { await enqueueRepair(operation.id,operation.preview.intent.profile,operation.attempt); }
         catch { return response(503,{error:"repair_enqueue_failed",message:"The repair was saved but queue delivery was not confirmed. Retry this same submission.",operation}); }
       }
       return response(operation.status === "succeeded" ? 200 : 202,{operation});
@@ -197,9 +197,10 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       if (!operation) return response(404,{error:"operation_not_found"});
       assertOwned(actor.subject,operation.actor.subject);
       if (!["failed","needs_review","queued"].includes(operation.status)) fail(409,"Only queued, failed, or interrupted repairs can be resumed");
+      if(operation.status !== "queued") operation.attempt += 1;
       operation.status = "queued";
       await store.saveOperation(operation);
-      try { await enqueueRepair(operation.id,operation.preview.intent.profile); }
+      try { await enqueueRepair(operation.id,operation.preview.intent.profile,operation.attempt); }
       catch { return response(503,{error:"repair_enqueue_failed",message:"The repair remains queued but queue delivery was not confirmed. Retry the operation.",operation}); }
       return response(202,{operation});
     }

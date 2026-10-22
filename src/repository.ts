@@ -67,6 +67,8 @@ export interface ReconciliationState {
   notificationReplyTs?: string;
   lastHealthAlertAt?: string;
   pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
+  /** Refreshes requested after this run started; they require a fresh generation. */
+  followUpRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
 }
 
 function mergePendingRefreshRefs(
@@ -239,11 +241,17 @@ export class StateRepository {
         || (stalledAt && Date.now() - Date.parse(stalledAt) >= 15 * 60_000)));
       if (current?.pending && !explicitlyRetryable) {
         const staleOrNeverEnqueued = !current.lastEnqueuedAt;
+        const started = Boolean(current.lastStartedAt);
+        const refreshRefs = context.pendingRefreshRefs?.length
+          ? started
+            ? { followUpRefreshRefs: mergePendingRefreshRefs(current.followUpRefreshRefs, context.pendingRefreshRefs) }
+            : { pendingRefreshRefs: mergePendingRefreshRefs(current.pendingRefreshRefs, context.pendingRefreshRefs) }
+          : {};
         const next: ReconciliationState = {
           ...current,
           reason,
           lastRequestedAt: requestedAt,
-          ...(context.pendingRefreshRefs?.length ? { pendingRefreshRefs: mergePendingRefreshRefs(current.pendingRefreshRefs, context.pendingRefreshRefs) } : {}),
+          ...refreshRefs,
           ...((current.requester || context.requester) ? { requester: current.requester || context.requester } : {}),
           ...((current.slackChannelId || context.slackChannelId) ? { slackChannelId: current.slackChannelId || context.slackChannelId } : {}),
           ...((current.slackMessageTs || context.slackMessageTs) ? { slackMessageTs: current.slackMessageTs || context.slackMessageTs } : {}),
@@ -254,7 +262,7 @@ export class StateRepository {
           await client.send(new UpdateCommand({
             TableName: this.ensureTable(),
             Key: key(`RECONCILE#${profile}`),
-            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, requester = :requester, slackChannelId = :channel, slackMessageTs = :messageTs, slackThreadTs = :thread, slackDecisionId = :decisionId, pendingRefreshRefs = :refreshRefs, expiresAt = :expiresAt",
+            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, requester = :requester, slackChannelId = :channel, slackMessageTs = :messageTs, slackThreadTs = :thread, slackDecisionId = :decisionId, pendingRefreshRefs = :refreshRefs, followUpRefreshRefs = :followUpRefs, expiresAt = :expiresAt",
             ConditionExpression: "#pending = :true AND generation = :generation",
             ExpressionAttributeNames: { "#pending": "pending" },
             ExpressionAttributeValues: {
@@ -268,6 +276,7 @@ export class StateRepository {
               ":thread": current.slackThreadTs || context.slackThreadTs || "",
               ":decisionId": current.slackDecisionId || context.slackDecisionId || "",
               ":refreshRefs": next.pendingRefreshRefs || current.pendingRefreshRefs || [],
+              ":followUpRefs": next.followUpRefreshRefs || [],
               ":expiresAt": ttl(30),
             },
           }));
@@ -289,6 +298,13 @@ export class StateRepository {
         status: "queued",
         lastProgressAt: requestedAt,
         ...context,
+        ...(() => {
+          const refreshRefs = mergePendingRefreshRefs(
+            mergePendingRefreshRefs(current?.pendingRefreshRefs, current?.followUpRefreshRefs),
+            context.pendingRefreshRefs,
+          );
+          return refreshRefs.length ? { pendingRefreshRefs: refreshRefs } : {};
+        })(),
         ...(current?.lastCompletedAt ? { lastCompletedAt: current.lastCompletedAt } : {}),
       };
       if (current && (current.lastFailedAt || explicitlyRetryable)) {
