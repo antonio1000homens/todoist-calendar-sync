@@ -615,7 +615,7 @@ export class ProjectAwareSynchronizer {
     // Always check the permanent event-side history marker before deleting a
     // provider event discovered from Calendar shared taskId properties.
     if (eventId) {
-      const completed = await this.state.getCompletedCalendarProjectionByEvent(sourceProfile, eventId);
+      const completed = await this.state.getCompletedCalendarProjectionByEvent?.(sourceProfile, eventId);
       if (completed?.taskId === task.id) {
         await this.state.audit(sourceProfile, "todoist_project_removal_historical_calendar_retained", {
           taskId: task.id, eventId, completedAt: completed.completedAt,
