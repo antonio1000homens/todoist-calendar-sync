@@ -346,10 +346,11 @@ function consolidationMasterFingerprint(event: CalendarEvent, plan: ReturnType<t
   delete shared.taskId;
   delete shared.syncRecurrenceOwner;
   delete shared.todoistRecurrence;
+  delete shared.syncHistoryCutoff;
   Object.assign(shared, {
     syncSource:"todoist-calendar-sync", syncHistoryOnly:"true", syncHistoryTaskId:taskId,
     syncHistoryOriginalRule:plan.originalRule, syncHistorySuccessorId:plan.newMasterId,
-    syncHistoryCutoff:plan.previousOccurrence,
+    ...(plan.previousOccurrence ? { syncHistoryCutoff: plan.previousOccurrence } : {}),
   });
   normalized.extendedProperties = { ...properties, shared };
   return fingerprint(normalized);
@@ -1017,7 +1018,7 @@ export class ManualInterventionService {
   private createManualExecutionClientFactory(
     state: StateRepository,
     budget: ReconciliationMutationBudget,
-    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision; consolidation?: { duplicateTaskId:string; oldMasterId:string; newMasterId:string; previousOccurrence:string } },
+    protectedItems: { taskIds: string[]; eventIds: string[]; decision: ManualDecision; consolidation?: { duplicateTaskId:string; oldMasterId:string; newMasterId:string; previousOccurrence?:string } },
   ): ProviderClientFactory {
     const recheckProtectedItems = async (profile: Profile) => {
       const current = await this.store.get(protectedItems.decision.decisionId);
@@ -1349,7 +1350,7 @@ export class ManualInterventionService {
       consolidationMasterFingerprint: consolidationMasterFingerprint(master,plan,task.id),
       consolidationTombstoneUpdatedAt: tombstone?.sourceUpdatedAt,
       consolidationFuturePlan: plan,
-      consolidationPreview: `Keep recurring task ${task.id}; remove one-off task ${duplicate.id} and cancelled event ${cancelled.id}. Preserve Calendar master ${master.id} through ${plan.previousOccurrence}, end its old series before ${plan.nextOldOccurrence}, then start the Todoist yearly recurrence on ${plan.newStart} (${calendarTimeZone}).`,
+      consolidationPreview: `Keep recurring task ${task.id}; remove one-off task ${duplicate.id} and cancelled event ${cancelled.id}. ${futureSplitDescription(plan, master.start?.date)}; future starts on ${plan.newStart} (${calendarTimeZone}).`,
     };
   }
 
