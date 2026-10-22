@@ -1,4 +1,5 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
@@ -13,34 +14,56 @@ const api = async (path:string, init?:RequestInit) => {
   return data;
 };
 function App() {
-  const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [details,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
+  const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
   const [action,setAction] = useState("link"), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
-  const [taskId,setTaskId] = useState(""), [eventId,setEventId] = useState(""), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
+  const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
   const [leftovers,setLeftovers] = useState<Record<string,string>>({});
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
+  const selectionVersion = useRef(0);
+  const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
+  // A detail response from the previously selected case must never be displayed.
+  const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
+  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction);
+  const validPreview=canPreview && preview?.intent?.caseId===selected?.id && preview?.intent?.profile===selected?.profile
+    && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
+    && preview?.intent?.action===action ? preview : undefined;
+  const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");};
+  const selectCase=(item?:Case)=>{
+    invalidatePreview();
+    setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
+    setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
+    setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+  };
+  const editId=(side:"todoist"|"calendar",id:string,verified=false)=>{
+    invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified));
+  };
+  const setTaskId=(id:string,verified=false)=>editId("todoist",id,verified);
+  const setEventId=(id:string,verified=false)=>editId("calendar",id,verified);
   const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
   const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data.reconciliation); };
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
-    api(`cases/${encodeURIComponent(caseId)}`).then(data=>{ setProfile(data.item.profile); setSelected(data.item); setDetails(data); })
+    api(`cases/${encodeURIComponent(caseId)}`).then(data=>{ setProfile(data.item.profile); selectCase(data.item); })
       .catch(e=>setMessage(e.message));
   },[]);
   useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
   useEffect(() => {
     if (!selected) { setDetails(undefined); setPreview(undefined); setOperation(undefined); return; }
     setMessage(""); setPreview(undefined); setOperation(undefined); setSubmitKey("");
-    setTaskId(selected.taskId||selected.decision?.context?.providerTaskId||"");
-    setEventId(selected.eventId||selected.decision?.context?.providerEventId||"");
-    setLeftovers({}); setSearchText(""); setSearchResults([]); setSearchSide("todoist"); setReconcileProfile(selected.profile);
+    setDetails(undefined);setRepairSelection(emptyRepairSelection(selected));
+    setLeftovers({}); setReconcileProfile(selected.profile);
     let cancelled=false;
     api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
       if(cancelled)return;
+      if(data.item?.id!==selected.id||data.item?.profile!==selected.profile)throw new Error("Selected conflict changed during refresh");
+      // Apply both the visible live data and its verified form IDs as one update.
       setDetails(data);
+      setRepairSelection(current=>reconcileRepairSelection(data.item,data.snapshots,current));
       const operationId=data.item?.operationId||selected.operationId;
       if(operationId){
         try { const result=await api(`operations/${encodeURIComponent(operationId)}`); if(!cancelled)setOperation(result.operation); }
@@ -63,7 +86,10 @@ function App() {
     try { const parsed=new URL(href); return ["https:","http:"].includes(parsed.protocol)?parsed.href:undefined; } catch { return undefined; }
   };
   const displaySnapshot=(sideName:"todoist"|"calendar") => {
-    const current=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName), item=current?.object as ProviderObject|undefined;
+    const matches=details?.snapshots?.filter((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName)||[];
+    const requestedId=sideName==="todoist"?taskId:eventId;
+    const current=matches.find((s:any)=>s.ref.id===requestedId)||(!requestedId&&matches.length===1?matches[0]:undefined);
+    const item=current?.object as ProviderObject|undefined;
     if (!item) return <p>{current?`The provider could not find ${sideName} item ${current.ref.id}.`:`No ${sideName} item ID is attached to this alert. Search for the item below to continue.`}</p>;
     const start=sideName==="todoist"?(item.due?.datetime||item.due?.date):(item.start?.dateTime||item.start?.date);
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
@@ -95,35 +121,46 @@ function App() {
     alertContext.calendarStart&&liveEvent?.start&&(alertContext.calendarStart!==(liveEvent.start.dateTime||liveEvent.start.date))?`Calendar date changed from ${alertContext.calendarStart}`:undefined,
   ].filter(Boolean) as string[];
   const itemTitle=(snapshot:any) => snapshot?.object?.content||snapshot?.object?.summary||snapshot?.ref?.id;
-  const updateLeftover=(key:string,value:string) => setLeftovers(current=>({...current,[key]:value}));
+  const updateLeftover=(key:string,value:string) => {invalidatePreview();setLeftovers(current=>({...current,[key]:value}));};
   const search=async () => {
     if (!selected) return;
     setBusy(true);setMessage("");setSearchResults([]);
-    try { const q=new URLSearchParams({profile:selected.profile,side:searchSide,q:searchText});const result=await api(`search?${q}`);setSearchResults(result.items); }
+    const requestVersion=selectionVersion.current;
+    try { const q=new URLSearchParams({profile:selected.profile,side:searchSide,q:searchText});const result=await api(`search?${q}`);
+      if(requestVersion===selectionVersion.current)setSearchResults(result.items.map((item:any)=>({...item,_caseId:selected.id,_profile:selected.profile,_side:searchSide})));
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const refreshAffected=async () => {
     if(!selected)return;
-    setBusy(true);setMessage("");
+    setBusy(true);setMessage("");invalidatePreview();
+    const requestVersion=selectionVersion.current;
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:"POST",body:JSON.stringify(intent)});setDetails((current:any)=>({...current,snapshots:result.snapshots}));setLeftovers({}); }
+    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:"POST",body:JSON.stringify(intent)});
+      if(requestVersion!==selectionVersion.current)return;
+      setDetails((current:any)=>current?.item?.id===selected.id?{...current,snapshots:result.snapshots}:current);
+      setRepairSelection(current=>reconcileRepairSelection(selected,result.snapshots,current));setLeftovers({});
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const createPreview=async () => {
-    if (!selected) return;
+    if (!selected || !canPreview) return;
     setBusy(true);setMessage("");setPreview(undefined);setOperation(undefined);setSubmitKey("");
+    const requestVersion=selectionVersion.current;
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/previews`,{method:"POST",body:JSON.stringify(intent)});setPreview(result.preview); }
+    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/previews`,{method:"POST",body:JSON.stringify(intent)});
+      if(requestVersion===selectionVersion.current)setPreview(result.preview);
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const applyPreview=async () => {
-    if (!preview) return;
+    if (!validPreview) return;
     setBusy(true);setMessage("");
     const idempotencyKey=submitKey||crypto.randomUUID();
     setSubmitKey(idempotencyKey);
-    try { const result=await api(`previews/${encodeURIComponent(preview.id)}/submit`,{method:"POST",headers:{"Idempotency-Key":idempotencyKey},body:"{}"});setOperation(result.operation);setPreview(undefined); }
+    try { const result=await api(`previews/${encodeURIComponent(validPreview.id)}/submit`,{method:"POST",headers:{"Idempotency-Key":idempotencyKey},body:"{}"});setOperation(result.operation);setPreview(undefined); }
     catch(e:any){if(e.data?.operation)setOperation(e.data.operation);setMessage(e.message);} finally{setBusy(false);}
   };
   const resume=async () => {
@@ -145,19 +182,20 @@ function App() {
     if(!selected||selected.status!=="open")return;
     if(!window.confirm("Dismiss this alert without changing Todoist, Calendar, or their mapping?"))return;
     setBusy(true);setMessage("");
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});setSelected(result.item);await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
+    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item);await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
   const snapshots=(details?.snapshots||[]).filter((item:any)=>item.object);
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
+  const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
-      <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);setSelected(undefined);setDetails(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
+      <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);selectCase(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
     {message && <p className="notice" role="status">{message}</p>}
-    <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>setSelected(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
+    <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         {selected.decision?.type?.startsWith("operational_")&&<details className="preview"><summary>Delivery failure details</summary><dl>
@@ -176,29 +214,35 @@ function App() {
         <div className="preview">
           <h3>Repair this conflict</h3>
           <div className="formgrid">
-            <label>Action<select value={action} onChange={e=>{setAction(e.target.value);setPreview(undefined);}}>{[
+            <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);}}>{[
               ["link","Link or replace an association"],["separate","Keep items separate"],["create","Create the missing counterpart"],["exclude","Exclude selected items from syncing"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
             ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
             <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" /></label>
             <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" /></label>
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
-            {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{setTaskId(liveMapping.taskId);setEventId(currentMappedEventId);setPreview(undefined);}}>Use current mapped pair</button>}
+            {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
+              invalidatePreview();
+              setRepairSelection(reconcileRepairSelection(
+                {...selected,taskId:liveMapping.taskId,eventId:currentMappedEventId},details.snapshots,emptyRepairSelection(selected)
+              ));
+            }}>Use current mapped pair</button>}
             {action==="create"&&<div className="source-choice"><span>Choose which item should get a new counterpart:</span><div><button className="secondary" onClick={()=>setEventId("")}>Create Calendar event from this Todoist task</button><button className="secondary" onClick={()=>setTaskId("")}>Create Todoist task from this Calendar event</button></div></div>}
-            {action==="link"&&<label>Fields to use<select value={winner} onChange={e=>setWinner(e.target.value)}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select></label>}
-            {["link","create"].includes(action)&&<label>Recurrence owner<select value={owner} onChange={e=>setOwner(e.target.value)}><option value="">No recurrence / leave unchanged</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select></label>}
-            {["link","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>setScope(e.target.value)}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select></label>}
-            {action==="move"&&<label>Destination account<select value={targetProfile} onChange={e=>setTargetProfile(e.target.value)}><option value="">Choose account</option>{profiles.filter(p=>p!=="all"&&p!==selected.profile).map(p=><option key={p}>{p}</option>)}</select></label>}
-            {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>setDecisionAction(e.target.value)}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
+            {action==="link"&&<label>Fields to use<select value={winner} onChange={e=>{invalidatePreview();setWinner(e.target.value);}}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select></label>}
+            {["link","create"].includes(action)&&<label>Recurrence owner<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}}><option value="">No recurrence / leave unchanged</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select></label>}
+            {["link","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select></label>}
+            {action==="move"&&<label>Destination account<select value={targetProfile} onChange={e=>{invalidatePreview();setTargetProfile(e.target.value);}}><option value="">Choose account</option>{profiles.filter(p=>p!=="all"&&p!==selected.profile).map(p=><option key={p}>{p}</option>)}</select></label>}
+            {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
-          <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>setSearchSide(e.target.value)}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
-          {searchResults.length>0&&<ul className="results">{searchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id):setEventId(item.id)}>Use this item</button></li>)}</ul>}
+          <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
+          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id,true):setEventId(item.id,true)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh affected items</button>
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Choose what happens to each live item left outside the selected repair.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;return <div className="leftover" key={key}><span><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)}</span><label>Disposition<select value={leftovers[key]||""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option><option value="create">Create a new counterpart</option><option value="exclude">Exclude from syncing</option></select></label></div>;})}</div>}
-          <button onClick={createPreview} disabled={busy}>{busy?"Working…":"Preview repair"}</button>
+          {!canPreview&&details&&<p className="warning" role="status">Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict.</p>}
+          <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
-        {preview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(preview.expiresAt*1000).toLocaleString()}.</p><h4>Affected provider items</h4><ul>{preview.snapshots.map((item:any)=><li key={choiceKey(item)}><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)||"Missing provider item"}{item.mapping&&<> · currently linked as {item.mapping.taskId} ↔ {item.mapping.eventId}</>}{item.control?.excluded&&" · currently excluded"}{item.checkedAt&&<> · checked {new Date(item.checkedAt).toLocaleString()}</>}</li>)}</ul><h4>Planned changes</h4><ul>{preview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul><h4>Warnings</h4><ul>{preview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
+        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><h4>Affected provider items</h4><ul>{validPreview.snapshots.map((item:any)=><li key={choiceKey(item)}><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)||"Missing provider item"}{item.mapping&&<> · currently linked as {item.mapping.taskId} ↔ {item.mapping.eventId}</>}{item.control?.excluded&&" · currently excluded"}{item.checkedAt&&<> · checked {new Date(item.checkedAt).toLocaleString()}</>}</li>)}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul><h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>
