@@ -36,6 +36,7 @@ function App() {
     invalidatePreview();
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
+    setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false)=>{
     invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified));
