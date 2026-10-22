@@ -1,8 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {planPurge, fingerprint} from "../scripts/item-purge-policy.mjs";
 
+test("standalone purge CLI parses without provider execution",()=>{
+ assert.doesNotThrow(()=>execFileSync(process.execPath,["--check","scripts/purge-item.mjs"]));
+});
 const target = {profile:"home",taskId:"task-123",eventId:"evt_123"};
 function record(pk, sk="STATE", values={}) {return {pk,sk,...values};}
 test("inventories all direct mapping indexes and other state with exact keys", () => {
