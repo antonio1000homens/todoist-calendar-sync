@@ -1,19 +1,16 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createReviewApiClient, isAbortError } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
-type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}> };
+type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
+type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
-const api = async (path:string, init?:RequestInit) => {
-  const response = await fetch("/review/api/" + path, { ...init, headers:{ "content-type":"application/json", ...(init?.headers || {}) } });
-  const data = await response.json();
-  if (!response.ok) { const error:any=new Error(data.message||data.error||`Request failed (${response.status})`);error.data=data;throw error; }
-  return data;
-};
+const api = createReviewApiClient();
 function IdentityDetails({value,scope}:{value:any;scope?:string}) {
   const identity=providerIdentity(value);
   return <div className="item-identity">
@@ -36,6 +33,17 @@ function App() {
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
   const selectionVersion = useRef(0);
+  const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
+  const [detailRetry,setDetailRetry] = useState(0);
+  const detailKey=selected ? `${selected.profile}:${selected.id}` : "";
+  const currentDetailState=detailState?.key===detailKey ? detailState : undefined;
+  const retryDetails=()=>{
+    if (!selected) return;
+    setDetails(undefined);
+    setRepairSelection(emptyRepairSelection(selected));
+    setDetailState({key:detailKey,status:"loading"});
+    setDetailRetry(value=>value+1);
+  };
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
@@ -50,6 +58,7 @@ function App() {
   const selectCase=(item?:Case)=>{
     invalidatePreview();
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
+    setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
   };
@@ -63,30 +72,40 @@ function App() {
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
-    api(`cases/${encodeURIComponent(caseId)}`).then(data=>{ setProfile(data.item.profile); selectCase(data.item); })
-      .catch(e=>setMessage(e.message));
+    const controller=new AbortController();
+    api(`cases/${encodeURIComponent(caseId)}`,{signal:controller.signal})
+      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item);}})
+      .catch(e=>{if(!isAbortError(e))setMessage(e.message);});
+    return ()=>controller.abort();
   },[]);
   useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
   useEffect(() => {
     if (!selected) { setDetails(undefined); setPreview(undefined); setOperation(undefined); return; }
+    const controller=new AbortController();
+    const key=`${selected.profile}:${selected.id}`;
     setMessage(""); setPreview(undefined); setOperation(undefined); setSubmitKey("");
     setDetails(undefined);setRepairSelection(emptyRepairSelection(selected));
     setLeftovers({}); setReconcileProfile(selected.profile);
-    let cancelled=false;
-    api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
-      if(cancelled)return;
+    setDetailState({key,status:"loading"});
+    api(`cases/${encodeURIComponent(selected.id)}`,{signal:controller.signal},{
+      onRetry:()=>{if(!controller.signal.aborted)setDetailState({key,status:"retrying"});},
+    }).then(async data=>{
+      if(controller.signal.aborted)return;
       if(data.item?.id!==selected.id||data.item?.profile!==selected.profile)throw new Error("Selected conflict changed during refresh");
       // Apply both the visible live data and its verified form IDs as one update.
       setDetails(data);
+      setDetailState({key,status:"ready"});
       setRepairSelection(current=>reconcileRepairSelection(data.item,data.snapshots,current));
       const operationId=data.item?.operationId||selected.operationId;
       if(operationId){
-        try { const result=await api(`operations/${encodeURIComponent(operationId)}`); if(!cancelled)setOperation(result.operation); }
-        catch(e:any){if(!cancelled)setMessage(e.message);}
+        try { const result=await api(`operations/${encodeURIComponent(operationId)}`,{signal:controller.signal}); if(!controller.signal.aborted)setOperation(result.operation); }
+        catch(e:any){if(!controller.signal.aborted&&!isAbortError(e))setMessage(e.message);}
       }
-    }).catch(e=>{if(!cancelled)setMessage(e.message);});
-    return ()=>{cancelled=true;};
-  },[selected]);
+    }).catch(e=>{
+      if(!controller.signal.aborted&&!isAbortError(e))setDetailState({key,status:"error",message:e.message});
+    });
+    return ()=>controller.abort();
+  },[selected,detailRetry]);
   useEffect(() => {
     refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
   },[reconcileProfile]);
@@ -236,7 +255,10 @@ function App() {
           {selected.decision.context?.providerEventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.providerEventId}</dd></>}
         </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
         {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
-        <div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>
+        {!details?<div className="notice detail-load" role="status">
+          {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
+            <p>{currentDetailState?.status==="retrying"?"Review API is busy (HTTP 429). Retrying case details…":"Loading live Todoist and Calendar details…"}</p>}
+        </div>:<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>}
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
@@ -265,14 +287,14 @@ function App() {
           </div>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true):setEventId(item.id,true)}>Use this item</button></li>)}</ul>}
-          <button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh affected items</button>
+          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const options=dispositionOptions(item);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}</select></label>}</div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict.</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
-        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} /><div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul><h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
+        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} /><div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{!operation.abandoned&&["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>
