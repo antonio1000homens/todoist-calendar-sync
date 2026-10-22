@@ -1,4 +1,4 @@
-import { attachProjectCommentReference, buildProjectMappingIndex } from "./mapping-comments.js";
+import { attachProjectCommentReference, buildProjectMappingIndex, deleteMappingComments } from "./mapping-comments.js";
 import { planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule, type FutureSeriesSplitPlan } from "./recurrence-split.js";
 import { hasCanonicalState, toCalendarEvent } from "./sync.js";
 import { selectTodoistCurrentInstance } from "./todoist-recurrence.js";
@@ -57,6 +57,15 @@ export async function applyApprovedFutureSeriesSplit(
   options: {
     now?: Date; expectedRule?: string; expectedDue?: string;
     approvedPlan?: FutureSeriesSplitPlan; approvedEtag?: string;
+    consolidation?: {
+      retainedTaskId: string;
+      discardedTask: TodoistTask;
+      previousMapping: Mapping;
+      previousLink: RecurrenceLink;
+      cancelledEventId: string;
+      decisionId: string;
+      tombstone?: import("./repository.js").CalendarProjectionTombstone;
+    };
   } = {},
 ): Promise<FutureSplitResult> {
   const now = options.now || new Date();
@@ -71,7 +80,7 @@ export async function applyApprovedFutureSeriesSplit(
   }
   const planningDate = archived && options.approvedPlan?.approvedAt
     ? new Date(options.approvedPlan.approvedAt) : now;
-  const plan = planFutureSeriesSplit(profile, task, old, planningDate, timeZone);
+  const plan = planFutureSeriesSplit(profile, task, old, planningDate, timeZone, options.consolidation?.discardedTask.id);
   if (options.approvedPlan) {
     for (const field of ["oldMasterId", "newMasterId", "originalRule", "truncatedRule",
       "newRule", "previousOccurrence", "nextOldOccurrence", "newStart",
@@ -88,13 +97,14 @@ export async function applyApprovedFutureSeriesSplit(
     || (options.expectedRule && options.expectedRule !== plan.originalRule)) {
     throw new Error("Future split approval no longer matches the current task or Calendar schedule");
   }
-  if (!archived && old.extendedProperties?.shared?.taskId !== task.id) {
+  if (!archived && old.extendedProperties?.shared?.taskId !== task.id
+    && old.extendedProperties?.shared?.taskId !== options.consolidation?.discardedTask.id) {
     throw new Error("Legacy recurring Calendar master is not linked to the approved task");
   }
   if (archived && originalTaskId !== task.id) {
     throw new Error("Previously split Calendar series is not owned by this task");
   }
-  const [owner, oldEventMapping, tombstone, completed, history, taskLink, oldLink, tasks, linked] = await Promise.all([
+  const [owner, oldEventMapping, tombstone, completed, history, taskLink, oldLink, tasks, linked, discardedHistory] = await Promise.all([
     state.getMappingByTaskAnyProfile(task.id),
     state.getMappingByEvent(profile, old.id),
     state.getCalendarProjectionTombstone(profile, task.id),
@@ -103,9 +113,19 @@ export async function applyApprovedFutureSeriesSplit(
     state.getRecurrenceLink(profile, task.id),
     state.getRecurrenceLink(profile, old.iCalUID || old.id),
     pair.todoist.listTasks(),
-    pair.calendar.findByTodoistTaskId(task.id),
+    options.consolidation ? Promise.resolve(undefined) : pair.calendar.findByTodoistTaskId(task.id),
+    options.consolidation
+      ? state.listCompletedCalendarProjectionsByTaskAnyProfile(options.consolidation.discardedTask.id)
+      : Promise.resolve([]),
   ]);
-  if (tombstone || completed || history.length || oldEventMapping || oldLink) {
+  if ((tombstone && !options.consolidation)
+    || (tombstone && options.consolidation?.tombstone?.sourceUpdatedAt !== tombstone.sourceUpdatedAt)
+    || completed || history.length || oldEventMapping
+    || (!options.consolidation && oldLink)
+    || (options.consolidation && (oldLink?.owner !== "calendar"
+      || oldLink.taskId !== options.consolidation.discardedTask.id
+      || oldLink.updatedAt !== options.consolidation.previousLink.updatedAt
+      || discardedHistory.length))) {
     throw new Error("A tombstone, completed occurrence or old-series owner blocks automatic history splitting");
   }
   if (owner && (owner.profile !== profile || owner.taskId !== task.id
@@ -116,10 +136,28 @@ export async function applyApprovedFutureSeriesSplit(
     || taskLink.masterEventId !== plan.newMasterId)) {
     throw new Error("An existing recurrence link has different ownership");
   }
-  if (tasks.some((other) => other.id !== task.id && sameTitle(other.content, task.content))) {
+  if (tasks.some((other) => other.id !== task.id
+    && other.id !== options.consolidation?.discardedTask.id
+    && sameTitle(other.content, task.content))) {
     throw new Error("Another Todoist task has the same title; cannot prove unique recurring identity");
   }
-  if (!archived && (!linked || linked.id !== old.id)) {
+  if (options.consolidation) {
+    const discarded = options.consolidation.discardedTask;
+    const previous = options.consolidation.previousMapping;
+    const link = options.consolidation.previousLink;
+    if (discarded.id === task.id || discarded.due?.is_recurring
+      || discarded.is_deleted || discarded.is_completed
+      || !sameTitle(discarded.content, task.content)
+      || discarded.due?.date !== previous.activeEffectiveStart
+      || previous.taskId !== discarded.id || previous.recurrenceOwner !== "calendar"
+      || previous.masterEventId !== old.id || previous.activeInstanceId !== previous.eventId
+      || link.taskId !== discarded.id || link.owner !== "calendar"
+      || link.masterEventId !== old.id || link.activeInstanceId !== previous.activeInstanceId
+      || link.seriesId !== (old.iCalUID || old.id)
+      || !tasks.some((candidate) => candidate.id === discarded.id && candidate.is_deleted !== true)) {
+      throw new Error("The proposed duplicate is no longer the mapped active one-off occurrence");
+    }
+  } else if (!archived && (!linked || linked.id !== old.id)) {
     throw new Error("The Calendar task-link search does not uniquely identify the historical master");
   }
   if (archived && linked && linked.id !== plan.newMasterId) {
@@ -136,12 +174,20 @@ export async function applyApprovedFutureSeriesSplit(
     String(comment.content || "").includes(task.id) || String(comment.content || "").includes(old.id))) {
     throw new Error("Malformed project mapping comments reference the split identity");
   }
-  if (related.length > 1 || related.some(({ payload }) => payload.profile !== profile || payload.taskId !== task.id
-    || ![old.id, plan.newMasterId].includes(payload.eventId)
-    || payload.recurrenceOwner === "calendar"
-    || (payload.masterEventId && ![old.id, plan.newMasterId].includes(payload.masterEventId))
-    || (payload.seriesId && payload.seriesId !== task.id)
-    || payload.completedThroughOriginalStart || payload.calendarProgressVersion)) {
+  const invalidRelated = related.filter(({ payload }) => {
+    const source = options.consolidation?.previousMapping;
+    const isDiscardedBreadcrumb = Boolean(source && payload.profile === profile
+      && payload.taskId === source.taskId && payload.eventId === source.eventId
+      && payload.seriesId === source.seriesId && payload.masterEventId === source.masterEventId
+      && payload.recurrenceOwner === "calendar");
+    return !isDiscardedBreadcrumb && (payload.profile !== profile || payload.taskId !== task.id
+      || ![old.id, plan.newMasterId].includes(payload.eventId)
+      || payload.recurrenceOwner === "calendar"
+      || (payload.masterEventId && ![old.id, plan.newMasterId].includes(payload.masterEventId))
+      || (payload.seriesId && payload.seriesId !== task.id)
+      || payload.completedThroughOriginalStart || payload.calendarProgressVersion);
+  });
+  if (related.length > (options.consolidation ? 2 : 1) || invalidRelated.length) {
     throw new Error("Existing project mapping comments conflict with future-series ownership");
   }
   const legacy = await pair.todoist.listTaskComments(task.id);
@@ -169,7 +215,10 @@ export async function applyApprovedFutureSeriesSplit(
   await state.assertHistoricalSeriesUnowned(old.id, [
     ...historical.map((item) => item.id),
     ...oldFuture.map((item) => item.id),
-  ]);
+  ], options.consolidation ? {
+    mapping: options.consolidation.previousMapping,
+    link: options.consolidation.previousLink,
+  } : undefined);
   if (!archived && oldFuture.some((item) =>
     !isUnmodifiedInstance(item, old.id)
     || !sameTitle(item.summary, old.summary)
@@ -194,6 +243,16 @@ export async function applyApprovedFutureSeriesSplit(
   // Persist the split guard BEFORE the first provider write. If the worker
   // crashes after capping the master, manual reconciliation and Todoist
   // webhooks must not create a competing recurrence while this remains pending.
+  if (options.consolidation) {
+    await state.putConsolidationGuard(
+      profile,
+      options.consolidation.discardedTask.id,
+      task.id,
+      options.consolidation.decisionId,
+      options.consolidation.cancelledEventId,
+      options.consolidation.previousMapping,
+    );
+  }
   await state.beginFutureSeriesSplit(profile, task.id, old.id, plan.newMasterId, plan.previousOccurrence);
   if (!archived) {
     const shared = { ...(old.extendedProperties?.shared || {}) };
@@ -252,7 +311,7 @@ export async function applyApprovedFutureSeriesSplit(
   }
   const [currentTask, linkedNow, occurrences] = await Promise.all([
     pair.todoist.getTask(task.id),
-    pair.calendar.findByTodoistTaskId(task.id),
+    options.consolidation ? Promise.resolve(undefined) : pair.calendar.findByTodoistTaskId(task.id),
     pair.calendar.listInstancesInWindow(
       future.id, addDays(plan.newStart, -1) + "T00:00:00Z",
       addDays(plan.newStart, 2) + "T00:00:00Z",
@@ -261,7 +320,7 @@ export async function applyApprovedFutureSeriesSplit(
   if (!currentTask.due?.is_recurring || currentTask.due.date !== task.due?.date
     || currentTask.due.string !== task.due?.string
     || currentTask.content !== task.content || currentTask.updated_at !== task.updated_at
-    || linkedNow?.id !== future.id) {
+    || (!options.consolidation && linkedNow?.id !== future.id)) {
     throw new Error("Todoist task or Calendar linked identity changed before mapping");
   }
   const active = selectTodoistCurrentInstance(occurrences, currentTask);
@@ -277,6 +336,7 @@ export async function applyApprovedFutureSeriesSplit(
       || currentLink?.masterEventId !== future.id || currentLink.taskId !== task.id) {
       throw new Error("Ownership changed during the series split");
     }
+    if (options.consolidation) await finalizeConsolidation(options.consolidation, pair, state);
     await state.completeFutureSeriesSplit(profile, task.id, future.id);
     return { mapping: existing, plan, resumed: true };
   }
@@ -301,8 +361,19 @@ export async function applyApprovedFutureSeriesSplit(
     activeEffectiveStart: mapping.activeEffectiveStart, taskId: task.id,
     eventId: future.id, updatedAt: mapping.updatedAt,
   };
-  const committed = await state.putNewRecurrenceMappingIfUnowned(mapping, link);
+  const committed = options.consolidation
+    ? await state.commitRecurrenceConsolidation({
+      mapping, link,
+      previousMapping: options.consolidation.previousMapping,
+      previousLink: options.consolidation.previousLink,
+      discardedTaskId: options.consolidation.discardedTask.id,
+      decisionId: options.consolidation.decisionId,
+      expectedTombstone: options.consolidation.tombstone,
+      cancelledEventId: options.consolidation.cancelledEventId,
+    })
+    : await state.putNewRecurrenceMappingIfUnowned(mapping, link);
   if (!committed) throw new Error("A concurrent mapping or tombstone claimed the task before commit");
+  if (options.consolidation) await finalizeConsolidation(options.consolidation, pair, state);
   await state.completeFutureSeriesSplit(profile, task.id, future.id);
   await state.audit(profile, "manual_future_series_split_applied", {
     taskId: task.id, oldMasterId: old.id, newMasterId: future.id,
@@ -310,4 +381,33 @@ export async function applyApprovedFutureSeriesSplit(
     priorRule: plan.originalRule, newRule: plan.newRule,
   });
   return { mapping, plan, resumed: archived };
+}
+
+async function finalizeConsolidation(
+  consolidation: NonNullable<NonNullable<Parameters<typeof applyApprovedFutureSeriesSplit>[5]>["consolidation"]>,
+  pair: ProviderClients,
+  state: StateRepository,
+): Promise<void> {
+  if (consolidation.previousMapping.projectCommentId || consolidation.previousMapping.commentId
+    || consolidation.previousMapping.taskCommentId) {
+    await deleteMappingComments(pair.todoist, consolidation.previousMapping);
+  }
+  const cancelledComment = await pair.todoist.findComment(consolidation.retainedTaskId, consolidation.cancelledEventId);
+  if (cancelledComment) {
+    const record = await pair.todoist.getComment(cancelledComment.id).catch(() => undefined);
+    await deleteMappingComments(pair.todoist, {
+      profile: consolidation.previousMapping.profile,
+      taskId: consolidation.retainedTaskId,
+      eventId: consolidation.cancelledEventId,
+      updatedAt: new Date().toISOString(),
+      ...(record?.project_id ? { projectCommentId: cancelledComment.id } : { taskCommentId: cancelledComment.id }),
+    });
+  }
+  await pair.calendar.deleteEvent(consolidation.cancelledEventId).catch((error: unknown) => {
+    if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+  });
+  await pair.todoist.deleteTask(consolidation.discardedTask.id).catch((error: unknown) => {
+    if (Number((error as { status?: number }).status) !== 404) throw error;
+  });
+  await state.recordMutation(consolidation.previousMapping.profile);
 }

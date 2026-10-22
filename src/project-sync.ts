@@ -312,6 +312,16 @@ export class ProjectAwareSynchronizer {
     const rawPayload = JSON.parse(delivery.body) as TodoistWebhookPayload;
     if (!rawPayload.event_data?.id) return;
 
+    const consolidated = await this.state.getConsolidatedTask?.(delivery.profile, rawPayload.event_data.id);
+    if (consolidated) {
+      await this.state.audit(delivery.profile, "todoist_consolidated_duplicate_webhook_ignored", {
+        discardedTaskId: rawPayload.event_data.id,
+        retainedTaskId: consolidated.retainedTaskId,
+        decisionId: consolidated.decisionId,
+      });
+      return;
+    }
+
     const mapping = await this.state.getMappingByTaskAnyProfile(rawPayload.event_data.id);
     const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {

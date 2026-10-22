@@ -14,6 +14,7 @@ import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./futu
 import { ManualDecisionStore, ManualInterventionService, type ManualDecision } from "./manual-intervention.js";
 import { ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
 import { guardRepairProviders } from "./repair-provider-guard.js";
+import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 const missing = (e: unknown) => [404, 410].includes(Number((e as { status?: number }).status));
 const at = () => new Date().toISOString();
@@ -26,8 +27,10 @@ function recurrenceAnchorMatches(event: CalendarEvent): boolean {
 function decisionRepairIntent(intent: RepairIntent, decision?: ManualDecision): RepairIntent {
   if (intent.action !== "decision") return intent;
   if (!decision || !decision.permittedActions.some(a => a.id === intent.decisionAction) || intent.decisionAction === "reconcile_now") throw new Error("Select a permitted repair action; reconciliation is a separate explicit request");
-  const taskId = intent.decisionAction?.startsWith("bind_task:") ? intent.decisionAction.slice("bind_task:".length) : decision.taskId || decision.mappingSnapshot?.taskId;
-  const eventId = decision.eventId || decision.mappingSnapshot?.eventId || decision.activeInstanceId || decision.masterEventId;
+  const contextTaskId = typeof decision.context?.providerTaskId === "string" ? decision.context.providerTaskId : undefined;
+  const contextEventId = typeof decision.context?.providerEventId === "string" ? decision.context.providerEventId : undefined;
+  const taskId = intent.decisionAction?.startsWith("bind_task:") ? intent.decisionAction.slice("bind_task:".length) : decision.taskId || decision.mappingSnapshot?.taskId || contextTaskId;
+  const eventId = decision.eventId || decision.mappingSnapshot?.eventId || decision.activeInstanceId || decision.masterEventId || contextEventId;
   if (intent.taskId && intent.taskId !== taskId || intent.eventId && intent.eventId !== eventId) throw new Error("Selected items do not match the decision's repair targets");
   return { ...intent, taskId, eventId };
 }
@@ -79,8 +82,10 @@ export class ReviewEngine {
     }
     if (intent.action === "decision" && decision) {
       const mapping = decision.mappingSnapshot;
-      for (const taskId of [decision.taskId, mapping?.taskId]) if (taskId) add({ profile:intent.profile, side:"todoist", id:taskId });
-      for (const eventId of [decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId]) {
+      const contextTaskId = typeof decision.context?.providerTaskId === "string" ? decision.context.providerTaskId : undefined;
+      const contextEventId = typeof decision.context?.providerEventId === "string" ? decision.context.providerEventId : undefined;
+      for (const taskId of [decision.taskId, mapping?.taskId, contextTaskId]) if (taskId) add({ profile:intent.profile, side:"todoist", id:taskId });
+      for (const eventId of [decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId, contextEventId]) {
         if (eventId) add({ profile:intent.profile, side:"calendar", id:eventId });
       }
     }
@@ -143,6 +148,10 @@ export class ReviewEngine {
     if (event?.recurringEventId && intent.owner === "calendar" && ["link","create"].includes(intent.action)
       && masterSnapshot?.calendarProjectionId !== event.id) throw new Error("Choose the active Calendar occurrence or its master to repair this series");
     const changes: string[] = [], warnings: string[] = [];
+    const show = (value:unknown) => value === undefined ? "unset" : typeof value === "string" ? value : JSON.stringify(value);
+    const fieldChange = (label:string,before:unknown,after:unknown) => {
+      if (reviewHash({value:before}) !== reviewHash({value:after})) changes.push(`${label}: ${show(before)} → ${show(after)}`);
+    };
     const preview: RepairPreview = { id: randomUUID(), actor, intent, case: record, snapshots, fingerprint: snapshotFingerprint(snapshots),
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings };
     if (intent.action === "link" && (!task || !event)) throw new Error("Linking requires a live task and event");
@@ -176,8 +185,33 @@ export class ReviewEngine {
       } else if (task?.due?.is_recurring && intent.owner !== "todoist" && !event?.recurringEventId) {
         throw new Error("Choose Todoist recurrence ownership for this recurring task, or use its existing recurrence resolution action");
       }
-      changes.push(`Link task ${task!.content} to event ${event!.summary}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
-    } else changes.push(`${intent.action}: preserve the original provider items`);
+      changes.push(`Link Todoist task ${task!.id} to Calendar event ${event!.id}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
+      if (intent.winner === "todoist") {
+        const desired=toCalendarEvent(task!,event!);
+        fieldChange("Calendar title",event!.summary,desired.summary);
+        fieldChange("Calendar description",event!.description,desired.description);
+        fieldChange("Calendar start",event!.start,desired.start);
+        fieldChange("Calendar end (duration / multi-day span)",event!.end,desired.end);
+      } else if (intent.winner === "calendar") {
+        const desired=toTodoistTask(event!);
+        fieldChange("Todoist title",task!.content,desired.content);
+        fieldChange("Todoist description",task!.description,desired.description);
+        fieldChange("Todoist due date",task!.due,desired.due);
+      }
+    } else if (intent.action === "create") {
+      const source=task || event!;
+      changes.push(task ? `Create and link a new Calendar event from Todoist task ${task.id}` : `Create and link a new Todoist task from Calendar event ${event!.id}`);
+      if(task) {
+        const desired=toCalendarEvent(task);
+        changes.push(`New Calendar fields: title ${show(desired.summary)}, description ${show(desired.description)}, start ${show(desired.start)}, end ${show(desired.end)}`);
+      } else {
+        const desired=toTodoistTask(source as CalendarEvent);
+        changes.push(`New Todoist fields: title ${show(desired.content)}, description ${show(desired.description)}, due ${show(desired.due)}`);
+      }
+    } else if (intent.action === "separate") changes.push(`Keep the selected Todoist task ${intent.taskId || "(none)"} and Calendar event ${intent.eventId || "(none)"} unlinked`);
+    else if (intent.action === "exclude") changes.push("Exclude the selected provider items from future syncing");
+    else if (intent.action === "verify") changes.push(`Verify the existing association between task ${intent.taskId || "(none)"} and event ${intent.eventId || "(none)"} without changing provider fields`);
+    else changes.push(`${intent.action}: preserve the original provider items`);
     const chosen = new Set([intent.taskId && `todoist:${intent.taskId}`, intent.eventId && `calendar:${intent.eventId}`]);
     const seriesProjections = new Set(snapshots.filter(s => s.ref.side === "calendar" && s.calendarProjectionId
       && (intent.leftovers[entityKey(s.ref)] === "create" || s.ref.id === intent.eventId && ["link","create"].includes(intent.action)))
@@ -199,7 +233,12 @@ export class ReviewEngine {
         if (s.ref.side === "todoist") toCalendarEvent(s.object as TodoistTask);
         else if ((s.object as CalendarEvent).status !== "confirmed") throw new Error(`Calendar repair source ${entityKey(s.ref)} must be confirmed`);
       }
-      if (s.object) changes.push(`${disposition} counterpart handling for ${s.ref.side} ${(s.object as TodoistTask).content || (s.object as CalendarEvent).summary || s.ref.id}`);
+      if (s.object && disposition === "create") {
+        const title=(s.object as TodoistTask).content || (s.object as CalendarEvent).summary || s.ref.id;
+        changes.push(s.ref.side === "todoist"
+          ? `Create a new Calendar counterpart from Todoist task ${s.ref.id} (${title}) and link that new pair`
+          : `Create a new Todoist counterpart from Calendar event ${s.ref.id} (${title}) and link that new pair`);
+      } else if (s.object && disposition === "exclude") changes.push(`Exclude ${s.ref.side} item ${s.ref.id} from future syncing`);
     }
     for (const s of snapshots) if (s.mapping) changes.push(`Replace existing association ${s.mapping.taskId} ↔ ${s.mapping.eventId}`);
     warnings.push("Past Calendar occurrences and audit records are retained. Old associations cannot be recovered automatically.");
@@ -524,12 +563,23 @@ export class ReviewEngine {
         releases.push({ref:targetTaskRef,providerUpdatedAt:(moved.object as TodoistTask|null)?.updated_at,clearExclusion:true});
       }
       operation.verified=verified;
+      const pendingRefreshRefs=await this.controls.pendingRefreshRefs([
+        ...operation.preview.snapshots.map(snapshot=>snapshot.ref),
+        ...(targetTaskRef?[targetTaskRef]:[]),
+      ]);
+      if(pendingRefreshRefs.length) {
+        await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs});
+        operation.notificationText="Succeeded: repair verified; queued a refresh for updates received during the repair.";
+      }
       if(operation.preview.case.decision)await new ManualInterventionService().finishReconciliationDecision(operation.preview.case.decision.decisionId,"Resolved and verified in the review page");
       // Finalization owns its transaction/recovery. Do not persist a failure
       // over an uncertain commit; a delivery retry reads the durable result.
       return this.store.finalizeOperation(operation, releases);
     } catch(e) {
       if (claimed && !operation.steps.validated && !Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")) {
+        const refs=[...operation.preview.snapshots.map(s=>s.ref),...(intent.action==="move"&&intent.targetProfile&&intent.taskId?[{profile:intent.targetProfile,side:"todoist" as const,id:intent.taskId}]:[])];
+        const pending=await this.controls.pendingRefreshRefs(refs);
+        if(pending.length) await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:pending});
         for (const ref of operation.preview.snapshots.map(s=>s.ref)) await this.controls.release(ref,id).catch(()=>undefined);
         if (intent.action==="move"&&intent.targetProfile&&intent.taskId) await this.controls.release({profile:intent.targetProfile,side:"todoist",id:intent.taskId},id).catch(()=>undefined);
       }

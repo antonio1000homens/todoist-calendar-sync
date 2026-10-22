@@ -57,3 +57,15 @@ test("saving stale failure state cannot overwrite an atomically completed repair
   assert.equal(commands[0].Item.status,"needs_review");
   assert.equal(commands[0].ExpressionAttributeValues[":succeeded"],"succeeded");
 });
+
+test("a previously dismissed alert can enter an explicit repair without losing its history",async t=>{
+  const commands=[];
+  const store=new ReviewStore();
+  store.getCase=async()=>({id:"case",status:"dismissed",createdAt:"2026-10-21T12:00:00Z",operationId:""});
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await store.updateCase("case","repairing","Repair in progress","repair-1");
+  const command=commands[0].input;
+  assert.match(command.ConditionExpression,/#s = :dismissed/);
+  assert.equal(command.ExpressionAttributeValues[":empty"],"");
+  assert.equal(command.ExpressionAttributeValues[":op"],"repair-1");
+});

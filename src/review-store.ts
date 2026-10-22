@@ -12,6 +12,7 @@ export function reviewHash(value: unknown): string {
 }
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
+const dismissalResolutions = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
 export class ReviewStore {
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
@@ -20,13 +21,18 @@ export class ReviewStore {
   async observeDecision(decision: ManualDecision): Promise<void> {
     const id = decision.decisionId, existing = await this.getCase(id);
     if (existing) return;
+    const context = decision.context || {};
     const item: ReviewCase = {
       id, profile: decision.profile, title: decision.type.replaceAll("_", " "), reason: decision.sourceAuditAction || decision.type,
-      status: decision.status === "resolved" ? "dismissed" : "open", decision, taskId: decision.taskId, eventId: decision.eventId,
+      status: decision.status === "resolved"
+        ? dismissalResolutions.has(String(decision.resolution || "").toLowerCase()) ? "dismissed" : "resolved"
+        : "open",
+      decision, taskId: decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined),
+      eventId: decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined),
       createdAt: decision.createdAt, updatedAt: new Date().toISOString(),
     };
     try { await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
-      lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "dismissed" ? "CLOSED" : "OPEN"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
+      lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "open" ? "OPEN" : "CLOSED"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
     catch (e) { if (!conditional(e)) throw e; }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
@@ -58,7 +64,7 @@ export class ReviewStore {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
     const condition = status === "repairing"
-      ? "#s = :open OR (#s = :repairing AND operationId = :op)"
+      ? "#s = :open OR (#s = :dismissed AND (attribute_not_exists(operationId) OR operationId = :empty)) OR (#s = :repairing AND operationId = :op)"
       : status === "open"
         ? "#s = :repairing AND operationId = :op"
         : "#s = :current AND (attribute_not_exists(operationId) OR operationId = :op)";
@@ -66,7 +72,7 @@ export class ReviewStore {
       UpdateExpression: "SET #s = :s, #r = :r, updatedAt = :now, operationId = :op, lookupSk = :lookup",
       ConditionExpression: condition,
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: { ":s": status, ":r": result,
-        ":now": new Date().toISOString(), ":op": operationId || "", ":current": current.status, ":open":"open", ":repairing":"repairing",
+        ":now": new Date().toISOString(), ":op": operationId || "", ":current": current.status, ":open":"open", ":dismissed":"dismissed", ":empty":"", ":repairing":"repairing",
         ":lookup": `REVIEW#${terminal ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
@@ -84,7 +90,14 @@ export class ReviewStore {
       { Update: { TableName: reviewTable(), Key: key(`REPAIR_PREVIEW#${preview.id}`), UpdateExpression: "SET submittedOperation = :id",
         ConditionExpression: "attribute_not_exists(submittedOperation) OR submittedOperation = :id", ExpressionAttributeValues: { ":id": id } } },
       { Put: { TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${id}`) }, ConditionExpression: "attribute_not_exists(pk)" } },
-    ] })); } catch (e) { const current = await this.getOperation(id); if (current) return current; throw e; }
+    ] })); } catch (e) {
+      const current = await this.getOperation(id); if (current) return current;
+      const claimed = await this.getPreview(preview.id) as (RepairPreview & { submittedOperation?:string }) | undefined;
+      if (claimed?.submittedOperation && claimed.submittedOperation !== id) {
+        throw Object.assign(new Error("This preview was already submitted with a different idempotency key; create a fresh preview"), { status:409 });
+      }
+      throw e;
+    }
     return operation;
   }
   async saveOperation(operation: RepairOperation): Promise<void> {
@@ -106,12 +119,12 @@ export class ReviewStore {
     if (!current) throw new Error("Conflict no longer exists");
     const now = new Date().toISOString();
     const completed: RepairOperation = { ...operation, status:"succeeded", updatedAt:now, error:undefined, nextAction:undefined,
-      notificationPending:true, notificationText:"Succeeded: repair verified" };
+      notificationPending:true, notificationText:operation.notificationText || "Succeeded: repair verified" };
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: [
         ...[...new Map(releases.map(item => [entityKey(item.ref), item])).values()].map(item => ({ Update: {
           TableName:reviewTable(), Key:key(`SYNC_CONTROL#${entityKey(item.ref)}`),
-          UpdateExpression:`SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair, pendingRefresh`,
+          UpdateExpression:`SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair`,
           ConditionExpression:"activeRepair = :id", ExpressionAttributeValues:{ ":id":operation.id, ":now":now, ":version":item.providerUpdatedAt || "", ...(item.clearExclusion ? {":false":false} : {}) },
         } })),
         { Put:{ TableName:reviewTable(), Item:{ ...completed, ...key(`REPAIR#${operation.id}`),
@@ -141,7 +154,7 @@ export class ReviewStore {
     } while (cursor); return items;
   }
 }
-export interface SyncControl { excluded?: boolean; activeRepair?: string; pendingRefresh?: boolean; fencedAt?: string; providerUpdatedAt?: string }
+export interface SyncControl { excluded?: boolean; activeRepair?: string; pendingRefresh?: boolean; pendingRefreshAt?: string; fencedAt?: string; providerUpdatedAt?: string }
 export class SyncControls {
   control(ref: EntityRef): Promise<SyncControl | undefined> { return new ReviewStore().get(`SYNC_CONTROL#${entityKey(ref)}`); }
   async rejected(profile: Profile, taskId: string, eventId: string): Promise<boolean> {
@@ -159,7 +172,7 @@ export class SyncControls {
       const id = side === "todoist" ? ids.taskId : ids.eventId; if (!id) continue;
       const ref = { profile, side, id }, control = await this.control(ref);
       if (control?.activeRepair && control.activeRepair !== operationId) {
-        await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET pendingRefresh = :true", ExpressionAttributeValues: { ":true": true } }));
+        await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at", ExpressionAttributeValues: { ":true": true, ":at": randomUUID() } }));
         return true;
       }
       if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;
@@ -183,8 +196,26 @@ export class SyncControls {
   }
   async release(ref: EntityRef, operationId: string, providerUpdatedAt?: string): Promise<void> {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
-      UpdateExpression: "SET fencedAt = :now, providerUpdatedAt = :version REMOVE activeRepair, pendingRefresh",
+      UpdateExpression: "SET fencedAt = :now, providerUpdatedAt = :version REMOVE activeRepair",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":id": operationId, ":now": new Date().toISOString(), ":version": providerUpdatedAt || "" } }));
+  }
+  async pendingRefreshRefs(refs: EntityRef[]): Promise<Array<EntityRef & {pendingRefreshAt:string}>> {
+    const pending: Array<EntityRef & {pendingRefreshAt:string}> = [];
+    for (const ref of [...new Map(refs.map(item=>[entityKey(item),item])).values()]) {
+      const control = await this.control(ref);
+      if (control?.pendingRefresh && control.pendingRefreshAt) pending.push({...ref,pendingRefreshAt:control.pendingRefreshAt});
+    }
+    return pending;
+  }
+  async clearPendingRefresh(refs: Array<EntityRef & {pendingRefreshAt:string}>): Promise<void> {
+    for (const ref of refs) {
+      try {
+        await client.send(new UpdateCommand({TableName:reviewTable(),Key:key(`SYNC_CONTROL#${entityKey(ref)}`),
+          UpdateExpression:"REMOVE pendingRefresh, pendingRefreshAt",
+          ConditionExpression:"pendingRefresh = :true AND pendingRefreshAt = :at AND attribute_not_exists(activeRepair)",
+          ExpressionAttributeValues:{":true":true,":at":ref.pendingRefreshAt}}));
+      } catch (error) { if (!conditional(error)) throw error; }
+    }
   }
 }
 export const newPreviewId = () => randomUUID();

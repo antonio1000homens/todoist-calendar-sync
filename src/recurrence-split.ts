@@ -86,6 +86,7 @@ export function planFutureSeriesSplit(
   old: CalendarEvent,
   now = new Date(),
   timeZone = "UTC",
+  expectedPreviousTaskId?: string,
 ): FutureSeriesSplitPlan {
   if (old.status !== "confirmed" || !old.etag || !old.id || old.recurringEventId) {
     throw new Error("A live recurring master with a stable ETag is required");
@@ -95,10 +96,14 @@ export function planFutureSeriesSplit(
     || !task.due?.date || task.due.datetime || !task.due.is_recurring) {
     throw new Error("Future-only split supports all-day recurring task and Calendar master only");
   }
-  if ((old.extendedProperties?.shared?.taskId !== task.id
+  const previousTaskMatches = expectedPreviousTaskId
+    ? old.extendedProperties?.shared?.taskId === expectedPreviousTaskId
+      && old.extendedProperties?.shared?.syncRecurrenceOwner === "calendar"
+    : old.extendedProperties?.shared?.taskId === task.id
+      && old.extendedProperties?.shared?.syncRecurrenceOwner !== "calendar";
+  if ((!previousTaskMatches
       && !(old.extendedProperties?.shared?.syncHistoryOnly === "true"
         && old.extendedProperties?.shared?.syncHistoryTaskId === task.id))
-    || old.extendedProperties?.shared?.syncRecurrenceOwner === "calendar"
     || normalizedText(old.summary).toLowerCase() !== normalizedText(task.content).toLowerCase()) {
     throw new Error("Existing Calendar series does not prove this Todoist task's identity");
   }

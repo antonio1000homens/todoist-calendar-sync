@@ -39,7 +39,10 @@ export interface ReconciliationRequestResult {
 }
 
 type EnqueueReconciliation = (delivery: Delivery) => Promise<void>;
-export interface ReconciliationRequestContext { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string; }
+export interface ReconciliationRequestContext {
+  requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string;
+  pendingRefreshRefs?: Array<{profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string}>;
+}
 
 /**
  * Durably marks a profile dirty before attempting SQS delivery. If the SQS
@@ -115,4 +118,14 @@ export async function requestReconciliation(
       enqueueError: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+/** Schedule a profile refresh for entity updates deferred by an active repair. */
+export async function queuePendingRefresh(
+  state: StateRepository,
+  profile: Profile,
+  pendingRefreshRefs: NonNullable<Delivery["reconcile"]>["pendingRefreshRefs"],
+): Promise<ReconciliationRequestResult> {
+  if (!pendingRefreshRefs?.length) throw new Error("At least one pending repair update is required");
+  return requestReconciliation(state, profile, "manual", enqueueDelivery, { requester:"repair-refresh", pendingRefreshRefs });
 }

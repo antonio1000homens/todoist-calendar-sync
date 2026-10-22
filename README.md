@@ -94,7 +94,7 @@ The Slack bot token is shared infrastructure and currently remains at:
 
 Normal deployments pass **parameter names**, not plaintext secret values. Secret rotation is a separate operator action.
 
-The review inbox MVP is public and read-only. Anyone who can reach `calendar-sync.alf-broadcast.co.uk/review` can view conflict records and live Todoist/Calendar details; the API rejects non-GET requests and does not offer repair, dismissal, search, or manual reconciliation actions. Treat this as a public disclosure of the displayed task and calendar data. To seed existing active conflicts and retained manual decisions into the indexed inbox, set `STATE_TABLE_NAME` and `AWS_REGION`, inspect the preview, then run `npm run seed:review-inbox -- --apply`. The seeder is idempotent and leaves audit and decision history intact.
+The review page at `https://calendar-sync.alf-broadcast.co.uk/review` is protected by the Cloudflare Zero Trust application configured in `windsor-app`. The review API independently verifies the Cloudflare Access JWT signature, issuer, audience, expiry, and operator email before serving data or accepting writes. Repairs require same-origin POSTs, an idempotency key tied to the approved preview, and execute through the existing FIFO worker; provider credentials remain in AWS. The deployment workflow reads `CF_ACCESS_ISSUER`, `CF_ACCESS_AUDIENCE`, and `REVIEW_OPERATOR_EMAILS` from repository variables. To seed existing active conflicts and retained manual decisions into the indexed inbox, set `STATE_TABLE_NAME` and `AWS_REGION`, inspect the preview, then run `npm run seed:review-inbox -- --apply`. The seeder is idempotent and leaves audit and decision history intact.
 
 Calendar watch subscriptions use `https://calendar-sync.alf-broadcast.co.uk/calendar` by default. The deploy script passes this through the `CalendarWatchCallbackUrl` parameter (or `CALENDAR_WATCH_CALLBACK_URL` override), and the Cloudflare relay must forward it to the Lambda ingress using the matching proxy shared secret.
 
@@ -163,6 +163,9 @@ RESOURCE_NAME_PREFIX=todoist-calendar-sync
 SSM_PREFIX=/todoist-calendar-sync
 TODOIST_CALENDAR_SYNC_SLACK_CHANNEL=<Slack channel ID>
 SYNC_PROFILE_CONFIG_JSON=<profile routing JSON>
+CF_ACCESS_ISSUER=https://<your-team>.cloudflareaccess.com
+CF_ACCESS_AUDIENCE=<review application audience tag>
+REVIEW_OPERATOR_EMAILS=<comma-separated allowed operator emails>
 TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL=<optional email>
 ```
 

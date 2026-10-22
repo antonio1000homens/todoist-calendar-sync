@@ -87,6 +87,7 @@ export interface Delivery {
     slackMessageTs?: string;
     slackThreadTs?: string;
     slackDecisionId?: string;
+    pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
   };
   manual?: ManualControlDelivery;
   repair?: { operationId:string };

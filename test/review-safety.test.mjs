@@ -30,7 +30,8 @@ test("a blocked webhook records a pending refresh without taking over the repair
   assert.equal(await controls.blocked("home", { eventId: "event" }), true);
   assert.equal(commands.length, 1);
   assert.equal(commands[0].Key.pk, "SYNC_CONTROL#home:calendar:event");
-  assert.equal(commands[0].UpdateExpression, "SET pendingRefresh = :true");
+  assert.equal(commands[0].UpdateExpression, "SET pendingRefresh = :true, pendingRefreshAt = :at");
+  assert.match(commands[0].ExpressionAttributeValues[":at"], /^[0-9a-f-]{36}$/i);
 });
 
 test("a stale repair preview releases its acquired barriers without writing to providers", async () => {
@@ -50,6 +51,7 @@ test("a stale repair preview releases its acquired barriers without writing to p
   const engine = new ReviewEngine(store, {}, async () => { throw new Error("Provider writes must not run"); }, {
     async claim(refs) { calls.push(["claim", refs]); },
     async release(ref, operationId) { calls.push(["release", ref, operationId]); },
+    async pendingRefreshRefs() { return []; },
   });
   engine.collect = async () => {
     assert.equal(calls[0]?.[0], "claim");
@@ -81,7 +83,7 @@ test("Create counterpart previews include the selected source without requiring 
   const preview = await engine.preview({ subject: "operator", email: "operator@example.test" }, {
     caseId: "case", profile: "home", action: "create", taskId: "task", winner: "none", scope: "occurrence", leftovers: {},
   });
-  assert.ok(preview.changes.some(change => change.includes("create counterpart handling for todoist Task")));
+  assert.ok(preview.changes.some(change => change.includes("Create a new Calendar counterpart from Todoist task task (Task)")));
   assert.equal(saved.length, 1);
 });
 

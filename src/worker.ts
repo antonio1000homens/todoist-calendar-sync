@@ -10,7 +10,7 @@ import {
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { enqueueDelivery } from "./queue.js";
+import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
@@ -124,6 +124,7 @@ async function enqueueReconciliationContinuation(
       reason: delivery.reconcile.reason,
       generation: delivery.reconcile.generation,
       continuation,
+      pendingRefreshRefs: delivery.reconcile.pendingRefreshRefs,
     },
   };
   await enqueueDelivery(next);
@@ -415,6 +416,12 @@ export const handler: SQSHandler = async (event, context: Context) => {
       if (delivery.kind === "reconcile") {
         const reconciliation = await processReconciliation(delivery, state);
         if (!reconciliation.continuationRequired && !reconciliation.continuationQueued && delivery.reconcile?.generation) {
+          const current = await state.getReconciliationState(delivery.profile);
+          if (current?.generation === delivery.reconcile.generation && current.pendingRefreshRefs?.length) {
+            await state.clearPendingRefresh(current.pendingRefreshRefs);
+            const stillPending = await state.pendingRefreshRefs(current.pendingRefreshRefs);
+            if (stillPending.length) await queuePendingRefresh(state,delivery.profile,stillPending);
+          }
           await deliverReconciliationOutcome(state, manual, delivery.profile, delivery.reconcile.generation);
         }
         if (!reconciliation.continuationRequired) {

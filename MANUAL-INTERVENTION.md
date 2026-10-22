@@ -131,6 +131,14 @@ The worker rechecks that the Calendar event is still unmapped, the selected task
 
 Dynamic candidate actions such as `bind_task:<id>` cannot be saved as persistent policy defaults because provider IDs are decision-specific. Only stable catalog actions may be stored in policy.
 
+## Consolidating a cancelled recurrence duplicate
+
+For a cancelled Calendar projection with a recurring Todoist task, a **Keep yearly task; remove duplicate task and cancelled event** action is shown only when the worker can verify one active one-off Todoist mirror mapped to one Calendar-owned recurrence. The preview names both task IDs, the cancelled event and the active Calendar master.
+
+After explicit confirmation, the worker caps the old Calendar recurrence after its last historical occurrence, creates the Todoist-owned recurrence from the recurring task's next due date, and atomically transfers recurrence mapping ownership. It then removes the old one-off task and cancelled standalone event. A durable discarded-task marker suppresses delayed Todoist webhooks; a retry resumes the same cutover and cleanup. Changed ownership, recurrence exceptions, completed projection history, another matching task, or inconsistent mapping comments block the action for review.
+
+This action is destructive and cannot be configured for unattended execution. Existing cards can be refreshed with `/sync resume <decision ID>` to show the current consolidation proposal.
+
 ## Both-sides-changed conflicts
 
 For `todoist_snapshot_reconcile_conflict_both_sides_changed`, Slack supports:

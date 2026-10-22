@@ -37,6 +37,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async getCalendarProjectionTombstone() { return undefined; },
+    async getConsolidatedTask() { return undefined; },
     async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
     async getMappingByTaskAnyProfile(id) { return clone(mappingMap.get(id)); },
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
@@ -64,6 +65,8 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   t.mock.method(CanonicalIdentityStore.prototype, "put", async () => {});
   const controls = {
     async control(ref) { return clone(controlsMap.get(refKey(ref))); },
+    async pendingRefreshRefs() { return []; },
+    async pendingRefreshRefs() { return []; },
     async claim(refs, id) { calls.push(["claim", clone(refs)]); for (const ref of refs) controlsMap.set(refKey(ref), { ...controlsMap.get(refKey(ref)), activeRepair: id }); },
     rejected: new Set(),
     async reject(profile, taskId, eventId) { this.rejected.add(`${profile}:${taskId}:${eventId}`); },

@@ -66,6 +66,16 @@ export interface ReconciliationState {
   notificationText?: string;
   notificationReplyTs?: string;
   lastHealthAlertAt?: string;
+  pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
+}
+
+function mergePendingRefreshRefs(
+  current: NonNullable<ReconciliationState["pendingRefreshRefs"]> = [],
+  incoming: NonNullable<ReconciliationState["pendingRefreshRefs"]> = [],
+): NonNullable<ReconciliationState["pendingRefreshRefs"]> {
+  const refs = new Map<string, (typeof current)[number]>();
+  for (const ref of [...current, ...incoming]) refs.set(`${ref.profile}:${ref.side}:${ref.id}`, ref);
+  return [...refs.values()];
 }
 
 export function reconciliationRunStatus(run: ReconciliationState): NonNullable<ReconciliationState["status"]> {
@@ -103,6 +113,14 @@ export class StateRepository {
 
   async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
     return new SyncControls().blocked(profile, ids, this.repairOperationId);
+  }
+
+  async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {
+    return new SyncControls().pendingRefreshRefs(refs);
+  }
+
+  async clearPendingRefresh(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string}>): Promise<void> {
+    return new SyncControls().clearPendingRefresh(refs);
   }
 
   private readonly table = tableName;
@@ -210,7 +228,8 @@ export class StateRepository {
   async requestReconciliation(
     profile: Profile,
     reason: ReconciliationReason,
-    context: { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string } = {},
+    context: { requester?: string; slackChannelId?: string; slackMessageTs?: string; slackThreadTs?: string; slackDecisionId?: string;
+      pendingRefreshRefs?: Array<{profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string}> } = {},
   ): Promise<{ state: ReconciliationState; shouldEnqueue: boolean; created: boolean }> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const current = await this.getReconciliationState(profile);
@@ -224,6 +243,7 @@ export class StateRepository {
           ...current,
           reason,
           lastRequestedAt: requestedAt,
+          ...(context.pendingRefreshRefs?.length ? { pendingRefreshRefs: mergePendingRefreshRefs(current.pendingRefreshRefs, context.pendingRefreshRefs) } : {}),
           ...((current.requester || context.requester) ? { requester: current.requester || context.requester } : {}),
           ...((current.slackChannelId || context.slackChannelId) ? { slackChannelId: current.slackChannelId || context.slackChannelId } : {}),
           ...((current.slackMessageTs || context.slackMessageTs) ? { slackMessageTs: current.slackMessageTs || context.slackMessageTs } : {}),
@@ -234,7 +254,7 @@ export class StateRepository {
           await client.send(new UpdateCommand({
             TableName: this.ensureTable(),
             Key: key(`RECONCILE#${profile}`),
-            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, requester = :requester, slackChannelId = :channel, slackMessageTs = :messageTs, slackThreadTs = :thread, slackDecisionId = :decisionId, expiresAt = :expiresAt",
+            UpdateExpression: "SET reason = :reason, lastRequestedAt = :lastRequestedAt, requester = :requester, slackChannelId = :channel, slackMessageTs = :messageTs, slackThreadTs = :thread, slackDecisionId = :decisionId, pendingRefreshRefs = :refreshRefs, expiresAt = :expiresAt",
             ConditionExpression: "#pending = :true AND generation = :generation",
             ExpressionAttributeNames: { "#pending": "pending" },
             ExpressionAttributeValues: {
@@ -247,6 +267,7 @@ export class StateRepository {
               ":messageTs": current.slackMessageTs || context.slackMessageTs || "",
               ":thread": current.slackThreadTs || context.slackThreadTs || "",
               ":decisionId": current.slackDecisionId || context.slackDecisionId || "",
+              ":refreshRefs": next.pendingRefreshRefs || current.pendingRefreshRefs || [],
               ":expiresAt": ttl(30),
             },
           }));
@@ -565,21 +586,40 @@ export class StateRepository {
    * Refuse if any profile owns the master/instances, an old series link exists,
    * or completed history anywhere refers to that master.
    */
-  async assertHistoricalSeriesUnowned(masterEventId: string, instanceIds: string[]): Promise<void> {
+  async assertHistoricalSeriesUnowned(
+    masterEventId: string,
+    instanceIds: string[],
+    allowed?: { mapping?: Mapping; link?: RecurrenceLink },
+  ): Promise<void> {
     const ids = new Set([masterEventId, ...instanceIds]);
     if (ids.size > 1000) throw new Error("Too many historical occurrences for guarded ownership inventory");
     for (const profile of allProfiles) {
       const [mappings, links] = await Promise.all([
         this.listMappings(profile), this.listRecurrenceLinks(profile),
       ]);
-      if (mappings.some((mapping) =>
-        ids.has(mapping.eventId) || mapping.masterEventId === masterEventId
-        || (mapping.activeInstanceId && ids.has(mapping.activeInstanceId)))) {
+      if (mappings.some((mapping) => {
+        const matches = ids.has(mapping.eventId) || mapping.masterEventId === masterEventId
+          || (mapping.activeInstanceId && ids.has(mapping.activeInstanceId));
+        return matches && !(allowed?.mapping
+          && mapping.profile === allowed.mapping.profile
+          && mapping.taskId === allowed.mapping.taskId
+          && mapping.eventId === allowed.mapping.eventId
+          && mapping.updatedAt === allowed.mapping.updatedAt
+          && mapping.recurrenceOwner === allowed.mapping.recurrenceOwner
+          && mapping.masterEventId === allowed.mapping.masterEventId);
+      })) {
         throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
       }
-      if (links.some((link) =>
-        link.masterEventId === masterEventId || ids.has(link.eventId)
-        || (link.activeInstanceId && ids.has(link.activeInstanceId)))) {
+      if (links.some((link) => {
+        const matches = link.masterEventId === masterEventId || ids.has(link.eventId)
+          || (link.activeInstanceId && ids.has(link.activeInstanceId));
+        return matches && !(allowed?.link
+          && link.profile === allowed.link.profile
+          && link.seriesId === allowed.link.seriesId
+          && link.taskId === allowed.link.taskId
+          && link.masterEventId === allowed.link.masterEventId
+          && link.updatedAt === allowed.link.updatedAt);
+      })) {
         throw new Error("An existing recurrence link owns the old Calendar master/instances");
       }
       for (const id of ids) {
@@ -728,6 +768,135 @@ export class StateRepository {
         && reason.CancellationReasons.every((item) => item.Code === "ConditionalCheckFailed" || item.Code === "None")) {
         return false;
       }
+      throw error;
+    }
+  }
+
+  async getConsolidatedTask(profile: Profile, taskId: string): Promise<{
+    retainedTaskId: string; decisionId: string; cancelledEventId?: string; previousMapping?: Mapping;
+  } | undefined> {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(), Key: key(`CONSOLIDATED_TASK#${profile}#${taskId}`), ConsistentRead: true,
+    }));
+    if (typeof result.Item?.retainedTaskId !== "string" || typeof result.Item?.decisionId !== "string") return undefined;
+    return {
+      retainedTaskId: result.Item.retainedTaskId,
+      decisionId: result.Item.decisionId,
+      ...(typeof result.Item.cancelledEventId === "string" ? { cancelledEventId: result.Item.cancelledEventId } : {}),
+      ...(result.Item.previousMapping && typeof result.Item.previousMapping === "object"
+        ? { previousMapping: result.Item.previousMapping as Mapping } : {}),
+    };
+  }
+
+  /** Durable webhook guard written before the first Calendar mutation. */
+  async putConsolidationGuard(
+    profile: Profile, discardedTaskId: string, retainedTaskId: string, decisionId: string,
+    cancelledEventId?: string, previousMapping?: Mapping,
+  ): Promise<void> {
+    const item = {
+      ...key(`CONSOLIDATED_TASK#${profile}#${discardedTaskId}`),
+      profile, discardedTaskId, retainedTaskId, decisionId, status: "pending", updatedAt: now(),
+      ...(cancelledEventId ? { cancelledEventId } : {}),
+      ...(previousMapping ? { previousMapping } : {}),
+    };
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(), Item: item,
+        ConditionExpression: "attribute_not_exists(pk) OR (retainedTaskId = :retained AND decisionId = :decision)",
+        ExpressionAttributeValues: { ":retained": retainedTaskId, ":decision": decisionId },
+      }));
+    } catch (error) {
+      if (!conditionalFailure(error)) throw error;
+      throw new Error("The duplicate task is already reserved by a different consolidation");
+    }
+  }
+
+  /**
+   * Atomically replace a Calendar-owned mirror mapping with the approved
+   * Todoist-owned recurrence mapping. The duplicate webhook guard, canceled
+   * projection tombstone removal, and all mapping indexes change together.
+   */
+  async commitRecurrenceConsolidation(input: {
+    mapping: Mapping;
+    link: RecurrenceLink;
+    previousMapping: Mapping;
+    previousLink: RecurrenceLink;
+    discardedTaskId: string;
+    decisionId: string;
+    expectedTombstone?: CalendarProjectionTombstone;
+    cancelledEventId?: string;
+  }): Promise<boolean> {
+    const { mapping, link, previousMapping, previousLink, discardedTaskId, decisionId, expectedTombstone } = input;
+    if (mapping.recurrenceOwner !== "todoist" || mapping.taskId === discardedTaskId
+      || mapping.seriesId !== mapping.taskId || link.owner !== "todoist"
+      || link.seriesId !== mapping.seriesId || link.taskId !== mapping.taskId
+      || link.eventId !== mapping.eventId || link.masterEventId !== mapping.masterEventId
+      || previousMapping.taskId !== discardedTaskId || previousMapping.recurrenceOwner !== "calendar"
+      || previousLink.taskId !== discardedTaskId || previousLink.owner !== "calendar"
+      || previousLink.seriesId !== previousMapping.seriesId) {
+      throw new Error("Recurrence consolidation identities are inconsistent");
+    }
+    const table = this.ensureTable();
+    const previousValues = {
+      ":profile": previousMapping.profile,
+      ":task": previousMapping.taskId,
+      ":event": previousMapping.eventId,
+      ":updated": previousMapping.updatedAt,
+      ":owner": "calendar",
+      ":master": previousMapping.masterEventId,
+      ":series": previousMapping.seriesId,
+    };
+    const samePrevious = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND masterEventId = :master AND seriesId = :series";
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: { TableName: table, Key: key(`EVENT#${previousMapping.profile}#${previousMapping.eventId}`, "MAP"), ConditionExpression: samePrevious, ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: previousValues } },
+      { Delete: { TableName: table, Key: key(`TASK#${previousMapping.profile}#${discardedTaskId}`, "MAP"), ConditionExpression: samePrevious, ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: previousValues } },
+      { Delete: { TableName: table, Key: key(`TASKOWNER#${discardedTaskId}`, "MAP"), ConditionExpression: samePrevious, ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: previousValues } },
+      { Delete: { TableName: table, Key: key(`RECURRENCE#${previousLink.profile}#${previousLink.seriesId}`), ConditionExpression: "profile = :profile AND taskId = :task AND eventId = :event AND #owner = :owner AND updatedAt = :updated", ExpressionAttributeNames: { "#owner": "owner" }, ExpressionAttributeValues: { ":profile": previousLink.profile, ":task": previousLink.taskId, ":event": previousLink.eventId, ":owner": "calendar", ":updated": previousLink.updatedAt } } },
+      { Put: { TableName: table, Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) }, ConditionExpression: "attribute_not_exists(pk)" } },
+      { Put: { TableName: table, Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) }, ConditionExpression: "attribute_not_exists(pk)" } },
+      { Put: { TableName: table, Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) }, ConditionExpression: "attribute_not_exists(pk)" } },
+      { Put: { TableName: table, Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) }, ConditionExpression: "attribute_not_exists(pk)" } },
+      { Put: { TableName: table, Item: {
+        ...key(`CONSOLIDATED_TASK#${mapping.profile}#${discardedTaskId}`),
+        profile: mapping.profile, discardedTaskId, retainedTaskId: mapping.taskId, decisionId,
+        status: "pending", updatedAt: now(), previousMapping,
+        ...(input.cancelledEventId ? { cancelledEventId: input.cancelledEventId } : {}),
+      }, ConditionExpression: "attribute_not_exists(pk) OR (retainedTaskId = :retained AND decisionId = :decision)", ExpressionAttributeValues: { ":retained": mapping.taskId, ":decision": decisionId } } },
+    ];
+    const split = await this.getFutureSeriesSplitAnyProfile(mapping.taskId);
+    if (!split || split.profile !== mapping.profile || split.status !== "pending" || split.newMasterId !== mapping.eventId) {
+      const completed = await this.getMappingByTask(mapping.profile, mapping.taskId);
+      const alias = await this.getConsolidatedTask(mapping.profile, discardedTaskId);
+      if (completed?.eventId === mapping.eventId && completed.recurrenceOwner === "todoist"
+        && alias?.retainedTaskId === mapping.taskId && alias.decisionId === decisionId) return true;
+      throw new Error("The approved future-series operation is not pending");
+    }
+    tx.push({ ConditionCheck: {
+      TableName: table, Key: key(`FUTURE_SPLIT#TASK#${mapping.taskId}`),
+      ConditionExpression: "#status = :pending AND profile = :profile AND newMasterId = :master",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: { ":pending": "pending", ":profile": mapping.profile, ":master": mapping.eventId },
+    } });
+    if (expectedTombstone) {
+      tx.push({ Delete: {
+        TableName: table, Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "sourceUpdatedAt = :sourceUpdatedAt",
+        ExpressionAttributeValues: { ":sourceUpdatedAt": expectedTombstone.sourceUpdatedAt },
+      } });
+    } else {
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
       throw error;
     }
   }
