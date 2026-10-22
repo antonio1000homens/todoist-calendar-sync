@@ -197,12 +197,19 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       if (!operation) return response(404,{error:"operation_not_found"});
       assertOwned(actor.subject,operation.actor.subject);
       if (!["failed","needs_review","queued"].includes(operation.status)) fail(409,"Only queued, failed, or interrupted repairs can be resumed");
-      if(operation.status !== "queued") operation.attempt += 1;
+      // Every explicit retry gets a new SQS deduplication ID, including a
+      // queued operation whose earlier send may have been accepted but is
+      // still waiting behind another delivery in this profile's FIFO group.
+      operation.attempt += 1;
       operation.status = "queued";
       await store.saveOperation(operation);
       try { await enqueueRepair(operation.id,operation.preview.intent.profile,operation.attempt); }
-      catch { return response(503,{error:"repair_enqueue_failed",message:"The repair remains queued but queue delivery was not confirmed. Retry the operation.",operation}); }
-      return response(202,{operation});
+      catch(error) {
+        const message=error instanceof Error?error.message:String(error);
+        return response(503,{error:"repair_enqueue_failed",message:`The repair remains queued, but delivery of attempt ${operation.attempt} was not confirmed. Retry this operation; completed repair steps are checkpointed.`,operation,
+          queueDelivery:{enqueued:false,attempt:operation.attempt,error:message}});
+      }
+      return response(202,{operation,queueDelivery:{enqueued:true,attempt:operation.attempt}});
     }
     if (method === "GET" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected=profile(event.queryStringParameters?.profile || null);
