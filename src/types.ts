@@ -197,6 +197,8 @@ export interface CompletedCalendarProjection {
   taskId: string;
   eventId: string;
   completedAt: string;
+  /** Only set true after direct evidence that the final recurring occurrence completed and no active successor exists. */
+  terminalVerified?: true;
   recurrenceOwner?: "calendar" | "todoist";
   seriesId?: string;
   masterEventId?: string;

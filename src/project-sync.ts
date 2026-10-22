@@ -535,6 +535,15 @@ export class ProjectAwareSynchronizer {
       || existingEvent.recurringEventId || existingEvent.recurrence?.length)) {
       throw new Error("Approved Calendar event changed, cancelled or disappeared; no replacement permitted");
     }
+    if (existingEvent) {
+      const historical = await this.state.getCompletedCalendarProjectionByEvent?.(destinationProfile, existingEvent.id);
+      if (historical?.taskId === task.id) {
+        await this.state.audit(destinationProfile, "todoist_project_historical_projection_create_ignored", {
+          taskId: task.id, eventId: existingEvent.id, completedAt: historical.completedAt,
+        });
+        return undefined;
+      }
+    }
     if (!approved && existingEvent?.status === "cancelled") existingEvent = undefined;
     const stored = existingEvent && hasCanonicalState(existingEvent, task)
       ? existingEvent
@@ -610,6 +619,18 @@ export class ProjectAwareSynchronizer {
     }
     if (eventId && await this.state.syncBlocked(sourceProfile, { taskId: task.id, eventId })) {
       throw new Error("Source projection is protected by an active repair, exclusion, or rejected-pair decision");
+    }
+    // A task-side completed lookup can already be gone after seven days.
+    // Always check the permanent event-side history marker before deleting a
+    // provider event discovered from Calendar shared taskId properties.
+    if (eventId) {
+      const completed = await this.state.getCompletedCalendarProjectionByEvent?.(sourceProfile, eventId);
+      if (completed?.taskId === task.id) {
+        await this.state.audit(sourceProfile, "todoist_project_removal_historical_calendar_retained", {
+          taskId: task.id, eventId, completedAt: completed.completedAt,
+        });
+        return;
+      }
     }
     await this.state.putCalendarProjectionTombstone(sourceProfile, task.id, task.updated_at || delivery.receivedAt, tombstoneReason);
     if (eventId) {

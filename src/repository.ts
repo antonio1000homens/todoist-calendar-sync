@@ -1299,23 +1299,125 @@ export class StateRepository {
   }
 
   async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    // Once the event-side marker exists it is immutable. A retry must neither
+    // reset the seven-day clock nor recreate a task-side index retired by
+    // maintenance. Atomic creation avoids half-written history pairs.
     const item = { ...projection, updatedAt: now() };
-    await client.send(new TransactWriteCommand({
-      TransactItems: [
-        {
-          Put: {
-            TableName: this.ensureTable(),
-            Item: { ...item, ...key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) },
+    try {
+      await client.send(new TransactWriteCommand({
+        TransactItems: [
+          {
+            Put: {
+              TableName: this.ensureTable(),
+              Item: { ...item, ...key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) },
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
           },
-        },
-        {
-          Put: {
-            TableName: this.ensureTable(),
-            Item: { ...item, ...key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) },
+          {
+            Put: {
+              TableName: this.ensureTable(),
+              Item: { ...item, ...key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`) },
+              ConditionExpression: "attribute_not_exists(pk)",
+            },
           },
+          ...(projection.terminalVerified === true && projection.recurrenceOwner === "todoist" && projection.seriesId
+            ? [{ Put: {
+              TableName: this.ensureTable(),
+              Item: {
+                ...key(`COMPLETED_SERIES#${projection.profile}#${projection.seriesId}`),
+                profile: projection.profile, seriesId: projection.seriesId,
+                recurrenceOwner: projection.recurrenceOwner, masterEventId: projection.masterEventId,
+                terminalCompletedAt: projection.completedAt, terminalEventId: projection.eventId,
+              },
+              ConditionExpression: "attribute_not_exists(pk)",
+            } }] : []),
+        ],
+      }));
+    } catch (error) {
+      if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
+      const saved = await this.getCompletedCalendarProjectionByEvent(projection.profile, projection.eventId);
+      if (!saved || saved.taskId !== projection.taskId || saved.completedAt !== projection.completedAt) {
+        // A replay can legitimately have a different delivery timestamp. The
+        // existing immutable event-side identity is sufficient to dedupe it.
+        if (saved?.taskId === projection.taskId && saved.profile === projection.profile) return;
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Mark a finite Calendar-owned series terminal ONLY while retiring its exact
+   * unchanged recurrence link. If a successor takes ownership, the transaction
+   * aborts and the occurrence stays historical but not cleanup-eligible.
+   */
+  async verifyTerminalCompletedCalendarProjection(
+    projection: CompletedCalendarProjection,
+    expectedLink: RecurrenceLink,
+  ): Promise<boolean> {
+    if (projection.recurrenceOwner !== "calendar" || !projection.seriesId
+      || expectedLink.owner !== "calendar" || expectedLink.profile !== projection.profile
+      || expectedLink.seriesId !== projection.seriesId || expectedLink.taskId !== projection.taskId
+      || expectedLink.eventId !== projection.eventId) return false;
+    const table = this.ensureTable();
+    const identity = { ":task": projection.taskId, ":profile": projection.profile };
+    const historyValues = { ...identity, ":completed": projection.completedAt, ":yes": true };
+    const sameHistory = "#profile = :profile AND taskId = :task AND completedAt = :completed";
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: {
+        TableName: table, Key: key(`RECURRENCE#${projection.profile}#${projection.seriesId}`),
+        ConditionExpression: "taskId = :task AND #profile = :profile AND #owner = :owner AND seriesId = :series AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: { ...identity, ":owner": "calendar", ":series": projection.seriesId, ":updated": expectedLink.updatedAt },
+      } },
+      { Update: {
+        TableName: table, Key: key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`),
+        UpdateExpression: "SET terminalVerified = :yes",
+        ConditionExpression: sameHistory,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: historyValues,
+      } },
+      { Update: {
+        TableName: table, Key: key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`),
+        UpdateExpression: "SET terminalVerified = :yes",
+        ConditionExpression: sameHistory,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: historyValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: {
+          ...key(`COMPLETED_SERIES#${projection.profile}#${projection.seriesId}`),
+          profile: projection.profile, seriesId: projection.seriesId,
+          recurrenceOwner: "calendar", masterEventId: projection.masterEventId,
+          terminalCompletedAt: projection.completedAt, terminalEventId: projection.eventId,
         },
-      ],
-    }));
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`TASKOWNER#${projection.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const candidateProfile of allProfiles) {
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`TASK#${candidateProfile}#${projection.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`EVENT#${candidateProfile}#${projection.eventId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
+      throw error;
+    }
   }
 
   async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
