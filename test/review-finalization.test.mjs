@@ -58,6 +58,16 @@ test("saving stale failure state cannot overwrite an atomically completed repair
   assert.equal(commands[0].ExpressionAttributeValues[":succeeded"],"succeeded");
 });
 
+test("stale retry cannot erase the abandoned marker after an atomic failed-before-write release",async t=>{
+  const commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command.input);return {};});
+  const store=new ReviewStore();
+  await store.saveOperation({...operation(),status:"queued"});
+  assert.match(commands[0].ConditionExpression,/attribute_not_exists\(abandoned\)/);
+  await store.saveOperation({...operation(),status:"failed",abandoned:true});
+  assert.match(commands[1].ConditionExpression,/abandoned = :yes/);
+  assert.match(commands[1].ConditionExpression,/#status = :failed/);
+});
 test("a previously dismissed alert can enter an explicit repair without losing its history",async t=>{
   const commands=[];
   const store=new ReviewStore();
