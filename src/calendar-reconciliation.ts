@@ -16,6 +16,8 @@ import {
   type CanonicalIdentityRepository,
 } from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
+import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
+import { logEvent } from "./observability.js";
 import { hasCanonicalState, selectCalendarRecurrenceInstance, startsMatch, toTodoistTask } from "./sync.js";
 import { normalizedText } from "./security.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
@@ -479,7 +481,17 @@ export async function reconcileUnmappedCalendar(
         await createOrBindStandalone(event);
       }
     } catch (error) {
-      if (!isMutationBudgetExhausted(error)) throw error;
+      if (!isMutationBudgetExhausted(error)) {
+        const failure = new ReconciliationItemError(error, { stage: "calendar", eventId: event.id });
+        const detail = reconciliationFailureDetails(failure);
+        logEvent("calendar_snapshot_reconcile_item_failed", { profile, ...detail }, "reconciliation");
+        try {
+          await state.audit(profile, "calendar_snapshot_reconcile_item_failed", detail);
+        } catch {
+          logEvent("calendar_snapshot_reconcile_failure_audit_failed", { profile, ...detail }, "reconciliation");
+        }
+        throw failure;
+      }
       summary.mutationCapReached = true;
       await state.audit(profile, "calendar_snapshot_reconcile_mutation_budget_exhausted", {
         eventId: event.id,

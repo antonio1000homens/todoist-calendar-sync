@@ -5,6 +5,8 @@ import { attachProjectCommentReference, deleteMappingComments } from "./mapping-
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
+import { isMutationBudgetExhausted } from "./mutation-budget.js";
+import { ReconciliationItemError, reconciliationFailureDetails, type ReconciliationFailureContext } from "./reconciliation-diagnostics.js";
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
@@ -303,6 +305,24 @@ export class SnapshotReconciler {
   private async repair(delivery: Delivery): Promise<void> {
     if (this.repairCurrentState) return this.repairCurrentState(delivery);
     return new ProjectAwareSynchronizer(this.state).process(delivery);
+  }
+
+  private async rethrowCandidateError(
+    profile: Profile, error: unknown, context: ReconciliationFailureContext,
+  ): Promise<never> {
+    // Mutation-budget failures are handled by the worker's deferred, non-DLQ
+    // path; never turn them into an item/provider incident.
+    if (isMutationBudgetExhausted(error)) throw error;
+    const failure = new ReconciliationItemError(error, context);
+    const detail = reconciliationFailureDetails(failure);
+    logEvent("todoist_snapshot_reconcile_item_failed", { profile, ...detail }, "reconciliation");
+    try {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_item_failed", detail);
+    } catch {
+      // Audit availability must not replace or hide the original provider error.
+      logEvent("todoist_snapshot_reconcile_failure_audit_failed", { profile, ...detail }, "reconciliation");
+    }
+    throw failure;
   }
 
   private async reconcileExistingRecurrence(profile: Profile): Promise<void> {
@@ -767,7 +787,8 @@ export class SnapshotReconciler {
       const candidates = mappings.filter((mapping) => !afterTaskId || mapping.taskId > afterTaskId);
       for (let index = 0; index < candidates.length; index += 1) {
         const mapping = candidates[index];
-        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients);
+        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients)
+          .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "mapped", taskId: mapping.taskId, eventId: mapping.eventId }));
         counts[outcome] += 1;
         if (isResolvedConflictOutcome(outcome)) {
           const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
@@ -791,7 +812,8 @@ export class SnapshotReconciler {
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-      const outcome = await this.reconcileUnmappedTask(profile, task, clients);
+      const outcome = await this.reconcileUnmappedTask(profile, task, clients)
+        .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "unmapped", taskId: task.id }));
       counts[outcome] += 1;
       if (isResolvedConflictOutcome(outcome)) {
         const resolve = (this.state as StateRepository & { resolveConflictAudits?: StateRepository["resolveConflictAudits"] }).resolveConflictAudits;
