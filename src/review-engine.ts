@@ -195,6 +195,7 @@ export class ReviewEngine {
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings, itemPlan: [] };
     if (intent.action === "link" && (!task || !event)) invalidRepairIntent("Linking requires a live task and event");
     if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
+    if (["link","create"].includes(intent.action) && task?.is_deleted) invalidRepairIntent("Todoist repair sources must not be deleted; choose a live task or exclude the deleted item");
     if (intent.action === "link" && intent.winner === "todoist") {
       try {
         if(event?.recurringEventId && intent.owner === "todoist") todoistOccurrenceProjection(task!,event!);
@@ -279,8 +280,10 @@ export class ReviewEngine {
       const disposition = intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
       if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart or Exclude for ${entityKey(s.ref)}`);
       if (s.object && disposition === "create") {
-        if (s.ref.side === "todoist") toCalendarEvent(s.object as TodoistTask);
-        else if ((s.object as CalendarEvent).status !== "confirmed") invalidRepairIntent(`Calendar repair source ${entityKey(s.ref)} must be confirmed`);
+        if (s.ref.side === "todoist") {
+          if ((s.object as TodoistTask).is_deleted) invalidRepairIntent(`Todoist repair source ${entityKey(s.ref)} must not be deleted`);
+          toCalendarEvent(s.object as TodoistTask);
+        } else if ((s.object as CalendarEvent).status !== "confirmed") invalidRepairIntent(`Calendar repair source ${entityKey(s.ref)} must be confirmed`);
       }
       if (s.object && disposition === "create") {
         const title=(s.object as TodoistTask).content || (s.object as CalendarEvent).summary || s.ref.id;
