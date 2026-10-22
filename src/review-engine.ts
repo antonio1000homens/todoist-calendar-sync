@@ -135,6 +135,18 @@ export class ReviewEngine {
     intent = decisionRepairIntent(intent, record.decision);
     const snapshots = await this.collect(intent, record.decision);
     if (!snapshots.length) invalidRepairIntent("Select at least one provider item");
+    // Never accept a disposition submitted for an undisclosed or ambiguous object.
+    // In particular a stale task's 404 snapshot must not be mistaken for a live task.
+    for (const key of Object.keys(intent.leftovers)) {
+      const s = snapshots.find(snapshot => entityKey(snapshot.ref) === key);
+      if (!s || !s.object || s.object.id !== s.ref.id) invalidRepairIntent(`Cannot identify the live item for disposition ${key}; refresh affected items`);
+      if (s.ref.side === "calendar") {
+        const event = s.object as CalendarEvent;
+        if (!event.start?.date && !event.start?.dateTime || !["confirmed","cancelled"].includes(event.status || "")) {
+          invalidRepairIntent(`Calendar disposition ${key} lacks a verified start or status; refresh affected items`);
+        }
+      }
+    }
     if (snapshots.some(s => s.control?.activeRepair)) invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
@@ -180,7 +192,7 @@ export class ReviewEngine {
       if (reviewHash({value:before}) !== reviewHash({value:after})) changes.push(`${label}: ${show(before)} → ${show(after)}`);
     };
     const preview: RepairPreview = { id: randomUUID(), actor, intent, case: record, snapshots, fingerprint: snapshotFingerprint(snapshots),
-      createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings };
+      createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings, itemPlan: [] };
     if (intent.action === "link" && (!task || !event)) invalidRepairIntent("Linking requires a live task and event");
     if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
     if (intent.action === "link" && intent.winner === "todoist") {
@@ -276,6 +288,50 @@ export class ReviewEngine {
           ? `Create a new Calendar counterpart from Todoist task ${s.ref.id} (${title}) and link that new pair`
           : `Create a new Todoist counterpart from Calendar event ${s.ref.id} (${title}) and link that new pair`);
       } else if (s.object && disposition === "exclude") changes.push(`Exclude ${s.ref.side} item ${s.ref.id} from future syncing`);
+    }
+    for (const s of snapshots) {
+      const key = entityKey(s.ref);
+      const selected = chosen.has(`${s.ref.side}:${s.ref.id}`);
+      const projection = s.ref.side === "calendar" && seriesProjections.has(s.ref.id);
+      const parent = s.ref.side === "calendar" && event?.recurringEventId === s.ref.id;
+      const disposition = intent.action === "exclude" && selected ? "exclude"
+        : intent.action === "create" && selected ? "create" : intent.leftovers[key];
+      let operation: string, result: string;
+      if (!s.object) {
+        operation = "Missing provider object — no provider write";
+        result = s.mapping ? "Stale association detached as part of repair; Calendar history retained" : "No live provider object or association";
+      } else if (projection) {
+        operation = "Use active Calendar occurrence for selected series";
+        result = "Included in the resulting recurrence association";
+      } else if (parent) {
+        operation = "Retain recurring master as occurrence context";
+        result = "Existing series history retained";
+      } else if (intent.action === "verify") {
+        operation = "Verify existing association";
+        result = "Retain verified mapping; no provider fields changed";
+      } else if (intent.action === "decision") {
+        operation = "Apply existing guarded decision";
+        result = "See decision executor details in planned changes";
+      } else if (intent.action === "move") {
+        operation = selected ? "Move Todoist task" : "Handle existing Calendar projection";
+        result = selected ? `Move to ${intent.targetProfile}; remap projection there` : "Use existing project-move lifecycle";
+      } else if (intent.action === "link" && selected) {
+        operation = "Link selected provider object";
+        result = `Map Todoist ${intent.taskId} ↔ Calendar ${intent.eventId}${intent.owner ? ` (recurrence owner: ${intent.owner}, scope: ${intent.scope})` : ""}`;
+      } else if (disposition === "create") {
+        operation = "Create a new counterpart";
+        result = `Create ${s.ref.side === "todoist" ? "Calendar event" : "Todoist task"} and map it to ${key}`;
+      } else if (disposition === "exclude") {
+        operation = "Exclude from syncing";
+        result = "Remove displaced mapping and mark this provider object excluded";
+      } else if (selected && intent.action === "separate") {
+        operation = "Keep selected items separate";
+        result = "Remove existing association; do not link the selected pair";
+      } else {
+        operation = "No provider mutation";
+        result = s.mapping ? "Existing association handled by repair" : "No association";
+      }
+      preview.itemPlan.push({ref:s.ref, operation, result});
     }
     for (const s of snapshots) if (s.mapping) changes.push(`Replace existing association ${s.mapping.taskId} ↔ ${s.mapping.eventId}`);
     warnings.push("Past Calendar occurrences and audit records are retained. Old associations cannot be recovered automatically.");
