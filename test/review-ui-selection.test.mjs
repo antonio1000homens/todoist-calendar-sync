@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "../review-ui/repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference, repairRecurrenceOwnerRequirement, repairValidationField } from "../review-ui/repair-selection.mjs";
 
 const caseFor = (id, profile, taskId, eventId) =>
   ({ id, profile, taskId, eventId, decision:{context:{}}, status:"open" });
@@ -91,6 +91,101 @@ test("a missing Todoist or Calendar disposition triggers an affected-items refre
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for work:calendar:master_20270301"),"work:calendar:master_20270301");
   assert.equal(missingDispositionReference("Mapping does not match the selected pair"),undefined);
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:calendar:"),undefined);
+});
+
+
+test("recurring Calendar occurrence requires an explicit owner for link preview", () => {
+  const item=caseFor("recurring-case","work","task","occurrence");
+  const snapshots=[live("work","todoist","task"),live("work","calendar","occurrence",{recurringEventId:"series-master"})];
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  // The frontend requires an owner regardless of scope; scope-specific
+  // restrictions are separately validated by the repair engine.
+  assert.equal(repairRecurrenceOwnerRequirement(form,detailsFor(item,snapshots),"link"),"calendar-occurrence");
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,""),false);
+  for(const owner of ["todoist","calendar"])
+    assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,owner),true,owner);
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"verify",undefined,""),true);
+});
+
+test("recurring Calendar series and counterpart creation require Calendar owner selection", () => {
+  const item=caseFor("series-case","home","task","series-master");
+  const snapshots=[live("home","todoist","task"),live("home","calendar","series-master",{recurrence:["RRULE:FREQ=WEEKLY"]})];
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.equal(repairRecurrenceOwnerRequirement(form,detailsFor(item,snapshots),"link"),"calendar-series");
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,""),false);
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,"calendar"),true);
+  const fromCalendar=editRepairSelection(form,"todoist","");
+  assert.equal(repairRecurrenceOwnerRequirement(fromCalendar,detailsFor(item,snapshots),"create"),"calendar-series");
+  assert.equal(repairPreviewAllowed(fromCalendar,item,detailsFor(item,snapshots),"create",undefined,""),false);
+  assert.equal(repairPreviewAllowed(fromCalendar,item,detailsFor(item,snapshots),"create",undefined,"calendar"),true);
+  assert.equal(repairRecurrenceOwnerRequirement(form,detailsFor(item,snapshots),"create"),undefined);
+});
+
+test("recurring Todoist task requires an owner for linking, but unrelated cases are unaffected", () => {
+  const item=caseFor("task-repeats","antonio","task","standalone");
+  const snapshots=[live("antonio","todoist","task",{due:{is_recurring:true,string:"every week"}}),live("antonio","calendar","standalone")];
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.equal(repairRecurrenceOwnerRequirement(form,detailsFor(item,snapshots),"link"),"todoist-task");
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,""),false);
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link",undefined,"todoist"),true);
+  const unrelated=caseFor("unrelated","antonio","task","standalone");
+  assert.equal(repairRecurrenceOwnerRequirement(form,detailsFor(unrelated,snapshots),"link"),undefined);
+  assert.equal(repairPreviewAllowed(form,unrelated,detailsFor(unrelated,snapshots),"link",undefined,"todoist"),false);
+});
+
+test("recurrence validation errors are routed to nearby controls", () => {
+  assert.equal(repairValidationField("Choose which provider owns the recurrence for this Calendar occurrence"),"owner");
+  assert.equal(repairValidationField("Creating a counterpart for a Calendar series requires Calendar recurrence ownership"),"owner");
+  assert.equal(repairValidationField("Changing a Calendar series to Todoist ownership requires a future-only preview"),"scope");
+  assert.equal(repairValidationField("Fields differ: choose Todoist or Calendar as the source"),"winner");
+  assert.equal(repairValidationField("Calendar repair sources must be confirmed; choose a live event"),"eventId");
+  assert.equal(repairValidationField("Verification requires live Todoist task task-1; refresh affected items"),"taskId");
+  assert.equal(repairValidationField("Verification requires live Calendar event event-1; refresh affected items"),"eventId");
+  assert.equal(repairValidationField("Selected pair does not match the current mapping: Todoist task task-1, selected Calendar event event-2"),"eventId");
+  assert.equal(repairValidationField("Selected pair does not match the current Calendar-owned recurrence"),"eventId");
+  assert.equal(repairValidationField("Unexpected failure"),undefined);
+});
+
+
+test("searched live recurring Calendar occurrence and master require an owner before preview", () => {
+  const item=caseFor("case-search","home","task","old-event");
+  // Neither searched Calendar event appears in the original conflict snapshots.
+  const snapshots=[live("home","todoist","task"),live("home","calendar","old-event")];
+  const details=detailsFor(item,snapshots);
+  const base=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  const occurrence=editRepairSelection(base,"calendar","searched-occurrence",true,{id:"searched-occurrence",recurringEventId:"series-master"});
+  assert.equal(repairRecurrenceOwnerRequirement(occurrence,details,"link"),"calendar-occurrence");
+  assert.equal(repairPreviewAllowed(occurrence,item,details,"link",undefined,""),false);
+  assert.equal(repairPreviewAllowed(occurrence,item,details,"link",undefined,"calendar"),true);
+  const master=editRepairSelection(occurrence,"calendar","series-master",true,{id:"series-master",recurrence:["RRULE:FREQ=WEEKLY"]});
+  assert.equal(repairRecurrenceOwnerRequirement(master,details,"link"),"calendar-series");
+  assert.equal(repairPreviewAllowed(master,item,details,"link",undefined,""),false);
+  const fromCalendar=editRepairSelection(master,"todoist","");
+  assert.equal(repairRecurrenceOwnerRequirement(fromCalendar,details,"create"),"calendar-series");
+  assert.equal(repairPreviewAllowed(fromCalendar,item,details,"create",undefined,""),false);
+  assert.equal(repairPreviewAllowed(fromCalendar,item,details,"create",undefined,"calendar"),true);
+});
+
+test("searched recurring Todoist task is guarded and search metadata is case- and ID-scoped", () => {
+  const item=caseFor("searched-task-case","work","old-task","event");
+  const snapshots=[live("work","todoist","old-task"),live("work","calendar","event")];
+  const details=detailsFor(item,snapshots);
+  const base=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  const searched=editRepairSelection(base,"todoist","new-task",true,{id:"new-task",due:{is_recurring:true,string:"every week"}});
+  assert.equal(repairRecurrenceOwnerRequirement(searched,details,"link"),"todoist-task");
+  assert.equal(repairPreviewAllowed(searched,item,details,"link",undefined,""),false);
+  assert.equal(repairPreviewAllowed(searched,item,details,"link",undefined,"todoist"),true);
+  const typed=editRepairSelection(searched,"todoist","another-task");
+  assert.equal(repairRecurrenceOwnerRequirement(typed,details,"link"),undefined);
+  assert.equal(repairPreviewAllowed(typed,item,details,"link",undefined,""),false);
+  const other=caseFor("other-case","work","old-task","event");
+  assert.equal(repairRecurrenceOwnerRequirement(searched,detailsFor(other,snapshots),"link"),undefined);
+  assert.equal(repairPreviewAllowed(searched,other,detailsFor(other,snapshots),"link",undefined,"todoist"),false);
+  const refreshed=reconcileRepairSelection(item,[live("work","todoist","new-task",{due:{is_recurring:true}}),live("work","calendar","event")],searched);
+  assert.equal(repairRecurrenceOwnerRequirement(refreshed,detailsFor(item,[live("work","todoist","new-task",{due:{is_recurring:true}})]),"link"),"todoist-task");
+  const vanished=reconcileRepairSelection(item,[live("work","calendar","event")],searched);
+  assert.equal(vanished.verifiedTaskId,"");
+  assert.equal(vanished.searchedTask,undefined);
 });
 
 test("review UI renders approved historical and future RRULEs and expiry before Apply", () => {

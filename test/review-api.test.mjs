@@ -89,15 +89,24 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   const caseUpdates=[];
   t.mock.method(ReviewStore.prototype,"updateCase",async(...args)=>{caseUpdates.push(args);});
   const previewWithValidation = ReviewEngine.prototype.preview;
+  const recurringEvent={id:"occurrence",summary:"Weekly reminder",description:"",status:"confirmed",recurringEventId:"series-master",start:{date:"2026-10-21"},end:{date:"2026-10-22"}};
+  const seriesMaster={id:"series-master",summary:"Weekly reminder",description:"",status:"confirmed",recurrence:["RRULE:FREQ=WEEKLY"],start:{date:"2026-10-21"},end:{date:"2026-10-22"}};
+  const recurringSnapshots=[
+    {ref:{profile:"home",side:"todoist",id:"task-1"},object:{id:"task-1",content:"Weekly reminder",description:"",due:{date:"2026-10-21"},project_id:"test-home-project"}},
+    {ref:{profile:"home",side:"calendar",id:"occurrence"},object:recurringEvent},
+    {ref:{profile:"home",side:"calendar",id:"series-master"},object:seriesMaster,calendarProjectionId:"occurrence"},
+  ];
   t.mock.method(ReviewEngine.prototype,"collect",async intent=>intent.eventId === "cancelled-event" ? [
     {ref:{profile:"home",side:"todoist",id:"task-1"},object:{id:"task-1",content:"Test task",project_id:"test-home-project"}},
     {ref:{profile:"home",side:"calendar",id:"cancelled-event"},object:{id:"cancelled-event",summary:"Cancelled event",status:"cancelled"}},
-  ] : []);
+  ] : ["occurrence","series-master"].includes(intent.eventId) ? recurringSnapshots : []);
   t.mock.method(ReviewEngine.prototype,"preview",async function(actor,intent) {
-    return intent.eventId === "cancelled-event"
+    return ["cancelled-event","occurrence","series-master"].includes(intent.eventId)
       ? previewWithValidation.call(this,actor,intent)
       : {...preview,actor};
   });
+  const persistedPreviews=[];
+  t.mock.method(ReviewStore.prototype,"putPreview",async saved=>{persistedPreviews.push(saved);});
   t.mock.method(ReviewStore.prototype,"getPreview",async id=>id==="preview-1"?preview:undefined);
   t.mock.method(ReviewStore.prototype,"submit",async()=>operation);
   const queueCalls=[];
@@ -117,6 +126,30 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   },{action:"link",taskId:"task-1",eventId:"cancelled-event",winner:"none",scope:"occurrence",leftovers:{}})));
   assert.equal(cancelledPreview.status,400);
   assert.equal(cancelledPreview.body.error,"Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
+
+  // Real engine preview validation behind the authenticated API: a missing
+  // owner must never persist a preview or queue provider writes. Both supported
+  // Calendar source shapes must succeed once the owner is explicit.
+  for (const [eventId,scope] of [["occurrence","occurrence"],["series-master","series"]]) {
+    const form={action:"link",taskId:"task-1",eventId,winner:"calendar",scope,leftovers:{}};
+    const missingOwner=await jsonResponse(await handler(event("/review/api/cases/case-1/previews","POST",{
+      ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+    },form)));
+    assert.equal(missingOwner.status,400,JSON.stringify(missingOwner.body));
+    assert.match(missingOwner.body.error,/Choose which provider owns the recurrence/);
+    assert.equal(persistedPreviews.length,scope==="occurrence"?0:1,"Invalid preview must not be persisted");
+    assert.equal(queueCalls.length,0,"Preview must never enqueue a repair");
+    assert.equal(caseUpdates.length,0,"Preview must not change the case");
+
+    const withOwner=await jsonResponse(await handler(event("/review/api/cases/case-1/previews","POST",{
+      ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+    },{...form,owner:"calendar"})));
+    assert.equal(withOwner.status,200,JSON.stringify(withOwner.body));
+    assert.equal(withOwner.body.preview.intent.owner,"calendar");
+    assert.equal(withOwner.body.preview.intent.scope,scope);
+    assert.equal(persistedPreviews.length,scope==="occurrence"?1:2);
+    assert.equal(queueCalls.length,0);
+  }
 
   const dismissed=await jsonResponse(await handler(event("/review/api/cases/case-1/dismiss","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
