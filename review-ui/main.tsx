@@ -36,7 +36,7 @@ function App() {
     setMessage(""); setPreview(undefined); setOperation(undefined); setSubmitKey("");
     setTaskId(selected.taskId||selected.decision?.context?.providerTaskId||"");
     setEventId(selected.eventId||selected.decision?.context?.providerEventId||"");
-    setLeftovers({}); setReconcileProfile(selected.profile);
+    setLeftovers({}); setSearchText(""); setSearchResults([]); setSearchSide("todoist"); setReconcileProfile(selected.profile);
     let cancelled=false;
     api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
       if(cancelled)return;
