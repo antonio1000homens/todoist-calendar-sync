@@ -23,6 +23,16 @@ function isUnmodifiedInstance(event: CalendarEvent, masterId: string): boolean {
 function sameTitle(a: string | undefined, b: string | undefined): boolean {
   return normalizedText(a).toLowerCase() === normalizedText(b).toLowerCase();
 }
+/** Provider JSON key order is not a semantic edit to Calendar ownership metadata. */
+function sameSharedFields(left?: Record<string, string>, right?: Record<string, string>): boolean {
+  const a = Object.entries(left || {}).sort(([x], [y]) => x.localeCompare(y));
+  const b = Object.entries(right || {}).sort(([x], [y]) => x.localeCompare(y));
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function sameDueShape(left: TodoistTask["due"], right: TodoistTask["due"]): boolean {
+  const keys = ["date", "datetime", "timezone", "string", "lang", "is_recurring"] as const;
+  return keys.every(key => left?.[key] === right?.[key]);
+}
 export interface FutureSplitResult {
   plan: FutureSeriesSplitPlan;
   mapping: Mapping;
@@ -84,7 +94,7 @@ export async function applyApprovedFutureSeriesSplit(
   if (options.approvedPlan) {
     for (const field of ["oldMasterId", "newMasterId", "originalRule", "truncatedRule",
       "newRule", "previousOccurrence", "nextOldOccurrence", "newStart",
-      "calendarTimeZone"] as const) {
+      "calendarTimeZone", "expiredUntil", "historicalLastOccurrence", "approvedTaskFingerprint"] as const) {
       if (plan[field] !== options.approvedPlan[field]) {
         throw new Error(`Approved future-series cutover changed (${field}); new approval required`);
       }
@@ -240,6 +250,27 @@ export async function applyApprovedFutureSeriesSplit(
     && item.recurringEventId !== old.id && item.id !== old.id);
   if (conflicts.length) throw new Error("Another nearby Calendar occurrence may represent the same reminder");
 
+  // ETags and stored previews must be checked against the live providers
+  // immediately BEFORE the first write, not only when the repair was queued.
+  const [liveTask, liveOld] = await Promise.all([
+    pair.todoist.getTask(task.id), pair.calendar.getEvent(old.id),
+  ]);
+  if (liveTask.id !== task.id || liveTask.project_id !== task.project_id
+    || liveTask.content !== task.content || liveTask.description !== task.description
+    || liveTask.updated_at !== task.updated_at || !sameDueShape(liveTask.due, task.due)
+    || liveTask.due?.is_recurring !== true || liveTask.is_deleted || liveTask.is_completed
+    || liveOld.etag !== old.etag || liveOld.status !== old.status
+    || liveOld.summary !== old.summary || liveOld.description !== old.description
+    || liveOld.iCalUID !== old.iCalUID || liveOld.recurringEventId !== old.recurringEventId
+    || liveOld.start?.date !== old.start?.date || liveOld.end?.date !== old.end?.date
+    || liveOld.start?.dateTime !== old.start?.dateTime || liveOld.end?.dateTime !== old.end?.dateTime
+    || liveOld.start?.timeZone !== old.start?.timeZone || liveOld.end?.timeZone !== old.end?.timeZone
+    || liveOld.recurrence?.length !== 1 || old.recurrence?.length !== 1
+    || !sameSafeYearlyRecurrenceRule(liveOld.recurrence[0], old.recurrence[0])
+    || !sameSharedFields(liveOld.extendedProperties?.shared, old.extendedProperties?.shared)) {
+    throw new Error("Todoist task or Calendar RRULE changed after approval; refresh the future-only preview before applying any changes");
+  }
+
   // Persist the split guard BEFORE the first provider write. If the worker
   // crashes after capping the master, manual reconciliation and Todoist
   // webhooks must not create a competing recurrence while this remains pending.
@@ -259,12 +290,13 @@ export async function applyApprovedFutureSeriesSplit(
     delete shared.taskId; // prevents old history + new master appearing as two linked identities
     delete shared.syncRecurrenceOwner;
     delete shared.todoistRecurrence;
+    delete shared.syncHistoryCutoff;
     Object.assign(shared, {
       syncSource: "todoist-calendar-sync",
       syncHistoryOnly: "true", syncHistoryTaskId: task.id,
       syncHistoryOriginalRule: plan.originalRule,
       syncHistorySuccessorId: plan.newMasterId,
-      syncHistoryCutoff: plan.previousOccurrence,
+      ...(plan.previousOccurrence ? { syncHistoryCutoff: plan.previousOccurrence } : {}),
     });
     await pair.calendar.upsertEventIfUnchanged({
       ...old,
@@ -301,7 +333,7 @@ export async function applyApprovedFutureSeriesSplit(
       shared: {
         ...(requested.extendedProperties?.shared || {}),
         syncHistoryMasterId: old.id,
-        syncHistoryCutoff: plan.previousOccurrence,
+        ...(plan.previousOccurrence ? { syncHistoryCutoff: plan.previousOccurrence } : {}),
         syncSplitVersion: "1",
       },
     },
@@ -317,9 +349,9 @@ export async function applyApprovedFutureSeriesSplit(
       addDays(plan.newStart, 2) + "T00:00:00Z",
     ),
   ]);
-  if (!currentTask.due?.is_recurring || currentTask.due.date !== task.due?.date
-    || currentTask.due.string !== task.due?.string
-    || currentTask.content !== task.content || currentTask.updated_at !== task.updated_at
+  if (!currentTask.due?.is_recurring || !sameDueShape(currentTask.due, task.due)
+    || currentTask.content !== task.content || currentTask.description !== task.description
+    || currentTask.updated_at !== task.updated_at
     || (!options.consolidation && linkedNow?.id !== future.id)) {
     throw new Error("Todoist task or Calendar linked identity changed before mapping");
   }
@@ -377,8 +409,9 @@ export async function applyApprovedFutureSeriesSplit(
   await state.completeFutureSeriesSplit(profile, task.id, future.id);
   await state.audit(profile, "manual_future_series_split_applied", {
     taskId: task.id, oldMasterId: old.id, newMasterId: future.id,
-    priorOccurrence: plan.previousOccurrence, newStart: plan.newStart,
-    priorRule: plan.originalRule, newRule: plan.newRule,
+    ...(plan.previousOccurrence ? { priorOccurrence: plan.previousOccurrence } : {}),
+    ...(plan.expiredUntil ? { expiredUntil: plan.expiredUntil } : {}),
+    newStart: plan.newStart, priorRule: plan.originalRule, newRule: plan.newRule,
   });
   return { mapping, plan, resumed: archived };
 }

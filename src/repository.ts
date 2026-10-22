@@ -688,7 +688,8 @@ export class StateRepository {
         TableName: this.ensureTable(),
         Item: {
           ...key(`FUTURE_SPLIT#TASK#${taskId}`),
-          profile, taskId, oldMasterId, newMasterId, previousOccurrence,
+          profile, taskId, oldMasterId, newMasterId,
+          ...(previousOccurrence ? { previousOccurrence } : {}),
           status: "pending", startedAt: now(),
           // No TTL while pending: automatic reconciliation must remain blocked
           // until an operator finishes or explicitly compensates the split.
