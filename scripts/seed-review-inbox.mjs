@@ -7,10 +7,30 @@ import { ReviewStore } from "../dist/review-store.js";
 const tableName = process.env.STATE_TABLE_NAME?.trim();
 if (!tableName) throw new Error("STATE_TABLE_NAME is required; refusing to select a table implicitly");
 const apply = process.argv.includes("--apply");
-const client = DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 5, retryMode: "standard" }), {
+const rawClient = DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 5, retryMode: "standard" }), {
   marshallOptions: { removeUndefinedValues: true },
 });
-const store = new ReviewStore();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const retryable = (error) => ["ProvisionedThroughputExceededException", "ThrottlingException", "RequestLimitExceeded"].includes(error?.name);
+// Keep every seeder request, including case writes, under a conservative
+// 5-RCU/s budget and add bounded retries for transient capacity errors.
+const client = { send: async (command) => {
+  command.input.ReturnConsumedCapacity = "TOTAL";
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const started = Date.now();
+    try {
+      const result = await rawClient.send(command);
+      const units = Number(result.ConsumedCapacity?.CapacityUnits || 0);
+      await sleep(Math.max(200, Math.ceil(units * 1000 / 5) - (Date.now() - started)));
+      return result;
+    } catch (error) {
+      if (attempt === 7 || !retryable(error)) throw error;
+      await sleep(Math.min(10000, 250 * 2 ** attempt));
+    }
+  }
+  throw new Error("DynamoDB retries exhausted");
+} };
+const store = new ReviewStore(client);
 let pendingDecisions = 0, activeIncidents = 0, seeded = 0;
 let cursor;
 do {
@@ -21,6 +41,12 @@ do {
     ...(cursor ? { ExclusiveStartKey: cursor } : {}),
   }));
   for (const decision of result.Items || []) if (decision.decisionId && decision.profile) pendingDecisions += 1;
+  if (apply) for (const decision of result.Items || []) {
+    if (decision.decisionId && decision.profile) {
+      await store.observeDecision(decision);
+      seeded += 1;
+    }
+  }
   cursor = result.LastEvaluatedKey;
 } while (cursor);
 
@@ -49,23 +75,5 @@ do {
 } while (cursor);
 
 cursor = undefined;
-if (apply) {
-  do {
-    const result = await client.send(new ScanCommand({
-      TableName: tableName, Limit: 50,
-      FilterExpression: "begins_with(pk, :manual) AND sk = :state",
-      ExpressionAttributeValues: { ":manual": "MANUAL#", ":state": "STATE" },
-      ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-    }));
-    for (const decision of result.Items || []) {
-      if (decision.decisionId && decision.profile) {
-        await store.observeDecision(decision);
-        seeded += 1;
-      }
-    }
-    cursor = result.LastEvaluatedKey;
-  } while (cursor);
-}
-
 console.log(JSON.stringify({ mode: apply ? "apply" : "preview", pendingAndRetainedDecisions: pendingDecisions,
   activeIncidents, recordsSeeded: seeded }));

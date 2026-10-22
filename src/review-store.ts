@@ -13,8 +13,9 @@ export function reviewHash(value: unknown): string {
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 export class ReviewStore {
+  constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
-    return (await client.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
+    return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const id = decision.decisionId, existing = await this.getCase(id);
@@ -24,14 +25,13 @@ export class ReviewStore {
       status: decision.status === "resolved" ? "dismissed" : "open", decision, taskId: decision.taskId, eventId: decision.eventId,
       createdAt: decision.createdAt, updatedAt: new Date().toISOString(),
     };
-    try { await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
+    try { await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
       lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "dismissed" ? "CLOSED" : "OPEN"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
     catch (e) { if (!conditional(e)) throw e; }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
     const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
-    if (await this.getCase(id)) return;
     const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
     const action = typeof audit.action === "string" ? audit.action : "active conflict";
     const createdAt = typeof audit.createdAt === "string" ? audit.createdAt : new Date().toISOString();
@@ -42,13 +42,13 @@ export class ReviewStore {
       createdAt, updatedAt: new Date().toISOString(),
     };
     try {
-      await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`), sourceAuditKey: auditKey,
+      await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`), sourceAuditKey: auditKey,
         lookupPk: `PROFILE#${profile}`, lookupSk: `REVIEW#OPEN#${createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" }));
     } catch (error) { if (!conditional(error)) throw error; }
   }
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
   async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {
-    const result = await client.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
+    const result = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
       KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)",
       ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": history ? "REVIEW#" : "REVIEW#OPEN#" }, Limit: 50,
       ExclusiveStartKey: cursor }));
@@ -62,7 +62,7 @@ export class ReviewStore {
       : status === "open"
         ? "#s = :repairing AND operationId = :op"
         : "#s = :current AND (attribute_not_exists(operationId) OR operationId = :op)";
-    await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
+    await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
       UpdateExpression: "SET #s = :s, #r = :r, updatedAt = :now, operationId = :op, lookupSk = :lookup",
       ConditionExpression: condition,
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: { ":s": status, ":r": result,
@@ -70,7 +70,7 @@ export class ReviewStore {
         ":lookup": `REVIEW#${terminal ? "CLOSED" : "OPEN"}#${current.createdAt}#${id}` } }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
-    await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
+    await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
   }
   getPreview(id: string): Promise<RepairPreview | undefined> { return this.get(`REPAIR_PREVIEW#${id}`); }
   getOperation(id: string): Promise<RepairOperation | undefined> { return this.get(`REPAIR#${id}`); }
@@ -80,7 +80,7 @@ export class ReviewStore {
     const old = await this.getOperation(id); if (old) return old;
     const operation: RepairOperation = { id, preview, actor, attempt: 1, status: "queued", steps: {}, notificationPending: false,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    try { await client.send(new TransactWriteCommand({ TransactItems: [
+    try { await this.db.send(new TransactWriteCommand({ TransactItems: [
       { Update: { TableName: reviewTable(), Key: key(`REPAIR_PREVIEW#${preview.id}`), UpdateExpression: "SET submittedOperation = :id",
         ConditionExpression: "attribute_not_exists(submittedOperation) OR submittedOperation = :id", ExpressionAttributeValues: { ":id": id } } },
       { Put: { TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${id}`) }, ConditionExpression: "attribute_not_exists(pk)" } },
@@ -89,13 +89,13 @@ export class ReviewStore {
   }
   async saveOperation(operation: RepairOperation): Promise<void> {
     operation.updatedAt = new Date().toISOString();
-    await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
+    await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
       ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded" : "attribute_not_exists(pk) OR #status <> :succeeded",
       ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} }));
   }
   async completeNotification(operationId: string, replyTs?: string): Promise<void> {
-    await client.send(new UpdateCommand({ TableName:reviewTable(), Key:key(`REPAIR#${operationId}`),
+    await this.db.send(new UpdateCommand({ TableName:reviewTable(), Key:key(`REPAIR#${operationId}`),
       UpdateExpression:"SET notificationPending = :false, updatedAt = :now, lookupSk = :lookup" + (replyTs ? ", notificationReplyTs = :reply" : ""),
       ConditionExpression:"#status IN (:succeeded, :needsReview, :failed)",
       ExpressionAttributeNames:{"#status":"status"},
@@ -108,7 +108,7 @@ export class ReviewStore {
     const completed: RepairOperation = { ...operation, status:"succeeded", updatedAt:now, error:undefined, nextAction:undefined,
       notificationPending:true, notificationText:"Succeeded: repair verified" };
     try {
-      await client.send(new TransactWriteCommand({ TransactItems: [
+      await this.db.send(new TransactWriteCommand({ TransactItems: [
         ...[...new Map(releases.map(item => [entityKey(item.ref), item])).values()].map(item => ({ Update: {
           TableName:reviewTable(), Key:key(`SYNC_CONTROL#${entityKey(item.ref)}`),
           UpdateExpression:`SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair, pendingRefresh`,
@@ -135,7 +135,7 @@ export class ReviewStore {
   }
   async pendingNotifications(profile: Profile): Promise<RepairOperation[]> {
     const items: RepairOperation[] = []; let cursor: Record<string, unknown> | undefined;
-    do { const page = await client.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
+    do { const page = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
       KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)", ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": "REPAIR#NOTIFY#" }, ExclusiveStartKey: cursor }));
       items.push(...(page.Items || []) as RepairOperation[]); cursor = page.LastEvaluatedKey;
     } while (cursor); return items;
