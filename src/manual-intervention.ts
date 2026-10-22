@@ -11,6 +11,7 @@ import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResul
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
+import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { profiles } from "./config.js";
 import { normalizedText } from "./security.js";
@@ -557,6 +558,13 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     } catch {
       // The failure record remains useful even when a legacy webhook is malformed.
     }
+  }
+  if (error instanceof ReconciliationItemError) {
+    context.providerTaskId = error.taskId;
+    context.providerEventId = error.eventId;
+    context.providerErrorTag = error.providerReason;
+    context.reconcileStage = error.stage;
+    context.providerSeriesId = error.seriesId;
   }
   if (delivery.reconcile) {
     context.reconcileReason = delivery.reconcile.reason;
@@ -1514,7 +1522,13 @@ export class ManualInterventionService {
       delivery.profile,
       type,
       { deliveryId: delivery.id, status, message: error instanceof Error ? error.message : String(error) },
-      { sourceDeliveryId: delivery.id },
+      {
+        sourceDeliveryId: delivery.id,
+        ...(delivery.kind === "orphan" && delivery.orphan ? {
+          taskId: delivery.orphan.taskId,
+          eventId: delivery.orphan.eventId,
+        } : {}),
+      },
       operationalFailureContext(delivery, error),
     );
   }

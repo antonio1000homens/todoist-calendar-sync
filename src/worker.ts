@@ -12,6 +12,7 @@ import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
+import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
@@ -36,6 +37,7 @@ function serializeError(error: unknown): Record<string, unknown> {
     code: provider.code,
     providerBody: provider.body?.slice(0, 2000),
     cause: provider.cause instanceof Error ? { name: provider.cause.name, message: provider.cause.message } : provider.cause,
+    ...reconciliationFailureDetails(error),
   };
 }
 
@@ -552,7 +554,9 @@ export const handler: SQSHandler = async (event, context: Context) => {
         });
       }
 
-      if (delivery?.kind !== "reconcile") await manual?.reportDeliveryFailure(delivery, error).catch((manualError: unknown) => {
+      // Reconciliation already has a run-level outcome. Create an actionable
+      // review incident only when the failing item is actually identified.
+      if (delivery?.kind !== "reconcile" || error instanceof ReconciliationItemError) await manual?.reportDeliveryFailure(delivery, error).catch((manualError: unknown) => {
         console.error(JSON.stringify({
           service: "todoist-calendar-sync-worker",
           event: "manual_failure_notification_failed",
