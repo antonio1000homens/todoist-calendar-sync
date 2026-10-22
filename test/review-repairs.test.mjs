@@ -223,6 +223,20 @@ test("a move previews, claims, and verifies its existing destination Calendar pr
   assert.equal(h.mappingMap.get("task").profile,"work");assert.ok(!h.eventMap.has("event"));
 });
 
+test("a confirmed multi-day Calendar event and matching Todoist task produce a preview or an actionable validation",async t=>{
+  const h=harness(t,{
+    tasks:[task("6hQ4jRqcGPVgFwVj",{content:"Antonio on-call",due:{date:"2026-11-23"}})],
+    events:[event("7jlq4bim3a0t8inv8kgu1pnp1g",{summary:"Antonio on-call",start:{date:"2026-11-23"},end:{date:"2026-11-30"}})],
+  });
+  const base={...intent(),taskId:"6hQ4jRqcGPVgFwVj",eventId:"7jlq4bim3a0t8inv8kgu1pnp1g"};
+  const keepFieldsPreview=await h.engine.preview(actor,base);
+  assert.equal(keepFieldsPreview.intent.winner,"none");
+  const preview=await h.engine.preview(actor,{...base,winner:"calendar"});
+  assert.equal(preview.intent.winner,"calendar");
+  assert.ok(preview.changes.some(change=>change.includes("Todoist due date")));
+  assert.equal(preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar").object.status,"confirmed");
+});
+
 for(const change of ["edit","new projection"]) test(`a destination ${change} after validation stops a move before source mutations`,async t=>{
   const h=moveHarness(t,{existing:change==="edit"}),save=h.engine.store.saveOperation;
   h.engine.store.saveOperation=async operation=>{
