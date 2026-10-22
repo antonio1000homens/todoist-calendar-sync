@@ -3,7 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
-import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase } from "./review-types.js";
+import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -107,8 +107,10 @@ export class ReviewStore {
     operation.updatedAt = new Date().toISOString();
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
-      ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded" : "attribute_not_exists(pk) OR #status <> :succeeded",
-      ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} }));
+      ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded AND attribute_not_exists(abandoned)"
+        : operation.abandoned ? "#status = :failed AND abandoned = :yes"
+        : "(attribute_not_exists(pk) OR #status <> :succeeded) AND attribute_not_exists(abandoned)",
+      ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded",":failed":"failed",":yes":true} }));
   }
   async completeNotification(operationId: string, replyTs?: string): Promise<void> {
     await this.db.send(new UpdateCommand({ TableName:reviewTable(), Key:key(`REPAIR#${operationId}`),
@@ -192,6 +194,51 @@ export class SyncControls {
       TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET activeRepair = :id",
       ConditionExpression: "attribute_not_exists(activeRepair) OR activeRepair = :id", ExpressionAttributeValues: { ":id": operationId },
     } })) }));
+  }
+  // Atomically release an unapplied failed repair, checking the controls from its preview.
+  async releaseUnapplied(
+    refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[], failure: { error: string; nextAction: string },
+    queuedRefresh: Array<EntityRef & {pendingRefreshAt: string}> = [],
+  ): Promise<void> {
+    const previous = new Map(snapshots.map(s => [entityKey(s.ref), s.control || {}]));
+    const queued = new Map(queuedRefresh.map(ref => [entityKey(ref), ref.pendingRefreshAt]));
+    const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
+    if (!unique.length) return;
+    const items = unique.map(ref => {
+      const before = previous.get(entityKey(ref));
+      if (!before) throw new Error(`No preview control snapshot for ${entityKey(ref)}; cannot release its repair barrier`);
+      const values: Record<string, unknown> = { ':id': operationId, ':now': new Date().toISOString() };
+      const conditions = ['activeRepair = :id'];
+      for (const name of ['excluded', 'fencedAt', 'providerUpdatedAt'] as const) {
+        const value = before[name];
+        if (value === undefined) conditions.push(`attribute_not_exists(${name})`);
+        else { values[`:${name}`] = value; conditions.push(`${name} = :${name}`); }
+      }
+      // A webhook arriving after pendingRefreshRefs() but before this transaction
+      // changes the token and rejects the entire release. No refresh is lost.
+      if (queued.has(entityKey(ref))) {
+        values[':pendingTrue'] = true;
+        values[':pendingAt'] = queued.get(entityKey(ref));
+        conditions.push('pendingRefresh = :pendingTrue', 'pendingRefreshAt = :pendingAt');
+      } else {
+        values[':pendingFalse'] = false;
+        conditions.push('(attribute_not_exists(pendingRefresh) OR pendingRefresh = :pendingFalse)',
+          'attribute_not_exists(pendingRefreshAt)');
+      }
+      return { Update: { TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+        UpdateExpression: 'SET fencedAt = :now REMOVE activeRepair',
+        ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } };
+    });
+    // Include the terminal operation marker in the SAME transaction as lock release.
+    // A crash or lost response cannot replay a previously validated preview.
+    const operationMarker = { Update: { TableName: reviewTable(), Key: key(`REPAIR#${operationId}`),
+      UpdateExpression: 'SET abandoned = :yes, #status = :failed, #error = :error, nextAction = :next, updatedAt = :now, notificationPending = :yes, notificationText = :notice, lookupSk = :lookup',
+      ConditionExpression: 'attribute_exists(pk) AND #status <> :succeeded AND attribute_not_exists(abandoned)',
+      ExpressionAttributeNames: { '#status': 'status', '#error': 'error' },
+      ExpressionAttributeValues: { ':yes': true, ':failed': 'failed', ':succeeded': 'succeeded', ':error': failure.error, ':next': failure.nextAction, ':now': new Date().toISOString(),
+        ':notice': `Failed: ${failure.error}`, ':lookup': `REPAIR#NOTIFY#${operationId}` }
+    } };
+    await client.send(new TransactWriteCommand({ TransactItems: [...items, operationMarker] }));
   }
   async exclude(ref: EntityRef, excluded: boolean, operationId: string): Promise<void> {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",

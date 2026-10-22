@@ -58,6 +58,16 @@ test("saving stale failure state cannot overwrite an atomically completed repair
   assert.equal(commands[0].ExpressionAttributeValues[":succeeded"],"succeeded");
 });
 
+test("stale retry cannot erase the abandoned marker after an atomic failed-before-write release",async t=>{
+  const commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command.input);return {};});
+  const store=new ReviewStore();
+  await store.saveOperation({...operation(),status:"queued"});
+  assert.match(commands[0].ConditionExpression,/attribute_not_exists\(abandoned\)/);
+  await store.saveOperation({...operation(),status:"failed",abandoned:true});
+  assert.match(commands[1].ConditionExpression,/abandoned = :yes/);
+  assert.match(commands[1].ConditionExpression,/#status = :failed/);
+});
 test("a previously dismissed alert can enter an explicit repair without losing its history",async t=>{
   const commands=[];
   const store=new ReviewStore();
@@ -68,4 +78,45 @@ test("a previously dismissed alert can enter an explicit repair without losing i
   assert.match(command.ConditionExpression,/#s = :dismissed/);
   assert.equal(command.ExpressionAttributeValues[":empty"],"");
   assert.equal(command.ExpressionAttributeValues[":op"],"repair-1");
+});
+
+test("unapplied release compares preview control state in one conditional transaction", async t => {
+  const { SyncControls } = await import("../dist/review-store.js");
+  const controls=new SyncControls(),commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await controls.releaseUnapplied([
+    {profile:"home",side:"todoist",id:"task"},
+    {profile:"home",side:"calendar",id:"event"},
+    {profile:"home",side:"todoist",id:"task"},
+  ],"repair",[
+    {ref:{profile:"home",side:"todoist",id:"task"},object:null,control:{excluded:true,fencedAt:"old",providerUpdatedAt:"v1"}},
+    {ref:{profile:"home",side:"calendar",id:"event"},object:null},
+  ],{error:"read-only failed validation",nextAction:"fresh preview"});
+  assert.equal(commands.length,1);
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,3);
+  assert.ok(tx.slice(0,2).every(x=>x.Update.ConditionExpression.includes("activeRepair = :id")));
+  assert.match(tx[0].Update.ConditionExpression,/excluded = :excluded/);
+  assert.match(tx[1].Update.ConditionExpression,/attribute_not_exists\(excluded\)/);
+  assert.ok(tx.slice(0,2).every(x=>!x.Update.UpdateExpression.includes("providerUpdatedAt")));
+  assert.match(tx[2].Update.UpdateExpression,/abandoned = :yes/);
+  assert.match(tx[2].Update.ConditionExpression,/attribute_not_exists\(abandoned\)/);
+  await assert.rejects(controls.releaseUnapplied([{profile:"home",side:"calendar",id:"unknown"}],"repair",[],{error:"failed",nextAction:"new preview"}),/No preview control snapshot/);
+  assert.equal(commands.length,1);
+});
+
+test("atomic abandonment rejects concurrent late pending-refresh changes",async t=>{
+  const { SyncControls }=await import("../dist/review-store.js");
+  const controls=new SyncControls(),captured=[];
+  t.mock.method(documentClient,"send",async cmd=>{captured.push(cmd);return {};});
+  const ref={profile:"home",side:"todoist",id:"task"},snapshots=[{ref,object:null}];
+  await controls.releaseUnapplied([ref],"repair",snapshots,{error:"validation failed",nextAction:"fresh preview"},[]);
+  const noPending=captured[0].input.TransactItems[0].Update;
+  assert.match(noPending.ConditionExpression,/attribute_not_exists\(pendingRefreshAt\)/);
+  assert.match(noPending.ConditionExpression,/attribute_not_exists\(pendingRefresh\)/);
+  await controls.releaseUnapplied([ref],"repair",snapshots,{error:"validation failed",nextAction:"fresh preview"},[{...ref,pendingRefreshAt:"generation-1"}]);
+  const pending=captured[1].input.TransactItems[0].Update;
+  assert.match(pending.ConditionExpression,/pendingRefreshAt = :pendingAt/);
+  assert.equal(pending.ExpressionAttributeValues[":pendingAt"],"generation-1");
+  assert.equal(pending.ExpressionAttributeValues[":pendingTrue"],true);
 });

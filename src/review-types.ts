@@ -36,9 +36,11 @@ export interface RepairOperation {
   id: string; preview: RepairPreview; actor: ReviewActor; attempt: number;
   status: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
-  error?: string; nextAction?: string; notificationPending: boolean; notificationReplyTs?: string;
+  error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
   outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded"; checkedAt: string }>;
+  /** Controls sampled before claiming extra, non-preview move destination locks. */
+  claimSnapshots?: ReviewSnapshot[];
   expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;
   recurrenceBindings?: Mapping[];
   creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;

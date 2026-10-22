@@ -1,11 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed } from "./repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number };
-type RepairOperation = { id:string; attempt:number; status:string; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
+type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
 const api = async (path:string, init?:RequestInit) => {
   const response = await fetch("/review/api/" + path, { ...init, headers:{ "content-type":"application/json", ...(init?.headers || {}) } });
@@ -153,7 +153,19 @@ function App() {
     try { const result=await api(`cases/${encodeURIComponent(selected.id)}/previews`,{method:"POST",body:JSON.stringify(intent)});
       if(requestVersion===selectionVersion.current)setPreview(result.preview);
     }
-    catch(e:any){setMessage(e.message);} finally{setBusy(false);}
+    catch(e:any){
+      if (missingDispositionReference(e.message)) {
+        // The selected pair can displace an item absent from the initial case detail.
+        try {
+          const refreshed=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:'POST',body:JSON.stringify(intent)});
+          if(requestVersion===selectionVersion.current) {
+            setDetails((current:any)=>current?.item?.id===selected.id?{...current,snapshots:refreshed.snapshots}:current);
+            setRepairSelection(current=>reconcileRepairSelection(selected,refreshed.snapshots,current));
+            setMessage('Additional linked items were found. Choose dispositions below for every displaced item, then preview again.');
+          }
+        } catch(refreshError:any) {setMessage(`Could not refresh affected items: ${refreshError.message}`);}
+      } else setMessage(e.message);
+    } finally{setBusy(false);}
   };
   const applyPreview=async () => {
     if (!validPreview) return;
@@ -246,7 +258,7 @@ function App() {
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
         {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><h4>Affected provider items</h4><ul>{validPreview.snapshots.map((item:any)=><li key={choiceKey(item)}><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)||"Missing provider item"}{item.mapping&&<> · currently linked as {item.mapping.taskId} ↔ {item.mapping.eventId}</>}{item.control?.excluded&&" · currently excluded"}{item.checkedAt&&<> · checked {new Date(item.checkedAt).toLocaleString()}</>}</li>)}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul><h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
-        {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
+        {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{!operation.abandoned&&["failed","needs_review","queued"].includes(operation.status)&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>
   </main>;
