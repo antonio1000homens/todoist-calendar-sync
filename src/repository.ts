@@ -1320,6 +1320,17 @@ export class StateRepository {
               ConditionExpression: "attribute_not_exists(pk)",
             },
           },
+          ...(projection.terminalVerified === true && projection.recurrenceOwner === "todoist" && projection.seriesId
+            ? [{ Put: {
+              TableName: this.ensureTable(),
+              Item: {
+                ...key(`COMPLETED_SERIES#${projection.profile}#${projection.seriesId}`),
+                profile: projection.profile, seriesId: projection.seriesId,
+                recurrenceOwner: projection.recurrenceOwner, masterEventId: projection.masterEventId,
+                terminalCompletedAt: projection.completedAt, terminalEventId: projection.eventId,
+              },
+              ConditionExpression: "attribute_not_exists(pk)",
+            } }] : []),
         ],
       }));
     } catch (error) {
@@ -1371,6 +1382,16 @@ export class StateRepository {
         ConditionExpression: sameHistory,
         ExpressionAttributeNames: { "#profile": "profile" },
         ExpressionAttributeValues: historyValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: {
+          ...key(`COMPLETED_SERIES#${projection.profile}#${projection.seriesId}`),
+          profile: projection.profile, seriesId: projection.seriesId,
+          recurrenceOwner: "calendar", masterEventId: projection.masterEventId,
+          terminalCompletedAt: projection.completedAt, terminalEventId: projection.eventId,
+        },
+        ConditionExpression: "attribute_not_exists(pk)",
       } },
       { ConditionCheck: {
         TableName: table, Key: key(`TASKOWNER#${projection.taskId}`, "MAP"),
