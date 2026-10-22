@@ -92,8 +92,9 @@ async function providers() {
     const comments = await clients.todoist.listTaskComments(taskId);
     legacy = comments.filter(comment => {
       const lines = String(comment.content || "").split(/\\r?\\n/);
-      return LEGACY_TASK_COMMENT_MARKERS.has(lines[0]) && (!eventId || lines.includes("calendarEventId=" + eventId));
-    }).map(comment => ({id:comment.id,content:comment.content,taskId}));
+      return LEGACY_TASK_COMMENT_MARKERS.has(lines[0]);
+    }).map(comment => ({id:comment.id,content:comment.content,taskId,
+      eventId:String(comment.content || "").split(/\\r?\\n/).find(line => line.startsWith("calendarEventId="))?.slice("calendarEventId=".length)}));
   }
   return {
     task,event,linked:linked?.status === "cancelled" ? null : linked,
@@ -123,7 +124,8 @@ function providerBlockers(data) {
   if (data.comments.some(item => item.profile !== profile || item.taskId !== taskId || item.eventId !== eventId || item.seriesId))
     blocks.push("Project mapping comment belongs to another item or recurrence");
   if (data.malformed.length) blocks.push("Unparseable mapping comments contain the selected identity");
-  if (data.legacy.length && !eventId) blocks.push("Legacy task mapping comment requires an exact Calendar event ID");
+  if (data.legacy.some(item => !eventId || item.eventId !== eventId))
+    blocks.push("Legacy task comments refer to another or unknown Calendar event");
   return blocks;
 }
 function output(data) { console.log(JSON.stringify(data, null, 2)); }
