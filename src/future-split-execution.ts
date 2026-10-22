@@ -84,7 +84,7 @@ export async function applyApprovedFutureSeriesSplit(
   if (options.approvedPlan) {
     for (const field of ["oldMasterId", "newMasterId", "originalRule", "truncatedRule",
       "newRule", "previousOccurrence", "nextOldOccurrence", "newStart",
-      "calendarTimeZone"] as const) {
+      "calendarTimeZone", "expiredUntil", "historicalLastOccurrence"] as const) {
       if (plan[field] !== options.approvedPlan[field]) {
         throw new Error(`Approved future-series cutover changed (${field}); new approval required`);
       }
@@ -239,6 +239,23 @@ export async function applyApprovedFutureSeriesSplit(
     && item.recurringEventId !== plan.newMasterId
     && item.recurringEventId !== old.id && item.id !== old.id);
   if (conflicts.length) throw new Error("Another nearby Calendar occurrence may represent the same reminder");
+
+  // ETags and stored previews must be checked against the live providers
+  // immediately BEFORE the first write, not only when the repair was queued.
+  const [liveTask, liveOld] = await Promise.all([
+    pair.todoist.getTask(task.id), pair.calendar.getEvent(old.id),
+  ]);
+  if (liveTask.id !== task.id || liveTask.project_id !== task.project_id
+    || liveTask.content !== task.content || liveTask.updated_at !== task.updated_at
+    || liveTask.due?.date !== task.due?.date || liveTask.due?.string !== task.due?.string
+    || liveTask.due?.is_recurring !== true || liveTask.is_deleted || liveTask.is_completed
+    || liveOld.etag !== old.etag || liveOld.status !== old.status
+    || liveOld.start?.date !== old.start?.date || liveOld.end?.date !== old.end?.date
+    || liveOld.recurrence?.length !== 1 || old.recurrence?.length !== 1
+    || !sameSafeYearlyRecurrenceRule(liveOld.recurrence[0], old.recurrence[0])
+    || JSON.stringify(liveOld.extendedProperties?.shared || {}) !== JSON.stringify(old.extendedProperties?.shared || {})) {
+    throw new Error("Todoist task or Calendar RRULE changed after approval; refresh the future-only preview before applying any changes");
+  }
 
   // Persist the split guard BEFORE the first provider write. If the worker
   // crashes after capping the master, manual reconciliation and Todoist
