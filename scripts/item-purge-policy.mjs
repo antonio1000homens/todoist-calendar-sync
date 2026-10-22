@@ -89,9 +89,13 @@ export function planPurge(rows, target) {
     presentKeys.add(key);
   }
   // Record links can point in either direction and can be nested in a preview.
-  for (let round = 0; round < 6; round++) {
+  for (let round = 0; round < 20; round++) {
     let changed = false;
     const ownedKeys = new Set([...included.values()].map(value => value.row.pk));
+    const references = new Set();
+    for (const {row} of included.values()) {
+      visit(row, (value, path) => { if (path !== "pk" && path !== "sk") references.add(value); });
+    }
     for (const row of rows) {
       const key = keyOf(row);
       if (included.has(key)) continue;
@@ -99,12 +103,17 @@ export function planPurge(rows, target) {
       visit(row, (value, path) => {
         if (path !== "pk" && ownedKeys.has(value)) reasons.push("references inventoried " + path);
       });
+      if (references.has(row.pk)) reasons.push("referenced by inventoried record");
+      if (["MANUAL", "REVIEW_CASE", "REPAIR", "REPAIR_PREVIEW"].includes(kindOf(row))
+        && references.has(row.pk.slice(kindOf(row).length + 1)))
+        reasons.push("linked operation or decision identifier");
       if (reasons.length) {
         included.set(key, { row, reasons: [...new Set(reasons)] });
         changed = true;
       }
     }
     if (!changed) break;
+    if (round === 19) throw new Error("Item provenance graph did not converge; manual handling required");
   }
   const records = [...included.values()].map(({ row, reasons }) => {
     const family = kindOf(row);
