@@ -212,14 +212,25 @@ export class ReviewEngine {
         if (intent.owner === "calendar" && intent.winner === "todoist") invalidRepairIntent("Use Calendar fields for a Calendar-owned series; change a future series with the Todoist owner option");
         if (intent.owner === "todoist") {
           const zone = await (await this.clients(intent.profile)).calendar.getTimeZone();
-          preview.splitPlan = planFutureSeriesSplit(intent.profile, task!, event, new Date(), zone);
-          changes.push(`Retain history through ${preview.splitPlan.previousOccurrence}; start future recurrence ${preview.splitPlan.newStart}`);
+          try {
+            preview.splitPlan = planFutureSeriesSplit(intent.profile, task!, event, new Date(), zone);
+          } catch (error) {
+            invalidRepairIntent(error instanceof Error ? error.message : "Unsupported Calendar recurrence; manual review required");
+          }
+          const split = preview.splitPlan!;
+          if (split.expiredUntil) {
+            changes.push(`Existing Calendar RRULE expired on ${split.expiredUntil}; keep historical master ${split.oldMasterId} and its rule unchanged (no old occurrences will be manufactured)`);
+          } else {
+            changes.push(`Retain Calendar history through ${split.previousOccurrence}; cap existing future dates starting ${split.nextOldOccurrence}`);
+          }
+          changes.push(`Historical Calendar RRULE: ${split.originalRule} → ${split.truncatedRule}`);
+          changes.push(`New future Calendar master starts ${split.newStart} in ${split.calendarTimeZone}: ${split.newRule}`);
         } else changes.push("Bind the next active Calendar occurrence; preserve the existing series and completed history");
       } else if (task?.due?.is_recurring && intent.owner !== "todoist" && !event?.recurringEventId) {
         invalidRepairIntent("Choose Todoist recurrence ownership for this recurring task, or use its existing recurrence resolution action");
       }
       changes.push(`Link Todoist task ${task!.id} to Calendar event ${event!.id}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
-      if (intent.winner === "todoist") {
+      if (intent.winner === "todoist" && !preview.splitPlan) {
         const desired=event?.recurringEventId && intent.owner === "todoist"
           ? todoistOccurrenceProjection(task!,event!) : toCalendarEvent(task!,event!);
         fieldChange("Calendar title",event!.summary,desired.summary);

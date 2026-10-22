@@ -30,9 +30,11 @@ const instance = (master, date) => ({
 });
 
 function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFuture = false,
-  failFirstCreate = false, normalizeCappedRule = false, tombstone = undefined, conflictingOwner = undefined } = {}) {
+  failFirstCreate = false, normalizeCappedRule = false, tombstone = undefined, conflictingOwner = undefined,
+  expiredUntil = undefined } = {}) {
   const task = todo();
   const master = original();
+  if (expiredUntil) master.recurrence = [`RRULE:FREQ=YEARLY;UNTIL=${expiredUntil}`];
   const events = new Map([[master.id, master]]);
   const calls = [];
   let created = 0;
@@ -41,13 +43,13 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
     owner: conflictingOwner,
     link: undefined,
     split: undefined,
-    async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId) {
+    async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId, previousOccurrence) {
       if (this.split && (this.split.profile !== profile || this.split.taskId !== taskId
         || this.split.oldMasterId !== oldMasterId || this.split.newMasterId !== newMasterId)) {
         throw new Error("another split already owns the task");
       }
       if (!this.split) {
-        this.split = { profile, taskId, oldMasterId, newMasterId, status: "pending" };
+        this.split = { profile, taskId, oldMasterId, newMasterId, previousOccurrence, status: "pending" };
         calls.push("split-pending");
       }
     },
@@ -345,4 +347,83 @@ test("an interrupted split may resume across a new yearly anniversary with uncha
   assert.equal(replay.plan.previousOccurrence, "2026-05-03");
   assert.equal(replay.resumed, true);
   assert.equal(f.created, 1);
+});
+
+test("approved repair leaves an expired-before-anchor Calendar RRULE unchanged and preserves audit lineage", async () => {
+  const f = fixture({ expiredUntil: "20231231" });
+  const old = f.events.get("old-may-master");
+  const approved = planFutureSeriesSplit("antonio", f.task, old, today, "Europe/London");
+  const result = await applyApprovedFutureSeriesSplit("antonio", f.task, old, f.pair, f.state, {
+    now: today, approvedPlan: approved, approvedEtag: old.etag,
+  });
+  assert.equal(result.plan.expiredUntil, "2023-12-31");
+  assert.equal(result.plan.previousOccurrence, undefined);
+  assert.equal(f.state.split.previousOccurrence, undefined, "the DynamoDB guard must not claim fabricated history");
+  assert.equal(f.events.get(old.id).extendedProperties.shared.syncHistoryCutoff, undefined);
+  assert.equal(f.events.get(result.plan.newMasterId).extendedProperties.shared.syncHistoryCutoff, undefined);
+  const audit = f.calls.find(value => Array.isArray(value) && value[0] === "manual_future_series_split_applied")?.[1];
+  assert.equal(audit?.priorOccurrence, undefined, "audit must omit nonexistent historical occurrence");
+  assert.equal(audit?.expiredUntil, "2023-12-31");
+  assert.equal(result.plan.truncatedRule, "RRULE:FREQ=YEARLY;UNTIL=20231231");
+  assert.equal(f.events.get(old.id).recurrence[0], "RRULE:FREQ=YEARLY;UNTIL=20231231");
+  assert.equal(f.events.get(old.id).start.date, "2025-05-03");
+  assert.equal(f.events.get(result.plan.newMasterId).start.date, "2027-07-01");
+  assert.equal(f.state.owner.masterEventId, result.plan.newMasterId);
+  assert.ok(f.calls.some(value => Array.isArray(value) && value[0] === "manual_future_series_split_applied"));
+  const retry = await applyApprovedFutureSeriesSplit("antonio", f.task, f.events.get(old.id),
+    f.pair, f.state, { now: today, approvedPlan: approved, approvedEtag: old.etag });
+  assert.equal(retry.resumed, true);
+  assert.equal(f.created, 1);
+});
+
+test("expired rule with an existing prior occurrence is retained without extending the history", async () => {
+  const f = fixture({ expiredUntil: "20251231" });
+  const result = await applyApprovedFutureSeriesSplit("antonio", f.task, f.events.get("old-may-master"),
+    f.pair, f.state, { now: today });
+  assert.equal(result.plan.historicalLastOccurrence, "2025-05-03");
+  assert.equal(result.plan.previousOccurrence, "2025-05-03");
+  assert.equal(f.state.split.previousOccurrence, "2025-05-03");
+  assert.equal(f.events.get("old-may-master").extendedProperties.shared.syncHistoryCutoff, "2025-05-03");
+  assert.equal(f.events.get("old-may-master").recurrence[0], "RRULE:FREQ=YEARLY;UNTIL=20251231");
+});
+
+test("approval rejects a stale Todoist due shape even when date and yearly RRULE are unchanged", async () => {
+  const f = fixture({ expiredUntil: "20231231" });
+  const old = f.events.get("old-may-master");
+  const approved = planFutureSeriesSplit("antonio", f.task, old, today, "Europe/London");
+  const mutatedTask = { ...f.task, due: { ...f.task.due, timezone: "Europe/London", lang: "en" } };
+  await assert.rejects(
+    applyApprovedFutureSeriesSplit("antonio", mutatedTask, old, f.pair, f.state,
+      { now: today, approvedPlan: approved, approvedEtag: old.etag }),
+    /Approved future-series cutover changed \(approvedTaskFingerprint\)/,
+  );
+  assert.deepEqual(f.calls, []);
+});
+
+test("a live due-shape mutation without a changed updated_at is rejected before the guard", async () => {
+  const f = fixture({ expiredUntil: "20231231" });
+  const old = f.events.get("old-may-master");
+  f.pair.todoist.getTask = async () => ({ ...f.task, due: { ...f.task.due, datetime: "2027-07-01T09:00:00Z" } });
+  await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task, old, f.pair, f.state,
+    { now: today }), /changed after approval/);
+  assert.deepEqual(f.calls, []);
+});
+
+test("task or Calendar updates between approved preview and first write block the split", async () => {
+  for (const provider of ["todoist", "calendar"]) {
+    const f = fixture({ expiredUntil: "20231231" });
+    const old = structuredClone(f.events.get("old-may-master"));
+    const approved = planFutureSeriesSplit("antonio", f.task, old, today, "Europe/London");
+    if (provider === "todoist") {
+      f.pair.todoist.getTask = async () => ({ ...f.task, updated_at: "2026-10-22T19:00:00Z" });
+    } else {
+      f.events.get(old.id).etag = '"outside-update"';
+    }
+    await assert.rejects(
+      applyApprovedFutureSeriesSplit("antonio", f.task, old, f.pair, f.state,
+        { now: today, approvedPlan: approved, approvedEtag: old.etag }),
+      /changed after approval/,
+    );
+    assert.deepEqual(f.calls, [], provider + " changed before a guard or provider mutation");
+  }
 });

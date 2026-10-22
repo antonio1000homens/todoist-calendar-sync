@@ -131,3 +131,57 @@ test("Calendar local midnight, not UTC midnight, determines historical cutoff du
   assert.equal(utc.previousOccurrence, "2026-05-03");
   assert.equal(local.calendarTimeZone, "Europe/London");
 });
+
+test("an RRULE with UNTIL before DTSTART stays expired; the 2027 successor never backfills history", () => {
+  const master = old();
+  master.recurrence = ["RRULE:FREQ=YEARLY;UNTIL=20231231"];
+  master.start.date = "2025-05-02";
+  master.end.date = "2025-05-03";
+  master.summary = "LL09 FZV honda vehicle tax bike expiry";
+  const next = task();
+  next.content = master.summary;
+  next.due = { date: "2027-05-02", is_recurring: true, string: "every year" };
+  const p = planFutureSeriesSplit("antonio", next, master, new Date("2026-10-22T12:00:00Z"), "Europe/London");
+  assert.equal(p.originalRule, "RRULE:FREQ=YEARLY;UNTIL=20231231");
+  assert.equal(p.truncatedRule, p.originalRule, "never expand the expired Calendar series");
+  assert.equal(p.expiredUntil, "2023-12-31");
+  assert.equal(p.historicalLastOccurrence, undefined, "original rule never produced an instance");
+  assert.equal(p.previousOccurrence, undefined, "do not persist a phantom pre-repair anniversary");
+  assert.ok(p.approvedTaskFingerprint, "bind approval to the entire Todoist task and due shape");
+  assert.equal(p.newStart, "2027-05-02");
+  assert.equal(p.newRule, "RRULE:FREQ=YEARLY");
+  assert.doesNotThrow(() => assertUnmodifiedHistoricalOccurrences(master, [], p));
+  assert.throws(() => assertUnmodifiedHistoricalOccurrences(master, [{
+    recurringEventId: master.id, start: { date: "2025-05-02" },
+    end: { date: "2025-05-03" }, status: "confirmed",
+    summary: master.summary,
+  }], p), /Last historical/);
+});
+
+test("expired UNTIL after DTSTART verifies actual history and preserves the old cap", () => {
+  const master = old();
+  master.recurrence = ["RRULE:UNTIL=20251231;FREQ=YEARLY;INTERVAL=1"];
+  // Calendar may reorder components; the supported subset is order-agnostic.
+  const p = planFutureSeriesSplit("antonio", task(), master, new Date("2026-10-19T12:00:00Z"));
+  assert.equal(p.truncatedRule, master.recurrence[0]);
+  assert.equal(p.expiredUntil, "2025-12-31");
+  assert.equal(p.historicalLastOccurrence, "2025-05-03");
+  assert.equal(p.previousOccurrence, "2025-05-03", "history cutoff must respect the expired UNTIL");
+  assert.throws(() => assertUnmodifiedHistoricalOccurrences(master, [], p), /Last historical/);
+});
+
+test("unsupported or ambiguous expiry clauses fail closed with actionable guidance", () => {
+  for (const rule of [
+    "RRULE:FREQ=YEARLY;COUNT=3", "RRULE:FREQ=YEARLY;RDATE=20270502",
+    "RRULE:FREQ=YEARLY;EXDATE=20250502", "RRULE:FREQ=YEARLY;UNTIL=20231231;BYMONTH=5",
+    "RRULE:FREQ=YEARLY;UNTIL=20231231T000000Z", "RRULE:FREQ=YEARLY;UNTIL=20231231;UNTIL=20231231",
+  ]) {
+    const master = old(); master.recurrence = [rule];
+    assert.throws(() => planFutureSeriesSplit("antonio", task(), master, new Date("2026-10-19T12:00:00Z")), /manual review/, rule);
+  }
+  const master = old();
+  master.recurrence = ["RRULE:FREQ=YEARLY", "EXDATE;VALUE=DATE:20250503"];
+  assert.throws(() => planFutureSeriesSplit("antonio", task(), master), /RDATE, EXDATE/);
+  master.recurrence = ["RRULE:FREQ=YEARLY;UNTIL=20991231"];
+  assert.throws(() => planFutureSeriesSplit("antonio", task(), master, new Date("2026-10-19T12:00:00Z")), /not yet expired/);
+});

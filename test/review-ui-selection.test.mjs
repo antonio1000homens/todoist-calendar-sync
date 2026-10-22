@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference, repairRecurrenceOwnerRequirement, repairValidationField } from "../review-ui/repair-selection.mjs";
 
 const caseFor = (id, profile, taskId, eventId) =>
@@ -185,4 +186,17 @@ test("searched recurring Todoist task is guarded and search metadata is case- an
   const vanished=reconcileRepairSelection(item,[live("work","calendar","event")],searched);
   assert.equal(vanished.verifiedTaskId,"");
   assert.equal(vanished.searchedTask,undefined);
+});
+
+test("review UI renders approved historical and future RRULEs and expiry before Apply", () => {
+  const main = readFileSync(new URL("../review-ui/main.tsx", import.meta.url), "utf8");
+  for (const label of [
+    "Historical Calendar rule", "Rule after repair", "Future recurrence starts",
+    "Future RRULE", "Calendar timezone", "Existing series expired",
+  ]) {
+    assert.ok(main.includes(label), `Preview should display ${label}`);
+  }
+  assert.match(main, /validPreview\.splitPlan\.expiredUntil/);
+  assert.match(main, /historical rule will not be extended/);
+  assert.ok(main.indexOf("Historical Calendar rule") < main.lastIndexOf("Apply repair"));
 });
