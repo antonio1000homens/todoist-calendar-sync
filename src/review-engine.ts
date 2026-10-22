@@ -253,6 +253,13 @@ export class ReviewEngine {
     const budget = new ReconciliationMutationBudget(20);
     const factory = guardRepairProviders(operation, createBudgetedClientFactory(budget, rawFactory), () => this.store.saveOperation(operation));
     let claimed = false;
+    const queueDeferredRefresh = async (refs:EntityRef[]) => {
+      const pending=await this.controls.pendingRefreshRefs(refs);
+      if(!pending.length)return false;
+      const request=await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:pending});
+      if(!request.queued&&!request.coalesced)throw new Error("Provider updates arrived during this repair, but their reconciliation could not be queued; the repair barrier remains active. Resume this operation to retry.");
+      return true;
+    };
     const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
       const saved = operation.steps[name];
       if (saved?.status === "done") return saved.result as T;
@@ -563,12 +570,11 @@ export class ReviewEngine {
         releases.push({ref:targetTaskRef,providerUpdatedAt:(moved.object as TodoistTask|null)?.updated_at,clearExclusion:true});
       }
       operation.verified=verified;
-      const pendingRefreshRefs=await this.controls.pendingRefreshRefs([
+      const queuedRefresh=await queueDeferredRefresh([
         ...operation.preview.snapshots.map(snapshot=>snapshot.ref),
         ...(targetTaskRef?[targetTaskRef]:[]),
       ]);
-      if(pendingRefreshRefs.length) {
-        await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs});
+      if(queuedRefresh) {
         operation.notificationText="Succeeded: repair verified; queued a refresh for updates received during the repair.";
       }
       if(operation.preview.case.decision)await new ManualInterventionService().finishReconciliationDecision(operation.preview.case.decision.decisionId,"Resolved and verified in the review page");
@@ -578,8 +584,7 @@ export class ReviewEngine {
     } catch(e) {
       if (claimed && !operation.steps.validated && !Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")) {
         const refs=[...operation.preview.snapshots.map(s=>s.ref),...(intent.action==="move"&&intent.targetProfile&&intent.taskId?[{profile:intent.targetProfile,side:"todoist" as const,id:intent.taskId}]:[])];
-        const pending=await this.controls.pendingRefreshRefs(refs);
-        if(pending.length) await requestReconciliation(state,intent.profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:pending});
+        await queueDeferredRefresh(refs);
         for (const ref of operation.preview.snapshots.map(s=>s.ref)) await this.controls.release(ref,id).catch(()=>undefined);
         if (intent.action==="move"&&intent.targetProfile&&intent.taskId) await this.controls.release({profile:intent.targetProfile,side:"todoist",id:intent.taskId},id).catch(()=>undefined);
       }

@@ -10,6 +10,7 @@ import { ReviewStore, SyncControls } from "../dist/review-store.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { todoistRecurrenceKey, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { ManualDecisionStore, ManualInterventionService } from "../dist/manual-intervention.js";
+import { SQSClient } from "@aws-sdk/client-sqs";
 
 process.env.STATE_TABLE_NAME ||= "test-state";
 
@@ -22,6 +23,53 @@ const task = (id = "task", extra = {}) => ({ id, project_id: profiles.home.todoi
   content: "Portugal", description: "Plan", due: { date: "2099-12-18" }, updated_at: "2026-10-21T12:00:00Z", ...extra });
 const intent = (extra = {}) => ({ caseId: "case", profile: "home", action: "link", taskId: "task", eventId: "event",
   winner: "none", scope: "occurrence", leftovers: {}, ...extra });
+
+test("repair queues a pending provider refresh before its final transaction releases the barrier", async (t) => {
+  const h=harness(t);
+  const order=[];
+  const previousQueueUrl=process.env.QUEUE_URL;
+  process.env.QUEUE_URL="https://sqs.eu-west-2.amazonaws.com/123/test.fifo";
+  t.after(()=>{if(previousQueueUrl===undefined)delete process.env.QUEUE_URL;else process.env.QUEUE_URL=previousQueueUrl;});
+  const pendingRefreshRefs=[{profile:"home",side:"todoist",id:"task",pendingRefreshAt:"refresh-version-1"}];
+  h.controls.pendingRefreshRefs=async()=>pendingRefreshRefs;
+  t.mock.method(StateRepository.prototype,"requestReconciliation",async(profile,reason,_context)=>{
+    order.push("record-refresh");
+    return {state:{profile,pending:true,generation:"refresh-generation",reason,requestedAt:new Date().toISOString(),lastRequestedAt:new Date().toISOString()},shouldEnqueue:true,created:true};
+  });
+  t.mock.method(StateRepository.prototype,"markReconciliationEnqueued",async()=>{});
+  t.mock.method(SQSClient.prototype,"send",async command=>{
+    const message=JSON.parse(command.input.MessageBody);
+    assert.equal(message.kind,"reconcile");
+    assert.deepEqual(message.reconcile.pendingRefreshRefs,pendingRefreshRefs);
+    order.push("enqueue-refresh");
+    return {};
+  });
+  const finalize=h.engine.store.finalizeOperation.bind(h.engine.store);
+  h.engine.store.finalizeOperation=async(...args)=>{order.push("finalize-release");return finalize(...args);};
+
+  const result=await h.execute(intent());
+
+  assert.equal(result.status,"succeeded");
+  assert.deepEqual(order,["record-refresh","enqueue-refresh","finalize-release"]);
+});
+
+test("repair keeps its barrier when a pending provider refresh cannot be queued", async (t) => {
+  const h=harness(t);
+  const previousQueueUrl=process.env.QUEUE_URL;
+  process.env.QUEUE_URL="https://sqs.eu-west-2.amazonaws.com/123/test.fifo";
+  t.after(()=>{if(previousQueueUrl===undefined)delete process.env.QUEUE_URL;else process.env.QUEUE_URL=previousQueueUrl;});
+  h.controls.pendingRefreshRefs=async()=>[{profile:"home",side:"todoist",id:"task",pendingRefreshAt:"refresh-version-2"}];
+  t.mock.method(StateRepository.prototype,"requestReconciliation",async(profile,reason)=>({
+    state:{profile,pending:true,generation:"refresh-generation",reason,requestedAt:new Date().toISOString(),lastRequestedAt:new Date().toISOString()},shouldEnqueue:true,created:true,
+  }));
+  t.mock.method(SQSClient.prototype,"send",async()=>{throw new Error("queue unavailable");});
+
+  const result=await h.execute(intent());
+
+  assert.equal(result.status,"needs_review");
+  assert.match(result.error,/reconciliation could not be queued/);
+  assert.ok([...h.controlsMap.values()].every(control=>control.activeRepair==="repair"));
+});
 
 // Exercise the real preview/execute/provider conversion paths with in-memory
 // provider and repository seams. Unexpected external calls fail these tests.

@@ -34,6 +34,18 @@ test("a blocked webhook records a pending refresh without taking over the repair
   assert.match(commands[0].ExpressionAttributeValues[":at"], /^[0-9a-f-]{36}$/i);
 });
 
+test("pending refresh cleanup is conditional on the captured update version and released barrier", async (t) => {
+  const commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command.input);return {};});
+  process.env.STATE_TABLE_NAME ||= "test-state";
+  await new SyncControls().clearPendingRefresh([{profile:"home",side:"todoist",id:"task",pendingRefreshAt:"refresh-version"}]);
+  assert.equal(commands.length,1);
+  assert.equal(commands[0].UpdateExpression,"REMOVE pendingRefresh, pendingRefreshAt");
+  assert.match(commands[0].ConditionExpression,/pendingRefreshAt = :at/);
+  assert.match(commands[0].ConditionExpression,/attribute_not_exists\(activeRepair\)/);
+  assert.equal(commands[0].ExpressionAttributeValues[":at"],"refresh-version");
+});
+
 test("a stale repair preview releases its acquired barriers without writing to providers", async () => {
   const ref = { profile: "home", side: "todoist", id: "task" };
   const snapshots = [{ ref, object: { id: "task", content: "Original", updated_at: "version-1" } }];
