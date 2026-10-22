@@ -44,7 +44,7 @@ async function inspect(target: CompletedCommentTarget, adapter: CompletedComment
   }
   const comment = await adapter.getComment(target.commentId);
   const parsed = parseMappingComment(comment);
-  if (!parsed || "error" in parsed || comment.project_id !== target.projectId
+  if (!parsed || "error" in parsed || comment.id !== target.commentId || comment.project_id !== target.projectId
     || comment.task_id || parsed.payload.profile !== target.profile
     || parsed.payload.projectId !== target.projectId
     || parsed.payload.taskId !== target.taskId || parsed.payload.eventId !== target.eventId) {
