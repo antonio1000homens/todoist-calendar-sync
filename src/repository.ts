@@ -1348,32 +1348,29 @@ export class StateRepository {
       || expectedLink.seriesId !== projection.seriesId || expectedLink.taskId !== projection.taskId
       || expectedLink.eventId !== projection.eventId) return false;
     const table = this.ensureTable();
-    const values = {
-      ":task": projection.taskId, ":profile": projection.profile, ":completed": projection.completedAt,
-      ":owner": "calendar", ":series": projection.seriesId, ":updated": expectedLink.updatedAt,
-      ":yes": true,
-    };
+    const identity = { ":task": projection.taskId, ":profile": projection.profile };
+    const historyValues = { ...identity, ":completed": projection.completedAt, ":yes": true };
     const sameHistory = "#profile = :profile AND taskId = :task AND completedAt = :completed";
     const tx: Array<Record<string, unknown>> = [
       { Delete: {
         TableName: table, Key: key(`RECURRENCE#${projection.profile}#${projection.seriesId}`),
         ConditionExpression: "taskId = :task AND #profile = :profile AND #owner = :owner AND seriesId = :series AND updatedAt = :updated",
         ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
-        ExpressionAttributeValues: values,
+        ExpressionAttributeValues: { ...identity, ":owner": "calendar", ":series": projection.seriesId, ":updated": expectedLink.updatedAt },
       } },
       { Update: {
         TableName: table, Key: key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`),
         UpdateExpression: "SET terminalVerified = :yes",
         ConditionExpression: sameHistory,
         ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: values,
+        ExpressionAttributeValues: historyValues,
       } },
       { Update: {
         TableName: table, Key: key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`),
         UpdateExpression: "SET terminalVerified = :yes",
         ConditionExpression: sameHistory,
         ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: values,
+        ExpressionAttributeValues: historyValues,
       } },
       { ConditionCheck: {
         TableName: table, Key: key(`TASKOWNER#${projection.taskId}`, "MAP"),
