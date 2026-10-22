@@ -121,6 +121,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async allow(profile, taskId, eventId) { this.rejected.delete(`${profile}:${taskId}:${eventId}`); },
     async exclude(ref, excluded) { controlsMap.set(refKey(ref), { ...controlsMap.get(refKey(ref)), excluded }); },
     async release(ref) { calls.push(["release", clone(ref)]); const value = controlsMap.get(refKey(ref)); delete value.activeRepair; },
+    async releaseUnapplied(refs, id) { calls.push(["release-unapplied", clone(refs)]); for (const ref of refs) { assert.equal(controlsMap.get(refKey(ref))?.activeRepair,id); const old=controlsMap.get(refKey(ref)); controlsMap.set(refKey(ref),{...old,activeRepair:undefined,fencedAt:"2099-01-01T00:00:00Z"}); } },
   };
   const clients = {
     calendar: {
@@ -441,6 +442,35 @@ test("decision previews derive the executor's targets and reject unrelated selec
   assert.deepEqual(h.writes, []);
 });
 
+test("a post-validation failure with no repair writes releases ownership and permits a new preview", async t => {
+  const h=harness(t);
+  const preview=await h.engine.preview(actor,intent());
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.engine.store.updateCase=async (_caseId,status)=>{if(status==="repairing")throw new Error("Read-only post-validation failure");};
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"failed",result.error);
+  assert.equal(result.abandoned,true);
+  assert.ok(result.steps.validated);
+  assert.deepEqual(h.writes,[]);
+  assert.ok([...h.controlsMap.values()].every(control=>!control.activeRepair));
+  assert.equal(h.calls.filter(c=>c[0]==="release-unapplied").length,1);
+  await assert.rejects(h.engine.execute("repair"),/fresh preview/);
+  const next=await h.engine.preview(actor,intent());
+  assert.ok(next.id);
+});
+
+test("an uncertain release retains the barrier and marks the failed repair for review", async t => {
+  const h=harness(t);
+  const preview=await h.engine.preview(actor,intent());
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.engine.store.updateCase=async (_caseId,status)=>{if(status==="repairing")throw new Error("Read-only failure");};
+  h.controls.releaseUnapplied=async()=>{throw new Error("Dynamo transaction rejected");};
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"needs_review");
+  assert.equal(result.abandoned,undefined);
+  assert.match(result.error,/Dynamo transaction rejected/);
+  assert.ok([...h.controlsMap.values()].every(control=>control.activeRepair==="repair"));
+});
 test("replacement of a deleted counterpart accepts only the expected completed detachment", async (t) => {
   const mapping = { profile: "home", taskId: "task", eventId: "deleted-event" };
   const h = harness(t, { events: [], mappings: [mapping] });

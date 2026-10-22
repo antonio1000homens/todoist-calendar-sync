@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed } from "../review-ui/repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "../review-ui/repair-selection.mjs";
 
 const caseFor = (id, profile, taskId, eventId) =>
   ({ id, profile, taskId, eventId, decision:{context:{}}, status:"open" });
@@ -83,4 +83,11 @@ test("search selection is confirmed explicitly but only for the current case", (
   assert.equal(repairPreviewAllowed(selected,caseFor("other","work"),detailsFor(item,[]),"move"),false);
   const refreshed=reconcileRepairSelection(item,[live("work","todoist","search-result")],selected);
   assert.equal(refreshed.verifiedTaskId,"search-result");
+});
+
+test("a missing Todoist or Calendar disposition triggers an affected-items refresh", () => {
+  assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:todoist:duplicate"),"home:todoist:duplicate");
+  assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for work:calendar:master_20270301"),"work:calendar:master_20270301");
+  assert.equal(missingDispositionReference("Mapping does not match the selected pair"),undefined);
+  assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:calendar:"),undefined);
 });

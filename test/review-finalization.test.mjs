@@ -69,3 +69,26 @@ test("a previously dismissed alert can enter an explicit repair without losing i
   assert.equal(command.ExpressionAttributeValues[":empty"],"");
   assert.equal(command.ExpressionAttributeValues[":op"],"repair-1");
 });
+
+test("unapplied release compares preview control state in one conditional transaction", async t => {
+  const { SyncControls } = await import("../dist/review-store.js");
+  const controls=new SyncControls(),commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await controls.releaseUnapplied([
+    {profile:"home",side:"todoist",id:"task"},
+    {profile:"home",side:"calendar",id:"event"},
+    {profile:"home",side:"todoist",id:"task"},
+  ],"repair",[
+    {ref:{profile:"home",side:"todoist",id:"task"},object:null,control:{excluded:true,fencedAt:"old",providerUpdatedAt:"v1"}},
+    {ref:{profile:"home",side:"calendar",id:"event"},object:null},
+  ]);
+  assert.equal(commands.length,1);
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,2);
+  assert.ok(tx.every(x=>x.Update.ConditionExpression.includes("activeRepair = :id")));
+  assert.match(tx[0].Update.ConditionExpression,/excluded = :excluded/);
+  assert.match(tx[1].Update.ConditionExpression,/attribute_not_exists\(excluded\)/);
+  assert.ok(tx.every(x=>!x.Update.UpdateExpression.includes("providerUpdatedAt")));
+  await assert.rejects(controls.releaseUnapplied([{profile:"home",side:"calendar",id:"unknown"}],"repair",[]),/No preview control snapshot/);
+  assert.equal(commands.length,1);
+});

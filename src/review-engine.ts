@@ -284,6 +284,7 @@ export class ReviewEngine {
   async execute(id: string): Promise<RepairOperation> {
     const operation = await this.store.getOperation(id); if (!operation) throw new Error("Repair not found");
     if (operation.status === "succeeded") return operation;
+    if (operation.abandoned) throw Object.assign(new Error("This unapplied repair was released. Create a fresh preview rather than resuming it."), { status:409 });
     let { intent } = operation.preview;
     const state = new StateRepository(id);
     const rawFactory = this.clients;
@@ -623,16 +624,29 @@ export class ReviewEngine {
       // over an uncertain commit; a delivery retry reads the durable result.
       return this.store.finalizeOperation(operation, releases);
     } catch(e) {
-      if (claimed && !operation.steps.validated && !Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")) {
-        const refs=[...operation.preview.snapshots.map(s=>s.ref),...(intent.action==="move"&&intent.targetProfile&&intent.taskId?[{profile:intent.targetProfile,side:"todoist" as const,id:intent.taskId}]:[])];
-        await queueDeferredRefresh(refs);
-        for (const ref of operation.preview.snapshots.map(s=>s.ref)) await this.controls.release(ref,id).catch(()=>undefined);
-        if (intent.action==="move"&&intent.targetProfile&&intent.taskId) await this.controls.release({profile:intent.targetProfile,side:"todoist",id:intent.taskId},id).catch(()=>undefined);
+      const providerProgress = Object.keys(operation.creations || {}).length > 0
+        || Object.entries(operation.expectedProviders || {}).some(([key, object]) =>
+          reviewHash(object) !== reviewHash(operation.preview.snapshots.find(s => entityKey(s.ref) === key)?.object ?? null));
+      // 'validated' is read-only: it must not strand a failed repair. Other
+      // started steps, provider changes or recorded outcomes may contain writes.
+      const changesMayHaveStarted = providerProgress || Object.keys(operation.steps).some(name => name !== 'validated')
+        || operation.outcomes !== undefined || operation.verified !== undefined || operation.recurrenceBindings !== undefined;
+      let releaseError: unknown;
+      if (claimed && !changesMayHaveStarted && !['exclude', 'separate', 'move'].includes(intent.action)) {
+        const refs = operation.preview.snapshots.map(snapshot => snapshot.ref);
+        try {
+          await queueDeferredRefresh(refs);
+          await this.controls.releaseUnapplied(refs, id, operation.preview.snapshots);
+          operation.abandoned = true;
+        } catch(error) { releaseError = error; }
       }
-      const providerProgress = Object.keys(operation.creations || {}).length > 0 || Object.entries(operation.expectedProviders || {}).some(([key,object]) => reviewHash(object) !== reviewHash(operation.preview.snapshots.find(s=>entityKey(s.ref)===key)?.object ?? null));
-      operation.status=providerProgress || Object.values(operation.steps).some(s=>s.status==="done"&&s.id!=="validated")?"needs_review":"failed";
-      operation.error=e instanceof Error?e.message:String(e);operation.nextAction="Review live state. Resume this operation for an interrupted write, or refresh an unapplied stale preview.";
-      await this.store.updateCase(intent.caseId,"open",operation.error,id);
+      operation.status = changesMayHaveStarted || releaseError || claimed && !operation.abandoned ? 'needs_review' : 'failed';
+      operation.error = e instanceof Error ? e.message : String(e);
+      if (releaseError) operation.error += `; repair barriers were retained because safe release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`;
+      operation.nextAction = operation.abandoned
+        ? 'No repair writes were recorded and ownership was released. Refresh the affected items and create a new preview; do not resume this failed operation.'
+        : 'Repair ownership remains protected; inspect live state and resume only when the recorded changes are understood.';
+      await this.store.updateCase(intent.caseId, 'open', operation.error, id);
     }
     operation.notificationPending=true;operation.notificationText=`${operation.status === "needs_review"?"Needs review":"Failed"}: ${operation.error}`;
     await this.store.saveOperation(operation);return operation;

@@ -3,7 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
-import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase } from "./review-types.js";
+import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -192,6 +192,27 @@ export class SyncControls {
       TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET activeRepair = :id",
       ConditionExpression: "attribute_not_exists(activeRepair) OR activeRepair = :id", ExpressionAttributeValues: { ":id": operationId },
     } })) }));
+  }
+  // Atomically release an unapplied failed repair, checking the controls from its preview.
+  async releaseUnapplied(refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[]): Promise<void> {
+    const previous = new Map(snapshots.map(s => [entityKey(s.ref), s.control || {}]));
+    const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
+    if (!unique.length) return;
+    const items = unique.map(ref => {
+      const before = previous.get(entityKey(ref));
+      if (!before) throw new Error(`No preview control snapshot for ${entityKey(ref)}; cannot release its repair barrier`);
+      const values: Record<string, unknown> = { ':id': operationId, ':now': new Date().toISOString() };
+      const conditions = ['activeRepair = :id'];
+      for (const name of ['excluded', 'fencedAt', 'providerUpdatedAt'] as const) {
+        const value = before[name];
+        if (value === undefined) conditions.push(`attribute_not_exists(${name})`);
+        else { values[`:${name}`] = value; conditions.push(`${name} = :${name}`); }
+      }
+      return { Update: { TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+        UpdateExpression: 'SET fencedAt = :now REMOVE activeRepair',
+        ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } };
+    });
+    await client.send(new TransactWriteCommand({ TransactItems: items }));
   }
   async exclude(ref: EntityRef, excluded: boolean, operationId: string): Promise<void> {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",
