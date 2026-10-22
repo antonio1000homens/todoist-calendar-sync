@@ -206,3 +206,31 @@ test("backend blocks stale, unknown and unidentified Calendar disposition rows",
       /Cannot identify the live item|lacks a verified start or status/);
   }
 });
+
+test("preview blocks cancelled or deleted disposition creation but allows explicit exclusion", async () => {
+  const actor={subject:"operator",email:"operator@example.test"};
+  const source={ref:{profile:"home",side:"todoist",id:"current"},object:{
+    id:"current",content:"Current task",due:{date:"2099-12-18"}}};
+  const candidates=[
+    {ref:{profile:"home",side:"calendar",id:"cancelled-event"},object:{id:"cancelled-event",
+      summary:"Cancelled",status:"cancelled",start:{date:"2099-12-18"},end:{date:"2099-12-19"}}},
+    {ref:{profile:"home",side:"todoist",id:"deleted-task"},object:{id:"deleted-task",
+      content:"Deleted",is_deleted:true,due:{date:"2099-12-18"}}},
+  ];
+  const engine=new ReviewEngine({
+    async getCase() { return {id:"case",profile:"home"}; },
+    async putPreview() {},
+  });
+  const input={caseId:"case",profile:"home",action:"create",taskId:"current",
+    winner:"none",scope:"occurrence",leftovers:{}};
+  for (const candidate of candidates) {
+    engine.collect=async()=>[source,candidate];
+    const key=`${candidate.ref.profile}:${candidate.ref.side}:${candidate.ref.id}`;
+    await assert.rejects(engine.preview(actor,{...input,leftovers:{[key]:"create"}}),
+      /must be confirmed|must not be deleted/);
+    const allowed=await engine.preview(actor,{...input,leftovers:{[key]:"exclude"}});
+    assert.match(allowed.itemPlan.find(row=>row.ref.id===candidate.ref.id).operation,/Exclude/);
+  }
+  engine.collect=async()=>[candidates[1]];
+  await assert.rejects(engine.preview(actor,{...input,taskId:"deleted-task"}),/must not be deleted/);
+});
