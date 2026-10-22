@@ -58,6 +58,11 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  CompletedHistoryCleanupApply:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable transactional seven-day COMPLETED_TASK retirement only after an operator-reviewed dry run.
   StateTableReadCapacity:
     Type: Number
     Default: 25
@@ -462,6 +467,40 @@ Resources:
       FunctionName: !Ref ReconcilerFunction
       Principal: events.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ResourceNamePrefix}-reconcile-${Stage}
+
+  CompletedHistoryCleanupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
+      Handler: completed-history-cleanup.handler
+      CodeUri: .
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY: !Ref CompletedHistoryCleanupApply
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncState
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt SyncState.Arn
+      Events:
+        DailyCompletedHistoryReview:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
+            Description: Bounded cursor-based completed-task history maintenance; read-only until explicitly enabled.
+            Enabled: true
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/completed-history-cleanup.ts]
+        Format: cjs
+        Target: es2022
+        Minify: true
 
   WatchFunction:
     Type: AWS::Serverless::Function
