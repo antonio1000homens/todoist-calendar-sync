@@ -1079,6 +1079,125 @@ export class StateRepository {
     }
   }
 
+
+  /**
+   * An earlier cancelled Calendar instance is not the series's live mirror.
+   * Purge ONLY that instance's EVENT/canonical rows, plus historical task
+   * indexes if they still refer to a distinct, discarded task. The active
+   * recurrence link and all three active mapping indexes are CAS-guarded and
+   * are never written by this transaction.
+   */
+  async purgeEarlierCancelledCalendarOccurrence(
+    link: RecurrenceLink,
+    occurrenceId: string,
+    staleMapping?: Mapping,
+  ): Promise<boolean> {
+    if (link.owner !== "calendar" || !link.masterEventId || !link.activeInstanceId
+      || occurrenceId === link.activeInstanceId || occurrenceId === link.masterEventId
+      || (staleMapping && (staleMapping.profile !== link.profile
+        || staleMapping.eventId !== occurrenceId || staleMapping.recurrenceOwner !== "calendar"
+        || staleMapping.seriesId !== link.seriesId || staleMapping.masterEventId !== link.masterEventId))) {
+      throw new Error("Earlier Calendar occurrence cleanup requires a distinct, same-series inactive event");
+    }
+    const table = this.ensureTable();
+    const canonicalKey = key(`CANONICAL#${link.profile}#calendar#${occurrenceId}`);
+    const canonical = await client.send(new GetCommand({
+      TableName: table, Key: canonicalKey, ConsistentRead: true,
+    }));
+    if (!staleMapping && !canonical.Item) return false;
+    // Canonical identities are independently rewritten by reconciliation.
+    // Never remove a row whose identity or write version has changed since
+    // this strongly consistent read, even if the EVENT mapping is still old.
+    const canonicalSnapshot = canonical.Item;
+    if (canonicalSnapshot && (canonicalSnapshot.profile !== link.profile
+      || canonicalSnapshot.side !== "calendar" || canonicalSnapshot.providerId !== occurrenceId
+      || typeof canonicalSnapshot.updatedAt !== "string" || !canonicalSnapshot.updatedAt
+      || !canonicalSnapshot.identity || typeof canonicalSnapshot.identity !== "object")) {
+      return false;
+    }
+
+    const baseValues = {
+      ":owner": "calendar",
+      ":series": link.seriesId,
+      ":master": link.masterEventId,
+      ":active": link.activeInstanceId,
+      ":task": link.taskId,
+    };
+    const activeGuard = "eventId = :active AND taskId = :task AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master";
+    const items: Record<string, unknown>[] = [
+      { ConditionCheck: {
+        TableName: table, Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
+        ConditionExpression: "#owner = :owner AND masterEventId = :master AND activeInstanceId = :active AND eventId = :active AND taskId = :task",
+        ExpressionAttributeNames: { "#owner": "owner" },
+        ExpressionAttributeValues: { ":owner": "calendar", ":master": link.masterEventId, ":active": link.activeInstanceId, ":task": link.taskId },
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`EVENT#${link.profile}#${link.activeInstanceId}`, "MAP"),
+        ConditionExpression: activeGuard, ExpressionAttributeValues: baseValues,
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`TASK#${link.profile}#${link.taskId}`, "MAP"),
+        ConditionExpression: activeGuard, ExpressionAttributeValues: baseValues,
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`TASKOWNER#${link.taskId}`, "MAP"),
+        ConditionExpression: `#profile = :profile AND ${activeGuard}`,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: { ...baseValues, ":profile": link.profile },
+      } },
+      { Delete: {
+        TableName: table, Key: key(`EVENT#${link.profile}#${occurrenceId}`, "MAP"),
+        ConditionExpression: staleMapping
+          ? "taskId = :oldTask AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master AND updatedAt = :oldUpdated"
+          : "attribute_not_exists(pk)",
+        ExpressionAttributeValues: staleMapping
+          ? { ":oldTask": staleMapping.taskId, ":owner": "calendar", ":series": link.seriesId, ":master": link.masterEventId, ":oldUpdated": staleMapping.updatedAt }
+          : undefined,
+      } },
+      { Delete: {
+        TableName: table, Key: canonicalKey,
+        ConditionExpression: canonicalSnapshot
+          ? "#profile = :canonicalProfile AND #side = :canonicalSide AND providerId = :canonicalProvider AND updatedAt = :canonicalUpdated AND #identity = :canonicalIdentity"
+          : "attribute_not_exists(pk)",
+        ExpressionAttributeNames: canonicalSnapshot
+          ? { "#profile": "profile", "#side": "side", "#identity": "identity" }
+          : undefined,
+        ExpressionAttributeValues: canonicalSnapshot
+          ? { ":canonicalProfile": link.profile, ":canonicalSide": "calendar",
+            ":canonicalProvider": occurrenceId, ":canonicalUpdated": canonicalSnapshot.updatedAt,
+            ":canonicalIdentity": canonicalSnapshot.identity }
+          : undefined,
+      } },
+    ];
+    if (staleMapping && staleMapping.taskId !== link.taskId) {
+      for (const index of [
+        key(`TASK#${link.profile}#${staleMapping.taskId}`, "MAP"),
+        key(`TASKOWNER#${staleMapping.taskId}`, "MAP"),
+      ]) {
+        items.push({ Delete: {
+          TableName: table, Key: index,
+          ConditionExpression: "attribute_not_exists(pk) OR (#profile = :profile AND eventId = :oldEvent AND taskId = :oldTask)",
+          ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: { ":profile": link.profile, ":oldEvent": occurrenceId, ":oldTask": staleMapping.taskId },
+        } });
+      }
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: items as never }));
+      return true;
+    } catch (error) {
+      // Ownership or index changes require another read; never erase newer
+      // mappings on the strength of a delayed Google notification.
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   async deleteMapping(mapping: Mapping): Promise<void> {
     const owner = await client.send(new GetCommand({
       TableName: this.ensureTable(),

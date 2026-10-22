@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, isAbortError } from "./api-client.mjs";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "./repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
@@ -35,6 +35,7 @@ function App() {
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
   const [detailRetry,setDetailRetry] = useState(0);
+  const [validationError,setValidationError] = useState<{field:string; message:string}>();
   const detailKey=selected ? `${selected.profile}:${selected.id}` : "";
   const currentDetailState=detailState?.key===detailKey ? detailState : undefined;
   const retryDetails=()=>{
@@ -47,14 +48,22 @@ function App() {
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
-  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction)
+  const ownerRequirement=repairRecurrenceOwnerRequirement(repairSelection,details,action);
+  const ownerExplanation=ownerRequirement === "calendar-occurrence"
+    ? "This occurrence belongs to a recurring Calendar series. Choose which provider owns the recurrence."
+    : ownerRequirement === "calendar-series"
+      ? "This is a recurring Calendar series. Choose its recurrence owner before previewing."
+      : ownerRequirement === "todoist-task"
+        ? "This Todoist task repeats. Select Todoist as recurrence owner unless repairing a Calendar-owned series."
+        : undefined;
+  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
     && Object.entries(leftovers).every(([key,disposition]) => (details?.snapshots||[]).some((s:any)=>
       `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key
       && dispositionOptions(s).length>0 && (!disposition || dispositionOptions(s).includes(disposition))));
   const validPreview=canPreview && preview?.intent?.caseId===selected?.id && preview?.intent?.profile===selected?.profile
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
-  const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");};
+  const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");setValidationError(undefined);};
   const selectCase=(item?:Case)=>{
     invalidatePreview();
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
@@ -62,11 +71,11 @@ function App() {
     setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
   };
-  const editId=(side:"todoist"|"calendar",id:string,verified=false)=>{
-    invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified));
+  const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
+    invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified,searchedItem));
   };
-  const setTaskId=(id:string,verified=false)=>editId("todoist",id,verified);
-  const setEventId=(id:string,verified=false)=>editId("calendar",id,verified);
+  const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
+  const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
   const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
   const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data.reconciliation); };
   useEffect(() => {
@@ -180,7 +189,7 @@ function App() {
   };
   const createPreview=async () => {
     if (!selected || !canPreview) return;
-    setBusy(true);setMessage("");setPreview(undefined);setOperation(undefined);setSubmitKey("");
+    setBusy(true);setMessage("");setValidationError(undefined);setPreview(undefined);setOperation(undefined);setSubmitKey("");
     const requestVersion=selectionVersion.current;
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
@@ -198,7 +207,11 @@ function App() {
             setMessage('Additional linked items were found. Choose dispositions below for every displaced item, then preview again.');
           }
         } catch(refreshError:any) {setMessage(`Could not refresh affected items: ${refreshError.message}`);}
-      } else setMessage(e.message);
+      } else if(requestVersion===selectionVersion.current) {
+        const field=repairValidationField(e.message);
+        if(field)setValidationError({field,message:e.message});
+        else setMessage(e.message);
+      }
     } finally{setBusy(false);}
   };
   const applyPreview=async () => {
@@ -269,8 +282,8 @@ function App() {
             <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);}}>{[
               ["link","Link or replace an association"],["separate","Keep items separate"],["create","Create the missing counterpart"],["exclude","Exclude selected items from syncing"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
             ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-            <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" /></label>
-            <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" /></label>
+            <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
+            <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
             {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
               invalidatePreview();
@@ -279,17 +292,17 @@ function App() {
               ));
             }}>Use current mapped pair</button>}
             {action==="create"&&<div className="source-choice"><span>Choose which item should get a new counterpart:</span><div><button className="secondary" onClick={()=>setEventId("")}>Create Calendar event from this Todoist task</button><button className="secondary" onClick={()=>setTaskId("")}>Create Todoist task from this Calendar event</button></div></div>}
-            {action==="link"&&<label>Fields to use<select value={winner} onChange={e=>{invalidatePreview();setWinner(e.target.value);}}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select></label>}
-            {["link","create"].includes(action)&&<label>Recurrence owner<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}}><option value="">No recurrence / leave unchanged</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select></label>}
-            {["link","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select></label>}
+            {action==="link"&&<label>Fields to use<select value={winner} onChange={e=>{invalidatePreview();setWinner(e.target.value);}} aria-invalid={validationError?.field==="winner"}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select>{validationError?.field==="winner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {["link","create"].includes(action)&&<label>Recurrence owner {ownerRequirement&&<strong>(required)</strong>}<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}} required={Boolean(ownerRequirement)} aria-invalid={validationError?.field==="owner" || Boolean(ownerRequirement&&!owner)} aria-describedby={ownerRequirement?"recurrence-owner-help":undefined}><option value="">{ownerRequirement?"Choose a recurrence owner":"No recurrence / leave unchanged"}</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select>{ownerExplanation&&<small id="recurrence-owner-help">{ownerExplanation}</small>}{validationError?.field==="owner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {["link","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}} aria-invalid={validationError?.field==="scope"}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select>{validationError?.field==="scope"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {action==="move"&&<label>Destination account<select value={targetProfile} onChange={e=>{invalidatePreview();setTargetProfile(e.target.value);}}><option value="">Choose account</option>{profiles.filter(p=>p!=="all"&&p!==selected.profile).map(p=><option key={p}>{p}</option>)}</select></label>}
             {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
-          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true):setEventId(item.id,true)}>Use this item</button></li>)}</ul>}
+          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const options=dispositionOptions(item);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}</select></label>}</div>;})}</div>}
-          {!canPreview&&details&&<p className="warning" role="status">Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict.</p>}
+          {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}

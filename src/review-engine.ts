@@ -151,7 +151,8 @@ export class ReviewEngine {
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
     if (intent.action === "verify") {
-      if (!task || !event) invalidRepairIntent(`Verification requires live Todoist task ${intent.taskId || "(not selected)"} and Calendar event ${intent.eventId || "(not selected)"}; refresh affected items and select the current pair`);
+      if (!task) invalidRepairIntent(`Verification requires live Todoist task ${intent.taskId || "(not selected)"}; refresh affected items and select the current pair`);
+      if (!event) invalidRepairIntent(`Verification requires live Calendar event ${intent.eventId || "(not selected)"}; refresh affected items and select the current pair`);
       const mapping = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId)?.mapping
         || snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId)?.mapping;
       if (!mapping) invalidRepairIntent(`Selected pair does not match the current mapping: Todoist task ${task.id}, selected Calendar event ${event.id}; expected Calendar event none (no mapping found). Refresh affected items and use the current mapped pair.`);
