@@ -5,7 +5,7 @@
  * this operation reads Todoist and can delete ONE project comment after approval.
  * It never deletes a Calendar event, task, completion marker or mapping row.
  */
-import { GetCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { profiles, todoistToken } from "./config.js";
 import { Todoist } from "./providers.js";
@@ -31,6 +31,8 @@ export interface CompletedCommentAdapter {
   /** True only when Todoist confirms a task is absent (404). Other errors abort. */
   taskAbsent(id: string): Promise<boolean>;
   deleteComment(id: string): Promise<void>;
+  /** Enumerate canonical recurrence records with consistent reads. Never infer absence from an incomplete scan. */
+  findRelatedRecurrenceLink(taskId: string, eventIds: string[], seriesIds: string[]): Promise<string | undefined>;
 }
 const allProfiles: Profile[] = ["home", "antonio", "work"];
 const grace = 7 * 24 * 60 * 60 * 1000;
@@ -66,11 +68,19 @@ async function inspect(target: CompletedCommentTarget, adapter: CompletedComment
     activeKeys.push([`TASK#${profile}#${target.taskId}`,"MAP"]);
     for (const eventId of eventIds) activeKeys.push([`EVENT#${profile}#${eventId}`,"MAP"]);
   }
-  const seriesId = marker.seriesId || parsed.payload.seriesId;
-  if (seriesId) for (const profile of allProfiles) activeKeys.push([`RECURRENCE#${profile}#${seriesId}`,"STATE"]);
+  const seriesIds = new Set([marker.seriesId, parsed.payload.seriesId]
+    .filter((id): id is string => Boolean(id)));
+  for (const profile of allProfiles) {
+    for (const seriesId of seriesIds) activeKeys.push([`RECURRENCE#${profile}#${seriesId}`,"STATE"]);
+  }
   for (const [pk,sk] of activeKeys) {
     if (await adapter.get(pk,sk)) return report(target,"skipped_active",`Live ownership at ${pk}`);
   }
+  // A recurrence may have been rebound under an entirely different series ID.
+  // Named-key reads cannot prove its absence. Inspect EVERY canonical link,
+  // across all profiles and scan pages, before either dry-run or apply qualifies.
+  const relatedLink = await adapter.findRelatedRecurrenceLink(target.taskId,[...eventIds],[...seriesIds]);
+  if (relatedLink) return report(target,"skipped_active",`Live recurrence ownership at ${relatedLink}`);
   if (!await adapter.taskAbsent(target.taskId)) {
     return report(target,"skipped_active","Todoist still exposes this task; completion or deletion is not independently verified");
   }
@@ -130,6 +140,32 @@ export async function completedProjectCommentAdapter(profile: Profile): Promise<
       return result.Item;
     },
     getComment: id => todoist.getComment(id),
+    async findRelatedRecurrenceLink(taskId,eventIds,seriesIds) {
+      const events = new Set(eventIds);
+      const series = new Set(seriesIds);
+      let cursor: Record<string,unknown> | undefined;
+      do {
+        // The ProfileLookupIndex is eventually consistent, so it cannot prove
+        // absence. This expensive full-table scan is intentionally restricted
+        // to this one-comment, operator-only command and must finish fully.
+        const page = await documentClient.send(new ScanCommand({
+          TableName:table, ConsistentRead:true,
+          FilterExpression:"begins_with(pk, :prefix)",
+          ExpressionAttributeValues:{":prefix":"RECURRENCE#"},
+          ProjectionExpression:"pk, taskId, eventId, seriesId, masterEventId, activeInstanceId",
+          ExclusiveStartKey:cursor,
+        }));
+        for (const item of page.Items || []) {
+          if (item.taskId === taskId || (typeof item.seriesId === "string" && series.has(item.seriesId))
+            || [item.eventId,item.masterEventId,item.activeInstanceId]
+              .some(id => typeof id === "string" && events.has(id))) {
+            return String(item.pk || "unknown recurrence link");
+          }
+        }
+        cursor = page.LastEvaluatedKey as Record<string,unknown> | undefined;
+      } while (cursor);
+      return undefined;
+    },
     async taskAbsent(id) {
       try { await todoist.getTask(id); return false; }
       catch(error) { if (Number((error as {status?:number}).status) === 404) return true; throw error; }
