@@ -1,11 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
-import { providerIdentity, scopeLabel, previewEffect } from "./item-identity.mjs";
+import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
-type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number };
+type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}> };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
 const api = async (path:string, init?:RequestInit) => {
@@ -40,8 +40,9 @@ function App() {
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
   const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction)
-    && Object.keys(leftovers).every(key => (details?.snapshots||[]).some((s:any)=>
-      `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key && providerIdentity(s).identified));
+    && Object.entries(leftovers).every(([key,disposition]) => (details?.snapshots||[]).some((s:any)=>
+      `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key
+      && dispositionOptions(s).length>0 && (!disposition || dispositionOptions(s).includes(disposition))));
   const validPreview=canPreview && preview?.intent?.caseId===selected?.id && preview?.intent?.profile===selected?.profile
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
@@ -265,7 +266,7 @@ function App() {
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true):setEventId(item.id,true)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh affected items</button>
-          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const verified=providerIdentity(item).identified;return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={!verified} value={verified?leftovers[key]||"":""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option><option value="create">Create a new counterpart</option><option value="exclude">Exclude from syncing</option></select></label>}</div>;})}</div>}
+          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const options=dispositionOptions(item);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}</select></label>}</div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict.</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
