@@ -142,7 +142,7 @@ export class ReviewEngine {
       if (!s || !s.object || s.object.id !== s.ref.id) invalidRepairIntent(`Cannot identify the live item for disposition ${key}; refresh affected items`);
       if (s.ref.side === "calendar") {
         const event = s.object as CalendarEvent;
-        if (!event.start?.date && !event.start?.dateTime || !["confirmed","cancelled"].includes(event.status || "")) {
+        if ((!event.start?.date && !event.start?.dateTime) || !["confirmed","cancelled"].includes(event.status || "")) {
           invalidRepairIntent(`Calendar disposition ${key} lacks a verified start or status; refresh affected items`);
         }
       }
@@ -317,13 +317,17 @@ export class ReviewEngine {
         result = selected ? `Move to ${intent.targetProfile}; remap projection there` : "Use existing project-move lifecycle";
       } else if (intent.action === "link" && selected) {
         operation = "Link selected provider object";
-        result = `Map Todoist ${intent.taskId} ↔ Calendar ${intent.eventId}${intent.owner ? ` (recurrence owner: ${intent.owner}, scope: ${intent.scope})` : ""}`;
+        const activeCalendarId = event?.recurrence?.length && intent.owner === "calendar" && masterSnapshot?.calendarProjectionId
+          ? masterSnapshot.calendarProjectionId : intent.eventId;
+        result = `Map Todoist ${intent.taskId} ↔ Calendar ${activeCalendarId}${activeCalendarId !== intent.eventId ? ` (series master ${intent.eventId})` : ""}${intent.owner ? ` (recurrence owner: ${intent.owner}, scope: ${intent.scope})` : ""}`;
       } else if (disposition === "create") {
         operation = "Create a new counterpart";
-        result = `Create ${s.ref.side === "todoist" ? "Calendar event" : "Todoist task"} and map it to ${key}`;
+        const sourceEventId = s.ref.side === "calendar" && event?.recurrence?.length && s.ref.id === event.id && intent.owner === "calendar"
+          ? masterSnapshot?.calendarProjectionId : undefined;
+        result = `Create ${s.ref.side === "todoist" ? "Calendar event" : "Todoist task"} and map it to ${sourceEventId ? `active Calendar occurrence ${sourceEventId} (series master ${s.ref.id})` : key}`;
       } else if (disposition === "exclude") {
         operation = "Exclude from syncing";
-        result = "Remove displaced mapping and mark this provider object excluded";
+        result = "Remove any displaced mapping and mark this provider object excluded";
       } else if (selected && intent.action === "separate") {
         operation = "Keep selected items separate";
         result = "Remove existing association; do not link the selected pair";
