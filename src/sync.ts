@@ -1081,7 +1081,26 @@ export class Synchronizer {
         : nextActiveInstance(instances, mapping.originalStart);
       if (!next) {
         await this.state.deleteMapping(progressMapping);
-        return this.state.audit(delivery.profile, "calendar_recurrence_completed_no_next", { seriesId: mapping.seriesId, taskId: task.id });
+        // An empty instances window alone is NOT proof of recurrence exhaustion.
+        // Require a finite RRULE on the fresh Calendar master and atomically
+        // retire exactly the old progress link while certifying this completion.
+        let master: CalendarEvent | undefined;
+        try { master = await calendar.getEvent(mapping.masterEventId); }
+        catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
+        const finite = master?.status !== "cancelled" && master?.recurrence?.some(
+          (rule) => /^RRULE:(?:[^;]*;)*(?:COUNT|UNTIL)=/i.test(rule),
+        );
+        const link = mapping.seriesId ? await this.state.getRecurrenceLink?.(delivery.profile, mapping.seriesId) : undefined;
+        if (finite && link && link.masterEventId === mapping.masterEventId
+          && link.completedThroughOriginalStart === progressMapping.completedThroughOriginalStart
+          && await this.state.verifyTerminalCompletedCalendarProjection?.(retained, link)) {
+          return this.state.audit(delivery.profile, "calendar_finite_recurrence_terminal_verified", {
+            seriesId: mapping.seriesId, taskId: task.id, eventId: retained.eventId,
+          });
+        }
+        return this.state.audit(delivery.profile, "calendar_recurrence_completed_no_next", {
+          seriesId: mapping.seriesId, taskId: task.id, terminality: "unverified",
+        });
       }
       const nextTask = await todoist.upsertTask(toTodoistTask(next));
       const nextMapping: Mapping = {
