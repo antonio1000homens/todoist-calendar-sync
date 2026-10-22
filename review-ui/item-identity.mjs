@@ -33,6 +33,14 @@ export function providerIdentity(value) {
   return { profile:ref?.profile || "", side:side || "", id:id || "", title, date, recurrence, status, identified, selectable };
 }
 
+// Cancelled Calendar events and deleted Todoist tasks are still identifiable for
+// exclusion, but must never be used as sources for new counterparts.
+export function dispositionOptions(value) {
+  const identity = providerIdentity(value);
+  if (!identity.identified) return [];
+  return identity.selectable ? ["create", "exclude"] : ["exclude"];
+}
+
 export function scopeLabel(scope) {
   return ({ occurrence:"This occurrence", series:"Entire series", future:"Future occurrences (preserve history)" })[scope] || "Scope not selected";
 }
