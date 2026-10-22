@@ -1288,6 +1288,14 @@ export class Synchronizer {
       const retainedLinkedEvent = linkedEvent
         ? await this.getCompletedProjection(delivery.profile, linkedEvent.id)
         : undefined;
+      if (retainedLinkedEvent?.taskId === task.id && !deleted) {
+        // Once COMPLETED_TASK has been purged, event-keyed history is still
+        // authoritative. Never rediscover that Calendar event or create a
+        // replacement Todoist projection in response to a stale update.
+        return this.state.audit(delivery.profile, "todoist_historical_projection_update_ignored", {
+          taskId: task.id, eventId: retainedLinkedEvent.eventId,
+        });
+      }
       if (linkedEvent?.status === "cancelled") {
         cancelledCalendarLink = true;
       } else if (linkedEvent && !retainedLinkedEvent) {
