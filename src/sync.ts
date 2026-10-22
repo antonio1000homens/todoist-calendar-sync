@@ -14,6 +14,7 @@ import {
   todoistRecurrenceKey,
   todoistRecurrenceToRrule,
 } from "./todoist-recurrence.js";
+import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 export function calendarResourceAlreadyDeleted(error: unknown): boolean {
@@ -1080,7 +1081,26 @@ export class Synchronizer {
         : nextActiveInstance(instances, mapping.originalStart);
       if (!next) {
         await this.state.deleteMapping(progressMapping);
-        return this.state.audit(delivery.profile, "calendar_recurrence_completed_no_next", { seriesId: mapping.seriesId, taskId: task.id });
+        // An empty instances window alone is NOT proof of recurrence exhaustion.
+        // Require a finite RRULE on the fresh Calendar master and atomically
+        // retire exactly the old progress link while certifying this completion.
+        let master: CalendarEvent | undefined;
+        try { master = await calendar.getEvent?.(mapping.masterEventId); }
+        catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
+        const finite = master?.status !== "cancelled" && master?.recurrence?.some(
+          (rule) => /^RRULE:(?:[^;]*;)*(?:COUNT|UNTIL)=/i.test(rule),
+        );
+        const link = mapping.seriesId ? await this.state.getRecurrenceLink?.(delivery.profile, mapping.seriesId) : undefined;
+        if (finite && link && link.masterEventId === mapping.masterEventId
+          && link.completedThroughOriginalStart === progressMapping.completedThroughOriginalStart
+          && await this.state.verifyTerminalCompletedCalendarProjection?.(retained, link)) {
+          return this.state.audit(delivery.profile, "calendar_finite_recurrence_terminal_verified", {
+            seriesId: mapping.seriesId, taskId: task.id, eventId: retained.eventId,
+          });
+        }
+        return this.state.audit(delivery.profile, "calendar_recurrence_completed_no_next", {
+          seriesId: mapping.seriesId, taskId: task.id, terminality: "unverified",
+        });
       }
       const nextTask = await todoist.upsertTask(toTodoistTask(next));
       const nextMapping: Mapping = {
@@ -1181,7 +1201,13 @@ export class Synchronizer {
         });
       }
 
-      const retained = completedCalendarProjection(mapping, delivery.receivedAt);
+      const retained: CompletedCalendarProjection = {
+        ...completedCalendarProjection(mapping, delivery.receivedAt),
+        // Only a fresh, explicitly completed provider task with no further
+        // recurrence can prove the rolling series was terminal.
+        ...(current?.is_completed === true && !current.due?.is_recurring
+          ? { terminalVerified: true as const } : {}),
+      };
       await this.putCompletedProjection(retained);
       await this.state.audit(delivery.profile, "todoist_recurrence_completed_calendar_retained", {
         taskId: task.id,
@@ -1262,6 +1288,14 @@ export class Synchronizer {
       const retainedLinkedEvent = linkedEvent
         ? await this.getCompletedProjection(delivery.profile, linkedEvent.id)
         : undefined;
+      if (retainedLinkedEvent?.taskId === task.id && lifecycle.action !== "delete_projection") {
+        // Once COMPLETED_TASK has been purged, event-keyed history is still
+        // authoritative. Never rediscover that Calendar event or create a
+        // replacement Todoist projection in response to a stale update.
+        return this.state.audit(delivery.profile, "todoist_historical_projection_update_ignored", {
+          taskId: task.id, eventId: retainedLinkedEvent.eventId,
+        });
+      }
       if (linkedEvent?.status === "cancelled") {
         cancelledCalendarLink = true;
       } else if (linkedEvent && !retainedLinkedEvent) {
@@ -1277,6 +1311,17 @@ export class Synchronizer {
     }
     if (deleted) {
       if (!mapping) {
+        const history = await this.listCompletedProjections(delivery.profile, task.id);
+        // Todoist plan pruning arrives as an ordinary item:deleted webhook.
+        // After seven full days historical events must never be deleted, even
+        // when the maintenance worker has not yet retired COMPLETED_TASK.
+        // Ambiguous recurrence history also fails safe when no live mapping
+        // exists; it must not be interpreted as permission to erase history.
+        if (lifecycle.reason === "deleted" && protectUnmappedCompletedHistory(history, Number.isFinite(Date.parse(delivery.receivedAt)) ? Date.parse(delivery.receivedAt) : Date.now())) {
+          return this.state.audit(delivery.profile, "todoist_late_completed_deletion_ignored", {
+            taskId: task.id, retainedHistory: history.length,
+          });
+        }
         const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, task.id, calendar);
         if (!removedHistory) return;
         return this.state.audit(delivery.profile, "todoist_deleted_completed_calendar_history", { taskId: task.id, removedHistory });

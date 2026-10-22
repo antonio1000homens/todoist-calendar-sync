@@ -14,7 +14,7 @@ The production scan returned 7,472 rows while DescribeTable.ItemCount reported 7
 | BASELINE | 163 | Preserve; reconciliation |
 | CANONICAL | 131 | Preserve; canonical comparison |
 | EVENT / TASK / TASKOWNER | 256 | Preserve; three materialized views of live mappings; investigate inconsistency |
-| COMPLETED_TASK / COMPLETED_EVENT | 36 | **Never delete**; completed-task calendar history |
+| COMPLETED_TASK / COMPLETED_EVENT | 36 | Preserve completed Calendar history. See #114: only proven-terminal COMPLETED_TASK references can be retired after seven days; COMPLETED_EVENT markers are permanent. |
 | Other state | 48 | Preserve; watches, recurrence, circuit breaker, sync tokens, policy, migration marker |
 
 The 211 initial AUDIT candidates consisted of 138 old 90-day TTL records and 73 old 30-day TTL records, both older than the application's current seven-day retention. They are **significant diagnostic records** (not "routine" log spam). **Deleting historical diagnostics is a separate approval decision** after reviewing the report and creating a verified backup.
@@ -36,7 +36,7 @@ Historical AUDIT deletion is optional and separate from the report. It:
 - Defaults to a strict upper limit of **250** candidate deletions; a larger run must opt in with --max-deletes=N (maximum 1000).
 - Selects **only** AUDIT rows with a valid profile/action and timestamps, original **30-/90-day** TTL, still awaiting original TTL expiry, and at least **seven full days** since creation.
 - Strongly rereads every candidate and conditionally deletes only when createdAt, expiresAt, and action still match. Races skip the row, not overwrite or delete changed state.
-- Never touches EVENT, TASK, TASKOWNER, COMPLETED_*, CANONICAL, BASELINE, RECURRENCE, DELIVERY, or any other non-AUDIT family; it does not call Google Calendar or Todoist and does not change their data.
+- This *audit deletion* script never touches EVENT, TASK, TASKOWNER, COMPLETED_*, CANONICAL, BASELINE, RECURRENCE, DELIVERY, or any other non-AUDIT family; it does not call Google Calendar or Todoist and does not change their data. The separate #114 completed-history retirement operation has a distinct safety policy.
 
 ## Read-only report
 
@@ -89,3 +89,86 @@ Run npm run state:inspect again, verify table and GSI activity, watch worker/Dyn
 5. Investigate 17 repeatedly conflicting task/event pairs. A reduction in audit rows without fixing the conflicts would conceal the symptom rather than resolve it.
 
 Do **not** automatically delete SYSTEM#PROFILE_LOOKUP_INDEX or unindexed RECURRENCE rows: the former is retained migration evidence; a legacy recurrence row can still be written by recordRecurrence and may be needed for compatibility.
+
+
+## Terminal completed-task history (issue #114; new independent maintenance operation)
+
+Completion already drops the active EVENT/TASK/TASKOWNER mapping. An immutable
+`COMPLETED_EVENT#profile#eventId` marker remains **indefinitely** to block Calendar
+webhook, snapshot and orphan recovery from creating a duplicate Todoist task.
+Its initial `completedAt` is immutable: a replay must never reset the grace
+period or recreate a retired `COMPLETED_TASK` row.
+
+The new scheduled `CompletedHistoryCleanupFunction` inspects at most ten pages
+of 25 evaluated items every day, paced at five read units/second and using a
+durable cursor in apply mode. Its stack parameter
+`CompletedHistoryCleanupApply` defaults to **false** (dry-run only). It scans
+only candidate `COMPLETED_TASK` rows, groups the task's strongly consistent
+completion references, and retires all eligible task-side completion lookup
+rows in **one guarded transaction**, retaining `COMPLETED_EVENT`. It can also
+remove a strictly older baseline with a timestamp condition. It checks all
+three profiles' task mapping indexes, the global TASKOWNER, event mapping
+indexes, and recurrence ownership before writing. A missing/changed guard,
+unverified recurrence, more than 12 history rows, or an active owner is a
+*safety skip*, never permission to delete. A verified exhausted recurrence
+uses an immutable `COMPLETED_SERIES#profile#seriesId` certificate (no Todoist
+task reference) to retire older occurrences in safe transactional batches of
+at most 12 event references; without the certificate a truncated multi-row
+history query is always skipped. Version, canonical, tombstone,
+audit, delivery and other state are untouched.
+
+Eligibility starts at **seven full 24-hour periods** since the latest
+persisted completion. A missing Todoist task, old due date, cancelled instance,
+or lack of an available next occurrence does **not** establish terminality.
+Calendar-owned finite COUNT/UNTIL series can be marked terminal only after
+confirming the current master and absence of a successor and atomically
+retiring its unchanged recurrence link. Todoist-owned rolling series require
+a freshly returned completed provider task with no recurring due. Finality
+is recorded as a permanent series certificate, which allows cleanup of older
+occurrences only after the latest terminal completion's seven-day grace.
+All other recurring histories deliberately remain in `skipped_ambiguous`
+for human review. The worker does not modify live providers or remove project mapping
+comments; comment references, if still present, require a separate
+provider-aware ownership-checked operation. This conservative limitation
+must be resolved before declaring complete project-comment retention.
+
+### Verification and staged activation
+
+1. Deploy with `CompletedHistoryCleanupApply=false` and examine the daily
+   CloudWatch `terminal_completed_history_cleanup_report` counts. No
+   completed rows are written by this default schedule.
+2. Use an authorized read-only session to run `npm ci` then
+   `npm run state:cleanup-completed -- --max-pages=40`. The output is a
+   dry-run report with `eligible`, `retired`, `skipped_active`,
+   `skipped_ambiguous`, `too_recent`, `failed`, and an encoded
+   `nextCursor`. Continue with `--cursor=<nextCursor>` to audit other
+   bounded pages. Do not interpret a page report as a whole-table count.
+3. Inspect sample task/event marker pairs, recurrence links, all three mapping
+   copies, and any Todoist project comment references. Check Calendar events
+   are still visible and replaying those events does not recreate tasks.
+4. After separate change approval, create an on-demand DynamoDB backup for the
+   exact state table and verify backup AVAILABLE and PITR enabled. For a
+   small operator-controlled apply run, execute:
+
+   ```bash
+   npm run state:cleanup-completed -- \
+     --apply --max-pages=2 \
+     --confirm=RETIRE_TERMINAL_COMPLETED_TASK_REFERENCES \
+     --backup-arn="$BACKUP_ARN"
+   ```
+
+   The CLI validates the backup belongs to this table, is AVAILABLE and was
+   created in the last 24 hours. Scheduled apply additionally requires an
+   explicitly reviewed stack configuration change setting the parameter to
+   `true` and has no provider write permissions.
+5. Compare the before/after `COMPLETED_TASK` rows, permanent
+   `COMPLETED_EVENT` markers and mapping triplets; replay an old Calendar
+   delta, Todoist deletion and snapshot; watch for throttling and failed
+   conditions. Do not run any production backfill or apply as part of the PR.
+
+Late Todoist `item:deleted` after seven days is suppressed independently of
+this schedule, even when COMPLETED_TASK is still present. Once the task lookup
+has been removed, the event-side guard continues to block destructive delete
+and stale update recovery. Explicit deletion of an active mapped task remains
+on the existing path; younger one-off completion deletion retains its prior
+semantics.
