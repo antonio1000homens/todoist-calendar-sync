@@ -748,23 +748,81 @@ export class Synchronizer {
         return this.state.audit(delivery.profile, "todoist_recurrence_calendar_master_deleted_projection_only", { eventId: event.id, taskId: mapping.taskId, projectionSuppressed: true });
       }
 
-      const series = event.iCalUID || event.recurringEventId || event.id;
-      const existingRecurrence = await this.state.getRecurrenceLink(delivery.profile, series);
+      // Cancelled Google exceptions can omit iCalUID and shared properties.
+      // Resolve the persisted series before acting on any occurrence mapping.
+      const series = (mapping?.recurrenceOwner === "calendar" && mapping.seriesId)
+        || event.iCalUID || event.recurringEventId || event.id;
+      let existingRecurrence = await this.state.getRecurrenceLink(delivery.profile, series);
+      if (!existingRecurrence && event.recurringEventId) {
+        existingRecurrence = (await this.state.listRecurrenceLinks(delivery.profile))
+          .find((link) => link.owner === "calendar" && link.masterEventId === event.recurringEventId);
+      }
       if (existingRecurrence?.owner === "calendar" && existingRecurrence.masterEventId) {
-        if (
-          event.recurringEventId
-          && existingRecurrence.activeInstanceId
-          && event.id !== existingRecurrence.activeInstanceId
-        ) {
-          return this.state.audit(
-            delivery.profile,
-            "calendar_recurrence_stale_instance_cancellation_ignored",
-            {
-              seriesId: series,
-              eventId: event.id,
-              activeInstanceId: existingRecurrence.activeInstanceId,
-            },
-          );
+        if (event.recurringEventId && event.id !== existingRecurrence.activeInstanceId) {
+          const activeInstanceId = existingRecurrence.activeInstanceId;
+          if (!activeInstanceId) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_stale_instance_cancellation_ignored", {
+              seriesId: existingRecurrence.seriesId, eventId: event.id, reason: "active_instance_unknown",
+            });
+          }
+          // Never infer a deletion from a delayed delta alone. Read back both
+          // instances, establish immutable logical ordering, and prove that the
+          // later occurrence still owns the task before touching DynamoDB.
+          const { calendar } = await this.clients(delivery.profile);
+          let cancelled: CalendarEvent;
+          let active: CalendarEvent;
+          try {
+            cancelled = await calendar.getEvent(event.id);
+            active = await calendar.getEvent(activeInstanceId);
+          } catch (error) {
+            if (!calendarEventGoneOnDirectRead(error)) throw error;
+            return this.state.audit(delivery.profile, "calendar_recurrence_stale_instance_cancellation_ignored", {
+              seriesId: existingRecurrence.seriesId, eventId: event.id, activeInstanceId, reason: "provider_read_missing",
+            });
+          }
+          const oldStart = eventStart(cancelled) || eventStart(event);
+          const activeStart = eventStart(active);
+          const deltaStart = eventStart(event);
+          const verified = cancelled.id === event.id && cancelled.status === "cancelled"
+            && cancelled.recurringEventId === existingRecurrence.masterEventId
+            && active.id === activeInstanceId && active.status === "confirmed"
+            && active.recurringEventId === existingRecurrence.masterEventId
+            && Boolean(oldStart && activeStart)
+            && Number.isFinite(Date.parse(oldStart || ""))
+            && Number.isFinite(Date.parse(activeStart || ""))
+            && (!deltaStart || !eventStart(cancelled) || compareLogicalStarts(deltaStart, oldStart!) === 0);
+          if (!verified || compareLogicalStarts(oldStart!, activeStart!) >= 0) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_stale_instance_cancellation_ignored", {
+              seriesId: existingRecurrence.seriesId, eventId: event.id, activeInstanceId,
+              reason: !verified ? "provider_or_identity_unverified" : "not_earlier_than_active",
+            });
+          }
+          const activeMapping = await this.state.getMappingByEvent(delivery.profile, activeInstanceId);
+          if (!activeMapping || activeMapping.taskId !== existingRecurrence.taskId
+            || activeMapping.eventId !== activeInstanceId
+            || activeMapping.recurrenceOwner !== "calendar"
+            || activeMapping.seriesId !== existingRecurrence.seriesId
+            || activeMapping.masterEventId !== existingRecurrence.masterEventId
+            || (mapping && (mapping.recurrenceOwner !== "calendar"
+              || mapping.seriesId !== existingRecurrence.seriesId
+              || mapping.masterEventId !== existingRecurrence.masterEventId))) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_stale_instance_cancellation_ignored", {
+              seriesId: existingRecurrence.seriesId, eventId: event.id, activeInstanceId, reason: "mapping_ownership_unverified",
+            });
+          }
+          if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_delete_suppressed", {
+              seriesId: existingRecurrence.seriesId, eventId: event.id, mode: delivery.mode,
+            });
+          }
+          if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
+          const removed = await this.state.purgeEarlierCancelledCalendarOccurrence(existingRecurrence, event.id, mapping);
+          if (removed) await this.state.recordMutation(delivery.profile);
+          return this.state.audit(delivery.profile,
+            removed ? "calendar_recurrence_earlier_instance_cancellation_honored"
+              : "calendar_recurrence_earlier_instance_cancellation_noop",
+            { seriesId: existingRecurrence.seriesId, eventId: event.id, activeInstanceId,
+              taskId: existingRecurrence.taskId, oldStart, activeStart, stateChanged: removed });
         }
         if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
           return this.state.audit(delivery.profile, "calendar_recurrence_delete_suppressed", { seriesId: series, mode: delivery.mode });
@@ -802,6 +860,13 @@ export class Synchronizer {
         await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "calendar_recurrence_instance_deleted_rolled", { seriesId: series, eventId: next.id, taskId: nextTask.id });
+      }
+      // An unbound/legacy cancelled series instance must never fall through
+      // to the standalone deletion path and delete the still-live Todoist task.
+      if (event.recurringEventId && mapping?.recurrenceOwner === "calendar") {
+        return this.state.audit(delivery.profile, "calendar_recurrence_unbound_instance_cancellation_deferred", {
+          eventId: event.id, masterEventId: event.recurringEventId, taskId: mapping.taskId,
+        });
       }
       if (!mapping) return;
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) return this.state.audit(delivery.profile, "calendar_delete_suppressed", { eventId: event.id, mode: delivery.mode });
