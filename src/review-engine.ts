@@ -138,6 +138,25 @@ export class ReviewEngine {
     if (snapshots.some(s => s.control?.activeRepair)) throw new Error("An incomplete repair owns an affected item; resume that operation first");
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
+    if (intent.action === "verify") {
+      if (!task || !event) invalidRepairIntent(`Verification requires live Todoist task ${intent.taskId || "(not selected)"} and Calendar event ${intent.eventId || "(not selected)"}; refresh affected items and select the current pair`);
+      const mapping = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId)?.mapping
+        || snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId)?.mapping;
+      const expectedEventIds = [...new Set([mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId].filter((id): id is string => Boolean(id)))];
+      const mismatch = () => invalidRepairIntent(`Selected pair does not match the current mapping: Todoist task ${task.id}, selected Calendar event ${event.id}; expected Calendar event ${expectedEventIds.join(", ") || "none (no mapping found)"}. Refresh affected items and use the current mapped pair.`);
+      if (!mapping || mapping.taskId !== task.id || !expectedEventIds.includes(event.id)) mismatch();
+      if (mapping.recurrenceOwner === "calendar" && mapping.masterEventId) {
+        const active = await (await this.clients(intent.profile)).calendar.getEvent(mapping.activeInstanceId || mapping.eventId);
+        if (!hasCanonicalState(active, task)) mismatch();
+      } else if (mapping.recurrenceOwner === "todoist" && mapping.masterEventId) {
+        const pairClients = await this.clients(intent.profile);
+        const [master, active] = await Promise.all([
+          pairClients.calendar.getEvent(mapping.masterEventId),
+          pairClients.calendar.getEvent(mapping.activeInstanceId || mapping.eventId),
+        ]);
+        if (!calendarRecurrenceMatchesTodoist(master, task) || !recurrenceAnchorMatches(master) || !occurrenceStateMatches(active, task)) mismatch();
+      } else if (mapping.eventId !== event.id || !hasCanonicalState(event, task)) mismatch();
+    }
     const masterSnapshot = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === (event?.recurringEventId || event?.id));
     const approvedCalendarOccurrence = event?.recurrence?.length && intent.owner === "calendar"
       ? snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === masterSnapshot?.calendarProjectionId)?.object as CalendarEvent | undefined
@@ -477,14 +496,14 @@ export class ReviewEngine {
       } else {
         if(!originalTask||!originalEvent)throw new Error("Verification requires both selected provider items");
         const mapping=await state.getMappingByTask(intent.profile,originalTask.id);
-        if(!mapping)throw new Error("Mapping does not match the selected pair");
+        if(!mapping)throw new Error(`Selected pair does not match the current mapping: Todoist task ${originalTask.id}, Calendar event ${originalEvent.id}; no mapping is recorded. Refresh affected items and use the current mapped pair.`);
         if(mapping.recurrenceOwner==="calendar"&&mapping.masterEventId){
           const pairClients=await factory(intent.profile),active=await pairClients.calendar.getEvent(mapping.activeInstanceId||mapping.eventId);
-          if((originalEvent.id!==mapping.masterEventId&&originalEvent.id!==mapping.eventId)||!hasCanonicalState(active,originalTask))throw new Error("Calendar-owned recurrence is not currently synchronized");
+          if((originalEvent.id!==mapping.masterEventId&&originalEvent.id!==mapping.eventId&&originalEvent.id!==mapping.activeInstanceId)||!hasCanonicalState(active,originalTask))throw new Error(`Selected pair does not match the current Calendar-owned recurrence: Todoist task ${originalTask.id}, Calendar event ${originalEvent.id}; expected ${[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter(Boolean).join(", ")}. Refresh affected items and use the current mapped pair.`);
         }else if(mapping.recurrenceOwner==="todoist"&&mapping.masterEventId){
           const pairClients=await factory(intent.profile),master=await pairClients.calendar.getEvent(mapping.masterEventId),active=await pairClients.calendar.getEvent(mapping.activeInstanceId||mapping.eventId);
-          if(!calendarRecurrenceMatchesTodoist(master,originalTask)||!recurrenceAnchorMatches(master)||!occurrenceStateMatches(active,originalTask))throw new Error("Todoist-owned recurrence is not currently synchronized");
-        }else if(mapping.eventId!==originalEvent.id||!hasCanonicalState(originalEvent,originalTask))throw new Error("Mapping does not match the selected pair");
+          if(![mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].includes(originalEvent.id)||!calendarRecurrenceMatchesTodoist(master,originalTask)||!recurrenceAnchorMatches(master)||!occurrenceStateMatches(active,originalTask))throw new Error(`Selected pair does not match the current Todoist-owned recurrence: Todoist task ${originalTask.id}, Calendar event ${originalEvent.id}; expected ${[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter(Boolean).join(", ")}. Refresh affected items and use the current mapped pair.`);
+        }else if(mapping.eventId!==originalEvent.id||!hasCanonicalState(originalEvent,originalTask))throw new Error(`Selected pair does not match the current mapping: Todoist task ${originalTask.id}, Calendar event ${originalEvent.id}; expected Calendar event ${mapping.eventId}. Refresh affected items and use the current mapped pair.`);
         recordVerified(mapping);
       }
       const outcomes: NonNullable<RepairOperation["outcomes"]> = [];
