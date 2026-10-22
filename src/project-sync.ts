@@ -535,6 +535,15 @@ export class ProjectAwareSynchronizer {
       || existingEvent.recurringEventId || existingEvent.recurrence?.length)) {
       throw new Error("Approved Calendar event changed, cancelled or disappeared; no replacement permitted");
     }
+    if (existingEvent) {
+      const historical = await this.state.getCompletedCalendarProjectionByEvent?.(destinationProfile, existingEvent.id);
+      if (historical?.taskId === task.id) {
+        await this.state.audit(destinationProfile, "todoist_project_historical_projection_create_ignored", {
+          taskId: task.id, eventId: existingEvent.id, completedAt: historical.completedAt,
+        });
+        return undefined;
+      }
+    }
     if (!approved && existingEvent?.status === "cancelled") existingEvent = undefined;
     const stored = existingEvent && hasCanonicalState(existingEvent, task)
       ? existingEvent
