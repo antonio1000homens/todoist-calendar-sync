@@ -40,7 +40,7 @@ Resources:
             Condition:
               StringEquals:
                 "token.actions.githubusercontent.com:aud": sts.amazonaws.com
-                "token.actions.githubusercontent.com:sub": repo:antonio1000homens/todoist-calendar-sync:environment:production
+                "token.actions.githubusercontent.com:sub": repo:antonio1000homens@36929120/todoist-calendar-sync@1370572332:environment:production
 
   DeploymentPolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -95,7 +95,10 @@ Resources:
               - lambda:DeleteFunction
               - lambda:GetFunction
               - lambda:GetFunctionConfiguration
+              - lambda:GetFunctionCodeSigningConfig
               - lambda:GetFunctionConcurrency
+              - lambda:GetFunctionRecursionConfig
+              - lambda:GetRuntimeManagementConfig
               - lambda:GetPolicy
               - lambda:UpdateFunctionCode
               - lambda:UpdateFunctionConfiguration
@@ -113,6 +116,7 @@ Resources:
               - lambda:DeleteFunctionUrlConfig
               - lambda:GetFunctionUrlConfig
               - lambda:PutFunctionConcurrency
+              - lambda:PutFunctionRecursionConfig
               - lambda:DeleteFunctionConcurrency
               - lambda:CreateEventSourceMapping
               - lambda:UpdateEventSourceMapping
