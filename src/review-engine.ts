@@ -631,20 +631,30 @@ export class ReviewEngine {
       // started steps, provider changes or recorded outcomes may contain writes.
       const changesMayHaveStarted = providerProgress || Object.keys(operation.steps).some(name => name !== 'validated')
         || operation.outcomes !== undefined || operation.verified !== undefined || operation.recurrenceBindings !== undefined;
+      const failureMessage = e instanceof Error ? e.message : String(e);
+      const abandonedNextAction = 'No repair writes were recorded and ownership was released. Refresh affected items and create a new preview; do not resume this failed operation.';
       let releaseError: unknown;
       if (claimed && !changesMayHaveStarted && !['exclude', 'separate', 'move'].includes(intent.action)) {
         const refs = operation.preview.snapshots.map(snapshot => snapshot.ref);
         try {
           await queueDeferredRefresh(refs);
-          await this.controls.releaseUnapplied(refs, id, operation.preview.snapshots);
-          operation.abandoned = true;
+          try {
+            await this.controls.releaseUnapplied(refs, id, operation.preview.snapshots, {error: failureMessage, nextAction: abandonedNextAction});
+            operation.abandoned = true;
+          } catch(error) {
+            // A lost DynamoDB transaction response may mean BOTH the marker
+            // and locks were committed; never overwrite that durable result.
+            const durable = await this.store.getOperation(id).catch(()=>undefined);
+            if (durable?.abandoned) operation.abandoned = true;
+            else releaseError = error;
+          }
         } catch(error) { releaseError = error; }
       }
       operation.status = changesMayHaveStarted || releaseError || claimed && !operation.abandoned ? 'needs_review' : 'failed';
-      operation.error = e instanceof Error ? e.message : String(e);
+      operation.error = failureMessage;
       if (releaseError) operation.error += `; repair barriers were retained because safe release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`;
       operation.nextAction = operation.abandoned
-        ? 'No repair writes were recorded and ownership was released. Refresh the affected items and create a new preview; do not resume this failed operation.'
+        ? abandonedNextAction
         : 'Repair ownership remains protected; inspect live state and resume only when the recorded changes are understood.';
       await this.store.updateCase(intent.caseId, 'open', operation.error, id);
     }

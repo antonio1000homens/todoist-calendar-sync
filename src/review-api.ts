@@ -197,6 +197,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       const operation = await store.getOperation(segments[1]);
       if (!operation) return response(404,{error:"operation_not_found"});
       assertOwned(actor.subject,operation.actor.subject);
+      if (operation.abandoned) fail(409,"This unapplied repair was released; refresh affected items and create a new preview instead of resuming it");
       if (!["failed","needs_review","queued"].includes(operation.status)) fail(409,"Only queued, failed, or interrupted repairs can be resumed");
       // Every explicit retry gets a new SQS deduplication ID, including a
       // queued operation whose earlier send may have been accepted but is

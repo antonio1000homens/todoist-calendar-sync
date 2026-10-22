@@ -194,7 +194,7 @@ export class SyncControls {
     } })) }));
   }
   // Atomically release an unapplied failed repair, checking the controls from its preview.
-  async releaseUnapplied(refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[]): Promise<void> {
+  async releaseUnapplied(refs: EntityRef[], operationId: string, snapshots: ReviewSnapshot[], failure: { error: string; nextAction: string }): Promise<void> {
     const previous = new Map(snapshots.map(s => [entityKey(s.ref), s.control || {}]));
     const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
     if (!unique.length) return;
@@ -212,7 +212,16 @@ export class SyncControls {
         UpdateExpression: 'SET fencedAt = :now REMOVE activeRepair',
         ConditionExpression: conditions.join(' AND '), ExpressionAttributeValues: values } };
     });
-    await client.send(new TransactWriteCommand({ TransactItems: items }));
+    // Include the terminal operation marker in the SAME transaction as lock release.
+    // A crash or lost response cannot replay a previously validated preview.
+    const operationMarker = { Update: { TableName: reviewTable(), Key: key(`REPAIR#${operationId}`),
+      UpdateExpression: 'SET abandoned = :yes, #status = :failed, #error = :error, nextAction = :next, updatedAt = :now, notificationPending = :yes, notificationText = :notice, lookupSk = :lookup',
+      ConditionExpression: 'attribute_exists(pk) AND #status <> :succeeded AND attribute_not_exists(abandoned)',
+      ExpressionAttributeNames: { '#status': 'status', '#error': 'error' },
+      ExpressionAttributeValues: { ':yes': true, ':failed': 'failed', ':succeeded': 'succeeded', ':error': failure.error, ':next': failure.nextAction, ':now': new Date().toISOString(),
+        ':notice': `Failed: ${failure.error}`, ':lookup': `REPAIR#NOTIFY#${operationId}` }
+    } };
+    await client.send(new TransactWriteCommand({ TransactItems: [...items, operationMarker] }));
   }
   async exclude(ref: EntityRef, excluded: boolean, operationId: string): Promise<void> {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",
