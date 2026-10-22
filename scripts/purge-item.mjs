@@ -112,8 +112,12 @@ function providerBlockers(data) {
   if (data.event?.recurrence?.length || data.event?.recurringEventId)
     blocks.push("Recurring Calendar item: series/exception requires manual handling");
   if (data.event && !flag("delete-calendar")) blocks.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
+  if (data.event?.extendedProperties?.shared?.taskId && data.event.extendedProperties.shared.taskId !== taskId)
+    blocks.push("Selected Calendar event is linked to a different Todoist task");
   if (data.linked && (!eventId || data.linked.id !== eventId))
     blocks.push("Another Calendar projection links to this task; manual inspection required");
+  if (data.linked && !flag("delete-calendar"))
+    blocks.push("A live Calendar projection would recreate the Todoist task unless separately deleted");
   if (data.linked?.recurrence?.length || data.linked?.recurringEventId)
     blocks.push("Linked Calendar recurrence needs manual handling");
   if (data.comments.some(item => item.profile !== profile || item.taskId !== taskId || item.eventId !== eventId || item.seriesId))
