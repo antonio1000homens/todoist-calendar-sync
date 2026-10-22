@@ -60,6 +60,15 @@ test("linked review cases are included through sourceAuditKey",()=>{
  const result=planPurge([audit,review],target);
  assert.equal(result.records.length,2);
 });
+test("includes redacted audit through a selected review case and referenced manual record",()=>{
+ const audit=record("AUDIT#home#redacted","STATE",{detail:{redacted:true}});
+ const decision=record("MANUAL#decision-xyz","STATE",{profile:"home",context:{providerTaskId:"task-123"}});
+ const review=record("REVIEW_CASE#xyz","STATE",{profile:"home",taskId:"task-123",
+   sourceAuditKey:audit.pk,decision:{decisionId:"decision-xyz"}});
+ const result=planPurge([audit,decision,review],target);
+ assert.equal(result.records.length,3);
+ assert.deepEqual(result.blockers,[]);
+});
 test("rejects malformed selectors, malformed scan keys, and duplicate rows",()=>{
  assert.throws(()=>planPurge([], {profile:"invalid",taskId:"123"}));
  assert.throws(()=>planPurge([{pk:"oops"}],target));
