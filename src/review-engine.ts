@@ -229,7 +229,7 @@ export class ReviewEngine {
         invalidRepairIntent("Choose Todoist recurrence ownership for this recurring task, or use its existing recurrence resolution action");
       }
       changes.push(`Link Todoist task ${task!.id} to Calendar event ${event!.id}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
-      if (intent.winner === "todoist") {
+      if (intent.winner === "todoist" && !preview.splitPlan) {
         const desired=event?.recurringEventId && intent.owner === "todoist"
           ? todoistOccurrenceProjection(task!,event!) : toCalendarEvent(task!,event!);
         fieldChange("Calendar title",event!.summary,desired.summary);
