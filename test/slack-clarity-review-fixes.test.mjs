@@ -449,3 +449,31 @@ test('recurrence deletion falls back to the master without overwriting the known
   assert.equal(notifier.posted[0].context.calendarTitle, 'Recurring series');
   assert.equal(notifier.posted[0].context.calendarStart, '2026-09-18T16:00:00+01:00');
 });
+
+test('orphan Calendar 410 quarantine keeps the provider identities for review instead of an anonymous DLQ card', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const store = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(store, notifier, async () => ({}), new FakePolicyStore());
+  const error = Object.assign(new Error('Provider request failed: 410'), { status: 410 });
+
+  await service.reportDeliveryFailure({
+    id: 'original:orphan:event-gone:task-gone',
+    kind: 'orphan',
+    profile: 'home',
+    mode: 'aws',
+    receivedAt: '2026-10-22T18:00:00Z',
+    headers: {},
+    body: '',
+    orphan: { eventId: 'event-gone', taskId: 'task-gone', attempt: 2 },
+  }, error);
+
+  assert.equal(notifier.posted.length, 1);
+  const decision = notifier.posted[0];
+  assert.equal(decision.type, 'operational_dlq');
+  assert.equal(decision.eventId, 'event-gone');
+  assert.equal(decision.taskId, 'task-gone');
+  assert.equal(decision.context.providerEventId, 'event-gone');
+  assert.equal(decision.context.providerTaskId, 'task-gone');
+  assert.equal(decision.context.status, 410);
+});
