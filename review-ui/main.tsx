@@ -47,11 +47,11 @@ function App() {
     setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
   };
-  const editId=(side:"todoist"|"calendar",id:string,verified=false)=>{
-    invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified));
+  const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
+    invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified,searchedItem));
   };
-  const setTaskId=(id:string,verified=false)=>editId("todoist",id,verified);
-  const setEventId=(id:string,verified=false)=>editId("calendar",id,verified);
+  const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
+  const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
   const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
   const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data.reconciliation); };
   useEffect(() => {
@@ -262,7 +262,7 @@ function App() {
             {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
-          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id,true):setEventId(item.id,true)}>Use this item</button></li>)}</ul>}
+          {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh affected items</button>
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Choose what happens to each live item left outside the selected repair.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;return <div className="leftover" key={key}><span><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)}</span><label>Disposition<select value={leftovers[key]||""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option><option value="create">Create a new counterpart</option><option value="exclude">Exclude from syncing</option></select></label></div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
