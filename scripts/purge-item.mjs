@@ -11,6 +11,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, GetCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
 import { profiles } from "../dist/config.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
+import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "../dist/mapping-comments.js";
 import { fingerprint, planPurge } from "./item-purge-policy.mjs";
 
 const argumentsMap = new Map();
@@ -78,8 +79,28 @@ async function readEvent() {
   } catch (error) { if (gone(error)) return null; throw error; }
 }
 async function providers() {
-  const [task, event] = await Promise.all([readTask(),readEvent()]);
-  return {task,event};
+  const [task, event, linked, projectComments] = await Promise.all([
+    readTask(), readEvent(), clients.calendar.findByTodoistTaskId(taskId),
+    clients.todoist.listProjectComments(profiles[profile].todoistProjectId, true),
+  ]);
+  const indexed = buildProjectMappingIndex(projectComments);
+  const relevant = indexed.parsed.filter(item => item.payload.taskId === taskId || item.payload.eventId === eventId);
+  const malformed = indexed.malformed.filter(item =>
+    item.comment.content?.includes(taskId) || (eventId && item.comment.content?.includes(eventId)));
+  let legacy = [];
+  if (task) {
+    const comments = await clients.todoist.listTaskComments(taskId);
+    legacy = comments.filter(comment => {
+      const lines = String(comment.content || "").split(/\\r?\\n/);
+      return LEGACY_TASK_COMMENT_MARKERS.has(lines[0]) && (!eventId || lines.includes("calendarEventId=" + eventId));
+    }).map(comment => ({id:comment.id,content:comment.content,taskId}));
+  }
+  return {
+    task,event,linked:linked?.status === "cancelled" ? null : linked,
+    comments:relevant.map(item => ({id:item.comment.id,content:item.comment.content,profile:item.payload.profile,
+      taskId:item.payload.taskId,eventId:item.payload.eventId,seriesId:item.payload.seriesId})),
+    legacy,malformed:malformed.map(item=>({id:item.comment.id,error:item.error})),
+  };
 }
 function providerBlockers(data) {
   const blocks = [];
@@ -91,6 +112,14 @@ function providerBlockers(data) {
   if (data.event?.recurrence?.length || data.event?.recurringEventId)
     blocks.push("Recurring Calendar item: series/exception requires manual handling");
   if (data.event && !flag("delete-calendar")) blocks.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
+  if (data.linked && (!eventId || data.linked.id !== eventId))
+    blocks.push("Another Calendar projection links to this task; manual inspection required");
+  if (data.linked?.recurrence?.length || data.linked?.recurringEventId)
+    blocks.push("Linked Calendar recurrence needs manual handling");
+  if (data.comments.some(item => item.profile !== profile || item.taskId !== taskId || item.eventId !== eventId || item.seriesId))
+    blocks.push("Project mapping comment belongs to another item or recurrence");
+  if (data.malformed.length) blocks.push("Unparseable mapping comments contain the selected identity");
+  if (data.legacy.length && !eventId) blocks.push("Legacy task mapping comment requires an exact Calendar event ID");
   return blocks;
 }
 function output(data) { console.log(JSON.stringify(data, null, 2)); }
@@ -112,7 +141,9 @@ try {
     mode:flag("apply") ? "apply" : "preview", target, table,
     selectedActions:{deleteTodoist:true,deleteCalendar:flag("delete-calendar")},
     providerBefore:{todoist:observed.task ? {id:observed.task.id,title:observed.task.content,updatedAt:observed.task.updated_at} : null,
-      calendar:observed.event ? {id:observed.event.id,title:observed.event.summary,etag:observed.event.etag} : null},
+      calendar:observed.event ? {id:observed.event.id,title:observed.event.summary,etag:observed.event.etag} : null,
+      linkedCalendar:observed.linked ? {id:observed.linked.id,status:observed.linked.status} : null,
+      matchingMappingComments:observed.comments.map(item=>item.id),matchingLegacyComments:observed.legacy.map(item=>item.id)},
     scanned:initialScan.scanned, records:plan.records.map(publicRecord), blockers,
     warning:"PURGE PERMANENTLY REMOVES AUDIT/HISTORY AND DISABLES HISTORICAL REPAIR/FORENSICS. Untagged delivery receipts or redacted historical records cannot be proven attributable; manually inspect queued deliveries and backups.",
     ...(blockers.length ? {} : {actionTimeConfirmation:"PERMANENTLY_ERASE_" + token}),
@@ -130,8 +161,17 @@ try {
   if (secondPlan.inventoryDigest !== plan.inventoryDigest || fingerprint(secondProvider) !== fingerprint(observed)
     || secondPlan.blockers.length || providerBlockers(secondProvider).length)
     throw new Error("Stale inventory or provider snapshot; no changes made. Preview again.");
-  const result = {deletedProvider:[],alreadyAbsent:[],deletedState:[],partialFailure:null};
+  const result = {deletedProvider:[],alreadyAbsent:[],deletedComments:[],deletedState:[],partialFailure:null};
   try {
+    // Provider mapping comments are durable reverse indexes. Clear only rows
+    // whose validated payload matches this exact task/event selection, and
+    // never leave breadcrumbs that can rebuild the erased Dynamo mappings.
+    for (const comment of [...secondProvider.comments,...secondProvider.legacy]) {
+      const current = await clients.todoist.getComment(comment.id);
+      if (current.content !== comment.content) throw new Error("Mapping comment changed since inventory");
+      await clients.todoist.deleteComment(comment.id);
+      result.deletedComments.push(comment.id);
+    }
     if (secondProvider.task) {
       try { await clients.todoist.deleteTask(taskId); result.deletedProvider.push("todoist"); }
       catch (error) { if (!gone(error)) throw error; result.alreadyAbsent.push("todoist"); }
@@ -141,7 +181,8 @@ try {
       catch (error) { if (!gone(error)) throw error; result.alreadyAbsent.push("calendar"); }
     } else if (eventId) result.alreadyAbsent.push("calendar");
     const afterProviders = await providers();
-    if (afterProviders.task || afterProviders.event) throw new Error("Provider post-read is not absent: DynamoDB purge was not started");
+    if (afterProviders.task || afterProviders.event || afterProviders.linked || afterProviders.comments.length || afterProviders.legacy.length)
+      throw new Error("Provider post-read is not absent: DynamoDB purge was not started");
     // Re-inventory after provider writes. Providers can generate late deliveries.
     const afterScan = await scan();
     const afterPlan = planPurge(afterScan.rows, target);
@@ -169,16 +210,16 @@ try {
     for (let check=0;check<2;check++) {
       const [remaining, checkProviders] = await Promise.all([scan(),providers()]);
       const leftover = planPurge(remaining.rows,target);
-      if (leftover.records.length || checkProviders.task || checkProviders.event) {
+      if (leftover.records.length || checkProviders.task || checkProviders.event || checkProviders.linked || checkProviders.comments.length || checkProviders.legacy.length) {
         throw new Error("Postflight detected retained or late-arriving state; inspect and resume");
       }
       if (!check) await sleep(500);
     }
-    output({status:"succeeded",deletedProvider:result.deletedProvider,alreadyAbsent:result.alreadyAbsent,deletedState:result.deletedState,
+    output({status:"succeeded",deletedProvider:result.deletedProvider,alreadyAbsent:result.alreadyAbsent,deletedComments:result.deletedComments,deletedState:result.deletedState,
       retainedPerItemOperationRecord:false});
   } catch (error) {
     output({status:"partial_failure",deletedProvider:result.deletedProvider,alreadyAbsent:result.alreadyAbsent,
-      deletedState:result.deletedState, error:error instanceof Error?error.message:String(error),
+      deletedComments:result.deletedComments,deletedState:result.deletedState, error:error instanceof Error?error.message:String(error),
       nextAction:"Keep delivery ingress/workers paused. Rerun PREVIEW with the same exact IDs, inspect and confirm the NEW token to resume. Do not reconcile yet."});
     process.exitCode = 2;
   }
