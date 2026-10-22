@@ -41,3 +41,21 @@ test("weekly/yearly active recurrence occurrence history is never terminal by ag
     assert.equal(terminalCompletionDecision([previous, { ...verified, seriesId: "different" }], boundary + 365 * 86_400_000), "ambiguous");
   }
 });
+
+test("immutable series certificate makes prior finite recurring occurrences eligible only after last completion", () => {
+  const prior = oneOff({
+    recurrenceOwner: "calendar", seriesId: "finite", masterEventId: "master",
+  });
+  const certificate = {
+    profile: "home", seriesId: "finite", recurrenceOwner: "calendar",
+    masterEventId: "master", terminalCompletedAt: "2026-10-17T12:00:00Z",
+  };
+  assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-18T12:00:00Z"), certificate), "too_recent");
+  assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-24T12:00:00Z"), certificate), "eligible");
+  assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-24T12:00:00Z"), {
+    ...certificate, masterEventId: "wrong",
+  }), "ambiguous");
+  assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-24T12:00:00Z"), {
+    ...certificate, recurrenceOwner: "todoist",
+  }), "ambiguous");
+});
