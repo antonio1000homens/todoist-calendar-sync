@@ -1334,6 +1334,74 @@ export class StateRepository {
     }
   }
 
+  /**
+   * Mark a finite Calendar-owned series terminal ONLY while retiring its exact
+   * unchanged recurrence link. If a successor takes ownership, the transaction
+   * aborts and the occurrence stays historical but not cleanup-eligible.
+   */
+  async verifyTerminalCompletedCalendarProjection(
+    projection: CompletedCalendarProjection,
+    expectedLink: RecurrenceLink,
+  ): Promise<boolean> {
+    if (projection.recurrenceOwner !== "calendar" || !projection.seriesId
+      || expectedLink.owner !== "calendar" || expectedLink.profile !== projection.profile
+      || expectedLink.seriesId !== projection.seriesId || expectedLink.taskId !== projection.taskId
+      || expectedLink.eventId !== projection.eventId) return false;
+    const table = this.ensureTable();
+    const values = {
+      ":task": projection.taskId, ":profile": projection.profile, ":completed": projection.completedAt,
+      ":owner": "calendar", ":series": projection.seriesId, ":updated": expectedLink.updatedAt,
+      ":yes": true,
+    };
+    const sameHistory = "#profile = :profile AND taskId = :task AND completedAt = :completed";
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: {
+        TableName: table, Key: key(`RECURRENCE#${projection.profile}#${projection.seriesId}`),
+        ConditionExpression: "taskId = :task AND #profile = :profile AND #owner = :owner AND seriesId = :series AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: values,
+      } },
+      { Update: {
+        TableName: table, Key: key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`),
+        UpdateExpression: "SET terminalVerified = :yes",
+        ConditionExpression: sameHistory,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: values,
+      } },
+      { Update: {
+        TableName: table, Key: key(`COMPLETED_TASK#${projection.profile}#${projection.taskId}`, `EVENT#${projection.eventId}`),
+        UpdateExpression: "SET terminalVerified = :yes",
+        ConditionExpression: sameHistory,
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: values,
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`TASKOWNER#${projection.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const candidateProfile of allProfiles) {
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`TASK#${candidateProfile}#${projection.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`EVENT#${candidateProfile}#${projection.eventId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
+      throw error;
+    }
+  }
+
   async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
     await client.send(new TransactWriteCommand({
       TransactItems: [
