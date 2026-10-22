@@ -28,6 +28,24 @@ export class ReviewStore {
       lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "dismissed" ? "CLOSED" : "OPEN"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
     catch (e) { if (!conditional(e)) throw e; }
   }
+  async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
+    const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
+    const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
+    if (await this.getCase(id)) return;
+    const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
+    const action = typeof audit.action === "string" ? audit.action : "active conflict";
+    const createdAt = typeof audit.createdAt === "string" ? audit.createdAt : new Date().toISOString();
+    const item: ReviewCase = {
+      id, profile, title: action.replaceAll("_", " "), reason: action,
+      status: "open", taskId: typeof detail.taskId === "string" ? detail.taskId : undefined,
+      eventId: typeof detail.eventId === "string" ? detail.eventId : undefined,
+      createdAt, updatedAt: new Date().toISOString(),
+    };
+    try {
+      await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`), sourceAuditKey: auditKey,
+        lookupPk: `PROFILE#${profile}`, lookupSk: `REVIEW#OPEN#${createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" }));
+    } catch (error) { if (!conditional(error)) throw error; }
+  }
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
   async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {
     const result = await client.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",

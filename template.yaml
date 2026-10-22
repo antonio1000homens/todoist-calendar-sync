@@ -59,6 +59,11 @@ Parameters:
     Type: String
     Default: ""
     AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  ReviewRepairsEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable preview and repair submissions after read-only rollout validation.
   StateTableReadCapacity:
     Type: Number
     Default: 25
@@ -128,6 +133,7 @@ Globals:
         CF_ACCESS_TEAM_DOMAIN: !Ref CloudflareAccessTeamDomain
         CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
         REVIEW_OPERATOR_EMAIL: !Ref ReviewOperatorEmail
+        REVIEW_REPAIRS_ENABLED: !Ref ReviewRepairsEnabled
 
 Resources:
   SyncState:

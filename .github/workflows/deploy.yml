@@ -34,6 +34,7 @@ jobs:
       CF_ACCESS_TEAM_DOMAIN: ${{ vars.CF_ACCESS_TEAM_DOMAIN }}
       CF_ACCESS_AUDIENCE: ${{ vars.CF_ACCESS_AUDIENCE }}
       REVIEW_OPERATOR_EMAIL: ${{ vars.REVIEW_OPERATOR_EMAIL }}
+      REVIEW_REPAIRS_ENABLED: ${{ vars.REVIEW_REPAIRS_ENABLED }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.TODOIST_CALENDAR_SYNC_CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Validate non-secret deployment configuration

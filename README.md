@@ -94,6 +94,8 @@ The Slack bot token is shared infrastructure and currently remains at:
 
 Normal deployments pass **parameter names**, not plaintext secret values. Secret rotation is a separate operator action.
 
+The review inbox is deployed read-only first. Set `REVIEW_REPAIRS_ENABLED=true` in the protected production deployment environment only after the read-only inbox and owner-only Access application have been validated. To seed existing active conflicts and retained manual decisions into the indexed inbox, set `STATE_TABLE_NAME` and `AWS_REGION`, inspect the preview, then run `npm run seed:review-inbox -- --apply`. The seeder is idempotent and leaves audit and decision history intact.
+
 Calendar watch subscriptions use `https://calendar-sync.alf-broadcast.co.uk/calendar` by default. The deploy script passes this through the `CalendarWatchCallbackUrl` parameter (or `CALENDAR_WATCH_CALLBACK_URL` override), and the Cloudflare relay must forward it to the Lambda ingress using the matching proxy shared secret.
 
 ## Development

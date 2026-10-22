@@ -65,7 +65,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       const profiles = selected ? [profile(selected)] : REVIEW_PROFILES;
       const history = event.queryStringParameters?.history === "true";
       const results = await Promise.all(profiles.map(async item => ({ profile:item, ...(await store.listCases(item,undefined,history)) })));
-      return response(200,{items:results.flatMap(result=>result.items),actor:actor.email});
+      return response(200,{items:results.flatMap(result=>result.items),actor:actor.email,repairsEnabled:process.env.REVIEW_REPAIRS_ENABLED === "true"});
     }
     if (method === "GET" && segments[0] === "cases" && segments.length === 2) {
       const item = await store.getCase(segments[1]);
@@ -93,11 +93,13 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       return response(200,{reconciliation:await new StateRepository().getReconciliationState(selected)});
     }
     if (method === "POST" && segments.join("/") === "previews") {
+      if (process.env.REVIEW_REPAIRS_ENABLED !== "true") return response(403,{error:"repairs_not_enabled_during_read_only_rollout"});
       const input=body(event), intent=input.intent as RepairIntent;
       if (!intent || typeof intent!=="object") throw Object.assign(new Error("intent is required"),{status:400});
       return response(200,{preview:await new ReviewEngine(store).preview(actor,intent)});
     }
     if (method === "POST" && segments.join("/") === "repairs") {
+      if (process.env.REVIEW_REPAIRS_ENABLED !== "true") return response(403,{error:"repairs_not_enabled_during_read_only_rollout"});
       const input=body(event),previewId=requiredText(input.previewId,"previewId"),idempotencyKey=requiredText(input.idempotencyKey,"idempotencyKey");
       const preview=await store.getPreview(previewId);
       if (!preview) return response(404,{error:"preview_not_found"});

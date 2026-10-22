@@ -19,6 +19,7 @@ sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
 cf_access_team_domain="${CF_ACCESS_TEAM_DOMAIN:-}"
 cf_access_audience="${CF_ACCESS_AUDIENCE:-}"
 review_operator_email="${REVIEW_OPERATOR_EMAIL:-}"
+review_repairs_enabled="${REVIEW_REPAIRS_ENABLED:-false}"
 # SAM's key=value parameter parser consumes JSON quotes unless they are escaped.
 # Keep the value JSON for validation, but escape quotes only at the CLI boundary.
 sam_profile_config_json="${sync_profile_config_json//\"/\\\"}"
@@ -146,4 +147,5 @@ sam deploy \
     "CloudflareAccessTeamDomain=$cf_access_team_domain" \
     "CloudflareAccessAudience=$cf_access_audience" \
     "ReviewOperatorEmail=$review_operator_email" \
+    "ReviewRepairsEnabled=$review_repairs_enabled" \
     ${BILLING_ALARM_EMAIL:+"BillingAlarmEmail=$BILLING_ALARM_EMAIL"}
