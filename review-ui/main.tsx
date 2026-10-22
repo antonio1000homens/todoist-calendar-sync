@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createReviewApiClient, isAbortError } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 
@@ -7,12 +8,7 @@ type ProviderObject = { id:string; content?:string; summary?:string; description
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all","home","antonio","work"];
-const api = async (path:string, init?:RequestInit) => {
-  const response = await fetch("/review/api/" + path, { ...init, headers:{ "content-type":"application/json", ...(init?.headers || {}) } });
-  const data = await response.json();
-  if (!response.ok) { const error:any=new Error(data.message||data.error||`Request failed (${response.status})`);error.data=data;throw error; }
-  return data;
-};
+const api = createReviewApiClient();
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
@@ -25,6 +21,17 @@ function App() {
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
   const selectionVersion = useRef(0);
+  const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
+  const [detailRetry,setDetailRetry] = useState(0);
+  const detailKey=selected ? `${selected.profile}:${selected.id}` : "";
+  const currentDetailState=detailState?.key===detailKey ? detailState : undefined;
+  const retryDetails=()=>{
+    if (!selected) return;
+    setDetails(undefined);
+    setRepairSelection(emptyRepairSelection(selected));
+    setDetailState({key:detailKey,status:"loading"});
+    setDetailRetry(value=>value+1);
+  };
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
@@ -44,6 +51,7 @@ function App() {
   const selectCase=(item?:Case)=>{
     invalidatePreview();
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
+    setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
   };
@@ -57,30 +65,40 @@ function App() {
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
-    api(`cases/${encodeURIComponent(caseId)}`).then(data=>{ setProfile(data.item.profile); selectCase(data.item); })
-      .catch(e=>setMessage(e.message));
+    const controller=new AbortController();
+    api(`cases/${encodeURIComponent(caseId)}`,{signal:controller.signal})
+      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item);}})
+      .catch(e=>{if(!isAbortError(e))setMessage(e.message);});
+    return ()=>controller.abort();
   },[]);
   useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
   useEffect(() => {
     if (!selected) { setDetails(undefined); setPreview(undefined); setOperation(undefined); return; }
+    const controller=new AbortController();
+    const key=`${selected.profile}:${selected.id}`;
     setMessage(""); setPreview(undefined); setOperation(undefined); setSubmitKey("");
     setDetails(undefined);setRepairSelection(emptyRepairSelection(selected));
     setLeftovers({}); setReconcileProfile(selected.profile);
-    let cancelled=false;
-    api(`cases/${encodeURIComponent(selected.id)}`).then(async data=>{
-      if(cancelled)return;
+    setDetailState({key,status:"loading"});
+    api(`cases/${encodeURIComponent(selected.id)}`,{signal:controller.signal},{
+      onRetry:()=>{if(!controller.signal.aborted)setDetailState({key,status:"retrying"});},
+    }).then(async data=>{
+      if(controller.signal.aborted)return;
       if(data.item?.id!==selected.id||data.item?.profile!==selected.profile)throw new Error("Selected conflict changed during refresh");
       // Apply both the visible live data and its verified form IDs as one update.
       setDetails(data);
+      setDetailState({key,status:"ready"});
       setRepairSelection(current=>reconcileRepairSelection(data.item,data.snapshots,current));
       const operationId=data.item?.operationId||selected.operationId;
       if(operationId){
-        try { const result=await api(`operations/${encodeURIComponent(operationId)}`); if(!cancelled)setOperation(result.operation); }
-        catch(e:any){if(!cancelled)setMessage(e.message);}
+        try { const result=await api(`operations/${encodeURIComponent(operationId)}`,{signal:controller.signal}); if(!controller.signal.aborted)setOperation(result.operation); }
+        catch(e:any){if(!controller.signal.aborted&&!isAbortError(e))setMessage(e.message);}
       }
-    }).catch(e=>{if(!cancelled)setMessage(e.message);});
-    return ()=>{cancelled=true;};
-  },[selected]);
+    }).catch(e=>{
+      if(!controller.signal.aborted&&!isAbortError(e))setDetailState({key,status:"error",message:e.message});
+    });
+    return ()=>controller.abort();
+  },[selected,detailRetry]);
   useEffect(() => {
     refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
   },[reconcileProfile]);
@@ -234,7 +252,10 @@ function App() {
           {selected.decision.context?.providerEventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.providerEventId}</dd></>}
         </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
         {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
-        <div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>
+        {!details?<div className="notice detail-load" role="status">
+          {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
+            <p>{currentDetailState?.status==="retrying"?"Review API is busy (HTTP 429). Retrying case details…":"Loading live Todoist and Calendar details…"}</p>}
+        </div>:<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>}
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
@@ -263,7 +284,7 @@ function App() {
           </div>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><strong>{item.title||item.id}</strong> <small>{item.start?.dateTime||item.start?.date||item.due?.date||item.due?.datetime||""}</small> <button className="secondary" onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
-          <button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh affected items</button>
+          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Choose what happens to each live item left outside the selected repair.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;return <div className="leftover" key={key}><span><strong>{item.ref.profile} · {item.ref.side}</strong> — {itemTitle(item)}</span><label>Disposition<select value={leftovers[key]||""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option><option value="create">Create a new counterpart</option><option value="exclude">Exclude from syncing</option></select></label></div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
