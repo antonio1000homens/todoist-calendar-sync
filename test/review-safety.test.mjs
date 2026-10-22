@@ -176,7 +176,7 @@ test("yearly repair preview names the master, occurrence, stale deleted task and
   });
   engine.collect=async()=>snapshots;
   const input={caseId:"case",profile:"home",action:"link",taskId:yearly.id,eventId:master.id,
-    winner:"none",owner:"calendar",scope:"series",leftovers:{"home:calendar:standalone-2026":"exclude"}};
+    winner:"calendar",owner:"calendar",scope:"series",leftovers:{"home:calendar:standalone-2026":"exclude"}};
   const preview=await engine.preview({subject:"owner",email:"owner@example.test"},input);
   assert.equal(preview.itemPlan.length,5);
   const plan=id=>preview.itemPlan.find(row=>row.ref.id===id);
