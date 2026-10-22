@@ -454,7 +454,10 @@ test("a post-validation failure with no repair writes releases ownership and per
   assert.deepEqual(h.writes,[]);
   assert.ok([...h.controlsMap.values()].every(control=>!control.activeRepair));
   assert.equal(h.calls.filter(c=>c[0]==="release-unapplied").length,1);
-  await assert.rejects(h.engine.execute("repair"),/fresh preview/);
+  const redelivered=await h.engine.execute("repair");
+  assert.equal(redelivered.abandoned,true);
+  assert.equal(redelivered.status,"failed");
+  assert.equal(h.calls.filter(c=>c[0]==="release-unapplied").length,1);
   const next=await h.engine.preview(actor,intent());
   assert.ok(next.id);
 });
