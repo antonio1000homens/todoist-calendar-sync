@@ -1085,7 +1085,7 @@ export class Synchronizer {
         // Require a finite RRULE on the fresh Calendar master and atomically
         // retire exactly the old progress link while certifying this completion.
         let master: CalendarEvent | undefined;
-        try { master = await calendar.getEvent(mapping.masterEventId); }
+        try { master = await calendar.getEvent?.(mapping.masterEventId); }
         catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
         const finite = master?.status !== "cancelled" && master?.recurrence?.some(
           (rule) => /^RRULE:(?:[^;]*;)*(?:COUNT|UNTIL)=/i.test(rule),
