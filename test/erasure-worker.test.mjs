@@ -22,7 +22,7 @@ test("worker starts only a stored queued operation and self-dispatches its ident
   process.env.ERASURE_OPERATION_QUEUE_URL = "https://sqs.example/erasure";
   process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME = "sync-worker";
   const sent = [], starts = [];
-  const operation = { operationId: "op_1", status: "queued" };
+  const operation = { operationId: "op_1", status: "queued", providerDeletionReady: true };
   t.mock.method(ErasureOperationStore.prototype, "get", async id => id === "op_1" ? operation : undefined);
   t.mock.method(ErasureOperationStore.prototype, "transition", async () => {});
   t.mock.method(ErasureOperationStore.prototype, "startFencedLifecycle", async (...args) => starts.push(args));
@@ -40,6 +40,25 @@ test("worker starts only a stored queued operation and self-dispatches its ident
     if (old.table === undefined) delete process.env.STATE_TABLE_NAME; else process.env.STATE_TABLE_NAME = old.table;
     if (old.queue === undefined) delete process.env.ERASURE_OPERATION_QUEUE_URL; else process.env.ERASURE_OPERATION_QUEUE_URL = old.queue;
     if (old.target === undefined) delete process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME; else process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME = old.target;
+  }
+});
+
+test("preview-only operations cannot enter the queue or install a fence", async t => {
+  const old={table:process.env.STATE_TABLE_NAME,queue:process.env.ERASURE_OPERATION_QUEUE_URL,
+    target:process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME};
+  process.env.STATE_TABLE_NAME="test-state";process.env.ERASURE_OPERATION_QUEUE_URL="https://sqs.example/erasure";
+  process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME="sync-worker";
+  const starts=[],sent=[];
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({operationId:"preview-only",status:"previewed",providerDeletionReady:false}));
+  t.mock.method(ErasureOperationStore.prototype,"startFencedLifecycle",async(...args)=>starts.push(args));
+  t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
+  try {
+    const result=await handler({Records:[record('{"version":1,"operationId":"preview-only"}')],awsRequestId:"req"});
+    assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:"message-1"}]});
+    assert.deepEqual(starts,[]);assert.deepEqual(sent,[]);
+  } finally {
+    for(const [key,value] of Object.entries({STATE_TABLE_NAME:old.table,ERASURE_OPERATION_QUEUE_URL:old.queue,
+      ERASURE_TARGET_WORKER_FUNCTION_NAME:old.target})) if(value===undefined)delete process.env[key];else process.env[key]=value;
   }
 });
 

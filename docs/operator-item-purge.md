@@ -101,6 +101,33 @@ using the same selected IDs; the operation ID remains stable and the new token
 reflects the remaining records and provider state. Resume with that token and
 `--operation-id`. Do not clear the journal or fence by hand.
 
+## Review API preview and durable operation
+
+The authenticated review API prepares exact-item previews at
+`POST /review/api/erasure-previews`, then persists them at
+`POST /review/api/erasure-operations` using only the returned operation ID and
+single-use confirmation. Preview performs a complete, paced, strongly
+consistent table scan and exact provider reads; an incomplete scan, changed
+provider snapshot, active fence/lease, existing journal, recurrence, or
+ambiguous/shared row prevents confirmation or creation. The confirmation is
+bound to the canonical inventory and a digest of the provider snapshot, and
+creation repeats the reads before atomically storing the immutable operation
+and consuming the confirmation.
+
+This release deliberately keeps these operations in `previewed` with
+`providerDeletionReady: false`. The `/start` route and SQS worker reject them
+before queueing or installing a fence because provider deletion and postflight
+are not implemented. Do not change this field or enqueue these operation IDs.
+The durable record is prepared for a later, separately reviewed executor
+release; it is not an instruction to begin a purge.
+
+The API scan stops after its bounded 80-second preview window and returns no
+confirmation if it cannot finish. It uses the configured DynamoDB scan page
+limit and RCU pacing; retry the preview or use the guarded operator CLI when
+the state table cannot be inventoried in that window. A DynamoDB consistent
+scan is consistent per item, not a table-wide snapshot, so operation creation
+and the eventual action-time worker gate must both compare the exact inventory.
+
 ## Async worker gate drift
 
 The async review endpoint can report `status: "review_required"` with

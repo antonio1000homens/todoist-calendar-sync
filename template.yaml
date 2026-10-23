@@ -316,6 +316,7 @@ Resources:
       FunctionName: !Sub ${ResourceNamePrefix}-review-api-${Stage}
       Handler: review-api.handler
       ReservedConcurrentExecutions: 2
+      Timeout: 90
       CodeUri: .
       Environment:
         Variables:

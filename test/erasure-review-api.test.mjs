@@ -22,7 +22,7 @@ test("authenticated review API starts only stored confirmed operations and retur
   Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test",
     ERASURE_OPERATION_QUEUE_URL:"https://sqs.example/erasure"});
   const sent=[],transitions=[];
-  const operation={operationId:"op-113",status:"previewed",previewFingerprint:"secret-digest",confirmationId:"secret-confirmation",
+  const operation={operationId:"op-113",status:"previewed",providerDeletionReady:true,previewFingerprint:"secret-digest",confirmationId:"secret-confirmation",
     inventory:[{type:"TASK",key:{pk:"secret-key",sk:"META"},digest:"secret-row"}],createdAt:"2026-10-23T10:00:00.000Z",updatedAt:"2026-10-23T10:00:00.000Z"};
   t.mock.method(ErasureOperationStore.prototype,"get",async id=>id===operation.operationId?operation:undefined);
   t.mock.method(ErasureOperationStore.prototype,"transition",async(...args)=>{transitions.push(args);operation.status="queued";});

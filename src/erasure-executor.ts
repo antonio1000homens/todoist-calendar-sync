@@ -26,8 +26,11 @@ export interface ErasureOperation {
   profile: Profile;
   target: { taskId: string; eventId?: string; deleteCalendar: boolean };
   previewFingerprint: string;
+  providerSnapshotFingerprint: string;
   confirmationFingerprint: string;
   confirmationId: string;
+  /** Set only by a future trusted executor release that wires provider deletion and readback. */
+  providerDeletionReady?: boolean;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
   inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string }>;
   status: ErasureOperationStatus;
@@ -82,7 +85,7 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
 function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
-type ErasurePreview = Pick<ErasureOperation, "operationId" | "profile" | "target" | "selectedActions" | "inventory">;
+type ErasurePreview = Pick<ErasureOperation, "operationId" | "profile" | "target" | "selectedActions" | "inventory" | "providerSnapshotFingerprint">;
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") {
@@ -92,7 +95,8 @@ function canonical(value: unknown): string {
   return JSON.stringify(value);
 }
 export function erasurePreviewFingerprint(preview: Omit<ErasurePreview, "operationId">): string {
-  const content={version:1,profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,inventory:preview.inventory};
+  const content={version:1,profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,
+    providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory};
   return createHash("sha256").update(canonical(content)).digest("hex");
 }
 function stateTable(): string {
@@ -146,24 +150,44 @@ export class ErasureOperationStore {
   async issueConfirmation(preview: ErasurePreview, lifetimeMs = 5 * 60_000): Promise<{
     confirmationId: string; previewFingerprint: string; expiresAt: number;
   }> {
-    if (!preview.operationId || preview.selectedActions.deleteTodoist !== true
+    if (!preview.operationId || !/^[a-f0-9]{64}$/.test(preview.providerSnapshotFingerprint)
+      || preview.selectedActions.deleteTodoist !== true
       || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
       || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
     const now=Date.now();
+    if(Buffer.byteLength(JSON.stringify({profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,inventory:preview.inventory}))>300_000)
+      throw new Error("Exact inventory is too large for one durable operation; manual review is required");
     const confirmationId=this.newConfirmationId();
     const previewFingerprint=erasurePreviewFingerprint(preview);
     const expiresAt=now+lifetimeMs;
     await this.db.send(new TransactWriteCommand({TransactItems:[{Put:{TableName:stateTable(),Item:{
       ...confirmationKey(preview.operationId),operationId:preview.operationId,confirmationId,previewFingerprint,
+      preview:{profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,
+        providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory},
       status:"issued",expiresAt,createdAt:new Date(now).toISOString(),
     },ConditionExpression:"attribute_not_exists(pk)"}}]}));
     return {confirmationId,previewFingerprint,expiresAt};
+  }
+
+  async getIssuedPreview(operationId: string, confirmationId: string): Promise<{
+    profile: Profile; target: ErasureOperation["target"]; selectedActions: ErasureOperation["selectedActions"];
+    providerSnapshotFingerprint: string; inventory: ErasureOperation["inventory"]; previewFingerprint: string;
+  } | undefined> {
+    const result=await this.db.send(new GetCommand({TableName:stateTable(),Key:confirmationKey(operationId),ConsistentRead:true}));
+    const item=result.Item;
+    if(!item || item.status!=="issued" || item.operationId!==operationId || item.confirmationId!==confirmationId
+      || typeof item.expiresAt!=="number" || item.expiresAt<=Date.now() || !item.preview) return undefined;
+    const preview=item.preview as {profile:Profile;target:ErasureOperation["target"];
+      selectedActions:ErasureOperation["selectedActions"];providerSnapshotFingerprint:string;inventory:ErasureOperation["inventory"]};
+    return {...preview,previewFingerprint:item.previewFingerprint as string};
   }
 
   async create(operation: ErasureOperation): Promise<void> {
     const now=Date.now();
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
       || operation.lifecycle!==undefined
+      || operation.providerDeletionReady!==false
+      || !/^[a-f0-9]{64}$/.test(operation.providerSnapshotFingerprint)
       || operation.confirmationFingerprint !== operation.previewFingerprint
       || operation.selectedActions.deleteTodoist !== true
       || operation.selectedActions.deleteCalendar !== operation.target.deleteCalendar
@@ -204,7 +228,7 @@ export class ErasureOperationStore {
   async startFencedLifecycle(id: string, timeoutSeconds: number): Promise<void> {
     if(!Number.isInteger(timeoutSeconds) || timeoutSeconds<1) throw new Error("Invalid worker timeout");
     const current=await this.get(id);
-    if(!current || current.status!=="queued" || current.lifecycle
+    if(!current || current.status!=="queued" || current.providerDeletionReady!==true || current.lifecycle
       || !current.confirmationId || current.confirmationFingerprint!==current.previewFingerprint
       || current.previewFingerprint!==erasurePreviewFingerprint(current))
       throw new Error("Erasure operation is not ready to begin fencing");

@@ -82,6 +82,8 @@ export async function processErasureOperation(operationId: string): Promise<{
 }> {
   let operation=await store.get(operationId);
   if(!operation) throw new Error("Erasure operation was not found");
+  if(operation.status==="previewed" && operation.providerDeletionReady!==true)
+    throw new Error("Provider deletion workflow is not enabled for this preview; no worker or fence action was started");
   if(operation.status==="succeeded"||operation.status==="review_required")
     return {status:operation.status,phase:operation.lifecycle?.phase,scheduled:false};
   if(operation.status==="previewed") {
