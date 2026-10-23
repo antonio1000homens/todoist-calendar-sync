@@ -4,6 +4,7 @@ import { reconciliationRunStatus, StateRepository } from "./repository.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import { ReviewStore } from "./review-store.js";
+import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
 import type { Profile } from "./types.js";
 
 const profileList: Profile[] = ["home", "antonio", "work"];
@@ -14,13 +15,19 @@ function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-health", event, ...detail }));
 }
 
-/** Read-only provider health watchdog. It never enqueues reconciliation work. */
+/** Health watchdog; serialize its state and Slack writes against profile erasure fences. */
 export async function checkReconciliationHealth(
   state: StateRepository, manual: ManualInterventionService, profiles: Profile[] = profileList,
   lookupBudget: { deadlineAtMs?: number; requestId?: string } = {},
+  acquireWriteLease: (profile:Profile)=>Promise<()=>Promise<void>> = acquireProfileAdmissionLease,
 ): Promise<void> {
   for (const profile of profiles) {
+    let releaseLease:(()=>Promise<void>)|undefined;
     try {
+      // Health inspection may persist outcomes, retire incidents, and mark
+      // alerts. Fence admission before the first read/write and hold it across
+      // all provider/Slack delivery and the final state checkpoint.
+      releaseLease=await acquireWriteLease(profile);
       const current = await state.getReconciliationState(profile);
       // Notifications belong to generations, so a new run cannot hide an
       // undelivered outcome from an earlier one.
@@ -119,6 +126,10 @@ export async function checkReconciliationHealth(
         service: "todoist-calendar-sync-health", event: "profile_health_check_failed", profile,
         error: error instanceof Error ? error.message : String(error),
       }));
+    } finally {
+      try { await releaseLease?.(); }
+      catch(error) { console.error(JSON.stringify({service:"todoist-calendar-sync-health",event:"profile_admission_release_failed",profile,
+        error:error instanceof Error?error.message:String(error)})); }
     }
   }
 }

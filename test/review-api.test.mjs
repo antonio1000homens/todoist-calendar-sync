@@ -6,6 +6,7 @@ import { handler, reconciliationAlertRelation } from "../dist/review-api.js";
 import { ReviewStore } from "../dist/review-store.js";
 import { ReviewEngine } from "../dist/review-engine.js";
 import { StateRepository } from "../dist/repository.js";
+import { ErasureOperationStore } from "../dist/erasure-executor.js";
 
 const issuer = "https://alf1000.cloudflareaccess.com";
 const audience = "review-audience-test";
@@ -21,11 +22,11 @@ function event(path, method = "GET", headers = {}, body) {
     requestContext:{http:{method}},
   };
 }
-async function token(privateKey, email = "review-owner@example.test", {aud = audience, expired = false} = {}) {
+async function token(privateKey, email = "review-owner@example.test", {aud = audience, expired = false, kid = "review-test-key", tokenIssuer = issuer} = {}) {
   const now=Math.floor(Date.now()/1000);
   return new SignJWT({email})
-    .setProtectedHeader({alg:"RS256",kid:"review-test-key"})
-    .setIssuer(issuer).setAudience(aud).setSubject("access-user-123")
+    .setProtectedHeader({alg:"RS256",kid})
+    .setIssuer(tokenIssuer).setAudience(aud).setSubject("access-user-123")
     .setIssuedAt(expired?now-120:now).setExpirationTime(expired?now-60:now+300).sign(privateKey);
 }
 async function jsonResponse(result) { return {status:result.statusCode, body:JSON.parse(result.body)}; }
@@ -39,6 +40,93 @@ test("reconciliation alert hydration distinguishes superseded, progressed, compl
     lastCompletedAt:"2026-10-23T10:06:00.000Z" }), "completed_since_alert");
   assert.equal(reconciliationAlertRelation("generation-1", alertTime, { ...current, lastProgressAt:"2026-10-23T09:59:00.000Z" }), "same_generation");
   assert.equal(reconciliationAlertRelation("generation-1", alertTime), "unavailable");
+});
+
+test("all review, reconciliation, and erasure writers hold the profile admission lease through state/queue handoff",async (t)=>{
+  const leaseIssuer="https://lease.alf1000cloudflare.com";
+  const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
+    operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION};
+  const {privateKey,publicKey}=await generateKeyPair("RS256"),jwk=await exportJWK(publicKey);
+  Object.assign(jwk,{kid:"review-lease-test-key",alg:"RS256",use:"sig"});
+  globalThis.fetch=async input=>String(input).startsWith(`${leaseIssuer}/cdn-cgi/access/certs`)
+    ?new Response(JSON.stringify({keys:[jwk]}),{status:200}):new Response("unexpected fetch",{status:500});
+  Object.assign(process.env,{CF_ACCESS_ISSUER:leaseIssuer,CF_ACCESS_AUDIENCE:audience,
+    REVIEW_OPERATOR_EMAILS:"review-owner@example.test",ERASURE_PROTOCOL_VERSION:"1"});
+  t.after(()=>{globalThis.fetch=old.fetch;
+    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,
+      REVIEW_OPERATOR_EMAILS:old.operators,ERASURE_PROTOCOL_VERSION:old.protocol}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  });
+  const headers={"cf-access-jwt-assertion":await token(privateKey,"review-owner@example.test",{kid:"review-lease-test-key",tokenIssuer:leaseIssuer}),origin:"https://calendar-sync.alf-broadcast.co.uk"};
+  const active=new Set(),observed=[];
+  let fenceAttempts=0,fenceInstalled=false;
+  const tryFence=()=>{if(active.size)return false;fenceInstalled=true;return true;};
+  const recordWrite=label=>{fenceAttempts++;assert.equal(tryFence(),false,`${label}: a competing fence must wait for the lease`);observed.push(label);};
+  const fenceAfterRelease=()=>{assert.equal(tryFence(),true,"the fence may proceed after the writer releases its lease");fenceInstalled=false;};
+  const caseItem={id:"case-lease",profile:"home",status:"open",createdAt:"2026-10-23T00:00:00.000Z",updatedAt:"2026-10-23T00:00:00.000Z"};
+  const preview={id:"preview-lease",actor:{subject:"access-user-123",email:"review-owner@example.test"},
+    intent:{caseId:"case-lease",profile:"home",action:"exclude"},expiresAt:Math.floor(Date.now()/1000)+600};
+  const operation={id:"operation-lease",preview,actor:preview.actor,status:"queued",attempt:0,steps:{}};
+  const store={getCase:async()=>caseItem,dismissCase:async()=>{recordWrite("dismiss");return {...caseItem,status:"dismissed"};},
+    getPreview:async()=>preview,submit:async()=>{recordWrite("submit");return operation;},
+    getOperation:async()=>operation,saveOperation:async()=>{recordWrite("resume-save");},
+    countActionableCases:async()=>0};
+  const exact={operationId:"erase-lease",profile:"home",target:{taskId:"task-lease",deleteCalendar:false},
+    selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
+    inventory:[],actionPlan:{todoistTask:{id:"task-lease",digest:"b".repeat(64)},comments:[]},
+    previewFingerprint:"c".repeat(64),blockers:[]};
+  let issuedReads=0;
+  const erasureStore={issueConfirmation:async()=>{recordWrite("confirmation");return {confirmationId:"confirm",expiresAt:Date.now()+1000};},
+    getIssuedPreview:async()=>{issuedReads++;return {profile:"home",target:exact.target,selectedActions:exact.selectedActions,
+      providerSnapshotFingerprint:exact.providerSnapshotFingerprint,inventory:exact.inventory,actionPlan:exact.actionPlan,previewFingerprint:exact.previewFingerprint};},
+    create:async op=>{assert.ok(active.has("home"));assert.equal(op.providerDeletionReady,false);recordWrite("operation-create");}};
+  const deps={acquireWriteLease:async(profile,owner)=>{assert.ok(owner);assert.equal(fenceInstalled,false,"writers cannot enter after the fence wins");active.add(profile);return async()=>active.delete(profile);},
+    createReviewStore:()=>store,createReviewEngine:()=>({preview:async()=>{assert.ok(active.size);recordWrite("case-preview");return {id:"preview",intent:{profile:"home"}};}}),
+    createErasureOperationStore:()=>erasureStore,buildErasurePreview:async(_request,options)=>{assert.ok(active.has("home"));
+      assert.ok(options.allowLeaseOwner);recordWrite("erasure-preview-recheck");return exact;},
+    enqueueRepair:async()=>{assert.ok(active.size);recordWrite("queue-handoff");},
+    clearDeadLetterMessagesForProfile:async profile=>{assert.ok(active.has(profile));recordWrite("dlq-clear");return {cleared:0};},
+    createStateRepository:()=>({getReconciliationState:async()=>{assert.ok(active.has("home"));return {};}}),
+    requestReconciliation:async(_state,profile)=>{assert.ok(active.has(profile));recordWrite("reconciliation-write");return {enqueueError:false};}};
+
+  const casePreview=await jsonResponse(await handler(event("/review/api/cases/case-lease/previews","POST",headers,
+    {action:"exclude",winner:"none",scope:"occurrence",leftovers:{}}),deps));
+  assert.equal(casePreview.status,200);assert.equal(active.size,0);fenceAfterRelease();
+  const dismissed=await jsonResponse(await handler(event("/review/api/cases/case-lease/dismiss","POST",headers,{}),deps));
+  assert.equal(dismissed.status,200);assert.equal(active.size,0);fenceAfterRelease();
+  let caseLookups=0,dismissWrites=0;
+  store.getCase=async()=>++caseLookups===1?caseItem:{...caseItem,profile:"work"};
+  store.dismissCase=async()=>{dismissWrites++;return {...caseItem,status:"dismissed"};};
+  const changedProfile=await jsonResponse(await handler(event("/review/api/cases/case-lease/dismiss","POST",headers,{}),deps));
+  assert.equal(changedProfile.status,409);
+  assert.equal(dismissWrites,0,"A case whose profile changes after admission lookup must not be mutated");
+  assert.equal(active.size,0);
+  fenceAfterRelease();
+  caseLookups=0;
+  store.getCase=async()=>++caseLookups===1?undefined:caseItem;
+  const appearedAfterLookup=await jsonResponse(await handler(event("/review/api/cases/case-lease/dismiss","POST",headers,{}),deps));
+  assert.equal(appearedAfterLookup.status,409);
+  assert.equal(dismissWrites,0,"A record appearing after a missing admission lookup must not be mutated");
+  assert.equal(active.size,0);
+  fenceAfterRelease();
+  store.getCase=async()=>caseItem;
+  const submitted=await jsonResponse(await handler(event("/review/api/previews/preview-lease/submit","POST",{
+    ...headers,"idempotency-key":"lease-test-request"},{}),deps));
+  assert.equal(submitted.status,202);assert.equal(active.size,0);fenceAfterRelease();
+  const resumed=await jsonResponse(await handler(event("/review/api/operations/operation-lease/resume","POST",headers,{}),deps));
+  assert.equal(resumed.status,202);assert.equal(active.size,0);fenceAfterRelease();
+  const reconcile=await jsonResponse(await handler(event("/review/api/reconciliation","POST",headers,{profile:"home"}),deps));
+  assert.equal(reconcile.status,202);assert.equal(active.size,0);fenceAfterRelease();
+  const erasurePreview=await jsonResponse(await handler(event("/review/api/erasure-previews","POST",headers,
+    {profile:"home",taskId:"task-lease",deleteCalendar:false}),deps));
+  assert.equal(erasurePreview.status,200);assert.equal(active.size,0);fenceAfterRelease();
+  const erasureCreated=await jsonResponse(await handler(event("/review/api/erasure-operations","POST",headers,
+    {operationId:"erase-lease",confirmationId:"confirm"}),deps));
+  assert.equal(erasureCreated.status,201);assert.equal(active.size,0);assert.equal(issuedReads,2);fenceAfterRelease();
+  for(const expected of ["case-preview","dismiss","submit","queue-handoff","resume-save","dlq-clear",
+    "reconciliation-write","confirmation","erasure-preview-recheck","operation-create"])
+    assert.ok(observed.includes(expected),`expected leased writer ${expected}`);
+  assert.equal(fenceAttempts,observed.length,"every exercised writer must block a competing fence until its lease is released");
 });
 
 test("review API requires a valid owner Access JWT and same-origin mutations", async (t) => {
@@ -219,4 +307,23 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   },{})));
   assert.equal(submitted.status,202);
   assert.equal(queueCalls.length,1);
+
+  // Readiness revocation must reject a persisted active lifecycle before the
+  // API transitions state or hands another message to the queue.
+  const operationReads=[];
+  const transitions=[];
+  t.mock.method(ErasureOperationStore.prototype,"get",async id=>{
+    operationReads.push(id);
+    return {operationId:id,profile:"home",status:"deleting",providerDeletionReady:false,
+      lifecycle:{phase:"deleting",nextRunAt:"2026-10-23T10:00:00.000Z"}};
+  });
+  t.mock.method(ErasureOperationStore.prototype,"transition",async(...args)=>{transitions.push(args);});
+  const queueCountBefore=queueCalls.length;
+  const rejectedResume=await jsonResponse(await handler(event("/review/api/erasure-operations/erasure-1/start","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+  },{})));
+  assert.equal(rejectedResume.status,409,JSON.stringify(rejectedResume.body));
+  assert.deepEqual(operationReads,["erasure-1","erasure-1"],"The API pre-reads identity for admission, then re-reads before the decision");
+  assert.deepEqual(transitions,[]);
+  assert.equal(queueCalls.length,queueCountBefore,"A false-ready active lifecycle must not be re-enqueued");
 });

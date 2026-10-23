@@ -298,8 +298,10 @@ export class GoogleCalendar {
     );
   }
 
-  async deleteEvent(eventId: string): Promise<void> {
-    await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, { method: "DELETE" });
+  async deleteEvent(eventId: string, etag?: string): Promise<void> {
+    await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, {
+      method: "DELETE", ...(etag ? { headers: { "If-Match": etag } } : {}),
+    });
   }
 
   /** Delete only the exact Calendar version approved by a repair preview. */

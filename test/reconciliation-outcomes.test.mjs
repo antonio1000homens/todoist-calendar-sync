@@ -6,6 +6,7 @@ const { StateRepository, reconciliationRunStatus } = await import('../dist/repos
 const { ManualInterventionService, SlackManualNotifier, MANUAL_DECISION_CATALOG } = await import('../dist/manual-intervention.js');
 const { checkReconciliationHealth } = await import('../dist/reconcile.js');
 const { deliverPendingReconciliationOutcome } = await import('../dist/reconciliation-outcomes.js');
+const { ReviewStore } = await import('../dist/review-store.js');
 const { reconciliationDatabase } = await import('./support/reconciliation-state.mjs');
 
 const old = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -92,6 +93,32 @@ test('health retries a failed alert post and only deduplicates confirmed deliver
   assert.equal(store.decisions.size, 1);
   await checkReconciliationHealth(state, service, ['home']);
   assert.equal(calls.length, 2);
+});
+
+test('scheduled health holds admission across alert, manual-decision, and state writes', async (t) => {
+  const current=run({status:'failed',lastFailedAt:old,lastError:'HTTP 503'});
+  let held=false, fenceBlocked=0;
+  const state={
+    async getReconciliationState(){assert.equal(held,true,'admission lease must precede health reads');return current;},
+    async listPendingReconciliationOutcomes(){assert.equal(held,true);return [];},
+    async markReconciliationHealthAlert(){assert.equal(held,true,'state alert write must stay leased');assert.equal(await tryFence(),false);current.lastHealthAlertAt=new Date().toISOString();},
+  };
+  const tryFence=async()=>{if(held){fenceBlocked++;return false;}return true;};
+  t.mock.method(ReviewStore.prototype,'pendingNotifications',async()=>{assert.equal(held,true);return [];});
+  const manual={enabled:true,
+    async retireStaleReconciliationIncidents(){assert.equal(held,true,'manual decision retirement must stay leased');assert.equal(await tryFence(),false);},
+    async alertReconciliationNeeded(){assert.equal(held,true,'manual alert write must stay leased');assert.equal(await tryFence(),false);return true;},
+  };
+  const acquired=[];
+  await checkReconciliationHealth(state,manual,['home'],{},async profile=>{
+    assert.equal(held,false);
+    held=true;acquired.push(profile);
+    return async()=>{assert.equal(held,true);held=false;};
+  });
+  assert.deepEqual(acquired,['home']);
+  assert.equal(held,false,'lease must release after all health writes');
+  assert.equal(fenceBlocked,3,'a concurrent fence attempt must lose at each scheduled health write');
+  assert.ok(current.lastHealthAlertAt,'health alert state checkpoint should happen under the lease');
 });
 
 test('stuck incidents persist structured generation diagnostics without exposing raw errors', async (t) => {

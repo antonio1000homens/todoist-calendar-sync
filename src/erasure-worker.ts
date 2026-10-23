@@ -5,6 +5,9 @@ import { documentClient } from "./dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
+import { defaultProviderClientFactory } from "./mutation-budget.js";
+import { buildErasurePreview } from "./erasure-preview.js";
+import { executeErasureDeletionStep, verifyErasurePostflight } from "./erasure-deletion.js";
 
 const lambda=new LambdaClient({});
 function targetWorkerFunction(): string {
@@ -59,9 +62,25 @@ const adapters: ErasureWorkerAdapters={
     }));
   },
   async finishFence(profile,operationId) { await finishErasureFence(profile as ErasureOperation["profile"],operationId); },
-  async verifyDeletion() { return unavailableDeletionBoundary(); },
-  async readFreshSnapshot() { return unavailableDeletionBoundary(); },
+  async verifyDeletion(operation) {
+    return verifyErasurePostflight(operation,{db:documentClient,clients:await defaultProviderClientFactory(operation.profile),
+      inspectFence:async profile=>{const value=await inspectErasureFence(profile as ErasureOperation["profile"]);return {fence:value.fence?{operationId:value.fence.operationId as string}:undefined,leases:value.leases};}});
+  },
+  async readFreshSnapshot(operation) {
+    const preview=await buildErasurePreview({profile:operation.profile,taskId:operation.target.taskId,
+      ...(operation.target.eventId?{eventId:operation.target.eventId}:{}),deleteCalendar:operation.selectedActions.deleteCalendar},
+      {db:documentClient,clients:await defaultProviderClientFactory(operation.profile),
+        inspectFence:async profile=>{const value=await inspectErasureFence(profile);return {fence:value.fence?{operationId:value.fence.operationId as string}:undefined,leases:value.leases};},
+        newOperationId:()=>operation.operationId,ignoreOperationId:operation.operationId,
+        allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId});
+    return preview;
+  },
   async readMappingStates(ids) { return this.mappingStates(ids); },
+  async executeDeletionStep(operation,progress) {
+    return executeErasureDeletionStep(operation,progress,{db:documentClient,
+      clients:await defaultProviderClientFactory(operation.profile),
+      inspectFence:async profile=>{const value=await inspectErasureFence(profile);return {fence:value.fence?{operationId:value.fence.operationId as string}:undefined,leases:value.leases};}});
+  },
 };
 const store=new ErasureOperationStore(documentClient,undefined,adapters);
 
@@ -81,11 +100,18 @@ export async function processErasureOperation(operationId: string): Promise<{
   status: string; phase?: string; nextRunAt?: number; scheduled: boolean;
 }> {
   let operation=await store.get(operationId);
-  if(!operation) throw new Error("Erasure operation was not found");
-  if(operation.status==="previewed" && operation.providerDeletionReady!==true)
-    throw new Error("Provider deletion workflow is not enabled for this preview; no worker or fence action was started");
+  // A successful operation erases its operation/confirmation records. Retried
+  // queue deliveries after that atomic cleanup are identity-free no-ops.
+  if(!operation) return {status:"succeeded",scheduled:false};
   if(operation.status==="succeeded"||operation.status==="review_required")
     return {status:operation.status,phase:operation.lifecycle?.phase,scheduled:false};
+  if(operation.providerDeletionReady!==true) {
+    if(operation.lifecycle&&["fencing","deleting","verifying"].includes(operation.status)) {
+      await store.markExecutionDisabledReviewRequired(operationId);
+      return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
+    }
+    throw new Error("Provider deletion workflow is not enabled for this preview; no worker or fence action was started");
+  }
   if(operation.status==="previewed") {
     await store.transition(operationId,"previewed","queued");
     operation=await store.get(operationId);
@@ -104,28 +130,31 @@ export async function processErasureOperation(operationId: string): Promise<{
     throw new Error("Active erasure operation has no fenced lifecycle");
   }
   if(operation.lifecycle.phase==="ready_for_delete") {
-    try { await store.assertReadyForDelete(operationId); }
+    try { await store.beginDeletion(operationId); }
     catch(error) {
       if(!(error instanceof ErasureGateDriftError)) throw error;
       await store.markReviewRequired(operationId);
       return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
     }
-    return {status:operation.status,phase:operation.lifecycle.phase,scheduled:false};
+    await enqueueErasureOperation(operationId);
+    return {status:"deleting",phase:"delete",scheduled:true};
   }
   if(operation.lifecycle.phase==="complete") return {status:operation.status,phase:operation.lifecycle.phase,scheduled:false};
 
   const result=await store.advanceFencedLifecycle(operationId);
   if(result.phase==="ready_for_delete") {
-    try { await store.assertReadyForDelete(operationId); }
+    try { await store.beginDeletion(operationId); }
     catch(error) {
       if(!(error instanceof ErasureGateDriftError)) throw error;
       await store.markReviewRequired(operationId);
       return {status:"review_required",phase:result.phase,scheduled:false};
     }
+    await enqueueErasureOperation(operationId);
+    return {status:"deleting",phase:"delete",scheduled:true};
   }
-  if(result.phase!=="ready_for_delete"&&result.phase!=="complete"&&result.status!=="succeeded")
+  if(result.phase!=="complete"&&result.status!=="succeeded"&&result.status!=="review_required")
     await enqueueErasureOperation(operationId,result.nextRunAt);
-  return {...result,scheduled:result.phase!=="ready_for_delete"&&result.phase!=="complete"&&result.status!=="succeeded"};
+  return {...result,scheduled:result.phase!=="complete"&&result.status!=="succeeded"&&result.status!=="review_required"};
 }
 
 export const handler:SQSHandler=async event=>{
