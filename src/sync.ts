@@ -672,7 +672,15 @@ export class Synchronizer {
     // still run; unbound deleted instances cannot resurrect Todoist tasks.
     if (!archived && event.recurringEventId && event.status !== "cancelled") {
       const { calendar } = await this.clients(delivery.profile);
-      const parent = await calendar.getEvent(event.recurringEventId);
+      let parent: CalendarEvent;
+      try { parent = await calendar.getEvent(event.recurringEventId); }
+      catch(error) {
+        if (!calendarEventGoneOnDirectRead(error)) throw error;
+        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:event.recurringEventId});
+      }
+      if (parent.status === "cancelled" || !parent.recurrence?.length) {
+        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:parent.id});
+      }
       archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
     }
     if (archived) {

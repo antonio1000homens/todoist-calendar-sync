@@ -1601,3 +1601,15 @@ test("flatten refuses provider edits after cap and retains its recovery barriers
   assert.equal(h.controlsMap.get("home:todoist:task").activeRepair,"repair");
   assert.equal(h.writes.filter(w=>w[0]==="create-event").length,0);
 });
+
+for (const firstOccurrence of [false,true]) test(`flatten remains stable across delayed Calendar instance and Todoist notifications (in-place: ${firstOccurrence})`,async t=>{
+  const f=flattenFixture();if(firstOccurrence){f.master.start={date:"2027-08-16"};f.master.end={date:"2027-08-17"};}
+  const h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  assert.equal((await h.execute(f.input)).status,"succeeded");
+  const mapped=clone(h.mappingMap.get("task")), before=h.writes.length;
+  h.clients.calendar.listDelta=async()=>({items:[f.occurrence]});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"delayed-calendar",kind:"calendar",profile:"home",mode:"aws",receivedAt:"2026-10-23T14:00:00Z",headers:{},body:""});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"delayed-task",kind:"todoist",profile:"home",mode:"aws",headers:{},body:JSON.stringify({event_name:"item:updated",event_data:f.recurring})});
+  assert.deepEqual(h.mappingMap.get("task"),mapped);
+  assert.equal(h.writes.length,before);
+});

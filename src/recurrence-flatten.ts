@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { calendarLocalDay, sameSafeYearlyRecurrenceRule } from "./recurrence-split.js";
-import { hasCanonicalState, toTodoistTask } from "./sync.js";
+import { hasCanonicalState } from "./sync.js";
 import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 
 export interface RecurrenceFlattenPlan {
   masterId: string; occurrenceId: string; taskId: string; standaloneId: string;
   originalRule: string; cappedRule?: string; start: string; end: string;
-  mode: "cap-history" | "flatten-master"; timeZone: string;
+  mode: "cap-history" | "flatten-master"; timeZone: string; verifiedInstanceIds?: string[];
 }
 export const flattenStandaloneId = (profile:Profile,taskId:string,masterId:string,occurrenceId:string) => createHash("sha256").update(`flatten-v1:${profile}:${taskId}:${masterId}:${occurrenceId}`).digest("hex").slice(0,32);
 const stamp = (date: string) => {

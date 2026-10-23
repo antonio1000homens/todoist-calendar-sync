@@ -358,7 +358,10 @@ export class ReviewEngine {
       const provider = await this.clients(intent.profile), master = masterSnapshot.object as CalendarEvent;
       try {
         preview.flattenPlan = planRecurrenceFlatten(intent.profile,task,master,event,await provider.calendar.getTimeZone());
-        assertFlattenInstances(master,await provider.calendar.listInstancesInWindow(master.id,master.start!.date!+"T00:00:00Z",event.end!.date!+"T00:00:00Z"));
+        const instances = await provider.calendar.listInstancesInWindow(master.id,master.start!.date!+"T00:00:00Z",event.end!.date!+"T00:00:00Z");
+        assertFlattenInstances(master,instances);
+        if (!instances.some(item=>item.id===event.id)) throw new Error("Selected Calendar occurrence is missing from its verified series expansion");
+        preview.flattenPlan.verifiedInstanceIds = instances.map(item=>item.id).sort();
         if ((await provider.calendar.listExplicitSeriesExceptions(master.id)).length) throw new Error("Explicit Calendar series exceptions require separate review before flattening");
       } catch(error) { invalidRepairIntent(error instanceof Error ? error.message : "Unsupported flatten repair"); }
       if (preview.flattenPlan!.standaloneId !== master.id && snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===preview.flattenPlan!.standaloneId && s.object)) invalidRepairIntent("The deterministic standalone ID already exists; resume its original repair instead");
@@ -369,7 +372,7 @@ export class ReviewEngine {
         if (mapping.masterEventId && mapping.masterEventId !== master.id) invalidRepairIntent("The selected task is linked to a different series; resolve that mapping first");
       }
       if (snapshots.some(s=>s.ref.side==="calendar" && s.object && (s.object as CalendarEvent).status !== "cancelled" && s.ref.id !== master.id && s.ref.id !== event.id && s.mapping)) invalidRepairIntent("Another mapped Calendar object requires a separate repair");
-      await this.state.assertHistoricalSeriesUnowned(master.id,[event.id],{mapping:previousMappings.find(m=>m.masterEventId===master.id || m.eventId===event.id),link:masterSnapshot.recurrence});
+      await this.state.assertHistoricalSeriesUnowned(master.id,preview.flattenPlan!.verifiedInstanceIds!,{mapping:previousMappings.find(m=>m.masterEventId===master.id || m.eventId===event.id),link:masterSnapshot.recurrence});
       changes.push(`Remove recurrence from Todoist ${task.id}; retain due date ${preview.flattenPlan!.start}`);
       changes.push(`Retain exact Calendar occurrence ${event.id} as standalone ${preview.flattenPlan!.standaloneId} on ${preview.flattenPlan!.start}–${preview.flattenPlan!.end}`);
       changes.push(preview.flattenPlan!.mode === "cap-history" ? `Preserve master ${master.id} history with ${preview.flattenPlan!.cappedRule}; archive its sync identity` : `Remove the RRULE from master ${master.id} in place; retain the chosen DTSTART`);
@@ -551,12 +554,18 @@ export class ReviewEngine {
       const disposition = intent.action === "exclude" && selected ? "exclude"
         : intent.action === "create" && selected ? "create" : intent.leftovers[key];
       let operation: string, result: string;
-      if (!s.object) {
+      if (intent.action === "flatten" && s.ref.side === "calendar" && s.ref.id === preview.flattenPlan!.standaloneId && !s.object) {
+        operation = "Create deterministic standalone Calendar event";
+        result = `Create ${s.ref.id} on ${preview.flattenPlan!.start}–${preview.flattenPlan!.end}; atomically link it to task ${intent.taskId}`;
+      } else if (!s.object) {
         operation = "Missing provider object — no provider write";
         result = s.mapping ? "Stale association detached as part of repair; Calendar history retained" : "No live provider object or association";
       } else if (projection) {
         operation = "Use active Calendar occurrence for selected series";
         result = "Included in the resulting recurrence association";
+      } else if (parent && intent.action === "flatten") {
+        operation = preview.flattenPlan!.mode === "cap-history" ? "Cap historical master and archive its sync identity" : "Convert master to selected standalone occurrence";
+        result = preview.flattenPlan!.mode === "cap-history" ? `${preview.flattenPlan!.cappedRule}; retain historical dates and remove recurrence ownership mapping` : "Remove RRULE; retain the exact selected date and unrelated metadata";
       } else if (parent) {
         operation = "Retain recurring master as occurrence context";
         result = "Existing series history retained";
@@ -818,9 +827,11 @@ export class ReviewEngine {
         const previous = [...new Map(operation.preview.snapshots.filter(s=>s.mapping && intent.leftovers[entityKey(s.ref)] !== "unchanged").map(s=>[s.mapping!.taskId,s.mapping!])).values()];
         const links = [...new Map(operation.preview.snapshots.filter(s=>s.recurrence).map(s=>[s.recurrence!.seriesId,s.recurrence!])).values()];
         if (!operation.steps["flatten-master"]) {
-          assertFlattenInstances(await pair.calendar.getEvent(plan.masterId),await pair.calendar.listInstancesInWindow(plan.masterId,originalMaster.start!.date!+"T00:00:00Z",plan.end+"T00:00:00Z"));
+          const instances = await pair.calendar.listInstancesInWindow(plan.masterId,originalMaster.start!.date!+"T00:00:00Z",plan.end+"T00:00:00Z");
+          assertFlattenInstances(await pair.calendar.getEvent(plan.masterId),instances);
+          if (reviewHash(instances.map(item=>item.id).sort())!==reviewHash(plan.verifiedInstanceIds)) throw new Error("Calendar series expansion changed after flatten preview");
           if ((await pair.calendar.listExplicitSeriesExceptions(plan.masterId)).length) throw new Error("Explicit Calendar series exceptions appeared after preview");
-          await state.assertHistoricalSeriesUnowned(plan.masterId,[plan.occurrenceId],{mapping:previous.find(m=>m.masterEventId===plan.masterId || m.eventId===plan.occurrenceId),link:links.find(l=>l.masterEventId===plan.masterId)});
+          await state.assertHistoricalSeriesUnowned(plan.masterId,plan.verifiedInstanceIds!,{mapping:previous.find(m=>m.masterEventId===plan.masterId || m.eventId===plan.occurrenceId),link:links.find(l=>l.masterEventId===plan.masterId)});
         }
         await step("flatten-master",async()=> {
           const live = await pair.calendar.getEvent(plan.masterId);
