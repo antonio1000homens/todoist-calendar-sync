@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import {
   mappingLookupSk,
   manualPendingLookupAttributes,
@@ -13,6 +13,9 @@ import {
   profileLookupBackfillCondition,
   recurrenceLookupSk,
   profileLookupParity,
+  manualDecisionKeyMatches,
+  terminalManualDecisionRepair,
+  terminalManualDecisionRepairItems,
 } from "../dist/profile-lookup.js";
 
 const tableName = process.env.STATE_TABLE_NAME?.trim();
@@ -82,6 +85,9 @@ function lookupFor(item) {
   if (sk === "STATE" && pk.startsWith("MANUAL#") && item.status === "pending") {
     const owner = profile(item.profile);
     const decisionId = typeof item.decisionId === "string" ? item.decisionId : pk.slice("MANUAL#".length);
+    if (!manualDecisionKeyMatches(pk, decisionId)) {
+      throw new Error(`Pending decision key does not match decisionId for ${pk}/${sk}`);
+    }
     if (!owner || !decisionId || typeof item.createdAt !== "string") {
       throw new Error(`Cannot index malformed pending decision ${pk}/${sk}`);
     }
@@ -100,7 +106,34 @@ const totals = {
   alreadyIndexed: 0,
   ignored: 0,
   conditionalMisses: 0,
+  terminalManualRowsResolved: 0,
 };
+
+async function repairTerminalManualRow(item, label) {
+  if (item.sk !== "STATE" || !String(item.pk || "").startsWith("MANUAL#") || item.status !== "pending") return false;
+  const decisionId = typeof item.decisionId === "string" ? item.decisionId : item.pk.slice("MANUAL#".length);
+  if (!manualDecisionKeyMatches(item.pk, decisionId)) {
+    throw new Error(`Pending decision key does not match decisionId for ${item.pk}/${item.sk}`);
+  }
+  const caseResult = await sendWithThrottleRetry(new GetCommand({
+    TableName: tableName,
+    Key: { pk: `REVIEW_CASE#${decisionId}`, sk: "STATE" },
+    ConsistentRead: true,
+  }), `${label}:terminal-case-read`);
+  const repair = terminalManualDecisionRepair(caseResult.Item, {
+    decisionId, profile: item.profile, status: item.status,
+  });
+  if (!repair) return false;
+  try {
+    await sendWithThrottleRetry(new TransactWriteCommand({
+      TransactItems: terminalManualDecisionRepairItems(tableName, repair),
+    }), `${label}:terminal-manual-repair`);
+    return { handled: true, resolved: true, conditionalMiss: false };
+  } catch (error) {
+    if (error?.name !== "ConditionalCheckFailedException" && error?.name !== "TransactionCanceledException") throw error;
+    return { handled: true, resolved: false, conditionalMiss: true };
+  }
+}
 
 async function backfillPass(label) {
   let lastEvaluatedKey;
@@ -109,6 +142,7 @@ async function backfillPass(label) {
   let alreadyIndexed = 0;
   let ignored = 0;
   let conditionalMisses = 0;
+  let terminalManualRowsResolved = 0;
   const expected = new Set();
 
   do {
@@ -121,6 +155,12 @@ async function backfillPass(label) {
 
     for (const item of result.Items || []) {
       scanned += 1;
+      const terminalRepair = await repairTerminalManualRow(item, label);
+      if (terminalRepair) {
+        if (terminalRepair.resolved) terminalManualRowsResolved += 1;
+        if (terminalRepair.conditionalMiss) conditionalMisses += 1;
+        continue;
+      }
       const lookup = lookupFor(item);
       if (!lookup) {
         ignored += 1;
@@ -168,6 +208,7 @@ async function backfillPass(label) {
       alreadyIndexed,
       ignored,
       conditionalMisses,
+      terminalManualRowsResolved,
       consumedCapacityUnits: Number(result.ConsumedCapacity?.CapacityUnits || 0),
       hasNextPage: Boolean(lastEvaluatedKey),
     }));
@@ -179,6 +220,7 @@ async function backfillPass(label) {
   totals.alreadyIndexed += alreadyIndexed;
   totals.ignored += ignored;
   totals.conditionalMisses += conditionalMisses;
+  totals.terminalManualRowsResolved += terminalManualRowsResolved;
   return { scanned, updated, alreadyIndexed, ignored, conditionalMisses, expected };
 }
 

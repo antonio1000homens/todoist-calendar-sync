@@ -172,6 +172,7 @@ export class ReviewStore {
     if (current.status !== "open") throw conflict();
     const operation = current.operationId ? await this.getOperation(current.operationId) : undefined;
     if (current.operationId && (!operation || operation.status !== "failed" || operationHasWriteEvidence(operation))) throw conflict();
+    const manual = await this.get<ManualDecision>(`MANUAL#${id}`);
     const now = new Date().toISOString();
     const values: Record<string, unknown> = {":open":"open", ":dismissed":"dismissed", ":result":result, ":now":now,
       ":lookup":`REVIEW#CLOSED#${current.createdAt}#${id}`, ":version":current.updatedAt};
@@ -184,6 +185,18 @@ export class ReviewStore {
       ConditionExpression:`#s = :open AND updatedAt = :version AND (${operationCondition})`,
       ExpressionAttributeNames:{"#s":"status", "#r":"result"}, ExpressionAttributeValues:values,
     }}];
+    if (manual?.status === "pending" && manual.profile === current.profile
+      && manual.decisionId === id && typeof manual.createdAt === "string") {
+      items.push({Update:{
+        TableName:reviewTable(), Key:key(`MANUAL#${id}`),
+        UpdateExpression:"SET #s = :resolved, resolution = :result, resolvedAt = :now REMOVE lookupPk, lookupSk",
+        ConditionExpression:"#s = :pending AND profile = :profile AND decisionId = :id AND createdAt = :createdAt",
+        ExpressionAttributeNames:{"#s":"status"}, ExpressionAttributeValues:{
+          ":pending":"pending", ":resolved":"resolved", ":profile":current.profile, ":id":id,
+          ":createdAt":manual.createdAt, ":result":result, ":now":now,
+        },
+      }});
+    }
     if (operation) items.push({ConditionCheck:{TableName:reviewTable(),Key:key(`REPAIR#${operation.id}`),
       ConditionExpression:"#s = :failed AND updatedAt = :version AND attribute_not_exists(writeStarted)",
       ExpressionAttributeNames:{"#s":"status"}, ExpressionAttributeValues:{":failed":"failed", ":version":operation.updatedAt}}});

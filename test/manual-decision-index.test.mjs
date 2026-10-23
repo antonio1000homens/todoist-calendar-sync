@@ -5,7 +5,7 @@ import { ManualDecisionStore } from "../dist/manual-intervention.js";
 import { ReviewStore } from "../dist/review-store.js";
 import { checkReconciliationHealth } from "../dist/reconcile.js";
 
-const readyMarker = { Item: { ready: true, version: 2 } };
+const readyMarker = { Item: { ready: true, version: 3 } };
 
 function decision(profile, id, status = "pending") {
   return {

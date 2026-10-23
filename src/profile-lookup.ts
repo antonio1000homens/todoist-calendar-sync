@@ -5,8 +5,12 @@ import { logEvent } from "./observability.js";
 export const PROFILE_LOOKUP_INDEX_NAME = "ProfileLookupIndex";
 export const PROFILE_LOOKUP_READY_KEY = "SYSTEM#PROFILE_LOOKUP_INDEX";
 export const PROFILE_LOOKUP_READY_SORT_KEY = "READY";
-export const PROFILE_LOOKUP_MIGRATION_VERSION = 2;
+export const PROFILE_LOOKUP_MIGRATION_VERSION = 3;
 export const MANUAL_PENDING_LOOKUP_PREFIX = "MANUAL#PENDING#";
+
+export function manualDecisionKeyMatches(pk: unknown, decisionId: unknown): boolean {
+  return typeof pk === "string" && pk === `MANUAL#${String(decisionId)}`;
+}
 
 export interface ProfileLookupParity {
   missing: string[];
@@ -18,6 +22,69 @@ export function profileLookupParity(expected: Set<string>, actual: Set<string>):
     missing: [...expected].filter((identity) => !actual.has(identity)),
     unexpected: [...actual].filter((identity) => !expected.has(identity)),
   };
+}
+
+type TerminalReviewCase = {
+  id?: unknown;
+  profile?: unknown;
+  status?: unknown;
+  updatedAt?: unknown;
+  result?: unknown;
+  decision?: { decisionId?: unknown };
+};
+type PendingManualDecision = {
+  decisionId?: unknown;
+  profile?: unknown;
+  status?: unknown;
+};
+
+/**
+ * A terminal review case is authoritative only for the same decision ID and
+ * profile. Orphaned operational decisions remain pending for operator review.
+ */
+export function terminalManualDecisionRepair(
+  reviewCase: TerminalReviewCase | undefined,
+  manual: PendingManualDecision,
+): { decisionId: string; profile: Profile; caseStatus: "dismissed" | "resolved" | "excluded"; caseUpdatedAt: string; resolution: string } | undefined {
+  if (!reviewCase || manual.status !== "pending"
+    || typeof manual.decisionId !== "string" || typeof manual.profile !== "string"
+    || reviewCase.id !== manual.decisionId || reviewCase.profile !== manual.profile
+    || (reviewCase.decision?.decisionId !== undefined && reviewCase.decision.decisionId !== manual.decisionId)
+    || !["dismissed", "resolved", "excluded"].includes(String(reviewCase.status))
+    || typeof reviewCase.updatedAt !== "string") return undefined;
+  const profile = manual.profile;
+  if (profile !== "home" && profile !== "antonio" && profile !== "work") return undefined;
+  const caseStatus = reviewCase.status as "dismissed" | "resolved" | "excluded";
+  const resolution = typeof reviewCase.result === "string" && reviewCase.result.trim()
+    ? reviewCase.result : `Closed from review as ${caseStatus}`;
+  return { decisionId: manual.decisionId, profile, caseStatus, caseUpdatedAt: reviewCase.updatedAt, resolution };
+}
+
+/** Conditional transaction keeps a stale pending row from outliving its terminal case. */
+export function terminalManualDecisionRepairItems(tableName: string, repair: NonNullable<ReturnType<typeof terminalManualDecisionRepair>>) {
+  return [
+    { Update: {
+      TableName: tableName,
+      Key: { pk: `MANUAL#${repair.decisionId}`, sk: "STATE" },
+      UpdateExpression: "SET #status = :resolved, resolution = :resolution, resolvedAt = :resolvedAt REMOVE lookupPk, lookupSk",
+      ConditionExpression: "#status = :pending AND profile = :profile AND (attribute_not_exists(decisionId) OR decisionId = :decisionId)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":pending": "pending", ":resolved": "resolved", ":profile": repair.profile,
+        ":decisionId": repair.decisionId, ":resolution": repair.resolution, ":resolvedAt": repair.caseUpdatedAt,
+      },
+    } },
+    { ConditionCheck: {
+      TableName: tableName,
+      Key: { pk: `REVIEW_CASE#${repair.decisionId}`, sk: "STATE" },
+      ConditionExpression: "#status = :caseStatus AND profile = :profile AND id = :decisionId AND updatedAt = :caseUpdatedAt",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":caseStatus": repair.caseStatus, ":profile": repair.profile,
+        ":decisionId": repair.decisionId, ":caseUpdatedAt": repair.caseUpdatedAt,
+      },
+    } },
+  ];
 }
 
 export function profileLookupPk(profile: Profile): string {

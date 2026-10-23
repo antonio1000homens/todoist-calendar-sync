@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { profileLookupPacingDelayMs, profileLookupQueryInput } from "../dist/dynamodb-capacity.js";
-import { profileLookupBackfillCondition } from "../dist/profile-lookup.js";
+import { manualDecisionKeyMatches, profileLookupBackfillCondition, terminalManualDecisionRepair, terminalManualDecisionRepairItems } from "../dist/profile-lookup.js";
 
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const cleanupSource = await readFile(new URL("../scripts/cleanup-routine-audit.mjs", import.meta.url), "utf8");
@@ -80,9 +80,43 @@ test("a decision resolved after the scan cannot be reindexed by the backfill", (
   assert.match(backfillSource, /pass\.updated === 0 && pass\.conditionalMisses === 0/);
 });
 
+test("backfill repairs only same-ID same-profile terminal cases and leaves orphan operational decisions pending", () => {
+  const manual={decisionId:"decision-1",profile:"home",status:"pending"};
+  const dismissed={id:"decision-1",profile:"home",status:"dismissed",updatedAt:"2026-10-23T10:15:00.000Z",result:"Acknowledged"};
+  const repair=terminalManualDecisionRepair(dismissed,manual);
+  assert.deepEqual(repair,{decisionId:"decision-1",profile:"home",caseStatus:"dismissed",
+    caseUpdatedAt:"2026-10-23T10:15:00.000Z",resolution:"Acknowledged"});
+  const items=terminalManualDecisionRepairItems("state",repair);
+  assert.equal(items.length,2);
+  assert.equal(items[0].Update.Key.pk,"MANUAL#decision-1");
+  assert.match(items[0].Update.UpdateExpression,/REMOVE lookupPk, lookupSk/);
+  assert.match(items[0].Update.ConditionExpression,/#status = :pending AND profile = :profile/);
+  assert.equal(items[1].ConditionCheck.Key.pk,"REVIEW_CASE#decision-1");
+  assert.match(items[1].ConditionCheck.ConditionExpression,/updatedAt = :caseUpdatedAt/);
+  assert.equal(terminalManualDecisionRepair({...dismissed,profile:"work"},manual),undefined);
+  assert.equal(terminalManualDecisionRepair({...dismissed,id:"different"},manual),undefined);
+  assert.equal(terminalManualDecisionRepair({...dismissed,status:"open"},manual),undefined);
+  assert.equal(terminalManualDecisionRepair(undefined,{...manual,decisionId:"orphan-operational"}),undefined);
+});
+
+test("a pending row with a mismatched primary key and decisionId fails closed before repair or indexing", () => {
+  assert.equal(manualDecisionKeyMatches("MANUAL#decision-1", "decision-1"), true);
+  assert.equal(manualDecisionKeyMatches("MANUAL#canonical", "decision-1"), false);
+  assert.match(backfillSource, /if \(!manualDecisionKeyMatches\(item\.pk, decisionId\)\)\s*\{\s*throw new Error/);
+  assert.match(backfillSource, /if \(!manualDecisionKeyMatches\(pk, decisionId\)\)\s*\{\s*throw new Error/);
+});
+
+test("profile lookup backfill reconciles terminal mismatches transactionally before calculating pending parity",()=>{
+  assert.match(backfillSource,/terminalManualDecisionRepair\(caseResult\.Item/);
+  assert.match(backfillSource,/new TransactWriteCommand\(/);
+  assert.match(backfillSource,/terminalManualRowsResolved/);
+  assert.match(backfillSource,/profileLookupParity\(readyExpected, actual\)/);
+  assert.match(backfillSource,/terminalManualDecisionRepairItems\(tableName, repair\)/);
+});
+
 test("pending decisions use the existing profile GSI and require the expanded migration parity", async () => {
   const { PROFILE_LOOKUP_MIGRATION_VERSION, manualPendingLookupAttributes } = await import("../dist/profile-lookup.js");
-  assert.equal(PROFILE_LOOKUP_MIGRATION_VERSION, 2);
+  assert.equal(PROFILE_LOOKUP_MIGRATION_VERSION, 3);
   assert.deepEqual(manualPendingLookupAttributes({ profile: "home", decisionId: "home-review-1", createdAt: "2026-10-23T10:00:00.000Z" }), {
     lookupPk: "PROFILE#home",
     lookupSk: "MANUAL#PENDING#2026-10-23T10:00:00.000Z#home-review-1",
