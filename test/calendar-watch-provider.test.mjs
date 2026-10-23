@@ -52,3 +52,20 @@ test("manual Calendar deletion sends If-Match for the exact approved event versi
     globalThis.fetch=originalFetch;
   }
 });
+
+test("recurring occurrence identity cleanup sends an If-Match metadata-only PATCH",async()=>{
+  const originalFetch=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init={})=>{
+    calls.push({url,init});
+    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-after",extendedProperties:{shared:{syncHistoryOnly:"true"}}});
+  };
+  try {
+    const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"home@example.test");
+    await calendar.updateSharedEventPropertiesIfUnchanged("exact-instance","etag-approved",{taskId:null,syncRecurrenceOwner:null,syncHistoryOnly:"true"});
+    const patch=calls.find(({init})=>init.method==="PATCH");
+    assert.match(patch.url,/\/events\/exact-instance$/);
+    assert.equal(patch.init.headers.get("If-Match"),"etag-approved");
+    assert.deepEqual(JSON.parse(patch.init.body),{extendedProperties:{shared:{taskId:null,syncRecurrenceOwner:null,syncHistoryOnly:"true"}}});
+  } finally { globalThis.fetch=originalFetch; }
+});

@@ -332,10 +332,10 @@ export class ReviewEngine {
       const selected=snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="calendar"&&s.ref.id===intent.eventId);
       const selectedEvent=selected?.object as CalendarEvent|null|undefined;
       const linkedTaskId=selected?.mapping?.taskId||selectedEvent?.extendedProperties?.shared?.taskId;
+      const recurringOccurrence=Boolean(selectedEvent?.recurringEventId);
       if(!selectedEvent||selectedEvent.id!==intent.eventId||selectedEvent.status!=="confirmed"
-        ||selectedEvent.recurringEventId||selectedEvent.recurrence?.length
-        ||selectedEvent.extendedProperties?.shared?.syncRecurrenceOwner) {
-        invalidRepairIntent("History-only detachment requires a confirmed standalone Calendar event; recurring series and occurrences need a series-aware repair");
+        ||selectedEvent.recurrence?.length||(!recurringOccurrence&&selectedEvent.extendedProperties?.shared?.syncRecurrenceOwner)) {
+        invalidRepairIntent("History-only detachment requires a confirmed standalone Calendar event or an exact occurrence in a verified Calendar-owned series");
       }
       const sharedTaskId=selectedEvent.extendedProperties?.shared?.taskId;
       if(selected?.mapping?.taskId&&sharedTaskId&&selected.mapping.taskId!==sharedTaskId) {
@@ -353,6 +353,62 @@ export class ReviewEngine {
       if(!timeZone) invalidRepairIntent("Calendar timezone could not be verified; refresh before classifying elapsed history");
       if(!calendarEventHasElapsed(selectedEvent,Date.now(),timeZone)) invalidRepairIntent("The selected Calendar event has not fully elapsed in its Calendar timezone");
       const eventMapping=selected!.mapping;
+      if(recurringOccurrence) {
+        if(eventMapping) invalidRepairIntent("The elapsed recurring occurrence has its own event mapping; resolve the mapping split before detaching history");
+        if(!selectedEvent.etag||!selectedEvent.start||!selectedEvent.end||!selectedEvent.originalStartTime
+          ||(!selectedEvent.start.date&&!selectedEvent.start.dateTime)||(!selectedEvent.end.date&&!selectedEvent.end.dateTime)) {
+          invalidRepairIntent("Recurring occurrence detachment requires exact start, end, original start, and ETag data");
+        }
+        const masterSnapshot=snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="calendar"&&s.ref.id===selectedEvent.recurringEventId);
+        const master=masterSnapshot?.object as CalendarEvent|null|undefined;
+        const recurrenceLink=masterSnapshot?.recurrence;
+        const taskSnapshot=snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="todoist"&&s.ref.id===linkedTaskId);
+        const taskMapping=await this.state.getMappingByTask(intent.profile,linkedTaskId);
+        const ownerMapping=await this.state.getMappingByTaskAnyProfile(linkedTaskId);
+        let globalRecurrenceLink:Awaited<ReturnType<StateRepository["getRecurrenceLinkByTaskAnyProfile"]>>;
+        try { globalRecurrenceLink=await this.state.getRecurrenceLinkByTaskAnyProfile(linkedTaskId); }
+        catch { invalidRepairIntent("The Todoist task is claimed by multiple recurrence links across profiles; resolve recurrence ownership before detaching history"); }
+        const activeId=recurrenceLink?.activeInstanceId;
+        let activeSnapshot=activeId?snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="calendar"&&s.ref.id===activeId):undefined;
+        if(activeId&&!activeSnapshot) {
+          activeSnapshot=await this.snapshot({profile:intent.profile,side:"calendar",id:activeId});
+          snapshots.push(activeSnapshot);
+        }
+        const active=activeSnapshot?.object as CalendarEvent|null|undefined;
+        const seriesId=master?.iCalUID||master?.id;
+        if(!linkedTaskId||!taskSnapshot||!taskSnapshot.object||(taskSnapshot.object as TodoistTask).is_deleted
+          ||(taskSnapshot.object as TodoistTask).is_completed||!master||master.id!==selectedEvent.recurringEventId
+          ||master.status!=="confirmed"||!master.recurrence?.length||master.extendedProperties?.shared?.taskId!==linkedTaskId
+          ||master.extendedProperties?.shared?.syncRecurrenceOwner!=="calendar"
+          ||!recurrenceLink||recurrenceLink.owner!=="calendar"||recurrenceLink.profile!==intent.profile
+          ||recurrenceLink.taskId!==linkedTaskId||recurrenceLink.masterEventId!==master.id||recurrenceLink.seriesId!==seriesId
+          ||!activeId||!active||active.status!=="confirmed"||active.recurringEventId!==master.id||!active.end
+          ||active.extendedProperties?.shared?.taskId!==linkedTaskId
+          ||calendarEventHasElapsed(active,Date.now(),active.end.date&&!active.end.dateTime?timeZone:undefined)
+          ||reviewHash(mappingPayload(taskMapping))!==reviewHash(mappingPayload(ownerMapping))
+          ||reviewHash(mappingPayload(taskSnapshot.mapping as Mapping|undefined))!==reviewHash(mappingPayload(ownerMapping))
+          ||!taskMapping||taskMapping.profile!==intent.profile||taskMapping.taskId!==linkedTaskId
+          ||taskMapping.recurrenceId
+          ||taskMapping.recurrenceOwner!=="calendar"||taskMapping.seriesId!==seriesId||taskMapping.masterEventId!==master.id
+          ||taskMapping.eventId!==activeId||taskMapping.activeInstanceId!==activeId||taskMapping.calendarProgressVersion!==1
+          ||recurrenceLink.calendarProgressVersion!==1
+          ||recurrenceLink.eventId!==activeId||recurrenceLink.activeInstanceId!==activeId
+          ||reviewHash(mappingPayload(activeSnapshot?.mapping))!==reviewHash(mappingPayload(taskMapping))
+          ||masterSnapshot?.mapping
+          ||reviewHash(globalRecurrenceLink)!==reviewHash(recurrenceLink)) {
+          invalidRepairIntent("Elapsed occurrence detachment requires a verified Calendar-owned master, intact recurrence indexes, and one live mapped future occurrence");
+        }
+        if(selectedEvent.extendedProperties?.shared?.taskId!==linkedTaskId
+          ||selectedEvent.extendedProperties?.shared?.syncRecurrenceOwner!=="calendar") {
+          invalidRepairIntent("The elapsed occurrence does not carry the verified Calendar-series identity");
+        }
+        if(Object.values(selectedEvent.extendedProperties?.shared||{}).some(value=>typeof value!=="string")) {
+          invalidRepairIntent("Calendar occurrence metadata is malformed; refresh before detaching history");
+        }
+        elapsedCalendarHistoryPlan={eventId:intent.eventId!,taskId:linkedTaskId,timeZone,taskMapping,
+          retainedTaskMapping:taskMapping,recurringMasterId:master.id,activeInstanceId:activeId,
+          recurringMapping:taskMapping,recurrenceLink};
+      } else {
       if(eventMapping&&(eventMapping.profile!==intent.profile||eventMapping.eventId!==intent.eventId||eventMapping.taskId!==linkedTaskId
         ||eventMapping.recurrenceOwner||eventMapping.recurrenceId||eventMapping.seriesId||eventMapping.masterEventId||eventMapping.activeInstanceId||!eventMapping.updatedAt)) {
         invalidRepairIntent("The elapsed event mapping is ambiguous or recurrence-owned; refresh and resolve the mapping split first");
@@ -406,6 +462,7 @@ export class ReviewEngine {
       })) invalidRepairIntent("More than one current/future Calendar mapping claims this Todoist task; resolve the duplicate ownership before detaching history");
       if(Object.values(selectedEvent.extendedProperties?.shared||{}).some(value=>typeof value!=="string")) invalidRepairIntent("Calendar identity metadata is malformed; refresh the event before detaching it");
       elapsedCalendarHistoryPlan={eventId:intent.eventId!,taskId:linkedTaskId,timeZone,eventMapping,taskMapping,retainedTaskMapping,retainedEventMappings};
+      }
     }
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
@@ -545,9 +602,11 @@ export class ReviewEngine {
     const changes: string[] = [], warnings: string[] = [];
     if(elapsedCalendarHistoryPlan) {
       changes.push(`Keep elapsed Calendar event ${elapsedCalendarHistoryPlan.eventId} visible; remove its active Todoist identity metadata`);
-      changes.push(elapsedCalendarHistoryPlan.eventMapping
-        ? `Remove only EVENT#${intent.profile}#${elapsedCalendarHistoryPlan.eventId}; remove TASK/TASKOWNER indexes only if they still point to this elapsed event`
-        : `No event-specific mapping row exists for ${elapsedCalendarHistoryPlan.eventId}; retain all task mapping indexes`);
+      changes.push(elapsedCalendarHistoryPlan.recurringMasterId
+        ? `Keep Calendar master ${elapsedCalendarHistoryPlan.recurringMasterId} and its RRULE unchanged; retain all recurrence, TASK, TASKOWNER, and future EVENT indexes`
+        : elapsedCalendarHistoryPlan.eventMapping
+          ? `Remove only EVENT#${intent.profile}#${elapsedCalendarHistoryPlan.eventId}; remove TASK/TASKOWNER indexes only if they still point to this elapsed event`
+          : `No event-specific mapping row exists for ${elapsedCalendarHistoryPlan.eventId}; retain all task mapping indexes`);
       changes.push(elapsedCalendarHistoryPlan.retainedTaskMapping
         ? `Retain exact current/future mapping Todoist ${elapsedCalendarHistoryPlan.taskId} ↔ Calendar ${elapsedCalendarHistoryPlan.retainedTaskMapping.eventId}${elapsedCalendarHistoryPlan.retainedTaskMapping.activeInstanceId ? ` (active occurrence ${elapsedCalendarHistoryPlan.retainedTaskMapping.activeInstanceId})` : ""}`
         : `No current/future counterpart mapping remains for Todoist ${elapsedCalendarHistoryPlan.taskId}`);
@@ -772,7 +831,7 @@ export class ReviewEngine {
     for (const s of snapshots) {
       if(elapsedCalendarHistoryPlan) {
         if(s.ref.side==="calendar"&&s.ref.id===elapsedCalendarHistoryPlan.eventId) {
-          changes.push(`Calendar ${s.ref.id} · ${show((s.object as CalendarEvent|null)?.start)} to ${show((s.object as CalendarEvent|null)?.end)}: mark as Calendar-only history and detach this event mapping`);
+          changes.push(`Calendar ${s.ref.id} · ${show((s.object as CalendarEvent|null)?.start)} to ${show((s.object as CalendarEvent|null)?.end)}: mark as Calendar-only history and remove its active task identity`);
         } else if(s.ref.side==="todoist"&&s.ref.id===elapsedCalendarHistoryPlan.taskId) {
           changes.push(`Retain Todoist task ${s.ref.id} and its task-side indexes${elapsedCalendarHistoryPlan.retainedTaskMapping?" for the verified current/future counterpart":" only if they still identify the selected elapsed event"}`);
         } else if(s.ref.side==="calendar"&&elapsedCalendarHistoryPlan.retainedTaskMapping
@@ -814,7 +873,15 @@ export class ReviewEngine {
         let operation="Retain provider item and mapping unchanged",result="This item is context for the selected event-only detachment";
         if(s.ref.side==="calendar"&&s.ref.id===elapsedCalendarHistoryPlan.eventId) {
           operation="Keep elapsed Calendar event as history and remove its active Todoist identity";
-          result=`Keep event ${s.ref.id} visible from ${show((s.object as CalendarEvent|null)?.start)} to ${show((s.object as CalendarEvent|null)?.end)}; remove only this event mapping and its task identity metadata`;
+          result=elapsedCalendarHistoryPlan.recurringMasterId
+            ? `Keep this occurrence visible; patch only its identity metadata, preserving master ${elapsedCalendarHistoryPlan.recurringMasterId}`
+            : `Keep event ${s.ref.id} visible from ${show((s.object as CalendarEvent|null)?.start)} to ${show((s.object as CalendarEvent|null)?.end)}; remove only this event mapping and its task identity metadata`;
+        } else if(s.ref.side==="calendar"&&s.ref.id===elapsedCalendarHistoryPlan.recurringMasterId) {
+          operation="Retain Calendar recurrence master";
+          result="Keep its RRULE, series identity, and recurrence ownership unchanged";
+        } else if(s.ref.side==="calendar"&&s.ref.id===elapsedCalendarHistoryPlan.activeInstanceId) {
+          operation="Retain the mapped future occurrence";
+          result="Keep this live occurrence and its event mapping unchanged";
         } else if(s.ref.side==="todoist"&&s.ref.id===elapsedCalendarHistoryPlan.taskId) {
           operation="Retain Todoist task identity";
           result=elapsedCalendarHistoryPlan.retainedTaskMapping
@@ -1445,6 +1512,20 @@ export class ReviewEngine {
           await this.controls.reject(intent.profile,plan.taskId,plan.eventId,id);return true;
         });
         await step(`history-detach-mapping:${plan.eventId}`,async()=>{
+          if(plan.recurringMasterId) {
+            const [eventMapping,taskMapping,ownerMapping,link]=await Promise.all([
+              state.getMappingByEvent(intent.profile,plan.eventId),
+              state.getMappingByTask(intent.profile,plan.taskId),
+              state.getMappingByTaskAnyProfile(plan.taskId),
+              state.getRecurrenceLink(intent.profile,plan.recurrenceLink!.seriesId),
+            ]);
+            if(eventMapping||reviewHash(mappingPayload(taskMapping))!==reviewHash(mappingPayload(plan.recurringMapping))
+              ||reviewHash(mappingPayload(ownerMapping))!==reviewHash(mappingPayload(plan.recurringMapping))
+              ||reviewHash(link)!==reviewHash(plan.recurrenceLink)) {
+              throw new Error("Calendar recurrence mappings changed after preview; refresh before detaching this occurrence");
+            }
+            return true;
+          }
           const committed=await state.commitElapsedCalendarHistoryDetach({operationId:id,profile:intent.profile,eventId:plan.eventId,
             taskId:plan.taskId,eventMapping:plan.eventMapping,taskMapping:plan.taskMapping,retainedEventMappings:plan.retainedEventMappings});
           if(!committed) throw new Error("Event or task mapping indexes changed after preview; the repair barrier remains active. Refresh and create a new preview.");
@@ -1467,10 +1548,43 @@ export class ReviewEngine {
             return live;
           }
           if(reviewHash(live)!==reviewHash(originalEvent)) throw new Error("Calendar event changed after preview; refresh before removing its Todoist identity");
+          if(plan.recurringMasterId) {
+            const masterSnapshot=operation.preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.recurringMasterId);
+            const activeSnapshot=operation.preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.activeInstanceId);
+            if(!masterSnapshot?.object||!activeSnapshot?.object) throw new Error("Verified recurring master or future occurrence is missing from the preview");
+            const [master,active]=await Promise.all([
+              clients.calendar.getEvent(plan.recurringMasterId),clients.calendar.getEvent(plan.activeInstanceId!),
+            ]);
+            if(reviewHash(master)!==reviewHash(masterSnapshot.object)||reviewHash(active)!==reviewHash(activeSnapshot.object)
+              ||active.recurringEventId!==master.id) throw new Error("Calendar master or future occurrence changed after preview");
+            return trackedWrite(intent.profile,()=>clients.calendar.updateSharedEventPropertiesIfUnchanged(
+              live.id,live.etag!,Object.fromEntries([
+                ...Object.keys(live.extendedProperties?.shared||{}).filter(name=>name==="taskId"||name==="taskUrl"||name==="originalSummary"
+                  ||name.startsWith("sync")||name.startsWith("todoist")).map(name=>[name,null]),
+                ["syncHistoryOnly","true"],
+              ])));
+          }
           return trackedWrite(intent.profile,()=>clients.calendar.upsertEventIfUnchanged(
             calendarHistoryOnlyProjection(live),live.id,live.etag!));
         });
         if(!isCalendarHistoryOnly(historyEvent)||!calendarHistoryMatchesSnapshot(historyEvent,originalEvent)) throw new Error("Calendar-only history metadata readback failed");
+        if(plan.recurringMasterId) {
+          const masterSnapshot=operation.preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.recurringMasterId);
+          const activeSnapshot=operation.preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.activeInstanceId);
+          const clients=await factory(intent.profile);
+          const [eventMapping,taskMapping,ownerMapping,link,master,active]=await Promise.all([
+            state.getMappingByEvent(intent.profile,plan.eventId),state.getMappingByTask(intent.profile,plan.taskId),
+            state.getMappingByTaskAnyProfile(plan.taskId),state.getRecurrenceLink(intent.profile,plan.recurrenceLink!.seriesId),
+            clients.calendar.getEvent(plan.recurringMasterId),clients.calendar.getEvent(plan.activeInstanceId!),
+          ]);
+          if(eventMapping||reviewHash(mappingPayload(taskMapping))!==reviewHash(mappingPayload(plan.recurringMapping))
+            ||reviewHash(mappingPayload(ownerMapping))!==reviewHash(mappingPayload(plan.recurringMapping))
+            ||reviewHash(link)!==reviewHash(plan.recurrenceLink)
+            ||reviewHash(master)!==reviewHash(masterSnapshot?.object)||reviewHash(active)!==reviewHash(activeSnapshot?.object)
+            ||historyEvent.recurringEventId!==plan.recurringMasterId) {
+            throw new Error("Occurrence history metadata was updated but Calendar recurrence ownership or its future mapping changed; the repair barrier remains active");
+          }
+        }
         operation.expectedProviders={...(operation.expectedProviders||{}),[entityKey(eventSnapshot!.ref)]:historyEvent};
         operation.outcomes=operation.preview.snapshots.map(snapshot=>({entity:entityKey(snapshot.ref),
           outcome:snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.eventId?"history" as const:"unchanged" as const,checkedAt:at()}));

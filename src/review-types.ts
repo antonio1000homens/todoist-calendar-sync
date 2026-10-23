@@ -37,7 +37,7 @@ export interface RepairPreview {
   id: string; actor: ReviewActor; intent: RepairIntent; case: ReviewCase;
   snapshots: ReviewSnapshot[]; fingerprint: string; createdAt: string; expiresAt: number;
   changes: string[]; warnings: string[]; flattenPlan?: RecurrenceFlattenPlan; splitPlan?: FutureSeriesSplitPlan; annualPlan?: StandaloneAnnualPlan;
-  elapsedCalendarHistoryPlan?: { eventId:string; taskId:string; timeZone?:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedTaskMapping?:Mapping; retainedEventMappings?:Mapping[] };
+  elapsedCalendarHistoryPlan?: { eventId:string; taskId:string; timeZone?:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedTaskMapping?:Mapping; retainedEventMappings?:Mapping[]; recurringMasterId?:string; activeInstanceId?:string; recurringMapping?:Mapping; recurrenceLink?:RecurrenceLink };
   /** Exact provider refs and per-object planned effects, matched to frozen snapshots. */
   itemPlan: Array<{ ref:EntityRef; operation:string; result:string }>;
 }

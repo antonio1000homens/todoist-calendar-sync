@@ -7,7 +7,7 @@ import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 import { hasCanonicalState, startsMatch, toTodoistTask } from "./sync.js";
 
 type ProviderObject = CalendarEvent | TodoistTask;
-const calendarWrites = new Set(["upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
+const calendarWrites = new Set(["upsertEvent", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
 const taskWrites = new Set(["upsertTask", "updateRecurringOccurrence", "createTaskOnce", "moveTask", "deleteTask"]);
 
 /** Carry approved provider versions through our own writes and durable retries. */
@@ -50,7 +50,7 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
         if (!read && !write) return value.bind(target);
         return async (...args: unknown[]) => {
           if (method === "moveTask" || side === "calendar" && method === "deleteEvent" && profile === move.profile) await recheckDestination();
-          const id = read || method.startsWith("delete") || method === "moveTask" ? args[0] as string
+          const id = read || method.startsWith("delete") || method === "moveTask" || method === "updateSharedEventPropertiesIfUnchanged" ? args[0] as string
             : method === "updateRecurringOccurrence" ? (args[0] as TodoistTask).id
             : method === "createTaskOnce" ? undefined
             : method === "createFutureMasterOnce" || method === "createRepairEventOnce" ? (args[0] as CalendarEvent).id

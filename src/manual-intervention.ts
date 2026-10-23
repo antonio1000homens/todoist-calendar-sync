@@ -47,7 +47,7 @@ const PENDING_DECISION_QUERY_PAGE_LIMIT = 25;
 const PENDING_DECISION_QUERY_MAX_PAGES = 12;
 const MAX_MANUAL_BULK_MUTATIONS = 10;
 const MANUAL_CALENDAR_MUTATIONS = new Set([
-  "upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "deleteEvent",
+  "upsertEvent", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "deleteEvent",
 ]);
 const MANUAL_TODOIST_MUTATIONS = new Set(["upsertTask", "updateRecurringOccurrence", "deleteTask", "upsertComment", "deleteComment"]);
 
