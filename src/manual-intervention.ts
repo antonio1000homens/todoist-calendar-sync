@@ -517,11 +517,46 @@ export class ManualDecisionStore {
     let totalPages = 0;
     let examined = 0;
 
-    const ready = await documentClient.send(new GetCommand({
-      TableName: table,
-      Key: { pk: PROFILE_LOOKUP_READY_KEY, sk: PROFILE_LOOKUP_READY_SORT_KEY },
-      ConsistentRead: true,
-    }));
+    if (Date.now() >= deadlineAtMs) {
+      console.warn(JSON.stringify({
+        service: "todoist-calendar-sync-health",
+        event: "list_pending_manual_decisions_incomplete",
+        operation: "list_pending_manual_decisions",
+        profile,
+        requestId,
+        pages: 0,
+        itemsExamined: 0,
+        itemsReturned: 0,
+        elapsedMs: Date.now() - startedAt,
+        complete: false,
+        reason: "deadline_budget_exhausted",
+      }));
+      throw new Error("Pending manual-decision lookup deadline exhausted");
+    }
+    let ready: any;
+    try {
+      ready = await documentClient.send(new GetCommand({
+        TableName: table,
+        Key: { pk: PROFILE_LOOKUP_READY_KEY, sk: PROFILE_LOOKUP_READY_SORT_KEY },
+        ConsistentRead: true,
+      }), { abortSignal: AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now())) });
+    } catch (error) {
+      console.error(JSON.stringify({
+        service: "todoist-calendar-sync-health",
+        event: "list_pending_manual_decisions_incomplete",
+        operation: "list_pending_manual_decisions",
+        profile,
+        requestId,
+        pages: 0,
+        itemsExamined: 0,
+        itemsReturned: 0,
+        elapsedMs: Date.now() - startedAt,
+        complete: false,
+        reason: Date.now() >= deadlineAtMs ? "deadline_budget_exhausted" : "readiness_check_failed",
+        error: error instanceof Error ? error.name : "unknown_error",
+      }));
+      throw error;
+    }
     if (Number(ready.Item?.version || 0) < PROFILE_LOOKUP_MIGRATION_VERSION) {
       console.warn(JSON.stringify({
         service: "todoist-calendar-sync-health",
@@ -564,8 +599,9 @@ export class ManualDecisionStore {
             ExclusiveStartKey: cursor,
             Limit: pageLimit,
             ReturnConsumedCapacity: "TOTAL",
-          }, deadlineAtMs)));
+          }, deadlineAtMs)), { abortSignal: AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now())) });
         } catch (error) {
+          const deadlineExpired = Date.now() >= deadlineAtMs;
           console.error(JSON.stringify({
             service: "todoist-calendar-sync-health",
             event: "list_pending_manual_decisions_incomplete",
@@ -577,9 +613,10 @@ export class ManualDecisionStore {
             itemsReturned: results.length,
             elapsedMs: Date.now() - startedAt,
             complete: false,
-            reason: "query_failed",
+            reason: deadlineExpired ? "deadline_budget_exhausted" : "query_failed",
             error: error instanceof Error ? error.name : "unknown_error",
           }));
+          if (deadlineExpired) throw new Error(`Pending manual-decision lookup deadline exhausted for ${owner}`, { cause: error });
           throw error;
         }
         examined += Number(result.ScannedCount ?? result.Count ?? result.Items?.length ?? 0);

@@ -140,9 +140,34 @@ test("deadline and throttling outcomes fail closed instead of reporting an empty
   };
   t.after(() => { documentClient.send = originalSend; });
 
-  await assert.rejects(new ManualDecisionStore().listPending("home", { deadlineAtMs: 1 }), /lookup incomplete/);
+  await assert.rejects(new ManualDecisionStore().listPending("home", { deadlineAtMs: 1 }), /deadline exhausted/);
   assert.equal(queries, 0);
   await assert.rejects(new ManualDecisionStore().listPending("home", { requestId: "req-throttle" }), /throttled/);
   assert.equal(queries, 1);
+});
+
+test("a delayed indexed query is aborted at the caller deadline and cannot report an empty inbox", async (t) => {
+  const originalSend = documentClient.send;
+  let querySignal;
+  documentClient.send = async (command, options = {}) => {
+    if (command.constructor.name === "GetCommand") return readyMarker;
+    assert.equal(command.constructor.name, "QueryCommand");
+    querySignal = options.abortSignal;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(Object.assign(new Error("request timed out"), { name: "TimeoutError" }));
+      if (querySignal.aborted) onAbort();
+      else querySignal.addEventListener("abort", onAbort, { once: true });
+      const safetyTimer = setTimeout(() => reject(new Error("deadline signal was not delivered")), 1_000);
+      querySignal.addEventListener("abort", () => clearTimeout(safetyTimer), { once: true });
+    });
+  };
+  t.after(() => { documentClient.send = originalSend; });
+
+  await assert.rejects(
+    new ManualDecisionStore().listPending("home", { deadlineAtMs: Date.now() + 100, requestId: "req-slow-query" }),
+    /deadline exhausted/,
+  );
+  assert.ok(querySignal);
+  assert.equal(querySignal.aborted, true);
 });
 
