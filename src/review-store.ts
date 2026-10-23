@@ -110,7 +110,9 @@ export class ReviewStore {
       ConditionExpression:operation.status === "succeeded" ? "#status = :succeeded AND attribute_not_exists(abandoned)"
         : operation.abandoned ? "#status = :failed AND abandoned = :yes"
         : "(attribute_not_exists(pk) OR #status <> :succeeded) AND attribute_not_exists(abandoned)",
-      ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded",":failed":"failed",":yes":true} }));
+      ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:operation.status === "succeeded"
+        ? {":succeeded":"succeeded"}
+        : operation.abandoned ? {":failed":"failed",":yes":true} : {":succeeded":"succeeded"} }));
   }
   async completeNotification(operationId: string, replyTs?: string): Promise<void> {
     await this.db.send(new UpdateCommand({ TableName:reviewTable(), Key:key(`REPAIR#${operationId}`),
