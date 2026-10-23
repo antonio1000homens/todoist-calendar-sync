@@ -95,7 +95,11 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone(eventMappingMap.get(`${profile}:${id}`)||[...mappingMap.values()].find(value=>value.profile===profile&&value.eventId===id)); },
     async getRecurrenceLink(_profile, id) { return clone(recurrences.get(id)); },
-    async getRecurrenceLinkByTaskAnyProfile(id) { return clone([...recurrences.values()].find(value => value.taskId === id)); },
+    async getRecurrenceLinkByTaskAnyProfile(id) {
+      const matches=[...recurrences.values()].filter(value=>value.taskId===id);
+      if(matches.length>1)throw new Error(`Todoist task ${id} is claimed by multiple recurrence links`);
+      return clone(matches[0]);
+    },
     async listRecurrenceLinks(profile) { return clone([...recurrences.values()].filter(value => value.profile === profile)); },
     async getFutureSeriesSplitAnyProfile(taskId) { return clone(splits.get(taskId)); },
     async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId, previousOccurrence) {
@@ -379,6 +383,53 @@ test("elapsed recurring occurrence refuses a conflicting event mapping before pr
   const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[mapping],recurrence:{...mapping,owner:"calendar"}});
   h.eventMappingMap.set("home:elapsed",{...mapping,eventId:"elapsed",activeInstanceId:"active",updatedAt:"2026-10-03T00:00:00Z"});
   await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/own event mapping/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("elapsed recurring occurrence refuses a conflicting master event mapping before provider writes",async t=>{
+  const mapping={profile:"home",taskId:"task",eventId:"active",recurrenceOwner:"calendar",seriesId:"calendar-series",
+    masterEventId:"master",activeInstanceId:"active",calendarProgressVersion:1,updatedAt:"2026-10-02T00:00:00Z"};
+  const shared={taskId:"task",syncRecurrenceOwner:"calendar"};
+  const master=event("master",{iCalUID:"calendar-series",recurrence:["RRULE:FREQ=WEEKLY"],extendedProperties:{shared:{...shared}}});
+  const elapsed=event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},recurringEventId:"master",
+    originalStartTime:{date:"2025-05-02"},extendedProperties:{shared:{...shared}}});
+  const active=event("active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurringEventId:"master",
+    originalStartTime:{date:"2099-12-18"},extendedProperties:{shared:{...shared}}});
+  const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[mapping],recurrence:{...mapping,owner:"calendar"}});
+  h.eventMappingMap.set("home:master",{profile:"home",taskId:"other-task",eventId:"master",updatedAt:"2026-10-03T00:00:00Z"});
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/verified Calendar-owned master/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("elapsed recurring occurrence refuses a duplicate cross-profile recurrence link before provider writes",async t=>{
+  const mapping={profile:"home",taskId:"task",eventId:"active",recurrenceOwner:"calendar",seriesId:"calendar-series",
+    masterEventId:"master",activeInstanceId:"active",calendarProgressVersion:1,updatedAt:"2026-10-02T00:00:00Z"};
+  const shared={taskId:"task",syncRecurrenceOwner:"calendar"};
+  const master=event("master",{iCalUID:"calendar-series",recurrence:["RRULE:FREQ=WEEKLY"],extendedProperties:{shared:{...shared}}});
+  const elapsed=event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},recurringEventId:"master",
+    originalStartTime:{date:"2025-05-02"},extendedProperties:{shared:{...shared}}});
+  const active=event("active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurringEventId:"master",
+    originalStartTime:{date:"2099-12-18"},extendedProperties:{shared:{...shared}}});
+  const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[mapping],recurrence:{...mapping,owner:"calendar"}});
+  h.recurrences.set("other-profile-series",{...mapping,profile:"work",seriesId:"other-profile-series",updatedAt:"2026-10-03T00:00:00Z"});
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/multiple recurrence links across profiles/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("elapsed recurring occurrence refuses recurrenceId on its task-side mapping before provider writes",async t=>{
+  const mapping={profile:"home",taskId:"task",eventId:"active",recurrenceOwner:"calendar",seriesId:"calendar-series",
+    masterEventId:"master",activeInstanceId:"active",calendarProgressVersion:1,updatedAt:"2026-10-02T00:00:00Z"};
+  const shared={taskId:"task",syncRecurrenceOwner:"calendar"};
+  const master=event("master",{iCalUID:"calendar-series",recurrence:["RRULE:FREQ=WEEKLY"],extendedProperties:{shared:{...shared}}});
+  const elapsed=event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},recurringEventId:"master",
+    originalStartTime:{date:"2025-05-02"},extendedProperties:{shared:{...shared}}});
+  const active=event("active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurringEventId:"master",
+    originalStartTime:{date:"2099-12-18"},extendedProperties:{shared:{...shared}}});
+  const taskMapping={...mapping,recurrenceId:"unexpected-series"};
+  const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[taskMapping],recurrence:{...mapping,owner:"calendar"}});
+  h.eventMappingMap.set("home:active",mapping);
+  h.ownerMappingMap.set("task",taskMapping);
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/verified Calendar-owned master/);
   assert.deepEqual(h.writes,[]);
 });
 

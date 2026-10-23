@@ -365,6 +365,9 @@ export class ReviewEngine {
         const taskSnapshot=snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="todoist"&&s.ref.id===linkedTaskId);
         const taskMapping=await this.state.getMappingByTask(intent.profile,linkedTaskId);
         const ownerMapping=await this.state.getMappingByTaskAnyProfile(linkedTaskId);
+        let globalRecurrenceLink:Awaited<ReturnType<StateRepository["getRecurrenceLinkByTaskAnyProfile"]>>;
+        try { globalRecurrenceLink=await this.state.getRecurrenceLinkByTaskAnyProfile(linkedTaskId); }
+        catch { invalidRepairIntent("The Todoist task is claimed by multiple recurrence links across profiles; resolve recurrence ownership before detaching history"); }
         const activeId=recurrenceLink?.activeInstanceId;
         let activeSnapshot=activeId?snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="calendar"&&s.ref.id===activeId):undefined;
         if(activeId&&!activeSnapshot) {
@@ -385,11 +388,14 @@ export class ReviewEngine {
           ||reviewHash(mappingPayload(taskMapping))!==reviewHash(mappingPayload(ownerMapping))
           ||reviewHash(mappingPayload(taskSnapshot.mapping as Mapping|undefined))!==reviewHash(mappingPayload(ownerMapping))
           ||!taskMapping||taskMapping.profile!==intent.profile||taskMapping.taskId!==linkedTaskId
+          ||taskMapping.recurrenceId
           ||taskMapping.recurrenceOwner!=="calendar"||taskMapping.seriesId!==seriesId||taskMapping.masterEventId!==master.id
           ||taskMapping.eventId!==activeId||taskMapping.activeInstanceId!==activeId||taskMapping.calendarProgressVersion!==1
           ||recurrenceLink.calendarProgressVersion!==1
           ||recurrenceLink.eventId!==activeId||recurrenceLink.activeInstanceId!==activeId
-          ||reviewHash(mappingPayload(activeSnapshot?.mapping))!==reviewHash(mappingPayload(taskMapping))) {
+          ||reviewHash(mappingPayload(activeSnapshot?.mapping))!==reviewHash(mappingPayload(taskMapping))
+          ||masterSnapshot?.mapping
+          ||reviewHash(globalRecurrenceLink)!==reviewHash(recurrenceLink)) {
           invalidRepairIntent("Elapsed occurrence detachment requires a verified Calendar-owned master, intact recurrence indexes, and one live mapped future occurrence");
         }
         if(selectedEvent.extendedProperties?.shared?.taskId!==linkedTaskId
