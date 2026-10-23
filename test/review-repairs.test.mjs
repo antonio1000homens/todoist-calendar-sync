@@ -472,6 +472,8 @@ test("production Gabriel and Lennox series repair leaves the one-off event uncha
     assert.equal(unchangedPlan.operation,"Leave unchanged",key);
     assert.equal(unchangedPlan.result,"Retain provider object, mapping, and sync control without changes",key);
   }
+  assert.deepEqual(preview.changes.filter(change=>change.startsWith("Replace existing association")), [],
+    "the overall preview must not claim that an unchanged mapping will be replaced");
   const unchangedSnapshot=preview.snapshots.find(item=>refKey(item.ref)===`home:calendar:${oneOffId}`);
   assert.equal(unchangedSnapshot.object.id,oneOffId);
   assert.equal(unchangedSnapshot.object.status,"confirmed");
