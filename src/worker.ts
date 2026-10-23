@@ -609,7 +609,11 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // authorized writer. Do not let generic error reporting mutate state
       // outside the profile fence.
       const mayWriteFailureState = process.env.ERASURE_PROTOCOL_VERSION !== "1" || !!releaseWriterLease;
-      if (mayWriteFailureState && delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
+      if (!mayWriteFailureState) {
+        failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
+      if (delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
         await state.recordReconciliationFailure(
           delivery.profile,
           delivery.reconcile.generation,

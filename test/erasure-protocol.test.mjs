@@ -145,6 +145,8 @@ test("fence-denied reconcile delivery cannot write failure state without a write
   process.env.STATE_TABLE_NAME = "test-state";
   let failureWrites = 0;
   const method = t.mock.method(StateRepository.prototype, "recordReconciliationFailure", async () => { failureWrites++; });
+  const audit = t.mock.method(StateRepository.prototype, "audit", async () => {});
+  const complete = t.mock.method(StateRepository.prototype, "markDeliveryCompleted", async () => {});
   documentClient.send = async command => {
     if (command.constructor.name === "GetCommand" && command.input.Key.sk === "EPOCH") return { Item: { epoch: 1 } };
     if (command.constructor.name === "GetCommand" && command.input.Key.sk === "FENCE") return { Item: { operationId: "op-active" } };
@@ -171,4 +173,11 @@ test("fence-denied reconcile delivery cannot write failure state without a write
   assert.deepEqual(result.batchItemFailures, [{ itemIdentifier: "message-1" }]);
   assert.equal(method.mock.callCount(), 0);
   assert.equal(failureWrites, 0);
+  for (const kind of ["todoist", "calendar"]) {
+    const providerDelivery = { ...delivery, id: `fenced-${kind}`, kind };
+    const providerResult = await handler({ Records: [{ messageId: `message-${kind}`, body: JSON.stringify(providerDelivery), attributes: {}, messageAttributes: {} }] }, { awsRequestId: `request-${kind}` });
+    assert.deepEqual(providerResult.batchItemFailures, [{ itemIdentifier: `message-${kind}` }]);
+  }
+  assert.equal(audit.mock.callCount(), 0);
+  assert.equal(complete.mock.callCount(), 0);
 });
