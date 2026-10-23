@@ -92,6 +92,51 @@ test('health retries a failed alert post and only deduplicates confirmed deliver
   assert.equal(calls.length, 2);
 });
 
+test('stuck incidents persist structured generation diagnostics without exposing raw errors', async (t) => {
+  fakeSlack(t);
+  const store = new Store();
+  const state = new StateRepository();
+  const checkpoint = { phase: 'mapped', sequence: 2, deliveryId: 'reconcile:home:old:chunk:2', afterTaskId: 'task-25', observedAt: old };
+  reconciliationDatabase(t, [run({
+    status: 'failed', lastFailedAt: old, lastProgressAt: old, lastError: 'secret-bearing provider response',
+    failureContext: { category: 'provider_http_503', stage: 'mapped', status: 503, taskId: 'task-7' },
+    progressCheckpoint: checkpoint, lastDeliveryId: 'reconcile:home:old:chunk:2',
+  })]);
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await checkReconciliationHealth(state, service, ['home']);
+  const incident = [...store.decisions.values()][0];
+  assert.equal(incident.context.reconciliationGeneration, 'old');
+  assert.equal(incident.context.incidentClassification, 'worker_failure');
+  assert.equal(incident.context.failureCategory, 'provider_http_503');
+  assert.equal(incident.context.failureSummary, 'A provider request returned HTTP 503.');
+  assert.equal(incident.context.progressCheckpoint.afterTaskId, 'task-25');
+  assert.equal(incident.context.failureContext.taskId, 'task-7');
+  assert.equal(incident.context.detail.includes('secret-bearing'), false);
+  assert.match(incident.context.queueStateNote, /not queried/);
+});
+
+test('monitor-only stalls are labeled without inferring a worker failure or raw cause', async (t) => {
+  fakeSlack(t);
+  const store = new Store();
+  reconciliationDatabase(t, [run({ status: 'running', lastStartedAt: old, lastProgressAt: old })]);
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await checkReconciliationHealth(new StateRepository(), service, ['home']);
+  const incident = [...store.decisions.values()][0];
+  assert.equal(incident.context.incidentClassification, 'monitor_stall');
+  assert.equal(incident.context.failureCategory, undefined);
+  assert.match(incident.context.detail, /does not identify why progress stopped/);
+  assert.equal(incident.context.progressCheckpoint, undefined);
+});
+
+test('fresh progress suppresses a delayed-but-active monitor alert', async (t) => {
+  fakeSlack(t);
+  const store = new Store();
+  reconciliationDatabase(t, [run({ status: 'running', lastStartedAt: old, lastProgressAt: new Date().toISOString() })]);
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await checkReconciliationHealth(new StateRepository(), service, ['home']);
+  assert.equal(store.decisions.size, 0);
+});
+
 test('notification retry reuses its reply and tolerates an already-resolved incident after a new generation starts', async (t) => {
   const calls = fakeSlack(t);
   const db = reconciliationDatabase(t, [run()]);

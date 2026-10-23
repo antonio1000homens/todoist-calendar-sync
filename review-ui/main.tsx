@@ -4,7 +4,7 @@ import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, re
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
-type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string };
+type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
@@ -233,8 +233,11 @@ function App() {
     catch(e:any){if(e.data?.operation)setOperation(e.data.operation);setMessage(e.message);} finally{setBusy(false);}
   };
   const runReconciliation=async () => {
+    const targetProfile=selected?.profile||reconcileProfile;
+    if(selected?.decision?.type==="operational_reconciliation_stuck"
+      && !window.confirm(`Request reconciliation for ${targetProfile}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
     setBusy(true);setMessage("");
-    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:reconcileProfile})});setReconciliation(result.reconciliation);const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${reconcileProfile}. Reconciliation requested.`); }
+    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:targetProfile})});setReconciliation(result.reconciliation);const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${targetProfile}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}.`); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const dismissAlert=async () => {
@@ -257,7 +260,48 @@ function App() {
     <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
-        {selected.decision?.type?.startsWith("operational_")&&<details className="preview"><summary>Delivery failure details</summary><dl>
+        {selected.decision?.type==="operational_reconciliation_stuck"&&<section className="preview"><h3>Reconciliation diagnostics</h3>
+          <dl>
+            <dt>Generation</dt><dd>{selected.reconciliationGeneration||selected.decision.context?.reconciliationGeneration||"Not recorded"}</dd>
+            <dt>Profile</dt><dd>{selected.profile}</dd>
+            <dt>Incident classification</dt><dd>{(selected.decision.context?.incidentClassification||"legacy monitor alert").replaceAll("_"," ")}</dd>
+            {selected.decision.context?.reconciliationStatus&&<><dt>Status at alert</dt><dd>{selected.decision.context.reconciliationStatus}</dd></>}
+            {selected.decision.context?.failureCategory&&<><dt>Failure category</dt><dd>{selected.decision.context.failureCategory.replaceAll("_"," ")}</dd></>}
+            {selected.decision.context?.failureSummary&&<><dt>Observed failure</dt><dd>{selected.decision.context.failureSummary}</dd></>}
+            {selected.decision.context?.lastProgressAt&&<><dt>Last progress</dt><dd>{new Date(selected.decision.context.lastProgressAt).toLocaleString()}</dd></>}
+            {selected.decision.context?.lastStartedAt&&<><dt>Started</dt><dd>{new Date(selected.decision.context.lastStartedAt).toLocaleString()}</dd></>}
+            {(selected.progressCheckpoint||selected.decision.context?.progressCheckpoint)&&<><dt>Last checkpoint</dt><dd>{[selected.progressCheckpoint?.phase||selected.decision.context.progressCheckpoint.phase,
+              `sequence ${selected.progressCheckpoint?.sequence??selected.decision.context.progressCheckpoint.sequence??0}`].filter(Boolean).join(" · ")}</dd>
+              {(selected.progressCheckpoint?.afterTaskId||selected.decision.context.progressCheckpoint.afterTaskId)&&<><dt>Todoist cursor</dt><dd>{selected.progressCheckpoint?.afterTaskId||selected.decision.context.progressCheckpoint.afterTaskId}</dd></>}
+              {(selected.progressCheckpoint?.afterEventId||selected.decision.context.progressCheckpoint.afterEventId)&&<><dt>Calendar cursor</dt><dd>{selected.progressCheckpoint?.afterEventId||selected.decision.context.progressCheckpoint.afterEventId}</dd></>}
+            </>}
+            {selected.decision.context?.lastStartedDeliveryId&&<><dt>Last started delivery</dt><dd>{selected.decision.context.lastStartedDeliveryId}</dd></>}
+            {selected.decision.context?.lastDeliveryId&&<><dt>Latest accepted delivery</dt><dd>{selected.decision.context.lastDeliveryId}</dd></>}
+            {selected.decision.context?.nextContinuation&&<><dt>Expected continuation</dt><dd>{selected.decision.context.nextContinuation.deliveryId} · {selected.decision.context.nextContinuation.phase} sequence {selected.decision.context.nextContinuation.sequence}</dd>
+              {selected.decision.context.nextContinuation.afterTaskId&&<><dt>Next Todoist cursor</dt><dd>{selected.decision.context.nextContinuation.afterTaskId}</dd></>}
+              {selected.decision.context.nextContinuation.afterEventId&&<><dt>Next Calendar cursor</dt><dd>{selected.decision.context.nextContinuation.afterEventId}</dd></>}
+            </>}
+            {selected.decision.context?.failureContext?.stage&&<><dt>Failure stage</dt><dd>{selected.decision.context.failureContext.stage}</dd></>}
+            {selected.decision.context?.failureContext?.status&&<><dt>Provider status</dt><dd>HTTP {selected.decision.context.failureContext.status}</dd></>}
+            {selected.decision.context?.failureContext?.taskId&&<><dt>Failing task ID</dt><dd>{selected.decision.context.failureContext.taskId}</dd></>}
+            {selected.decision.context?.failureContext?.eventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.failureContext.eventId}</dd></>}
+            {selected.decision.context?.reconciliationResult&&<><dt>Recorded progress counts</dt><dd>{Object.entries(selected.decision.context.reconciliationResult).map(([key,value])=>`${key}: ${value}`).join(" · ")}</dd></>}
+            <dt>Queue state</dt><dd>{selected.decision.context?.queueState||"Unknown"}. {selected.decision.context?.queueStateNote||"Current SQS/DLQ state was not recorded."}</dd>
+          </dl>
+          {details?.reconciliation?.relationToAlert==="different_generation"&&<p className="notice">A different generation is current. This alert refers to an older run.</p>}
+          {details?.reconciliation?.relationToAlert==="progressed_since_alert"&&<p className="notice">This generation recorded progress after the alert. Check its latest checkpoint before deciding whether another run is needed.</p>}
+          {details?.reconciliation?.relationToAlert==="completed_since_alert"&&<p className="notice">This generation has a recorded terminal completion since the alert.</p>}
+          {details?.reconciliation?.relationToAlert==="failed_since_alert"&&<p className="notice">This generation recorded a worker failure after the alert. The failure category below is diagnostic context, not proof of the cause of the original stall.</p>}
+          {!selected.decision.context?.progressCheckpoint&&!details?.reconciliation?.run?.progressCheckpoint&&<p className="notice">No persisted progress checkpoint is available for this run.</p>}
+          {details?.reconciliation?.relationToAlert==="same_generation"&&details?.reconciliation?.run&&<p className="notice">Live run status: {details.reconciliation.run.status||"unknown"}; {details.reconciliation.run.pending?"still pending":"terminal"}. Dismissal of this alert is not evidence of recovery.</p>}
+          {details?.reconciliation?.run?.lastProgressAt&&<p>Latest live progress: {new Date(details.reconciliation.run.lastProgressAt).toLocaleString()}</p>}
+          {details?.reconciliation?.run?.progressCheckpoint&&<p>Latest live checkpoint: {details.reconciliation.run.progressCheckpoint.phase||"unknown phase"} sequence {details.reconciliation.run.progressCheckpoint.sequence??0}
+            {details.reconciliation.run.progressCheckpoint.afterTaskId?` · after task ${details.reconciliation.run.progressCheckpoint.afterTaskId}`:""}
+            {details.reconciliation.run.progressCheckpoint.afterEventId?` · after event ${details.reconciliation.run.progressCheckpoint.afterEventId}`:""}</p>}
+          {details?.reconciliation?.run?.nextContinuation&&<p>Current expected continuation: {details.reconciliation.run.nextContinuation.deliveryId} · {details.reconciliation.run.nextContinuation.phase} sequence {details.reconciliation.run.nextContinuation.sequence}</p>}
+          <p>These fields are diagnostics from persisted state. A monitor stall does not establish why progress stopped. A queue acceptance record does not confirm current queue or DLQ state.</p>
+        </section>}
+        {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<details className="preview"><summary>Delivery failure details</summary><dl>
           {selected.decision.context?.kind&&<><dt>Delivery type</dt><dd>{selected.decision.context.kind}</dd></>}
           {selected.decision.context?.status&&<><dt>Provider response</dt><dd>HTTP {selected.decision.context.status}</dd></>}
           {selected.decision.context?.failure&&<><dt>Failure</dt><dd>{selected.decision.context.failure}</dd></>}
@@ -304,7 +348,7 @@ function App() {
           {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(selectedItem&&action!=="separate")return null;const options=dispositionOptions(item);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}</select></label>}</div>;})}</div>}
           {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
-          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Run reconciliation for {selected.profile}</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>{selected.decision?.type==="operational_reconciliation_stuck"?`Request fresh reconciliation for ${selected.profile}`:`Run reconciliation for ${selected.profile}`}</button>
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
         {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} /><div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}

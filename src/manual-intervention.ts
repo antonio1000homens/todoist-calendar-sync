@@ -993,7 +993,8 @@ export class ManualInterventionService {
     return this.notifier.deliverReconciliationOutcome(channel, threadTs, replyTs, text);
   }
 
-  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string): Promise<boolean> {
+  async alertReconciliationNeeded(profile: Profile, identity: string, channel: string | undefined, detail: string,
+    diagnostic: Record<string, unknown> = {}): Promise<boolean> {
     const decisionId = `${profile}-operational_reconciliation_stuck-${fingerprint({ identity })}`;
     const existing = await this.store.get(decisionId);
     if (existing) {
@@ -1003,7 +1004,7 @@ export class ManualInterventionService {
     const now = isoNow();
     const decision: ManualDecision = {
       decisionId, profile, type: "operational_reconciliation_stuck", severity: "warning", status: "pending",
-      createdAt: now, decisionDeadline: plusDays(DEFAULT_DECISION_DEADLINE_DAYS), context: { identity, detail },
+      createdAt: now, decisionDeadline: plusDays(DEFAULT_DECISION_DEADLINE_DAYS), context: { identity, detail, ...diagnostic },
       fingerprint: fingerprint({ identity }), permittedActions: MANUAL_DECISION_CATALOG.operational_reconciliation_stuck.actions,
       ...(channel ? { slackChannelId: channel } : {}),
     };
