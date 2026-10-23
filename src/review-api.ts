@@ -175,10 +175,13 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
       if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
       if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
-      if (operation.status === "previewed" && operation.providerDeletionReady !== true)
-        fail(409,"The provider deletion and postflight workflow is not available; this preview remains durable but cannot be queued");
       if (!["previewed","queued","fencing","deleting","verifying"].includes(operation.status))
         fail(409,"This erasure operation cannot be started or resumed");
+      // Readiness is a hard admission gate for every start/resume request. An
+      // active persisted lifecycle must not be re-enqueued after readiness is
+      // revoked; the worker's own guard is only a second line of defense.
+      if (operation.providerDeletionReady !== true)
+        fail(409,"The provider deletion and postflight workflow is not available; this operation cannot be queued or resumed");
       if (operation.status === "previewed") {
         try { await operationStore.transition(operation.operationId,"previewed","queued"); }
         catch {

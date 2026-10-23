@@ -6,6 +6,7 @@ import { handler, reconciliationAlertRelation } from "../dist/review-api.js";
 import { ReviewStore } from "../dist/review-store.js";
 import { ReviewEngine } from "../dist/review-engine.js";
 import { StateRepository } from "../dist/repository.js";
+import { ErasureOperationStore } from "../dist/erasure-executor.js";
 
 const issuer = "https://alf1000.cloudflareaccess.com";
 const audience = "review-audience-test";
@@ -219,4 +220,23 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   },{})));
   assert.equal(submitted.status,202);
   assert.equal(queueCalls.length,1);
+
+  // Readiness revocation must reject a persisted active lifecycle before the
+  // API transitions state or hands another message to the queue.
+  const operationReads=[];
+  const transitions=[];
+  t.mock.method(ErasureOperationStore.prototype,"get",async id=>{
+    operationReads.push(id);
+    return {operationId:id,profile:"home",status:"deleting",providerDeletionReady:false,
+      lifecycle:{phase:"deleting",nextRunAt:"2026-10-23T10:00:00.000Z"}};
+  });
+  t.mock.method(ErasureOperationStore.prototype,"transition",async(...args)=>{transitions.push(args);});
+  const queueCountBefore=queueCalls.length;
+  const rejectedResume=await jsonResponse(await handler(event("/review/api/erasure-operations/erasure-1/start","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+  },{})));
+  assert.equal(rejectedResume.status,409,JSON.stringify(rejectedResume.body));
+  assert.equal(operationReads.length,1);
+  assert.deepEqual(transitions,[]);
+  assert.equal(queueCalls.length,queueCountBefore,"A false-ready active lifecycle must not be re-enqueued");
 });
