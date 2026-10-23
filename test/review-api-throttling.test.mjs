@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { createReviewApiClient, isAbortError } from "../review-ui/api-client.mjs";
+import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "../review-ui/api-client.mjs";
 
 const ok = data => Response.json(data);
 const throttled = headers => new Response("Lambda throttled", { status: 429, headers });
@@ -161,4 +161,37 @@ test("UI requests only the selected case and keeps failed detail panels out of r
   assert.match(source, /Retry case details/);
   assert.match(source, /disabled=\{busy\|\|!details\}/);
   assert.match(source, /!details\?<div className="notice detail-load"/);
+});
+
+test("reconciliation status polling starts slowly and backs off under repeated 429s",()=>{
+  assert.deepEqual([0,1,2,3,4,5,8].map(reconciliationPollDelayMs),[5000,10000,20000,40000,60000,60000,60000]);
+  const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  assert.match(source,/if\(terminal\|\|!data\.reconciliation\?\.pending\)[\s\S]*?setTerminalInboxRefreshPending\(true\)/);
+  assert.match(source,/createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
+  assert.doesNotMatch(source,/else timer=window\.setTimeout\(poll,1500\)/);
+});
+
+test("terminal inbox refresh retries independently after a failed refresh", async () => {
+  const scheduled=[];
+  let attempts=0, completed=0;
+  const errors=[];
+  const task=createRetryingTask({
+    run:async()=>{attempts++;if(attempts===1)throw new Error("temporary list failure");},
+    onSuccess:()=>completed++,
+    onError:error=>errors.push(error.message),
+    schedule:(callback,delay)=>{scheduled.push({callback,delay});return scheduled.length;},
+    cancel:()=>{},
+  });
+
+  task.start();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(attempts,1);
+  assert.deepEqual(errors,["temporary list failure"]);
+  assert.equal(scheduled[0].delay,10_000);
+
+  scheduled[0].callback();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(attempts,2);
+  assert.equal(completed,1);
+  task.stop();
 });

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { createReviewApiClient, isAbortError } from "./api-client.mjs";
+import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
@@ -32,6 +32,7 @@ function App() {
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
+  const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
   const [detailRetry,setDetailRetry] = useState(0);
@@ -123,20 +124,33 @@ function App() {
     if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
     let cancelled=false;
     let timer:number;
+    let pollFailures=0;
     const poll=async()=>{
       try {
         const data=await refreshReconciliation(reconcileProfile);
-        await refresh();
         if(cancelled)return;
+        pollFailures=0;
         const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
         const terminal=["succeeded","needs_review","failed"].includes(runStatus);
-        if(terminal||!data.reconciliation?.pending) setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
-        else timer=window.setTimeout(poll,1500);
-      } catch(e:any) { if(!cancelled){setMessage(e.message);timer=window.setTimeout(poll,3000);} }
+        if(terminal||!data.reconciliation?.pending) {
+          setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
+          setTerminalInboxRefreshPending(true);
+        } else timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
+      } catch(e:any) { if(!cancelled){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));} }
     };
-    timer=window.setTimeout(poll,1500);
+    timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
     return ()=>{cancelled=true;window.clearTimeout(timer);};
   },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
+  useEffect(() => {
+    if (!terminalInboxRefreshPending) return;
+    const refreshTask=createRetryingTask({
+      run:refresh,
+      onSuccess:()=>setTerminalInboxRefreshPending(false),
+      onError:(error:any)=>setMessage(`Run is terminal, but the review inbox could not refresh: ${error.message}`),
+    });
+    refreshTask.start();
+    return ()=>refreshTask.stop();
+  },[terminalInboxRefreshPending,profile,history]);
   const providerLink=(item:ProviderObject|undefined) => {
     const href=item?.url||item?.htmlLink;
     if (!href) return undefined;
