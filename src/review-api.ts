@@ -142,6 +142,21 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     if (method === "GET" && segments[0] === "cases" && segments.length === 2) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
+      const repairOperationId = item.decision?.type === "operational_dlq" && item.decision.context?.kind === "repair"
+        ? item.decision.context.repairOperationId : undefined;
+      if (item.decision?.type === "operational_dlq" && item.decision.context?.kind === "repair") {
+        if (typeof repairOperationId !== "string" || !repairOperationId) fail(409,"Repair operation context is unavailable; provider items cannot be safely hydrated");
+        const operation = await store.getOperation(repairOperationId);
+        const preview = operation?.preview;
+        if (!operation || !preview || operation.id !== repairOperationId || operation.preview.id !== preview.id
+          || preview.intent.profile !== item.profile || preview.intent.caseId !== item.id
+          || (operation.status !== "failed" && operation.status !== "needs_review")) {
+          fail(409,"Repair operation does not match this incident; provider items cannot be safely hydrated");
+        }
+        const snapshots = await new ReviewEngine(store).collect(preview.intent,item.decision);
+        return response(200,{item:{...item,taskId:preview.intent.taskId,eventId:preview.intent.eventId,
+          repairContext:{operationId:operation.id,status:operation.status,itemPlan:preview.itemPlan}},snapshots});
+      }
       const intent: RepairIntent = { caseId:item.id, profile:item.profile, action:item.decision?"decision":"link",
         taskId:item.taskId || (typeof item.decision?.context?.providerTaskId === "string" ? item.decision.context.providerTaskId : undefined),
         eventId:item.eventId || (typeof item.decision?.context?.providerEventId === "string" ? item.decision.context.providerEventId : undefined),
