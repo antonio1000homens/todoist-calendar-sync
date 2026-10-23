@@ -12,7 +12,8 @@ export interface StandaloneAnnualPlan {
   sourceId: string;
   sourceEtag: string;
   masterId: string;
-  mode: "keep-history" | "annualize-in-place";
+  activeInstanceId?: string;
+  mode: "keep-history" | "annualize-in-place" | "reuse-existing";
   rule: string;
   start: string;
   end: string;
@@ -37,7 +38,7 @@ const hashTask = (task: TodoistTask) => createHash("sha256").update(JSON.stringi
 const addDays = (date: string, n: number) => new Date(day(date) + n * 86400000).toISOString().slice(0, 10);
 
 export function planStandaloneAnnualRepair(
-  profile: Profile, task: TodoistTask, source: CalendarEvent, timeZone: string, now = new Date(),
+  profile: Profile, task: TodoistTask, source: CalendarEvent, timeZone: string, now = new Date(), existingMasterId?: string, activeInstanceId?: string,
 ): StandaloneAnnualPlan {
   if (!source.id || !source.etag || source.status !== "confirmed" || source.recurringEventId || source.recurrence?.length) {
     throw new Error("Select a confirmed standalone Calendar event without a recurrence or parent");
@@ -66,12 +67,12 @@ export function planStandaloneAnnualRepair(
   }
   const sameDay = start === due;
   const duration = Math.round((day(end) - day(start)) / 86400000);
-  const mode = sameDay ? "annualize-in-place" : "keep-history";
-  const masterId = sameDay ? source.id : createHash("sha256")
+  const mode = sameDay ? "annualize-in-place" : existingMasterId ? "reuse-existing" : "keep-history";
+  const masterId = sameDay ? source.id : existingMasterId || createHash("sha256")
     .update(`standalone-annual-v1:${profile}:${task.id}:${source.id}:${due}:${rule}`)
     .digest("hex").slice(0, 32);
   return {
-    sourceId: source.id, sourceEtag: source.etag, masterId, mode, rule,
+    sourceId: source.id, sourceEtag: source.etag, masterId, activeInstanceId, mode, rule,
     start: due, end: addDays(due, duration), originalStart: start, originalEnd: end,
     timeZone, taskFingerprint: hashTask(task),
   };
@@ -103,8 +104,20 @@ export async function verifyStandaloneAnnualOwnership(
     && normalize(other.content) === normalize(task.content))) {
     throw new Error("Another active Todoist task has the same title; resolve the competing mirror before annualizing");
   }
+  if (plan.mode === "reuse-existing") {
+    const active = occurrences.find(item => item.status !== "cancelled" && item.recurringEventId === plan.masterId
+      && item.start?.date === plan.start && normalize(item.summary) === normalize(task.content));
+    if (!active) throw new Error("The existing annual Calendar series no longer has the selected Todoist occurrence");
+    const master = await pair.calendar.getEvent(plan.masterId);
+    const shared = master.extendedProperties?.shared;
+    if (!calendarRecurrenceMatchesTodoist(master, task) || normalize(master.summary) !== normalize(task.content)
+      || (shared?.taskId && shared.taskId !== task.id)) {
+      throw new Error("The matching Calendar recurrence is not already a verified Todoist-owned series; use a guarded ownership transfer");
+    }
+  }
   const conflicting = occurrences.find(item => item.status !== "cancelled"
     && item.id !== source.id && item.recurringEventId !== source.id
+    && !(plan.mode === "reuse-existing" && item.recurringEventId === plan.masterId)
     && !(allowApprovedResume && (item.id === plan.masterId || item.recurringEventId === plan.masterId))
     && normalize(item.summary) === normalize(task.content));
   if (conflicting) {
@@ -145,10 +158,10 @@ export async function applyStandaloneAnnualRepair(
     if (!marker || marker.status !== "pending" || marker.profile !== profile
       || marker.taskId !== task.id || marker.oldMasterId !== plan.sourceId
       || marker.newMasterId !== plan.masterId
-      || marker.previousOccurrence !== (plan.mode === "keep-history" ? plan.originalStart : undefined)) {
+      || marker.previousOccurrence !== (plan.mode !== "annualize-in-place" ? plan.originalStart : undefined)) {
       throw new Error("Annual repair provider was modified without its exact pending split guard; manual review required");
     }
-    if (plan.mode === "keep-history") {
+    if (plan.mode !== "annualize-in-place") {
       assertStandaloneHistory(source, plan, task.id);
       if (source.summary !== approvedSource.summary || source.description !== approvedSource.description) {
         throw new Error("Historical standalone fields changed after the approved repair");
@@ -177,7 +190,9 @@ export async function applyStandaloneAnnualRepair(
       return {mapping:previous,master:complete};
     }
   } else {
-    const recalculated = planStandaloneAnnualRepair(profile, task, source, zone);
+    const recalculated = planStandaloneAnnualRepair(profile, task, source, zone, new Date(),
+      plan.mode === "reuse-existing" ? plan.masterId : undefined,
+      plan.mode === "reuse-existing" ? plan.activeInstanceId : undefined);
     for (const field of ["masterId", "mode", "rule", "start", "end", "originalStart", "originalEnd"] as const) {
       if (recalculated[field] !== plan[field]) throw new Error(`Approved annual repair changed (${field}); refresh the preview`);
     }
@@ -185,9 +200,9 @@ export async function applyStandaloneAnnualRepair(
   await verifyStandaloneAnnualOwnership(profile, task, source, plan, pair, state, started);
   // Fence Todoist deliveries before Calendar becomes a visible recurring master.
   await state.beginFutureSeriesSplit(profile, task.id, source.id, plan.masterId,
-    plan.mode === "keep-history" ? plan.originalStart : undefined);
+    plan.mode !== "annualize-in-place" ? plan.originalStart : undefined);
   let master: CalendarEvent;
-  if (plan.mode === "keep-history") {
+  if (plan.mode !== "annualize-in-place") {
     const shared = { ...(source.extendedProperties?.shared || {}) };
     delete shared.taskId; delete shared.taskUrl; delete shared.syncRecurrenceOwner;
     delete shared.todoistRecurrence; delete shared.todoistAnchorStart; delete shared.todoistAnchorEnd;
@@ -203,7 +218,7 @@ export async function applyStandaloneAnnualRepair(
       assertStandaloneHistory(preserved, plan, task.id);
     }
     const projected = toCalendarEvent(task);
-    master = await pair.calendar.createFutureMasterOnce({
+    master = plan.mode === "reuse-existing" ? await pair.calendar.getEvent(plan.masterId) : await pair.calendar.createFutureMasterOnce({
       ...projected, id: plan.masterId, start: { date:plan.start }, end:{ date:plan.end },
       extendedProperties: { ...projected.extendedProperties, shared: {
         ...projected.extendedProperties?.shared, syncHistoryMasterId:source.id,
@@ -214,18 +229,24 @@ export async function applyStandaloneAnnualRepair(
   } else if (started) {
     master = source;
   } else {
-    const projected = toCalendarEvent(task, source);
+    const shared = { ...(source.extendedProperties?.shared || {}) };
+    for (const key of ["syncHistoryMasterId", "syncHistoryCutoff", "syncHistoryOnly", "syncHistoryTaskId",
+      "syncHistorySuccessorId", "syncHistoryOriginalRule", "syncRecurrenceOwner", "todoistRecurrence",
+      "todoistAnchorStart", "todoistAnchorEnd", "todoistAnchorAllDay", "todoistAnchorTimeZone",
+      "todoistTemplateSummary", "todoistTemplateDescription", "syncSplitVersion"]) delete shared[key];
+    const cleanSource = { ...source, extendedProperties: { ...source.extendedProperties, shared } };
+    const projected = toCalendarEvent(task, cleanSource);
     master = await pair.calendar.upsertEventIfUnchanged({
-      ...source, ...projected, id:source.id, status:"confirmed",
+      ...cleanSource, ...projected, id:source.id, status:"confirmed",
       start:{date:plan.start}, end:{date:plan.end},
-      extendedProperties:{...source.extendedProperties,shared:{
-        ...source.extendedProperties?.shared,...projected.extendedProperties?.shared,
+      extendedProperties:{...cleanSource.extendedProperties,shared:{
+        ...cleanSource.extendedProperties?.shared,...projected.extendedProperties?.shared,
         todoistAnchorEnd:plan.end, todoistAnchorTimeZone:zone,
       }},
     }, plan.sourceId, source.etag!);
   }
-  if (master.id !== plan.masterId || master.start?.date !== plan.start
-    || master.end?.date !== plan.end || !calendarRecurrenceMatchesTodoist(master, task)
+  if (master.id !== plan.masterId || (plan.mode !== "reuse-existing" && (master.start?.date !== plan.start
+    || master.end?.date !== plan.end)) || !calendarRecurrenceMatchesTodoist(master, task)
     || !hasCanonicalState(master, task)) {
     throw new Error("Created Calendar recurrence differs from approved annual master; manual review is required");
   }

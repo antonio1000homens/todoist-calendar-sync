@@ -970,7 +970,8 @@ test("yearly standalone refuses duplicate mirrors, existing series, unsupported 
   for(const option of ["duplicate","series","unsupported","mapped","scope"]) {
     const tsk=task("task",{due:option==="unsupported"?{...due,string:"every! year"}:due});
     const moreTasks=option==="duplicate"?[task("other",{due:{date:"2099-12-18"}})]:[];
-    const moreEvents=option==="series"?[event("occurrence",{recurringEventId:"existing-master"})]:[];
+    const moreEvents=option==="series"?[event("existing-master",{start:{date:"2098-12-18"},recurrence:["RRULE:FREQ=YEARLY"]}),
+      event("occurrence",{recurringEventId:"existing-master"})]:[];
     const mappings=option==="mapped"?[{profile:"home",taskId:"task",eventId:"event"}]:[];
     const h=harness(t,{events:[event(),...moreEvents],tasks:[tsk,...moreTasks],mappings});
     await assert.rejects(h.engine.preview(actor,intent({owner:"todoist",winner:"todoist",scope:option==="scope"?"occurrence":"future"})),
@@ -981,6 +982,30 @@ test("yearly standalone refuses duplicate mirrors, existing series, unsupported 
       /Future occurrences/);
     assert.deepEqual(h.writes,[]);
   }
+});
+
+test("yearly standalone reuses the exact active occurrence of an already Todoist-owned annual master",async t=>{
+  const recurring=task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}});
+  const key=todoistRecurrenceKey(recurring);
+  const master=event("existing-master",{start:{date:"2026-12-18"},end:{date:"2026-12-21"},
+    recurrence:[todoistRecurrenceToRrule(recurring)],extendedProperties:{shared:{taskId:"task",syncRecurrenceOwner:"todoist",
+      todoistRecurrence:key,todoistAnchorStart:"2026-12-18",todoistAnchorEnd:"2026-12-21",todoistAnchorAllDay:"true",
+      todoistAnchorTimeZone:"Europe/London"}}});
+  const active=event("existing-active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurrence:undefined,
+    recurringEventId:master.id,originalStartTime:{date:"2099-12-18"},extendedProperties:master.extendedProperties});
+  const source=event("event",{start:{date:"2098-12-18"},end:{date:"2098-12-21"},extendedProperties:{shared:{taskId:"task"}}});
+  const h=harness(t,{events:[source,master,active],tasks:[recurring]});
+  const input=intent({owner:"todoist",winner:"todoist",scope:"future"});
+  const preview=await h.engine.preview(actor,input);
+  assert.equal(preview.annualPlan.mode,"reuse-existing");
+  assert.equal(preview.annualPlan.masterId,"existing-master");
+  assert.equal(preview.annualPlan.activeInstanceId,"existing-active");
+  const result=await h.execute(input);
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.mappingMap.get("task").masterEventId,"existing-master");
+  assert.equal(h.eventMap.get("event").extendedProperties.shared.syncHistorySuccessorId,"existing-master");
+  assert.ok(!h.writes.some(write=>write[0]==="create-future-master"));
+  assert.equal(h.taskMap.size,1);
 });
 
 test("stale annual preview cannot write to a modified standalone event", async t=>{
@@ -1019,7 +1044,11 @@ test("yearly historical event survives a lost future-master acknowledgement and 
 });
 
 test("same-date annualizing can resume after the Calendar update but before reading its occurrence",async t=>{
-  const h=harness(t,{tasks:[task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}})]});
+  const h=harness(t,{events:[event("event",{extendedProperties:{shared:{syncHistoryMasterId:"stale-master",
+    syncSplitVersion:"stale-version",
+    syncRecurrenceOwner:"todoist",todoistRecurrence:"stale-rule",todoistAnchorStart:"2098-12-18",
+    todoistAnchorEnd:"2098-12-21"}}})],
+    tasks:[task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}})]});
   const read=h.clients.calendar.listInstancesInWindow;
   let calls=0;
   h.clients.calendar.listInstancesInWindow=async(...args)=>{
@@ -1032,6 +1061,10 @@ test("same-date annualizing can resume after the Calendar update but before read
   const result=await h.engine.execute("repair");
   assert.equal(result.status,"succeeded",result.error);
   assert.equal(h.mappingMap.get("task").masterEventId,"event");
+  const shared=h.eventMap.get("event").extendedProperties.shared;
+  assert.equal(shared.syncRecurrenceOwner,"todoist");
+  assert.equal(shared.todoistRecurrence,todoistRecurrenceKey(task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}})));
+  assert.ok(!shared.syncHistoryOnly && !shared.syncHistoryMasterId);
   assert.equal(h.writes.filter(w=>w[0]==="event" && w[1]==="event").length,2); // annualization + metadata link
   assert.equal(h.taskMap.size,1);
 });

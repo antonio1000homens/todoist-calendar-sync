@@ -15,6 +15,7 @@ import { planStandaloneAnnualRepair, verifyStandaloneAnnualOwnership, applyStand
 import { ManualDecisionStore, ManualInterventionService, type ManualDecision } from "./manual-intervention.js";
 import { ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
 import { guardRepairProviders } from "./repair-provider-guard.js";
+import { normalizedText } from "./security.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 const missing = (e: unknown) => [404, 410].includes(Number((e as { status?: number }).status));
@@ -202,7 +203,25 @@ export class ReviewEngine {
       const provider = await this.clients(intent.profile);
       try {
         const zone = await provider.calendar.getTimeZone();
-        preview.annualPlan = planStandaloneAnnualRepair(intent.profile, task, event, zone);
+        let existingMasterId: string | undefined;
+        let existingActiveInstanceId: string | undefined;
+        const due = task.due?.date;
+        if (due && /^\d{4}-\d{2}-\d{2}$/.test(due)) {
+          const nextDay = new Date(Date.parse(`${due}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+          const occurrences = await provider.calendar.listOccurrencesInWindow(`${due}T00:00:00Z`, `${nextDay}T00:00:00Z`);
+          for (const occurrence of occurrences) {
+            if (occurrence.status === "cancelled" || !occurrence.recurringEventId || occurrence.start?.date !== due
+              || normalizedText(occurrence.summary).toLowerCase() !== normalizedText(task.content).toLowerCase()) continue;
+            const master = await provider.calendar.getEvent(occurrence.recurringEventId);
+            if (calendarRecurrenceMatchesTodoist(master, task)
+              && (!master.extendedProperties?.shared?.taskId || master.extendedProperties.shared.taskId === task.id)) {
+              existingMasterId = master.id;
+              existingActiveInstanceId = occurrence.id;
+              break;
+            }
+          }
+        }
+        preview.annualPlan = planStandaloneAnnualRepair(intent.profile, task, event, zone, new Date(), existingMasterId, existingActiveInstanceId);
         await verifyStandaloneAnnualOwnership(intent.profile, task, event, preview.annualPlan, provider, this.state);
       } catch (error) {
         invalidRepairIntent(error instanceof Error ? error.message : "Unsupported standalone Calendar recurrence repair");
@@ -260,7 +279,9 @@ export class ReviewEngine {
         const p = preview.annualPlan;
         changes.push(p.mode === "keep-history"
           ? `Keep standalone Calendar event ${p.sourceId} unchanged as an event on ${p.originalStart}–${p.originalEnd} (remove only its obsolete task-link metadata); create future annual master ${p.masterId}`
-          : `Annualize Calendar event ${p.sourceId} in place without moving its date; retain its original occurrence as part of the series`);
+          : p.mode === "reuse-existing"
+            ? `Keep standalone Calendar event ${p.sourceId} as history and reuse verified Todoist-owned annual master ${p.masterId}`
+            : `Annualize Calendar event ${p.sourceId} in place without moving its date; retain its original occurrence as part of the series`);
         changes.push(`Calendar yearly series: DTSTART ${p.start}, DTEND ${p.end}, ${p.rule}, timezone ${p.timeZone}; master ID ${p.masterId}; map existing Todoist task ${task!.id} to its verified ${p.start} occurrence (Google instance ID verified at Apply)`);
       }
       changes.push(`Link Todoist task ${task!.id} to Calendar ${preview.annualPlan ? "annual series " + preview.annualPlan.masterId : "event " + event!.id}; ${intent.winner === "none" ? "retain matching fields" : `use ${intent.winner} fields`}`);
@@ -296,6 +317,10 @@ export class ReviewEngine {
     else if (intent.action === "verify") changes.push(`Verify the existing association between task ${intent.taskId || "(none)"} and event ${intent.eventId || "(none)"} without changing provider fields`);
     else changes.push(`${intent.action}: preserve the original provider items`);
     const chosen = new Set([intent.taskId && `todoist:${intent.taskId}`, intent.eventId && `calendar:${intent.eventId}`]);
+    if (preview.annualPlan?.mode === "reuse-existing" && preview.annualPlan.activeInstanceId) {
+      chosen.add(`calendar:${preview.annualPlan.activeInstanceId}`);
+      chosen.add(`calendar:${preview.annualPlan.masterId}`);
+    }
     const seriesProjections = new Set(snapshots.filter(s => s.ref.side === "calendar" && s.calendarProjectionId
       && (intent.leftovers[entityKey(s.ref)] === "create" || s.ref.id === intent.eventId && ["link","create"].includes(intent.action)))
       .map(s => s.calendarProjectionId!));
@@ -459,8 +484,9 @@ export class ReviewEngine {
       const originalEvent = eventSnapshot?.object as CalendarEvent | undefined;
       const splitHistoryMasterId = (snapshot: ReviewSnapshot) => operation.preview.splitPlan && snapshot.ref.side === "calendar"
         && (snapshot.ref.id === intent.eventId || (snapshot.object as CalendarEvent|null)?.recurringEventId === intent.eventId) ? intent.eventId : undefined;
-      const standaloneHistory = (snapshot: ReviewSnapshot) => operation.preview.annualPlan?.mode === "keep-history"
-        && snapshot.ref.side === "calendar" && snapshot.ref.id === operation.preview.annualPlan.sourceId;
+      const standaloneHistory = (snapshot: ReviewSnapshot) => Boolean(operation.preview.annualPlan
+        && operation.preview.annualPlan.mode !== "annualize-in-place"
+        && snapshot.ref.side === "calendar" && snapshot.ref.id === operation.preview.annualPlan.sourceId);
       const writeGate = async (profile: Profile) => { if (!await state.mutationAllowed(profile)) throw new Error("Mutation circuit is open. Wait for it to cool down, then resume this repair."); };
       const trackedWrite = async <T>(profile: Profile, run: () => Promise<T>, count: number | ((result: T) => number) = 1): Promise<T> => {
         await writeGate(profile);
