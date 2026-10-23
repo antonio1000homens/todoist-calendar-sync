@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference, repairRecurrenceOwnerRequirement, repairValidationField } from "../review-ui/repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference, repairRecurrenceOwnerRequirement, repairValidationField, operationResumeEligibility } from "../review-ui/repair-selection.mjs";
 
 const caseFor = (id, profile, taskId, eventId) =>
   ({ id, profile, taskId, eventId, decision:{context:{}}, status:"open" });
@@ -92,7 +92,6 @@ test("a missing Todoist or Calendar disposition triggers an affected-items refre
   assert.equal(missingDispositionReference("Mapping does not match the selected pair"),undefined);
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:calendar:"),undefined);
 });
-
 
 test("recurring Calendar occurrence requires an explicit owner for link preview", () => {
   const item=caseFor("recurring-case","work","task","occurrence");
@@ -201,4 +200,12 @@ test("review UI renders approved historical and future RRULEs and expiry before 
   assert.match(main, /validPreview\.splitPlan\.expiredUntil/);
   assert.match(main, /historical rule will not be extended/);
   assert.ok(main.indexOf("Historical Calendar rule") < main.lastIndexOf("Apply repair"));
+});
+
+test("failed repair resume requires recorded write evidence", () => {
+  assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}}}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}}}),"resume");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{},outcomes:[]}),"resume");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{},abandoned:true}),"none");
+  assert.equal(operationResumeEligibility({status:"queued",steps:{}}),"resume");
 });

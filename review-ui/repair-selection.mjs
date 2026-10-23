@@ -94,6 +94,21 @@ export function repairValidationField(message) {
   return undefined;
 }
 
+// Failed operation status alone does not prove that resuming can do useful work.
+// A validated checkpoint is read-only; any other started checkpoint may have
+// crossed a side-effect boundary and must retain its existing recovery path.
+export function operationResumeEligibility(operation) {
+  if (!operation || operation.abandoned || !["failed", "needs_review", "queued"].includes(operation.status)) return "none";
+  if (operation.status === "queued" || operation.status === "needs_review") return "resume";
+  const steps = operation.steps || {};
+  const hasWriteEvidence = Object.keys(steps).some(name => name !== "validated")
+    || Object.values(operation.creations || {}).length > 0
+    || Object.values(operation.expectedProviders || {}).some(value => value !== undefined)
+    || operation.outcomes !== undefined || operation.verified !== undefined
+    || operation.recurrenceBindings !== undefined;
+  return hasWriteEvidence ? "resume" : "fresh-preview";
+}
+
 export function repairPreviewAllowed(form, selected, details, action, decisionAction, owner = "") {
   if (!selected || !details || form.caseId !== selected.id || form.profile !== selected.profile
       || details.item?.id !== selected.id || details.item?.profile !== selected.profile) return false;
