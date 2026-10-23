@@ -18,7 +18,7 @@ import {
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
+import { calendarEventHasElapsed, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -43,18 +43,6 @@ function candidateLimit(): number {
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
-}
-
-function eventPoint(event: CalendarEvent, key: "start" | "end"): string | undefined {
-  const point = event[key];
-  return point?.dateTime || point?.date;
-}
-
-function eventEnded(event: CalendarEvent, now = Date.now()): boolean {
-  const end = eventPoint(event, "end") || eventPoint(event, "start");
-  if (!end) return false;
-  const parsed = Date.parse(end);
-  return Number.isFinite(parsed) && parsed < now;
 }
 
 function isTodoistOwnedProjection(event: CalendarEvent): boolean {
@@ -166,6 +154,9 @@ export async function reconcileUnmappedCalendar(
   const tasks = await pair.todoist.listTasks();
   const snapshot = await pair.calendar.listDelta();
   const now = Date.now();
+  const calendarTimeZone = snapshot.items.some((event) => event.end?.date && !event.end.dateTime)
+    ? pair.calendar.getTimeZone ? await pair.calendar.getTimeZone() : undefined
+    : undefined;
   const reservedTaskIds = new Set<string>();
 
   const canMutate = async (eventId?:string, taskId?:string): Promise<boolean> => {
@@ -374,7 +365,7 @@ export async function reconcileUnmappedCalendar(
     }
     const instances = await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
     const active = selectCalendarRecurrenceInstance(instances, undefined, now);
-    if (!active || active.status === "cancelled" || eventEnded(active, now)) {
+    if (!active || active.status === "cancelled" || calendarEventHasElapsed(active, now, calendarTimeZone)) {
       summary.skipped += 1;
       return;
     }
@@ -472,7 +463,7 @@ export async function reconcileUnmappedCalendar(
         summary.skipped += 1;
       } else if (event.recurrence?.length) {
         await createOrBindSeries(event);
-      } else if (eventEnded(event, now)) {
+      } else if (calendarEventHasElapsed(event, now, calendarTimeZone)) {
         summary.skipped += 1;
       } else {
         await createOrBindStandalone(event);

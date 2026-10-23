@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canRecreateCalendarProjection, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
+import { calendarEventHasElapsed, canRecreateCalendarProjection, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
@@ -42,6 +42,60 @@ test("multi-day Calendar events use only their first day as the Todoist due date
   const moved = toCalendarEvent({ ...task, due: { date: "2026-12-22" } }, original);
   assert.deepEqual(moved.start, { date: "2026-12-22" });
   assert.deepEqual(moved.end, { date: "2026-12-27" }, "a start edit shifts the original five-day span");
+});
+
+test("elapsed Calendar event classification honors exclusive all-day end dates in Calendar timezone", () => {
+  const event = { id: "all-day", start: { date: "2027-01-01" }, end: { date: "2027-01-02" } };
+  const now = Date.parse("2027-01-01T23:00:00Z");
+  assert.equal(calendarEventHasElapsed(event, now, "Europe/London"), false,
+    "the exclusive end date has not begun in the Calendar timezone");
+  assert.equal(calendarEventHasElapsed(event, now, "Asia/Tokyo"), true,
+    "the exclusive end date has begun in the Calendar timezone");
+  assert.equal(calendarEventHasElapsed(event, now), false,
+    "missing timezone data must not classify an all-day event as elapsed");
+  assert.equal(calendarEventHasElapsed({ ...event, end: { dateTime: "2027-01-01T23:00:00Z" } }, now), true);
+  assert.equal(calendarEventHasElapsed({ ...event, end: { dateTime: "2027-01-02T00:00:00Z" } }, now), false);
+  assert.equal(calendarEventHasElapsed({ ...event, recurringEventId: "master" }, now, "Asia/Tokyo"), true,
+    "occurrence end classification is independent; callers apply their series policy");
+});
+
+test("elapsed standalone Calendar delta cannot update the current Todoist task", async () => {
+  const mapping = { profile: "home", eventId: "old-calendar-event", taskId: "current-task", updatedAt: "2026-10-01T00:00:00Z" };
+  const event = {
+    id: mapping.eventId, status: "confirmed", summary: "Vehicle tax", description: "",
+    start: { date: "2025-05-02" }, end: { date: "2025-05-03" },
+    extendedProperties: { shared: { taskId: mapping.taskId, syncSource: "todoist-calendar-sync" } },
+  };
+  const audits = [];
+  let mappingWrites = 0, taskReads = 0, taskWrites = 0;
+  const state = {
+    async syncBlocked() { return false; },
+    async getMappingByEvent() { return structuredClone(mapping); },
+    async getMappingByTask() { return structuredClone(mapping); },
+    async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async mutationAllowed() { return true; },
+    async putMapping() { mappingWrites += 1; },
+    async recordMutation() {},
+    async getSyncToken() { return "sync-token"; },
+    async putSyncToken() {},
+    async audit(_profile, action, detail) { audits.push({ action, detail }); },
+  };
+  const calendar = {
+    async listDelta() { return { items: [event], nextSyncToken: "next-token" }; },
+    async getTimeZone() { return "Europe/London"; },
+  };
+  const todoist = {
+    async getTask() { taskReads += 1; return { id: mapping.taskId, content: "Vehicle tax", due: { date: "2027-05-02" } }; },
+    async upsertTask() { taskWrites += 1; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  await sync.process({ id: "elapsed-calendar-delta", kind: "calendar", profile: "home", mode: "aws", receivedAt: new Date().toISOString(), headers: {}, body: "" });
+
+  assert.equal(mappingWrites, 0);
+  assert.equal(taskReads, 0);
+  assert.equal(taskWrites, 0);
+  assert.equal(audits.some(({ action }) => action === "calendar_elapsed_standalone_event_ignored"), true);
 });
 
 test("timed Calendar events project the start only and preserve existing end offsets", () => {
