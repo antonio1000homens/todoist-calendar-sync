@@ -39,6 +39,22 @@ export function manualPendingLookupAttributes(input: Pick<{ profile: Profile; de
   };
 }
 
+export function profileLookupBackfillCondition(lookup: { lookupSk: string }): {
+  expression: string;
+  names?: Record<string, string>;
+  values: Record<string, string>;
+} {
+  const base = "attribute_exists(pk) AND attribute_exists(sk) AND attribute_not_exists(lookupPk) AND attribute_not_exists(lookupSk)";
+  if (!lookup.lookupSk.startsWith(MANUAL_PENDING_LOOKUP_PREFIX)) {
+    return { expression: base, values: {} };
+  }
+  return {
+    expression: `${base} AND #status = :pending`,
+    names: { "#status": "status" },
+    values: { ":pending": "pending" },
+  };
+}
+
 export function mappingLookupAttributes(mapping: Pick<Mapping, "profile" | "eventId" | "taskId">): Record<string, string> {
   return {
     lookupPk: profileLookupPk(mapping.profile),

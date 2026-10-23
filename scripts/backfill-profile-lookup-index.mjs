@@ -10,6 +10,7 @@ import {
   PROFILE_LOOKUP_MIGRATION_VERSION,
   PROFILE_LOOKUP_READY_KEY,
   PROFILE_LOOKUP_READY_SORT_KEY,
+  profileLookupBackfillCondition,
   recurrenceLookupSk,
   profileLookupParity,
 } from "../dist/profile-lookup.js";
@@ -138,12 +139,18 @@ async function backfillPass(label) {
       }
 
       try {
+        const condition = profileLookupBackfillCondition(lookup);
         await sendWithThrottleRetry(new UpdateCommand({
           TableName: tableName,
           Key: { pk: item.pk, sk: item.sk },
           UpdateExpression: "SET lookupPk = :lookupPk, lookupSk = :lookupSk",
-          ConditionExpression: "attribute_exists(pk) AND attribute_exists(sk) AND attribute_not_exists(lookupPk) AND attribute_not_exists(lookupSk)",
-          ExpressionAttributeValues: { ":lookupPk": lookup.lookupPk, ":lookupSk": lookup.lookupSk },
+          ConditionExpression: condition.expression,
+          ...(condition.names ? { ExpressionAttributeNames: condition.names } : {}),
+          ExpressionAttributeValues: {
+            ":lookupPk": lookup.lookupPk,
+            ":lookupSk": lookup.lookupSk,
+            ...condition.values,
+          },
         }), `${label}:update`);
         updated += 1;
       } catch (error) {
