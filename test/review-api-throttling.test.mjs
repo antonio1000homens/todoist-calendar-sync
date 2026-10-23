@@ -27,6 +27,42 @@ test("a realistic 24-case inbox never fans out more than one request at a time",
   assert.deepEqual(result.map(item => item.item.id), Array.from({ length: 24 }, (_, i) => `case-${i}`));
 });
 
+test("a 24-case inbox completes all detail loads through transient Lambda throttles", async () => {
+  let inFlight = 0, peak = 0, attempts = 0;
+  const attemptsByCase = new Map(), waits = [];
+  const throttledCases = new Set(["case-3", "case-10", "case-17", "case-22"]);
+  const api = createReviewApiClient({
+    fetchImpl: async path => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      attempts++;
+      const id = path.split("/").at(-1);
+      const count = (attemptsByCase.get(id) || 0) + 1;
+      attemptsByCase.set(id, count);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      inFlight--;
+      if (throttledCases.has(id) && count === 1) {
+        return throttled({ "Retry-After": "1" });
+      }
+      return ok({ item: { id }, snapshots: [{ provider: "todoist", items: [{ id: `${id}-task` }] }] });
+    },
+    wait: async ms => { waits.push(ms); },
+    random: () => 0,
+  });
+
+  // The inbox can expose many cases at once. Simulate their outstanding detail
+  // reads sharing one tab-level client while throttling hits several cases.
+  const details = await Promise.all(Array.from({ length: 24 }, (_, i) => api(`cases/case-${i}`)));
+
+  assert.equal(peak, 1);
+  assert.equal(details.length, 24);
+  assert.deepEqual(details.map(detail => detail.item.id), Array.from({ length: 24 }, (_, i) => `case-${i}`));
+  assert.deepEqual([...throttledCases].map(id => attemptsByCase.get(id)), [2, 2, 2, 2]);
+  assert.equal(attempts, 28);
+  assert.deepEqual(waits, [1000, 1000, 1000, 1000]);
+  assert.ok(details.every(detail => detail.snapshots[0].items.length === 1));
+});
+
 test("rapid case changes discard queued requests and abort the old selected case", async () => {
   const requested = [];
   const api = createReviewApiClient({
