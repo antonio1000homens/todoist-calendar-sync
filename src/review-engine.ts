@@ -488,6 +488,19 @@ export class ReviewEngine {
     if (["link","transfer"].includes(intent.action) && (!task || !event)) invalidRepairIntent("Linking requires a live task and event");
     if (["link","transfer","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
     if (["link","transfer","create"].includes(intent.action) && task?.is_deleted) invalidRepairIntent("Todoist repair sources must not be deleted; choose a live task or exclude the deleted item");
+    const selectedTaskSnapshot = snapshots.find(snapshot => snapshot.ref.profile === intent.profile
+      && snapshot.ref.side === "todoist" && snapshot.ref.id === intent.taskId);
+    if (intent.action === "link" && task && event && selectedTaskSnapshot?.mapping
+      && selectedTaskSnapshot.mapping.eventId !== event.id
+      && !selectedTaskSnapshot.mapping.recurrenceOwner && !selectedTaskSnapshot.mapping.seriesId && !selectedTaskSnapshot.mapping.masterEventId
+      && !event.recurringEventId && !event.recurrence?.length) {
+      const oldEvent = snapshots.find(snapshot => snapshot.ref.profile === intent.profile
+        && snapshot.ref.side === "calendar" && snapshot.ref.id === selectedTaskSnapshot.mapping!.eventId);
+      if (oldEvent?.mapping?.taskId === task.id && oldEvent.mapping.eventId === selectedTaskSnapshot.mapping.eventId
+        && intent.leftovers[entityKey(oldEvent.ref)] === "unchanged") {
+        invalidRepairIntent(`Cannot leave the currently mapped Calendar event ${oldEvent.ref.id} and its mapping unchanged while linking Todoist task ${task.id} to ${event.id}; choose Exclude to retain the old event while detaching its obsolete mapping`);
+      }
+    }
     if (intent.action === "link" && intent.winner === "todoist") {
       try {
         if(event?.recurringEventId && intent.owner === "todoist") todoistOccurrenceProjection(task!,event!);
