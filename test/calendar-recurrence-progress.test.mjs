@@ -146,7 +146,7 @@ function fakeClients(state, instances, link, masterDelta) {
       async listDelta() { return { items: masterDelta ? [masterDelta] : [], nextSyncToken: "next" }; },
       async listInstances() { return instances.map((item) => structuredClone(item)); },
       async deleteEvent(id) { calendarDeletes.push(id); state.operations.push({ action: "delete-calendar", id }); },
-      async getEvent(id) { return instances.find((item) => item.id === id); },
+      async getEvent(id) { return id === masterDelta?.id ? structuredClone(masterDelta) : instances.find((item) => item.id === id); },
       async findByTodoistTaskId() { return undefined; },
       async upsertEvent(event) { return { ...structuredClone(event), id: event.id || "stored" }; },
     },

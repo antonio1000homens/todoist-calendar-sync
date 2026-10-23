@@ -981,3 +981,55 @@ test("deleting the Todoist recurring task deletes its Calendar RRULE master", as
   assert.deepEqual(clients.calendarDeletes, [master.id]);
   assert.equal(state.links.length, 0);
 });
+
+for (const shape of ["title-date", "shared-master", "shared-instance", "one-off-other-profile", "recurring-existing-mirror"]) {
+  test(`Calendar worker blocks duplicate recurrence recovery: ${shape}`, async () => {
+    const current = instance("current", "2099-01-01", "2099-01-02");
+    const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
+    const task = { id:"original-task", content:current.summary, project_id:"home-project", due:{ date:current.start.date, is_recurring:true } };
+    if (shape === "shared-master" || shape === "one-off-other-profile") master.extendedProperties = {shared:{taskId:task.id}};
+    if (shape === "shared-instance") current.extendedProperties = {shared:{taskId:task.id}};
+    if (shape.startsWith("shared-")) task.content = "Renamed original";
+    if (shape === "one-off-other-profile") { task.project_id = "other-project"; task.due.is_recurring = false; }
+    const state = new FakeState(shape === "recurring-existing-mirror" ? linkFor(current,task.id) : undefined);
+    const clients = fakeClients(state,[current],new Map(shape === "one-off-other-profile" ? [] : [[task.id,task]]),master);
+    const sync = new Synchronizer(state,undefined,async () => clients);
+    const delivery = {id:"first",kind:"calendar",profile:PROFILE,mode:"aws",receivedAt:"2098-12-01T00:00:00Z",headers:{},body:""};
+    await sync.process(delivery);
+    await sync.process({...delivery,id:"retry"});
+    assert.deepEqual(clients.todoistUpserts,[]);
+    assert.deepEqual(clients.todoistDeletes,[]);
+    assert.equal(state.audits.filter(item => item.action === "calendar_snapshot_recurring_identity_conflict").length,2);
+  });
+}
+
+test("new genuinely Calendar-owned series creates one mirror across retries", async () => {
+  const current = instance("current", "2099-01-01", "2099-01-02");
+  const master = {id:MASTER,iCalUID:SERIES,summary:current.summary,recurrence:["RRULE:FREQ=YEARLY"],status:"confirmed"};
+  const state = new FakeState();
+  const clients = fakeClients(state,[current],new Map(),master);
+  const sync = new Synchronizer(state,undefined,async () => clients);
+  const delivery = {id:"first",kind:"calendar",profile:PROFILE,mode:"aws",receivedAt:"2098-12-01T00:00:00Z",headers:{},body:""};
+  await sync.process(delivery);
+  await sync.process({...delivery,id:"retry"});
+  assert.equal(clients.todoistUpserts.length,1);
+  assert.equal(state.links[0].taskId,clients.todoistUpserts[0].id);
+});
+
+for (const status of ["cancelled", "flattened", "gone", "excluded", "todoist-owned"]) {
+  test(`stale series delta cannot create a mirror after master is ${status}`, async () => {
+    const current = instance("current", "2099-01-01", "2099-01-02");
+    const master = {id:MASTER,iCalUID:SERIES,summary:current.summary,recurrence:["RRULE:FREQ=YEARLY"],status:"confirmed"};
+    const state = new FakeState();
+    const clients = fakeClients(state,[current],new Map(),master);
+    if (status === "gone") clients.events.delete(MASTER);
+    if (status === "cancelled") clients.events.set(MASTER,{...master,status:"cancelled"});
+    if (status === "flattened") clients.events.set(MASTER,{...master,recurrence:undefined});
+    if (status === "todoist-owned") clients.events.set(MASTER,{...master,extendedProperties:{shared:{syncRecurrenceOwner:"todoist",taskId:"annual-task"}}});
+    if (status === "excluded") state.syncBlocked = async (_profile,ids) => ids.eventId === MASTER;
+    const sync = new Synchronizer(state,undefined,async () => clients);
+    await sync.process({id:"stale",kind:"calendar",profile:PROFILE,mode:"aws",receivedAt:"2098-12-01T00:00:00Z",headers:{},body:""});
+    assert.deepEqual(clients.todoistUpserts,[]);
+    assert.deepEqual(state.links,[]);
+  });
+}
