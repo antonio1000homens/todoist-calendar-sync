@@ -13,6 +13,7 @@ import {
   profileLookupBackfillCondition,
   recurrenceLookupSk,
   profileLookupParity,
+  manualDecisionKeyMatches,
   terminalManualDecisionRepair,
   terminalManualDecisionRepairItems,
 } from "../dist/profile-lookup.js";
@@ -84,6 +85,9 @@ function lookupFor(item) {
   if (sk === "STATE" && pk.startsWith("MANUAL#") && item.status === "pending") {
     const owner = profile(item.profile);
     const decisionId = typeof item.decisionId === "string" ? item.decisionId : pk.slice("MANUAL#".length);
+    if (!manualDecisionKeyMatches(pk, decisionId)) {
+      throw new Error(`Pending decision key does not match decisionId for ${pk}/${sk}`);
+    }
     if (!owner || !decisionId || typeof item.createdAt !== "string") {
       throw new Error(`Cannot index malformed pending decision ${pk}/${sk}`);
     }
@@ -108,6 +112,9 @@ const totals = {
 async function repairTerminalManualRow(item, label) {
   if (item.sk !== "STATE" || !String(item.pk || "").startsWith("MANUAL#") || item.status !== "pending") return false;
   const decisionId = typeof item.decisionId === "string" ? item.decisionId : item.pk.slice("MANUAL#".length);
+  if (!manualDecisionKeyMatches(item.pk, decisionId)) {
+    throw new Error(`Pending decision key does not match decisionId for ${item.pk}/${item.sk}`);
+  }
   const caseResult = await sendWithThrottleRetry(new GetCommand({
     TableName: tableName,
     Key: { pk: `REVIEW_CASE#${decisionId}`, sk: "STATE" },

@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { profileLookupPacingDelayMs, profileLookupQueryInput } from "../dist/dynamodb-capacity.js";
-import { profileLookupBackfillCondition, terminalManualDecisionRepair, terminalManualDecisionRepairItems } from "../dist/profile-lookup.js";
+import { manualDecisionKeyMatches, profileLookupBackfillCondition, terminalManualDecisionRepair, terminalManualDecisionRepairItems } from "../dist/profile-lookup.js";
 
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const cleanupSource = await readFile(new URL("../scripts/cleanup-routine-audit.mjs", import.meta.url), "utf8");
@@ -97,6 +97,13 @@ test("backfill repairs only same-ID same-profile terminal cases and leaves orpha
   assert.equal(terminalManualDecisionRepair({...dismissed,id:"different"},manual),undefined);
   assert.equal(terminalManualDecisionRepair({...dismissed,status:"open"},manual),undefined);
   assert.equal(terminalManualDecisionRepair(undefined,{...manual,decisionId:"orphan-operational"}),undefined);
+});
+
+test("a pending row with a mismatched primary key and decisionId fails closed before repair or indexing", () => {
+  assert.equal(manualDecisionKeyMatches("MANUAL#decision-1", "decision-1"), true);
+  assert.equal(manualDecisionKeyMatches("MANUAL#canonical", "decision-1"), false);
+  assert.match(backfillSource, /if \(!manualDecisionKeyMatches\(item\.pk, decisionId\)\)\s*\{\s*throw new Error/);
+  assert.match(backfillSource, /if \(!manualDecisionKeyMatches\(pk, decisionId\)\)\s*\{\s*throw new Error/);
 });
 
 test("profile lookup backfill reconciles terminal mismatches transactionally before calculating pending parity",()=>{

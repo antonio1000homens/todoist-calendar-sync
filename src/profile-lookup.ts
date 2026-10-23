@@ -8,6 +8,10 @@ export const PROFILE_LOOKUP_READY_SORT_KEY = "READY";
 export const PROFILE_LOOKUP_MIGRATION_VERSION = 3;
 export const MANUAL_PENDING_LOOKUP_PREFIX = "MANUAL#PENDING#";
 
+export function manualDecisionKeyMatches(pk: unknown, decisionId: unknown): boolean {
+  return typeof pk === "string" && pk === `MANUAL#${String(decisionId)}`;
+}
+
 export interface ProfileLookupParity {
   missing: string[];
   unexpected: string[];
