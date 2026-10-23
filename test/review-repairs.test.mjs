@@ -281,6 +281,44 @@ function todoistSeriesFixture({moved=false}={}) {
   return {...fixture,tasks:[liveTask]};
 }
 
+test("Verify preview is a no-op for an already reciprocal association", async t => {
+  const mapping = { profile: "home", taskId: "task", eventId: "event" };
+  const mappingWrites = [];
+  t.mock.method(StateRepository.prototype, "putMapping", async value => mappingWrites.push(clone(value)));
+  const h = harness(t, {
+    events: [event("event", { extendedProperties: { shared: { taskId: "task" } } })],
+    mappings: [mapping],
+  });
+
+  const preview = await h.engine.preview(actor, intent({ action: "verify" }));
+
+  assert.ok(preview.changes.some(change => change.startsWith("Verify the existing association")));
+  assert.ok(preview.changes.every(change => !change.startsWith("Replace existing association")));
+  assert.equal(preview.itemPlan.length, 2);
+  assert.ok(preview.itemPlan.every(item => item.operation === "Verify existing association"));
+  assert.ok(preview.itemPlan.every(item => item.result === "Retain verified mapping; no provider fields changed"));
+
+  h.operations.set("repair", { id: "repair", status: "queued", steps: {}, preview });
+  const result = await h.engine.execute("repair");
+  assert.equal(result.status, "succeeded", result.error);
+  assert.deepEqual(h.writes, []);
+  assert.deepEqual(mappingWrites, []);
+  assert.deepEqual(h.mappingMap.get("task"), mapping);
+});
+
+test("Verify rejects an inconsistent mapping instead of planning a repair", async t => {
+  const h = harness(t, {
+    events: [event("event", { extendedProperties: { shared: { taskId: "task" } } })],
+    mappings: [{ profile: "home", taskId: "task", eventId: "another-event" }],
+  });
+
+  await assert.rejects(
+    h.engine.preview(actor, intent({ action: "verify" })),
+    /Selected pair does not match the current mapping/,
+  );
+  assert.deepEqual(h.writes, []);
+});
+
 test("Todoist-owned snapshots and Verify retain the overdue mapped occurrence instead of a future iteration",async t=>{
   const h=harness(t,todoistSeriesFixture());
   const preview=await h.engine.preview(actor,intent({action:"verify",eventId:"master",owner:"todoist",scope:"series"}));
