@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { advanceErasureOperation, enterFencedErasure, erasurePreviewFingerprint, finishFencedErasure, ErasureOperationStore } from "../dist/erasure-executor.js";
+import { advanceErasureOperation, advanceFencedLifecycle, assertErasureReadyForDelete, beginFencedRestoreLifecycle,
+  enterFencedErasure, erasurePreviewFingerprint, finishFencedErasure, initialFencedLifecycle, ErasureOperationStore } from "../dist/erasure-executor.js";
 
 const operation={operationId:"op",profile:"home",target:{taskId:"task",deleteCalendar:false},previewFingerprint:"digest",
   status:"previewed",createdAt:"2026-10-23T00:00:00Z",updatedAt:"2026-10-23T00:00:00Z"};
@@ -27,6 +28,108 @@ test("fence and journal are retained until mapping restoration completes",async(
     restoreMappings:async()=>{events.push("restore");throw new Error("restore failed")},
     finishFence:async()=>events.push("finish fence")}));
   assert.deepEqual(events,["restore"]);
+});
+
+test("fenced lifecycle advances one durable phase per invocation and honors next-run time",async()=>{
+  let now=10_000,leases=[{id:"writer"}],fence,failDisable=true,failRestore=true,failSaveAfterRelease=true;
+  const states=new Map([["uuid-enabled","Enabled"],["uuid-disabled","Enabled"]]);
+  const events=[];
+  const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
+    selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row",classification:"selected"}]};
+  const digest=erasurePreviewFingerprint(preview);
+  const operation={operationId:"op",...preview,previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"confirm",
+    status:"fencing",createdAt:"now",updatedAt:"now",lifecycle:initialFencedLifecycle({
+      mappingIds:["uuid-enabled","uuid-disabled"],enabledMappingIds:["uuid-enabled"],timeoutSeconds:30,
+    },now)};
+  const dep={now:()=>now,
+    disableMappings:async ids=>{events.push(["disable",ids]);if(failDisable){failDisable=false;throw new Error("transient disable failure");}
+      for(const id of ids)states.set(id,"Disabled");},
+    mappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
+    inspectFence:async()=>({fence,leases}),
+    beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
+    restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
+      for(const id of ids)states.set(id,"Enabled");},
+    finishFence:async(profile,id)=>{events.push(["finish",profile,id]);fence=undefined;},
+    save:async(_expectedStatus,expectedPhase,next,nextStatus)=>{
+      assert.equal(operation.lifecycle.phase,expectedPhase);
+      if(failSaveAfterRelease&&expectedPhase==="release_fence"&&next.phase==="complete"){
+        failSaveAfterRelease=false;throw new Error("simulated process crash after fence release");
+      }
+      operation.lifecycle=next;if(nextStatus)operation.status=nextStatus;
+    }};
+  const step=()=>advanceFencedLifecycle({operation,dependencies:dep});
+
+  let result=await step();
+  assert.equal(result.phase,"disable_mappings");assert.match(operation.lifecycle.lastError,/transient/);
+  const retryAt=operation.lifecycle.nextRunAt;now=retryAt;
+  assert.equal((await step()).phase,"confirm_disabled");
+  assert.equal((await step()).phase,"drain_before_fence");
+  result=await step();assert.equal(result.phase,"drain_before_fence");assert.equal(result.waiting,true);
+  const pollAt=operation.lifecycle.nextRunAt;
+  now=pollAt-1;const beforeWait=events.length;assert.equal((await step()).waiting,true);assert.equal(events.length,beforeWait);
+  now=pollAt;leases=[];assert.equal((await step()).phase,"install_fence");
+  assert.equal((await step()).phase,"wait_worker_timeout");
+  const workerDeadline=operation.lifecycle.nextRunAt;
+  now=workerDeadline-1;assert.equal((await step()).waiting,true);
+  now=workerDeadline;assert.equal((await step()).phase,"drain_after_timeout");
+  leases=[{id:"late-writer"}];result=await step();assert.equal(result.phase,"drain_after_timeout");
+  now=operation.lifecycle.nextRunAt;leases=[];result=await step();
+  assert.equal(result.phase,"ready_for_delete");assert.equal(operation.status,"deleting");
+  const freshSnapshot={profile:operation.profile,target:operation.target,selectedActions:operation.selectedActions,inventory:operation.inventory};
+  assert.doesNotThrow(()=>assertErasureReadyForDelete(operation,freshSnapshot));
+  assert.throws(()=>assertErasureReadyForDelete(operation,{...freshSnapshot,inventory:[{...freshSnapshot.inventory[0],digest:"changed"}]}),
+    /confirmation, inventory, or fenced lifecycle changed/);
+  assert.ok(!events.some(event=>event[0]==="delete"),"fencing lifecycle never performs provider deletion");
+
+  operation.status="verifying";
+  operation.lifecycle=beginFencedRestoreLifecycle(operation.lifecycle,now);
+  result=await step();assert.equal(result.phase,"restore_mappings");assert.match(operation.lifecycle.lastError,/transient restore failure/);
+  now=operation.lifecycle.nextRunAt;assert.equal((await step()).phase,"confirm_restored");
+  assert.equal((await step()).phase,"release_fence");
+  await assert.rejects(step(),/simulated process crash/);
+  assert.equal(operation.lifecycle.phase,"release_fence","failed persistence leaves the durable phase unchanged");
+  now=operation.lifecycle.nextRunAt;result=await step();
+  assert.equal(result.phase,"complete");assert.equal(operation.status,"succeeded");
+  assert.equal(events.filter(event=>event[0]==="finish").length,1,"retry after release must accept an already-released fence");
+});
+
+test("delete readiness requires the stored preview digest and completed fence",()=>{
+  const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
+    selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[]};
+  const digest=erasurePreviewFingerprint(preview);
+  const ready={...preview,operationId:"op",previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"once",
+    status:"deleting",createdAt:"now",updatedAt:"now",lifecycle:initialFencedLifecycle({mappingIds:["uuid"],enabledMappingIds:[],timeoutSeconds:30})};
+  ready.lifecycle.phase="ready_for_delete";
+  const fresh={profile:ready.profile,target:ready.target,selectedActions:ready.selectedActions,inventory:ready.inventory};
+  assert.doesNotThrow(()=>assertErasureReadyForDelete(ready,fresh));
+  assert.throws(()=>assertErasureReadyForDelete({...ready,target:{...ready.target,taskId:"changed"}},fresh),/confirmation, inventory, or fenced lifecycle changed/);
+  assert.throws(()=>assertErasureReadyForDelete(ready,{...fresh,inventory:[{type:"changed"}]}),/confirmation, inventory, or fenced lifecycle changed/);
+  assert.throws(()=>assertErasureReadyForDelete({...ready,lifecycle:{...ready.lifecycle,phase:"wait_worker_timeout"}},fresh),/confirmation, inventory, or fenced lifecycle changed/);
+});
+
+test("operation store atomically starts and advances the durable fence phase",async()=>{
+  const calls=[];let item={...operation,status:"queued",previewFingerprint:"digest"};
+  const db={send:async command=>{
+    calls.push(command);
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      item={...item,status:values[":next"]??values[":fencing"],lifecycle:values[":lifecycle"]};return {};
+    }
+    return {};
+  }};
+  const store=new ErasureOperationStore(db),old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  try {
+    const lifecycle=initialFencedLifecycle({mappingIds:["uuid"],enabledMappingIds:["uuid"],timeoutSeconds:30},123);
+    await store.startFencedLifecycle("op",lifecycle,123);
+    assert.equal(item.status,"fencing");assert.equal(item.lifecycle.phase,"disable_mappings");
+    assert.match(calls.at(-1).input.ConditionExpression,/attribute_not_exists\(lifecycle\)/);
+    const next={...lifecycle,phase:"confirm_disabled",nextRunAt:124};
+    await store.saveLifecycle("op","fencing","disable_mappings",next,"fencing",124);
+    assert.equal(item.lifecycle.phase,"confirm_disabled");
+    assert.match(calls.at(-1).input.ConditionExpression,/lifecycle.#phase=:phase/);
+    assert.equal(calls.at(-1).input.ExpressionAttributeValues[":phase"],"disable_mappings");
+  } finally {if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
 });
 
 test("durable operation store digests immutable preview content and atomically consumes confirmation once",async()=>{
