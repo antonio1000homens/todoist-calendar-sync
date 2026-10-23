@@ -139,11 +139,11 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
-        ...(operation.status==="review_required"?{recoveryRequired:true,
-          message:"Create a fresh preview and confirmation; this operation cannot be resumed."}:{}),
+        ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
+          message:"Operator break-glass recovery is required. Keep the profile fence and worker mappings in place; do not start a fresh preview until service admission is restored. This operation cannot be resumed."}:{}),
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
       if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
-      if (operation.status === "review_required") fail(409,"This operation requires a fresh preview and confirmation; it cannot be resumed");
+      if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
       if (operation.lifecycle?.phase === "ready_for_delete") fail(409,"Fencing is complete; provider deletion requires the separate confirmed deletion workflow");
       if (!["previewed","queued","fencing","deleting","verifying"].includes(operation.status))
         fail(409,"This erasure operation cannot be started or resumed");

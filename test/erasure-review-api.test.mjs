@@ -58,10 +58,11 @@ test("authenticated review API starts only stored confirmed operations and retur
   const reviewBody=JSON.parse(reviewStatus.body);
   assert.equal(reviewStatus.statusCode,200);
   assert.equal(reviewBody.operation.status,"review_required");
-  assert.equal(reviewBody.operation.recoveryRequired,true);
-  assert.match(reviewBody.operation.message,/fresh preview and confirmation/);
+  assert.equal(reviewBody.operation.operatorRecoveryRequired,true);
+  assert.match(reviewBody.operation.message,/break-glass recovery is required/);
+  assert.match(reviewBody.operation.message,/do not start a fresh preview until service admission is restored/i);
   const resume=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(resume.statusCode,409);
-  assert.match(JSON.parse(resume.body).error,/fresh preview and confirmation/);
+  assert.match(JSON.parse(resume.body).error,/break-glass recovery is required/);
   assert.equal(sent.length,2,"review-required operations cannot requeue the stale confirmation");
 });

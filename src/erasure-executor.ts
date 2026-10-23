@@ -352,7 +352,7 @@ export class ErasureOperationStore {
     const operation=await this.get(id);
     if(!operation || operation.status!=="deleting" || operation.lifecycle?.phase!=="ready_for_delete")
       throw new Error("Erasure operation is no longer at the deletion review gate");
-    const message="Action-time deletion gate changed; create a fresh preview and confirmation. This operation cannot be resumed.";
+    const message="Action-time deletion gate changed. Operator break-glass recovery is required; keep the profile fence and worker mappings in place. Do not start a fresh preview until service admission is restored. This operation cannot be resumed.";
     const now=new Date().toISOString();
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:reviewRequired, #error=:error, updatedAt=:updatedAt, lifecycle.#lastError=:error",

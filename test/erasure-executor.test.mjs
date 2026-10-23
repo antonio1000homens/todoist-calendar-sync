@@ -60,7 +60,8 @@ test("deletion gate drift is persisted as review-required with a CAS and cannot 
     const store=new ErasureOperationStore(db);
     await store.markReviewRequired("op");
     assert.equal(item.status,"review_required");
-    assert.match(item.error,/fresh preview and confirmation/);
+    assert.match(item.error,/break-glass recovery is required/);
+    assert.match(item.error,/Do not start a fresh preview until service admission is restored/);
     assert.equal(item.lifecycle.lastError,item.error);
     await assert.rejects(store.markReviewRequired("op"),/no longer at the deletion review gate/);
     assert.equal(calls.filter(command=>command.constructor.name.includes("Update")).length,1);
