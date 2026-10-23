@@ -214,9 +214,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       if (Object.keys(body || {}).length) fail(400,"Dismiss accepts no request fields");
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
-      if (item.status !== "open") fail(409,"Only an open alert can be dismissed");
-      await store.updateCase(item.id,"dismissed",`Alert dismissed by ${actor.email}`);
-      return response(200,{item:{...item,status:"dismissed",result:`Alert dismissed by ${actor.email}`}});
+      return response(200,{item:await store.dismissCase(item.id,`Alert dismissed by ${actor.email}`)});
     }
     if (method === "POST" && segments[0] === "previews" && segments[2] === "submit" && segments.length === 3) {
       const idempotencyKey = requestHeader(event,"idempotency-key") || "";
