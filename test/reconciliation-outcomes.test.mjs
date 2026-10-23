@@ -23,6 +23,7 @@ class Store {
   decisions = new Map();
   finishes = 0;
   async get(id) { return structuredClone(this.decisions.get(id)); }
+  async listPending(profile) { return [...this.decisions.values()].filter(item => item.status === 'pending' && (!profile || item.profile === profile)); }
   async putPending(input) {
     const current = this.decisions.get(input.decisionId);
     if (current) return { decision: current, created: false };
@@ -33,10 +34,11 @@ class Store {
   async setSlackLocation(id, channel, ts) {
     Object.assign(this.decisions.get(id), { slackChannelId: channel, slackMessageTs: ts });
   }
-  async finish(id) {
+  async finish(id, status = 'resolved', resolution) {
     const current = this.decisions.get(id);
     if (current?.status !== 'pending') throw Object.assign(new Error('not pending'), { name: 'ConditionalCheckFailedException' });
-    current.status = 'resolved';
+    current.status = status;
+    current.resolution = resolution;
     this.finishes++;
   }
 }
@@ -135,6 +137,20 @@ test('fresh progress suppresses a delayed-but-active monitor alert', async (t) =
   const service = new ManualInterventionService(store, new SlackManualNotifier(store));
   await checkReconciliationHealth(new StateRepository(), service, ['home']);
   assert.equal(store.decisions.size, 0);
+});
+
+test('a later terminal generation marks only its older stuck-run alert stale', async (t) => {
+  const store = new Store();
+  store.decisions.set('old-stuck', decision({ decisionId: 'old-stuck', type: 'operational_reconciliation_stuck',
+    context: { reconciliationGeneration: 'old-generation' } }));
+  store.decisions.set('other-case', decision({ decisionId: 'other-case', type: 'both_sides_changed',
+    context: {} }));
+  reconciliationDatabase(t, [run({ generation: 'new-generation', pending: false, status: 'succeeded' })]);
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await checkReconciliationHealth(new StateRepository(), service, ['home']);
+  assert.equal(store.decisions.get('old-stuck').status, 'resolved');
+  assert.match(store.decisions.get('old-stuck').resolution, /no longer actionable/);
+  assert.equal(store.decisions.get('other-case').status, 'pending');
 });
 
 test('notification retry reuses its reply and tolerates an already-resolved incident after a new generation starts', async (t) => {

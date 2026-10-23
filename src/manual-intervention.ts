@@ -989,6 +989,20 @@ export class ManualInterventionService {
     }
   }
 
+  async retireStaleReconciliationIncidents(profile: Profile, generation: string, pending: boolean): Promise<void> {
+    for (const incident of await this.store.listPending(profile)) {
+      if (incident.type !== "operational_reconciliation_stuck") continue;
+      const alertedGeneration = typeof incident.context?.reconciliationGeneration === "string"
+        ? incident.context.reconciliationGeneration : undefined;
+      if (!alertedGeneration || (alertedGeneration === generation && pending)) continue;
+      await this.store.finish(incident.decisionId, "resolved",
+        `This reconciliation alert is no longer actionable: generation ${alertedGeneration} was superseded or reached a terminal state. Current generation: ${generation}.`,
+        "reconciliation-health").catch((error) => {
+          if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
+        });
+    }
+  }
+
   async deliverReconciliationOutcome(channel: string | undefined, threadTs: string | undefined, replyTs: string | undefined, text: string): Promise<string | undefined> {
     return this.notifier.deliverReconciliationOutcome(channel, threadTs, replyTs, text);
   }
