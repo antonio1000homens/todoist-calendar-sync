@@ -300,6 +300,14 @@ export class ReviewStore {
     const now = new Date().toISOString();
     const completed: RepairOperation = { ...operation, status:"succeeded", updatedAt:now, error:undefined, nextAction:undefined,
       notificationPending:true, notificationText:operation.notificationText || "Succeeded: repair verified" };
+    // ReviewCase stores a snapshot of its source ManualDecision. The worker
+    // resolves that decision before finalizing this transaction; carry the
+    // same terminal state into the snapshot so the API cannot return a closed
+    // case with an apparently pending embedded decision.
+    const completedDecision = current.decision?.status === "pending"
+      ? { ...current.decision, status:"resolved" as const,
+        resolution:"Resolved and verified in the review page", resolvedAt:now }
+      : current.decision;
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: [
         ...[...new Map(releases.map(item => [entityKey(item.ref), item])).values()].map(item => ({ Update: {
@@ -311,12 +319,13 @@ export class ReviewStore {
           lookupPk:`PROFILE#${operation.preview.intent.profile}`, lookupSk:`REPAIR#NOTIFY#${operation.id}` },
           ConditionExpression:"#status <> :succeeded", ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} } },
         { Update:{ TableName:reviewTable(), Key:key(`REVIEW_CASE#${current.id}`),
-          UpdateExpression:"SET #status = :status, #result = :result, updatedAt = :now, operationId = :id, lookupSk = :lookup",
+          UpdateExpression:"SET #status = :status, #result = :result, updatedAt = :now, operationId = :id, lookupSk = :lookup" + (completedDecision ? ", decision = :decision" : ""),
           ConditionExpression:"#status = :repairing AND operationId = :id",
           ExpressionAttributeNames:{"#status":"status","#result":"result"}, ExpressionAttributeValues:{
             ":repairing":"repairing",
             ":status":operation.preview.intent.action === "exclude" ? "excluded" : "resolved", ":result":"Repair verified against current provider state",
             ":now":now, ":id":operation.id, ":lookup":`REVIEW#CLOSED#${current.createdAt}#${current.id}`,
+            ...(completedDecision ? { ":decision":completedDecision } : {}),
           } } },
       ] }));
       return completed;
