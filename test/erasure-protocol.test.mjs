@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { documentClient } from "../dist/dynamodb-capacity.js";
-import { acquireErasureProtocolLease, beginErasureFence, ErasureFenceActiveError, ErasureLeaseAlreadyHeldError } from "../dist/erasure-protocol.js";
+import { acquireErasureProtocolLease, beginErasureFence, ErasureFenceActiveError, ErasureLeaseAlreadyHeldError, inspectErasureFence } from "../dist/erasure-protocol.js";
 import { restoreMappings } from "../scripts/erasure-mappings.mjs";
 import { StateRepository } from "../dist/repository.js";
 import { handler } from "../dist/worker.js";
@@ -82,6 +82,23 @@ test("unrelated transaction cancellation is propagated instead of mislabeled as 
     error => error.name === "TransactionCanceledException" && /transaction conflict/.test(error.message),
   );
   assert.equal(transactions, 1);
+});
+
+test("fence inspection paginates every lease row before reporting a drained profile", async (t) => {
+  const originalSend = documentClient.send;
+  let pages = 0;
+  documentClient.send = async command => {
+    assert.equal(command.constructor.name, "QueryCommand");
+    assert.equal(command.input.ConsistentRead, true);
+    pages++;
+    if (pages === 1) return { Items: [{ pk: "ERASURE#home", sk: "FENCE", operationId: "op" }, { pk: "ERASURE#home", sk: "WRITER#a" }], LastEvaluatedKey: { pk: "ERASURE#home", sk: "WRITER#a" } };
+    return { Items: [{ pk: "ERASURE#home", sk: "ADMISSION#b" }] };
+  };
+  t.after(() => { documentClient.send = originalSend; });
+  const state = await inspectErasureFence("home");
+  assert.equal(pages, 2);
+  assert.equal(state.fence.operationId, "op");
+  assert.deepEqual(state.leases.map(item => item.sk), ["WRITER#a", "ADMISSION#b"]);
 });
 
 test("partial mapping restoration keeps the original UUID manifest for retry", async () => {

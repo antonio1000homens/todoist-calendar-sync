@@ -102,10 +102,16 @@ export async function beginErasureFence(profile: Profile, operationId: string): 
 
 export async function inspectErasureFence(profile: Profile): Promise<{ fence?: Record<string, unknown>; leases: Record<string, unknown>[] }> {
   const key = fenceKey(profile);
-  const result = await documentClient.send(new QueryCommand({
-    TableName: table(), KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": key.pk }, ConsistentRead: true,
-  }));
-  const rows = result.Items || [];
+  const rows: Record<string, unknown>[] = [];
+  let cursor: Record<string, unknown> | undefined;
+  do {
+    const result = await documentClient.send(new QueryCommand({
+      TableName: table(), KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": key.pk },
+      ConsistentRead: true, ExclusiveStartKey: cursor,
+    }));
+    rows.push(...((result.Items || []) as Record<string, unknown>[]));
+    cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (cursor);
   return {
     fence: rows.find((item) => item.sk === key.sk),
     leases: rows.filter((item) => typeof item.sk === "string" && ![key.sk, "JOURNAL", "EPOCH"].includes(item.sk)) as Record<string, unknown>[],
