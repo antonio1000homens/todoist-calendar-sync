@@ -207,7 +207,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       for (const item of releases) {
         if (item.clearExclusion) await controls.exclude(item.ref, false);
         await controls.release(item.ref);
-        controlsMap.get(refKey(item.ref)).fencedAt = "2099-01-01T00:00:00Z";
+        if (!item.preserveControlState) controlsMap.get(refKey(item.ref)).fencedAt = "2099-01-01T00:00:00Z";
       }
       operations.set(operation.id, clone(completed));
       return completed;
@@ -456,6 +456,7 @@ test("production Gabriel and Lennox series repair leaves the one-off event uncha
   const targetEvent=event("repair-event",{summary:"Repair another item",start:{date:"2026-11-01"},end:{date:"2026-11-02"}});
   const h=harness(t,{events:[master,active,oneOff,targetEvent],tasks:[recurringTask,targetTask],
     mappings:[recurrenceMapping],recurrence:{...recurrenceMapping,owner:"todoist"}});
+  h.controlsMap.set(`home:calendar:${oneOffId}`,{excluded:false,fencedAt:"preserve-this-fence",providerUpdatedAt:"preserve-this-version"});
   const refs=[{profile:"home",side:"todoist",id:targetTask.id},{profile:"home",side:"calendar",id:targetEvent.id},
     {profile:"home",side:"todoist",id:taskId},{profile:"home",side:"calendar",id:masterId},
     {profile:"home",side:"calendar",id:active.id},{profile:"home",side:"calendar",id:oneOffId}];
@@ -488,7 +489,9 @@ test("production Gabriel and Lennox series repair leaves the one-off event uncha
   assert.equal(h.taskMap.get(taskId).due.is_recurring,true);
   assert.deepEqual(h.eventMap.get(masterId).recurrence,["RRULE:FREQ=YEARLY"]);
   assert.deepEqual(h.eventMap.get(oneOffId),oneOff);
-  assert.equal(h.controlsMap.get(`home:calendar:${oneOffId}`)?.excluded,undefined);
+  assert.equal(h.controlsMap.get(`home:calendar:${oneOffId}`)?.excluded,false);
+  assert.equal(h.controlsMap.get(`home:calendar:${oneOffId}`)?.fencedAt,"preserve-this-fence");
+  assert.equal(h.controlsMap.get(`home:calendar:${oneOffId}`)?.providerUpdatedAt,"preserve-this-version");
   assert.ok(result.outcomes.some(value=>value.entity===`home:calendar:${masterId}`&&value.outcome==="unchanged"));
   assert.ok(result.outcomes.some(value=>value.entity===`home:calendar:${oneOffId}`&&value.outcome==="unchanged"));
   assert.ok(!h.calls.some(call=>call[0]==="tombstone"));

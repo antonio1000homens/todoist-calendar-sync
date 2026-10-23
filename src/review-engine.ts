@@ -801,12 +801,13 @@ export class ReviewEngine {
       }
       const releases: RepairRelease[] = [];
       for(const snapshot of operation.preview.snapshots){
+        const preserveControlState = operation.outcomes?.some(outcome => outcome.entity === entityKey(snapshot.ref) && outcome.outcome === "unchanged") || false;
         if(intent.action==="move"&&snapshot.ref.side==="todoist"&&snapshot.ref.id===intent.taskId){
           const moved=await(await factory(intent.targetProfile!)).todoist.getTask(snapshot.ref.id);
-          releases.push({ref:snapshot.ref,providerUpdatedAt:moved.updated_at});continue;
+          releases.push({ref:snapshot.ref,providerUpdatedAt:moved.updated_at,preserveControlState});continue;
         }
         const live=await this.snapshot(snapshot.ref);
-        releases.push({ref:snapshot.ref,providerUpdatedAt:(live.object as TodoistTask)?.updated_at || (live.object as CalendarEvent)?.updated,clearExclusion:bindings.has(entityKey(snapshot.ref))});
+        releases.push({ref:snapshot.ref,providerUpdatedAt:(live.object as TodoistTask)?.updated_at || (live.object as CalendarEvent)?.updated,clearExclusion:bindings.has(entityKey(snapshot.ref)),preserveControlState});
       }
       if(targetTaskRef){
         const moved=await this.snapshot(targetTaskRef);

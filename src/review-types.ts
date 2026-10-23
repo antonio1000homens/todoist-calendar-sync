@@ -59,6 +59,6 @@ export function operationHasWriteEvidence(operation: RepairOperation): boolean {
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
 }
-export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean }
+export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean; preserveControlState?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }
 export const REVIEW_PROFILES: Profile[] = ["home", "antonio", "work"];

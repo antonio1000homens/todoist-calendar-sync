@@ -28,6 +28,17 @@ test("successful repair result, case resolution, and every barrier release share
   assert.equal(items[3].Update.ExpressionAttributeValues[":status"],"resolved");
 });
 
+test("unchanged entity finalization releases its barrier without rewriting control state", async t => {
+  const store = new ReviewStore(), commands=[];
+  store.getCase = async () => ({id:"case",createdAt:"2026-10-21T12:00:00Z"});
+  t.mock.method(documentClient,"send",async command => { commands.push(command); return {}; });
+  await store.finalizeOperation(operation(),[{ref:{profile:"home",side:"calendar",id:"unchanged"},preserveControlState:true}]);
+  const update=commands[0].input.TransactItems[0].Update;
+  assert.equal(update.UpdateExpression,"REMOVE activeRepair");
+  assert.equal(update.ConditionExpression,"activeRepair = :id");
+  assert.deepEqual(update.ExpressionAttributeValues,{":id":"repair"});
+});
+
 test("operation save sends only values referenced by the selected terminal condition", async t => {
   const store = new ReviewStore(), commands=[];
   t.mock.method(documentClient,"send",async command => { commands.push(command); return {}; });
