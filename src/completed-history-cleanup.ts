@@ -10,6 +10,7 @@ import type { CompletedCalendarProjection, Profile } from "./types.js";
 
 const profiles: Profile[] = ["home", "antonio", "work"];
 const cursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "STATE" };
+const dryRunCursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "DRY_RUN_STATE" };
 const MAX_HISTORY_ROWS = 12; // conservative: all guards and deletes fit in one DynamoDB transaction
 type Row = CompletedCalendarProjection & { pk: string; sk: string };
 type ScanKey = Record<string, unknown>;
@@ -148,17 +149,21 @@ async function processTask(
 }
 
 export async function runCompletedHistoryCleanup(options: {
-  apply?: boolean; maxPages?: number; cursor?: ScanKey; nowMs?: number;
+  apply?: boolean; maxPages?: number; cursor?: ScanKey; nowMs?: number; persistDryRunCursor?: boolean;
 } = {}): Promise<CleanupCounts> {
   const table = process.env.STATE_TABLE_NAME?.trim();
   if (!table) throw new Error("STATE_TABLE_NAME must be set");
   const apply = options.apply === true;
+  if (apply && options.persistDryRunCursor) throw new Error("persistDryRunCursor is available only for a read-only dry run");
   const maxPages = options.maxPages ?? 10;
   if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 40) throw new Error("maxPages must be 1..40");
   const nowMs = options.nowMs ?? Date.now();
   const stored = apply && !options.cursor ? await strongGet(table, cursorKey.pk, cursorKey.sk) : undefined;
+  const storedDryRun = !apply && options.persistDryRunCursor
+    ? await strongGet(table, dryRunCursorKey.pk, dryRunCursorKey.sk) : undefined;
+  const startingCursor = stored?.nextCursor ?? storedDryRun?.nextCursor;
   let cursor: ScanKey | undefined = options.cursor || (
-    stored?.nextCursor && typeof stored.nextCursor === "object" ? stored.nextCursor as ScanKey : undefined
+    startingCursor && typeof startingCursor === "object" ? startingCursor as ScanKey : undefined
   );
   const counts: CleanupCounts = {
     eligible: 0, retired: 0, skipped_active: 0, skipped_ambiguous: 0,
@@ -216,13 +221,29 @@ export async function runCompletedHistoryCleanup(options: {
   }
   counts.nextCursor = cursor;
   if (!apply) counts.eligibleCandidates = eligibleCandidates;
+  const { eligibleCandidates: _candidateDetails, ...diagnosticCounts } = counts;
   if (apply) {
     await db.send(new PutCommand({
       TableName: table, Item: { ...cursorKey, ...(cursor ? { nextCursor: cursor } : {}),
         updatedAt: new Date(nowMs).toISOString(), lastCounts: counts },
     }));
+  } else if (options.persistDryRunCursor) {
+    // Scheduled dry-runs cannot return a cursor to EventBridge's next
+    // invocation. Persist only this maintenance checkpoint (never candidate
+    // rows) so each bounded invocation advances through the table. A version
+    // condition prevents overlapping/manual invocations from moving it back.
+    const version = Number(storedDryRun?.version || 0);
+    await db.send(new PutCommand({
+      TableName: table,
+      Item: { ...dryRunCursorKey, ...(cursor ? { nextCursor: cursor } : {}),
+        scanComplete: !cursor, version: version + 1,
+        updatedAt: new Date(nowMs).toISOString(), lastCounts: diagnosticCounts },
+      ...(version ? {
+        ConditionExpression: "version = :expectedVersion",
+        ExpressionAttributeValues: { ":expectedVersion": version },
+      } : { ConditionExpression: "attribute_not_exists(pk)" }),
+    }));
   }
-  const { eligibleCandidates: _candidateDetails, ...diagnosticCounts } = counts;
   console.info(JSON.stringify({ event: "terminal_completed_history_cleanup_report", apply,
     ...diagnosticCounts, nextCursor: Boolean(cursor) }));
   return counts;
@@ -231,4 +252,5 @@ export async function runCompletedHistoryCleanup(options: {
 export const handler = async (): Promise<CleanupCounts> => runCompletedHistoryCleanup({
   // Deliberately OFF until the preflight report has been reviewed.
   apply: process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY === "true",
+  persistDryRunCursor: process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY !== "true",
 });
