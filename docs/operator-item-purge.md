@@ -97,7 +97,8 @@ Todoist (if still live), then the exact separately approved Calendar event
 (if live), and finally the inventory's DynamoDB rows. Every row is checked
 with a consistent Get and a full-attribute conditional Delete. Already-absent
 records are skipped. There is a second double-check of provider and state
-absence after deletion. Normal sync code is not changed.
+absence after deletion. Normal lifecycle rules are unchanged; unmapped Todoist
+upserts now require an active-task existence check before projection.
 
 ## Refusals and manual handling
 
@@ -115,11 +116,15 @@ absence after deletion. Normal sync code is not changed.
   full-table item inventory. This is a platform provenance limitation and a
   reason to **withhold production erasure** until operators have independently
   audited those sources. The CLI is not a data-protection compliance guarantee.
+- For an unmapped Todoist upsert, sync re-reads the active task by exact
+  provider ID before trusting the webhook payload. A 404 is dropped without
+  creating mapping or audit state. This narrows that stale-webhook replay path
+  but does not establish queue/receipt quiescence or cover every delayed
+  source; the inventory and execution blockers remain in force.
 - No per-item suppression tombstone is retained after success, so recovery
   must rely on all source objects being absent and replay sources being
   quiesced/drained. If an unrelated live Calendar item must remain, do not
-  bypass this refusal: a safe, identity-free replay-prevention design is
-  still needed.
+  bypass this refusal; a complete replay-prevention design is still needed.
 
 ## Partial failure / resume
 
@@ -142,6 +147,7 @@ This PR provides a conservative, executable operator CLI, preview inventory,
 conditional deletion, provider re-reads and regression tests. It deliberately
 does **not** expose a new review-page button or a background auto-retry
 mechanism, because the current event-delivery receipts and historical records
-are not fully attributable by item and there is no identity-free mechanism
-to prevent a delayed payload from recreating an item. Production execution
+are not fully attributable by item. The sync path drops a delayed unmapped
+Todoist upsert when its exact task has disappeared, but that control does not
+cover all delivery sources or prove replay quiescence. Production execution
 must remain gated until these design gaps have been addressed.

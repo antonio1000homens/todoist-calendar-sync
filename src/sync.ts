@@ -1103,6 +1103,21 @@ export class Synchronizer {
     if (!task?.id || !lifecycle) return;
     const existingMapping = await this.state.getMappingByTaskAnyProfile(task.id);
     const controlProfile = existingMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
+    // A delayed create/update webhook may arrive after an operator purge has
+    // removed every mapping and the Todoist task itself. Do not trust its
+    // retained payload to recreate a Calendar projection. The active-task
+    // lookup is authoritative for this otherwise-unmapped upsert; 404 means
+    // the source no longer exists and must be a silent no-op so this guard
+    // does not recreate an item-specific DynamoDB audit record.
+    if (lifecycle.action === "upsert" && !existingMapping) {
+      const { todoist } = await this.clients(controlProfile);
+      try {
+        await todoist.getTask(task.id);
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 404) return;
+        throw error;
+      }
+    }
     if (await this.state.syncBlocked(controlProfile, { taskId: task.id, eventId: existingMapping?.eventId })) {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });
     }

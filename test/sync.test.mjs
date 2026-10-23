@@ -261,6 +261,35 @@ test("rechecks completion immediately before Calendar-to-Todoist mutation", asyn
   assert.equal(audits.some((entry) => entry.action === "calendar_completed_projection_ignored" && entry.detail.recheckedBeforeMutation === true), true);
 });
 
+test("a delayed Todoist upsert for a purged task is silently ignored when the provider task is gone", async () => {
+  const writes = [];
+  const state = {
+    async getMappingByTaskAnyProfile() { return undefined; },
+    async syncBlocked() { writes.push("syncBlocked"); return false; },
+    async acceptTaskVersion() { writes.push("acceptTaskVersion"); return true; },
+    async audit() { writes.push("audit"); },
+  };
+  const calendar = {
+    async findByTodoistTaskId() { writes.push("calendarFind"); },
+    async upsertEvent() { writes.push("calendarUpsert"); throw new Error("must not recreate purged item"); },
+  };
+  const todoist = {
+    async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  await sync.process({
+    id: "late-purged-item-webhook", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2026-10-01T12:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:added", event_data: {
+      id: "purged-task", project_id: "project-home", content: "Previously erased item",
+      due: { date: "2026-10-02" }, updated_at: "2026-10-01T11:00:00Z",
+    } }),
+  });
+
+  assert.deepEqual(writes, [], "do not perform sync-state writes or provider mutations for a source that no longer exists");
+});
+
 test("allows a newer due-date re-add but suppresses stale dated webhooks", () => {
   const readded = todoistCalendarLifecycle({ event_name: "item:updated", event_data: { id: "task-1", content: "Task", due: { date: "2026-09-02" }, updated_at: "2026-09-01T12:01:00Z" }, event_data_extra: { old_item: { id: "task-1", content: "Task", due: null } } });
   assert.equal(canRecreateCalendarProjection(readded, "2026-09-01T12:01:00Z", "2026-09-01T12:00:00Z"), true);
