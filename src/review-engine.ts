@@ -1077,8 +1077,9 @@ export class ReviewEngine {
           throw error;
         });
         const deleteStepName = `delete-calendar-projection:${intent.eventId}`;
-        const recoveringLostDeleteAck = liveEvent === null && operation.steps[deleteStepName]?.status === "running";
-        if (reviewHash(liveEvent) !== reviewHash(originalEvent || null) && !recoveringLostDeleteAck) {
+        const deleteStepStatus = operation.steps[deleteStepName]?.status;
+        const recoveringPriorDelete = liveEvent === null && (deleteStepStatus === "running" || deleteStepStatus === "done");
+        if (reviewHash(liveEvent) !== reviewHash(originalEvent || null) && !recoveringPriorDelete) {
           throw new Error("The exact Calendar projection changed after preview; refresh affected items");
         }
         await step(`todoist-only-delete-exclude-task:${originalTask.id}`, async () => {
@@ -1100,7 +1101,7 @@ export class ReviewEngine {
             }
             return true;
           });
-        } else if (recoveringLostDeleteAck) {
+        } else if (recoveringPriorDelete && deleteStepStatus === "running") {
           // A 404 readback after the persisted conditional delete boundary is
           // sufficient to complete a lost-ack step; never issue a new delete.
           await step(deleteStepName, async () => true);

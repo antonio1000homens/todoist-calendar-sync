@@ -86,10 +86,13 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
                     && reviewHash({...comparable(live),due:null}) === reviewHash({...comparable(originalTask),due:null});
                 }
               }
+              const deleteStepStatus = operation.steps[`delete-calendar-projection:${move.eventId}`]?.status;
               if (move.action === "todoist-only-delete-calendar" && side === "calendar" && id === move.eventId
-                && object === null && operation.steps[`delete-calendar-projection:${move.eventId}`]?.status === "running") {
+                && object === null && (deleteStepStatus === "running" || deleteStepStatus === "done")) {
                 // Recover a lost acknowledgement only for the exact
-                // conditional delete persisted as running by this repair.
+                // conditional delete persisted by this repair. A done step
+                // also authorizes absence while later cleanup checkpoints
+                // resume; neither case can target another Calendar ID.
                 expected[key] = null;
                 await save();
                 return;

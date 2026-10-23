@@ -1890,3 +1890,27 @@ test("lost conditional-delete acknowledgement resumes from exact absence without
   assert.equal(h.eventMap.has(projection.id),false);
   assert.equal(h.mappingMap.size,0);
 });
+
+test("completed Calendar deletion resumes after later mapping cleanup failure",async t=>{
+  const current=task("keep-task"),projection=event("projection");
+  const mapping={profile:"home",taskId:current.id,eventId:projection.id};
+  const h=harness(t,{events:[projection],tasks:[current],mappings:[mapping]});
+  const preview=await h.engine.preview(actor,intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:projection.id}));
+  h.operations.set("cleanup-after-delete",{id:"cleanup-after-delete",status:"queued",steps:{},preview});
+  const originalDeleteMapping=StateRepository.prototype.deleteMapping;
+  let failCleanup=true;
+  StateRepository.prototype.deleteMapping=async function(value) {
+    if(failCleanup){failCleanup=false;throw new Error("temporary mapping cleanup failure");}
+    return originalDeleteMapping.call(this,value);
+  };
+  t.after(()=>{StateRepository.prototype.deleteMapping=originalDeleteMapping;});
+  const failed=await h.engine.execute("cleanup-after-delete");
+  assert.notEqual(failed.status,"succeeded");
+  assert.equal(h.eventMap.has(projection.id),false);
+  assert.equal(h.operations.get("cleanup-after-delete").steps[`delete-calendar-projection:${projection.id}`].status,"done");
+  assert.deepEqual(h.mappingMap.get(current.id),mapping);
+  const resumed=await h.engine.execute("cleanup-after-delete");
+  assert.equal(resumed.status,"succeeded",resumed.error);
+  assert.equal(h.mappingMap.size,0);
+  assert.deepEqual(h.writes,[["delete-event",projection.id]],"resume trusts the recorded exact deletion and does not repeat it");
+});
