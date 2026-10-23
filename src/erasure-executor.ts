@@ -1,5 +1,6 @@
 /** Reusable lifecycle and durable async contract for per-item erasure jobs. */
-import { GetCommand, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { createHash, randomUUID } from "node:crypto";
+import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
 
@@ -10,6 +11,7 @@ export interface ErasureOperation {
   target: { taskId: string; eventId?: string; deleteCalendar: boolean };
   previewFingerprint: string;
   confirmationFingerprint: string;
+  confirmationId: string;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
   inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string }>;
   status: ErasureOperationStatus;
@@ -33,6 +35,20 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 }
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
+function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
+type ErasurePreview = Pick<ErasureOperation, "operationId" | "profile" | "target" | "selectedActions" | "inventory">;
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object=value as Record<string,unknown>;
+    return `{${Object.keys(object).sort().map(key=>`${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+export function erasurePreviewFingerprint(preview: Omit<ErasurePreview, "operationId">): string {
+  const content={version:1,profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,inventory:preview.inventory};
+  return createHash("sha256").update(canonical(content)).digest("hex");
+}
 function stateTable(): string {
   const value = process.env.STATE_TABLE_NAME?.trim();
   if (!value) throw new Error("STATE_TABLE_NAME is required");
@@ -41,14 +57,39 @@ function stateTable(): string {
 
 /** Exact preview is immutable after submission; workers use conditional status changes. */
 export class ErasureOperationStore {
-  constructor(private readonly db = documentClient) {}
+  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID) {}
 
-  async create(operation: ErasureOperation): Promise<void> {
+  async issueConfirmation(preview: ErasurePreview, now = Date.now(), lifetimeMs = 5 * 60_000): Promise<{
+    confirmationId: string; previewFingerprint: string; expiresAt: number;
+  }> {
+    if (!preview.operationId || preview.selectedActions.deleteTodoist !== true
+      || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
+      || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
+    const confirmationId=this.newConfirmationId();
+    const previewFingerprint=erasurePreviewFingerprint(preview);
+    const expiresAt=now+lifetimeMs;
+    await this.db.send(new TransactWriteCommand({TransactItems:[{Put:{TableName:stateTable(),Item:{
+      ...confirmationKey(preview.operationId),operationId:preview.operationId,confirmationId,previewFingerprint,
+      status:"issued",expiresAt,createdAt:new Date(now).toISOString(),
+    },ConditionExpression:"attribute_not_exists(pk)"}}]}));
+    return {confirmationId,previewFingerprint,expiresAt};
+  }
+
+  async create(operation: ErasureOperation, now = Date.now()): Promise<void> {
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
       || operation.confirmationFingerprint !== operation.previewFingerprint
-      || operation.selectedActions.deleteTodoist !== true) throw new Error("Invalid erasure operation preview");
-    await this.db.send(new PutCommand({TableName:stateTable(),Item:{...operation,...operationKey(operation.operationId)},
-      ConditionExpression:"attribute_not_exists(pk)"}));
+      || operation.selectedActions.deleteTodoist !== true
+      || operation.selectedActions.deleteCalendar !== operation.target.deleteCalendar
+      || (operation.target.deleteCalendar && !operation.target.eventId)
+      || operation.previewFingerprint !== erasurePreviewFingerprint(operation)) throw new Error("Invalid erasure operation preview");
+    await this.db.send(new TransactWriteCommand({TransactItems:[
+      {Put:{TableName:stateTable(),Item:{...operation,...operationKey(operation.operationId)},ConditionExpression:"attribute_not_exists(pk)"}},
+      {Update:{TableName:stateTable(),Key:confirmationKey(operation.operationId),
+        UpdateExpression:"SET #status=:consumed, consumedAt=:now, consumedBy=:operationId",
+        ConditionExpression:"#status=:issued AND confirmationId=:confirmationId AND previewFingerprint=:fingerprint AND expiresAt>:now",
+        ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":issued":"issued",":consumed":"consumed",
+          ":confirmationId":operation.confirmationId,":fingerprint":operation.previewFingerprint,":operationId":operation.operationId,":now":now}}},
+    ]}));
   }
 
   async get(id: string): Promise<ErasureOperation | undefined> {
