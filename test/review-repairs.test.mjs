@@ -384,6 +384,19 @@ test("Calendar-owned series transfer preserves the recurring birthday task and a
   assert.equal(h.writes.length,writes,"repeated delivery does not create another counterpart or rewrite recurrence");
 });
 
+test("series transfer treats explicit INTERVAL=1 as equivalent to Todoist every year",async t=>{
+  const f=birthdayTransferFixture();
+  f.master={...f.master,recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
+  const h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+  }));
+  assert.ok(preview.changes.some(change=>change.includes("transfer the Calendar-owned series association")));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  assert.equal((await h.engine.execute("repair")).status,"succeeded");
+  assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
+});
+
 test("series transfer refuses an unowned Calendar recurrence without a recurrence link or ownership metadata",async t=>{
   const f=birthdayTransferFixture();
   f.master={...f.master,extendedProperties:{shared:{taskId:f.displaced.id}}};
