@@ -7,6 +7,30 @@ export function reconciliationPollDelayMs(attempt = 0) {
   return Math.min(60_000, 5_000 * 2 ** normalized);
 }
 
+export function createRetryingTask({ run, onSuccess, onError, schedule = setTimeout, cancel = clearTimeout }) {
+  let stopped = false;
+  let timer;
+  let failures = 0;
+  const attempt = async () => {
+    try {
+      await run();
+      if (!stopped) onSuccess?.();
+    } catch (error) {
+      if (stopped) return;
+      failures++;
+      onError?.(error);
+      timer = schedule(attempt, reconciliationPollDelayMs(failures));
+    }
+  };
+  return {
+    start: () => { void attempt(); },
+    stop: () => {
+      stopped = true;
+      if (timer !== undefined) cancel(timer);
+    },
+  };
+}
+
 export function delay(ms, signal) {
   if (signal?.aborted) return Promise.reject(abortError());
   return new Promise((resolve, reject) => {

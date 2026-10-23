@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { createReviewApiClient, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
+import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
@@ -32,6 +32,7 @@ function App() {
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
+  const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
   const [detailRetry,setDetailRetry] = useState(0);
@@ -133,13 +134,23 @@ function App() {
         const terminal=["succeeded","needs_review","failed"].includes(runStatus);
         if(terminal||!data.reconciliation?.pending) {
           setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
-          await refresh();
+          setTerminalInboxRefreshPending(true);
         } else timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
       } catch(e:any) { if(!cancelled){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));} }
     };
     timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
     return ()=>{cancelled=true;window.clearTimeout(timer);};
   },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
+  useEffect(() => {
+    if (!terminalInboxRefreshPending) return;
+    const refreshTask=createRetryingTask({
+      run:refresh,
+      onSuccess:()=>setTerminalInboxRefreshPending(false),
+      onError:(error:any)=>setMessage(`Run is terminal, but the review inbox could not refresh: ${error.message}`),
+    });
+    refreshTask.start();
+    return ()=>refreshTask.stop();
+  },[terminalInboxRefreshPending,profile,history]);
   const providerLink=(item:ProviderObject|undefined) => {
     const href=item?.url||item?.htmlLink;
     if (!href) return undefined;
