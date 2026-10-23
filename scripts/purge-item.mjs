@@ -16,6 +16,7 @@ import { profiles } from "../dist/config.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "../dist/mapping-comments.js";
 import { beginErasureFence, finishErasureProtocol, inspectErasureFence } from "../dist/erasure-protocol.js";
+import { restoreMappings } from "./erasure-mappings.mjs";
 import { fingerprint, planPurge, publicInventoryRecord } from "./item-purge-policy.mjs";
 
 const argumentsMap = new Map();
@@ -126,14 +127,11 @@ async function waitForLeaseDrain() {
   throw new Error("Admission or writer leases did not drain; keep the worker event source disabled and investigate before resuming");
 }
 async function restoreWorkerMappings(mappingIds) {
-  await Promise.all(mappingIds.map(UUID => lambda.send(new UpdateEventSourceMappingCommand({UUID,Enabled:true}))));
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    const current = await Promise.all(mappingIds.map(UUID => lambda.send(new GetEventSourceMappingCommand({UUID}))));
-    if (current.every(mapping => mapping.State === "Enabled")) return;
-    await sleep(1000);
-  }
-  throw new Error("Previously enabled worker SQS mappings did not all return to Enabled state");
+  return restoreMappings(mappingIds, {
+    update: UUID => lambda.send(new UpdateEventSourceMappingCommand({UUID,Enabled:true})),
+    get: UUID => lambda.send(new GetEventSourceMappingCommand({UUID})),
+    pause: sleep,
+  });
 }
 const clients = await defaultProviderClientFactory(profile);
 const gone = error => [404,410].includes(Number(error?.status));
