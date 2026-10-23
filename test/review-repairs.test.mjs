@@ -329,6 +329,27 @@ test("elapsed Calendar history preview fails closed when task and owner indexes 
   assert.deepEqual(h.writes,[]);
 });
 
+test("elapsed Calendar history rejects recurrence metadata on matching task-side indexes",async t=>{
+  const oldEventMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const recurringTaskMapping={...oldEventMapping,recurrenceOwner:"todoist",seriesId:"series",masterEventId:"master",activeInstanceId:"elapsed"};
+  const h=harness(t,{events:[event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},extendedProperties:{shared:{taskId:"task"}}})],
+    tasks:[task("task")],mappings:[recurringTaskMapping]});
+  h.eventMappingMap.set("home:elapsed",oldEventMapping);
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/recurring task mapping/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("elapsed Calendar history classifies all-day retained counterparts in the Calendar timezone",async t=>{
+  const oldMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const staleCounterpartMapping={profile:"home",taskId:"task",eventId:"old-all-day",updatedAt:"2026-10-02T00:00:00Z"};
+  const h=harness(t,{events:[
+    event("elapsed",{start:{dateTime:"2025-05-02T12:00:00Z"},end:{dateTime:"2025-05-02T13:00:00Z"},extendedProperties:{shared:{taskId:"task"}}}),
+    event("old-all-day",{start:{date:"2020-05-02"},end:{date:"2020-05-03"},extendedProperties:{shared:{taskId:"task"}}}),
+  ],tasks:[task("task")],mappings:[oldMapping,staleCounterpartMapping]});
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/no verified live Calendar counterpart/);
+  assert.deepEqual(h.writes,[]);
+});
+
 test("a move previews, claims, and verifies its existing destination Calendar projection",async t=>{
   const h=moveHarness(t),preview=await h.engine.preview(actor,h.input);
   assert.ok(preview.snapshots.some(s=>s.ref.profile==="work"&&s.ref.id==="destination"));

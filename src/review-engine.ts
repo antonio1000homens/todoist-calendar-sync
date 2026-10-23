@@ -346,7 +346,11 @@ export class ReviewEngine {
       if(!selectedEvent.etag||!selectedEvent.start||!selectedEvent.end||(!selectedEvent.start.date&&!selectedEvent.start.dateTime)
         ||(!selectedEvent.end.date&&!selectedEvent.end.dateTime)) invalidRepairIntent("History-only detachment requires exact Calendar start, end, and ETag data");
       const provider=await this.clients(intent.profile);
-      const timeZone=selectedEvent.end.date&&!selectedEvent.end.dateTime?await provider.calendar.getTimeZone():undefined;
+      // A selected timed event can still have an all-day retained counterpart.
+      // Resolve the Calendar zone once so every date-only end is classified
+      // against the same local date; missing zone data must not look live.
+      const timeZone=await provider.calendar.getTimeZone();
+      if(!timeZone) invalidRepairIntent("Calendar timezone could not be verified; refresh before classifying elapsed history");
       if(!calendarEventHasElapsed(selectedEvent,Date.now(),timeZone)) invalidRepairIntent("The selected Calendar event has not fully elapsed in its Calendar timezone");
       const eventMapping=selected!.mapping;
       if(eventMapping&&(eventMapping.profile!==intent.profile||eventMapping.eventId!==intent.eventId||eventMapping.taskId!==linkedTaskId
@@ -360,6 +364,10 @@ export class ReviewEngine {
       if(reviewHash(mappingPayload(taskMapping))!==reviewHash(mappingPayload(ownerMapping))
         ||reviewHash(mappingPayload(taskSnapshot.mapping as Mapping|undefined))!==reviewHash(mappingPayload(ownerMapping))) {
         invalidRepairIntent("The task and owner mapping indexes disagree; do not detach until a fresh mapping repair resolves them");
+      }
+      if(taskMapping&&taskMapping.eventId===intent.eventId&&(taskMapping.recurrenceOwner||taskMapping.seriesId
+        ||taskMapping.masterEventId||taskMapping.activeInstanceId)) {
+        invalidRepairIntent("The selected event is still owned by a recurring task mapping; resolve recurrence ownership before detaching history");
       }
       let retainedTaskMapping:Mapping|undefined;
       if(ownerMapping) {
