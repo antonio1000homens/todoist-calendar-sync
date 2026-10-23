@@ -99,6 +99,7 @@ test("dry run reports one-off eligibility without state or provider writes", asy
   assert.equal(r.writes, 0);
   assert.ok(r.store.has(taskKey));
   assert.ok(r.store.has(eventKey));
+  assert.deepEqual(r.counts.eligibleCandidates,[{profile:"home",taskId:"one",eventIds:["event-1"],completedAt:["2026-10-01T12:00:00Z"]}]);
 });
 test("apply atomically retires task index and preserves permanent event guard", async () => {
   const r = await simulate({ apply: true });
