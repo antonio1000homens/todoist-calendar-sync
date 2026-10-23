@@ -29,4 +29,6 @@ test('active run polling refreshes the inbox and announces terminal status witho
   assert.match(polling, /actionableCaseCount/);
   assert.match(source, /createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
   assert.match(source, /Run: \{reconciliation\.summary\.runStatus\}; unresolved in this run: \{reconciliation\.summary\.runUnresolved\}\. Actionable review cases remaining: \{reconciliation\.summary\.actionableCaseCount\}\./);
+  assert.ok(source.includes('Candidate tasks: {item.detail.candidateTaskIds.join(", ")}'));
+  assert.ok(source.includes('Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}'));
 });

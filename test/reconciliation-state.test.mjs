@@ -92,6 +92,8 @@ test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded,
   await state.recordReconciliationDiagnostic('home', 'old', 'delivery-3', 'todoist_snapshot_reconcile_unmapped_conflict',
     { ...detail, calendarEtag: 'etag-v2' }, { caseId: 'home-decision-2', caseStatus: 'open' });
   await state.recordReconciliationDiagnostic('home', 'new-generation', 'delivery-4', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  await state.recordReconciliationDiagnostic('work', 'old', 'delivery-work', 'todoist_snapshot_reconcile_unmapped_conflict',
+    { taskId: 'work-only-task', eventId: 'work-only-event' });
   await state.recordReconciliationDiagnostic('home', 'old', 'delivery-5', 'todoist_snapshot_reconcile_baseline_established', detail);
 
   const first = await state.listReconciliationDiagnostics('home', 'old', 1);
@@ -107,6 +109,10 @@ test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded,
   assert.equal(first.items[0].detail.taskTitle, undefined);
   assert.deepEqual(new Set([first.items[0].caseStatus, second.items[0].caseStatus]), new Set(['dismissed','open']));
   assert.equal((await state.listReconciliationDiagnostics('home', 'new-generation')).items.length, 1);
+  const homeRows = await state.listReconciliationDiagnostics('home', 'old', 50);
+  const workRows = await state.listReconciliationDiagnostics('work', 'old', 50);
+  assert.ok(homeRows.items.every(item => item.profile === 'home' && item.taskId !== 'work-only-task'));
+  assert.deepEqual(workRows.items.map(item => item.taskId), ['work-only-task']);
 });
 
 test('worker failure context is retained separately from its free-form error', async (t) => {
