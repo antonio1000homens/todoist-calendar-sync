@@ -43,6 +43,36 @@ test('progress and terminal results persist with reserved attributes aliased', a
   assert.deepEqual(db.get('RECONCILE_OUTCOME#home', 'old').result, { repaired: 3, scanned: 5 });
 });
 
+test('reconciliation diagnostics persist accepted delivery, checkpoint, and next cursor', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  await state.markReconciliationEnqueued('home', 'old', 'reconcile:home:old');
+  assert.equal(db.get('RECONCILE#home').queueState, 'accepted');
+  await state.beginReconciliation('home', 'old', 'reconcile:home:old');
+  await state.addReconciliationProgress('home', 'old', { scanned: 25 }, {
+    phase: 'mapped', sequence: 1, deliveryId: 'reconcile:home:old', afterTaskId: 'task-25', observedAt: old,
+  });
+  await state.markReconciliationEnqueued('home', 'old', 'reconcile:home:old:chunk:2', {
+    phase: 'mapped', sequence: 2, deliveryId: 'reconcile:home:old:chunk:2', afterTaskId: 'task-50',
+  });
+  const saved = db.get('RECONCILE#home');
+  assert.equal(saved.queueState, 'accepted');
+  assert.equal(saved.lastStartedDeliveryId, 'reconcile:home:old');
+  assert.equal(saved.progressCheckpoint.afterTaskId, 'task-25');
+  assert.equal(saved.nextContinuation.deliveryId, 'reconcile:home:old:chunk:2');
+  assert.equal(saved.nextContinuation.afterTaskId, 'task-50');
+});
+
+test('worker failure context is retained separately from its free-form error', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  await new StateRepository().recordReconciliationFailure('home', 'old', 'provider failure details', {
+    category: 'provider_http_503', stage: 'mapped', status: 503, taskId: 'task-7',
+  });
+  assert.deepEqual(db.get('RECONCILE#home').failureContext, {
+    category: 'provider_http_503', stage: 'mapped', status: 503, taskId: 'task-7',
+  });
+});
+
 test('failed live keys never overwrite the archival evidence key', async (t) => {
   const db = reconciliationDatabase(t, [run({ lastFailedAt: old, lastError: 'Invalid start time' })]);
   await new StateRepository().requestReconciliation('home', 'manual');

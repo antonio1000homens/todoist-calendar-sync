@@ -10,6 +10,9 @@ export interface ReviewCase {
   status: "open" | "dismissed" | "repairing" | "resolved" | "excluded";
   decision?: ManualDecision; taskId?: string; eventId?: string;
   createdAt: string; updatedAt: string; operationId?: string; result?: string;
+  reconciliationGeneration?: string;
+  progressCheckpoint?: { phase?: "mapped" | "unmapped" | "calendar"; sequence?: number; deliveryId?: string;
+    nextDeliveryId?: string; afterTaskId?: string; afterEventId?: string; observedAt: string };
 }
 export interface RepairIntent {
   caseId: string; profile: Profile;
