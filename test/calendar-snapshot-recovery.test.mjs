@@ -276,6 +276,36 @@ test("recurrence snapshot guard recognises a competing recurring Todoist identit
     && entry.detail.candidateTaskIds.includes("original-yearly")));
 });
 
+test("recurrence snapshot guard trusts an exact shared task ID when title and start differ", async () => {
+  const master = {
+    ...futureEvent("ifttt-series", 15, "IFTTT renewal reminder"),
+    recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"],
+  };
+  const occurrence = {
+    ...futureEvent("ifttt-series_20990115", 15, "IFTTT renewal reminder"),
+    recurringEventId: master.id,
+    extendedProperties: { shared: { taskId: "annual-task" } },
+  };
+  const annualTask = {
+    id: "annual-task", content: "ifttt expire cancel auto-renew",
+    due: { date: "2099-01-16", is_recurring: true, string: "every year" },
+  };
+  assert.deepEqual(recurringTaskIdentityCandidates(occurrence, [annualTask]), ["annual-task"]);
+
+  const state = fakeState();
+  const clients = fakeClients([master], [annualTask]);
+  clients.pair.calendar.listInstances = async () => [occurrence];
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some(({ action, detail }) =>
+    action === "calendar_snapshot_recurring_identity_conflict"
+    && detail.candidateTaskIds.includes(annualTask.id)));
+});
+
 test("Calendar-owned recurring series still creates one active non-recurring mirror", async () => {
   const master = { ...futureEvent("calendar-series", 12, "Calendar-owned appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
   const occurrence = { ...futureEvent("calendar-series_20990112", 12, "Calendar-owned appointment"), recurringEventId: master.id };
