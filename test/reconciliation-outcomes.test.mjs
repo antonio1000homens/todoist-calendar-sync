@@ -23,6 +23,7 @@ class Store {
   decisions = new Map();
   finishes = 0;
   async get(id) { return structuredClone(this.decisions.get(id)); }
+  async listPending(profile) { return [...this.decisions.values()].filter(item => item.status === 'pending' && (!profile || item.profile === profile)); }
   async putPending(input) {
     const current = this.decisions.get(input.decisionId);
     if (current) return { decision: current, created: false };
@@ -33,10 +34,11 @@ class Store {
   async setSlackLocation(id, channel, ts) {
     Object.assign(this.decisions.get(id), { slackChannelId: channel, slackMessageTs: ts });
   }
-  async finish(id) {
+  async finish(id, status = 'resolved', resolution) {
     const current = this.decisions.get(id);
     if (current?.status !== 'pending') throw Object.assign(new Error('not pending'), { name: 'ConditionalCheckFailedException' });
-    current.status = 'resolved';
+    current.status = status;
+    current.resolution = resolution;
     this.finishes++;
   }
 }
@@ -137,12 +139,48 @@ test('fresh progress suppresses a delayed-but-active monitor alert', async (t) =
   assert.equal(store.decisions.size, 0);
 });
 
+test('a later terminal generation marks only its older stuck-run alert stale', async (t) => {
+  const calls = fakeSlack(t);
+  const store = new Store();
+  store.decisions.set('old-stuck', decision({ decisionId: 'old-stuck', type: 'operational_reconciliation_stuck',
+    slackChannelId: 'CTEST', slackMessageTs: '1.000',
+    context: { reconciliationGeneration: 'old-generation' } }));
+  store.decisions.set('other-case', decision({ decisionId: 'other-case', type: 'both_sides_changed',
+    context: {} }));
+  reconciliationDatabase(t, [run({ generation: 'new-generation', pending: false, status: 'succeeded' })]);
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await checkReconciliationHealth(new StateRepository(), service, ['home']);
+  assert.equal(store.decisions.get('old-stuck').status, 'resolved');
+  assert.match(store.decisions.get('old-stuck').resolution, /no longer actionable/);
+  assert.equal(store.decisions.get('other-case').status, 'pending');
+  const incidentUpdate = calls.find(({ method, payload }) => method === 'chat.update' && payload.ts === '1.000');
+  assert.ok(incidentUpdate);
+  assert.equal((incidentUpdate.payload.blocks || []).some((block) => block.type === 'actions'), false);
+});
+
+test('stale retirement updates Slack after a concurrent successful finish', async (t) => {
+  const calls = fakeSlack(t);
+  const store = new Store();
+  const incident = decision({ decisionId: 'old-stuck', type: 'operational_reconciliation_stuck',
+    slackChannelId: 'CTEST', slackMessageTs: '1.000', context: { reconciliationGeneration: 'old-generation' } });
+  store.decisions.set(incident.decisionId, incident);
+  const finish = store.finish.bind(store);
+  store.finish = async (...args) => {
+    await finish(...args);
+    throw Object.assign(new Error('conditional write lost after commit'), { name: 'ConditionalCheckFailedException' });
+  };
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await service.retireStaleReconciliationIncidents('home', 'new-generation', false);
+  assert.equal(store.decisions.get(incident.decisionId).status, 'resolved');
+  assert.ok(calls.some(({ method, payload }) => method === 'chat.update' && payload.ts === '1.000'));
+});
+
 test('notification retry reuses its reply and tolerates an already-resolved incident after a new generation starts', async (t) => {
   const calls = fakeSlack(t);
   const db = reconciliationDatabase(t, [run()]);
   const state = new StateRepository();
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   const service = new ManualInterventionService(store, new SlackManualNotifier(store));
   await state.completeReconciliation('home', 'old', 0, { repaired: 2 });
   const markNotified = state.markReconciliationNotified.bind(state);
@@ -184,7 +222,7 @@ test('legacy failed states report Failed consistently in the health check and Sl
   assert.equal(reconciliationRunStatus(legacy), 'failed');
   const state = { async storeReconciliationReply() {}, async markReconciliationNotified() {} };
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   await deliverPendingReconciliationOutcome(state, new ManualInterventionService(store, new SlackManualNotifier(store)), legacy);
   assert.match(calls[0].payload.text, /Failed/);
   assert.match(calls[0].payload.text, /task-1: Invalid start time/);
@@ -195,7 +233,7 @@ test('health delivers a legacy pending outcome even when no new run is requested
   const calls = fakeSlack(t);
   const db = reconciliationDatabase(t, [run({ pending: false, status: 'succeeded', notificationPending: true })]);
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   await checkReconciliationHealth(new StateRepository(), new ManualInterventionService(store, new SlackManualNotifier(store)), ['home']);
   assert.equal(db.get('RECONCILE_OUTCOME#home', 'old').notificationPending, false);
   assert.equal(calls.filter(({ method }) => method === 'chat.postMessage').length, 1);

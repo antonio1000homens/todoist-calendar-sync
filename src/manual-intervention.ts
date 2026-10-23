@@ -984,12 +984,35 @@ export class ManualInterventionService {
   }
 
   async finishReconciliationDecision(decisionId: string, text: string): Promise<void> {
+    let resolution = text;
     try {
       await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
     } catch (error) {
       if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
       const existing = await this.store.get(decisionId);
       if (existing?.status !== "resolved") throw error;
+      resolution = existing.resolution || text;
+    }
+    const incident = await this.store.get(decisionId);
+    if (incident?.status === "resolved") await this.notifier.updateResolution(incident, resolution);
+  }
+
+  async retireStaleReconciliationIncidents(profile: Profile, generation: string, pending: boolean): Promise<void> {
+    for (const incident of await this.store.listPending(profile)) {
+      if (incident.type !== "operational_reconciliation_stuck") continue;
+      const alertedGeneration = typeof incident.context?.reconciliationGeneration === "string"
+        ? incident.context.reconciliationGeneration : undefined;
+      if (!alertedGeneration || (alertedGeneration === generation && pending)) continue;
+      const resolution = `This reconciliation alert is no longer actionable: generation ${alertedGeneration} was superseded or reached a terminal state. Current generation: ${generation}.`;
+      try {
+        await this.store.finish(incident.decisionId, "resolved", resolution, "reconciliation-health");
+      } catch (error) {
+        if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
+        const existing = await this.store.get(incident.decisionId);
+        if (existing?.status !== "resolved") continue;
+      }
+      const finished = await this.store.get(incident.decisionId);
+      if (finished?.status === "resolved") await this.notifier.updateResolution(finished, finished.resolution || resolution);
     }
   }
 

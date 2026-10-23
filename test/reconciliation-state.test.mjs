@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 process.env.STATE_TABLE_NAME ||= 'test-reconciliation-state';
-const { StateRepository } = await import('../dist/repository.js');
+const { StateRepository, reconciliationSummary } = await import('../dist/repository.js');
 const { reconciliationDatabase } = await import('./support/reconciliation-state.mjs');
 
 const old = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -42,6 +42,23 @@ test('progress and terminal results persist with reserved attributes aliased', a
   assert.equal(db.get('RECONCILE_OUTCOME#home', 'old').notificationPending, true);
   assert.deepEqual(db.get('RECONCILE_OUTCOME#home', 'old').result, { repaired: 3, scanned: 5 });
 });
+
+for (const terminal of ['succeeded', 'needs_review']) {
+  test(`run-scoped ${terminal} summary remains distinct from open review cases after an earlier failure`, async (t) => {
+    const db = reconciliationDatabase(t, [run()]);
+    const state = new StateRepository();
+    await state.recordReconciliationFailure('home', 'old', 'previous generation failed');
+    const next = await state.requestReconciliation('home', 'manual');
+    await state.completeReconciliation('home', next.state.generation, terminal === 'needs_review' ? 1 : 0, { repaired: 4 });
+    const latest = db.get('RECONCILE#home');
+    const summary = reconciliationSummary(latest, 2);
+    assert.equal(summary.runStatus, terminal);
+    assert.equal(summary.runUnresolved, terminal === 'needs_review' ? 1 : 0);
+    assert.equal(summary.actionableCaseCount, 2);
+    assert.equal(summary.inboxClear, false);
+    assert.equal((await state.getReconciliationOutcome('home', 'old')).status, 'failed');
+  });
+}
 
 test('reconciliation diagnostics persist accepted delivery, checkpoint, and next cursor', async (t) => {
   const db = reconciliationDatabase(t, [run()]);

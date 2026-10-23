@@ -1,6 +1,6 @@
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { StateRepository } from "./repository.js";
+import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
@@ -260,7 +260,10 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     }
     if (method === "GET" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected=profile(event.queryStringParameters?.profile || null);
-      return response(200,{reconciliation:await new StateRepository().getReconciliationState(selected)});
+      const [reconciliation, actionableCaseCount] = await Promise.all([
+        new StateRepository().getReconciliationState(selected), store.countActionableCases(selected),
+      ]);
+      return response(200,{reconciliation, summary:reconciliationSummary(reconciliation, actionableCaseCount)});
     }
     if (method === "POST" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected = profile(typeof body?.profile === "string" ? body.profile : null);
@@ -271,8 +274,11 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
         console.error(JSON.stringify({ event:"profile_dlq_clear_failed", profile:selected, error:error instanceof Error ? error.message : String(error) }));
         return response(503,{error:"dlq_clear_failed",message:"The profile DLQ could not be cleared; reconciliation was not started."});
       }
-      const result = await requestReconciliation(new StateRepository(),selected,"manual",enqueueDelivery,{requester:actor.email});
-      return response(result.enqueueError?503:202,{reconciliation:result,clearedDlq});
+      const state = new StateRepository();
+      const result = await requestReconciliation(state,selected,"manual",enqueueDelivery,{requester:actor.email});
+      const [current, actionableCaseCount] = await Promise.all([state.getReconciliationState(selected),store.countActionableCases(selected)]);
+      return response(result.enqueueError?503:202,{reconciliation:result,clearedDlq,
+        run:current,summary:reconciliationSummary(current,actionableCaseCount)});
     }
     return response(404,{error:"not_found"});
   } catch(error) {

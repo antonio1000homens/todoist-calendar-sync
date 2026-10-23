@@ -18,7 +18,7 @@ export async function deliverPendingReconciliationOutcome(
     run.notificationReplyTs = replyTs;
   }
   const succeeded = runStatus === "succeeded";
-  await manual.updateReconciliationIncident(run.slackChannelId, run.slackMessageTs, text, succeeded, run.slackDecisionId);
   if (succeeded && run.slackDecisionId) await manual.finishReconciliationDecision(run.slackDecisionId, text);
+  else await manual.updateReconciliationIncident(run.slackChannelId, run.slackMessageTs, text, false, run.slackDecisionId);
   await state.markReconciliationNotified(run.profile, run.generation, replyTs);
 }

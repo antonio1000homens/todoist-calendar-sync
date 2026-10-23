@@ -153,6 +153,16 @@ export class ReviewStore {
       ExclusiveStartKey: cursor }));
     return { items: (result.Items || []) as ReviewCase[], cursor: result.LastEvaluatedKey };
   }
+  async countActionableCases(profile: Profile): Promise<number> {
+    let count = 0;
+    let cursor: Record<string, unknown> | undefined;
+    do {
+      const page = await this.listCases(profile, cursor, false);
+      count += page.items.filter(item => item.status === "open" || item.status === "repairing").length;
+      cursor = page.cursor;
+    } while (cursor);
+    return count;
+  }
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
