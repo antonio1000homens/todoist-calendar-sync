@@ -23,12 +23,27 @@ export function terminalCompletionDecision(
     || !p.eventId || typeof p.completedAt !== "string"
     || !Number.isFinite(Date.parse(p.completedAt))
     || Date.parse(p.completedAt) > nowMs)) return "ambiguous";
-  // A missing owner does not prove that this was a one-off. Partially written
-  // or legacy recurrence metadata must fail closed rather than be interpreted
-  // as terminal standalone history. The same applies to an orphaned terminal
-  // certificate bit: it is meaningful only with a known recurrence owner.
-  if (projections.some((p) => !p.recurrenceOwner
-    && (p.seriesId || p.masterEventId || p.originalStart || p.terminalVerified))) return "ambiguous";
+  // This is persisted input, so do not rely on the TypeScript union or
+  // truthiness. Unknown owners and empty-but-present recurrence identifiers
+  // are malformed/partial state, not proof of a standalone task.
+  const recurrenceOwners = new Set(["calendar", "todoist"]);
+  const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
+  for (const p of projections) {
+    const ownerPresent = hasOwn(p, "recurrenceOwner");
+    const terminalBitPresent = hasOwn(p, "terminalVerified");
+    if (ownerPresent && !recurrenceOwners.has(p.recurrenceOwner as string)) return "ambiguous";
+    if (terminalBitPresent && p.terminalVerified !== true) return "ambiguous";
+    const hasRecurrenceIdentity = ["seriesId", "masterEventId", "originalStart"]
+      .some((field) => hasOwn(p, field));
+    if (!ownerPresent && (hasRecurrenceIdentity || terminalBitPresent)) return "ambiguous";
+    if (p.recurrenceOwner && (typeof p.seriesId !== "string" || !p.seriesId.trim())) return "ambiguous";
+    for (const field of ["seriesId", "masterEventId", "originalStart"] as const) {
+      if (hasOwn(p, field)) {
+        const value = p[field];
+        if (typeof value !== "string" || !value.trim()) return "ambiguous";
+      }
+    }
+  }
   const newest = projections.reduce((a, b) =>
     Date.parse(a.completedAt) >= Date.parse(b.completedAt) ? a : b);
   // A rolling / RRULE occurrence has *not* ended the series. Only an explicit

@@ -38,6 +38,14 @@ test("partial recurrence identity never falls through to one-off cleanup", () =>
   ]) {
     assert.equal(terminalCompletionDecision([oneOff(extra)], boundary), "ambiguous");
   }
+  for (const field of ["seriesId", "masterEventId", "originalStart"]) {
+    assert.equal(terminalCompletionDecision([oneOff({ [field]: "" })], boundary), "ambiguous");
+    assert.equal(terminalCompletionDecision([oneOff({ [field]: null })], boundary), "ambiguous");
+    assert.equal(terminalCompletionDecision([oneOff({ [field]: undefined })], boundary), "ambiguous");
+  }
+  assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "migrated", terminalVerified: true })], boundary), "ambiguous");
+  assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "" })], boundary), "ambiguous");
+  assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "calendar", seriesId: "", terminalVerified: true })], boundary), "ambiguous");
 });
 
 test("weekly/yearly active recurrence occurrence history is never terminal by age", () => {
