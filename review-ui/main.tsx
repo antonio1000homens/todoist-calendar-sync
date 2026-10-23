@@ -119,7 +119,8 @@ function App() {
     refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
   },[reconcileProfile]);
   useEffect(() => {
-    if (!reconciliation?.reconciliation?.pending) return;
+    const currentRunStatus=reconciliation?.summary?.runStatus||reconciliation?.reconciliation?.status;
+    if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
     let cancelled=false;
     let timer:number;
     const poll=async()=>{
@@ -127,13 +128,15 @@ function App() {
         const data=await refreshReconciliation(reconcileProfile);
         await refresh();
         if(cancelled)return;
-        if(!data.reconciliation?.pending) setMessage(`Run ${data.summary?.runStatus||data.reconciliation?.status||"finished"}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
+        const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
+        const terminal=["succeeded","needs_review","failed"].includes(runStatus);
+        if(terminal||!data.reconciliation?.pending) setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
         else timer=window.setTimeout(poll,1500);
       } catch(e:any) { if(!cancelled){setMessage(e.message);timer=window.setTimeout(poll,3000);} }
     };
     timer=window.setTimeout(poll,1500);
     return ()=>{cancelled=true;window.clearTimeout(timer);};
-  },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending]);
+  },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
   const providerLink=(item:ProviderObject|undefined) => {
     const href=item?.url||item?.htmlLink;
     if (!href) return undefined;

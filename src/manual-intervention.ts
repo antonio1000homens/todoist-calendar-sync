@@ -980,13 +980,17 @@ export class ManualInterventionService {
   }
 
   async finishReconciliationDecision(decisionId: string, text: string): Promise<void> {
+    let resolution = text;
     try {
       await this.store.finish(decisionId, "resolved", text, "reconciliation-worker");
     } catch (error) {
       if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
       const existing = await this.store.get(decisionId);
       if (existing?.status !== "resolved") throw error;
+      resolution = existing.resolution || text;
     }
+    const incident = await this.store.get(decisionId);
+    if (incident?.status === "resolved") await this.notifier.updateResolution(incident, resolution);
   }
 
   async retireStaleReconciliationIncidents(profile: Profile, generation: string, pending: boolean): Promise<void> {

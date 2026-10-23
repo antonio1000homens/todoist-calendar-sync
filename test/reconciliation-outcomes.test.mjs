@@ -158,7 +158,7 @@ test('notification retry reuses its reply and tolerates an already-resolved inci
   const db = reconciliationDatabase(t, [run()]);
   const state = new StateRepository();
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   const service = new ManualInterventionService(store, new SlackManualNotifier(store));
   await state.completeReconciliation('home', 'old', 0, { repaired: 2 });
   const markNotified = state.markReconciliationNotified.bind(state);
@@ -200,7 +200,7 @@ test('legacy failed states report Failed consistently in the health check and Sl
   assert.equal(reconciliationRunStatus(legacy), 'failed');
   const state = { async storeReconciliationReply() {}, async markReconciliationNotified() {} };
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   await deliverPendingReconciliationOutcome(state, new ManualInterventionService(store, new SlackManualNotifier(store)), legacy);
   assert.match(calls[0].payload.text, /Failed/);
   assert.match(calls[0].payload.text, /task-1: Invalid start time/);
@@ -211,7 +211,7 @@ test('health delivers a legacy pending outcome even when no new run is requested
   const calls = fakeSlack(t);
   const db = reconciliationDatabase(t, [run({ pending: false, status: 'succeeded', notificationPending: true })]);
   const store = new Store();
-  store.decisions.set('incident', decision());
+  store.decisions.set('incident', decision({ slackChannelId: 'CTEST', slackMessageTs: '1.000' }));
   await checkReconciliationHealth(new StateRepository(), new ManualInterventionService(store, new SlackManualNotifier(store)), ['home']);
   assert.equal(db.get('RECONCILE_OUTCOME#home', 'old').notificationPending, false);
   assert.equal(calls.filter(({ method }) => method === 'chat.postMessage').length, 1);
