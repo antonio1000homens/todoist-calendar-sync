@@ -59,6 +59,60 @@ export function snapshotFingerprint(snapshots: ReviewSnapshot[]): string {
 export class ReviewEngine {
   constructor(readonly store = new ReviewStore(), readonly state = new StateRepository(), readonly clients: ProviderClientFactory = defaultProviderClientFactory,
     readonly controls = new SyncControls()) {}
+  private async queueDeferredRefresh(refs: EntityRef[], state = this.state): Promise<Array<EntityRef & {pendingRefreshAt:string}>> {
+    const pending = await this.controls.pendingRefreshRefs(refs);
+    if (!pending.length) return pending;
+    const byProfile = new Map<Profile, typeof pending>();
+    for (const ref of pending) {
+      const group = byProfile.get(ref.profile) || [];
+      group.push(ref);
+      byProfile.set(ref.profile, group);
+    }
+    for (const [profile, profileRefs] of byProfile) {
+      const request = await requestReconciliation(state, profile, "manual", enqueueDelivery,
+        { requester:"review-repair", pendingRefreshRefs:profileRefs });
+      if (!request.queued && !request.coalesced) {
+        throw new Error(`Provider updates arrived during this repair, but reconciliation could not be queued for ${profile}; the repair barrier remains active. Resume this operation to retry.`);
+      }
+    }
+    return pending;
+  }
+  private async releaseLegacyNoWriteClaims(actor: ReviewActor, snapshots: ReviewSnapshot[]): Promise<boolean> {
+    const owners = [...new Set(snapshots.map(snapshot => snapshot.control?.activeRepair).filter((id): id is string => typeof id === "string"))];
+    if (!owners.length) return false;
+    for (const id of owners) {
+      const operation = await this.store.getOperation(id);
+      // Only legacy failed attempts with the durable, read-only validation
+      // checkpoint can be superseded. Any other checkpoint may have crossed a
+      // provider or mapping write boundary and must retain its resume barrier.
+      if (!operation || operation.id !== id || operation.actor?.subject !== actor.subject
+        || operation.status !== "failed" || operation.abandoned
+        || operation.steps?.validated?.status !== "done" || operationHasWriteEvidence(operation)) {
+        invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
+      }
+      const ownedSnapshots = [...(operation.preview?.snapshots || []), ...(operation.claimSnapshots || [])];
+      const refs = [...new Map(ownedSnapshots.map(snapshot => [entityKey(snapshot.ref), snapshot.ref])).values()];
+      if (!refs.length || ownedSnapshots.some(snapshot => !snapshot.ref?.profile || !snapshot.ref?.side || !snapshot.ref?.id)) {
+        invalidRepairIntent("The failed repair has incomplete ownership evidence; inspect it before creating another preview");
+      }
+      for (const ref of refs) {
+        const control = await this.controls.control(ref);
+        if (control?.activeRepair !== id) {
+          invalidRepairIntent("Repair ownership changed while preparing a fresh preview; refresh affected items and retry");
+        }
+      }
+      try {
+        const queued = await this.queueDeferredRefresh(refs);
+        await this.controls.releaseUnapplied(refs, id, ownedSnapshots, {
+          error: operation.error || "No provider write was recorded",
+          nextAction: "No provider write is recorded. Refresh affected items and create a new preview; the failed operation remains available for audit.",
+        }, queued);
+      } catch (error) {
+        invalidRepairIntent(`The failed repair could not be safely superseded; its ownership remains protected. ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return true;
+  }
   async snapshot(ref: EntityRef): Promise<ReviewSnapshot> {
     const pair = await this.clients(ref.profile);
     let object: TodoistTask | CalendarEvent | null;
@@ -179,7 +233,7 @@ export class ReviewEngine {
     if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
     if (intent.action !== "transfer" && Object.values(intent.leftovers).includes("retain-unlinked")) invalidRepairIntent("Retain unlinked is available only during an explicit Calendar series transfer");
     intent = decisionRepairIntent(intent, record.decision);
-    const snapshots = await this.collect(intent, record.decision);
+    let snapshots = await this.collect(intent, record.decision);
     if (!snapshots.length) invalidRepairIntent("Select at least one provider item");
     // Never accept a disposition submitted for an undisclosed or ambiguous object.
     // In particular a stale task's 404 snapshot must not be mistaken for a live task.
@@ -193,7 +247,14 @@ export class ReviewEngine {
         }
       }
     }
-    if (snapshots.some(s => s.control?.activeRepair)) invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
+    if (snapshots.some(s => s.control?.activeRepair)) {
+      if (!await this.releaseLegacyNoWriteClaims(actor, snapshots)) invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
+      // Release is conditional and atomic with the old operation's terminal
+      // audit marker. Re-read provider versions, mappings, and controls so the
+      // newly created preview is never based on the pre-release snapshot.
+      snapshots = await this.collect(intent, record.decision);
+      if (snapshots.some(s => s.control?.activeRepair)) invalidRepairIntent("An incomplete repair still owns an affected item; resume that operation first");
+    }
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
     if (intent.action === "verify") {
@@ -524,19 +585,12 @@ export class ReviewEngine {
     const state = new StateRepository(id);
     const rawFactory = this.clients;
     const budget = new ReconciliationMutationBudget(20);
-    const factory = guardRepairProviders(operation, createBudgetedClientFactory(budget, rawFactory), () => this.store.saveOperation(operation));
+    const factory = guardRepairProviders(operation, createBudgetedClientFactory(budget, rawFactory), async () => {
+      operation.writeStarted = true;
+      await this.store.saveOperation(operation);
+    });
     let claimed = false;
-    const queueDeferredRefresh = async (refs:EntityRef[]) => {
-      const pending=await this.controls.pendingRefreshRefs(refs);
-      if(!pending.length)return pending;
-      const byProfile = new Map<Profile, typeof pending>();
-      for(const ref of pending){const group=byProfile.get(ref.profile)||[];group.push(ref);byProfile.set(ref.profile,group);}
-      for(const [profile,profileRefs] of byProfile){
-        const request=await requestReconciliation(state,profile,"manual",enqueueDelivery,{requester:"review-repair",pendingRefreshRefs:profileRefs});
-        if(!request.queued&&!request.coalesced)throw new Error(`Provider updates arrived during this repair, but reconciliation could not be queued for ${profile}; the repair barrier remains active. Resume this operation to retry.`);
-      }
-      return pending;
-    };
+    const queueDeferredRefresh = async (refs:EntityRef[]) => this.queueDeferredRefresh(refs,state);
     // Legacy failed operations can predate the durable abandoned marker. Do not
     // replay them unless persisted execution state proves a write may have begun.
     if (["failed", "needs_review"].includes(operation.status) && !operationHasWriteEvidence(operation)) {
@@ -554,6 +608,9 @@ export class ReviewEngine {
       const saved = operation.steps[name];
       if (saved?.status === "done") return saved.result as T;
       if (saved && Date.now()-Date.parse(saved.startedAt) > 23*3600000 && name.startsWith("create-task")) throw new Error("Task creation acknowledgement is uncertain and its idempotency window expired; inspect provider state before retrying");
+      // Persist the side-effect boundary with the checkpoint before running it.
+      // releaseUnapplied conditions on this marker to race safely with retries.
+      if (name !== "validated") operation.writeStarted = true;
       operation.steps[name] = { id: name, status: "running", startedAt: saved?.startedAt || at() }; await this.store.saveOperation(operation);
       const result = await run(); operation.steps[name] = { ...operation.steps[name], status: "done", result: result ?? null, completedAt: at() }; await this.store.saveOperation(operation); return result;
     };

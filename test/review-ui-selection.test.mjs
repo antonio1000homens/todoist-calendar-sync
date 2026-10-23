@@ -223,14 +223,27 @@ test("review UI renders approved historical and future RRULEs and expiry before 
 
 test("failed repair resume requires recorded write evidence", () => {
   assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}}}),"fresh-preview");
-  assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}},expectedProviders:{"home:calendar:event":{id:"event"}}}),"fresh-preview");
+  const ref={profile:"home",side:"calendar",id:"event"},object={id:"event"};
+  const noWriteWithProviderSnapshot={status:"failed",steps:{validated:{status:"done"}},expectedProviders:{"home:calendar:event":object},
+    preview:{snapshots:[{ref,object}]}};
+  assert.equal(operationResumeEligibility(noWriteWithProviderSnapshot),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"failed",steps:{},outcomes:[]}),"resume");
   assert.equal(operationResumeEligibility({status:"failed",steps:{},abandoned:true}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}},abandoned:true}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}},abandoned:true}),"none");
   assert.equal(operationResumeEligibility({status:"needs_review",steps:{validated:{status:"done"}}}),"fresh-preview");
-  assert.equal(operationResumeEligibility({status:"needs_review",steps:{validated:{status:"done"}},expectedProviders:{"home:calendar:event":{id:"event"}}}),"fresh-preview");
+  assert.equal(operationResumeEligibility({...noWriteWithProviderSnapshot,status:"needs_review"}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"needs_review",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"queued",steps:{}}),"resume");
+});
+
+test("a recorded provider delta keeps a legacy failed operation resumable", () => {
+  const ref={profile:"home",side:"calendar",id:"event"};
+  const before={id:"event",summary:"before"},after={id:"event",summary:"after"};
+  const operation={status:"failed",steps:{validated:{status:"done"}},
+    preview:{snapshots:[{ref,object:before}]},expectedProviders:{"home:calendar:event":after}};
+  assert.equal(operationResumeEligibility(operation),"resume");
+  assert.equal(operationResumeEligibility({...operation,abandoned:true}),"none");
+  assert.equal(operationResumeEligibility({...operation,expectedProviders:{"home:calendar:event":before}}),"fresh-preview");
 });

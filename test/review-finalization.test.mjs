@@ -124,10 +124,13 @@ test("unapplied release compares preview control state in one conditional transa
   assert.equal(tx.length,3);
   assert.ok(tx.slice(0,2).every(x=>x.Update.ConditionExpression.includes("activeRepair = :id")));
   assert.match(tx[0].Update.ConditionExpression,/excluded = :excluded/);
+  assert.match(tx[0].Update.ConditionExpression,/providerUpdatedAt = :providerUpdatedAt/);
+  assert.equal(tx[0].Update.ExpressionAttributeValues[":providerUpdatedAt"],"v1");
   assert.match(tx[1].Update.ConditionExpression,/attribute_not_exists\(excluded\)/);
   assert.ok(tx.slice(0,2).every(x=>!x.Update.UpdateExpression.includes("providerUpdatedAt")));
   assert.match(tx[2].Update.UpdateExpression,/abandoned = :yes/);
   assert.match(tx[2].Update.ConditionExpression,/attribute_not_exists\(abandoned\)/);
+  assert.match(tx[2].Update.ConditionExpression,/attribute_not_exists\(writeStarted\)/);
   await assert.rejects(controls.releaseUnapplied([{profile:"home",side:"calendar",id:"unknown"}],"repair",[],{error:"failed",nextAction:"new preview"}),/No preview control snapshot/);
   assert.equal(commands.length,1);
 });

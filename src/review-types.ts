@@ -45,6 +45,8 @@ export interface RepairOperation {
   status: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
   error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
+  /** Persisted before any non-validation execution step so no-write abandonment can race safely with retries. */
+  writeStarted?: boolean;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
   outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged" | "retained-unlinked"; checkedAt: string }>;
   /** Controls sampled before claiming extra, non-preview move destination locks. */
@@ -54,10 +56,21 @@ export interface RepairOperation {
   creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;
 }
 export function operationHasWriteEvidence(operation: RepairOperation): boolean {
-  return Object.keys(operation.steps || {}).some(name => name !== "validated")
+  const snapshotObjects = new Map((operation.preview?.snapshots || []).map(snapshot => [entityKey(snapshot.ref), snapshot.object ?? null]));
+  const providerProgress = Object.entries(operation.expectedProviders || {}).some(([key, object]) =>
+    !snapshotObjects.has(key) || stableOperationValue(object) !== stableOperationValue(snapshotObjects.get(key)));
+  return operation.writeStarted === true
+    || Object.keys(operation.steps || {}).some(name => name !== "validated")
     || Object.keys(operation.creations || {}).length > 0
+    || providerProgress
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
+}
+function stableOperationValue(value: unknown): string {
+  const normalize = (item: unknown): unknown => Array.isArray(item) ? item.map(normalize)
+    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b)).map(([key, child])=>[key,normalize(child)]))
+    : item;
+  return JSON.stringify(normalize(value)) ?? "undefined";
 }
 export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean; preserveControlState?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }
