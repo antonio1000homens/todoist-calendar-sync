@@ -1554,6 +1554,70 @@ export class StateRepository {
     }
   }
 
+  /**
+   * Remove only an elapsed Calendar event's EVENT row. The task-side indexes
+   * are removed only when they still point to that exact event; if they point
+   * to the approved current/future counterpart, conditional checks retain them.
+   */
+  async commitElapsedCalendarHistoryDetach(input:{
+    operationId:string; profile:Profile; eventId:string; taskId:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedEventMappings?:Mapping[];
+  }):Promise<boolean> {
+    const {operationId,profile,eventId,taskId,eventMapping,taskMapping,retainedEventMappings=[]}=input;
+    const same=(mapping:Mapping|undefined,event:string)=>Boolean(mapping&&mapping.profile===profile
+      &&mapping.taskId===taskId&&mapping.eventId===event&&mapping.updatedAt);
+    if(eventMapping&&!same(eventMapping,eventId))throw new Error("Elapsed Calendar mapping identity is invalid");
+    if(taskMapping&&(!taskMapping.updatedAt||taskMapping.profile!==profile||taskMapping.taskId!==taskId))throw new Error("Elapsed Calendar task mapping identity is invalid");
+    if(retainedEventMappings.some(mapping=>!mapping.updatedAt||mapping.profile!==profile||mapping.taskId!==taskId
+      ||mapping.eventId===eventId))throw new Error("Elapsed Calendar retained event mapping identity is invalid");
+    const retainedMappings=[...new Map(retainedEventMappings.map(mapping=>[mapping.eventId,mapping])).values()]
+      .filter(mapping=>mapping.eventId!==taskMapping?.eventId);
+    const table=this.ensureTable(),receiptKey=key(`ELAPSED_HISTORY_DETACH#${operationId}`);
+    const receipt=await client.send(new GetCommand({TableName:table,Key:receiptKey,ConsistentRead:true}));
+    if(receipt.Item) {
+      if(receipt.Item.profile!==profile||receipt.Item.eventId!==eventId||receipt.Item.taskId!==taskId) throw new Error("Elapsed Calendar detach receipt belongs to another event");
+      const [eventRow,taskRow,ownerRow]=await Promise.all([
+        client.send(new GetCommand({TableName:table,Key:key(`EVENT#${profile}#${eventId}`,"MAP"),ConsistentRead:true})),
+        client.send(new GetCommand({TableName:table,Key:key(`TASK#${profile}#${taskId}`,"MAP"),ConsistentRead:true})),
+        client.send(new GetCommand({TableName:table,Key:key(`TASKOWNER#${taskId}`,"MAP"),ConsistentRead:true})),
+      ]);
+      const expected=taskMapping&&taskMapping.eventId!==eventId?taskMapping:undefined;
+      const matches=(item:Record<string,unknown>|undefined,mapping:Mapping|undefined)=>mapping
+        ?item?.profile===mapping.profile&&item.taskId===mapping.taskId&&item.eventId===mapping.eventId&&item.updatedAt===mapping.updatedAt
+        :!item;
+      return !eventRow.Item&&matches(taskRow.Item,expected)&&matches(ownerRow.Item,expected);
+    }
+    const condition=(expected?:Mapping)=>expected?{
+      ConditionExpression:"#p = :p AND taskId = :t AND eventId = :e AND updatedAt = :v",
+      ExpressionAttributeNames:{"#p":"profile"},
+      ExpressionAttributeValues:{":p":profile,":t":taskId,":e":expected.eventId,":v":expected.updatedAt},
+    }:{ConditionExpression:"attribute_not_exists(pk)"};
+    const rowItems=(expected:Mapping|undefined, rowKey:Record<string,string>, removeIfOld:boolean) => {
+      if(removeIfOld&&same(expected,eventId))return {Delete:{TableName:table,Key:rowKey,...condition(expected)}};
+      return {ConditionCheck:{TableName:table,Key:rowKey,...condition(expected)}};
+    };
+    const items:Array<Record<string,unknown>>=[
+      ...(eventMapping
+        ? [{Delete:{TableName:table,Key:key(`EVENT#${profile}#${eventId}`,"MAP"),...condition(eventMapping)}}]
+        : [{ConditionCheck:{TableName:table,Key:key(`EVENT#${profile}#${eventId}`,"MAP"),ConditionExpression:"attribute_not_exists(pk)"}}]),
+      rowItems(taskMapping,key(`TASK#${profile}#${taskId}`,"MAP"),true),
+      rowItems(taskMapping,key(`TASKOWNER#${taskId}`,"MAP"),true),
+      ...(taskMapping&&taskMapping.eventId!==eventId?[{ConditionCheck:{TableName:table,
+        Key:key(`EVENT#${profile}#${taskMapping.eventId}`,"MAP"),...condition(taskMapping)}}]:[]),
+      ...retainedMappings.map(mapping=>({ConditionCheck:{TableName:table,
+        Key:key(`EVENT#${profile}#${mapping.eventId}`,"MAP"),...condition(mapping)}})),
+      ...allProfiles.filter(candidate=>candidate!==profile).map(candidate=>({ConditionCheck:{TableName:table,
+        Key:key(`TASK#${candidate}#${taskId}`,"MAP"),ConditionExpression:"attribute_not_exists(pk)"}})),
+      {Put:{TableName:table,Item:{...receiptKey,operationId,profile,eventId,taskId,updatedAt:now()},ConditionExpression:"attribute_not_exists(pk)"}},
+    ];
+    try { await client.send(new TransactWriteCommand({TransactItems:items as never})); return true; }
+    catch(error) {
+      const cancelled=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      if(cancelled.name==="TransactionCanceledException"&&cancelled.CancellationReasons?.some(reason=>reason.Code==="ConditionalCheckFailed")
+        &&cancelled.CancellationReasons.every(reason=>reason.Code==="None"||reason.Code==="ConditionalCheckFailed"))return false;
+      throw error;
+    }
+  }
+
   async acceptTaskVersion(profile: Profile, taskId: string, updatedAt: string | undefined, deliveryId?: string): Promise<boolean> {
     void profile;
     if (!updatedAt || !Number.isFinite(Date.parse(updatedAt))) return true;
