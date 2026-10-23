@@ -92,6 +92,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone([...mappingMap.values()].find(value => value.profile === profile && value.eventId === id)); },
     async getRecurrenceLink(_profile, id) { return clone(recurrences.get(id)); },
+    async getFutureSeriesSplitAnyProfile(taskId) { return clone(splits.get(taskId)); },
     async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId, previousOccurrence) {
       const entry=splits.get(taskId);
       if(entry && (entry.profile!==profile || entry.oldMasterId!==oldMasterId || entry.newMasterId!==newMasterId))throw new Error("Conflicting split");
@@ -991,4 +992,46 @@ test("stale annual preview cannot write to a modified standalone event", async t
   assert.notEqual(result.status,"succeeded");
   assert.match(result.error,/changed after preview|Provider state or ownership changed/);
   assert.deepEqual(h.writes,[]);
+});
+
+test("yearly historical event survives a lost future-master acknowledgement and resumes without duplicates",async t=>{
+  const h=harness(t,{events:[event("event",{start:{date:"2026-03-15"},end:{date:"2026-03-16"},
+    extendedProperties:{shared:{taskId:"task"}}})],
+    tasks:[task("task",{due:{date:"2027-03-15",is_recurring:true,string:"yearly"}})]});
+  const original=h.clients.calendar.createFutureMasterOnce;
+  let calls=0;
+  h.clients.calendar.createFutureMasterOnce=async (...args)=>{
+    if(++calls===1)throw new Error("Transient Calendar POST error");
+    return original(...args);
+  };
+  const input=intent({owner:"todoist",winner:"todoist",scope:"future"});
+  const first=await h.execute(input);
+  assert.equal(first.status,"needs_review");
+  assert.equal(h.eventMap.get("event").start.date,"2026-03-15");
+  assert.equal(h.eventMap.get("event").extendedProperties.shared.syncHistoryOnly,"true");
+  assert.equal(h.mappingMap.size,0);
+  const resumed=await h.engine.execute("repair");
+  assert.equal(resumed.status,"succeeded",resumed.error);
+  assert.equal(h.taskMap.size,1);
+  assert.equal(h.mappingMap.get("task").recurrenceOwner,"todoist");
+  assert.equal(h.eventMap.get("event").recurrence,undefined);
+  assert.equal(h.writes.filter(w=>w[0]==="create-future-master").length,1);
+});
+
+test("same-date annualizing can resume after the Calendar update but before reading its occurrence",async t=>{
+  const h=harness(t,{tasks:[task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}})]});
+  const read=h.clients.calendar.listInstancesInWindow;
+  let calls=0;
+  h.clients.calendar.listInstancesInWindow=async(...args)=>{
+    if(++calls===1)throw new Error("Transient Calendar instances read failed");
+    return read(...args);
+  };
+  const first=await h.execute(intent({owner:"todoist",winner:"todoist",scope:"future"}));
+  assert.equal(first.status,"needs_review");
+  assert.deepEqual(h.eventMap.get("event").recurrence,["RRULE:FREQ=YEARLY"]);
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.mappingMap.get("task").masterEventId,"event");
+  assert.equal(h.writes.filter(w=>w[0]==="event" && w[1]==="event").length,2); // annualization + metadata link
+  assert.equal(h.taskMap.size,1);
 });
