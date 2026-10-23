@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SQSClient } from "@aws-sdk/client-sqs";
+import { documentClient } from "../dist/dynamodb-capacity.js";
 import { enqueueDelivery, messageDeduplicationId } from "../dist/queue.js";
 
 const reportedId = "136357225910187fbd02c4c321c241fa57494e8c036e01a168373ec3c8506a43:orphan:6tgjepj170rjeb9icgs68b9k6orjgbb1cksmcb9o68pm8c3161h3ep32cc:6hpX9fgPf652P79j";
@@ -44,13 +45,17 @@ test("retry metadata does not change the token for the same logical delivery", (
 
 test("enqueueDelivery hashes every kind while preserving its body and per-profile ordering", async () => {
   const originalSend = SQSClient.prototype.send;
+  const originalDocumentSend = documentClient.send;
   const originalQueueUrl = process.env.QUEUE_URL;
+  const originalProtocolVersion = process.env.ERASURE_PROTOCOL_VERSION;
   const commands = [];
   SQSClient.prototype.send = async function (command) {
     commands.push(command);
     return {};
   };
+  documentClient.send = async () => ({});
   process.env.QUEUE_URL = "https://sqs.eu-west-2.amazonaws.com/123456789012/test.fifo";
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
   const deliveries = ["calendar", "todoist", "orphan", "reconcile", "manual"].map((kind) => ({
     ...identity,
     kind,
@@ -60,21 +65,64 @@ test("enqueueDelivery hashes every kind while preserving its body and per-profil
     body: "",
   }));
   const originalBodies = deliveries.map((delivery) => JSON.stringify(delivery));
-
   try {
     for (const delivery of deliveries) await enqueueDelivery(delivery);
   } finally {
     SQSClient.prototype.send = originalSend;
+    documentClient.send = originalDocumentSend;
     if (originalQueueUrl === undefined) delete process.env.QUEUE_URL;
     else process.env.QUEUE_URL = originalQueueUrl;
+    if (originalProtocolVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION = originalProtocolVersion;
   }
 
   assert.equal(commands.length, deliveries.length);
   commands.forEach((command, index) => {
     assert.match(command.input.MessageDeduplicationId, /^[a-f0-9]{64}$/);
     assert.equal(command.input.MessageDeduplicationId, messageDeduplicationId(deliveries[index]));
-    assert.equal(command.input.MessageBody, originalBodies[index]);
+    assert.equal(command.input.MessageBody, JSON.stringify({ ...deliveries[index], erasureEpoch: 0 }));
     assert.equal(JSON.stringify(deliveries[index]), originalBodies[index]);
     assert.equal(command.input.MessageGroupId, "sync:home");
   });
+});
+
+test("admission does not restamp an in-flight payload after a complete fence window", async () => {
+  const originalQueueSend = SQSClient.prototype.send;
+  const originalDocumentSend = documentClient.send;
+  const originalQueueUrl = process.env.QUEUE_URL;
+  const originalProtocolVersion = process.env.ERASURE_PROTOCOL_VERSION;
+  let epoch = 0;
+  let queueCalls = 0;
+  SQSClient.prototype.send = async () => { queueCalls++; return {}; };
+  documentClient.send = async command => {
+    if (command.constructor.name === "GetCommand") {
+      if (command.input.Key.sk === "EPOCH") return { Item: { epoch } };
+      return {};
+    }
+    if (command.constructor.name === "TransactWriteCommand") {
+      // The expected epoch was read before the fence. Simulate a full fence
+      // install+finish before the admission transaction reaches DynamoDB.
+      epoch = 1;
+      const error = new Error("condition check failed");
+      error.name = "TransactionCanceledException";
+      throw error;
+    }
+    return {};
+  };
+  process.env.QUEUE_URL = "https://sqs.eu-west-2.amazonaws.com/123456789012/test.fifo";
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
+  try {
+    await assert.rejects(enqueueDelivery({
+      ...identity, kind: "todoist", mode: "aws", receivedAt: "2026-10-23T12:00:00Z",
+      headers: {}, body: JSON.stringify({ event_name: "item:updated", event_data: { id: "task-123" } }),
+    }), /erasure epoch changed/);
+    assert.equal(queueCalls, 0);
+  } finally {
+    SQSClient.prototype.send = originalQueueSend;
+    documentClient.send = originalDocumentSend;
+    if (originalQueueUrl === undefined) delete process.env.QUEUE_URL;
+    else process.env.QUEUE_URL = originalQueueUrl;
+    if (originalProtocolVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION = originalProtocolVersion;
+  }
 });

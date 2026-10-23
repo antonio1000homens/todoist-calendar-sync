@@ -33,7 +33,7 @@ async function runLateDelete(withTaskIndex, receivedAt) {
     async findByTodoistTaskId() { return event; },
     async deleteEvent() { deleted++; },
   };
-  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {} }));
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return task; } } }));
   await sync.process({
     id: "delete-late", kind: "todoist", profile: "home", mode: "aws",
     receivedAt, headers: {}, body: JSON.stringify({ event_name: "item:deleted", event_data: task }),

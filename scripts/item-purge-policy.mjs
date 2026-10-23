@@ -49,8 +49,8 @@ function providerRefs(row) {
         if (key === "seriesId") series.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "todoist") tasks.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "calendar") events.add(value);
-      } else if (Array.isArray(value) && /^(candidateTaskIds|candidateEventIds)$/.test(key)) {
-        for (const item of value) if (typeof item === "string") (key === "candidateTaskIds" ? tasks : events).add(item);
+      } else if (Array.isArray(value) && /^(candidateTaskIds|candidateEventIds|taskIds|eventIds)$/.test(key)) {
+        for (const item of value) if (typeof item === "string") ((key === "candidateTaskIds" || key === "taskIds") ? tasks : events).add(item);
       }
       if (value && typeof value === "object") recurse(value, path ? path + "." + key : key, activeSide);
     }
@@ -89,9 +89,9 @@ export function planPurge(rows, target) {
     if (pk.startsWith("CONFLICT_STATE#" + profile + "#") && conflictHashes.has(pk.split("#").at(-1))) reasons.push("conflict identity hash");
     visit(row, (value, path) => {
       if (path === "pk" || path === "sk") return;
-      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId|candidateTaskIds)(\[\d+\])?$/.test(path)
+      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId|candidateTaskIds|identityRefs\.taskIds)(\[\d+\])?$/.test(path)
         || /(^|\.)ref\.id$/.test(path) && path.includes("todoist");
-      const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId|candidateEventIds)(\[\d+\])?$/.test(path);
+      const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId|candidateEventIds|identityRefs\.eventIds)(\[\d+\])?$/.test(path);
       if (value === taskId && taskPath) reasons.push("task ID at " + path);
       if (eventId && value === eventId && eventPath) reasons.push("event ID at " + path);
       const identityField = /(^|[._])[^.[\]]*(?:id|identity)(?:$|\[\d+\])/i.test(path);
@@ -111,12 +111,18 @@ export function planPurge(rows, target) {
   }
   // Record links can point in either direction and can be nested in a preview.
   // Seed the graph only from exact task/event IDs or the deterministic conflict hash.
-  // Delivery receipts without provider identity are included as unattributable
-  // candidates: a complete erasure preview must make that uncertainty visible.
   for (const row of rows) {
     if (kindOf(row) === "DELIVERY") {
+      const refs = providerRefs(row);
+      const hasIdentityRefs = Array.isArray(row.identityRefs?.taskIds) || Array.isArray(row.identityRefs?.eventIds);
+      if (hasIdentityRefs && !refs.tasks.has(taskId) && !(eventId && refs.events.has(eventId))) continue;
+      if (!hasIdentityRefs && row.profile !== profile) continue;
       const key = keyOf(row);
-      if (!included.has(key)) included.set(key, { row, reasons: ["delivery receipt must be assessed for replay/identity"] });
+      if (!included.has(key)) included.set(key, {
+        row,
+        reasons: hasIdentityRefs ? ["delivery receipt references selected provider identity"]
+          : ["legacy delivery receipt has no provider identity and requires manual attribution"],
+      });
     }
   }
   for (let round = 0; round < 32; round++) {

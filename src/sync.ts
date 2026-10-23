@@ -1161,10 +1161,46 @@ export class Synchronizer {
 
   private async processTodoist(delivery: Delivery): Promise<void> {
     const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-    const task = payload.event_data;
+    let task = payload.event_data;
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
+    // Epochs reject messages already admitted before an erasure fence. An old
+    // Todoist webhook can also arrive after that fence and receive the new
+    // epoch, so upserts must be checked against current provider state too.
+    if (lifecycle.action === "upsert") {
+      let current: TodoistTask;
+      try {
+        current = await (await this.clients(delivery.profile)).todoist.getTask(task.id);
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 404) {
+          return this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {
+            event: payload.event_name,
+          });
+        }
+        throw error;
+      }
+      const currentProfile = profileForTodoistProject(current.project_id);
+      if (currentProfile && currentProfile !== delivery.profile) {
+        return this.state.audit(delivery.profile, "todoist_stale_profile_replay_suppressed", {
+          currentProfile,
+        });
+      }
+      task = current;
+    }
     const existingMapping = await this.state.getMappingByTaskAnyProfile(task.id);
+    const completedHistory = lifecycle.action !== "upsert" && !existingMapping
+      ? await this.state.listCompletedCalendarProjectionsByTask?.(delivery.profile, task.id) || []
+      : [];
+    if (lifecycle.action !== "upsert" && !existingMapping && !completedHistory.length) {
+      try {
+        await (await this.clients(delivery.profile)).todoist.getTask(task.id);
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 404) {
+          return this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+        }
+        throw error;
+      }
+    }
     const controlProfile = existingMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: task.id, eventId: existingMapping?.eventId })) {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });

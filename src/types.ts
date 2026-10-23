@@ -78,6 +78,8 @@ export interface Delivery {
   /** Sanitized provider metadata only. Never persist auth/signature headers. */
   headers: Record<string, string>;
   body: string;
+  /** Profile erasure epoch assigned under the durable admission lease. */
+  erasureEpoch?: number;
   orphan?: { eventId: string; taskId: string; attempt: 2 };
   reconcile?: {
     reason: ReconciliationReason;

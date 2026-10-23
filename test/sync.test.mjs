@@ -427,7 +427,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   const calendar = {
     async getEvent() { return structuredClone(event); },
   };
-  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {} }));
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return structuredClone(task); } } }));
 
   await sync.process({
     id: "canonical-noop",
@@ -444,4 +444,31 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   assert.equal(saved.projectCommentId, "project-comment-7");
   assert.equal(saved.taskCommentId, "legacy-task-comment-2");
   assert.equal(saved.mappingRevision, 7);
+});
+
+test("erased Todoist upsert and delete replays emit identity-free suppression audits", async () => {
+  const audits = [];
+  const state = {
+    async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
+    async getMappingByTaskAnyProfile() { return undefined; },
+    async listCompletedCalendarProjectionsByTask() { return []; },
+  };
+  const todoist = {
+    async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
+  };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar: {}, todoist }));
+  const erasedTask = { id: "erased-task-id", content: "Old item", due: { date: "2026-10-23" } };
+  for (const eventName of ["item:updated", "item:completed", "item:deleted"]) {
+    await sync.process({
+      id: `old-${eventName}`, kind: "todoist", profile: "home", mode: "aws",
+      receivedAt: new Date().toISOString(), headers: {},
+      body: JSON.stringify({ event_name: eventName, event_data: { ...erasedTask, is_deleted: eventName === "item:deleted" } }),
+    });
+  }
+  assert.equal(audits.length, 3);
+  for (const audit of audits) {
+    assert.equal(audit.action, "todoist_erased_item_replay_suppressed");
+    assert.equal(Object.hasOwn(audit.detail, "taskId"), false);
+    assert.equal(Object.hasOwn(audit.detail, "deliveryId"), false);
+  }
 });
