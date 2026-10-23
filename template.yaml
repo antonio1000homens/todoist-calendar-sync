@@ -203,6 +203,27 @@ Resources:
         deadLetterTargetArn: !GetAtt SyncDlq.Arn
         maxReceiveCount: 1
 
+  ErasureOperationDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ResourceNamePrefix}-erasure-dlq-${Stage}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  ErasureOperationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ResourceNamePrefix}-erasure-${Stage}
+      # One bounded lifecycle action runs per delivery. Delayed self-dispatch
+      # persists longer waits in DynamoDB and reschedules at most 15 minutes out.
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ErasureOperationDlq.Arn
+        maxReceiveCount: 5
+
   AlertTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -299,11 +320,14 @@ Resources:
           CF_ACCESS_AUDIENCE: !Ref CloudflareAccessAudience
           REVIEW_OPERATOR_EMAILS: !Ref ReviewOperatorEmails
           DLQ_URL: !Ref SyncDlq
+          ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
         - SQSSendMessagePolicy:
             QueueName: !GetAtt SyncQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ErasureOperationQueue.QueueName
         - Statement:
             - Effect: Allow
               Action:
@@ -419,6 +443,62 @@ Resources:
       BuildMethod: esbuild
       BuildProperties:
         EntryPoints: [src/worker.ts]
+        Format: cjs
+        Target: es2022
+        Minify: true
+
+  ErasureWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ResourceNamePrefix}-erasure-worker-${Stage}
+      RetentionInDays: 14
+
+  ErasureWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-erasure-worker-${Stage}
+      Handler: erasure-worker.handler
+      ReservedConcurrentExecutions: 1
+      RecursiveLoop: Allow
+      Timeout: 50
+      CodeUri: .
+      Environment:
+        Variables:
+          ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
+          ERASURE_TARGET_WORKER_FUNCTION_NAME: !Ref WorkerFunction
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncState
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ErasureOperationQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ErasureOperationQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:GetFunctionConfiguration
+              Resource: !GetAtt WorkerFunction.Arn
+            - Effect: Allow
+              Action:
+                - lambda:ListEventSourceMappings
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - lambda:GetEventSourceMapping
+                - lambda:UpdateEventSourceMapping
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
+      Events:
+        ErasureOperationQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ErasureOperationQueue.Arn
+            BatchSize: 1
+            Enabled: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/erasure-worker.ts]
         Format: cjs
         Target: es2022
         Minify: true
@@ -957,5 +1037,9 @@ Outputs:
     Value: !GetAtt SyncQueue.Arn
   DlqUrl:
     Value: !Ref SyncDlq
+  ErasureOperationQueueUrl:
+    Value: !Ref ErasureOperationQueue
+  ErasureOperationDlqUrl:
+    Value: !Ref ErasureOperationDlq
   AlertTopicArn:
     Value: !Ref AlertTopic
