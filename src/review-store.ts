@@ -223,9 +223,15 @@ export class ReviewStore {
     if (preview.actor.subject !== actor.subject || preview.expiresAt * 1000 <= Date.now()) throw new Error("Preview expired or belongs to another operator");
     const id = reviewHash([actor.subject, preview.id, idempotencyKey]).slice(0, 32);
     const old = await this.getOperation(id); if (old) return old;
-    const superseded = preview.case?.status === "repairing" && preview.case.operationId
+    const caseStatus = preview.case?.status;
+    const terminalCase = ["resolved", "excluded", "dismissed"].includes(caseStatus || "");
+    const superseded = preview.case?.operationId && (caseStatus === "repairing" || terminalCase)
       ? await this.getOperation(preview.case.operationId) : undefined;
-    if (preview.case?.status === "repairing" && (!superseded?.abandoned || superseded.status !== "failed")) {
+    const safelyAbandoned = superseded?.status === "failed" && superseded.abandoned === true
+      && !operationHasWriteEvidence(superseded);
+    const priorSucceeded = terminalCase && superseded?.status === "succeeded";
+    if (preview.case?.operationId && (caseStatus === "repairing" || terminalCase)
+      && !safelyAbandoned && !priorSucceeded) {
       throw Object.assign(new Error("This case already has an active repair; refresh it and resume that operation"), { status:409 });
     }
     const operation: RepairOperation = { id, preview, actor, attempt: 1, status: "queued", steps: {}, notificationPending: false,
@@ -245,7 +251,7 @@ export class ReviewStore {
           ":lookup":`REVIEW#OPEN#${preview.case.createdAt}#${preview.case.id}`,":expectedStatus":preview.case.status,
           ...(preview.case.operationId === undefined ? {} : {":expectedOperation":preview.case.operationId}),
           ...(preview.case.updatedAt ? {":expectedUpdatedAt":preview.case.updatedAt} : {})} } },
-      ...(superseded ? [{ ConditionCheck:{ TableName:reviewTable(), Key:key(`REPAIR#${superseded.id}`),
+      ...(safelyAbandoned ? [{ ConditionCheck:{ TableName:reviewTable(), Key:key(`REPAIR#${superseded.id}`),
         ConditionExpression:"#status = :failed AND abandoned = :yes AND (attribute_not_exists(writeStarted) OR writeStarted = :no)",
         ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":failed":"failed",":yes":true,":no":false} } }] : []),
     ] })); } catch (e) {
@@ -255,12 +261,16 @@ export class ReviewStore {
         throw Object.assign(new Error("This preview was already submitted with a different idempotency key; create a fresh preview"), { status:409 });
       }
       const latestSuperseded = superseded ? await this.getOperation(superseded.id) : undefined;
-      if (superseded && (!latestSuperseded?.abandoned || latestSuperseded.status !== "failed" || operationHasWriteEvidence(latestSuperseded))) {
+      if (safelyAbandoned && (!latestSuperseded?.abandoned || latestSuperseded.status !== "failed" || operationHasWriteEvidence(latestSuperseded))) {
         throw Object.assign(new Error("This case already has an active repair; refresh it and resume that operation"), { status:409 });
       }
       const currentCase = await this.getCase(preview.intent.caseId);
       if (!currentCase || currentCase.status !== preview.case.status || currentCase.operationId !== preview.case.operationId
         || preview.case.updatedAt && currentCase.updatedAt !== preview.case.updatedAt) {
+        throw Object.assign(new Error("This case changed after preview; refresh the case and create a fresh preview"), { status:409 });
+      }
+      if (conditional(e) || (e as { name?:string }).name === "TransactionCanceledException") {
+        throw Object.assign(new Error("This case or repair changed while submitting; refresh the case and try again"), { status:409 });
       }
       throw e;
     }
