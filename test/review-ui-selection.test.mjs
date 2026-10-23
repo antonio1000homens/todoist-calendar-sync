@@ -206,6 +206,10 @@ test("failed repair resume requires recorded write evidence", () => {
   assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}}}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"failed",steps:{},outcomes:[]}),"resume");
-  assert.equal(operationResumeEligibility({status:"failed",steps:{},abandoned:true}),"none");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{},abandoned:true}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}},abandoned:true}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}},abandoned:true}),"none");
+  assert.equal(operationResumeEligibility({status:"needs_review",steps:{validated:{status:"done"}}}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"needs_review",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"queued",steps:{}}),"resume");
 });

@@ -98,14 +98,17 @@ export function repairValidationField(message) {
 // A validated checkpoint is read-only; any other started checkpoint may have
 // crossed a side-effect boundary and must retain its existing recovery path.
 export function operationResumeEligibility(operation) {
-  if (!operation || operation.abandoned || !["failed", "needs_review", "queued"].includes(operation.status)) return "none";
-  if (operation.status === "queued" || operation.status === "needs_review") return "resume";
+  if (!operation || !["failed", "needs_review", "queued"].includes(operation.status)) return "none";
   const steps = operation.steps || {};
   const hasWriteEvidence = Object.keys(steps).some(name => name !== "validated")
     || Object.values(operation.creations || {}).length > 0
     || Object.values(operation.expectedProviders || {}).some(value => value !== undefined)
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
+  if (operation.abandoned) return hasWriteEvidence ? "none" : "fresh-preview";
+  if (operation.status === "queued") return "resume";
+  if (operation.status === "needs_review" && !hasWriteEvidence) return "fresh-preview";
+  if (operation.status === "needs_review") return "resume";
   return hasWriteEvidence ? "resume" : "fresh-preview";
 }
 

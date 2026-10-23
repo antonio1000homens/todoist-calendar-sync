@@ -228,7 +228,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       assertOwned(actor.subject,operation.actor.subject);
       if (operation.abandoned) fail(409,"This unapplied repair was released; refresh affected items and create a new preview instead of resuming it");
       if (!["failed","needs_review","queued"].includes(operation.status)) fail(409,"Only queued, failed, or interrupted repairs can be resumed");
-      if (operation.status === "failed" && !operationHasWriteEvidence(operation)) fail(409,"No provider write is recorded for this failed repair; refresh affected items and create a new preview instead of resuming it");
+      if (operation.status !== "queued" && !operationHasWriteEvidence(operation)) fail(409,"No provider write is recorded for this repair; refresh affected items and create a new preview instead of resuming it");
       // Every explicit retry gets a new SQS deduplication ID, including a
       // queued operation whose earlier send may have been accepted but is
       // still waiting behind another delivery in this profile's FIFO group.

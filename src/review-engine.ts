@@ -410,14 +410,6 @@ export class ReviewEngine {
     // Already-abandoned deliveries are terminal: complete the FIFO receipt rather than
     // throwing a 409 into the dead-letter queue on retry/redelivery.
     if (operation.abandoned) return operation;
-    // Legacy failed operations can predate the durable abandoned marker. Do not
-    // replay them unless persisted execution state proves a write may have begun.
-    if (operation.status === "failed" && !operationHasWriteEvidence(operation)) {
-      operation.abandoned = true;
-      operation.nextAction = "No provider write is recorded. Refresh affected items and create a new preview; this failed operation remains immutable for audit.";
-      await this.store.saveOperation(operation);
-      return operation;
-    }
     let { intent } = operation.preview;
     const state = new StateRepository(id);
     const rawFactory = this.clients;
@@ -435,6 +427,19 @@ export class ReviewEngine {
       }
       return pending;
     };
+    // Legacy failed operations can predate the durable abandoned marker. Do not
+    // replay them unless persisted execution state proves a write may have begun.
+    if (["failed", "needs_review"].includes(operation.status) && !operationHasWriteEvidence(operation)) {
+      const snapshots = [...operation.preview.snapshots, ...(operation.claimSnapshots || [])];
+      const refs = snapshots.map(snapshot => snapshot.ref);
+      const queued = await queueDeferredRefresh(refs);
+      await this.controls.releaseUnapplied(refs, operation.id, snapshots, {
+        error: operation.error || "No provider write was recorded",
+        nextAction: "No provider write is recorded. Refresh affected items and create a new preview; this failed operation remains immutable for audit.",
+      }, queued);
+      operation.abandoned = true;
+      return operation;
+    }
     const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
       const saved = operation.steps[name];
       if (saved?.status === "done") return saved.result as T;
