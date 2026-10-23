@@ -17,6 +17,7 @@ export type CleanupCounts = {
   eligible: number; retired: number; skipped_active: number;
   skipped_ambiguous: number; too_recent: number; failed: number;
   scanned: number; pages: number; nextCursor?: ScanKey;
+  eligibleCandidates?: Array<{ profile: Profile; taskId: string; eventIds: string[]; completedAt: string[] }>;
 };
 const key = (pk: string, sk = "STATE") => ({ pk, sk });
 
@@ -164,6 +165,7 @@ export async function runCompletedHistoryCleanup(options: {
     too_recent: 0, failed: 0, scanned: 0, pages: 0,
   };
   const visited = new Set<string>();
+  const eligibleCandidates: NonNullable<CleanupCounts["eligibleCandidates"]> = [];
   for (let page = 0; page < maxPages; page += 1) {
     const scan = await db.send(new ScanCommand({
       TableName: table,
@@ -187,6 +189,17 @@ export async function runCompletedHistoryCleanup(options: {
       try {
         const decision = await processTask(table, row.profile, row.taskId, apply, nowMs);
         counts[decision]++;
+        if (decision === "eligible" && !apply) {
+          const events = (await db.send(new QueryCommand({
+            TableName: table, ConsistentRead: true,
+            KeyConditionExpression: "pk = :pk AND begins_with(sk, :event)",
+            ExpressionAttributeValues: { ":pk": `COMPLETED_TASK#${row.profile}#${row.taskId}`, ":event": "EVENT#" },
+            Limit: MAX_HISTORY_ROWS,
+          }))).Items || [];
+          eligibleCandidates.push({ profile: row.profile, taskId: row.taskId,
+            eventIds: events.map((item: any) => item.eventId).filter((id: unknown): id is string => typeof id === "string").sort(),
+            completedAt: events.map((item: any) => item.completedAt).filter((at: unknown): at is string => typeof at === "string").sort() });
+        }
         if (decision === "retired") {
           console.info(JSON.stringify({ event: "terminal_completed_history_retired", profile: row.profile, count: 1 }));
         }
@@ -202,14 +215,16 @@ export async function runCompletedHistoryCleanup(options: {
     await new Promise((resolve) => setTimeout(resolve, Math.max(250, Math.ceil(rcu * 1000 / 5))));
   }
   counts.nextCursor = cursor;
+  if (!apply) counts.eligibleCandidates = eligibleCandidates;
   if (apply) {
     await db.send(new PutCommand({
       TableName: table, Item: { ...cursorKey, ...(cursor ? { nextCursor: cursor } : {}),
         updatedAt: new Date(nowMs).toISOString(), lastCounts: counts },
     }));
   }
+  const { eligibleCandidates: _candidateDetails, ...diagnosticCounts } = counts;
   console.info(JSON.stringify({ event: "terminal_completed_history_cleanup_report", apply,
-    ...counts, nextCursor: Boolean(cursor) }));
+    ...diagnosticCounts, nextCursor: Boolean(cursor) }));
   return counts;
 }
 
