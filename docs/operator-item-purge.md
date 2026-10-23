@@ -116,11 +116,13 @@ upserts now require an active-task existence check before projection.
   full-table item inventory. This is a platform provenance limitation and a
   reason to **withhold production erasure** until operators have independently
   audited those sources. The CLI is not a data-protection compliance guarantee.
-- For an unmapped Todoist upsert, sync re-reads the active task by exact
-  provider ID before trusting the webhook payload. A 404 is dropped without
-  creating mapping or audit state. This narrows that stale-webhook replay path
-  but does not establish queue/receipt quiescence or cover every delayed
-  source; the inventory and execution blockers remain in force.
+- Before an unmapped Todoist upsert enters orphan recovery or project-transition
+  handling, the worker re-reads the task by exact provider ID and uses that
+  fresh snapshot for later decisions. A 404 is a no-op; other lookup failures
+  stop processing. This closes the stale-payload path through the worker, but
+  does not establish queue/receipt quiescence or cover direct/manual code paths
+  that bypass the worker entry point; the inventory and execution blockers
+  remain in force.
 - No per-item suppression tombstone is retained after success, so recovery
   must rely on all source objects being absent and replay sources being
   quiesced/drained. If an unrelated live Calendar item must remain, do not
