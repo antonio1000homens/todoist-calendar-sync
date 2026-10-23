@@ -166,6 +166,34 @@ test("worker adapters are bound at construction and request arguments cannot rep
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
 
+test("trusted class-based worker adapters retain their instance state after binding",async()=>{
+  const db=memoryDb(storedQueuedOperation());
+  class StatefulWorkerAdapters {
+    constructor(){this.listCalls=0;this.mappingInventory=[
+      {id:"worker-uuid",state:"Enabled",eventSourceArn:"arn:aws:sqs:eu-west-2:123:worker"},
+    ];}
+    async listWorkerMappings(){this.listCalls++;return this.mappingInventory;}
+    async disableMappings(){}
+    async mappingStates(ids){return ids.map(id=>({id,state:this.mappingInventory.find(item=>item.id===id)?.state}));}
+    async inspectFence(){return {leases:[]};}
+    async beginFence(){}
+    async restoreMappings(){}
+    async finishFence(){}
+    async verifyDeletion(){return {providersAbsent:true,stateAbsent:true};}
+    async readFreshSnapshot(operation){return {profile:operation.profile,target:operation.target,
+      selectedActions:operation.selectedActions,inventory:operation.inventory};}
+    async readMappingStates(ids){return ids.map(id=>({id,state:this.mappingInventory.find(item=>item.id===id)?.state}));}
+  }
+  const adapters=new StatefulWorkerAdapters();
+  const store=new ErasureOperationStore(db,()=>"unused",adapters);
+  const old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  try{
+    await store.startFencedLifecycle("op",30);
+    assert.equal(adapters.listCalls,1,"the original class instance supplies its own state");
+    assert.deepEqual(db.item.lifecycle.mappingIds,["worker-uuid"]);
+  }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
+});
+
 test("trusted clock controls confirmation issue and consume; caller timestamps cannot replay expiration",async()=>{
   let now=1_000;const confirmations=new Map(),operations=new Map(),calls=[];
   const db={async send(command){calls.push(command);

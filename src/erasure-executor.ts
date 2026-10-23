@@ -115,7 +115,18 @@ export class ErasureOperationStore {
    */
   constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID,
     workerAdapters?: ErasureWorkerAdapters) {
-    this.#workerAdapters=workerAdapters?Object.freeze({...workerAdapters}):undefined;
+    this.#workerAdapters=workerAdapters?Object.freeze({
+      listWorkerMappings:workerAdapters.listWorkerMappings.bind(workerAdapters),
+      disableMappings:workerAdapters.disableMappings.bind(workerAdapters),
+      mappingStates:workerAdapters.mappingStates.bind(workerAdapters),
+      inspectFence:workerAdapters.inspectFence.bind(workerAdapters),
+      beginFence:workerAdapters.beginFence.bind(workerAdapters),
+      restoreMappings:workerAdapters.restoreMappings.bind(workerAdapters),
+      finishFence:workerAdapters.finishFence.bind(workerAdapters),
+      verifyDeletion:workerAdapters.verifyDeletion.bind(workerAdapters),
+      readFreshSnapshot:workerAdapters.readFreshSnapshot.bind(workerAdapters),
+      readMappingStates:workerAdapters.readMappingStates.bind(workerAdapters),
+    }):undefined;
   }
 
   #worker(): ErasureWorkerAdapters {
