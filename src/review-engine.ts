@@ -352,7 +352,9 @@ export class ReviewEngine {
       }
       preview.itemPlan.push({ref:s.ref, operation, result});
     }
-    for (const s of snapshots) if (s.mapping) changes.push(`Replace existing association ${s.mapping.taskId} ↔ ${s.mapping.eventId}`);
+    if (intent.action !== "verify") {
+      for (const s of snapshots) if (s.mapping) changes.push(`Replace existing association ${s.mapping.taskId} ↔ ${s.mapping.eventId}`);
+    }
     warnings.push("Past Calendar occurrences and audit records are retained. Old associations cannot be recovered automatically.");
     await this.store.putPreview(preview); return preview;
   }
