@@ -29,6 +29,9 @@ export class ReviewStore {
         : "open",
       decision, taskId: decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined),
       eventId: decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined),
+      reconciliationGeneration: typeof context.reconciliationGeneration === "string" ? context.reconciliationGeneration : undefined,
+      progressCheckpoint: context.progressCheckpoint && typeof context.progressCheckpoint === "object"
+        ? context.progressCheckpoint as ReviewCase["progressCheckpoint"] : undefined,
       createdAt: decision.createdAt, updatedAt: new Date().toISOString(),
     };
     try { await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPair, exportJWK, SignJWT } from "jose";
 import { SQSClient } from "@aws-sdk/client-sqs";
-import { handler } from "../dist/review-api.js";
+import { handler, reconciliationAlertRelation } from "../dist/review-api.js";
 import { ReviewStore } from "../dist/review-store.js";
 import { ReviewEngine } from "../dist/review-engine.js";
 
@@ -28,6 +28,17 @@ async function token(privateKey, email = "review-owner@example.test", {aud = aud
     .setIssuedAt(expired?now-120:now).setExpirationTime(expired?now-60:now+300).sign(privateKey);
 }
 async function jsonResponse(result) { return {status:result.statusCode, body:JSON.parse(result.body)}; }
+
+test("reconciliation alert hydration distinguishes superseded, progressed, completed, and unchanged runs", () => {
+  const alertTime = "2026-10-23T10:00:00.000Z";
+  const current = { generation:"generation-1", pending:true, lastProgressAt:"2026-10-23T10:05:00.000Z" };
+  assert.equal(reconciliationAlertRelation("generation-0", alertTime, current), "different_generation");
+  assert.equal(reconciliationAlertRelation("generation-1", alertTime, current), "progressed_since_alert");
+  assert.equal(reconciliationAlertRelation("generation-1", alertTime, { ...current, pending:false,
+    lastCompletedAt:"2026-10-23T10:06:00.000Z" }), "completed_since_alert");
+  assert.equal(reconciliationAlertRelation("generation-1", alertTime, { ...current, lastProgressAt:"2026-10-23T09:59:00.000Z" }), "same_generation");
+  assert.equal(reconciliationAlertRelation("generation-1", alertTime), "unavailable");
+});
 
 test("review API requires a valid owner Access JWT and same-origin mutations", async (t) => {
   const originalFetch = globalThis.fetch;

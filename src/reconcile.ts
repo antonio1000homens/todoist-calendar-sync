@@ -69,10 +69,43 @@ export async function checkReconciliationHealth(
       }
       if (current.lastHealthAlertAt || !manual.enabled) continue;
 
+      const statusCode = current.lastError?.match(/\bHTTP\s+(\d{3})\b/i)?.[1];
+      const failureCategory = runStatus !== "failed" ? undefined : current.failureContext?.category
+        || (/timeout|timed out/i.test(current.lastError || "") ? "timeout"
+          : /queue|enqueue|sqs/i.test(current.lastError || "") ? "queue_failure"
+            : statusCode ? `provider_http_${statusCode}` : "worker_failure");
+      const classifiedStatus = statusCode || failureCategory?.match(/(?:provider_http_)(\d{3})/)?.[1];
+      const failureSummary = failureCategory === "timeout" ? "A worker operation timed out."
+        : failureCategory === "queue_failure" ? "A queue handoff failed."
+          : classifiedStatus ? `A provider request returned HTTP ${classifiedStatus}.`
+            : runStatus === "failed" ? "The worker recorded a failure; the underlying cause is not classified." : undefined;
       const detail = runStatus === "failed"
-        ? `The previous run failed: ${current.lastError || "unknown error"}. Click to start a fresh generation after addressing the cause.`
-        : `${runStatus} for ${Math.floor(ageMs / 60_000)} minutes without progress. Click to request a fresh manual reconciliation.`;
-      const delivered = await manual.alertReconciliationNeeded(profile, current.generation, current.slackChannelId, detail);
+        ? `${failureSummary} A fresh generation is required after addressing the cause.`
+        : `${runStatus} for ${Math.floor(ageMs / 60_000)} minutes without a recorded progress update. This monitor observation does not identify why progress stopped.`;
+      const diagnostic = {
+        reconciliationGeneration: current.generation,
+        reconciliationStatus: runStatus,
+        reconciliationPending: current.pending,
+        requestedAt: current.requestedAt,
+        lastEnqueuedAt: current.lastEnqueuedAt,
+        lastStartedAt: current.lastStartedAt,
+        lastProgressAt: current.lastProgressAt,
+        lastCompletedAt: current.lastCompletedAt,
+        lastFailedAt: current.lastFailedAt,
+        reconciliationResult: current.result,
+        progressCheckpoint: current.progressCheckpoint,
+        nextContinuation: current.nextContinuation,
+        lastDeliveryId: current.lastDeliveryId,
+        lastStartedDeliveryId: current.lastStartedDeliveryId,
+        queueState: current.queueState || "unknown",
+        queueStateNote: "Queue acceptance is recorded when available; current SQS and DLQ state is not queried by this monitor.",
+        failureCategory,
+        failureSummary,
+        failureContext: current.failureContext,
+        incidentClassification: runStatus === "failed" ? "worker_failure" : "monitor_stall",
+        observedAt: new Date().toISOString(),
+      };
+      const delivered = await manual.alertReconciliationNeeded(profile, current.generation, current.slackChannelId, detail, diagnostic);
       if (!delivered) continue;
       await state.markReconciliationHealthAlert(profile, current.generation);
       log("reconciliation_health_alerted", { profile, generation: current.generation, status: runStatus, ageMs });
