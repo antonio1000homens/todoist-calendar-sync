@@ -32,7 +32,21 @@ function recurrenceAnchorMatches(event: CalendarEvent): boolean {
 }
 function calendarSeriesRuleMatchesTodoistTask(event: CalendarEvent, task: TodoistTask): boolean {
   const rule = todoistRecurrenceToRrule(task);
-  return Boolean(rule && event.recurrence?.includes(rule));
+  if (!rule || !event.recurrence?.length) return false;
+  const normalize = (value: string): string | undefined => {
+    if (!value.startsWith("RRULE:")) return undefined;
+    const parts = value.slice("RRULE:".length).split(";");
+    if (parts.some(part => !/^[A-Z]+=[^;]+$/.test(part))) return undefined;
+    if (new Set(parts.map(part => part.slice(0, part.indexOf("=")))).size !== parts.length) return undefined;
+    const entries = new Map(parts.map(part => {
+      const [key, ...rest] = part.split("=");
+      return [key, rest.join("=")];
+    }));
+    if (entries.get("INTERVAL") === "1") entries.delete("INTERVAL");
+    return [...entries].sort(([a], [b]) => a.localeCompare(b)).map(([key, val]) => `${key}=${val}`).join(";");
+  };
+  const expected = normalize(rule);
+  return Boolean(expected && event.recurrence.some(candidate => normalize(candidate) === expected));
 }
 function decisionRepairIntent(intent: RepairIntent, decision?: ManualDecision): RepairIntent {
   if (intent.action !== "decision") return intent;
