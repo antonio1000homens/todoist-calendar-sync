@@ -1,6 +1,7 @@
 import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } from "./types.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { FutureSeriesSplitPlan } from "./recurrence-split.js";
+import type { StandaloneAnnualPlan } from "./standalone-annual-repair.js";
 export type Side = "todoist" | "calendar";
 export interface ReviewActor { subject: string; email: string }
 export interface EntityRef { profile: Profile; side: Side; id: string }
@@ -29,7 +30,7 @@ export interface ReviewSnapshot {
 export interface RepairPreview {
   id: string; actor: ReviewActor; intent: RepairIntent; case: ReviewCase;
   snapshots: ReviewSnapshot[]; fingerprint: string; createdAt: string; expiresAt: number;
-  changes: string[]; warnings: string[]; splitPlan?: FutureSeriesSplitPlan;
+  changes: string[]; warnings: string[]; splitPlan?: FutureSeriesSplitPlan; annualPlan?: StandaloneAnnualPlan;
   /** Exact provider refs and per-object planned effects, matched to frozen snapshots. */
   itemPlan: Array<{ ref:EntityRef; operation:string; result:string }>;
 }
