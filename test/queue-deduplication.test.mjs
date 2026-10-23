@@ -85,3 +85,44 @@ test("enqueueDelivery hashes every kind while preserving its body and per-profil
     assert.equal(command.input.MessageGroupId, "sync:home");
   });
 });
+
+test("admission does not restamp an in-flight payload after a complete fence window", async () => {
+  const originalQueueSend = SQSClient.prototype.send;
+  const originalDocumentSend = documentClient.send;
+  const originalQueueUrl = process.env.QUEUE_URL;
+  const originalProtocolVersion = process.env.ERASURE_PROTOCOL_VERSION;
+  let epoch = 0;
+  let queueCalls = 0;
+  SQSClient.prototype.send = async () => { queueCalls++; return {}; };
+  documentClient.send = async command => {
+    if (command.constructor.name === "GetCommand") {
+      if (command.input.Key.sk === "EPOCH") return { Item: { epoch } };
+      return {};
+    }
+    if (command.constructor.name === "TransactWriteCommand") {
+      // The expected epoch was read before the fence. Simulate a full fence
+      // install+finish before the admission transaction reaches DynamoDB.
+      epoch = 1;
+      const error = new Error("condition check failed");
+      error.name = "TransactionCanceledException";
+      throw error;
+    }
+    return {};
+  };
+  process.env.QUEUE_URL = "https://sqs.eu-west-2.amazonaws.com/123456789012/test.fifo";
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
+  try {
+    await assert.rejects(enqueueDelivery({
+      ...identity, kind: "todoist", mode: "aws", receivedAt: "2026-10-23T12:00:00Z",
+      headers: {}, body: JSON.stringify({ event_name: "item:updated", event_data: { id: "task-123" } }),
+    }), /erasure epoch changed/);
+    assert.equal(queueCalls, 0);
+  } finally {
+    SQSClient.prototype.send = originalQueueSend;
+    documentClient.send = originalDocumentSend;
+    if (originalQueueUrl === undefined) delete process.env.QUEUE_URL;
+    else process.env.QUEUE_URL = originalQueueUrl;
+    if (originalProtocolVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION = originalProtocolVersion;
+  }
+});

@@ -30,6 +30,13 @@ export class ErasureEpochChangedError extends Error {
   }
 }
 
+export class ErasureLeaseAlreadyHeldError extends Error {
+  constructor(readonly profile: Profile, readonly kind: "admission" | "writer") {
+    super(`A ${kind} lease is already held for profile ${profile}`);
+    this.name = "ErasureLeaseAlreadyHeldError";
+  }
+}
+
 /**
  * Acquire a durable, profile-scoped lease before accepting queue work or
  * processing a delivery. The transaction serializes the lease against fence
@@ -53,9 +60,12 @@ export async function acquireErasureProtocolLease(
   } catch (error) {
     const name = (error as { name?: string })?.name;
     if (name === "TransactionCanceledException" || name === "ConditionalCheckFailedException") {
-      const current = await documentClient.send(new GetCommand({ TableName: table(), Key: key, ConsistentRead: true }));
-      if (current.Item) throw new ErasureFenceActiveError(profile);
-      throw new ErasureEpochChangedError(profile);
+      const currentFence = await documentClient.send(new GetCommand({ TableName: table(), Key: key, ConsistentRead: true }));
+      if (currentFence.Item) throw new ErasureFenceActiveError(profile);
+      const currentEpoch = await getErasureEpoch(profile);
+      if (currentEpoch !== expectedEpoch) throw new ErasureEpochChangedError(profile);
+      const existingLease = await documentClient.send(new GetCommand({ TableName: table(), Key: leaseKey, ConsistentRead: true }));
+      if (existingLease.Item) throw new ErasureLeaseAlreadyHeldError(profile, kind);
     }
     throw error;
   }

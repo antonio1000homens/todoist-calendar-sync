@@ -22,13 +22,16 @@ export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   let epoch: number | undefined;
   let release: (() => Promise<void>) | undefined;
   if (protocolEnabled) {
-    while (!release) {
-      epoch = await getErasureEpoch(delivery.profile);
-      try {
-        release = await acquireErasureProtocolLease(delivery.profile, "admission", undefined, epoch);
-      } catch (error) {
-        if (!(error instanceof ErasureEpochChangedError)) throw error;
+    // Never resample and re-enqueue an in-flight payload after an epoch race.
+    // A provider retry gets a fresh invocation and passes through live-state checks.
+    epoch = await getErasureEpoch(delivery.profile);
+    try {
+      release = await acquireErasureProtocolLease(delivery.profile, "admission", undefined, epoch);
+    } catch (error) {
+      if (error instanceof ErasureEpochChangedError) {
+        throw new Error("Admission rejected because the erasure epoch changed; retry from the source after revalidation");
       }
+      throw error;
     }
   }
   try {

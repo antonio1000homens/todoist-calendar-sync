@@ -359,7 +359,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
       delivery = JSON.parse(record.body) as Delivery;
       state = new StateRepository();
       if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
-        while (!releaseWriterLease) {
+        for (let attempt = 0; attempt < 3 && !releaseWriterLease; attempt++) {
           const currentErasureEpoch = await getErasureEpoch(delivery.profile);
           if ((delivery.erasureEpoch ?? 0) !== currentErasureEpoch) {
             logEvent("stale_erasure_epoch_delivery_dropped", { profile: delivery.profile, deliveryEpoch: delivery.erasureEpoch ?? 0, currentEpoch: currentErasureEpoch });
@@ -373,7 +373,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
               currentErasureEpoch,
             );
           } catch (error) {
-            if (!(error instanceof ErasureEpochChangedError)) throw error;
+            if (!(error instanceof ErasureEpochChangedError) || attempt === 2) throw error;
           }
         }
         if (!releaseWriterLease) {
@@ -605,7 +605,11 @@ export const handler: SQSHandler = async (event, context: Context) => {
         delivery: deliverySummary(delivery),
       });
     } catch (error) {
-      if (delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
+      // Fence/lease acquisition failures happen before this invocation is an
+      // authorized writer. Do not let generic error reporting mutate state
+      // outside the profile fence.
+      const mayWriteFailureState = process.env.ERASURE_PROTOCOL_VERSION !== "1" || !!releaseWriterLease;
+      if (mayWriteFailureState && delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
         await state.recordReconciliationFailure(
           delivery.profile,
           delivery.reconcile.generation,
