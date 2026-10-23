@@ -188,6 +188,7 @@ test("dismissal preserves failed repair history and atomically closes the inbox 
   const commands=[],store=new ReviewStore();
   const item={id:"case",status:"open",operationId:"failed",createdAt:"2026-10-20",updatedAt:"case-v1"};
   store.getCase=async()=>item;
+  store.get=async()=>undefined;
   store.getOperation=async()=>({id:"failed",status:"failed",updatedAt:"op-v1",steps:{validated:{status:"done"}},preview:{snapshots:[]}});
   t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
   const dismissed=await store.dismissCase("case","Acknowledged");
@@ -200,6 +201,52 @@ test("dismissal preserves failed repair history and atomically closes the inbox 
   assert.doesNotMatch(tx[0].Update.UpdateExpression,/operationId/);
   assert.equal(tx[1].ConditionCheck.Key.pk,"REPAIR#failed");
   assert.match(tx[1].ConditionCheck.ConditionExpression,/attribute_not_exists\(writeStarted\)/);
+});
+
+test("dismissal atomically resolves the same-profile pending manual decision and removes its profile index keys",async t=>{
+  const commands=[],store=new ReviewStore();
+  store.getCase=async()=>({id:"case",profile:"home",status:"open",createdAt:"2026-10-20",updatedAt:"case-v1"});
+  store.get=async pk=>pk==="MANUAL#case"?{decisionId:"case",profile:"home",status:"pending",createdAt:"decision-v1",
+    lookupPk:"PROFILE#home",lookupSk:"MANUAL#PENDING#2026-10-20#case"}:undefined;
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await store.dismissCase("case","Acknowledged in review");
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,2);
+  const manualUpdate=tx[1].Update;
+  assert.equal(manualUpdate.Key.pk,"MANUAL#case");
+  assert.match(manualUpdate.UpdateExpression,/SET #s = :resolved/);
+  assert.match(manualUpdate.UpdateExpression,/REMOVE lookupPk, lookupSk/);
+  assert.match(manualUpdate.ConditionExpression,/#s = :pending AND profile = :profile AND decisionId = :id AND createdAt = :createdAt/);
+  assert.equal(manualUpdate.ExpressionAttributeValues[":profile"],"home");
+  assert.equal(manualUpdate.ExpressionAttributeValues[":createdAt"],"decision-v1");
+});
+
+test("dismissal loses cleanly when the manual decision resolves concurrently",async t=>{
+  const commands=[],store=new ReviewStore();
+  store.getCase=async()=>({id:"case",profile:"home",status:"open",createdAt:"created",updatedAt:"case-v1"});
+  store.get=async pk=>pk==="MANUAL#case"?{decisionId:"case",profile:"home",status:"pending",createdAt:"decision-v1"}:undefined;
+  t.mock.method(documentClient,"send",async command=>{
+    commands.push(command);
+    if(command.constructor.name==="TransactWriteCommand")
+      throw Object.assign(new Error("manual row changed"),{name:"TransactionCanceledException"});
+    return {};
+  });
+  await assert.rejects(store.dismissCase("case","Acknowledged"),error=>error.status===409);
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,2,"case close and manual resolution share the cancelled transaction");
+  assert.equal(tx[0].Update.Key.pk,"REVIEW_CASE#case");
+  assert.equal(tx[1].Update.Key.pk,"MANUAL#case");
+});
+
+test("dismissal does not claim an orphaned or cross-profile pending manual decision",async t=>{
+  const commands=[],store=new ReviewStore();
+  store.getCase=async()=>({id:"case",profile:"home",status:"open",createdAt:"created",updatedAt:"case-v1"});
+  store.get=async pk=>pk==="MANUAL#case"?{decisionId:"case",profile:"work",status:"pending",createdAt:"decision-v1"}:undefined;
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await store.dismissCase("case","Acknowledged");
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,1,"only the exact same-profile manual row may be resolved with its case");
+  assert.equal(tx[0].Update.Key.pk,"REVIEW_CASE#case");
 });
 
 test("dismissal refuses missing, active, or partially written repair operations",async t=>{
@@ -216,7 +263,11 @@ test("dismissal refuses missing, active, or partially written repair operations"
 test("dismiss retry returns persisted dismissal and raced repair yields actionable conflict",async t=>{
   const store=new ReviewStore();let item={id:"case",status:"open",createdAt:"old",updatedAt:"v1"};
   store.getCase=async()=>item;
-  t.mock.method(documentClient,"send",async()=>{throw Object.assign(new Error("race"),{name:"TransactionCanceledException"});});
+  t.mock.method(documentClient,"send",async command=>{
+    if(command.constructor.name==="TransactWriteCommand")
+      throw Object.assign(new Error("race"),{name:"TransactionCanceledException"});
+    return {};
+  });
   await assert.rejects(store.dismissCase("case","dismiss"),e=>e.status===409 && /refresh/.test(e.message));
   item={...item,status:"dismissed",result:"Already dismissed"};
   assert.deepEqual(await store.dismissCase("case","dismiss"),item);
