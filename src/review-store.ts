@@ -4,7 +4,7 @@ import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
 import { retainedConflictIdentity } from "./audit-policy.js";
-import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
+import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -162,6 +162,39 @@ export class ReviewStore {
       cursor = page.cursor;
     } while (cursor);
     return count;
+  }
+  /** Dismissal acknowledges an alert; it never claims provider repair verification. */
+  async dismissCase(id: string, result: string): Promise<ReviewCase> {
+    const conflict = () => Object.assign(new Error("Alert or repair changed; refresh the case before dismissing"), { status:409 });
+    const current = await this.getCase(id);
+    if (!current) throw Object.assign(new Error("Conflict no longer exists"), {status:404});
+    if (current.status === "dismissed") return current;
+    if (current.status !== "open") throw conflict();
+    const operation = current.operationId ? await this.getOperation(current.operationId) : undefined;
+    if (current.operationId && (!operation || operation.status !== "failed" || operationHasWriteEvidence(operation))) throw conflict();
+    const now = new Date().toISOString();
+    const values: Record<string, unknown> = {":open":"open", ":dismissed":"dismissed", ":result":result, ":now":now,
+      ":lookup":`REVIEW#CLOSED#${current.createdAt}#${id}`, ":version":current.updatedAt};
+    const operationCondition = current.operationId ? "operationId = :op" : "attribute_not_exists(operationId) OR operationId = :empty";
+    if (current.operationId) values[":op"] = current.operationId;
+    else values[":empty"] = "";
+    const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [{Update:{
+      TableName:reviewTable(), Key:key(`REVIEW_CASE#${id}`),
+      UpdateExpression:"SET #s = :dismissed, #r = :result, updatedAt = :now, lookupSk = :lookup",
+      ConditionExpression:`#s = :open AND updatedAt = :version AND (${operationCondition})`,
+      ExpressionAttributeNames:{"#s":"status", "#r":"result"}, ExpressionAttributeValues:values,
+    }}];
+    if (operation) items.push({ConditionCheck:{TableName:reviewTable(),Key:key(`REPAIR#${operation.id}`),
+      ConditionExpression:"#s = :failed AND updatedAt = :version AND attribute_not_exists(writeStarted)",
+      ExpressionAttributeNames:{"#s":"status"}, ExpressionAttributeValues:{":failed":"failed", ":version":operation.updatedAt}}});
+    try { await this.db.send(new TransactWriteCommand({TransactItems:items})); }
+    catch (error) {
+      const latest = await this.getCase(id);
+      if (latest?.status === "dismissed") return latest;
+      if (conditional(error) || (error as {name?:string}).name === "TransactionCanceledException") throw conflict();
+      throw error;
+    }
+    return {...current,status:"dismissed",result,updatedAt:now};
   }
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");

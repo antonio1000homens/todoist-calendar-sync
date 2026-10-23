@@ -167,3 +167,41 @@ test("successful no-op releases only its temporary barrier without changing sync
   assert.equal(update.ConditionExpression,"activeRepair = :id");
   assert.deepEqual(update.ExpressionAttributeValues,{":id":"repair"});
 });
+
+test("dismissal preserves failed repair history and atomically closes the inbox index",async t=>{
+  const commands=[],store=new ReviewStore();
+  const item={id:"case",status:"open",operationId:"failed",createdAt:"2026-10-20",updatedAt:"case-v1"};
+  store.getCase=async()=>item;
+  store.getOperation=async()=>({id:"failed",status:"failed",updatedAt:"op-v1",steps:{validated:{status:"done"}},preview:{snapshots:[]}});
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  const dismissed=await store.dismissCase("case","Acknowledged");
+  assert.equal(dismissed.status,"dismissed"); assert.equal(dismissed.operationId,"failed");
+  const tx=commands[0].input.TransactItems;
+  assert.equal(tx.length,2);
+  assert.equal(tx[0].Update.ExpressionAttributeValues[":op"],"failed");
+  assert.equal(tx[0].Update.ExpressionAttributeValues[":lookup"],"REVIEW#CLOSED#2026-10-20#case");
+  assert.match(tx[0].Update.ConditionExpression,/updatedAt = :version/);
+  assert.doesNotMatch(tx[0].Update.UpdateExpression,/operationId/);
+  assert.equal(tx[1].ConditionCheck.Key.pk,"REPAIR#failed");
+  assert.match(tx[1].ConditionCheck.ConditionExpression,/attribute_not_exists\(writeStarted\)/);
+});
+
+test("dismissal refuses missing, active, or partially written repair operations",async t=>{
+  const store=new ReviewStore();let writes=0;
+  store.getCase=async()=>({id:"case",status:"open",operationId:"repair",updatedAt:"v1"});
+  t.mock.method(documentClient,"send",async()=>{writes++;return {};});
+  for (const op of [undefined,{status:"running",steps:{}},{status:"failed",steps:{event:{status:"running"}}},{status:"failed",steps:{},writeStarted:true}]) {
+    store.getOperation=async()=>op;
+    await assert.rejects(store.dismissCase("case","dismiss"),e=>e.status===409);
+  }
+  assert.equal(writes,0);
+});
+
+test("dismiss retry returns persisted dismissal and raced repair yields actionable conflict",async t=>{
+  const store=new ReviewStore();let item={id:"case",status:"open",createdAt:"old",updatedAt:"v1"};
+  store.getCase=async()=>item;
+  t.mock.method(documentClient,"send",async()=>{throw Object.assign(new Error("race"),{name:"TransactionCanceledException"});});
+  await assert.rejects(store.dismissCase("case","dismiss"),e=>e.status===409 && /refresh/.test(e.message));
+  item={...item,status:"dismissed",result:"Already dismissed"};
+  assert.deepEqual(await store.dismissCase("case","dismiss"),item);
+});
