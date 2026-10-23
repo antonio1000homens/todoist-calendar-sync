@@ -3,7 +3,7 @@ import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { ReviewEngine } from "../dist/review-engine.js";
 import { StateRepository } from "../dist/repository.js";
-import { DynamoReconciliationStore } from "../dist/reconciliation.js";
+import { SnapshotReconciler, DynamoReconciliationStore } from "../dist/reconciliation.js";
 import { CanonicalIdentityStore } from "../dist/canonical-identity.js";
 import { Synchronizer } from "../dist/sync.js";
 import { ReviewStore, SyncControls } from "../dist/review-store.js";
@@ -1494,4 +1494,31 @@ test("same-date annualizing can resume after the Calendar update but before read
   assert.ok(!shared.syncHistoryOnly && !shared.syncHistoryMasterId);
   assert.equal(h.writes.filter(w=>w[0]==="event" && w[1]==="event").length,2); // annualization + metadata link
   assert.equal(h.taskMap.size,1);
+});
+
+
+test("an explicit Todoist-only disposition survives repeat snapshot and webhook projection and a cancelled stray counterpart",async t=>{
+  const h=harness(t,{events:[event("history",{start:{date:"2026-03-01"},end:{date:"2026-03-08"}})],tasks:[task("current",{due:{date:"2027-03-01"}})]});
+  const before=clone(h.eventMap.get("history"));
+  const result=await h.execute(intent({action:"exclude",taskId:"current",eventId:undefined,leftovers:{}}));
+  assert.equal(result.status,"succeeded");
+  assert.equal(h.controlsMap.get("home:todoist:current").excluded,true);
+  const controls=new SyncControls();
+  controls.control=async ref=>h.controlsMap.get(refKey(ref));
+  t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
+  const state=new StateRepository(), reconciler=new SnapshotReconciler(state,async()=>h.clients);
+  const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
+  for(let run=0;run<3;run++) {
+    assert.equal(await reconciler.reconcileUnmappedTask("home",h.taskMap.get("current"),h.clients),"blocked");
+    await synchronizer.process({id:`repeat-${run}`,kind:"todoist",profile:"home",mode:"aws",headers:{},body:JSON.stringify({event_name:"item:updated",event_data:h.taskMap.get("current")})});
+  }
+  h.mappingMap.set("current",{profile:"home",taskId:"current",eventId:"stray"});
+  h.eventMappingMap.set("home:stray",{profile:"home",taskId:"current",eventId:"stray"});
+  h.clients.calendar.listDelta=async()=>({items:[event("stray",{status:"cancelled",extendedProperties:{shared:{taskId:"current"}}})]});
+  await synchronizer.process({id:"delete-stray",kind:"calendar",profile:"home",mode:"aws",headers:{},body:""});
+  assert.deepEqual(h.taskMap.get("current"),task("current",{due:{date:"2027-03-01"}}));
+  assert.deepEqual(h.eventMap.get("history"),before);
+  assert.deepEqual(h.writes,[]);
+  assert.ok(h.calls.some(call=>call[1]==="calendar_event_sync_control_blocked"));
 });

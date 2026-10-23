@@ -26,6 +26,8 @@ test("successful repair result, case resolution, and every barrier release share
   assert.equal(items[2].Put.Item.status,"succeeded");
   assert.equal(items[2].Put.Item.lookupSk,"REPAIR#NOTIFY#repair");
   assert.equal(items[3].Update.ExpressionAttributeValues[":status"],"resolved");
+  assert.equal(items[3].Update.ConditionExpression,"#status = :repairing AND operationId = :id");
+  assert.equal(items[3].Update.ExpressionAttributeValues[":repairing"],"repairing");
 });
 
 test("unchanged entity finalization releases its barrier without rewriting control state", async t => {
