@@ -106,16 +106,22 @@ reflects the remaining records and provider state. Resume with that token and
 The async review endpoint can report `status: "review_required"` with
 `operatorRecoveryRequired: true` if the final read-only deletion gate detects a
 changed preview, mapping inventory/state, fence owner, active lease, or lifecycle
-receipt. This worker does not delete provider objects. It deliberately leaves
-the original profile fence and worker mapping state in place, acknowledges the
-queue message only after recording the terminal status, and refuses to resume
-the same operation. A fresh preview cannot run while the profile is fenced.
+receipt. This worker does not delete provider objects. After detecting drift,
+it makes no further changes to the fence or mappings. It acknowledges the queue
+message only after recording the terminal status and refuses to resume the same
+operation. The mismatch means the worker has not proved that all protections
+remain intact; do not assume the profile is safely fenced. Preserve any
+protections that remain, inspect the fence and mapping state, and escalate if
+either differs. A fresh preview is unsafe until controlled recovery restores
+service admission.
 
 There is no automated operator recovery endpoint or command in this release. The
-safe response is to leave the profile fenced and escalate for a separately
-reviewed recovery action; do not requeue the operation, delete or edit fence /
-epoch rows, or enable event-source mappings by hand. A recovery implementation
-must, at minimum, do all of the following under operator change control:
+safe response is to preserve any remaining protections and escalate for a
+separately reviewed recovery action; do not requeue the operation, delete or
+edit fence / epoch rows, or enable event-source mappings by hand. Escalate
+immediately if the fence or a mapping is missing, changed, or cannot be
+verified. A recovery implementation must, at minimum, do all of the following
+under operator change control:
 
 1. Read the durable operation and its original `mappingIds`,
    `enabledMappingIds`, preview fingerprint, and lifecycle receipts. Read back
@@ -123,11 +129,12 @@ must, at minimum, do all of the following under operator change control:
    consistent provider and DynamoDB inventory for the exact selected IDs.
 2. Confirm the profile fence is still owned by this operation and inspect all
    pages of lease rows. If ownership is different, a lease remains, an expected
-   mapping is missing, or any inventory is ambiguous, stop and keep the profile
-   fenced.
+   mapping is missing, or any inventory is ambiguous, stop, preserve whatever
+   protections remain, and escalate without attempting to restore admission.
 3. Restore only mappings listed in `enabledMappingIds`; preserve mappings that
    were originally disabled. Read every mapping back and verify its exact
-   original state while the fence remains installed.
+   original state while the fence is verified as installed and owned by this
+   operation. If that fence check fails, stop and escalate.
 4. Recheck fence ownership and the full lease set after mapping readback. Remove
    only this operation's temporary fence through a reviewed, conditionally
    guarded protocol action when the lease set is empty. Retain the monotonic
