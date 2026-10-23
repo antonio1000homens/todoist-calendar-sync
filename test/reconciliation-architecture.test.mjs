@@ -6,6 +6,7 @@ import { syncMessageGroupId } from "../dist/types.js";
 const template = await readFile(new URL("../template.yaml", import.meta.url), "utf8");
 const workerSource = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
 const handlerSource = await readFile(new URL("../src/handler.ts", import.meta.url), "utf8");
+const erasureProtocolSource = await readFile(new URL("../src/erasure-protocol.ts", import.meta.url), "utf8");
 const repositorySource = await readFile(new URL("../src/repository.ts", import.meta.url), "utf8");
 const reconciliationSource = await readFile(new URL("../src/reconciliation.ts", import.meta.url), "utf8");
 const queueSource = await readFile(new URL("../src/queue.ts", import.meta.url), "utf8");
@@ -109,6 +110,35 @@ test("standalone deployment role scopes SNS and cannot write application secrets
 test("ingress no longer claims DynamoDB delivery state before SQS enqueue", () => {
   assert.doesNotMatch(handlerSource, /claimDelivery\s*\(/);
   assert.match(handlerSource, /await enqueueDelivery\(delivery\)/);
+});
+
+test("ingress grants only the DynamoDB table actions required by admission lease protocol", () => {
+  const ingressBlock = template.match(/IngressFunction:[\s\S]*?ReviewApiLogGroup:/)?.[0] || "";
+  const tablePolicy = ingressBlock.match(/Action:\n((?:\s+- dynamodb:[^\n]+\n)+)\s+Resource: !GetAtt SyncState\.Arn/)?.[1] || "";
+  const granted = new Set([...tablePolicy.matchAll(/dynamodb:([A-Za-z]+)/g)].map((match) => match[1]));
+
+  const epochRead = erasureProtocolSource.match(/export async function getErasureEpoch[\s\S]*?\n}\n/)?.[0] || "";
+  const admissionLease = erasureProtocolSource.match(/export async function acquireErasureProtocolLease[\s\S]*?\n}\n/)?.[0] || "";
+  assert.ok(epochRead && admissionLease, "expected epoch read and admission lease implementations");
+
+  const required = new Set();
+  if (/new GetCommand\(/.test(epochRead) || /new GetCommand\(/.test(admissionLease)) required.add("GetItem");
+  if (/ConditionCheck\s*:/.test(admissionLease)) required.add("ConditionCheckItem");
+  if (/\bPut\s*:/.test(admissionLease)) required.add("PutItem");
+  if (/new DeleteCommand\(/.test(admissionLease)) required.add("DeleteItem");
+
+  for (const action of required) assert.ok(granted.has(action), `IngressFunction must allow dynamodb:${action}`);
+  assert.deepEqual([...granted].sort(), ["ConditionCheckItem", "DeleteItem", "GetItem", "PutItem", "UpdateItem"].sort(),
+    "the state-table policy should contain only current ingress state and admission-lease actions");
+  assert.match(ingressBlock, /Resource: !GetAtt SyncState\.Arn/);
+  assert.doesNotMatch(tablePolicy, /\*/);
+});
+
+test("failed webhook admission returns a retryable non-2xx response without claiming acceptance", () => {
+  const enqueueCatch = handlerSource.match(/await enqueueDelivery\(delivery\);([\s\S]*?)log\("webhook_enqueued"/)?.[1] || "";
+  assert.match(enqueueCatch, /logError\("webhook_enqueue_failed"/);
+  assert.match(enqueueCatch, /return response\(503,\s*\{\s*error:\s*"enqueue_failed",\s*accepted:\s*false/);
+  assert.doesNotMatch(enqueueCatch, /response\(202/);
 });
 
 test("state table uses fixed 25/25 provisioned capacity, remains protected and worker can transact mappings", () => {

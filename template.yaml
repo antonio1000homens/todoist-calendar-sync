@@ -286,6 +286,9 @@ Resources:
               Action:
                 - dynamodb:GetItem
                 - dynamodb:UpdateItem
+                - dynamodb:ConditionCheckItem
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
               Resource: !GetAtt SyncState.Arn
       FunctionUrlConfig:
         AuthType: NONE

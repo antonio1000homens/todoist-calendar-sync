@@ -117,7 +117,9 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     await enqueueDelivery(delivery);
   } catch (error) {
     logError("webhook_enqueue_failed", error, { deliveryId: id, kind, profile });
-    throw error;
+    // Provider webhooks retry non-2xx responses. Returning an explicit 503 also
+    // avoids relying on Lambda URL's translation of an uncaught exception.
+    return response(503, { error: "enqueue_failed", accepted: false, deliveryId: id });
   }
 
   log("webhook_enqueued", { deliveryId: id, kind, profile, messageGroup: `sync:${profile}` });
