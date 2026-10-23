@@ -365,6 +365,10 @@ export class ReviewEngine {
         if ((await provider.calendar.listExplicitSeriesExceptions(master.id)).length) throw new Error("Explicit Calendar series exceptions require separate review before flattening");
       } catch(error) { invalidRepairIntent(error instanceof Error ? error.message : "Unsupported flatten repair"); }
       if (preview.flattenPlan!.standaloneId !== master.id && snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===preview.flattenPlan!.standaloneId && s.object)) invalidRepairIntent("The deterministic standalone ID already exists; resume its original repair instead");
+      for (const snapshot of snapshots) if (intent.leftovers[entityKey(snapshot.ref)] && (
+        snapshot.ref.side === "todoist" && snapshot.ref.id === task.id
+        || snapshot.ref.side === "calendar" && ([master.id,event.id,preview.flattenPlan!.standaloneId].includes(snapshot.ref.id)
+          || snapshot.mapping && (snapshot.object as CalendarEvent|null)?.status === "cancelled"))) invalidRepairIntent("A provider item handled by the flatten plan cannot have a separate disposition");
       const providerTaskIds = [master.extendedProperties?.shared?.taskId,event.extendedProperties?.shared?.taskId].filter(Boolean);
       if (snapshots.some(s=>s.ref.side==="todoist" && s.ref.id!==task.id && s.object && providerTaskIds.includes(s.ref.id))) invalidRepairIntent("The series still names another live Todoist task; resolve its exact ownership before flattening");
       const previousMappings = [...new Map(snapshots.filter(s=>s.mapping).map(s=>[s.mapping!.taskId,s.mapping!])).values()];
