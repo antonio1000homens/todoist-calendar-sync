@@ -130,7 +130,10 @@ async function enqueueReconciliationContinuation(
     },
   };
   await enqueueDelivery(next);
-  await state.markReconciliationEnqueued(delivery.profile, delivery.reconcile.generation);
+  await state.markReconciliationEnqueued(delivery.profile, delivery.reconcile.generation, next.id, {
+    phase: continuation.phase, sequence: continuation.sequence, deliveryId: next.id,
+    afterTaskId: continuation.afterTaskId, afterEventId: continuation.afterEventId,
+  });
   return next;
 }
 
@@ -154,7 +157,7 @@ export async function processReconciliation(
   );
 
   const { generation, reason, continuation } = delivery.reconcile;
-  if (!await state.beginReconciliation(delivery.profile, generation)) {
+  if (!await state.beginReconciliation(delivery.profile, generation, delivery.id)) {
     log("reconciliation_stale_or_completed_skipped", { ...deliverySummary(delivery) });
     return { continuationRequired: false };
   }
@@ -213,7 +216,11 @@ export async function processReconciliation(
 
   if (snapshot?.continuation) {
     try {
-      await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts);
+      await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts, {
+        phase: continuation?.phase || "mapped", sequence: continuation?.sequence || 0, deliveryId: delivery.id,
+        afterTaskId: continuation?.afterTaskId, afterEventId: continuation?.afterEventId,
+        observedAt: new Date().toISOString(),
+      });
       const next = await enqueueReconciliationContinuation(delivery, state, snapshot.continuation);
       await state.audit(delivery.profile, "reconciliation_chunk_queued", {
         deliveryId: delivery.id,
@@ -241,7 +248,11 @@ export async function processReconciliation(
     }
   }
 
-  if (snapshot) await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts);
+  if (snapshot) await state.addReconciliationProgress(delivery.profile, generation, snapshot.counts, {
+    phase: continuation?.phase || "mapped", sequence: continuation?.sequence || 0, deliveryId: delivery.id,
+    afterTaskId: continuation?.afterTaskId, afterEventId: continuation?.afterEventId,
+    observedAt: new Date().toISOString(),
+  });
   if (mutationBudget.exhausted) return deferForMutationBudget("mapped_state");
 
   const calendarRecovery = await reconcileUnmappedCalendar(
@@ -259,6 +270,10 @@ export async function processReconciliation(
     calendar_blocked: calendarRecovery.blocked,
     calendar_skipped: calendarRecovery.skipped,
     provider_mutations: calendarRecovery.providerMutations,
+  }, {
+    phase: "calendar", sequence: continuation?.sequence || 0, deliveryId: delivery.id,
+    afterTaskId: continuation?.afterTaskId, afterEventId: continuation?.afterEventId,
+    observedAt: new Date().toISOString(),
   });
 
   if (calendarRecovery.continuation) {
@@ -541,6 +556,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
           delivery.profile,
           delivery.reconcile.generation,
           error instanceof Error ? error.message : String(error),
+          error instanceof ReconciliationItemError ? {
+            category: error.providerReason || (error.status ? `provider_http_${error.status}` : "provider_item_failure"),
+            stage: error.stage, status: error.status, taskId: error.taskId, eventId: error.eventId, seriesId: error.seriesId,
+          } : undefined,
         ).catch((stateError: unknown) => {
           console.error(JSON.stringify({
             service: "todoist-calendar-sync-worker",

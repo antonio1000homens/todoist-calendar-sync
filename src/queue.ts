@@ -94,7 +94,7 @@ export async function requestReconciliation(
 
   try {
     await enqueue(delivery);
-    await state.markReconciliationEnqueued(profile, request.state.generation);
+    await state.markReconciliationEnqueued(profile, request.state.generation, delivery.id);
     return {
       profile,
       generation: request.state.generation,
