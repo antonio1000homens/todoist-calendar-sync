@@ -77,6 +77,21 @@ export async function acquireErasureProtocolLease(
   };
 }
 
+/** Shared admission primitive for writers that need the epoch they were admitted under. */
+export async function acquireProfileAdmissionLeaseWithEpoch(profile:Profile,owner=randomUUID()):Promise<{
+  epoch:number|undefined;release:()=>Promise<void>;
+}> {
+  if(process.env.ERASURE_PROTOCOL_VERSION!=="1") return {epoch:undefined,release:async()=>{}};
+  const expectedEpoch=await getErasureEpoch(profile);
+  const release=await acquireErasureProtocolLease(profile,"admission",owner,expectedEpoch);
+  return {epoch:expectedEpoch,release};
+}
+
+/** Shared admission primitive for writers that need only the fence barrier. */
+export async function acquireProfileAdmissionLease(profile:Profile,owner=randomUUID()):Promise<()=>Promise<void>> {
+  return (await acquireProfileAdmissionLeaseWithEpoch(profile,owner)).release;
+}
+
 /** Install the profile fence. Existing leases remain visible and must drain. */
 export async function beginErasureFence(profile: Profile, operationId: string): Promise<void> {
   const key = fenceKey(profile);

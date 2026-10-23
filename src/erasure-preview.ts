@@ -41,6 +41,7 @@ type Dependencies = {
   ignoreOperationId?: string;
   allowFenceOperationId?: string;
   allowJournalOperationId?: string;
+  allowLeaseOwner?: string;
   scanDeadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
 };
@@ -184,7 +185,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     blockers.push("A prior item-erasure journal exists for this profile; break-glass review is required before another preview");
   if (protocol.fence && protocol.fence.operationId !== dependencies.allowFenceOperationId)
     blockers.push("A profile erasure fence is active; preserve protections and use the break-glass recovery procedure");
-  if (protocol.leases.length) blockers.push("Provider work leases are active; retry only after they have drained");
+  if (protocol.leases.some(lease=>lease.owner!==dependencies.allowLeaseOwner))
+    blockers.push("Provider work leases are active; retry only after they have drained");
   const operationId = (dependencies.newOperationId || randomUUID)();
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
   const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },

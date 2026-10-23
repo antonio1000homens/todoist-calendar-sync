@@ -8,14 +8,16 @@ import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import { buildErasurePreview } from "./erasure-preview.js";
-import { acquireErasureProtocolLease, getErasureEpoch } from "./erasure-protocol.js";
+import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
+import { randomUUID } from "node:crypto";
 
 const REVIEW_ORIGIN = "https://calendar-sync.alf-broadcast.co.uk";
 type Claims = { email?: unknown; sub?: unknown; aud?: unknown };
 let remoteKeys: ReturnType<typeof createRemoteJWKSet> | undefined;
+let remoteKeysIssuer: string | undefined;
 
 function response(statusCode: number, payload: unknown): LambdaFunctionURLResult {
   return { statusCode, headers: { "content-type":"application/json", "cache-control":"no-store", "x-content-type-options":"nosniff" }, body: JSON.stringify(payload) };
@@ -56,7 +58,10 @@ async function authenticate(event: LambdaFunctionURLEvent, requireSameOrigin: bo
   const assertion = requestHeader(event, "cf-access-jwt-assertion");
   if (!assertion) fail(401, "Cloudflare Access authentication required");
   const { issuer, audience, operators } = accessConfig();
-  remoteKeys ||= createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+  if (!remoteKeys || remoteKeysIssuer !== issuer) {
+    remoteKeys = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+    remoteKeysIssuer = issuer;
+  }
   let payload;
   try {
     ({ payload } = await jwtVerify(assertion, remoteKeys, { issuer, audience, algorithms: ["RS256"] }));
@@ -127,7 +132,13 @@ async function enqueueRepair(operationId: string, selectedProfile: Profile, atte
 export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   buildErasurePreview?: typeof buildErasurePreview;
   createErasureOperationStore?: () => ErasureOperationStore;
-  acquireManualWriteLease?: (selectedProfile:Profile)=>Promise<()=>Promise<void>>;
+  acquireWriteLease?: (selectedProfile:Profile,owner:string)=>Promise<()=>Promise<void>>;
+  createReviewStore?:()=>ReviewStore;
+  createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
+  createStateRepository?:()=>StateRepository;
+  clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
+  requestReconciliation?:typeof requestReconciliation;
+  enqueueRepair?:typeof enqueueRepair;
 } = {}): Promise<LambdaFunctionURLResult> {
   const previewBuilder = dependencies.buildErasurePreview || buildErasurePreview;
   const erasureStore = () => dependencies.createErasureOperationStore?.() || new ErasureOperationStore();
@@ -140,26 +151,54 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     const segments = path.slice("/review/api/".length).split("/").filter(Boolean).map(decodeURIComponent);
     const body = method === "POST" ? bodyJson(event) : undefined;
     const actor = await authenticate(event, method === "POST");
-    // Every manual provider/state mutation participates in the same admission
-    // barrier as sync work. Acquire all profiles because repair intents can
-    // name a destination profile distinct from their source case profile.
-    // Erasure API calls themselves only create/read durable preparation state.
-    const erasurePreparationRoute = segments[0] === "erasure-previews"
-      || segments[0] === "erasure-operations";
-    if(method === "POST" && !erasurePreparationRoute && process.env.ERASURE_PROTOCOL_VERSION === "1") {
-      for(const selectedProfile of REVIEW_PROFILES) {
-        const acquire=dependencies.acquireManualWriteLease || (async (profile:Profile) =>
-          acquireErasureProtocolLease(profile,"admission",undefined,await getErasureEpoch(profile)));
-        manualWriteLeases.push(await acquire(selectedProfile));
+    const store = dependencies.createReviewStore?.() || new ReviewStore();
+    const reviewEngine=dependencies.createReviewEngine?.(store) || new ReviewEngine(store);
+    const enqueueRepairFn=dependencies.enqueueRepair || enqueueRepair;
+    const admissionOwner=randomUUID();
+    const writeProfiles:Profile[]=[];
+    if(method==="POST") {
+      if(segments[0]==="erasure-previews"&&typeof body?.profile==="string"&&REVIEW_PROFILES.includes(body.profile as Profile)) {
+        writeProfiles.push(body.profile as Profile);
+      } else if(segments[0]==="erasure-operations") {
+        const operationStore=erasureStore();
+        if(segments[2]==="start"&&segments[1]) {
+          const operation=await operationStore.get(segments[1]);
+          if(operation) writeProfiles.push(operation.profile);
+        } else if(typeof body?.operationId==="string"&&typeof body?.confirmationId==="string") {
+          const issued=await operationStore.getIssuedPreview(body.operationId,body.confirmationId);
+          if(issued) writeProfiles.push(issued.profile);
+        }
+      } else if(segments[0]==="cases"&&segments.length>=3&&segments[1]) {
+        if(segments[2]==="previews") writeProfiles.push(...REVIEW_PROFILES);
+        else {
+          const item=await store.getCase(segments[1]);
+          if(item) writeProfiles.push(item.profile);
+        }
+      } else if(segments[0]==="previews"&&segments[2]==="submit"&&segments[1]) {
+        const preview=await store.getPreview(segments[1]);
+        if(preview) writeProfiles.push(preview.intent.profile);
+      } else if(segments[0]==="operations"&&segments[2]==="resume"&&segments[1]) {
+        const operation=await store.getOperation(segments[1]);
+        if(operation) writeProfiles.push(operation.preview.intent.profile);
+      } else if(segments[0]==="reconciliation"&&typeof body?.profile==="string") {
+        writeProfiles.push(profile(body.profile));
+      }
+      for(const selectedProfile of [...new Set(writeProfiles)]) {
+        const acquire=dependencies.acquireWriteLease || acquireProfileAdmissionLease;
+        manualWriteLeases.push(await acquire(selectedProfile,admissionOwner));
       }
     }
-    const store = new ReviewStore();
+    const requireAdmissionProfile=(selectedProfile:Profile):void=>{
+      if(method==="POST"&&process.env.ERASURE_PROTOCOL_VERSION==="1"&&!writeProfiles.includes(selectedProfile))
+        fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
+    };
 
     if ((method === "GET" && segments[0] === "erasure-operations" && segments.length === 2)
       || (method === "POST" && segments[0] === "erasure-operations" && segments[2] === "start" && segments.length === 3)) {
       const operationStore = erasureStore();
       const operation = await operationStore.get(segments[1]);
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
+      if(method==="POST") requireAdmissionProfile(operation.profile);
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
         providerDeletionReady:operation.providerDeletionReady===true,
         backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE,
@@ -205,7 +244,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         || (body?.eventId !== undefined && typeof body.eventId !== "string")
         || typeof body?.deleteCalendar !== "boolean") fail(400,"Exact erasure target and action selections are required");
       const preview = await previewBuilder({profile:profile(body.profile),taskId:body.taskId,
-        ...(typeof body.eventId === "string" ? {eventId:body.eventId} : {}),deleteCalendar:body.deleteCalendar});
+        ...(typeof body.eventId === "string" ? {eventId:body.eventId} : {}),deleteCalendar:body.deleteCalendar},
+        {allowLeaseOwner:admissionOwner});
       if (!preview.blockers.length) {
         let issued;
         try { issued = await erasureStore().issueConfirmation(preview); }
@@ -228,9 +268,10 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const operationStore = erasureStore();
       const issued = await operationStore.getIssuedPreview(body.operationId,body.confirmationId);
       if (!issued) fail(409,"The preview confirmation is missing, expired, or already used; request a fresh preview");
+      requireAdmissionProfile(issued.profile);
       const current = await previewBuilder({profile:issued.profile,taskId:issued.target.taskId,
         ...(issued.target.eventId ? {eventId:issued.target.eventId} : {}),deleteCalendar:issued.selectedActions.deleteCalendar},
-        {newOperationId:()=>body!.operationId as string,ignoreOperationId:body.operationId});
+        {newOperationId:()=>body!.operationId as string,ignoreOperationId:body.operationId,allowLeaseOwner:admissionOwner});
       if (current.blockers.length || current.previewFingerprint !== issued.previewFingerprint)
         fail(409,"The exact provider/state inventory changed or became unsafe; request a fresh preview");
       const now=new Date().toISOString();
@@ -269,7 +310,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           || (operation.status !== "failed" && operation.status !== "needs_review")) {
           fail(409,"Repair operation does not match this incident; provider items cannot be safely hydrated");
         }
-        const snapshots = await new ReviewEngine(store).collect(preview.intent,item.decision);
+        const snapshots = await reviewEngine.collect(preview.intent,item.decision);
         return response(200,{item:{...item,taskId:preview.intent.taskId,eventId:preview.intent.eventId,
           repairContext:{operationId:operation.id,status:operation.status,itemPlan:preview.itemPlan}},snapshots});
       }
@@ -277,7 +318,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         taskId:item.taskId || (typeof item.decision?.context?.providerTaskId === "string" ? item.decision.context.providerTaskId : undefined),
         eventId:item.eventId || (typeof item.decision?.context?.providerEventId === "string" ? item.decision.context.providerEventId : undefined),
         winner:"none", scope:"occurrence", leftovers:{} };
-      const snapshots = await new ReviewEngine(store).collect(intent,item.decision);
+      const snapshots = await reviewEngine.collect(intent,item.decision);
       const reconciliation = item.decision?.type === "operational_reconciliation_stuck"
         ? await new StateRepository().getReconciliationState(item.profile) : undefined;
       const alertedGeneration = item.reconciliationGeneration || item.decision?.context?.reconciliationGeneration;
@@ -301,7 +342,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const side = event.queryStringParameters?.side;
       const query = event.queryStringParameters?.q?.trim();
       if (!query || query.length < 2 || query.length > 200 || !["todoist","calendar"].includes(side || "")) fail(400,"Choose a search phrase of 2–200 characters and a provider");
-      const pair = await new ReviewEngine(store).clients(selectedProfile);
+      const pair = await reviewEngine.clients(selectedProfile);
       const needle = query.toLocaleLowerCase();
       if (side === "todoist") {
         const items = (await pair.todoist.listTasks()).filter(item => `${item.content} ${item.description || ""}`.toLocaleLowerCase().includes(needle)).slice(0,40)
@@ -316,20 +357,21 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
       const intent = selectedIntent(body!,item.id,item.profile);
-      const preview = await new ReviewEngine(store).preview(actor,intent);
+      const preview = await reviewEngine.preview(actor,intent);
       return response(200,{preview});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
       const intent = selectedIntent(body!,item.id,item.profile);
-      const snapshots = await new ReviewEngine(store).collect(intent,item.decision);
+      const snapshots = await reviewEngine.collect(intent,item.decision);
       return response(200,{snapshots});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "dismiss" && segments.length === 3) {
       if (Object.keys(body || {}).length) fail(400,"Dismiss accepts no request fields");
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
+      requireAdmissionProfile(item.profile);
       return response(200,{item:await store.dismissCase(item.id,`Alert dismissed by ${actor.email}`)});
     }
     if (method === "POST" && segments[0] === "previews" && segments[2] === "submit" && segments.length === 3) {
@@ -337,10 +379,11 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) fail(400,"A valid Idempotency-Key header is required");
       const preview = await store.getPreview(segments[1]);
       if (!preview) return response(404,{error:"preview_not_found"});
+      requireAdmissionProfile(preview.intent.profile);
       assertOwned(actor.subject,preview.actor.subject);
       const operation = await store.submit(preview,actor,idempotencyKey);
       if (operation.status === "queued") {
-        try { await enqueueRepair(operation.id,operation.preview.intent.profile,operation.attempt); }
+        try { await enqueueRepairFn(operation.id,operation.preview.intent.profile,operation.attempt); }
         catch { return response(503,{error:"repair_enqueue_failed",message:"The repair was saved but queue delivery was not confirmed. Retry this same submission.",operation}); }
       }
       return response(operation.status === "succeeded" ? 200 : 202,{operation});
@@ -348,12 +391,14 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     if (method === "GET" && segments[0] === "operations" && segments.length === 2) {
       const operation = await store.getOperation(segments[1]);
       if (!operation) return response(404,{error:"operation_not_found"});
+      requireAdmissionProfile(operation.preview.intent.profile);
       assertOwned(actor.subject,operation.actor.subject);
       return response(200,{operation});
     }
     if (method === "POST" && segments[0] === "operations" && segments[2] === "resume" && segments.length === 3) {
       const operation = await store.getOperation(segments[1]);
       if (!operation) return response(404,{error:"operation_not_found"});
+      requireAdmissionProfile(operation.preview.intent.profile);
       assertOwned(actor.subject,operation.actor.subject);
       if (operation.abandoned) fail(409,"This unapplied repair was released; refresh affected items and create a new preview instead of resuming it");
       if (!["failed","needs_review","queued"].includes(operation.status)) fail(409,"Only queued, failed, or interrupted repairs can be resumed");
@@ -364,7 +409,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       operation.attempt += 1;
       operation.status = "queued";
       await store.saveOperation(operation);
-      try { await enqueueRepair(operation.id,operation.preview.intent.profile,operation.attempt); }
+      try { await enqueueRepairFn(operation.id,operation.preview.intent.profile,operation.attempt); }
       catch(error) {
         const message=error instanceof Error?error.message:String(error);
         return response(503,{error:"repair_enqueue_failed",message:`The repair remains queued, but delivery of attempt ${operation.attempt} was not confirmed. Retry this operation; completed repair steps are checkpointed.`,operation,
@@ -399,15 +444,16 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     }
     if (method === "POST" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected = profile(typeof body?.profile === "string" ? body.profile : null);
+      requireAdmissionProfile(selected);
       let clearedDlq: Awaited<ReturnType<typeof clearDeadLetterMessagesForProfile>>;
       try {
-        clearedDlq = await clearDeadLetterMessagesForProfile(selected);
+        clearedDlq = await (dependencies.clearDeadLetterMessagesForProfile || clearDeadLetterMessagesForProfile)(selected);
       } catch (error) {
         console.error(JSON.stringify({ event:"profile_dlq_clear_failed", profile:selected, error:error instanceof Error ? error.message : String(error) }));
         return response(503,{error:"dlq_clear_failed",message:"The profile DLQ could not be cleared; reconciliation was not started."});
       }
-      const state = new StateRepository();
-      const result = await requestReconciliation(state,selected,"manual",enqueueDelivery,{requester:actor.email});
+      const state = dependencies.createStateRepository?.() || new StateRepository();
+      const result = await (dependencies.requestReconciliation || requestReconciliation)(state,selected,"manual",enqueueDelivery,{requester:actor.email});
       const [current, actionableCaseCount] = await Promise.all([state.getReconciliationState(selected),store.countActionableCases(selected)]);
       return response(result.enqueueError?503:202,{reconciliation:result,clearedDlq,
         run:current,summary:reconciliationSummary(current,actionableCaseCount)});

@@ -1,6 +1,6 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
-import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
+import { acquireProfileAdmissionLeaseWithEpoch, ErasureEpochChangedError } from "./erasure-protocol.js";
 import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
@@ -24,9 +24,10 @@ export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   if (protocolEnabled) {
     // Never resample and re-enqueue an in-flight payload after an epoch race.
     // A provider retry gets a fresh invocation and passes through live-state checks.
-    epoch = await getErasureEpoch(delivery.profile);
     try {
-      release = await acquireErasureProtocolLease(delivery.profile, "admission", undefined, epoch);
+      const admission=await acquireProfileAdmissionLeaseWithEpoch(delivery.profile);
+      release=admission.release;
+      epoch=admission.epoch;
     } catch (error) {
       if (error instanceof ErasureEpochChangedError) {
         throw new Error("Admission rejected because the erasure epoch changed; retry from the source after revalidation");
