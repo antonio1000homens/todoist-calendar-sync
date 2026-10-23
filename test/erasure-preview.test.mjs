@@ -47,6 +47,8 @@ test("malformed live provider responses cannot produce an exact preview", async 
     ["Todoist response without project identity", { id:"task-123" }, undefined, { profile:"home", taskId:"task-123", deleteCalendar:false }],
     ["empty Calendar response", { id:"task-123", project_id:"test-home-project" }, {}, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
     ["Calendar response without identity", { id:"task-123", project_id:"test-home-project" }, { status:"confirmed" }, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
+    ["cancelled Calendar response without identity", { id:"task-123", project_id:"test-home-project" }, { status:"cancelled" }, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
+    ["cancelled Calendar response with wrong identity", { id:"task-123", project_id:"test-home-project" }, { id:"other-event", status:"cancelled" }, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
   ]) {
     await t.test(name, async () => {
       const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[]}: {}};

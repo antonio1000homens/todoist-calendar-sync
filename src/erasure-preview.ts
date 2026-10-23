@@ -134,7 +134,10 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   if (target.eventId) {
     try {
       event = await providerClients.calendar.getEvent(target.eventId);
-      if (event?.status === "cancelled") { event = undefined; eventMissing = true; }
+      // A cancelled item is absent for purge purposes only after the provider
+      // response proves it is the exact requested event. A malformed or
+      // mismatched response must flow through providerBlockers and fail closed.
+      if (event?.status === "cancelled" && event.id === target.eventId) { event = undefined; eventMissing = true; }
     }
     catch (error) { if (!missing(error)) throw error; eventMissing = true; }
   }
