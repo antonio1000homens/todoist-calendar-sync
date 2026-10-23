@@ -24,7 +24,9 @@ test("expired-UNTIL split completion sends only expression values used by its ex
     assert.equal(captured.constructor.name, "UpdateCommand");
     const input = captured.input;
     const used = new Set((input.UpdateExpression + " " + input.ConditionExpression).match(/:[A-Za-z]+\b/g) || []);
-    assert.deepEqual(Object.keys(input.ExpressionAttributeValues).sort(), [...used].sort());
+    const values = input.ExpressionAttributeValues;
+    for (const placeholder of used) assert.ok(Object.hasOwn(values, placeholder), `missing expression value ${placeholder}`);
+    assert.deepEqual(Object.keys(values).sort(), [...used].sort());
     assert.equal(input.ExpressionAttributeValues[":done"], "completed");
   } finally { documentClient.send = original; }
 });
