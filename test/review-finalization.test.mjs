@@ -28,6 +28,22 @@ test("successful repair result, case resolution, and every barrier release share
   assert.equal(items[3].Update.ExpressionAttributeValues[":status"],"resolved");
 });
 
+test("operation save sends only values referenced by the selected terminal condition", async t => {
+  const store = new ReviewStore(), commands=[];
+  t.mock.method(documentClient,"send",async command => { commands.push(command); return {}; });
+  const base = operation();
+  const cases = [
+    [{...base,status:"succeeded"}, [":succeeded"]],
+    [{...base,status:"failed",abandoned:true}, [":failed",":yes"]],
+    [{...base,status:"running"}, [":succeeded"]],
+  ];
+  for (const [value, expected] of cases) {
+    await store.saveOperation(value);
+    const input = commands.at(-1).input;
+    assert.deepEqual(Object.keys(input.ExpressionAttributeValues).sort(), expected.sort());
+  }
+});
+
 test("transaction failure performs no separate release or terminal-result write",async t=>{
   const store = new ReviewStore(),commands=[];
   store.getCase=async()=>({id:"case",createdAt:"2026-10-21"});
