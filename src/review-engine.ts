@@ -29,6 +29,10 @@ function recurrenceAnchorMatches(event: CalendarEvent): boolean {
     && (event.start?.dateTime || event.start?.date) === shared.todoistAnchorStart
     && (event.end?.dateTime || event.end?.date) === shared.todoistAnchorEnd);
 }
+function calendarSeriesRuleMatchesTodoistTask(event: CalendarEvent, task: TodoistTask): boolean {
+  const rule = todoistRecurrenceToRrule(task);
+  return Boolean(rule && event.recurrence?.includes(rule));
+}
 function decisionRepairIntent(intent: RepairIntent, decision?: ManualDecision): RepairIntent {
   if (intent.action !== "decision") return intent;
   if (!decision || !decision.permittedActions.some(a => a.id === intent.decisionAction) || intent.decisionAction === "reconcile_now") invalidRepairIntent("Select a permitted repair action; reconciliation is a separate explicit request");
@@ -43,6 +47,9 @@ function unchangedControlState(control?: Record<string, unknown>): { excluded: u
   // The active repair claim is expected to change while a repair runs; compare
   // the durable user-facing control state that existed in the approved preview.
   return { excluded: control?.excluded, fencedAt: control?.fencedAt };
+}
+function retainedTaskControlState(control?: Record<string, unknown>): { excluded: boolean; fencedAt: unknown } {
+  return { excluded: control?.excluded === true, fencedAt: control?.fencedAt };
 }
 export function snapshotFingerprint(snapshots: ReviewSnapshot[]): string {
   return reviewHash(snapshots.map(s => ({ ref: s.ref, object: s.object, mapping: s.mapping,
@@ -131,14 +138,46 @@ export class ReviewEngine {
         }
       }
     }
+    if (intent.action === "transfer" && intent.taskId && intent.eventId) {
+      const task = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | null | undefined;
+      const master = snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId);
+      const active = master?.calendarProjectionId
+        ? snapshots.find(s => s.ref.side === "calendar" && s.ref.id === master.calendarProjectionId)?.object as CalendarEvent | null | undefined
+        : undefined;
+      const activeStart = active?.start?.dateTime || active?.start?.date;
+      if (task && activeStart) {
+        const provider = await this.clients(intent.profile);
+        const annualRule = todoistRecurrenceToRrule(task) === "RRULE:FREQ=YEARLY";
+        const annualDate = (value?: string) => value && /^\d{4}-\d{2}-\d{2}/.test(value) ? value.slice(5, 10) : undefined;
+        const candidates = (await provider.calendar.listDelta()).items.filter(candidate => candidate.id !== active.id
+          && !candidate.recurringEventId && !candidate.recurrence?.length
+          && candidate.status !== "cancelled"
+          && ((candidate.start?.dateTime || candidate.start?.date) === activeStart
+            || annualRule && annualDate(candidate.start?.dateTime || candidate.start?.date) === annualDate(activeStart))
+          && normalizedText(candidate.summary).toLowerCase() === normalizedText(task.content).toLowerCase());
+        for (const candidate of candidates) {
+          if (snapshots.some(s => s.ref.side === "calendar" && s.ref.id === candidate.id)) continue;
+          if (snapshots.length >= 20) invalidRepairIntent("Too many affected items for one transfer; narrow the selection");
+          const snapshot = await this.snapshot({profile:intent.profile,side:"calendar",id:candidate.id});
+          snapshots.push(snapshot);
+          // Surface the exact mapped task too; matching only discovers a
+          // candidate and never chooses its disposition or transfers its link.
+          if (snapshot.mapping && !snapshots.some(s => s.ref.side === "todoist" && s.ref.id === snapshot.mapping!.taskId)) {
+            if (snapshots.length >= 20) invalidRepairIntent("Too many affected items for one transfer; narrow the selection");
+            snapshots.push(await this.snapshot({profile:intent.profile,side:"todoist",id:snapshot.mapping.taskId}));
+          }
+        }
+      }
+    }
     return snapshots.sort((a,b) => entityKey(a.ref).localeCompare(entityKey(b.ref)));
   }
   async preview(actor: ReviewActor, intent: RepairIntent): Promise<RepairPreview> {
     const record = await this.store.getCase(intent.caseId);
     if (!record || record.profile !== intent.profile) invalidRepairIntent("Conflict not found in this profile");
-    if (!["link","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
+    if (!["link","transfer","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
     if (!["none","todoist","calendar"].includes(intent.winner) || !["occurrence","series","future"].includes(intent.scope)) invalidRepairIntent("Invalid field winner or recurrence scope");
-    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
+    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
+    if (intent.action !== "transfer" && Object.values(intent.leftovers).includes("retain-unlinked")) invalidRepairIntent("Retain unlinked is available only during an explicit Calendar series transfer");
     intent = decisionRepairIntent(intent, record.decision);
     const snapshots = await this.collect(intent, record.decision);
     if (!snapshots.length) invalidRepairIntent("Select at least one provider item");
@@ -183,6 +222,46 @@ export class ReviewEngine {
       ? snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === masterSnapshot?.calendarProjectionId)?.object as CalendarEvent | undefined
       : undefined;
     const calendarFieldSource = approvedCalendarOccurrence || event;
+    if (intent.action === "transfer") {
+      if (!task || !event) invalidRepairIntent("Series transfer requires a live Todoist task and Calendar series master");
+      if (intent.owner !== "calendar" || intent.scope !== "future" || intent.winner !== "none") invalidRepairIntent("Series transfer requires Calendar ownership, Future occurrences (preserve history), and Keep current fields");
+      if (!event.recurrence?.length || event.recurringEventId) invalidRepairIntent("Select the existing Calendar series master for transfer");
+      if (!task.due?.is_recurring || !task.due.string) invalidRepairIntent("Series transfer requires an already-recurring Todoist task with a verifiable recurrence rule");
+      if (task.is_completed || task.is_deleted) invalidRepairIntent("Series transfer requires an active, incomplete Todoist task");
+      if (await this.state.getCalendarProjectionTombstone(intent.profile, task.id)) invalidRepairIntent("The selected Todoist task has a projection tombstone; resolve that state before transfer");
+      if (!masterSnapshot?.calendarProjectionId) invalidRepairIntent("Calendar series has no verifiable future occurrence; refresh affected items");
+      const occurrence = snapshots.find(s => s.ref.side === "calendar" && s.ref.id === masterSnapshot.calendarProjectionId)?.object as CalendarEvent | null | undefined;
+      if (!occurrence || occurrence.recurringEventId !== event.id || occurrence.status !== "confirmed") invalidRepairIntent("The selected Calendar occurrence changed or is not confirmed; refresh affected items");
+      if (!calendarSeriesRuleMatchesTodoistTask(event, task) || !occurrenceStateMatches(occurrence, task)) invalidRepairIntent("The existing Todoist recurrence and Calendar series do not describe the same future occurrence; no transfer is safe");
+      const selectedTaskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === task.id);
+      if (selectedTaskSnapshot?.mapping) invalidRepairIntent("The selected recurring Todoist task already has a mapping; resolve that exact association before transfer");
+      const seriesId = event.iCalUID || event.id;
+      const calendarOwnerVerified = (masterSnapshot.recurrence?.owner === "calendar"
+        && masterSnapshot.recurrence.seriesId === seriesId)
+        || event.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";
+      if (!calendarOwnerVerified) invalidRepairIntent("Series transfer requires a verified Calendar ownership signal");
+      if (masterSnapshot.recurrence && (masterSnapshot.recurrence.owner !== "calendar" || masterSnapshot.recurrence.seriesId !== seriesId)) invalidRepairIntent("The existing recurrence owner or series identity changed; refresh affected items");
+      const oldTaskId = masterSnapshot.recurrence?.taskId;
+      const seriesMappings = [...new Map(snapshots.map(s => s.mapping).filter((m): m is Mapping => Boolean(m)
+        && m!.recurrenceOwner === "calendar" && m!.seriesId === seriesId).map(m => [`${m.taskId}:${m.eventId}:${m.updatedAt}`,m])).values()];
+      if (seriesMappings.length > 1) invalidRepairIntent("Multiple mappings claim this Calendar series; resolve the competing associations before transfer");
+      const previous = seriesMappings.find(m => m.taskId === oldTaskId && [event.id, masterSnapshot.calendarProjectionId].includes(m.eventId));
+      if (oldTaskId && oldTaskId !== task.id && !previous) invalidRepairIntent("The displaced recurrence mapping is missing or ambiguous; use a fresh preview or the stale-mapping recovery workflow");
+      if (previous) {
+        const disposition = intent.leftovers[entityKey({profile:previous.profile,side:"todoist",id:previous.taskId})];
+        if (!["retain-unlinked","exclude","create"].includes(String(disposition))) invalidRepairIntent("Choose an explicit disposition for the exact displaced Todoist task before transfer");
+      }
+      if (masterSnapshot.recurrence && !masterSnapshot.recurrence.updatedAt) invalidRepairIntent("The Calendar recurrence state has no version; refresh affected items before transfer");
+      if (previous && (!previous.updatedAt || previous.profile !== intent.profile || previous.masterEventId !== event.id
+        || previous.activeInstanceId && previous.activeInstanceId !== masterSnapshot.calendarProjectionId
+        || masterSnapshot.recurrence && (previous.calendarProgressVersion !== masterSnapshot.recurrence.calendarProgressVersion
+          || previous.completedThroughOriginalStart !== masterSnapshot.recurrence.completedThroughOriginalStart))) {
+        invalidRepairIntent("The displaced mapping and recurrence progress disagree; refresh affected items and resolve the split state first");
+      }
+      if (!oldTaskId && snapshots.some(s => s.mapping?.recurrenceOwner === "calendar" && s.mapping.masterEventId === event.id)) invalidRepairIntent("A competing Calendar-owned mapping exists without matching recurrence state");
+      if (Object.entries(intent.leftovers).some(([key, disposition]) => disposition === "retain-unlinked"
+        && !snapshots.some(s => entityKey(s.ref) === key && s.mapping?.taskId === oldTaskId))) invalidRepairIntent("Retain unlinked is allowed only for the exact displaced task mapping");
+    }
     if (intent.action === "link" && event?.recurringEventId && intent.owner === "todoist") {
       const parent = masterSnapshot?.object as CalendarEvent|undefined;
       const existingOwner = masterSnapshot?.recurrence?.owner || masterSnapshot?.mapping?.recurrenceOwner || parent?.extendedProperties?.shared?.syncRecurrenceOwner;
@@ -232,9 +311,9 @@ export class ReviewEngine {
         invalidRepairIntent(error instanceof Error ? error.message : "Unsupported standalone Calendar recurrence repair");
       }
     }
-    if (intent.action === "link" && (!task || !event)) invalidRepairIntent("Linking requires a live task and event");
-    if (["link","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
-    if (["link","create"].includes(intent.action) && task?.is_deleted) invalidRepairIntent("Todoist repair sources must not be deleted; choose a live task or exclude the deleted item");
+    if (["link","transfer"].includes(intent.action) && (!task || !event)) invalidRepairIntent("Linking requires a live task and event");
+    if (["link","transfer","create"].includes(intent.action) && event && event.status !== "confirmed") invalidRepairIntent("Calendar repair sources must be confirmed; choose a live event or exclude the cancelled item");
+    if (["link","transfer","create"].includes(intent.action) && task?.is_deleted) invalidRepairIntent("Todoist repair sources must not be deleted; choose a live task or exclude the deleted item");
     if (intent.action === "link" && intent.winner === "todoist") {
       try {
         if(event?.recurringEventId && intent.owner === "todoist") todoistOccurrenceProjection(task!,event!);
@@ -246,7 +325,7 @@ export class ReviewEngine {
     if (intent.action === "create" && Boolean(task) === Boolean(event)) invalidRepairIntent("Select just the item whose counterpart should be created");
     if (intent.action === "create" && event?.recurrence?.length && intent.owner !== "calendar") invalidRepairIntent("Creating a counterpart for a Calendar series requires Calendar recurrence ownership");
     if (intent.action === "create" && event?.recurringEventId && intent.owner !== "calendar") invalidRepairIntent("Creating a counterpart for a Calendar occurrence requires Calendar recurrence ownership");
-    if (["link","create"].includes(intent.action) && event?.recurrence?.length && intent.owner === "calendar" && !masterSnapshot?.calendarProjectionId) invalidRepairIntent("Calendar series has no active occurrence to preview");
+    if (["link","transfer","create"].includes(intent.action) && event?.recurrence?.length && intent.owner === "calendar" && !masterSnapshot?.calendarProjectionId) invalidRepairIntent("Calendar series has no active occurrence to preview");
     if (intent.action === "decision") {
       if (!record.decision || !record.decision.permittedActions.some(a => a.id === intent.decisionAction) || intent.decisionAction === "reconcile_now") invalidRepairIntent("Select a permitted repair action; reconciliation is a separate explicit request");
       changes.push(`Apply ${intent.decisionAction} with the existing guarded executor`);
@@ -254,6 +333,9 @@ export class ReviewEngine {
       if (!task || !intent.targetProfile || !["home","antonio","work"].includes(intent.targetProfile) || intent.targetProfile === intent.profile) invalidRepairIntent("Select a different destination profile for this task");
       changes.push(`Move task to ${intent.targetProfile}; apply existing project-transition rules to its Calendar projection`);
       warnings.push("The source projection follows the existing project-move lifecycle, shown as displaced below.");
+    } else if (intent.action === "transfer") {
+      changes.push(`Preserve recurring Todoist task ${task!.id} exactly and transfer the Calendar-owned series association to its verified active occurrence`);
+      changes.push(`Calendar series ${event!.id} and RRULE remain unchanged; no recurrence is created, split, or annualized`);
     } else if (intent.action === "link") {
       // Calendar occurrence projections are date-only. Applying one to an
       // existing recurring Todoist task can move its due date to that
@@ -335,9 +417,9 @@ export class ReviewEngine {
       chosen.add(`calendar:${preview.annualPlan.masterId}`);
     }
     const seriesProjections = new Set(snapshots.filter(s => s.ref.side === "calendar" && s.calendarProjectionId
-      && (intent.leftovers[entityKey(s.ref)] === "create" || s.ref.id === intent.eventId && ["link","create"].includes(intent.action)))
+      && (intent.leftovers[entityKey(s.ref)] === "create" || s.ref.id === intent.eventId && ["link","transfer","create"].includes(intent.action)))
       .map(s => s.calendarProjectionId!));
-    if (event?.recurrence?.length && masterSnapshot?.calendarProjectionId && ["link","create"].includes(intent.action)) {
+    if (event?.recurrence?.length && masterSnapshot?.calendarProjectionId && ["link","transfer","create"].includes(intent.action)) {
       chosen.add(`calendar:${masterSnapshot.calendarProjectionId}`);
       if (intent.leftovers[entityKey({profile:intent.profile, side:"calendar", id:masterSnapshot.calendarProjectionId})]) invalidRepairIntent("The active occurrence belongs to the selected series repair and cannot have a separate disposition");
       changes.push(`Use active Calendar occurrence ${masterSnapshot.calendarProjectionId} for the resulting association`);
@@ -347,9 +429,9 @@ export class ReviewEngine {
       const masterOfSelected = s.ref.side === "calendar" && event?.recurringEventId === s.ref.id;
       const selectedProjection = s.ref.side === "calendar" && seriesProjections.has(s.ref.id);
       if (selectedProjection && intent.leftovers[entityKey(s.ref)]) invalidRepairIntent("An occurrence handled by a series repair cannot have a separate disposition");
-      if (intent.action === "link" && selected || selectedProjection || ["decision","verify","move"].includes(intent.action) || masterOfSelected) continue;
+      if (["link","transfer"].includes(intent.action) && selected || selectedProjection || ["decision","verify","move"].includes(intent.action) || masterOfSelected) continue;
       const disposition = intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
-      if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart, Exclude, or Leave unchanged for ${entityKey(s.ref)}`);
+      if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart, Exclude, Leave unchanged, or Retain unlinked for ${entityKey(s.ref)}`);
       if (s.object && disposition === "create") {
         if (s.ref.side === "todoist") {
           if ((s.object as TodoistTask).is_deleted) invalidRepairIntent(`Todoist repair source ${entityKey(s.ref)} must not be deleted`);
@@ -363,6 +445,7 @@ export class ReviewEngine {
           : `Create a new Todoist counterpart from Calendar event ${s.ref.id} (${title}) and link that new pair`);
       } else if (s.object && disposition === "exclude") changes.push(`Exclude ${s.ref.side} item ${s.ref.id} from future syncing`);
       else if (s.object && disposition === "unchanged") changes.push(`Leave ${s.ref.side} item ${s.ref.id} unchanged`);
+      else if (s.object && disposition === "retain-unlinked") changes.push(`Retain ${s.ref.side} item ${s.ref.id} unchanged and detach its exact obsolete mapping`);
     }
     for (const s of snapshots) {
       const key = entityKey(s.ref);
@@ -390,6 +473,9 @@ export class ReviewEngine {
       } else if (intent.action === "move") {
         operation = selected ? "Move Todoist task" : "Handle existing Calendar projection";
         result = selected ? `Move to ${intent.targetProfile}; remap projection there` : "Use existing project-move lifecycle";
+      } else if (intent.action === "transfer" && selected) {
+        operation = "Transfer existing Calendar series to recurring Todoist task";
+        result = `Preserve Todoist recurrence and map task ${intent.taskId} to active Calendar occurrence ${masterSnapshot?.calendarProjectionId} under master ${intent.eventId}`;
       } else if (intent.action === "link" && selected) {
         operation = "Link selected provider object";
         const activeCalendarId = preview.annualPlan?.masterId || (event?.recurrence?.length && intent.owner === "calendar" && masterSnapshot?.calendarProjectionId
@@ -406,6 +492,9 @@ export class ReviewEngine {
       } else if (disposition === "unchanged") {
         operation = "Leave unchanged";
         result = "Retain provider object, mapping, and sync control without changes";
+      } else if (disposition === "retain-unlinked") {
+        operation = "Retain provider item and detach its old mapping";
+        result = "Keep this exact provider object unchanged; detach only its obsolete mapping, ownership, comments, and baseline links";
       } else if (selected && intent.action === "separate") {
         operation = "Keep selected items separate";
         result = "Remove existing association; do not link the selected pair";
@@ -622,6 +711,159 @@ export class ReviewEngine {
         });
         const mapping=await state.getMappingByTaskAnyProfile(originalTask!.id);if(!mapping||mapping.profile!==intent.targetProfile)throw new Error("Project move is not verified");
         const destination=await factory(mapping.profile);await bind(mapping.profile,await destination.todoist.getTask(mapping.taskId),await destination.calendar.getEvent(mapping.masterEventId||mapping.eventId),mapping.recurrenceOwner);
+      } else if (intent.action === "transfer") {
+        const master = originalEvent;
+        const targetTask = originalTask;
+        const masterState = eventSnapshot?.recurrence;
+        const activeId = eventSnapshot?.calendarProjectionId;
+        if (!master || !targetTask || !activeId || !targetTask.due?.is_recurring || !targetTask.due.string) throw new Error("The approved series transfer no longer has its recurring task or active occurrence");
+        const originalDue = reviewHash(targetTask.due);
+        const originalRule = reviewHash(master.recurrence);
+        const occurrenceSnapshot = operation.preview.snapshots.find(s => s.ref.side === "calendar" && s.ref.id === activeId);
+        const originalOccurrence = occurrenceSnapshot?.object as CalendarEvent | null | undefined;
+        if (!occurrenceSnapshot || !originalOccurrence || originalOccurrence.recurringEventId !== master.id) throw new Error("The approved active occurrence is missing or no longer belongs to the selected master");
+        const seriesId = master.iCalUID || master.id;
+        if (!(masterState?.owner === "calendar" && masterState.seriesId === seriesId)
+          && master.extendedProperties?.shared?.syncRecurrenceOwner !== "calendar") throw new Error("Calendar series ownership is no longer verified; no transfer was applied");
+        const previous = masterState?.taskId && masterState.taskId !== targetTask.id
+          ? operation.preview.snapshots.map(s => s.mapping).find(m => m?.taskId === masterState.taskId && m.seriesId === seriesId
+            && m.recurrenceOwner === "calendar" && [master.id, activeId].includes(m.eventId))
+          : undefined;
+        if (masterState?.taskId && masterState.taskId !== targetTask.id && !previous) throw new Error("The displaced series mapping changed after preview; refresh affected items");
+        if (operation.preview.snapshots.some(s => s.mapping && s.mapping.taskId !== previous?.taskId
+          && (s.mapping.masterEventId === master.id || s.mapping.eventId === master.id || s.mapping.activeInstanceId === activeId))) {
+          throw new Error("A competing mapping now owns this Calendar series or occurrence; no transfer was applied");
+        }
+        const exactDisposition = previous && intent.leftovers[entityKey({profile:previous.profile,side:"todoist",id:previous.taskId})];
+        if (previous && !["retain-unlinked","exclude","create"].includes(String(exactDisposition))) throw new Error("Choose an explicit disposition for the exact displaced Todoist task before transfer");
+        const transferMapping: Mapping = {
+          profile:intent.profile, taskId:targetTask.id, eventId:activeId,
+          projectId:targetTask.project_id || profiles[intent.profile].todoistProjectId,
+          recurrenceOwner:"calendar", seriesId, masterEventId:master.id, activeInstanceId:activeId,
+          originalStart:originalOccurrence.originalStartTime?.dateTime || originalOccurrence.originalStartTime?.date
+            || originalOccurrence.start?.dateTime || originalOccurrence.start?.date,
+          activeEffectiveStart:originalOccurrence.start?.dateTime || originalOccurrence.start?.date,
+          calendarProgressVersion:masterState?.calendarProgressVersion ?? 1,
+          completedThroughOriginalStart:masterState?.completedThroughOriginalStart,
+          updatedAt:at(),
+        };
+        const transferLink: import("./types.js").RecurrenceLink = {
+          profile:intent.profile, owner:"calendar", seriesId, masterEventId:master.id,
+          activeInstanceId:activeId, eventId:activeId, taskId:targetTask.id,
+          originalStart:transferMapping.originalStart, activeEffectiveStart:transferMapping.activeEffectiveStart,
+          calendarProgressVersion:transferMapping.calendarProgressVersion,
+          completedThroughOriginalStart:transferMapping.completedThroughOriginalStart, updatedAt:at(),
+        };
+        const [preflightTask,preflightMaster,preflightOccurrence] = await Promise.all([
+          pair.todoist.getTask(targetTask.id), pair.calendar.getEvent(master.id), pair.calendar.getEvent(activeId),
+        ]);
+        if (reviewHash(preflightTask.due) !== originalDue || !preflightTask.due?.is_recurring || !preflightTask.due.string) throw new Error("Todoist recurrence changed after preview; refresh affected items");
+        if (reviewHash(preflightMaster.recurrence) !== originalRule || preflightMaster.status !== "confirmed"
+          || !calendarSeriesRuleMatchesTodoistTask(preflightMaster,preflightTask) || preflightOccurrence.status !== "confirmed"
+          || preflightOccurrence.recurringEventId !== master.id || !occurrenceStateMatches(preflightOccurrence,preflightTask)) {
+          throw new Error("Calendar series or selected occurrence changed after preview; refresh affected items");
+        }
+        const mappingStep = `transfer-mapping:${seriesId}`;
+        if (operation.steps[mappingStep]?.status !== "done"
+          && (preflightTask.updated_at !== targetTask.updated_at || preflightMaster.etag !== master.etag
+            || preflightOccurrence.etag !== originalOccurrence.etag)) {
+          throw new Error("A provider version changed after preview; refresh affected items before transfer");
+        }
+        const installed = await step(mappingStep, async () => state.transferCalendarSeriesMapping({
+          previous, expectedLink:masterState, mapping:transferMapping, link:transferLink,
+        }));
+        if (!installed) {
+          // A conditional transaction returning false proves it committed no
+          // state. Remove its read-only checkpoint so the normal no-write
+          // failure path can release the claim and require a fresh preview.
+          delete operation.steps[mappingStep];
+          await this.store.saveOperation(operation);
+          throw new Error("Calendar series mapping or Todoist ownership changed during transfer; refresh affected items");
+        }
+        await step(`transfer-calendar-metadata:${master.id}`, async () => {
+          const liveMaster = await pair.calendar.getEvent(master.id);
+          const liveOccurrence = await pair.calendar.getEvent(activeId);
+          const liveTask = await pair.todoist.getTask(targetTask.id);
+          if (reviewHash(liveTask.due) !== originalDue || !liveTask.due?.is_recurring || !liveTask.due.string) throw new Error("Todoist recurrence changed after preview; no transfer was applied");
+          const masterMetadataApplied = liveMaster.extendedProperties?.shared?.taskId === targetTask.id
+            && liveMaster.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";
+          const occurrenceMetadataApplied = liveOccurrence.extendedProperties?.shared?.taskId === targetTask.id
+            && liveOccurrence.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";
+          if ((!masterMetadataApplied && liveMaster.etag !== master.etag) || (!occurrenceMetadataApplied && liveOccurrence.etag !== originalOccurrence.etag)
+            || reviewHash(liveMaster.recurrence) !== originalRule || liveMaster.status !== "confirmed"
+            || !calendarSeriesRuleMatchesTodoistTask(liveMaster, liveTask) || liveOccurrence.status !== "confirmed"
+            || liveOccurrence.recurringEventId !== master.id || !occurrenceStateMatches(liveOccurrence, liveTask)) {
+            throw new Error("Calendar series or selected occurrence changed after preview; refresh affected items");
+          }
+          const shared = { ...liveMaster.extendedProperties?.shared, taskId: liveTask.id,
+            taskUrl: `https://app.todoist.com/app/task/${liveTask.id}`, syncSource: "todoist-calendar-sync", syncRecurrenceOwner: "calendar" };
+          const activeShared = { ...liveOccurrence.extendedProperties?.shared, ...shared };
+          const storedMaster = await trackedWrite(intent.profile, () => pair.calendar.upsertEventIfUnchanged({
+            ...liveMaster, extendedProperties: { ...liveMaster.extendedProperties, shared },
+          }, liveMaster.id, liveMaster.etag!));
+          const storedOccurrence = await trackedWrite(intent.profile, () => pair.calendar.upsertEventIfUnchanged({
+            ...liveOccurrence, extendedProperties: { ...liveOccurrence.extendedProperties, shared: activeShared },
+          }, liveOccurrence.id, liveOccurrence.etag!));
+          return { master: storedMaster, occurrence: storedOccurrence };
+        });
+        if (previous) {
+          await this.controls.reject(previous.profile, previous.taskId, previous.eventId, id);
+          await step(`transfer-delete-old-comment:${previous.taskId}`, async () => {
+            const oldClient = await factory(previous.profile);
+            return trackedWrite(previous.profile, () => deleteMappingComments(oldClient.todoist, previous), count => count);
+          });
+          await step(`transfer-delete-old-baseline:${previous.taskId}`, async () => new DynamoReconciliationStore().deleteBaseline(previous.profile, previous.taskId));
+          if (exactDisposition === "retain-unlinked") await this.controls.exclude({profile:previous.profile,side:"todoist",id:previous.taskId},true,id);
+        }
+        await this.controls.allow(intent.profile,targetTask.id,activeId);
+        const mappedComment = await step(`transfer-project-comment:${targetTask.id}`, async () => {
+          const liveTask = await pair.todoist.getTask(targetTask.id);
+          const liveMaster = await pair.calendar.getEvent(master.id);
+          return trackedWrite(intent.profile, () => upsertProjectMappingComment(pair.todoist, transferMapping, transferMapping.projectId!, liveMaster.htmlLink), 2);
+        });
+        const finalTask = await pair.todoist.getTask(targetTask.id);
+        const finalMaster = await pair.calendar.getEvent(master.id);
+        const finalOccurrence = await pair.calendar.getEvent(activeId);
+        if (reviewHash(finalTask.due) !== originalDue || !finalTask.due?.is_recurring || !finalTask.due.string) throw new Error("The recurring Todoist due rule changed during transfer");
+        if (reviewHash(finalMaster.recurrence) !== originalRule || !calendarSeriesRuleMatchesTodoistTask(finalMaster, finalTask)
+          || !occurrenceStateMatches(finalOccurrence, finalTask)) throw new Error("Calendar recurrence or selected occurrence failed post-transfer verification");
+        const persisted = await state.getMappingByTask(intent.profile, targetTask.id);
+        const persistedLink = await state.getRecurrenceLink(intent.profile, seriesId);
+        if (!persisted || persisted.taskId !== targetTask.id || persisted.eventId !== activeId || persisted.recurrenceOwner !== "calendar"
+          || !persistedLink || persistedLink.taskId !== targetTask.id || persistedLink.activeInstanceId !== activeId) throw new Error("Transferred mapping indexes or recurrence ownership did not verify");
+        await new DynamoReconciliationStore().putBaseline(intent.profile,targetTask.id,finalTask,finalOccurrence);
+        const identities = new CanonicalIdentityStore();
+        const ti = todoistCanonicalIdentity(finalTask), ei = calendarCanonicalIdentity(finalOccurrence);
+        if (ti) await identities.put(intent.profile,"todoist",targetTask.id,ti);
+        if (ei) await identities.put(intent.profile,"calendar",activeId,ei);
+        await state.acceptTaskVersion(intent.profile,targetTask.id,finalTask.updated_at,`review:${id}`);
+        bindings.set(entityKey({profile:intent.profile,side:"todoist",id:targetTask.id}),activeId);
+        bindings.set(entityKey({profile:intent.profile,side:"calendar",id:activeId}),targetTask.id);
+        bindings.set(entityKey({profile:intent.profile,side:"calendar",id:master.id}),targetTask.id);
+        recordVerified(persisted);
+        if (previous && exactDisposition === "exclude") await step(`transfer-exclude-old:${previous.taskId}`, () => this.controls.exclude({profile:previous.profile,side:"todoist",id:previous.taskId},true,id));
+        // The new project mapping comment is idempotently upserted; a subsequent
+        // repair retry resumes from the durable operation checkpoint.
+        void mappedComment;
+        for (const snapshot of operation.preview.snapshots) {
+          const disposition = intent.leftovers[entityKey(snapshot.ref)];
+          if (!snapshot.object || !disposition || disposition === "retain-unlinked" || disposition === "unchanged") continue;
+          if (disposition === "exclude") await step(`transfer-exclude:${entityKey(snapshot.ref)}`, () => this.controls.exclude(snapshot.ref,true,id));
+          if (disposition === "create") {
+            const clients = await factory(snapshot.ref.profile);
+            if (snapshot.ref.side === "todoist") {
+              const source = await clients.todoist.getTask(snapshot.ref.id);
+              const created = await step(`transfer-create-event:${source.id}`, () => trackedWrite(snapshot.ref.profile,
+                () => clients.calendar.createRepairEventOnce({...toCalendarEvent(source),id:reviewHash([id,source.id]).slice(0,32)},id)));
+              await bind(snapshot.ref.profile,source,created,source.due?.is_recurring?"todoist":undefined);
+            } else {
+              const source = await clients.calendar.getEvent(snapshot.ref.id);
+              const created = await step(`transfer-create-task:${source.id}`, () => trackedWrite(snapshot.ref.profile,
+                () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+source.id)));
+              await bind(snapshot.ref.profile,created,source,undefined);
+            }
+          }
+        }
       } else if (operation.preview.annualPlan) {
         const converted = await step("annualize-standalone", async () =>
           trackedWrite(intent.profile, () => applyStandaloneAnnualRepair(
@@ -698,7 +940,7 @@ export class ReviewEngine {
       const outcomes: NonNullable<RepairOperation["outcomes"]> = [];
       for(const snapshot of operation.preview.snapshots) {
         const excluded=await this.controls.control(snapshot.ref);
-        if(excluded?.excluded){outcomes.push({entity:entityKey(snapshot.ref),outcome:"excluded",checkedAt:at()});continue;}
+        if(excluded?.excluded && intent.leftovers[entityKey(snapshot.ref)] !== "retain-unlinked") {outcomes.push({entity:entityKey(snapshot.ref),outcome:"excluded",checkedAt:at()});continue;}
         if(verified.some(v=>v.profile===snapshot.ref.profile&&(snapshot.ref.side==="todoist"?v.taskId===snapshot.ref.id:v.eventId===snapshot.ref.id))||["decision","move"].includes(intent.action))continue;
         const disposition=intent.leftovers[entityKey(snapshot.ref)];
         if(disposition==="unchanged"){
@@ -707,6 +949,19 @@ export class ReviewEngine {
             ||reviewHash(current.mapping??null)!==reviewHash(snapshot.mapping??null)
             ||reviewHash(unchangedControlState(current.control))!==reviewHash(unchangedControlState(snapshot.control)))throw new Error(`Leave unchanged verification failed for ${entityKey(snapshot.ref)}; provider or sync state changed`);
           outcomes.push({entity:entityKey(snapshot.ref),outcome:"unchanged",checkedAt:at()});continue;
+        }
+        if (disposition === "retain-unlinked") {
+          if (intent.action !== "transfer" || snapshot.ref.side !== "todoist" || !snapshot.mapping) throw new Error("Retain unlinked is restricted to the exact displaced Todoist mapping");
+          const current = await this.snapshot(snapshot.ref);
+          const seriesId = snapshot.mapping.seriesId;
+          const link = seriesId ? await state.getRecurrenceLink(snapshot.ref.profile, seriesId) : undefined;
+          if (reviewHash(current.object) !== reviewHash(operation.expectedProviders?.[entityKey(snapshot.ref)] ?? snapshot.object)
+            || current.mapping || !link || link.taskId === snapshot.ref.id || link.owner !== "calendar"
+            || current.control?.excluded !== true
+            || reviewHash(retainedTaskControlState(current.control)) !== reviewHash({ ...retainedTaskControlState(snapshot.control), excluded:true })) {
+            throw new Error(`Retained provider item ${entityKey(snapshot.ref)} or its detached mapping changed during transfer`);
+          }
+          outcomes.push({entity:entityKey(snapshot.ref),outcome:"retained-unlinked",checkedAt:at()});continue;
         }
         if (snapshot.ref.side === "calendar" && recurrenceBindings.some(m => m.profile === snapshot.ref.profile && m.activeInstanceId === snapshot.ref.id)) continue;
         if(!snapshot.object){
@@ -753,7 +1008,10 @@ export class ReviewEngine {
         }
         const [t,e]=await Promise.all([clients.todoist.getTask(binding.taskId),clients.calendar.getEvent(mapping?.activeInstanceId||binding.eventId)]);
         if (recurrence?.activeInstanceId && e.recurringEventId !== recurrence.masterEventId) throw new Error("The repaired active occurrence no longer belongs to its verified master");
-        if (mapping?.recurrenceOwner === "todoist" && mapping.masterEventId) {
+        if (intent.action === "transfer" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId) {
+          const master=await clients.calendar.getEvent(mapping.masterEventId);
+          if(!calendarSeriesRuleMatchesTodoistTask(master,t)||!occurrenceStateMatches(e,t))throw new Error("Transferred Calendar-owned recurrence or active occurrence changed before release");
+        } else if (mapping?.recurrenceOwner === "todoist" && mapping.masterEventId) {
           const master=await clients.calendar.getEvent(mapping.masterEventId);
           if(!calendarRecurrenceMatchesTodoist(master,t)||!recurrenceAnchorMatches(master)||!occurrenceStateMatches(e,t))throw new Error("A provider changed before recurrence verification completed; resume after reviewing the live data");
         } else if(!hasCanonicalState(e,t))throw new Error("A provider changed before verification completed; resume after reviewing the live data");
@@ -777,6 +1035,15 @@ export class ReviewEngine {
           if(reviewHash(current.object)!==reviewHash(operation.expectedProviders?.[outcome.entity]??snapshot.object)
             ||reviewHash(current.mapping??null)!==reviewHash(snapshot.mapping??null)
             ||reviewHash(unchangedControlState(current.control))!==reviewHash(unchangedControlState(snapshot.control)))throw new Error(`Leave unchanged state for ${outcome.entity} changed before release`);
+          continue;
+        }
+        if (outcome.outcome === "retained-unlinked") {
+          const seriesId = snapshot.mapping?.seriesId;
+          const link = seriesId ? await state.getRecurrenceLink(snapshot.ref.profile, seriesId) : undefined;
+          if (reviewHash(current.object) !== reviewHash(operation.expectedProviders?.[outcome.entity] ?? snapshot.object)
+            || current.mapping || !link || link.taskId === snapshot.ref.id || link.owner !== "calendar"
+            || current.control?.excluded !== true
+            || reviewHash(retainedTaskControlState(current.control)) !== reviewHash({ ...retainedTaskControlState(snapshot.control), excluded:true })) throw new Error(`Retained provider item ${outcome.entity} changed before release`);
           continue;
         }
         const splitHistory=splitHistoryMasterId(snapshot);

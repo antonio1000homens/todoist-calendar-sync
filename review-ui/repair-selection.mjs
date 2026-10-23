@@ -61,7 +61,7 @@ export function editRepairSelection(previous, side, id, verified = false, search
 // Only derive recurrence requirements from the *selected*, live provider snapshot.
 // A different case's recurrence must not accidentally block the current repair.
 export function repairRecurrenceOwnerRequirement(form, details, action) {
-  if (!["link","create"].includes(action) || !form?.profile || details?.item?.profile !== form.profile
+  if (!["link","transfer","create"].includes(action) || !form?.profile || details?.item?.profile !== form.profile
     || details?.item?.id !== form.caseId) return undefined;
   const current = (side, id) => {
     if (!id) return undefined;
@@ -77,8 +77,8 @@ export function repairRecurrenceOwnerRequirement(form, details, action) {
   };
   const event = current("calendar", form.eventId);
   const task = current("todoist", form.taskId);
-  if ((action === "link" || action === "create" && !form.taskId) && event?.recurringEventId) return "calendar-occurrence";
-  if ((action === "link" || action === "create" && !form.taskId) && event?.recurrence?.length) return "calendar-series";
+  if ((action === "link" || action === "transfer" || action === "create" && !form.taskId) && event?.recurringEventId) return "calendar-occurrence";
+  if ((action === "link" || action === "transfer" || action === "create" && !form.taskId) && event?.recurrence?.length) return "calendar-series";
   if (action === "link" && task?.due?.is_recurring) return "todoist-task";
   return undefined;
 }
@@ -122,6 +122,7 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
   const hasEvent = Boolean(form.eventId && form.verifiedEventId === form.eventId);
   switch (action) {
     case "link":
+    case "transfer":
     case "verify": return hasTask && hasEvent;
     case "create": return hasTask !== hasEvent;
     case "move": return hasTask;
@@ -135,6 +136,6 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
 // Preview validation may discover a mapped item outside the original case snapshots.
 // Refresh the complete affected set rather than guessing a safe disposition.
 export function missingDispositionReference(message) {
-  const match = /^Choose Create counterpart(?: or Exclude|, Exclude, or Leave unchanged) for (home|antonio|work):(todoist|calendar):([^\s]+)$/.exec(message || '');
+  const match = /^Choose (?:Create counterpart or Exclude|Create counterpart, Exclude, or Leave unchanged|Create counterpart, Exclude, Leave unchanged, or Retain unlinked) for (home|antonio|work):(todoist|calendar):([^\s]+)$/.exec(message || '');
   return match ? `${match[1]}:${match[2]}:${match[3]}` : undefined;
 }

@@ -104,6 +104,7 @@ test("a missing Todoist or Calendar disposition triggers an affected-items refre
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for work:calendar:master_20270301"),"work:calendar:master_20270301");
   for (const ref of ["home:todoist:task-1", "work:calendar:master_20270301", "antonio:calendar:occurrence_20270301T090000Z"]) {
     assert.equal(missingDispositionReference(`Choose Create counterpart, Exclude, or Leave unchanged for ${ref}`), ref);
+    assert.equal(missingDispositionReference(`Choose Create counterpart, Exclude, Leave unchanged, or Retain unlinked for ${ref}`), ref);
   }
   assert.equal(missingDispositionReference("Mapping does not match the selected pair"),undefined);
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:calendar:"),undefined);
@@ -177,6 +178,8 @@ test("searched live recurring Calendar occurrence and master require an owner be
   const master=editRepairSelection(occurrence,"calendar","series-master",true,{id:"series-master",recurrence:["RRULE:FREQ=WEEKLY"]});
   assert.equal(repairRecurrenceOwnerRequirement(master,details,"link"),"calendar-series");
   assert.equal(repairPreviewAllowed(master,item,details,"link",undefined,""),false);
+  assert.equal(repairRecurrenceOwnerRequirement(master,details,"transfer"),"calendar-series");
+  assert.equal(repairPreviewAllowed(master,item,details,"transfer",undefined,"calendar"),true);
   const fromCalendar=editRepairSelection(master,"todoist","");
   assert.equal(repairRecurrenceOwnerRequirement(fromCalendar,details,"create"),"calendar-series");
   assert.equal(repairPreviewAllowed(fromCalendar,item,details,"create",undefined,""),false);

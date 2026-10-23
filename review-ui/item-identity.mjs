@@ -35,10 +35,12 @@ export function providerIdentity(value) {
 
 // Cancelled Calendar events and deleted Todoist tasks are still identifiable for
 // exclusion, but must never be used as sources for new counterparts.
-export function dispositionOptions(value) {
+export function dispositionOptions(value, action) {
   const identity = providerIdentity(value);
   if (!identity.identified) return [];
-  return identity.selectable ? ["create", "exclude", "unchanged"] : ["exclude", "unchanged"];
+  const ordinary = identity.selectable ? ["create", "exclude", "unchanged"] : ["exclude", "unchanged"];
+  return action === "transfer" && value?.ref?.side === "todoist" && value?.mapping?.recurrenceOwner === "calendar"
+    ? [...(identity.selectable ? ["create", "exclude"] : ["exclude"]), "retain-unlinked"] : ordinary;
 }
 
 export function scopeLabel(scope) {
@@ -52,5 +54,6 @@ export function previewEffect(snapshot, intent, plan) {
   if (disposition === "create") return { operation:"Create counterpart", result:"Link to newly created counterpart" };
   if (disposition === "exclude") return { operation:"Exclude", result:"Excluded from syncing" };
   if (disposition === "unchanged") return { operation:"Leave unchanged", result:"Retain provider object, mapping, and sync control without changes" };
+  if (disposition === "retain-unlinked") return { operation:"Retain provider item and detach its old mapping", result:"Keep this exact provider object unchanged; detach only its obsolete mapping, ownership, comments, and baseline links" };
   return { operation:"Selected repair / contextual item", result:"See planned changes below" };
 }

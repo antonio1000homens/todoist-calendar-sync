@@ -66,7 +66,7 @@ async function authenticate(event: LambdaFunctionURLEvent, requireSameOrigin: bo
 function selectedIntent(body: Record<string, unknown>, caseId: string, selectedProfile: Profile): RepairIntent {
   const allowed = ["caseId","profile","action","taskId","eventId","winner","owner","scope","leftovers","decisionAction","targetProfile"];
   if (Object.keys(body).some(key => !allowed.includes(key))) fail(400, "Unsupported repair fields");
-  if (!["link","separate","create","exclude","decision","verify","move"].includes(String(body.action))) fail(400,"Invalid repair action");
+  if (!["link","transfer","separate","create","exclude","decision","verify","move"].includes(String(body.action))) fail(400,"Invalid repair action");
   if (!["none","todoist","calendar"].includes(String(body.winner))) fail(400,"Invalid field winner");
   if (!["occurrence","series","future"].includes(String(body.scope))) fail(400,"Invalid recurrence scope");
   if (body.owner !== undefined && !["todoist","calendar"].includes(String(body.owner))) fail(400,"Invalid recurrence owner");
@@ -76,10 +76,10 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
     return value;
   };
   if (body.leftovers !== undefined && (!body.leftovers || typeof body.leftovers !== "object" || Array.isArray(body.leftovers))) fail(400, "Invalid leftover dispositions");
-  const leftovers: Record<string,"exclude"|"create"|"unchanged"> = {};
+  const leftovers: Record<string,"exclude"|"create"|"unchanged"|"retain-unlinked"> = {};
   for (const [key,value] of Object.entries((body.leftovers || {}) as Record<string,unknown>)) {
-    if (!/^(home|antonio|work):(todoist|calendar):.{1,1024}$/.test(key) || !["exclude","create","unchanged"].includes(String(value))) fail(400,"Invalid leftover disposition");
-    leftovers[key] = value as "exclude"|"create"|"unchanged";
+    if (!/^(home|antonio|work):(todoist|calendar):.{1,1024}$/.test(key) || !["exclude","create","unchanged","retain-unlinked"].includes(String(value))) fail(400,"Invalid leftover disposition");
+    leftovers[key] = value as "exclude"|"create"|"unchanged"|"retain-unlinked";
   }
   const decisionAction = typeof body.decisionAction === "string" ? body.decisionAction : undefined;
   const taskId = decisionAction?.startsWith("bind_task:") ? decisionAction.slice("bind_task:".length)
