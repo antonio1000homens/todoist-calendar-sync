@@ -83,8 +83,8 @@ function timedEvent(id, summary, hour, extra = {}) {
     status: "confirmed",
     summary,
     description: "",
-    start: { dateTime: `2026-09-18T${hh}:30:00+01:00`, timeZone: "Europe/London" },
-    end: { dateTime: `2026-09-18T${hh}:00:00Z`, timeZone: "Europe/London" },
+    start: { dateTime: `2099-09-18T${hh}:30:00+01:00`, timeZone: "Europe/London" },
+    end: { dateTime: `2099-09-18T${hh}:00:00Z`, timeZone: "Europe/London" },
     ...extra,
   };
 }
@@ -96,8 +96,8 @@ function timedTask(id, content, hour, extra = {}) {
     content,
     description: "",
     project_id: HOME,
-    due: { datetime: `2026-09-18T${hh}:30:00+01:00`, timezone: "Europe/London" },
-    updated_at: "2026-09-17T10:00:00Z",
+    due: { datetime: `2099-09-18T${hh}:30:00+01:00`, timezone: "Europe/London" },
+    updated_at: "2099-09-17T10:00:00Z",
     ...extra,
   };
 }

@@ -116,6 +116,23 @@ test("snapshot recovery imports one future unmapped Calendar event and binds it"
   assert.equal(state.mutations, 2);
 });
 
+test("snapshot recovery skips elapsed Calendar history and imports the future event", async () => {
+  const historical = {
+    id: "elapsed", status: "confirmed", summary: "Historical event", description: "",
+    start: { date: "2000-01-01" }, end: { date: "2000-01-02" },
+  };
+  const future = futureEvent("future", 10, "Current appointment");
+  const state = fakeState();
+  const clients = fakeClients([historical, future]);
+  clients.pair.calendar.getTimeZone = async () => "Europe/London";
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.imported, 1);
+  assert.deepEqual(state.mappings.map((mapping) => mapping.eventId), ["future"]);
+  assert.equal(clients.created, 1);
+});
+
 test("snapshot recovery ignores a retained completed Calendar projection", async () => {
   const event = futureEvent("calendar-completed", 10, "Completed appointment");
   const state = fakeState();

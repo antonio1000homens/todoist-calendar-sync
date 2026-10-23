@@ -295,6 +295,40 @@ function eventEnd(event: CalendarEvent): string | undefined {
   return event.end?.dateTime || event.end?.date;
 }
 
+function localDateAt(now: number, timeZone: string): string | undefined {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(now);
+    const value = (type: string) => parts.find((part) => part.type === type)?.value;
+    const year = value("year"), month = value("month"), day = value("day");
+    return year && month && day ? `${year}-${month}-${day}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Classify a Calendar event end without confusing all-day dates with UTC
+ * instants. Date-only Google ends are exclusive and must be compared with the
+ * Calendar's local date; timed ends are RFC3339 instants. Missing or
+ * unparseable timezone data fails open so an incomplete response cannot
+ * retire a live association. Callers apply their standalone/series policy.
+ */
+export function calendarEventHasElapsed(event: CalendarEvent, now = Date.now(), timeZone?: string): boolean {
+  if (event.end?.date && !event.end.dateTime) {
+    const localDate = timeZone ? localDateAt(now, timeZone) : undefined;
+    return Boolean(localDate && /^\d{4}-\d{2}-\d{2}$/.test(event.end.date) && event.end.date <= localDate);
+  }
+  const end = event.end?.dateTime;
+  if (!end || !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(end)) return false;
+  const endTime = Date.parse(end);
+  return Number.isFinite(endTime) && endTime <= now;
+}
+
 export function calendarOccurrenceHasEnded(event: CalendarEvent, now = Date.now()): boolean {
   if (event.status === "cancelled") return true;
   const end = eventEnd(event);
@@ -687,6 +721,18 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "calendar_archived_series_delta_ignored", {
         eventId: event.id, masterEventId: event.recurringEventId || event.id,
       });
+    }
+    if (!event.recurringEventId && !event.recurrence?.length && event.status !== "cancelled") {
+      const endIsAllDay = Boolean(event.end?.date && !event.end.dateTime);
+      const calendar = endIsAllDay ? (await this.clients(delivery.profile)).calendar : undefined;
+      const timeZone = calendar?.getTimeZone ? await calendar.getTimeZone() : undefined;
+      if (calendarEventHasElapsed(event, Date.now(), timeZone)) {
+        return this.state.audit(delivery.profile, "calendar_elapsed_standalone_event_ignored", {
+          eventId: event.id,
+          end: event.end?.dateTime || event.end?.date,
+          ...(timeZone ? { timeZone } : {}),
+        });
+      }
     }
     const completedProjection = await this.getCompletedProjection(delivery.profile, event.id);
     if (completedProjection) {
