@@ -10,6 +10,7 @@ import {
 import { defaultProviderClientFactory, type ProviderClientFactory, type ProviderClients } from "./mutation-budget.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { StateRepository } from "./repository.js";
+import { todoistCalendarLifecycle } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => Promise<void>;
@@ -283,11 +284,32 @@ export class OrphanRecoveringSynchronizer {
   }
 
   private async processTodoist(delivery: Delivery): Promise<void> {
-    const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-    const task = payload.event_data;
+    let payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
+    let task = payload.event_data;
     if (!task?.id) {
       await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
       return;
+    }
+
+    // Validate an otherwise-unmapped upsert against Todoist before orphan
+    // recovery or project-transition logic can write mappings/projections.
+    // Delayed webhook bodies outlive item purges, so a payload alone cannot be
+    // treated as proof that its source item still exists. Use the fresh item as
+    // the input to every later recovery/projection decision.
+    if (todoistCalendarLifecycle(payload)?.action === "upsert"
+      && !await this.state.getMappingByTaskAnyProfile(task.id)) {
+      const lookupProfile = profileForTodoistProject(task.project_id) || delivery.profile;
+      const { todoist } = await this.clientFactory(lookupProfile);
+      try {
+        const currentTask = await todoist.getTask(task.id);
+        if (currentTask.id !== task.id) throw new Error("Todoist returned a different task identity for an unmapped webhook");
+        task = currentTask;
+        payload = { ...payload, event_data: currentTask };
+        delivery = { ...delivery, body: JSON.stringify(payload) };
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 404) return;
+        throw error;
+      }
     }
 
     const directMapping = await this.state.getMappingByTaskAnyProfile(task.id);

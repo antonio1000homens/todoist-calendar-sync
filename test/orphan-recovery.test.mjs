@@ -171,7 +171,7 @@ function fixture({ events = [], tasks = [] } = {}) {
 
   const clients = async () => ({ calendar, todoist });
   const sync = new OrphanRecoveringSynchronizer(state, undefined, clients, identities);
-  return { state, identities, eventMap, taskMap, calendarUpserts, todoistUpserts, sync };
+  return { state, identities, eventMap, taskMap, calendar, todoist, calendarUpserts, todoistUpserts, sync };
 }
 
 test("canonical identity treats Calendar offset time and Todoist floating wall-clock time as the same logical start", () => {
@@ -241,6 +241,49 @@ test("Todoist edit re-links the unique Calendar event matching old_item and upda
   assert.equal(f.calendarUpserts[0].event.summary, "Dental check-up");
   assert.equal(f.eventMap.size, 1, "must update the orphan rather than create a duplicate Calendar event");
   assert.ok(f.state.audits.some((entry) => entry.action === "todoist_orphan_calendar_rebound_previous_identity"));
+});
+
+test("worker-facing unmapped Todoist upsert ignores a stale payload when the source task is gone", async () => {
+  const stalePayload = {
+    event_name: "item:added",
+    event_data: timedTask("purged-task", "Purged task from delayed webhook", 9),
+  };
+  const f = fixture();
+
+  await f.sync.process(delivery("todoist", JSON.stringify(stalePayload)));
+
+  assert.equal(f.calendarUpserts.length, 0, "configured-project create path must not create a Calendar projection from a stale payload");
+  assert.equal(f.state.mappings.length, 0);
+  assert.equal(f.state.audits.length, 0, "a deleted source should not leave new item-specific state");
+});
+
+test("worker-facing unmapped Todoist upsert uses the live task snapshot instead of stale webhook fields", async () => {
+  const liveTask = timedTask("live-task", "Current Todoist title", 11, { updated_at: "2026-09-17T10:05:00Z" });
+  const stalePayload = {
+    event_name: "item:updated",
+    event_data: timedTask("live-task", "Stale webhook title", 9, { updated_at: "2026-09-17T10:01:00Z" }),
+  };
+  const f = fixture({ tasks: [liveTask] });
+
+  await f.sync.process(delivery("todoist", JSON.stringify(stalePayload)));
+
+  assert.equal(f.calendarUpserts.length, 1);
+  assert.equal(f.calendarUpserts[0].event.summary, "Current Todoist title");
+  assert.equal(f.state.mappings[0]?.taskId, "live-task");
+});
+
+test("worker-facing unmapped Todoist upsert propagates non-404 provider lookup failures without writes", async () => {
+  const task = timedTask("lookup-failure-task", "Delayed task", 9);
+  const f = fixture();
+  f.todoist.getTask = async () => { const error = new Error("temporarily unavailable"); error.status = 503; throw error; };
+
+  await assert.rejects(
+    f.sync.process(delivery("todoist", JSON.stringify({ event_name: "item:added", event_data: task }))),
+    /temporarily unavailable/,
+  );
+  assert.equal(f.calendarUpserts.length, 0);
+  assert.equal(f.state.mappings.length, 0);
+  assert.equal(f.state.audits.length, 0);
 });
 
 test("Todoist previous-identity ambiguity performs no Calendar mutation", async () => {
