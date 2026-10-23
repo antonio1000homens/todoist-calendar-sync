@@ -31,11 +31,11 @@ export function reconcileRepairSelection(item, snapshots, previous) {
     return { id, verified: id };
   };
   const task = resolve("todoist", current.taskId, current.manualTask,
-    [item.taskId, item.decision?.taskId, context.providerTaskId, mapping?.taskId]);
+    [mapping?.taskId, item.decision?.taskId, context.providerTaskId, item.taskId]);
   const event = resolve("calendar", current.eventId, current.manualEvent,
-    [item.eventId, item.decision?.eventId, context.providerEventId,
-      item.decision?.activeInstanceId, mapping?.activeInstanceId,
-      mapping?.eventId, item.decision?.masterEventId, mapping?.masterEventId]);
+    [mapping?.activeInstanceId, mapping?.eventId, mapping?.masterEventId,
+      item.decision?.activeInstanceId, item.decision?.eventId, context.providerEventId,
+      item.decision?.masterEventId, item.eventId]);
   return { ...current, taskId:task.id, verifiedTaskId:task.verified,
     eventId:event.id, verifiedEventId:event.verified,
     // A provider refresh takes precedence over earlier search evidence. Never
@@ -92,6 +92,23 @@ export function repairValidationField(message) {
   if (/^Verification requires live Calendar|^Selected pair does not match/.test(message || "")) return "eventId";
   if (/^Calendar series has no active occurrence|^Choose the active Calendar occurrence|^Calendar repair sources must be confirmed/.test(message || "")) return "eventId";
   return undefined;
+}
+
+// Failed operation status alone does not prove that resuming can do useful work.
+// A validated checkpoint is read-only; any other started checkpoint may have
+// crossed a side-effect boundary and must retain its existing recovery path.
+export function operationResumeEligibility(operation) {
+  if (!operation || !["failed", "needs_review", "queued"].includes(operation.status)) return "none";
+  const steps = operation.steps || {};
+  const hasWriteEvidence = Object.keys(steps).some(name => name !== "validated")
+    || Object.values(operation.creations || {}).length > 0
+    || operation.outcomes !== undefined || operation.verified !== undefined
+    || operation.recurrenceBindings !== undefined;
+  if (operation.abandoned) return hasWriteEvidence ? "none" : "fresh-preview";
+  if (operation.status === "queued") return "resume";
+  if (operation.status === "needs_review" && !hasWriteEvidence) return "fresh-preview";
+  if (operation.status === "needs_review") return "resume";
+  return hasWriteEvidence ? "resume" : "fresh-preview";
 }
 
 export function repairPreviewAllowed(form, selected, details, action, decisionAction, owner = "") {

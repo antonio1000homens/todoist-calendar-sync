@@ -51,6 +51,12 @@ export interface RepairOperation {
   recurrenceBindings?: Mapping[];
   creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;
 }
+export function operationHasWriteEvidence(operation: RepairOperation): boolean {
+  return Object.keys(operation.steps || {}).some(name => name !== "validated")
+    || Object.keys(operation.creations || {}).length > 0
+    || operation.outcomes !== undefined || operation.verified !== undefined
+    || operation.recurrenceBindings !== undefined;
+}
 export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }
 export const REVIEW_PROFILES: Profile[] = ["home", "antonio", "work"];
