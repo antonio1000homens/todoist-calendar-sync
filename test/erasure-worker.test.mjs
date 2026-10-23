@@ -62,11 +62,26 @@ test("preview-only operations cannot enter the queue or install a fence", async 
   }
 });
 
+test("revoked readiness freezes an active lifecycle before any provider or queue work",async t=>{
+  const operation={operationId:"active-disabled",status:"deleting",providerDeletionReady:false,
+    lifecycle:{phase:"delete"}};
+  let reviewed=0,advanced=0;
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>operation);
+  t.mock.method(ErasureOperationStore.prototype,"markExecutionDisabledReviewRequired",async()=>{
+    reviewed++;operation.status="review_required";
+  });
+  t.mock.method(ErasureOperationStore.prototype,"advanceFencedLifecycle",async()=>{advanced++;});
+  const queued=[];t.mock.method(SQSClient.prototype,"send",async command=>{queued.push(command.input);return {};});
+  const result=await handler({Records:[record('{"version":1,"operationId":"active-disabled"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[]});
+  assert.equal(reviewed,1);assert.equal(advanced,0);assert.equal(queued.length,0);
+});
+
 test("worker respects durable next-run time and stops before provider deletion", async t => {
   const oldQueue = process.env.ERASURE_OPERATION_QUEUE_URL;
   process.env.ERASURE_OPERATION_QUEUE_URL = "https://sqs.example/erasure";
   const sent = [], advances = [];
-  let operation = { operationId: "op_2", status: "fencing", lifecycle: { phase: "drain_before_fence", nextRunAt: 1 } };
+  let operation = { operationId: "op_2", status: "fencing", providerDeletionReady:true, lifecycle: { phase: "drain_before_fence", nextRunAt: 1 } };
   t.mock.method(ErasureOperationStore.prototype, "get", async () => operation);
   t.mock.method(ErasureOperationStore.prototype, "advanceFencedLifecycle", async id => {
     advances.push(id);
@@ -83,7 +98,7 @@ test("worker respects durable next-run time and stops before provider deletion",
     assert.deepEqual(advances, ["op_2"]);
     assert.ok(sent[0].DelaySeconds >= 74 && sent[0].DelaySeconds <= 75);
 
-    operation = { operationId: "op_2", status: "deleting", lifecycle: { phase: "ready_for_delete", nextRunAt: Date.now() } };
+    operation = { operationId: "op_2", status: "deleting", providerDeletionReady:true, lifecycle: { phase: "ready_for_delete", nextRunAt: Date.now() } };
     sent.length = 0;
     result = await handler({ Records: [record('{"version":1,"operationId":"op_2"}')], awsRequestId: "req" });
     assert.deepEqual(result, { batchItemFailures: [] });
@@ -96,7 +111,7 @@ test("worker respects durable next-run time and stops before provider deletion",
 });
 
 test("failed action-time gate becomes durable review-required state and cannot be resumed", async t => {
-  let operation = { operationId:"op_drift",status:"deleting",lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()} };
+  let operation = { operationId:"op_drift",status:"deleting",providerDeletionReady:true,lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()} };
   let gateReads=0,reviewMarks=0;
   t.mock.method(ErasureOperationStore.prototype,"get",async()=>operation);
   t.mock.method(ErasureOperationStore.prototype,"assertReadyForDelete",async()=>{
@@ -121,7 +136,7 @@ test("failed action-time gate becomes durable review-required state and cannot b
 
 test("transient action-time gate read failures are retried instead of marked review-required", async t => {
   t.mock.method(ErasureOperationStore.prototype,"get",async()=>({operationId:"op_read",status:"deleting",
-    lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()}}));
+    providerDeletionReady:true,lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()}}));
   let reviewMarks=0;
   t.mock.method(ErasureOperationStore.prototype,"assertReadyForDelete",async()=>{throw new Error("DynamoDB throttled");});
   t.mock.method(ErasureOperationStore.prototype,"markReviewRequired",async()=>{reviewMarks++;});

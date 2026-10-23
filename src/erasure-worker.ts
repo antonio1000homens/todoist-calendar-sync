@@ -103,10 +103,15 @@ export async function processErasureOperation(operationId: string): Promise<{
   // A successful operation erases its operation/confirmation records. Retried
   // queue deliveries after that atomic cleanup are identity-free no-ops.
   if(!operation) return {status:"succeeded",scheduled:false};
-  if(operation.status==="previewed" && operation.providerDeletionReady!==true)
-    throw new Error("Provider deletion workflow is not enabled for this preview; no worker or fence action was started");
   if(operation.status==="succeeded"||operation.status==="review_required")
     return {status:operation.status,phase:operation.lifecycle?.phase,scheduled:false};
+  if(operation.providerDeletionReady!==true) {
+    if(operation.lifecycle&&["fencing","deleting","verifying"].includes(operation.status)) {
+      await store.markExecutionDisabledReviewRequired(operationId);
+      return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
+    }
+    throw new Error("Provider deletion workflow is not enabled for this preview; no worker or fence action was started");
+  }
   if(operation.status==="previewed") {
     await store.transition(operationId,"previewed","queued");
     operation=await store.get(operationId);

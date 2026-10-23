@@ -52,7 +52,7 @@ export interface ErasureOperation {
 }
 export interface ErasureActionPlan {
   todoistTask?: { id: string; digest: string };
-  calendarEvent?: { id: string; digest: string };
+  calendarEvent?: { id: string; digest: string; etag: string };
   comments: Array<{ id: string; kind: "project" | "task"; digest: string }>;
 }
 export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
@@ -108,7 +108,7 @@ function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,
   if(!plan||!Array.isArray(plan.comments)) return false;
   if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
   if(plan.calendarEvent&&(!operation.selectedActions.deleteCalendar||plan.calendarEvent.id!==operation.target.eventId
-    ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.digest))) return false;
+    ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.digest)||typeof plan.calendarEvent.etag!=="string"||!plan.calendarEvent.etag)) return false;
   const ids=new Set<string>();
   return plan.comments.every(item=>typeof item.id==="string"&&item.id.length>0&&!ids.has(item.id)
     &&(ids.add(item.id),true)&&(item.kind==="project"||item.kind==="task")&&/^[a-f0-9]{64}$/.test(item.digest));
@@ -276,9 +276,9 @@ export class ErasureOperationStore {
       timeoutSeconds,pollMs:defaultFencePollMs,nextRunAt:Date.now(),evidence:{}};
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:fencing, lifecycle=:lifecycle, updatedAt=:updatedAt",
-      ConditionExpression:"#status=:queued AND attribute_not_exists(lifecycle) AND previewFingerprint=:fingerprint",
+      ConditionExpression:"#status=:queued AND attribute_not_exists(lifecycle) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
       ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":queued":"queued",":fencing":"fencing",
-        ":lifecycle":lifecycle,":updatedAt":new Date(Date.now()).toISOString(),":fingerprint":current.previewFingerprint}}));
+        ":ready":true,":lifecycle":lifecycle,":updatedAt":new Date(Date.now()).toISOString(),":fingerprint":current.previewFingerprint}}));
   }
 
   /** Execute one trusted adapter action/readback and persist its opaque receipt with a CAS. */
@@ -289,6 +289,7 @@ export class ErasureOperationStore {
     const current=operation?.lifecycle;
     if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
+    if(operation.providerDeletionReady!==true) throw new Error("Erasure executor is disabled; the active fence must remain for break-glass review");
     const adapters=this.#worker();
     const now=Date.now();
     if(current.nextRunAt>now) return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:true};
@@ -395,7 +396,7 @@ export class ErasureOperationStore {
   async beginDeletion(id:string):Promise<void> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
-    if(!operation||operation.status!=="deleting"||current?.phase!=="ready_for_delete")
+    if(!operation||operation.providerDeletionReady!==true||operation.status!=="deleting"||current?.phase!=="ready_for_delete")
       throw new Error("Erasure operation is no longer at the deletion gate");
     await this.assertReadyForDelete(id);
     const now=Date.now();
@@ -422,7 +423,7 @@ export class ErasureOperationStore {
     const validReceipts=receipts.every((receipt,index)=>receipt?.operationId===operation.operationId
       && receipt.phase===required[index] && /^[0-9a-f-]{36}$/i.test(receipt.receiptId));
     const times=receipts.map(receipt=>receipt?.completedAt);
-    if(operation.status!=="deleting" || lifecycle?.phase!=="ready_for_delete"
+    if(operation.providerDeletionReady!==true || operation.status!=="deleting" || lifecycle?.phase!=="ready_for_delete"
       || !operation.confirmationId || operation.confirmationFingerprint!==operation.previewFingerprint
       || operation.previewFingerprint!==erasurePreviewFingerprint(operation)
       || operation.previewFingerprint!==erasurePreviewFingerprint(freshSnapshot)
@@ -447,6 +448,23 @@ export class ErasureOperationStore {
       ExpressionAttributeNames:{"#status":"status","#phase":"phase","#lastError":"lastError","#error":"error"},
       ExpressionAttributeValues:{":deleting":"deleting",":reviewRequired":"review_required",":ready":"ready_for_delete",
         ":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
+  }
+
+  /** Freeze a previously enabled execution if its durable readiness bit is revoked mid-flight. */
+  async markExecutionDisabledReviewRequired(id:string):Promise<void> {
+    const operation=await this.get(id);
+    const lifecycle=operation?.lifecycle;
+    if(!operation||!lifecycle||operation.providerDeletionReady===true
+      ||!["fencing","deleting","verifying"].includes(operation.status))
+      throw new Error("Operation is not an active execution with a revoked readiness gate");
+    const message=ERASURE_REVIEW_REQUIRED_MESSAGE;
+    const now=new Date().toISOString();
+    await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
+      UpdateExpression:"SET #status=:reviewRequired, #error=:error, updatedAt=:updatedAt, lifecycle.#lastError=:error",
+      ConditionExpression:"#status=:status AND lifecycle.#phase=:phase AND (providerDeletionReady=:disabled OR attribute_not_exists(providerDeletionReady)) AND previewFingerprint=:fingerprint",
+      ExpressionAttributeNames:{"#status":"status","#phase":"phase","#lastError":"lastError","#error":"error"},
+      ExpressionAttributeValues:{":status":operation.status,":phase":lifecycle.phase,":disabled":false,
+        ":reviewRequired":"review_required",":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
   }
 
   #advance(operationId:string,current: FencedLifecycle, phase: FencedLifecyclePhase, now: number,
@@ -514,9 +532,9 @@ export class ErasureOperationStore {
       throw new Error("Worker timeout must start at persisted fence installation time");
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
       UpdateExpression:"SET #status=:next, lifecycle=:lifecycle, updatedAt=:updatedAt",
-      ConditionExpression:"#status=:expected AND lifecycle.#phase=:phase AND previewFingerprint=:fingerprint",
+      ConditionExpression:"#status=:expected AND lifecycle.#phase=:phase AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
       ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":expected":operation.status,
-        ":next":nextStatus,":phase":current.phase,":lifecycle":candidate,":updatedAt":new Date(now).toISOString(),
+        ":next":nextStatus,":phase":current.phase,":ready":true,":lifecycle":candidate,":updatedAt":new Date(now).toISOString(),
         ":fingerprint":operation.previewFingerprint}}));
   }
 
@@ -526,8 +544,8 @@ export class ErasureOperationStore {
       throw new ErasureGateDriftError();
     await this.db.send(new TransactWriteCommand({TransactItems:[
       {Delete:{TableName:stateTable(),Key:operationKey(operation.operationId),
-        ConditionExpression:"#status=:verifying AND lifecycle.#phase=:release AND previewFingerprint=:fingerprint",
-        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":verifying":"verifying",":release":"release_fence",":fingerprint":operation.previewFingerprint}}},
+        ConditionExpression:"#status=:verifying AND lifecycle.#phase=:release AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
+        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":verifying":"verifying",":release":"release_fence",":ready":true,":fingerprint":operation.previewFingerprint}}},
       {Delete:{TableName:stateTable(),Key:confirmationKey(operation.operationId),
         ConditionExpression:"#status=:consumed AND operationId=:operationId",
         ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":consumed":"consumed",":operationId":operation.operationId}}},

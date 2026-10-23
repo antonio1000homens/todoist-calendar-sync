@@ -111,8 +111,9 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
       try { event=await clients.calendar.getEvent(operation.target.eventId!); }
       catch(error) { if(!calendarEventGoneOnDirectRead(error)) throw error; }
       if(event && event.status!=="cancelled") {
-        if(event.id!==operation.target.eventId || fingerprint(event)!==plan.calendarEvent.digest) throw new ErasureGateDriftError();
-        await clients.calendar.deleteEvent(operation.target.eventId!);
+        if(!plan.calendarEvent || event.id!==operation.target.eventId || event.etag!==plan.calendarEvent.etag
+          || fingerprint(event)!==plan.calendarEvent.digest) throw new ErasureGateDriftError();
+        await clients.calendar.deleteEvent(operation.target.eventId!,plan.calendarEvent.etag);
       } else if(event && event.id!==operation.target.eventId) throw new ErasureGateDriftError();
       try {
         const remaining=await clients.calendar.getEvent(operation.target.eventId!);

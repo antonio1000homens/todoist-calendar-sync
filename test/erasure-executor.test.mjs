@@ -73,6 +73,29 @@ test("deletion gate drift is persisted as review-required with a CAS and cannot 
   }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
 });
 
+test("revoked readiness stops active lifecycle work and retains its fence for break-glass review",async()=>{
+  const item={...storedQueuedOperation(),providerDeletionReady:false,status:"deleting",
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{fenceInstalled:{operationId:"op",phase:"fenceInstalled",receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:1}}}};
+  const db={async send(command){
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      assert.equal(values[":disabled"],false);
+      assert.match(command.input.ConditionExpression,/providerDeletionReady=:disabled/);
+      item.status=values[":reviewRequired"];item.lifecycle.lastError=values[":error"];
+      return {};
+    }
+    throw new Error("Unexpected database command");
+  }};
+  const store=new ErasureOperationStore(db);
+  await assert.rejects(store.advanceFencedLifecycle("op"),/executor is disabled/);
+  await store.markExecutionDisabledReviewRequired("op");
+  assert.equal(item.status,"review_required");
+  assert.equal(item.lifecycle.phase,"delete");
+  assert.match(item.lifecycle.lastError,/break-glass recovery is required/);
+});
+
 test("fenced executor disables admission, drains, fences, waits out old workers, then drains again",async()=>{
   const events=[];
   await enterFencedErasure({profile:"home",operationId:"op",mappings:["uuid"],timeoutSeconds:30,

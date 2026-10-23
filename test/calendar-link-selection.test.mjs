@@ -45,3 +45,18 @@ test("Google task-ID lookup paginates and fails closed instead of taking first r
     globalThis.fetch = original;
   }
 });
+
+test("Calendar delete sends If-Match for a confirmed ETag",async()=>{
+  const original=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init)=>{
+    calls.push({url:String(url),method:init?.method,headers:new Headers(init?.headers)});
+    if(String(url).includes("oauth2.googleapis.com"))return new Response(JSON.stringify({access_token:"token"}),{status:200});
+    return new Response(null,{status:204});
+  };
+  try{
+    const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"test@example.invalid");
+    await calendar.deleteEvent("event-1","etag-approved");
+    const deletion=calls.find(call=>call.method==="DELETE");
+    assert.equal(deletion.headers.get("if-match"),"etag-approved");
+  }finally{globalThis.fetch=original;}
+});

@@ -42,3 +42,29 @@ test("state deletion uses an exact conditional match for every inventoried attri
   assert.ok(Object.values(deleteInput.ExpressionAttributeNames).includes("revision"));
   assert.ok(Object.values(deleteInput.ExpressionAttributeValues).includes(7));
 });
+
+test("Calendar deletion is bound to the approved event ETag",async()=>{
+  const event={id:"event-1",etag:"etag-approved",status:"confirmed",summary:"Exact event"};
+  const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
+    selectedActions:{...baseOperation.selectedActions,deleteCalendar:true},
+    actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:event.id,etag:event.etag,digest:fingerprint(event)}}};
+  let deletes=[];
+  const calendar={getEvent:async()=>deletes.length?{id:event.id,status:"cancelled"}:event,
+    deleteEvent:async(id,etag)=>deletes.push({id,etag})};
+  const result=await executeErasureDeletionStep(operation,{stage:"calendar",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:{send:async()=>({})},clients:{todoist:{},calendar},inspectFence:async()=>({leases:[]})});
+  assert.deepEqual(deletes,[{id:"event-1",etag:"etag-approved"}]);
+  assert.equal(result.progress.stage,"state");
+});
+
+test("Calendar changes after approval block deletion",async()=>{
+  const event={id:"event-1",etag:"etag-current",status:"confirmed",summary:"Changed event"};
+  const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
+    selectedActions:{...baseOperation.selectedActions,deleteCalendar:true},
+    actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:event.id,etag:"etag-approved",digest:fingerprint({id:event.id,etag:"etag-approved",status:"confirmed",summary:"Old event"})}}};
+  let deletes=0;
+  await assert.rejects(executeErasureDeletionStep(operation,{stage:"calendar",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:{send:async()=>({})},clients:{todoist:{},calendar:{getEvent:async()=>event,deleteEvent:async()=>{deletes++;}}},inspectFence:async()=>({leases:[]})}),
+    ErasureGateDriftError);
+  assert.equal(deletes,0);
+});

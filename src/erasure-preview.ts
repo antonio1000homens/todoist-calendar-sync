@@ -176,6 +176,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   if (!task && !taskMissing) blockers.push("Todoist returned no task without an explicit not-found response");
   if (target.eventId && !event && !eventMissing)
     blockers.push("Calendar returned no event without an explicit not-found response");
+  if (input.deleteCalendar && event && (typeof event.etag!=="string"||!event.etag))
+    blockers.push("Calendar event has no ETag for conditional deletion; refresh or use manual review");
   const protocol = await (dependencies.inspectFence || inspectErasureFence)(target.profile);
   const journal = await db.send(new GetCommand({ TableName: tableName(), Key: { pk: `ERASURE#${target.profile}`, sk: "JOURNAL" }, ConsistentRead: true }));
   if (journal.Item && journal.Item.operationId !== dependencies.allowJournalOperationId)
@@ -189,7 +191,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     digest: record.digest, classification: record.classification }));
   const providerSnapshotFingerprint = fingerprint(providerData);
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
-    calendarEvent: event ? { id: target.eventId!, digest: fingerprint(event) } : undefined,
+    calendarEvent: event ? { id: target.eventId!, digest: fingerprint(event), etag:event.etag as string } : undefined,
     comments: [
       ...relevant.map(item => ({ id: item.comment.id, kind: "project" as const, digest: fingerprint(item.comment.content) })),
       ...legacy.map(item => ({ id: item.id, kind: "task" as const, digest: item.digest })),
