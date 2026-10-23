@@ -1135,7 +1135,10 @@ export class ManualInterventionService {
     if (mode === "prompt" && contextEnricher) {
       // Avoid provider reads for disabled/observe/auto policies and repeated deterministic decisions.
       const existing = await this.store.get(key.decisionId);
-      if (existing) return { decision: existing, mode };
+      if (existing) {
+        if (typeof existing.context?.conflictKey === "string") await new ReviewStore().observeDecision(existing);
+        return { decision: existing, mode };
+      }
       try {
         decisionContext = { ...context, ...await contextEnricher() };
       } catch (error) {
@@ -1416,14 +1419,13 @@ export class ManualInterventionService {
       {
         sourceDeliveryId: delivery.id,
         sourceAuditAction: action,
-        ...(conflictKey ? { conflictKey } : {}),
         eventId,
         taskId,
         seriesId,
         masterEventId: typeof detail.masterEventId === "string" ? detail.masterEventId : undefined,
         activeInstanceId: typeof detail.activeInstanceId === "string" ? detail.activeInstanceId : undefined,
       },
-      context,
+      { ...context, ...(conflictKey ? { conflictKey } : {}) },
       canEnrichConflict
         ? async () => {
             const pair = await this.providerClients(profile);
