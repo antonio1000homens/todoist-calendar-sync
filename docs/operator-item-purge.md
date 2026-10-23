@@ -8,6 +8,43 @@ unless the operator repeats the exact identifiers and a fresh inventory token.
 
 ## Safety boundaries
 
+### Occurrence-aware read-only inventory
+
+For a recurring series, a retained active/completed task, or a cancelled
+occurrence beside a live sibling, use the **read-only** inventory mode. It
+does not offer or perform apply. Supply the task as the protected anchor and
+list exact retained Calendar master/sibling IDs when they are known:
+
+```bash
+node scripts/purge-item.mjs --inventory-only --profile=work \
+  --task-id=EXACT_RETAINED_TASK_ID --event-id=EXACT_SELECTED_EVENT_ID \
+  --preserve-task --protect-event-ids=EXACT_MASTER_ID,EXACT_ACTIVE_SIBLING_ID
+```
+
+Every matching or transitively linked state row is classified as
+`selected-only`, `shared with protected state`, `ambiguous`, or
+`unattributable`. The output includes counts, exact keys, attribution reasons,
+and blockers. Exact retained IDs prevent task-level baselines/canonical rows,
+active or completed mappings, recurrence ownership, and sibling occurrences
+from being treated as selected-only history. Transitive review and manual
+decision records are followed through their explicit record links. Unknown
+identity fields and malformed/unknown state families fail closed.
+
+All `DELIVERY` receipt rows are included in inventory. A receipt with no exact
+selected identity is `unattributable`; one that does carry an exact identity
+is still `ambiguous`, because identity alone does not establish that a
+delivery is completed, drained, or impossible to replay. Either classification
+blocks destructive apply. This preview cannot establish replay quiescence; an
+operator checkbox cannot prove that an external delayed webhook or retry will
+not recreate erased state. A later executor needs a verifiable replay barrier.
+Table-wide PITR backups may also retain deleted data during their recovery
+window.
+
+`--inventory-only` is deliberately preview-only. `--preserve-task` and
+`--protect-event-ids` cannot be combined with `--apply`; the existing pair
+purge executor still only supports deleting its exact selected task and
+optional event after all of its own safety gates pass.
+
 1. Arrange a maintenance window and **pause the sync ingress, all worker
    consumers, reconciler and any producers of old webhook/delta deliveries**.
    Inspect/drain the affected profile's FIFO queue and dead-letter queue, plus
