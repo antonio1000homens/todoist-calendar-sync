@@ -431,6 +431,18 @@ test("rebinding a Calendar master clears rejection of the persisted task/instanc
   assert.deepEqual(result.verified, [{ profile: "home", taskId: "task", eventId: "active" }]);
 });
 
+test("preview blocks linking a yearly Todoist task to a Calendar-owned yearly occurrence", async (t) => {
+  const fixture = seriesFixture();
+  fixture.events[0] = { ...fixture.events[0], recurrence: ["RRULE:FREQ=YEARLY"], start: { date: "2027-05-02" } };
+  fixture.events[1] = { ...fixture.events[1], start: { date: "2027-05-02" },
+    originalStartTime: { date: "2027-05-02" } };
+  const yearlyTask = task("task", { due: { date: "2027-05-02", string: "every year", is_recurring: true } });
+  const h = harness(t, { events: fixture.events, tasks: [yearlyTask] });
+  const input = intent({ eventId: "active", owner: "calendar", winner: "todoist", scope: "occurrence" });
+  await assert.rejects(h.engine.preview(actor, input), /replace its recurrence with a one-off due date/);
+  assert.deepEqual(h.writes, []);
+});
+
 test("counterpart creation from the active occurrence preserves Calendar ownership and its master", async (t) => {
   const fixture = seriesFixture();
   const h = harness(t, { events: fixture.events, tasks: [] });
