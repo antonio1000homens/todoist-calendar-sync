@@ -12,7 +12,7 @@ const releases = () => [
 
 test("successful repair result, case resolution, and every barrier release share one transaction", async t => {
   const store = new ReviewStore(), commands=[];
-  store.getCase = async () => ({id:"case",createdAt:"2026-10-21T12:00:00Z"});
+  store.getCase = async () => ({id:"case",createdAt:"2026-10-21T12:00:00Z",decision:{decisionId:"decision",status:"pending",resolution:undefined}});
   t.mock.method(documentClient,"send",async command => { commands.push(command); return {}; });
   const result = await store.finalizeOperation(operation(),releases());
   assert.equal(result.status,"succeeded"); assert.equal(result.notificationPending,true);
@@ -28,6 +28,22 @@ test("successful repair result, case resolution, and every barrier release share
   assert.equal(items[3].Update.ExpressionAttributeValues[":status"],"resolved");
   assert.equal(items[3].Update.ConditionExpression,"#status = :repairing AND operationId = :id");
   assert.equal(items[3].Update.ExpressionAttributeValues[":repairing"],"repairing");
+  assert.equal(items[3].Update.ExpressionAttributeValues[":decision"].status,"resolved");
+  assert.equal(items[3].Update.ExpressionAttributeValues[":decision"].decisionId,"decision");
+  assert.equal(items[3].Update.ExpressionAttributeValues[":decision"].resolution,"Resolved and verified in the review page");
+  assert.equal(items[3].Update.ExpressionAttributeValues[":decision"].resolvedAt,items[3].Update.ExpressionAttributeValues[":now"]);
+});
+
+test("excluded repair finalization also closes the embedded pending decision snapshot", async t => {
+  const commands=[];
+  const store=new ReviewStore();
+  store.getCase=async()=>({id:"case",profile:"home",status:"repairing",createdAt:"2026-10-21T12:00:00Z",
+    decision:{decisionId:"decision",status:"pending",createdAt:"2026-10-20T12:00:00Z"}});
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await store.finalizeOperation({...operation(),preview:{...operation().preview,intent:{caseId:"case",profile:"home",action:"exclude"}}},[]);
+  const caseUpdate=commands[0].input.TransactItems.at(-1).Update;
+  assert.equal(caseUpdate.ExpressionAttributeValues[":status"],"excluded");
+  assert.equal(caseUpdate.ExpressionAttributeValues[":decision"].status,"resolved");
 });
 
 test("unchanged entity finalization releases its barrier without rewriting control state", async t => {
