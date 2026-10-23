@@ -50,6 +50,17 @@ test("backfill cannot resurrect deleted rows and publishes readiness only after 
   assert.match(backfillSource, /missing\.length === 0 && unexpected\.length === 0/);
   assert.match(backfillSource, /missing=\$\{missing\.length\}, unexpected=\$\{unexpected\.length\}/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
+  assert.match(backfillSource, /item\.status === "pending"/);
+  assert.match(backfillSource, /MANUAL_PENDING_LOOKUP_PREFIX/);
+});
+
+test("pending decisions use the existing profile GSI and require the expanded migration parity", async () => {
+  const { PROFILE_LOOKUP_MIGRATION_VERSION, manualPendingLookupAttributes } = await import("../dist/profile-lookup.js");
+  assert.equal(PROFILE_LOOKUP_MIGRATION_VERSION, 2);
+  assert.deepEqual(manualPendingLookupAttributes({ profile: "home", decisionId: "home-review-1", createdAt: "2026-10-23T10:00:00.000Z" }), {
+    lookupPk: "PROFILE#home",
+    lookupSk: "MANUAL#PENDING#2026-10-23T10:00:00.000Z#home-review-1",
+  });
 });
 
 test("administrative migration paths retry throttling and document their full-table cost", () => {

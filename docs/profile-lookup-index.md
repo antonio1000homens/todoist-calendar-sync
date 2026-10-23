@@ -6,6 +6,7 @@ The worker must not scan the state table to list profile mappings or recurrence 
 lookupPk = PROFILE#<profile>
 lookupSk = MAPPING#TASK#<taskId>       # reconciliation mappings
 lookupSk = RECURRENCE#<seriesId>       # recurrence links
+lookupSk = MANUAL#PENDING#<createdAt>#<decisionId> # pending manual decisions
 ```
 
 Mapping and recurrence writes populate these attributes in the same transaction/write as the canonical item. The production table keeps its existing primary key, `DeletionPolicy: Retain`, and `UpdateReplacePolicy: Retain`; the GSI is additive and does not replace the table.
@@ -18,7 +19,7 @@ The guarded rollout used this sequence:
 2. Wait at least five minutes so invocations running the pre-index-attribute write path have drained.
 3. Run `npm run build` followed by `AWS_PROFILE=default AWS_REGION=eu-west-2 STATE_TABLE_NAME=<table> node scripts/backfill-profile-lookup-index.mjs --confirm-writers-drained`.
 4. The migration requires an explicit `STATE_TABLE_NAME`; it never defaults to production. It uses 25-item scan/query pages, paces scan pages, retries throttling with bounded exponential backoff, refuses to overwrite partial/conflicting lookup attributes, and requires the source item to still exist before adding index fields.
-5. The migration performs catch-up passes until a stable pass makes no updates and has no conditional races. It then verifies the exact set of expected lookup identities against the GSI before writing `SYSTEM#PROFILE_LOOKUP_INDEX / READY`.
+5. The migration performs catch-up passes until a stable pass makes no updates and has no conditional races. It then verifies the exact set of expected lookup identities against the GSI before writing `SYSTEM#PROFILE_LOOKUP_INDEX / READY`. Version 2 also backfills pending manual decisions; the health check fails closed with an incomplete diagnostic until version 2 is ready.
 6. During the guarded rollout, the readiness marker selected between the temporary labelled `scan_fallback` path and the indexed query path.
 7. Production validation compared query results, lookup pages/duration, worker duration, queue age, Lambda throttles and DynamoDB/GSI throttle metrics over equivalent cycles.
 
@@ -28,7 +29,7 @@ The backfill remains as idempotent migration/recovery tooling. Its conditional u
 
 Production parity has been validated and the temporary readiness/fallback branch has been retired. Normal reconciliation mapping and recurrence-list reads are therefore query-only and do not consult the readiness marker on each call. Tests explicitly prevent these hot paths from regressing to `pacedScan()`.
 
-The readiness marker and migration constants remain only for the retained backfill/migration history; they are not runtime feature flags.
+The readiness marker remains outside reconciliation mapping/recurrence runtime feature flags. Pending-decision reads require migration version 2 because their indexed query must not mistake legacy unindexed decisions for an empty inbox. The query is profile/status partitioned and has a page/deadline budget; incomplete results are surfaced rather than treated as empty.
 
 ## GSI capacity and alarms
 

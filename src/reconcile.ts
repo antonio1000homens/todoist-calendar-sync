@@ -17,8 +17,9 @@ function log(event: string, detail: Record<string, unknown> = {}): void {
 /** Read-only provider health watchdog. It never enqueues reconciliation work. */
 export async function checkReconciliationHealth(
   state: StateRepository, manual: ManualInterventionService, profiles: Profile[] = profileList,
+  lookupBudget: { deadlineAtMs?: number; requestId?: string } = {},
 ): Promise<void> {
-  for (const profile of profileList) {
+  for (const profile of profiles) {
     try {
       const current = await state.getReconciliationState(profile);
       // Notifications belong to generations, so a new run cannot hide an
@@ -56,7 +57,7 @@ export async function checkReconciliationHealth(
       // A stuck alert describes one run. Once a later generation replaces it,
       // or the alerted run reaches a terminal state, it is stale; it must not
       // remain actionable alongside the current run.
-      await manual.retireStaleReconciliationIncidents(profile,current.generation,current.pending);
+      await manual.retireStaleReconciliationIncidents(profile,current.generation,current.pending,lookupBudget);
       const runStatus = reconciliationRunStatus(current);
 
       if (!current.pending || !["queued", "running", "failed"].includes(runStatus)) continue;
@@ -124,5 +125,10 @@ export async function checkReconciliationHealth(
 
 export const handler: Handler = async (_event, context) => {
   log("reconciliation_health_check", { awsRequestId: context.awsRequestId, profiles: profileList });
-  await checkReconciliationHealth(new StateRepository(), new ManualInterventionService());
+  const remainingMs = typeof context.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : 25_000;
+  const deadlineAtMs = Date.now() + Math.max(0, remainingMs - 4_000);
+  await checkReconciliationHealth(new StateRepository(), new ManualInterventionService(), profileList, {
+    deadlineAtMs,
+    requestId: context.awsRequestId,
+  });
 };

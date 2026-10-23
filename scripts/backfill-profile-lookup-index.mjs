@@ -4,6 +4,8 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, QueryCommand, ScanCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import {
   mappingLookupSk,
+  manualPendingLookupAttributes,
+  MANUAL_PENDING_LOOKUP_PREFIX,
   profileLookupPk,
   PROFILE_LOOKUP_MIGRATION_VERSION,
   PROFILE_LOOKUP_READY_KEY,
@@ -75,6 +77,14 @@ function lookupFor(item) {
     const [, candidate, seriesId] = pk.split("#");
     const owner = profile(candidate);
     return owner && seriesId ? { lookupPk: profileLookupPk(owner), lookupSk: recurrenceLookupSk(seriesId) } : undefined;
+  }
+  if (sk === "STATE" && pk.startsWith("MANUAL#") && item.status === "pending") {
+    const owner = profile(item.profile);
+    const decisionId = typeof item.decisionId === "string" ? item.decisionId : pk.slice("MANUAL#".length);
+    if (!owner || !decisionId || typeof item.createdAt !== "string") {
+      throw new Error(`Cannot index malformed pending decision ${pk}/${sk}`);
+    }
+    return manualPendingLookupAttributes({ profile: owner, decisionId, createdAt: item.createdAt });
   }
   return undefined;
 }
@@ -168,7 +178,7 @@ async function backfillPass(label) {
 async function indexedIdentities() {
   const actual = new Set();
   for (const owner of ["home", "antonio", "work"]) {
-    for (const prefix of ["MAPPING#", "RECURRENCE#"]) {
+    for (const prefix of ["MAPPING#", "RECURRENCE#", MANUAL_PENDING_LOOKUP_PREFIX]) {
       let exclusiveStartKey;
       do {
         const result = await sendWithThrottleRetry(new QueryCommand({
