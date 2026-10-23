@@ -410,7 +410,7 @@ test("selecting a Calendar master previews its existing task and active instance
   const input = intent({ action: "create", taskId: undefined, eventId: "master", owner: "calendar", scope: "series" });
   const snapshots = await h.engine.collect(input);
   assert.deepEqual(snapshots.map(value => refKey(value.ref)), ["home:calendar:active", "home:calendar:master", "home:todoist:task"]);
-  await assert.rejects(h.engine.preview(actor, input), /Choose Create counterpart or Exclude for home:todoist:task/);
+  await assert.rejects(h.engine.preview(actor, input), /Choose Create counterpart, Exclude, or Leave unchanged for home:todoist:task/);
   assert.deepEqual(h.writes, []);
   const result = await h.execute({ ...input, leftovers: { "home:todoist:task": "exclude" } });
   assert.equal(result.status, "succeeded", result.error);
@@ -421,6 +421,45 @@ test("selecting a Calendar master previews its existing task and active instance
   assert.ok(!h.controlsMap.get("home:calendar:active").activeRepair);
   assert.deepEqual(h.eventMap.get("master"), seriesFixture().events[0]);
   assert.equal(h.baselines[0][3].id, "active");
+});
+
+test("Leave unchanged retains an affected provider object and verifies its exact state before release", async t => {
+  const secondary=event("secondary",{extendedProperties:{shared:{taskId:"event"}}});
+  const h=harness(t,{events:[event("event",{extendedProperties:{shared:{taskId:"task"}}}),secondary]});
+  const input=intent({leftovers:{"home:calendar:secondary":"unchanged"}});
+  h.engine.collect=async()=>[
+    {ref:{profile:"home",side:"todoist",id:"task"},object:clone(h.taskMap.get("task"))},
+    {ref:{profile:"home",side:"calendar",id:"event"},object:clone(h.eventMap.get("event"))},
+    {ref:{profile:"home",side:"calendar",id:"secondary"},object:clone(h.eventMap.get("secondary"))},
+  ];
+  const result=await h.execute(input);
+  assert.equal(result.status,"succeeded",result.error);
+  assert.ok(result.outcomes.some(value=>value.entity==="home:calendar:secondary"&&value.outcome==="unchanged"));
+  assert.deepEqual(h.eventMap.get("secondary"),secondary);
+  assert.equal(h.controlsMap.get("home:calendar:secondary").excluded,undefined);
+  assert.ok(!h.writes.some(write=>write[1]==="secondary"));
+});
+
+test("Leave unchanged retains the repair barrier if its sync control changes before release", async t => {
+  const h=harness(t,{events:[event("event",{extendedProperties:{shared:{taskId:"task"}}}),
+    event("secondary",{extendedProperties:{shared:{taskId:"event"}}})]});
+  h.engine.collect=async()=>[
+    {ref:{profile:"home",side:"todoist",id:"task"},object:clone(h.taskMap.get("task"))},
+    {ref:{profile:"home",side:"calendar",id:"event"},object:clone(h.eventMap.get("event"))},
+    {ref:{profile:"home",side:"calendar",id:"secondary"},object:clone(h.eventMap.get("secondary"))},
+  ];
+  const snapshot=h.engine.snapshot.bind(h.engine);
+  let secondaryReads=0;
+  h.engine.snapshot=async ref=>{
+    if(ref.side==="calendar"&&ref.id==="secondary"&&++secondaryReads===2){
+      h.controlsMap.set("home:calendar:secondary",{...h.controlsMap.get("home:calendar:secondary"),excluded:true});
+    }
+    return snapshot(ref);
+  };
+  const result=await h.execute(intent({leftovers:{"home:calendar:secondary":"unchanged"}}));
+  assert.equal(result.status,"needs_review");
+  assert.match(result.error,/Leave unchanged state for home:calendar:secondary changed before release/);
+  assert.ok(h.controlsMap.get("home:calendar:secondary").activeRepair,"barrier must remain held after exact-state verification fails");
 });
 
 test("rebinding a Calendar master clears rejection of the persisted task/instance pair", async (t) => {

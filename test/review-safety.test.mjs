@@ -109,7 +109,7 @@ test("relinking cannot silently discard a displaced live counterpart", async () 
   ];
   await assert.rejects(engine.preview({ subject: "operator", email: "operator@example.test" }, {
     caseId: "case", profile: "home", action: "link", taskId: "task", eventId: "chosen", winner: "todoist", scope: "occurrence", leftovers: {},
-  }), /Choose Create counterpart or Exclude for home:calendar:displaced/);
+  }), /Choose Create counterpart, Exclude, or Leave unchanged for home:calendar:displaced/);
 });
 
 test("Calendar repair creation requires a deterministic ID and preserves unrelated metadata", async () => {

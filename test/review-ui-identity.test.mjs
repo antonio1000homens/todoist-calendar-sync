@@ -79,8 +79,8 @@ test("cancelled Calendar and deleted Todoist objects can be excluded but not use
   const cancelled=calendar("cancelled","2027-03-01",{status:"cancelled"});
   const deleted={ref:{profile:"home",side:"todoist",id:"deleted-task"},object:{
     id:"deleted-task",content:"Old task",is_deleted:true,due:{date:"2027-03-01"}}};
-  assert.deepEqual(dispositionOptions(cancelled),["exclude"]);
-  assert.deepEqual(dispositionOptions(deleted),["exclude"]);
-  assert.deepEqual(dispositionOptions(calendar("confirmed","2027-03-01")),["create","exclude"]);
+  assert.deepEqual(dispositionOptions(cancelled),["exclude","unchanged"]);
+  assert.deepEqual(dispositionOptions(deleted),["exclude","unchanged"]);
+  assert.deepEqual(dispositionOptions(calendar("confirmed","2027-03-01")),["create","exclude","unchanged"]);
   assert.deepEqual(dispositionOptions({ref:{profile:"home",side:"calendar",id:"missing"},object:null}),[]);
 });

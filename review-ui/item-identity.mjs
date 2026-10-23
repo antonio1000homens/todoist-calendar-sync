@@ -38,7 +38,7 @@ export function providerIdentity(value) {
 export function dispositionOptions(value) {
   const identity = providerIdentity(value);
   if (!identity.identified) return [];
-  return identity.selectable ? ["create", "exclude"] : ["exclude"];
+  return identity.selectable ? ["create", "exclude", "unchanged"] : ["exclude", "unchanged"];
 }
 
 export function scopeLabel(scope) {
@@ -51,5 +51,6 @@ export function previewEffect(snapshot, intent, plan) {
   const disposition = intent?.leftovers?.[key];
   if (disposition === "create") return { operation:"Create counterpart", result:"Link to newly created counterpart" };
   if (disposition === "exclude") return { operation:"Exclude", result:"Excluded from syncing" };
+  if (disposition === "unchanged") return { operation:"Leave unchanged", result:"Retain provider object, mapping, and sync control without changes" };
   return { operation:"Selected repair / contextual item", result:"See planned changes below" };
 }

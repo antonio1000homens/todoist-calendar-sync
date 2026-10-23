@@ -39,6 +39,11 @@ function decisionRepairIntent(intent: RepairIntent, decision?: ManualDecision): 
   if (intent.taskId && intent.taskId !== taskId || intent.eventId && intent.eventId !== eventId) invalidRepairIntent("Selected items do not match the decision's repair targets");
   return { ...intent, taskId, eventId };
 }
+function unchangedControlState(control?: Record<string, unknown>): { excluded: unknown; fencedAt: unknown } {
+  // The active repair claim is expected to change while a repair runs; compare
+  // the durable user-facing control state that existed in the approved preview.
+  return { excluded: control?.excluded, fencedAt: control?.fencedAt };
+}
 export function snapshotFingerprint(snapshots: ReviewSnapshot[]): string {
   return reviewHash(snapshots.map(s => ({ ref: s.ref, object: s.object, mapping: s.mapping,
     recurrence: s.recurrence, calendarProjectionId: s.calendarProjectionId, destination:s.destination,
@@ -133,7 +138,7 @@ export class ReviewEngine {
     if (!record || record.profile !== intent.profile) invalidRepairIntent("Conflict not found in this profile");
     if (!["link","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
     if (!["none","todoist","calendar"].includes(intent.winner) || !["occurrence","series","future"].includes(intent.scope)) invalidRepairIntent("Invalid field winner or recurrence scope");
-    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
+    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
     intent = decisionRepairIntent(intent, record.decision);
     const snapshots = await this.collect(intent, record.decision);
     if (!snapshots.length) invalidRepairIntent("Select at least one provider item");
@@ -344,7 +349,7 @@ export class ReviewEngine {
       if (selectedProjection && intent.leftovers[entityKey(s.ref)]) invalidRepairIntent("An occurrence handled by a series repair cannot have a separate disposition");
       if (intent.action === "link" && selected || selectedProjection || ["decision","verify","move"].includes(intent.action) || masterOfSelected) continue;
       const disposition = intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
-      if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart or Exclude for ${entityKey(s.ref)}`);
+      if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart, Exclude, or Leave unchanged for ${entityKey(s.ref)}`);
       if (s.object && disposition === "create") {
         if (s.ref.side === "todoist") {
           if ((s.object as TodoistTask).is_deleted) invalidRepairIntent(`Todoist repair source ${entityKey(s.ref)} must not be deleted`);
@@ -357,6 +362,7 @@ export class ReviewEngine {
           ? `Create a new Calendar counterpart from Todoist task ${s.ref.id} (${title}) and link that new pair`
           : `Create a new Todoist counterpart from Calendar event ${s.ref.id} (${title}) and link that new pair`);
       } else if (s.object && disposition === "exclude") changes.push(`Exclude ${s.ref.side} item ${s.ref.id} from future syncing`);
+      else if (s.object && disposition === "unchanged") changes.push(`Leave ${s.ref.side} item ${s.ref.id} unchanged`);
     }
     for (const s of snapshots) {
       const key = entityKey(s.ref);
@@ -397,6 +403,9 @@ export class ReviewEngine {
       } else if (disposition === "exclude") {
         operation = "Exclude from syncing";
         result = "Remove any displaced mapping and mark this provider object excluded";
+      } else if (disposition === "unchanged") {
+        operation = "Leave unchanged";
+        result = "Retain provider object, mapping, and sync control without changes";
       } else if (selected && intent.action === "separate") {
         operation = "Keep selected items separate";
         result = "Remove existing association; do not link the selected pair";
@@ -652,6 +661,7 @@ export class ReviewEngine {
           if(originalEvent?.recurringEventId===snapshot.ref.id)continue;
           const disposition=intent.action==="exclude"&&selected?"exclude":intent.action==="create"&&selected?"create":intent.leftovers[entityKey(snapshot.ref)];
           if(disposition==="exclude")await step(`exclude:${entityKey(snapshot.ref)}`,()=>this.controls.exclude(snapshot.ref,true,id));
+          if(disposition==="unchanged")continue;
           if(disposition==="create") {
             const clients=await factory(snapshot.ref.profile);
             if(snapshot.ref.side==="todoist") {
@@ -683,6 +693,14 @@ export class ReviewEngine {
         const excluded=await this.controls.control(snapshot.ref);
         if(excluded?.excluded){outcomes.push({entity:entityKey(snapshot.ref),outcome:"excluded",checkedAt:at()});continue;}
         if(verified.some(v=>v.profile===snapshot.ref.profile&&(snapshot.ref.side==="todoist"?v.taskId===snapshot.ref.id:v.eventId===snapshot.ref.id))||["decision","move"].includes(intent.action))continue;
+        const disposition=intent.leftovers[entityKey(snapshot.ref)];
+        if(disposition==="unchanged"){
+          const current=await this.snapshot(snapshot.ref);
+          if(reviewHash(current.object)!==reviewHash(operation.expectedProviders?.[entityKey(snapshot.ref)]??snapshot.object)
+            ||reviewHash(current.mapping??null)!==reviewHash(snapshot.mapping??null)
+            ||reviewHash(unchangedControlState(current.control))!==reviewHash(unchangedControlState(snapshot.control)))throw new Error(`Leave unchanged verification failed for ${entityKey(snapshot.ref)}; provider or sync state changed`);
+          outcomes.push({entity:entityKey(snapshot.ref),outcome:"unchanged",checkedAt:at()});continue;
+        }
         if (snapshot.ref.side === "calendar" && recurrenceBindings.some(m => m.profile === snapshot.ref.profile && m.activeInstanceId === snapshot.ref.id)) continue;
         if(!snapshot.object){
           const current=await this.snapshot(snapshot.ref);
@@ -746,6 +764,12 @@ export class ReviewEngine {
         const current=await this.snapshot(snapshot.ref);
         if(outcome.outcome==="missing"){
           if(current.object||!matchesExpectedAfterDetach(snapshot,current))throw new Error(`Missing item ${outcome.entity} changed before release`);
+          continue;
+        }
+        if(outcome.outcome==="unchanged"){
+          if(reviewHash(current.object)!==reviewHash(operation.expectedProviders?.[outcome.entity]??snapshot.object)
+            ||reviewHash(current.mapping??null)!==reviewHash(snapshot.mapping??null)
+            ||reviewHash(unchangedControlState(current.control))!==reviewHash(unchangedControlState(snapshot.control)))throw new Error(`Leave unchanged state for ${outcome.entity} changed before release`);
           continue;
         }
         const splitHistory=splitHistoryMasterId(snapshot);
