@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { runPurgeItem } from "../scripts/purge-item-service.mjs";
 import {createHash} from "node:crypto";
 import {readFileSync} from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -8,8 +9,22 @@ import {planPurge, fingerprint, publicInventoryRecord} from "../scripts/item-pur
 test("standalone purge CLI parses without provider execution",()=>{
  assert.doesNotThrow(()=>execFileSync(process.execPath,["--check","scripts/purge-item.mjs"]));
 });
+test("purge service returns a read-only preview through injected clients",async()=>{
+ const commands=[],outputs=[];
+ const db={send:async command=>{commands.push(command.constructor.name);return command.constructor.name.includes("Scan")?{Items:[],ScannedCount:0}:{};}};
+ const clients={todoist:{getTask:async()=>null,listProjectComments:async()=>[],listTaskComments:async()=>[],deleteTask:async()=>{},deleteComment:async()=>{}},
+  calendar:{getEvent:async()=>null,findByTodoistTaskId:async()=>null,deleteEvent:async()=>{}}};
+ const preview=await runPurgeItem({profile:"home",taskId:"task-123"},{
+  db,lambda:{send:async()=>({})},clients,inspectErasureFence:async()=>({leases:[]}),sleep:async()=>{},onOutput:value=>outputs.push(value),
+ });
+ assert.equal(preview.mode,"preview");
+ assert.deepEqual(outputs,[preview]);
+ assert.ok(commands.includes("ScanCommand"));
+ assert.ok(commands.includes("GetCommand"));
+ assert.ok(commands.every(name=>!/(Put|Delete|Update|Transact)/.test(name)),"preview service must not issue writes");
+});
 test("purge keeps its recovery journal through mapping restore and final commit",()=>{
- const source=readFileSync(new URL("../scripts/purge-item.mjs",import.meta.url),"utf8");
+ const source=readFileSync(new URL("../scripts/purge-item-service.mjs",import.meta.url),"utf8");
  const executor=readFileSync(new URL("../src/erasure-executor.ts",import.meta.url),"utf8");
  assert.match(source,/finishFencedErasure\(\{enabledMappingIds:enabledMappings/);
  const restore=executor.indexOf("await input.restoreMappings(input.enabledMappingIds)");
