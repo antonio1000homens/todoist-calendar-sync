@@ -137,6 +137,11 @@ export class ReviewEngine {
     if (mapping && mapping.profile !== ref.profile) invalidRepairIntent(`Item belongs to ${mapping.profile}; use Move to profile instead`);
     if (ref.side === "todoist" && object && (object as TodoistTask).project_id !== profiles[ref.profile].todoistProjectId) invalidRepairIntent("Task is outside the selected profile's project");
     const snapshot: ReviewSnapshot = { ref, object, mapping, checkedAt: at(), control: await this.controls.control(ref) as Record<string, unknown> | undefined };
+    if (ref.side === "todoist" && object && !mapping && (object as TodoistTask).due?.is_recurring) {
+      const recurrence = await this.state.getRecurrenceLinkByTaskAnyProfile(ref.id);
+      if (recurrence && recurrence.profile !== ref.profile) invalidRepairIntent(`Item belongs to ${recurrence.profile}; use Move to profile instead`);
+      snapshot.recurrence = recurrence;
+    }
     if (ref.side === "calendar" && (object as CalendarEvent|null)?.recurrence?.length) {
       const event = object as CalendarEvent;
       const taskId = mapping?.taskId || event.extendedProperties?.shared?.taskId;
@@ -185,6 +190,10 @@ export class ReviewEngine {
         add({ profile: snapshot.mapping.profile, side: "todoist", id: snapshot.mapping.taskId });
         add({ profile: snapshot.mapping.profile, side: "calendar", id: snapshot.mapping.eventId });
         if (snapshot.mapping.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.mapping.masterEventId });
+      }
+      if (ref.side === "todoist" && snapshot.recurrence) {
+        if (snapshot.recurrence.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId });
+        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.activeInstanceId || snapshot.recurrence.eventId });
       }
       if (ref.side === "calendar" && snapshot.object) {
         const event = snapshot.object as CalendarEvent;
@@ -244,6 +253,16 @@ export class ReviewEngine {
       if (occurrence && master && occurrence.start?.date !== master.start?.date) {
         const id = flattenStandaloneId(intent.profile,intent.taskId,master.id,occurrence.id);
         if (!snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===id)) snapshots.push(await this.snapshot({profile:intent.profile,side:"calendar",id}));
+      }
+    }
+    for (const snapshot of snapshots) {
+      const recurrence = snapshot.recurrence;
+      if (!recurrence) continue;
+      for (const refId of [recurrence.masterEventId, recurrence.activeInstanceId || recurrence.eventId]) {
+        if (!refId) continue;
+        const related = snapshots.find(candidate => candidate.ref.profile === recurrence.profile
+          && candidate.ref.side === "calendar" && candidate.ref.id === refId);
+        if (related && !related.recurrence) related.recurrence = recurrence;
       }
     }
     return snapshots.sort((a,b) => entityKey(a.ref).localeCompare(entityKey(b.ref)));
@@ -320,6 +339,11 @@ export class ReviewEngine {
       const selectedTaskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === task.id);
       if (selectedTaskSnapshot?.mapping) invalidRepairIntent("The selected recurring Todoist task already has a mapping; resolve that exact association before transfer");
       const seriesId = event.iCalUID || event.id;
+      if (masterSnapshot.recurrence?.owner === "calendar" && masterSnapshot.recurrence.seriesId === seriesId
+        && masterSnapshot.recurrence.taskId === task.id
+        && (masterSnapshot.recurrence.activeInstanceId || masterSnapshot.recurrence.eventId) === occurrence.id) {
+        invalidRepairIntent("This Todoist task already owns the selected Calendar series occurrence; refresh the case and apply its pending decision instead of transferring the association");
+      }
       const calendarOwnerVerified = (masterSnapshot.recurrence?.owner === "calendar"
         && masterSnapshot.recurrence.seriesId === seriesId)
         || event.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";

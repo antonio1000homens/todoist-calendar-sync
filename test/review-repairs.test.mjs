@@ -95,6 +95,8 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone([...mappingMap.values()].find(value => value.profile === profile && value.eventId === id)); },
     async getRecurrenceLink(_profile, id) { return clone(recurrences.get(id)); },
+    async getRecurrenceLinkByTaskAnyProfile(id) { return clone([...recurrences.values()].find(value => value.taskId === id)); },
+    async listRecurrenceLinks(profile) { return clone([...recurrences.values()].filter(value => value.profile === profile)); },
     async getFutureSeriesSplitAnyProfile(taskId) { return clone(splits.get(taskId)); },
     async beginFutureSeriesSplit(profile, taskId, oldMasterId, newMasterId, previousOccurrence) {
       const entry=splits.get(taskId);
@@ -395,6 +397,46 @@ test("series transfer treats explicit INTERVAL=1 as equivalent to Todoist every 
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   assert.equal((await h.engine.execute("repair")).status,"succeeded");
   assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
+});
+
+test("task-only review detail hydrates its existing recurrence owner and active Calendar occurrence", async t => {
+  const f = birthdayTransferFixture();
+  const link = { ...f.recurrence, taskId: f.annual.id };
+  const cancelled = { ...f.standalone, status: "cancelled" };
+  const h = harness(t, { events: [f.master, f.active, cancelled], tasks: [f.annual], recurrence: link });
+  const decision = {
+    decisionId: "cancelled-projection", profile: "home", status: "pending", type: "todoist_cancelled_projection_blocked",
+    taskId: f.annual.id, eventId: cancelled.id,
+    permittedActions: [{ id: "acknowledge", label: "Keep Calendar deleted" }],
+  };
+
+  const snapshots = await h.engine.collect({
+    caseId: decision.decisionId, profile: "home", action: "decision", taskId: decision.taskId, eventId: decision.eventId,
+    winner: "none", scope: "occurrence", leftovers: {}, decisionAction: "acknowledge",
+  }, decision);
+  const taskSnapshot = snapshots.find(snapshot => snapshot.ref.side === "todoist" && snapshot.ref.id === f.annual.id);
+
+  assert.equal(taskSnapshot.mapping, undefined, "no direct MAP row exists");
+  assert.equal(taskSnapshot.recurrence.taskId, f.annual.id);
+  assert.equal(taskSnapshot.recurrence.owner, "calendar");
+  assert.ok(snapshots.some(snapshot => snapshot.ref.side === "calendar" && snapshot.ref.id === f.master.id));
+  const activeSnapshot = snapshots.find(snapshot => snapshot.ref.side === "calendar" && snapshot.ref.id === f.active.id);
+  assert.ok(activeSnapshot);
+  assert.equal(activeSnapshot.recurrence.taskId, f.annual.id);
+  assert.deepEqual(h.writes, [], "hydration performs reads only");
+});
+
+test("transfer preview rejects a series already assigned to the selected Todoist task", async t => {
+  const f = birthdayTransferFixture();
+  f.master = { ...f.master, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"] };
+  const link = { ...f.recurrence, taskId: f.annual.id, activeInstanceId: f.active.id, eventId: f.active.id };
+  const h = harness(t, { events: [f.master, f.active], tasks: [f.annual], recurrence: link });
+
+  await assert.rejects(
+    h.engine.preview(actor, transferIntent(f)),
+    /already owns the selected Calendar series occurrence/,
+  );
+  assert.deepEqual(h.writes, [], "an already-correct recurrence association needs no provider write");
 });
 
 test("series transfer refuses an unowned Calendar recurrence without a recurrence link or ownership metadata",async t=>{

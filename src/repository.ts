@@ -1572,6 +1572,19 @@ export class StateRepository {
     });
   }
 
+  async getRecurrenceLinkByTaskAnyProfile(taskId: string): Promise<RecurrenceLink | undefined> {
+    const matches: RecurrenceLink[] = [];
+    for (const profile of allProfiles) {
+      for (const link of await this.listRecurrenceLinks(profile)) {
+        if (link.taskId === taskId) matches.push(link);
+      }
+    }
+    if (matches.length > 1) {
+      throw new Error(`Todoist task ${taskId} is claimed by multiple recurrence links; resolve the profile/series ownership before review`);
+    }
+    return matches[0];
+  }
+
   async getCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<CalendarProjectionTombstone | undefined> {
     const result = await client.send(new GetCommand({
       TableName: this.ensureTable(),
