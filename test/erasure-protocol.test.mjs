@@ -6,6 +6,7 @@ import { restoreMappings } from "../scripts/erasure-mappings.mjs";
 import { StateRepository } from "../dist/repository.js";
 import { handler } from "../dist/worker.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
+import { ManualInterventionService } from "../dist/manual-intervention.js";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -232,4 +233,38 @@ test("erased-item webhook replay writes no identity-bearing completion receipt",
   assert.equal(audit.mock.callCount(), 1);
   assert.deepEqual(audit.mock.calls[0].arguments[2], {});
   assert.equal(completed.mock.callCount(), 0);
+});
+
+test("failed erased-item suppression audit cannot create an identity-bearing incident", async (t) => {
+  const originalSend = documentClient.send;
+  const previousVersion = process.env.ERASURE_PROTOCOL_VERSION;
+  const previousTable = process.env.STATE_TABLE_NAME;
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
+  process.env.STATE_TABLE_NAME = "test-state";
+  documentClient.send = async command => {
+    if (command.constructor.name === "GetCommand" && command.input.Key.sk === "EPOCH") return { Item: { epoch: 1 } };
+    return {};
+  };
+  t.mock.method(StateRepository.prototype, "audit", async () => { throw new Error("audit write unavailable"); });
+  const completed = t.mock.method(StateRepository.prototype, "markDeliveryCompleted", async () => {});
+  const failureReports = t.mock.method(ManualInterventionService.prototype, "reportDeliveryFailure", async () => {});
+  t.mock.method(OrphanRecoveringSynchronizer.prototype, "process", async function (delivery) {
+    await this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+  });
+  t.after(() => {
+    documentClient.send = originalSend;
+    if (previousVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION = previousVersion;
+    if (previousTable === undefined) delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME = previousTable;
+  });
+  const delivery = {
+    id: "todoist-webhook-id", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: new Date().toISOString(), headers: {}, erasureEpoch: 1,
+    body: JSON.stringify({ event_name: "item:updated", event_data: { id: "erased-task-id" } }),
+  };
+  const result = await handler({ Records: [{ messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} }] }, { awsRequestId: "request-erased-audit-failure" });
+  assert.deepEqual(result.batchItemFailures, [{ itemIdentifier: "message-erased" }]);
+  assert.equal(completed.mock.callCount(), 0);
+  assert.equal(failureReports.mock.callCount(), 0);
 });

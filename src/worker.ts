@@ -620,6 +620,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
         failures.push({ itemIdentifier: record.messageId });
         continue;
       }
+      // The suppression audit is intentionally identity-free. If its write
+      // fails, generic incident reporting would persist the webhook task ID
+      // and recreate the erased identity in DynamoDB. Leave the message for
+      // retry without any secondary state writes or notifications.
+      if (suppressCompletionReceipt) {
+        failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
       if (delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
         await state.recordReconciliationFailure(
           delivery.profile,
