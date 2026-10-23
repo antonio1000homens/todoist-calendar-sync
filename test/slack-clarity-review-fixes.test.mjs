@@ -477,3 +477,18 @@ test('orphan Calendar 410 quarantine keeps the provider identities for review in
   assert.equal(decision.context.providerTaskId, 'task-gone');
   assert.equal(decision.context.status, 410);
 });
+
+test('repair DLQ failure records only the durable operation reference in safe context', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const store = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(store, notifier, async () => ({}), new FakePolicyStore());
+  await service.reportDeliveryFailure({ id:'repair:op-123:attempt:1', kind:'repair', profile:'home', mode:'aws',
+    receivedAt:'2026-10-23T09:00:00Z', headers:{authorization:'must-not-persist'}, body:'secret', repair:{operationId:'op-123'} },
+  new Error('repair failed'));
+  const decision = notifier.posted[0];
+  assert.equal(decision.context.repairOperationId,'op-123');
+  assert.equal(decision.context.kind,'repair');
+  assert.equal(JSON.stringify(decision.context).includes('must-not-persist'),false);
+  assert.equal(JSON.stringify(decision.context).includes('secret'),false);
+});
