@@ -583,6 +583,7 @@ export class ManualDecisionStore {
         ownerPages += 1;
         totalPages += 1;
         let result: any;
+        const deadlineSignal = AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now()));
         try {
           result = await documentClient.send(new QueryCommand(withProfileLookupDeadline({
             TableName: table,
@@ -599,9 +600,12 @@ export class ManualDecisionStore {
             ExclusiveStartKey: cursor,
             Limit: pageLimit,
             ReturnConsumedCapacity: "TOTAL",
-          }, deadlineAtMs)), { abortSignal: AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now())) });
+          }, deadlineAtMs)), { abortSignal: deadlineSignal });
         } catch (error) {
-          const deadlineExpired = Date.now() >= deadlineAtMs;
+          // The timeout signal may fire just before Date.now() reaches the absolute
+          // deadline. Its aborted state is the authoritative indication that this
+          // query exhausted the caller's budget.
+          const deadlineExpired = Date.now() >= deadlineAtMs || deadlineSignal.aborted;
           console.error(JSON.stringify({
             service: "todoist-calendar-sync-health",
             event: "list_pending_manual_decisions_incomplete",

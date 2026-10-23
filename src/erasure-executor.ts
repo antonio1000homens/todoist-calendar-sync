@@ -4,7 +4,7 @@ import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dy
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
 
-export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure";
+export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure" | "review_required";
 export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "drain_before_fence"
   | "install_fence" | "wait_worker_timeout" | "drain_after_timeout" | "ready_for_delete"
   | "restore_mappings" | "confirm_restored" | "release_fence" | "complete";
@@ -59,10 +59,19 @@ export interface ErasureSnapshotReader {
 /** Bind these process-trusted adapters when constructing the worker service, never per request. */
 export interface ErasureWorkerAdapters extends FencedLifecycleAdapters, ErasureDeletionVerifier, ErasureSnapshotReader {}
 
+export class ErasureGateDriftError extends Error {
+  constructor() {
+    super("Erasure is not ready: persisted action receipts, confirmation, inventory, or lifecycle changed");
+    this.name="ErasureGateDriftError";
+  }
+}
+
+export const ERASURE_REVIEW_REQUIRED_MESSAGE="Operator break-glass recovery is required. Preserve any protections that remain, inspect the actual profile fence and worker mapping state, and escalate if either is missing, changed, or cannot be verified. Do not start a fresh preview until service admission is restored; this operation cannot be resumed.";
+
 const transitions: Record<ErasureOperationStatus, ErasureOperationStatus[]> = {
   previewed: ["queued"], queued: ["fencing", "partial_failure"], fencing: ["deleting", "partial_failure"],
-  deleting: ["verifying", "partial_failure"], verifying: ["succeeded", "partial_failure"],
-  succeeded: [], partial_failure: ["queued"],
+  deleting: ["verifying", "partial_failure", "review_required"], verifying: ["succeeded", "partial_failure"],
+  succeeded: [], partial_failure: ["queued"], review_required: [],
 };
 
 export function advanceErasureOperation(current: ErasureOperation, status: ErasureOperationStatus,
@@ -337,7 +346,22 @@ export class ErasureOperationStore {
       || !validReceipts || times.some((time,index)=>!Number.isFinite(time)
         || (index>0 && (time as number)<(times[index-1] as number)))
       || (times[4] as number)<(times[3] as number)+lifecycle.timeoutSeconds*1000+2000)
-      throw new Error("Erasure is not ready: persisted action receipts, confirmation, inventory, or lifecycle changed");
+      throw new ErasureGateDriftError();
+  }
+
+  /** Stop a fenced operation durably when its action-time deletion gate has drifted. */
+  async markReviewRequired(id: string): Promise<void> {
+    const operation=await this.get(id);
+    if(!operation || operation.status!=="deleting" || operation.lifecycle?.phase!=="ready_for_delete")
+      throw new Error("Erasure operation is no longer at the deletion review gate");
+    const message=ERASURE_REVIEW_REQUIRED_MESSAGE;
+    const now=new Date().toISOString();
+    await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
+      UpdateExpression:"SET #status=:reviewRequired, #error=:error, updatedAt=:updatedAt, lifecycle.#lastError=:error",
+      ConditionExpression:"#status=:deleting AND lifecycle.#phase=:ready AND previewFingerprint=:fingerprint",
+      ExpressionAttributeNames:{"#status":"status","#phase":"phase","#lastError":"lastError","#error":"error"},
+      ExpressionAttributeValues:{":deleting":"deleting",":reviewRequired":"review_required",":ready":"ready_for_delete",
+        ":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
   }
 
   #advance(operationId:string,current: FencedLifecycle, phase: FencedLifecyclePhase, now: number,

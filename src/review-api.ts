@@ -5,6 +5,8 @@ import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
+import { enqueueErasureOperation } from "./erasure-queue.js";
+import { ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
@@ -130,6 +132,37 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     const body = method === "POST" ? bodyJson(event) : undefined;
     const actor = await authenticate(event, method === "POST");
     const store = new ReviewStore();
+
+    if ((method === "GET" && segments[0] === "erasure-operations" && segments.length === 2)
+      || (method === "POST" && segments[0] === "erasure-operations" && segments[2] === "start" && segments.length === 3)) {
+      const operation = await new ErasureOperationStore().get(segments[1]);
+      if (!operation) return response(404,{error:"erasure_operation_not_found"});
+      if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
+        phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
+        ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
+          message:ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
+        createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
+      if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
+      if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
+      if (operation.lifecycle?.phase === "ready_for_delete") fail(409,"Fencing is complete; provider deletion requires the separate confirmed deletion workflow");
+      if (!["previewed","queued","fencing","deleting","verifying"].includes(operation.status))
+        fail(409,"This erasure operation cannot be started or resumed");
+      if (operation.status === "previewed") {
+        const erasureStore=new ErasureOperationStore();
+        try { await erasureStore.transition(operation.operationId,"previewed","queued"); }
+        catch {
+          const latest=await erasureStore.get(operation.operationId);
+          if (latest?.status !== "queued") throw new Error("Erasure operation changed while it was being started; refresh before retrying");
+        }
+      }
+      try {
+        await enqueueErasureOperation(operation.operationId,operation.lifecycle?.nextRunAt);
+      } catch {
+        return response(503,{error:"erasure_enqueue_failed",message:"The confirmed operation remains durable. Retry this same start request."});
+      }
+      return response(202,{operation:{operationId:operation.operationId,status:operation.status === "previewed"?"queued":operation.status,
+        phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt}});
+    }
 
     if (method === "GET" && segments[0] === "cases" && segments.length === 1) {
       const selected = event.queryStringParameters?.profile;
