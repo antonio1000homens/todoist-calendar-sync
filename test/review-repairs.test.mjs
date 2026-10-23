@@ -458,6 +458,53 @@ test("series transfer rejects an unchanged disposition for its displaced mapping
   assert.deepEqual(h.writes,[]);
 });
 
+test("link preview rejects leaving a displaced one-off association unchanged",async t=>{
+  const current=task("yearly-task"), oldEvent=event("old-2025-event",{start:{date:"2025-05-02"},end:{date:"2025-05-03"}});
+  const selectedEvent=event("selected-2027-event"), oldMapping={profile:"home",taskId:current.id,eventId:oldEvent.id,updatedAt:"old-version"};
+  const selectedMapping={profile:"home",taskId:current.id,eventId:selectedEvent.id,updatedAt:"selected-version"};
+  const h=harness(t,{events:[oldEvent,selectedEvent],tasks:[current]});
+  const snapshots=[
+    {ref:{profile:"home",side:"todoist",id:current.id},object:current,mapping:oldMapping},
+    {ref:{profile:"home",side:"calendar",id:oldEvent.id},object:oldEvent,mapping:oldMapping},
+    {ref:{profile:"home",side:"calendar",id:selectedEvent.id},object:selectedEvent,mapping:selectedMapping},
+  ];
+  h.engine.collect=async()=>snapshots.map(clone);
+  const unchanged={
+    caseId:"case",profile:"home",action:"link",taskId:current.id,eventId:selectedEvent.id,
+    winner:"none",scope:"occurrence",leftovers:{[refKey(snapshots[1].ref)]:"unchanged"},
+  };
+  await assert.rejects(h.engine.preview(actor,unchanged),/Cannot leave the currently mapped Calendar event old-2025-event.*choose Exclude to retain the old event while detaching its obsolete mapping/);
+  assert.deepEqual(h.writes,[]);
+
+  const safe=await h.engine.preview(actor,{...unchanged,leftovers:{[refKey(snapshots[1].ref)]:"exclude"}});
+  const oldPlan=safe.itemPlan.find(item=>refKey(item.ref)===refKey(snapshots[1].ref));
+  assert.equal(oldPlan.operation,"Exclude from syncing");
+  assert.equal(oldPlan.result,"Remove any displaced mapping and mark this provider object excluded");
+  assert.ok(safe.changes.includes(`Exclude calendar item ${oldEvent.id} from future syncing`));
+});
+
+test("link preview fails closed when TASK and EVENT mapping indexes disagree",async t=>{
+  const current=task("yearly-task"), oldEvent=event("old-2025-event"), selectedEvent=event("selected-2027-event");
+  const taskMapping={profile:"home",taskId:current.id,eventId:oldEvent.id,updatedAt:"task-index-version"};
+  const selectedMapping={profile:"home",taskId:current.id,eventId:selectedEvent.id,updatedAt:"selected-version"};
+  for (const eventMapping of [undefined,{...taskMapping,eventId:"different-event"},{...taskMapping,updatedAt:"event-index-version"}]) {
+    const h=harness(t,{events:[oldEvent,selectedEvent],tasks:[current]});
+    const snapshots=[
+      {ref:{profile:"home",side:"todoist",id:current.id},object:current,mapping:taskMapping},
+      {ref:{profile:"home",side:"calendar",id:oldEvent.id},object:oldEvent,...(eventMapping?{mapping:eventMapping}:{})},
+      {ref:{profile:"home",side:"calendar",id:selectedEvent.id},object:selectedEvent,mapping:selectedMapping},
+    ];
+    h.engine.collect=async()=>snapshots.map(clone);
+    const input={caseId:"case",profile:"home",action:"link",taskId:current.id,eventId:selectedEvent.id,
+      winner:"none",scope:"occurrence",leftovers:{[refKey(snapshots[1].ref)]:"unchanged"}};
+    await assert.rejects(h.engine.preview(actor,input),/mapping index is missing or disagrees.*choose Exclude/);
+    assert.deepEqual(h.writes,[]);
+
+    const excluded=await h.engine.preview(actor,{...input,leftovers:{[refKey(snapshots[1].ref)]:"exclude"}});
+    assert.equal(excluded.itemPlan.find(row=>refKey(row.ref)===refKey(snapshots[1].ref)).operation,"Exclude from syncing");
+  }
+});
+
 test("series transfer discovers same-date standalone duplicates from other years",async t=>{
   const f=birthdayTransferFixture(),prior=event("birthday-standalone-2026",{summary:f.annual.content,
     start:{date:"2026-07-17"},end:{date:"2026-07-18"}});
