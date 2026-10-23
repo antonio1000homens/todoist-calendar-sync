@@ -177,6 +177,8 @@ test("searched live recurring Calendar occurrence and master require an owner be
   const master=editRepairSelection(occurrence,"calendar","series-master",true,{id:"series-master",recurrence:["RRULE:FREQ=WEEKLY"]});
   assert.equal(repairRecurrenceOwnerRequirement(master,details,"link"),"calendar-series");
   assert.equal(repairPreviewAllowed(master,item,details,"link",undefined,""),false);
+  assert.equal(repairRecurrenceOwnerRequirement(master,details,"transfer"),"calendar-series");
+  assert.equal(repairPreviewAllowed(master,item,details,"transfer",undefined,"calendar"),true);
   const fromCalendar=editRepairSelection(master,"todoist","");
   assert.equal(repairRecurrenceOwnerRequirement(fromCalendar,details,"create"),"calendar-series");
   assert.equal(repairPreviewAllowed(fromCalendar,item,details,"create",undefined,""),false);

@@ -18,11 +18,11 @@ export interface ReviewCase {
 }
 export interface RepairIntent {
   caseId: string; profile: Profile;
-  action: "link" | "separate" | "create" | "exclude" | "decision" | "verify" | "move";
+  action: "link" | "transfer" | "separate" | "create" | "exclude" | "decision" | "verify" | "move";
   taskId?: string; eventId?: string;
   winner: Side | "none";
   owner?: Side; scope: "occurrence" | "series" | "future";
-  leftovers: Record<string, "exclude" | "create" | "unchanged">;
+  leftovers: Record<string, "exclude" | "create" | "unchanged" | "retain-unlinked">;
   decisionAction?: string; targetProfile?: Profile;
 }
 export interface ReviewSnapshot {
@@ -46,7 +46,7 @@ export interface RepairOperation {
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
   error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
-  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged"; checkedAt: string }>;
+  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged" | "retained-unlinked"; checkedAt: string }>;
   /** Controls sampled before claiming extra, non-preview move destination locks. */
   claimSnapshots?: ReviewSnapshot[];
   expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;

@@ -631,6 +631,133 @@ export class StateRepository {
     }));
   }
 
+  /**
+   * Transfer one Calendar-owned series association from its displaced task to
+   * an already-recurring Todoist task without changing either provider's
+   * recurrence. The series occurrence index, task indexes, and recurrence
+   * owner change in one conditional transaction.
+   */
+  async transferCalendarSeriesMapping(input: {
+    previous?: Mapping;
+    expectedLink?: RecurrenceLink;
+    mapping: Mapping;
+    link: RecurrenceLink;
+  }): Promise<boolean> {
+    const { previous, expectedLink, mapping, link } = input;
+    if (mapping.recurrenceOwner !== "calendar" || link.owner !== "calendar"
+      || mapping.profile !== link.profile || mapping.taskId !== link.taskId
+      || mapping.eventId !== link.eventId || mapping.masterEventId !== link.masterEventId
+      || mapping.seriesId !== link.seriesId || mapping.activeInstanceId !== link.activeInstanceId
+      || !mapping.seriesId || !mapping.masterEventId || !mapping.activeInstanceId
+      || previous?.taskId === mapping.taskId
+      || (previous && (previous.profile !== mapping.profile || previous.recurrenceOwner !== "calendar"
+        || previous.seriesId !== mapping.seriesId || previous.masterEventId !== mapping.masterEventId))
+      || (expectedLink && (expectedLink.owner !== "calendar" || expectedLink.profile !== mapping.profile
+        || expectedLink.seriesId !== mapping.seriesId || expectedLink.taskId !== previous?.taskId))) {
+      throw new Error("Invalid Calendar series transfer mapping");
+    }
+    const currentTarget = await this.getMappingByTask(mapping.profile, mapping.taskId);
+    const currentLink = await this.getRecurrenceLink(mapping.profile, mapping.seriesId);
+    if (currentTarget && currentTarget.taskId === mapping.taskId && currentTarget.eventId === mapping.eventId
+      && currentTarget.masterEventId === mapping.masterEventId && currentTarget.activeInstanceId === mapping.activeInstanceId
+      && currentTarget.recurrenceOwner === "calendar" && currentLink?.owner === "calendar"
+      && currentLink.taskId === mapping.taskId && currentLink.eventId === mapping.eventId
+      && currentLink.masterEventId === mapping.masterEventId && currentLink.activeInstanceId === mapping.activeInstanceId) return true;
+    const table = this.ensureTable();
+    const identityValues = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt,
+    };
+    const oldIdentityValues = previous ? {
+      ":oldProfile": previous.profile, ":oldTask": previous.taskId,
+      ":oldEvent": previous.eventId, ":oldUpdated": previous.updatedAt,
+    } : undefined;
+    const items: Array<Record<string, unknown>> = [];
+    if (previous) {
+      if (!previous.updatedAt) throw new Error("The displaced mapping has no version; refresh affected items");
+      if (previous.eventId === mapping.eventId) {
+        items.push({ Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+          ConditionExpression: "#profile = :oldProfile AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldUpdated",
+          ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldIdentityValues,
+        } });
+      } else {
+        items.push({ Delete: {
+          TableName: table, Key: key(`EVENT#${previous.profile}#${previous.eventId}`, "MAP"),
+          ConditionExpression: "#profile = :oldProfile AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldUpdated",
+          ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldIdentityValues,
+        } });
+        items.push({ Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+          ConditionExpression: "attribute_not_exists(pk)",
+        } });
+      }
+      items.push({ Delete: {
+        TableName: table, Key: key(`TASK#${previous.profile}#${previous.taskId}`, "MAP"),
+        ConditionExpression: "#profile = :oldProfile AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldUpdated",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: oldIdentityValues,
+      } });
+      items.push({ Delete: {
+        TableName: table, Key: key(`TASKOWNER#${previous.taskId}`, "MAP"),
+        ConditionExpression: "#profile = :oldProfile AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldUpdated",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: oldIdentityValues,
+      } });
+    } else {
+      items.push({ Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    items.push(
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
+        ...(expectedLink ? {
+          ConditionExpression: "#owner = :oldOwner AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldLinkUpdated",
+          ExpressionAttributeNames: { "#owner": "owner" },
+          ExpressionAttributeValues: {
+            ":oldOwner": expectedLink.owner, ":oldTask": expectedLink.taskId,
+            ":oldEvent": expectedLink.eventId, ":oldLinkUpdated": expectedLink.updatedAt,
+          },
+        } : { ConditionExpression: "attribute_not_exists(pk)" }),
+      } },
+    );
+    for (const profile of allProfiles) {
+      if (profile === mapping.profile) continue;
+      items.push({ ConditionCheck: {
+        TableName: table, Key: key(`TASK#${profile}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: items as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some(reason => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every(reason => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
+      throw error;
+    }
+  }
+
   async listMappings(profile: Profile): Promise<Mapping[]> {
     return readProfileLookup<Mapping>({
       client, profile, operation: "future_series_mapping_ownership",

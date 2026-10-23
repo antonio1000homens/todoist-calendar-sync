@@ -82,5 +82,7 @@ test("cancelled Calendar and deleted Todoist objects can be excluded but not use
   assert.deepEqual(dispositionOptions(cancelled),["exclude","unchanged"]);
   assert.deepEqual(dispositionOptions(deleted),["exclude","unchanged"]);
   assert.deepEqual(dispositionOptions(calendar("confirmed","2027-03-01")),["create","exclude","unchanged"]);
+  assert.deepEqual(dispositionOptions({ref:{profile:"home",side:"todoist",id:"old"},object:{id:"old"},mapping:{recurrenceOwner:"calendar"}},"transfer"),["create","exclude","unchanged","retain-unlinked"]);
+  assert.deepEqual(dispositionOptions(calendar("confirmed","2027-03-01"),"transfer"),["create","exclude","unchanged"]);
   assert.deepEqual(dispositionOptions({ref:{profile:"home",side:"calendar",id:"missing"},object:null}),[]);
 });
