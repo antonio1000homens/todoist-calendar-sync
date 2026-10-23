@@ -1716,3 +1716,42 @@ test("an explicit Todoist-only disposition survives repeat snapshot and webhook 
   assert.deepEqual(h.writes,[]);
   assert.ok(h.calls.some(call=>call[1]==="calendar_event_sync_control_blocked"));
 });
+
+test("Todoist-only flatten keeps the selected due date, excludes projection, and preserves historical Calendar bytes",async t=>{
+  const annual=task("annual-task",{content:"Write letter for Gabriel and Lennox",due:{date:"2027-03-01",is_recurring:true,string:"every year"}});
+  const history=event("history-event",{summary:"Gabriel and Lennox letter",description:"Historical note",start:{date:"2026-03-01"},end:{date:"2026-03-09"}});
+  const h=harness(t,{events:[history],tasks:[annual]}),before=clone(h.eventMap.get(history.id));
+  const result=await h.execute(intent({action:"todoist-only",taskId:annual.id,eventId:history.id,winner:"none",scope:"future"}));
+  assert.equal(result.status,"succeeded",result.error);
+  assert.deepEqual(h.taskMap.get(annual.id).due,{date:"2027-03-01"});
+  assert.equal(h.controlsMap.get(`home:todoist:${annual.id}`).excluded,true);
+  assert.equal(h.controlsMap.get(`home:calendar:${history.id}`).excluded,true);
+  assert.equal(h.mappingMap.size,0);
+  assert.deepEqual(h.eventMap.get(history.id),before,"the historical Calendar item remains byte-for-byte unchanged");
+  assert.deepEqual(h.writes,[ ["task",annual.id] ],"no Calendar counterpart or metadata write is made");
+
+  const controls=new SyncControls();
+  controls.control=async ref=>h.controlsMap.get(refKey(ref));
+  t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
+  const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
+  const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
+  for(let run=0;run<3;run++) {
+    assert.equal(await reconciler.reconcileUnmappedTask("home",h.taskMap.get(annual.id),h.clients),"blocked");
+    await synchronizer.process({id:`todoist-only-${run}`,kind:"todoist",profile:"home",mode:"aws",headers:{},body:JSON.stringify({event_name:"item:updated",event_data:h.taskMap.get(annual.id)})});
+    assert.equal(h.writes.length,1,"Todoist updates stay excluded from projection");
+    await synchronizer.process({id:`history-${run}`,kind:"calendar",profile:"home",mode:"aws",headers:{},body:""});
+    assert.equal(h.writes.length,1,"the standalone Calendar history does not import a new Todoist task");
+  }
+  assert.deepEqual(h.taskMap.get(annual.id).due,{date:"2027-03-01"});
+  assert.deepEqual(h.eventMap.get(history.id),before);
+  assert.deepEqual(h.writes,[ ["task",annual.id] ],"repeat reconciliation and provider notifications create no counterpart");
+});
+
+test("Todoist-only flatten rejects stale links or recurrence ownership before writes",async t=>{
+  const annual=task("annual-task",{due:{date:"2027-03-01",is_recurring:true,string:"every year"}});
+  const history=event("history-event",{start:{date:"2026-03-01"},end:{date:"2026-03-09"},extendedProperties:{shared:{taskId:annual.id}}});
+  const h=harness(t,{events:[history],tasks:[annual]});
+  await assert.rejects(h.engine.preview(actor,intent({action:"todoist-only",taskId:annual.id,eventId:history.id,scope:"future"})),/no mapping, recurrence ownership, or stale Calendar task identity/);
+  assert.deepEqual(h.writes,[]);
+});

@@ -19,7 +19,7 @@ export interface ReviewCase {
 }
 export interface RepairIntent {
   caseId: string; profile: Profile;
-  action: "flatten" | "link" | "transfer" | "separate" | "create" | "exclude" | "decision" | "verify" | "move";
+  action: "flatten" | "todoist-only" | "link" | "transfer" | "separate" | "create" | "exclude" | "decision" | "verify" | "move";
   taskId?: string; eventId?: string;
   winner: Side | "none";
   owner?: Side; scope: "occurrence" | "series" | "future";

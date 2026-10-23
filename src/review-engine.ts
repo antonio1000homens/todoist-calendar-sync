@@ -21,6 +21,9 @@ import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 const missing = (e: unknown) => [404, 410].includes(Number((e as { status?: number }).status));
 const at = () => new Date().toISOString();
+const validAllDayDate = (value: unknown): value is string => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)
+  && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+  && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0,10) === value;
 function invalidRepairIntent(message: string): never {
   throw Object.assign(new Error(message), { status: 400 });
 }
@@ -270,7 +273,7 @@ export class ReviewEngine {
   async preview(actor: ReviewActor, intent: RepairIntent): Promise<RepairPreview> {
     const record = await this.store.getCase(intent.caseId);
     if (!record || record.profile !== intent.profile) invalidRepairIntent("Conflict not found in this profile");
-    if (!["flatten","link","transfer","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
+    if (!["flatten","todoist-only","link","transfer","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
     if (!["none","todoist","calendar"].includes(intent.winner) || !["occurrence","series","future"].includes(intent.scope)) invalidRepairIntent("Invalid field winner or recurrence scope");
     if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
     if (intent.action !== "transfer" && Object.values(intent.leftovers).includes("retain-unlinked")) invalidRepairIntent("Retain unlinked is available only during an explicit Calendar series transfer");
@@ -299,6 +302,30 @@ export class ReviewEngine {
     }
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
+    if (intent.action === "todoist-only") {
+      const taskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId);
+      const eventSnapshot = snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId);
+      if (record.status && record.status !== "open") invalidRepairIntent("Todoist-only flatten is available only for unresolved open cases");
+      if (!task || !event || !taskSnapshot || !eventSnapshot) invalidRepairIntent("Select the exact live Todoist task and historical Calendar event");
+      const dueDate = task.due?.date;
+      if (!validAllDayDate(dueDate) || task.due?.datetime || task.due?.date?.includes("T")
+        || !["RRULE:FREQ=YEARLY","RRULE:FREQ=YEARLY;INTERVAL=1"].includes(todoistRecurrenceToRrule(task) || "")) {
+        invalidRepairIntent("Todoist-only flatten requires an active all-day yearly task with a verified due date");
+      }
+      const eventDate = event.start?.date;
+      if (task.is_deleted || task.is_completed || event.status !== "confirmed" || !validAllDayDate(eventDate) || !validAllDayDate(event.end?.date)
+        || event.end.date <= eventDate || event.start?.dateTime || event.end.dateTime
+        || event.recurringEventId || event.recurrence?.length || eventDate >= dueDate) {
+        invalidRepairIntent("Select a confirmed, historical standalone all-day Calendar item before the task due date");
+      }
+      if (snapshots.length !== 2 || taskSnapshot.mapping || taskSnapshot.recurrence || eventSnapshot.mapping || eventSnapshot.recurrence
+        || event.extendedProperties?.shared?.taskId) {
+        invalidRepairIntent("Todoist-only flatten requires the selected historical Calendar item and task to have no mapping, recurrence ownership, or stale Calendar task identity");
+      }
+      if (Object.keys(intent.leftovers).some(key => key !== entityKey(eventSnapshot.ref) || intent.leftovers[key] !== "unchanged")) {
+        invalidRepairIntent("Todoist-only flatten keeps only the selected historical Calendar item unchanged");
+      }
+    }
     if (intent.action === "verify") {
       if (!task) invalidRepairIntent(`Verification requires live Todoist task ${intent.taskId || "(not selected)"}; refresh affected items and select the current pair`);
       if (!event) invalidRepairIntent(`Verification requires live Calendar event ${intent.eventId || "(not selected)"}; refresh affected items and select the current pair`);
@@ -382,6 +409,11 @@ export class ReviewEngine {
     if (event?.recurringEventId && intent.owner === "calendar" && ["link","create"].includes(intent.action)
       && masterSnapshot?.calendarProjectionId !== event.id) invalidRepairIntent("Choose the active Calendar occurrence or its master to repair this series");
     const changes: string[] = [], warnings: string[] = [];
+    if (intent.action === "todoist-only") {
+      changes.push(`Remove the yearly recurrence from Todoist task ${task!.id}; keep its current due date ${task!.due!.date}`);
+      changes.push(`Do not create or link a Calendar counterpart for Todoist task ${task!.id}`);
+      changes.push(`Leave historical Calendar event ${event!.id} byte-for-byte unchanged and exclude it from future syncing`);
+    }
     const show = (value:unknown) => value === undefined ? "unset" : typeof value === "string" ? value : JSON.stringify(value);
     const fieldChange = (label:string,before:unknown,after:unknown) => {
       if (reviewHash({value:before}) !== reviewHash({value:after})) changes.push(`${label}: ${show(before)} → ${show(after)}`);
@@ -553,7 +585,9 @@ export class ReviewEngine {
     else if (intent.action === "exclude") changes.push("Exclude the selected provider items from future syncing");
     else if (intent.action === "verify") changes.push(`Verify the existing association between task ${intent.taskId || "(none)"} and event ${intent.eventId || "(none)"} without changing provider fields`);
     else changes.push(`${intent.action}: preserve the original provider items`);
-    const chosen = new Set([intent.taskId && `todoist:${intent.taskId}`, intent.eventId && `calendar:${intent.eventId}`]);
+    const chosen = new Set(intent.action === "todoist-only"
+      ? [intent.taskId && `todoist:${intent.taskId}`]
+      : [intent.taskId && `todoist:${intent.taskId}`, intent.eventId && `calendar:${intent.eventId}`]);
     if (preview.annualPlan?.mode === "reuse-existing" && preview.annualPlan.activeInstanceId) {
       chosen.add(`calendar:${preview.annualPlan.activeInstanceId}`);
       chosen.add(`calendar:${preview.annualPlan.masterId}`);
@@ -572,8 +606,11 @@ export class ReviewEngine {
       const selectedProjection = s.ref.side === "calendar" && seriesProjections.has(s.ref.id);
       if (selectedProjection && intent.leftovers[entityKey(s.ref)]) invalidRepairIntent("An occurrence handled by a series repair cannot have a separate disposition");
       if (intent.action === "flatten" && s.mapping && s.ref.side === "calendar" && (s.object as CalendarEvent|null)?.status === "cancelled") continue;
+      if (intent.action === "todoist-only" && selected && s.ref.side === "todoist") continue;
       if (["flatten","link","transfer"].includes(intent.action) && selected || selectedProjection || ["decision","verify","move"].includes(intent.action) || masterOfSelected) continue;
-      const disposition = intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
+      const todoistHistory = intent.action === "todoist-only" && s.ref.side === "calendar" && s.ref.id === intent.eventId;
+      const disposition = todoistHistory ? "unchanged"
+        : intent.action === "exclude" && selected ? "exclude" : intent.action === "create" && selected ? "create" : intent.leftovers[entityKey(s.ref)];
       if (s.object && !disposition) invalidRepairIntent(`Choose Create counterpart, Exclude, Leave unchanged, or Retain unlinked for ${entityKey(s.ref)}`);
       if (s.object && disposition === "create") {
         if (s.ref.side === "todoist") {
@@ -595,7 +632,9 @@ export class ReviewEngine {
       const selected = chosen.has(`${s.ref.side}:${s.ref.id}`);
       const projection = s.ref.side === "calendar" && seriesProjections.has(s.ref.id);
       const parent = s.ref.side === "calendar" && event?.recurringEventId === s.ref.id;
-      const disposition = intent.action === "exclude" && selected ? "exclude"
+      const todoistHistory = intent.action === "todoist-only" && s.ref.side === "calendar" && s.ref.id === intent.eventId;
+      const disposition = todoistHistory ? "unchanged"
+        : intent.action === "exclude" && selected ? "exclude"
         : intent.action === "create" && selected ? "create" : intent.leftovers[key];
       let operation: string, result: string;
       if (intent.action === "flatten" && s.ref.side === "calendar" && s.ref.id === preview.flattenPlan!.standaloneId && !s.object) {
@@ -616,6 +655,12 @@ export class ReviewEngine {
       } else if (intent.action === "verify") {
         operation = "Verify existing association";
         result = "Retain verified mapping; no provider fields changed";
+      } else if (intent.action === "todoist-only" && s.ref.side === "todoist" && selected) {
+        operation = "Make the Todoist task a one-off and exclude it from Calendar projection";
+        result = `Keep due date ${task!.due!.date}; remove only its recurrence and retain the Calendar history unlinked`;
+      } else if (todoistHistory) {
+        operation = "Retain historical Calendar item and exclude it from syncing";
+        result = "Preserve the provider object byte-for-byte; prevent it from importing or linking a Todoist counterpart";
       } else if (intent.action === "decision") {
         operation = "Apply existing guarded decision";
         result = "See decision executor details in planned changes";
@@ -916,6 +961,49 @@ export class ReviewEngine {
         bindings.set(entityKey({profile:intent.profile,side:"todoist",id:currentTask.id}),currentEvent.id);
         bindings.set(entityKey({profile:intent.profile,side:"calendar",id:currentEvent.id}),currentTask.id);
         recordVerified(mapping);
+      } else if (intent.action === "todoist-only") {
+        if (!originalTask || !originalEvent) throw new Error("Missing approved Todoist-only flatten items");
+        const dueDate = originalTask.due?.date;
+        if (!dueDate) throw new Error("The approved Todoist task no longer has its one-off due date");
+        const [preflightTask,preflightEvent] = await Promise.all([
+          pair.todoist.getTask(originalTask.id), pair.calendar.getEvent(originalEvent.id),
+        ]);
+        if (reviewHash(preflightTask) !== reviewHash(originalTask) || reviewHash(preflightEvent) !== reviewHash(originalEvent)) {
+          throw new Error("Todoist task or historical Calendar item changed after preview; refresh affected items");
+        }
+        await step(`todoist-only-exclude:${originalTask.id}`, async () => {
+          await this.controls.exclude({profile:intent.profile,side:"todoist",id:originalTask.id},true,id);
+          return true;
+        });
+        await step(`todoist-only-exclude-history:${originalEvent.id}`, async () => {
+          await this.controls.exclude({profile:intent.profile,side:"calendar",id:originalEvent.id},true,id);
+          return true;
+        });
+        const flattened = await step(`todoist-only-task:${originalTask.id}`, async () => {
+          const live = await pair.todoist.getTask(originalTask.id);
+          if (!live.due?.is_recurring && live.due?.date === dueDate && !live.due?.datetime) return live;
+          const {id:_id,...payload} = live;
+          payload.due = {date:dueDate};
+          const updated = await trackedWrite(intent.profile, () => pair.todoist.upsertTask(payload,live.id));
+          if (updated.due?.is_recurring || updated.due?.datetime || updated.due?.date !== dueDate) {
+            throw new Error("Todoist did not confirm the approved one-off due date");
+          }
+          return updated;
+        });
+        await step(`todoist-only-version-fence:${flattened.id}`, async () => {
+          await state.acceptTaskVersion(intent.profile,flattened.id,flattened.updated_at,`review:${id}`);
+          return true;
+        });
+        const [finalTask,finalEvent] = await Promise.all([
+          pair.todoist.getTask(flattened.id), pair.calendar.getEvent(originalEvent.id),
+        ]);
+        if (finalTask.due?.is_recurring || finalTask.due?.datetime || finalTask.due?.date !== dueDate
+          || finalEvent.id !== originalEvent.id || reviewHash(finalEvent) !== reviewHash(originalEvent)) {
+          throw new Error("Todoist-only flatten or unchanged Calendar history failed readback verification");
+        }
+        if (!(await this.controls.control({profile:intent.profile,side:"todoist",id:flattened.id}))?.excluded) {
+          throw new Error("Todoist-only projection exclusion did not persist");
+        }
       } else if (intent.action === "transfer") {
         const master = originalEvent;
         const targetTask = originalTask;
@@ -1157,7 +1245,8 @@ export class ReviewEngine {
           if (reviewHash(current.object)!==reviewHash(snapshot.object) || current.mapping) throw new Error("Displaced cancelled Calendar object changed during flatten");
           outcomes.push({entity:entityKey(snapshot.ref),outcome:"history",checkedAt:at()});continue;
         }
-        const disposition=intent.leftovers[entityKey(snapshot.ref)];
+        const disposition=intent.action === "todoist-only" && snapshot.ref.side === "calendar" && snapshot.ref.id === intent.eventId
+          ? "unchanged" : intent.leftovers[entityKey(snapshot.ref)];
         if(disposition==="unchanged"){
           const current=await this.snapshot(snapshot.ref);
           if(reviewHash(current.object)!==reviewHash(operation.expectedProviders?.[entityKey(snapshot.ref)]??snapshot.object)

@@ -69,7 +69,7 @@ async function authenticate(event: LambdaFunctionURLEvent, requireSameOrigin: bo
 function selectedIntent(body: Record<string, unknown>, caseId: string, selectedProfile: Profile): RepairIntent {
   const allowed = ["caseId","profile","action","taskId","eventId","winner","owner","scope","leftovers","decisionAction","targetProfile"];
   if (Object.keys(body).some(key => !allowed.includes(key))) fail(400, "Unsupported repair fields");
-  if (!["flatten","link","transfer","separate","create","exclude","decision","verify","move"].includes(String(body.action))) fail(400,"Invalid repair action");
+  if (!["flatten","todoist-only","link","transfer","separate","create","exclude","decision","verify","move"].includes(String(body.action))) fail(400,"Invalid repair action");
   if (!["none","todoist","calendar"].includes(String(body.winner))) fail(400,"Invalid field winner");
   if (!["occurrence","series","future"].includes(String(body.scope))) fail(400,"Invalid recurrence scope");
   if (body.owner !== undefined && !["todoist","calendar"].includes(String(body.owner))) fail(400,"Invalid recurrence owner");
