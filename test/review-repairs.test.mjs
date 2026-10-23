@@ -859,8 +859,10 @@ test("fresh preview supersedes a failed selected-pair mismatch only when validat
 
 test("fresh preview refuses a partial-write failure and preserves its resume barrier", async t => {
   const h=harness(t),preview=await h.engine.preview(actor,intent());
+  const eventSnapshot=preview.snapshots.find(snapshot=>snapshot.ref.side==="calendar");
   const partial={id:"partial-repair",status:"failed",attempt:1,
-    steps:{validated:{id:"validated",status:"done"},"calendar-write":{id:"calendar-write",status:"done"}},
+    steps:{validated:{id:"validated",status:"done"}},
+    expectedProviders:{[refKey(eventSnapshot.ref)]:{...eventSnapshot.object,summary:"written before the later failure"}},
     preview,error:"Todoist update failed after Calendar write",notificationPending:false};
   h.operations.set(partial.id,partial);
   for(const snapshot of preview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:partial.id});
@@ -869,7 +871,8 @@ test("fresh preview refuses a partial-write failure and preserves its resume bar
 
   assert.equal(h.calls.filter(call=>call[0]==="release-unapplied").length,0);
   assert.ok(preview.snapshots.every(snapshot=>h.controlsMap.get(refKey(snapshot.ref)).activeRepair===partial.id));
-  assert.equal(h.operations.get(partial.id).steps["calendar-write"].status,"done");
+  assert.equal(h.operations.get(partial.id).steps.validated.status,"done");
+  assert.equal(h.operations.get(partial.id).expectedProviders[refKey(eventSnapshot.ref)].summary,"written before the later failure");
 });
 
 test("superseded preview rereads current provider versions and the new operation rejects a later edit", async t => {

@@ -56,11 +56,21 @@ export interface RepairOperation {
   creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;
 }
 export function operationHasWriteEvidence(operation: RepairOperation): boolean {
+  const snapshotObjects = new Map((operation.preview?.snapshots || []).map(snapshot => [entityKey(snapshot.ref), snapshot.object ?? null]));
+  const providerProgress = Object.entries(operation.expectedProviders || {}).some(([key, object]) =>
+    !snapshotObjects.has(key) || stableOperationValue(object) !== stableOperationValue(snapshotObjects.get(key)));
   return operation.writeStarted === true
     || Object.keys(operation.steps || {}).some(name => name !== "validated")
     || Object.keys(operation.creations || {}).length > 0
+    || providerProgress
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
+}
+function stableOperationValue(value: unknown): string {
+  const normalize = (item: unknown): unknown => Array.isArray(item) ? item.map(normalize)
+    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b)).map(([key, child])=>[key,normalize(child)]))
+    : item;
+  return JSON.stringify(normalize(value)) ?? "undefined";
 }
 export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean; preserveControlState?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }

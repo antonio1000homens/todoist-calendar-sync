@@ -97,11 +97,24 @@ export function repairValidationField(message) {
 // Failed operation status alone does not prove that resuming can do useful work.
 // A validated checkpoint is read-only; any other started checkpoint may have
 // crossed a side-effect boundary and must retain its existing recovery path.
+function stableOperationValue(value) {
+  const normalize = item => Array.isArray(item) ? item.map(normalize)
+    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b)).map(([key, child])=>[key,normalize(child)]))
+    : item;
+  return JSON.stringify(normalize(value)) ?? "undefined";
+}
 export function operationResumeEligibility(operation) {
   if (!operation || !["failed", "needs_review", "queued"].includes(operation.status)) return "none";
   const steps = operation.steps || {};
+  const snapshotObjects = new Map((operation.preview?.snapshots || []).map(snapshot => [
+    `${snapshot.ref.profile}:${snapshot.ref.side}:${snapshot.ref.id}`, snapshot.object ?? null,
+  ]));
+  const providerProgress = Object.entries(operation.expectedProviders || {}).some(([key, object]) =>
+    !snapshotObjects.has(key) || stableOperationValue(object) !== stableOperationValue(snapshotObjects.get(key)));
   const hasWriteEvidence = Object.keys(steps).some(name => name !== "validated")
     || Object.values(operation.creations || {}).length > 0
+    || providerProgress
+    || operation.writeStarted === true
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
   if (operation.abandoned) return hasWriteEvidence ? "none" : "fresh-preview";
