@@ -53,6 +53,7 @@ export interface ReconciliationState {
   lastCompletedAt?: string;
   lastFailedAt?: string;
   lastError?: string;
+  failureContext?: { category: string; stage?: string; status?: number; taskId?: string; eventId?: string; seriesId?: string };
   status?: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   requester?: string;
   slackChannelId?: string;
@@ -66,6 +67,21 @@ export interface ReconciliationState {
   notificationText?: string;
   notificationReplyTs?: string;
   lastHealthAlertAt?: string;
+  /** Last durable worker checkpoint and accepted continuation identity. */
+  progressCheckpoint?: {
+    phase?: "mapped" | "unmapped" | "calendar";
+    sequence?: number;
+    deliveryId?: string;
+    nextDeliveryId?: string;
+    afterTaskId?: string;
+    afterEventId?: string;
+    observedAt: string;
+  };
+  nextContinuation?: { phase: "mapped" | "unmapped" | "calendar"; sequence: number; deliveryId: string;
+    afterTaskId?: string; afterEventId?: string };
+  queueState?: "accepted" | "running" | "terminal";
+  lastDeliveryId?: string;
+  lastStartedDeliveryId?: string;
   pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
   /** Refreshes requested after this run started; they require a fresh generation. */
   followUpRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
@@ -356,19 +372,25 @@ export class StateRepository {
     throw new Error(`Unable to request reconciliation for ${profile} because state changed repeatedly`);
   }
 
-  async markReconciliationEnqueued(profile: Profile, generation: string): Promise<void> {
+  async markReconciliationEnqueued(profile: Profile, generation: string, deliveryId?: string,
+    nextContinuation?: ReconciliationState["nextContinuation"]): Promise<void> {
     try {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET lastEnqueuedAt = :now, expiresAt = :expiresAt",
+        UpdateExpression: "SET lastEnqueuedAt = :now, queueState = :accepted, expiresAt = :expiresAt"
+          + (deliveryId ? ", lastDeliveryId = :deliveryId" : "")
+          + (nextContinuation ? ", nextContinuation = :nextContinuation" : ""),
         ConditionExpression: "#pending = :true AND generation = :generation",
         ExpressionAttributeNames: { "#pending": "pending" },
         ExpressionAttributeValues: {
           ":true": true,
           ":generation": generation,
           ":now": now(),
+          ":accepted": "accepted",
           ":expiresAt": ttl(30),
+          ...(deliveryId ? { ":deliveryId": deliveryId } : {}),
+          ...(nextContinuation ? { ":nextContinuation": nextContinuation } : {}),
         },
       }));
     } catch (error) {
@@ -376,12 +398,13 @@ export class StateRepository {
     }
   }
 
-  async beginReconciliation(profile: Profile, generation: string): Promise<boolean> {
+  async beginReconciliation(profile: Profile, generation: string, deliveryId?: string): Promise<boolean> {
     try {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
-        UpdateExpression: "SET lastStartedAt = :now, lastProgressAt = :now, #status = :running, expiresAt = :expiresAt REMOVE lastHealthAlertAt",
+        UpdateExpression: "SET lastStartedAt = :now, lastProgressAt = :now, #status = :running, queueState = :running, expiresAt = :expiresAt"
+          + (deliveryId ? ", lastStartedDeliveryId = :deliveryId" : "") + " REMOVE lastHealthAlertAt",
         ConditionExpression: "#pending = :true AND generation = :generation AND attribute_not_exists(lastFailedAt)",
         ExpressionAttributeNames: { "#pending": "pending", "#status": "status" },
         ExpressionAttributeValues: {
@@ -389,6 +412,7 @@ export class StateRepository {
           ":generation": generation,
           ":running": "running",
           ":now": now(),
+          ...(deliveryId ? { ":deliveryId": deliveryId } : {}),
           ":expiresAt": ttl(30),
         },
       }));
@@ -399,17 +423,22 @@ export class StateRepository {
     }
   }
 
-  async addReconciliationProgress(profile: Profile, generation: string, counts: Record<string, number>): Promise<void> {
+  async addReconciliationProgress(
+    profile: Profile, generation: string, counts: Record<string, number>,
+    checkpoint?: ReconciliationState["progressCheckpoint"],
+  ): Promise<void> {
     const current = await this.getReconciliationState(profile);
     if (!current || current.generation !== generation || !current.pending) return;
     const aggregate = { ...(current.result || {}) };
     for (const [name, count] of Object.entries(counts)) aggregate[name] = (aggregate[name] || 0) + count;
     await client.send(new UpdateCommand({
       TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
-      UpdateExpression: "SET #result = :result, lastProgressAt = :now, expiresAt = :expiresAt REMOVE lastHealthAlertAt",
+      UpdateExpression: "SET #result = :result, lastProgressAt = :now, expiresAt = :expiresAt"
+        + (checkpoint ? ", progressCheckpoint = :checkpoint" : "") + " REMOVE lastHealthAlertAt",
       ConditionExpression: "#pending = :true AND generation = :generation",
       ExpressionAttributeNames: { "#pending": "pending", "#result": "result" },
-      ExpressionAttributeValues: { ":result": aggregate, ":now": now(), ":expiresAt": ttl(30), ":true": true, ":generation": generation },
+      ExpressionAttributeValues: { ":result": aggregate, ":now": now(), ":expiresAt": ttl(30), ":true": true, ":generation": generation,
+        ...(checkpoint ? { ":checkpoint": { ...checkpoint, observedAt: now() } } : {}) },
     }));
   }
 
@@ -484,25 +513,29 @@ export class StateRepository {
       pending: false, status, unresolved, result: counts, lastCompletedAt: completedAt,
       lastProgressAt: completedAt, notificationText,
     }, {
-      UpdateExpression: "SET #pending = :false, #status = :status, unresolved = :unresolved, #result = :result, lastCompletedAt = :now, lastProgressAt = :now, notificationPending = :true, notificationText = :notification, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
+      UpdateExpression: "SET #pending = :false, #status = :status, queueState = :terminal, unresolved = :unresolved, #result = :result, lastCompletedAt = :now, lastProgressAt = :now, notificationPending = :true, notificationText = :notification, expiresAt = :expiresAt REMOVE lastEnqueuedAt, lastStartedAt, lastFailedAt, lastError",
       ExpressionAttributeNames: { "#pending": "pending", "#status": "status", "#result": "result" },
       ExpressionAttributeValues: {
-        ":true": true, ":false": false, ":status": status, ":unresolved": unresolved, ":result": counts,
+        ":true": true, ":false": false, ":status": status, ":terminal": "terminal", ":unresolved": unresolved, ":result": counts,
         ":notification": notificationText, ":generation": generation, ":now": completedAt, ":expiresAt": ttl(30),
       },
     });
   }
 
-  async recordReconciliationFailure(profile: Profile, generation: string, message: string): Promise<void> {
+  async recordReconciliationFailure(profile: Profile, generation: string, message: string,
+    failureContext?: ReconciliationState["failureContext"]): Promise<void> {
     const failedAt = now();
     const lastError = message.slice(0, 1000);
     await this.saveReconciliationOutcome(profile, generation, {
       status: "failed", lastFailedAt: failedAt, lastProgressAt: failedAt, lastError, notificationText: lastError,
+      ...(failureContext ? { failureContext } : {}),
     }, {
-      UpdateExpression: "SET lastFailedAt = :now, lastProgressAt = :now, #status = :failed, lastError = :message, notificationPending = :true, notificationText = :message, expiresAt = :expiresAt",
+      UpdateExpression: "SET lastFailedAt = :now, lastProgressAt = :now, #status = :failed, queueState = :terminal, lastError = :message, notificationPending = :true, notificationText = :message, expiresAt = :expiresAt"
+        + (failureContext ? ", failureContext = :failureContext" : ""),
       ExpressionAttributeNames: { "#pending": "pending", "#status": "status" },
       ExpressionAttributeValues: {
-        ":true": true, ":generation": generation, ":now": failedAt, ":message": lastError, ":failed": "failed", ":expiresAt": ttl(30),
+        ":true": true, ":generation": generation, ":now": failedAt, ":message": lastError, ":failed": "failed", ":terminal": "terminal", ":expiresAt": ttl(30),
+        ...(failureContext ? { ":failureContext": failureContext } : {}),
       },
     });
   }

@@ -6,6 +6,7 @@ import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import type { Delivery, Profile } from "./types.js";
+import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 
 const REVIEW_ORIGIN = "https://calendar-sync.alf-broadcast.co.uk";
@@ -101,6 +102,18 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
 function assertOwned(subject: string, owner: string): void {
   if (subject !== owner) fail(403, "This record belongs to another review operator");
 }
+export function reconciliationAlertRelation(
+  alertedGeneration: unknown, observedAt: unknown, current?: ReconciliationState,
+): "unavailable" | "different_generation" | "completed_since_alert" | "failed_since_alert" | "progressed_since_alert" | "same_generation" {
+  if (!current || typeof alertedGeneration !== "string") return "unavailable";
+  if (current.generation !== alertedGeneration) return "different_generation";
+  const alertTime = typeof observedAt === "string" ? Date.parse(observedAt) : Number.NaN;
+  if (Number.isFinite(alertTime) && !current.pending && current.lastCompletedAt
+    && Date.parse(current.lastCompletedAt) > alertTime) return "completed_since_alert";
+  if (Number.isFinite(alertTime) && current.lastFailedAt && Date.parse(current.lastFailedAt) > alertTime) return "failed_since_alert";
+  if (Number.isFinite(alertTime) && current.lastProgressAt && Date.parse(current.lastProgressAt) > alertTime) return "progressed_since_alert";
+  return "same_generation";
+}
 async function enqueueRepair(operationId: string, selectedProfile: Profile, attempt: number): Promise<void> {
   const delivery: Delivery = { id:`repair:${operationId}:attempt:${attempt}`, kind:"repair", profile:selectedProfile, mode:"aws",
     receivedAt:new Date().toISOString(), headers:{}, body:"", repair:{operationId} };
@@ -134,7 +147,23 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
         eventId:item.eventId || (typeof item.decision?.context?.providerEventId === "string" ? item.decision.context.providerEventId : undefined),
         winner:"none", scope:"occurrence", leftovers:{} };
       const snapshots = await new ReviewEngine(store).collect(intent,item.decision);
-      return response(200,{item,snapshots});
+      const reconciliation = item.decision?.type === "operational_reconciliation_stuck"
+        ? await new StateRepository().getReconciliationState(item.profile) : undefined;
+      const alertedGeneration = item.reconciliationGeneration || item.decision?.context?.reconciliationGeneration;
+      const observedAt = item.decision?.context?.observedAt;
+      const liveRelation = reconciliationAlertRelation(alertedGeneration, observedAt, reconciliation);
+      const liveRun = reconciliation ? {
+        generation: reconciliation.generation, pending: reconciliation.pending, status: reconciliation.status,
+        requestedAt: reconciliation.requestedAt, lastEnqueuedAt: reconciliation.lastEnqueuedAt,
+        lastStartedAt: reconciliation.lastStartedAt, lastProgressAt: reconciliation.lastProgressAt,
+        lastCompletedAt: reconciliation.lastCompletedAt, lastFailedAt: reconciliation.lastFailedAt,
+        queueState: reconciliation.queueState, lastDeliveryId: reconciliation.lastDeliveryId,
+        lastStartedDeliveryId: reconciliation.lastStartedDeliveryId,
+        progressCheckpoint: reconciliation.progressCheckpoint, nextContinuation: reconciliation.nextContinuation,
+        result: reconciliation.result, failureContext: reconciliation.failureContext,
+      } : undefined;
+      return response(200,{item,snapshots,...(item.decision?.type === "operational_reconciliation_stuck"
+        ? { reconciliation: { run: liveRun, relationToAlert: liveRelation, observedAt: new Date().toISOString() } } : {})});
     }
     if (method === "GET" && segments[0] === "search" && segments.length === 1) {
       const selectedProfile = profile(event.queryStringParameters?.profile || null);
