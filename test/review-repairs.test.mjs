@@ -84,6 +84,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const stateMethods = {
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async listCompletedCalendarProjectionsByTaskAnyProfile() { return []; },
     async getCalendarProjectionTombstone() { return undefined; },
     async getConsolidatedTask() { return undefined; },
     async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
