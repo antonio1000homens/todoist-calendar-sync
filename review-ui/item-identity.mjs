@@ -40,7 +40,7 @@ export function dispositionOptions(value, action) {
   if (!identity.identified) return [];
   const ordinary = identity.selectable ? ["create", "exclude", "unchanged"] : ["exclude", "unchanged"];
   return action === "transfer" && value?.ref?.side === "todoist" && value?.mapping?.recurrenceOwner === "calendar"
-    ? [...ordinary, "retain-unlinked"] : ordinary;
+    ? [...(identity.selectable ? ["create", "exclude"] : ["exclude"]), "retain-unlinked"] : ordinary;
 }
 
 export function scopeLabel(scope) {

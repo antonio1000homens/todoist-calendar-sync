@@ -366,11 +366,39 @@ test("Calendar-owned series transfer preserves the recurring birthday task and a
   assert.equal(h.taskMap.get(f.displaced.id).content,f.displaced.content);
   assert.deepEqual(h.eventMap.get(f.standalone.id),f.standalone);
   assert.ok(result.outcomes.some(row=>row.entity==="home:todoist:old-oneoff"&&row.outcome==="retained-unlinked"));
+  assert.equal(h.controlsMap.get("home:todoist:old-oneoff")?.excluded,true,"retained task must have a durable task-level reprojection fence");
   assert.ok(result.outcomes.some(row=>row.entity==="home:calendar:birthday-standalone"&&row.outcome==="unchanged"));
   assert.equal(h.writes.some(row=>row[0]==="task"||row[0]==="create-task"||row[0]==="create-event"),false);
   const writes=h.writes.length;
   assert.equal((await h.engine.execute("repair")).status,"succeeded");
   assert.equal(h.writes.length,writes,"repeated delivery does not create another counterpart or rewrite recurrence");
+});
+
+test("series transfer refuses an unowned Calendar recurrence without a recurrence link or ownership metadata",async t=>{
+  const f=birthdayTransferFixture();
+  f.master={...f.master,extendedProperties:{shared:{taskId:f.displaced.id}}};
+  f.active={...f.active,extendedProperties:{shared:{taskId:f.displaced.id}}};
+  const h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping]});
+  await assert.rejects(h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+  })),/verified Calendar ownership signal/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("series transfer rejects an unchanged disposition for its displaced mapping during preview",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  await assert.rejects(h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"unchanged","home:calendar:birthday-standalone":"unchanged",
+  })),/explicit disposition for the exact displaced Todoist task/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("series transfer discovers same-date standalone duplicates from other years",async t=>{
+  const f=birthdayTransferFixture(),prior=event("birthday-standalone-2026",{summary:f.annual.content,
+    start:{date:"2026-07-17"},end:{date:"2026-07-18"}});
+  const h=harness(t,{events:[f.master,f.active,prior],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const snapshots=await h.engine.collect(transferIntent(f,{}),undefined);
+  assert.ok(snapshots.some(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id===prior.id));
 });
 
 test("series transfer rejects stale or competing recurrence ownership before provider writes",async t=>{

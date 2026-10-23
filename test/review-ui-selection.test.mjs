@@ -104,6 +104,7 @@ test("a missing Todoist or Calendar disposition triggers an affected-items refre
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for work:calendar:master_20270301"),"work:calendar:master_20270301");
   for (const ref of ["home:todoist:task-1", "work:calendar:master_20270301", "antonio:calendar:occurrence_20270301T090000Z"]) {
     assert.equal(missingDispositionReference(`Choose Create counterpart, Exclude, or Leave unchanged for ${ref}`), ref);
+    assert.equal(missingDispositionReference(`Choose Create counterpart, Exclude, Leave unchanged, or Retain unlinked for ${ref}`), ref);
   }
   assert.equal(missingDispositionReference("Mapping does not match the selected pair"),undefined);
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:calendar:"),undefined);

@@ -147,3 +147,18 @@ test("atomic abandonment rejects concurrent late pending-refresh changes",async 
   assert.equal(pending.ExpressionAttributeValues[":pendingAt"],"generation-1");
   assert.equal(pending.ExpressionAttributeValues[":pendingTrue"],true);
 });
+
+test("successful no-op releases only its temporary barrier without changing sync-control fields",async t=>{
+  const commands=[];
+  const store=new ReviewStore();
+  store.getCase=async()=>({id:"case",profile:"home",createdAt:"2026-10-23T00:00:00.000Z"});
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  const ref={profile:"home",side:"calendar",id:"unchanged-event"};
+  await store.finalizeOperation({id:"repair",status:"running",updatedAt:"2026-10-23T00:00:00.000Z",steps:{},preview:{intent:{caseId:"case",profile:"home",action:"link"},case:{id:"case",createdAt:"2026-10-23T00:00:00.000Z"}}},[
+    {ref,preserveControlState:true},
+  ]);
+  const update=commands[0].input.TransactItems[0].Update;
+  assert.equal(update.UpdateExpression,"REMOVE activeRepair");
+  assert.equal(update.ConditionExpression,"activeRepair = :id");
+  assert.deepEqual(update.ExpressionAttributeValues,{":id":"repair"});
+});
