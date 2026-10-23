@@ -108,6 +108,8 @@ class FakeState {
   async audit(_profile, action, detail) { this.audits.push({ action, detail }); }
 }
 
+let currentTodoistTask;
+
 function fixture() {
   const state = new FakeState(mapping());
   const events = new Map([[MASTER_ID, masterEvent()]]);
@@ -142,12 +144,13 @@ function fixture() {
     },
     async deleteEvent() {},
   };
-  const todoist = {};
+  const todoist = { async getTask() { return structuredClone(currentTodoistTask); } };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
   return { state, sync, upserts };
 }
 
 function delivery(task, oldTask, updateIntent = "item_updated") {
+  currentTodoistTask = task;
   return {
     id: `delivery-${task.updated_at}-${updateIntent}`,
     kind: "todoist",

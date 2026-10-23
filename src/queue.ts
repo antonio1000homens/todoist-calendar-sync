@@ -1,5 +1,6 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
+import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
@@ -17,12 +18,32 @@ export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kin
 }
 
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
-  await queue.send(new SendMessageCommand({
-    QueueUrl: queueUrl(),
-    MessageBody: JSON.stringify(delivery),
-    MessageGroupId: syncMessageGroupId(delivery.profile),
-    MessageDeduplicationId: messageDeduplicationId(delivery),
-  }));
+  const protocolEnabled = process.env.ERASURE_PROTOCOL_VERSION === "1";
+  let epoch: number | undefined;
+  let release: (() => Promise<void>) | undefined;
+  if (protocolEnabled) {
+    while (!release) {
+      epoch = await getErasureEpoch(delivery.profile);
+      try {
+        release = await acquireErasureProtocolLease(delivery.profile, "admission", undefined, epoch);
+      } catch (error) {
+        if (!(error instanceof ErasureEpochChangedError)) throw error;
+      }
+    }
+  }
+  try {
+    const admittedDelivery = protocolEnabled
+      ? { ...delivery, erasureEpoch: epoch }
+      : delivery;
+    await queue.send(new SendMessageCommand({
+      QueueUrl: queueUrl(),
+      MessageBody: JSON.stringify(admittedDelivery),
+      MessageGroupId: syncMessageGroupId(admittedDelivery.profile),
+      MessageDeduplicationId: messageDeduplicationId(admittedDelivery),
+    }));
+  } finally {
+    await release?.();
+  }
 }
 
 export interface ReconciliationRequestResult {

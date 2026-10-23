@@ -1,11 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
+import {readFileSync} from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import {planPurge, fingerprint, publicInventoryRecord} from "../scripts/item-purge-policy.mjs";
 
 test("standalone purge CLI parses without provider execution",()=>{
  assert.doesNotThrow(()=>execFileSync(process.execPath,["--check","scripts/purge-item.mjs"]));
+});
+test("purge keeps its recovery journal through mapping restore and final commit",()=>{
+ const source=readFileSync(new URL("../scripts/purge-item.mjs",import.meta.url),"utf8");
+ const restore=source.lastIndexOf("await restoreWorkerMappings(enabledMappings)");
+ const finish=source.lastIndexOf("await finishErasureProtocol(profile,operationId,journalKey)");
+ assert.ok(restore>=0 && finish>restore,"mapping restoration must precede journal/fence deletion");
+ assert.match(source.slice(restore,finish),/restoreWorkerMappings/);
+ assert.match(source.slice(finish,source.indexOf("} finally",finish)),/catch \(error\)/);
 });
 test("occurrence inventory flags cannot enter a destructive apply path",()=>{
  const env={...process.env}; delete env.STATE_TABLE_NAME;
@@ -191,6 +200,26 @@ test("identity-free and target-linked pending deliveries are classified and bloc
  assert.equal(plan.counts.unattributable,1);
  assert.equal(plan.counts["selected-only"],1);
  assert.equal(plan.blockers.length,2);
+});
+
+test("new delivery receipts are attributable by exact references but remain replay blockers",()=>{
+ const rows=[
+  record("DELIVERY#exact","COMPLETED",{profile:"home",kind:"todoist",identityRefs:{taskIds:["task-123"],eventIds:[],seriesIds:[]}}),
+  record("DELIVERY#other","COMPLETED",{profile:"home",kind:"calendar",identityRefs:{taskIds:["other-task"],eventIds:["other-event"],seriesIds:[]}}),
+ ];
+ const plan=planPurge(rows,target);
+ assert.deepEqual(plan.records.map(item=>item.pk),["DELIVERY#exact"]);
+ assert.equal(plan.records[0].classification,"selected-only");
+ assert.equal(plan.blockers.length,1);
+ assert.match(plan.blockers[0],/replayable/);
+});
+
+test("legacy receipts without exact refs remain blockers until their retention expires",()=>{
+ const plan=planPurge([
+  record("DELIVERY#legacy","COMPLETED",{profile:"home",kind:"todoist"}),
+ ],target);
+ assert.equal(plan.records[0].classification,"unattributable");
+ assert.match(plan.blockers[0],/no exact selected provider identity/);
 });
 
 test("public inventory rows expose the same classifications as their summary counts",()=>{

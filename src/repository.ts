@@ -229,7 +229,12 @@ export class StateRepository {
     return Boolean(result.Item);
   }
 
-  async markDeliveryCompleted(id: string, profile: Profile, kind: string): Promise<void> {
+  async markDeliveryCompleted(
+    id: string,
+    profile: Profile,
+    kind: string,
+    identityRefs: { taskIds?: string[]; eventIds?: string[]; seriesIds?: string[]; generation?: string } = {},
+  ): Promise<void> {
     const completedAt = now();
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
@@ -237,6 +242,12 @@ export class StateRepository {
         ...key(`DELIVERY#${id}`, "COMPLETED"),
         profile,
         kind,
+        identityRefs: {
+          taskIds: [...new Set(identityRefs.taskIds || [])].sort(),
+          eventIds: [...new Set(identityRefs.eventIds || [])].sort(),
+          seriesIds: [...new Set(identityRefs.seriesIds || [])].sort(),
+          ...(identityRefs.generation ? { generation: identityRefs.generation } : {}),
+        },
         completedAt,
         expiresAt: ttl(14),
       },

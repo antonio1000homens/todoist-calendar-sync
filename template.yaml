@@ -118,6 +118,7 @@ Globals:
     Environment:
       Variables:
         STATE_TABLE_NAME: !Ref SyncState
+        ERASURE_PROTOCOL_VERSION: "1"
         QUEUE_URL: !Ref SyncQueue
         SYNC_PROFILE_CONFIG_JSON: !Ref ProfileConfigJson
         CALENDAR_WATCH_TOKEN_PARAMETER: !Ref CalendarWatchTokenParameter

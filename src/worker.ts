@@ -19,6 +19,8 @@ import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
+import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
+import { logEvent } from "./observability.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 
@@ -350,12 +352,63 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let delivery: Delivery | undefined;
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
+    let releaseWriterLease: (() => Promise<void>) | undefined;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
     try {
       delivery = JSON.parse(record.body) as Delivery;
       state = new StateRepository();
+      if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
+        while (!releaseWriterLease) {
+          const currentErasureEpoch = await getErasureEpoch(delivery.profile);
+          if ((delivery.erasureEpoch ?? 0) !== currentErasureEpoch) {
+            logEvent("stale_erasure_epoch_delivery_dropped", { profile: delivery.profile, deliveryEpoch: delivery.erasureEpoch ?? 0, currentEpoch: currentErasureEpoch });
+            break;
+          }
+          try {
+            releaseWriterLease = await acquireErasureProtocolLease(
+              delivery.profile,
+              "writer",
+              `${context.awsRequestId}:${record.messageId}`,
+              currentErasureEpoch,
+            );
+          } catch (error) {
+            if (!(error instanceof ErasureEpochChangedError)) throw error;
+          }
+        }
+        if (!releaseWriterLease) {
+          continue;
+        }
+      }
       manual = new ManualInterventionService();
+      const identityRefs = { taskIds: new Set<string>(), eventIds: new Set<string>(), seriesIds: new Set<string>(), generation: delivery.reconcile?.generation };
+      const collectIdentityRefs = (value: unknown, field = ""): void => {
+        if (Array.isArray(value)) {
+          if (field === "candidateTaskIds" || field === "taskIds") for (const id of value) if (typeof id === "string") identityRefs.taskIds.add(id);
+          if (field === "candidateEventIds" || field === "eventIds") for (const id of value) if (typeof id === "string") identityRefs.eventIds.add(id);
+          for (const item of value) collectIdentityRefs(item, field);
+          return;
+        }
+        if (!value || typeof value !== "object") return;
+        for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
+          if (typeof item === "string" && ["taskId", "providerTaskId", "linkedTaskId", "ownerTaskId"].includes(name)) identityRefs.taskIds.add(item);
+          if (typeof item === "string" && ["eventId", "providerEventId", "masterEventId", "activeInstanceId", "occurrenceId", "selectedEventId"].includes(name)) identityRefs.eventIds.add(item);
+          if (typeof item === "string" && name === "seriesId") identityRefs.seriesIds.add(item);
+          collectIdentityRefs(item, name);
+        }
+      };
+      if (delivery.kind === "todoist") {
+        try { collectIdentityRefs(JSON.parse(delivery.body).event_data); } catch { /* malformed deliveries are retained for operator review */ }
+      }
+      if (delivery.kind === "orphan" && delivery.orphan) collectIdentityRefs(delivery.orphan);
+      if (delivery.manual?.targetId) {
+        if (delivery.manual.targetType === "task") identityRefs.taskIds.add(delivery.manual.targetId);
+        if (delivery.manual.targetType === "event") identityRefs.eventIds.add(delivery.manual.targetId);
+      }
+      const markCompleted = () => state!.markDeliveryCompleted(delivery!.id, delivery!.profile, delivery!.kind, {
+        taskIds: [...identityRefs.taskIds], eventIds: [...identityRefs.eventIds],
+        seriesIds: [...identityRefs.seriesIds], generation: identityRefs.generation,
+      });
 
       // Synchronizers already call recordMutation only after an actual provider
       // write. Intercept that signal at the shared repository boundary so the
@@ -372,6 +425,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // decisions. Notification failure never suppresses the underlying audit.
       const audit = state.audit.bind(state);
       state.audit = async (profile, action, detail) => {
+        collectIdentityRefs(detail);
         await audit(profile, action, detail);
         if (delivery) await manual?.observeAudit(delivery, profile, action, detail);
       };
@@ -421,7 +475,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         } else {
           await manual.processManualDelivery(delivery, state);
         }
-        await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+        await markCompleted();
         log("manual_delivery_completed", {
           awsRequestId: context.awsRequestId,
           durationMs: Date.now() - startedAt,
@@ -455,7 +509,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
           await deliverReconciliationOutcome(state, manual, delivery.profile, delivery.reconcile.generation);
         }
         if (!reconciliation.continuationRequired) {
-          await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+          await markCompleted();
           log(reconciliation.continuationQueued ? "delivery_completed_with_queued_continuation" : "delivery_completed", {
             awsRequestId: context.awsRequestId,
             durationMs: Date.now() - startedAt,
@@ -478,14 +532,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
         const result = await new ReviewEngine().execute(delivery.repair.operationId);
         if (result.status === "succeeded" || result.status === "needs_review" || result.status === "failed") {
           await deliverRepairOutcome(manual, result.id);
-          await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+          await markCompleted();
         }
         log("repair_delivery_completed", { awsRequestId:context.awsRequestId, status:result.status, operationId:result.id });
         continue;
       }
 
       if (delivery.kind === "todoist" && await manual.interceptTodoistDeletion(delivery, state)) {
-        await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+        await markCompleted();
         log("todoist_delete_deferred_for_manual_decision", {
           awsRequestId: context.awsRequestId,
           durationMs: Date.now() - startedAt,
@@ -513,7 +567,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
           delivery.profile, `circuit:${delivery.id}`, undefined,
           "Calendar changes were deferred because the mutation circuit is open. Request reconciliation manually after the circuit cools down.",
         );
-        await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+        await markCompleted();
         continue;
       }
 
@@ -544,7 +598,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         baselineRecovery: delivery.kind === "calendar" && !hadCalendarToken, calendarMutationBlocked,
       });
 
-      await state.markDeliveryCompleted(delivery.id, delivery.profile, delivery.kind);
+      await markCompleted();
       log("delivery_completed", {
         awsRequestId: context.awsRequestId,
         durationMs: Date.now() - startedAt,
@@ -595,6 +649,26 @@ export const handler: SQSHandler = async (event, context: Context) => {
         dlqPolicy: { maxReceiveCount: 1, action: "quarantine_after_this_failed_receive" },
       }));
       failures.push({ itemIdentifier: record.messageId });
+    } finally {
+      if (releaseWriterLease) {
+        try {
+          await releaseWriterLease();
+        } catch (error) {
+          // A retained lease blocks erasure until an operator can prove this
+          // invocation ended. Never treat a failed release as a drained writer.
+          console.error(JSON.stringify({
+            service: "todoist-calendar-sync-worker",
+            event: "erasure_writer_lease_release_failed",
+            awsRequestId: context.awsRequestId,
+            deliveryId: delivery?.id,
+            profile: delivery?.profile,
+            error: serializeError(error),
+          }));
+          if (!failures.some((failure) => failure.itemIdentifier === record.messageId)) {
+            failures.push({ itemIdentifier: record.messageId });
+          }
+        }
+      }
     }
   }
   return { batchItemFailures: failures };

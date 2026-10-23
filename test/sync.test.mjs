@@ -427,7 +427,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   const calendar = {
     async getEvent() { return structuredClone(event); },
   };
-  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {} }));
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return structuredClone(task); } } }));
 
   await sync.process({
     id: "canonical-noop",
