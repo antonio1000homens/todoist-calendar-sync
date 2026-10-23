@@ -60,6 +60,10 @@ test("authenticated review API starts only stored confirmed operations and retur
   assert.equal(reviewBody.operation.status,"review_required");
   assert.equal(reviewBody.operation.operatorRecoveryRequired,true);
   assert.match(reviewBody.operation.message,/break-glass recovery is required/);
+  assert.match(reviewBody.operation.message,/preserve any protections that remain/i);
+  assert.match(reviewBody.operation.message,/inspect the actual profile fence and worker mapping state/i);
+  assert.match(reviewBody.operation.message,/escalate if either is missing, changed, or cannot be verified/i);
+  assert.doesNotMatch(reviewBody.operation.message,/keep the profile fence and worker mappings in place/i);
   assert.match(reviewBody.operation.message,/do not start a fresh preview until service admission is restored/i);
   const resume=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(resume.statusCode,409);

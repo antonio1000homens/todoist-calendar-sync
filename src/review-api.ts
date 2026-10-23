@@ -6,7 +6,7 @@ import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
-import { ErasureOperationStore } from "./erasure-executor.js";
+import { ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
@@ -140,7 +140,7 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
         ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
-          message:"Operator break-glass recovery is required. Keep the profile fence and worker mappings in place; do not start a fresh preview until service admission is restored. This operation cannot be resumed."}:{}),
+          message:ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
       if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
       if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
