@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "../dist/dynamodb-capacity.js";
-import { runCompletedHistoryCleanup } from "../dist/completed-history-cleanup.js";
+import { handler, runCompletedHistoryCleanup } from "../dist/completed-history-cleanup.js";
 
 const history = {
   pk: "COMPLETED_TASK#home#one", sk: "EVENT#event-1", profile: "home",
@@ -142,4 +142,78 @@ test("certified exhausted recurrence is safely retired in bounded batches", asyn
   assert.equal(result.store.has("COMPLETED_EVENT#home#event-13|STATE"), true);
   const remaining = [...result.store.values()].filter((i) => i.pk === "COMPLETED_TASK#home#one");
   assert.equal(remaining.length, 1);
+});
+
+test("scheduled dry-run checkpoints its bounded cursor and resumes without using the apply cursor", async t => {
+  const oldTable = process.env.STATE_TABLE_NAME;
+  process.env.STATE_TABLE_NAME = "unit-test-state";
+  const dryKey = "MAINTENANCE#TERMINAL_COMPLETED_TASK|DRY_RUN_STATE";
+  const applyKey = "MAINTENANCE#TERMINAL_COMPLETED_TASK|STATE";
+  const store = new Map([[applyKey, { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "STATE",
+    nextCursor: { pk: "apply-only", sk: "cursor" } }]]);
+  const scans = [];
+  const original = documentClient.send;
+  documentClient.send = async command => {
+    const q = command.input;
+    if (command instanceof GetCommand) return { Item: store.get(k(q.Key)) };
+    if (command instanceof ScanCommand) {
+      scans.push(q.ExclusiveStartKey);
+      if (scans.length === 1) return { ScannedCount: 25, Items: [], LastEvaluatedKey: { pk: "after-page-one", sk: "row" } };
+      return { ScannedCount: 25, Items: [] };
+    }
+    if (command instanceof PutCommand) {
+      const existing = store.get(k(q.Item));
+      if (q.ConditionExpression === "attribute_not_exists(pk)") assert.equal(existing, undefined);
+      else assert.equal(existing?.version, q.ExpressionAttributeValues[":expectedVersion"]);
+      store.set(k(q.Item), q.Item);
+      return {};
+    }
+    throw new Error("Unmocked DynamoDB command " + command.constructor.name);
+  };
+  t.after(() => {
+    documentClient.send = original;
+    if (oldTable === undefined) delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME = oldTable;
+  });
+
+  const first = await runCompletedHistoryCleanup({ maxPages: 1, nowMs: Date.parse("2026-10-23T12:00:00Z"), persistDryRunCursor: true });
+  assert.equal(first.nextCursor.pk, "after-page-one");
+  assert.deepEqual(scans[0], undefined);
+  assert.equal(store.get(dryKey).scanComplete, false);
+  assert.equal(store.get(applyKey).nextCursor.pk, "apply-only", "dry-run checkpoint does not overwrite apply progress");
+
+  const second = await runCompletedHistoryCleanup({ maxPages: 1, nowMs: Date.parse("2026-10-24T12:00:00Z"), persistDryRunCursor: true });
+  assert.equal(second.nextCursor, undefined);
+  assert.deepEqual(scans[1], { pk: "after-page-one", sk: "row" });
+  assert.equal(store.get(dryKey).scanComplete, true);
+  assert.equal(store.get(dryKey).version, 2);
+  assert.equal(store.get(applyKey).nextCursor.pk, "apply-only");
+});
+
+test("scheduled handler enables only the separate checkpoint while apply is disabled", async t => {
+  const oldTable = process.env.STATE_TABLE_NAME;
+  const oldApply = process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY;
+  process.env.STATE_TABLE_NAME = "unit-test-state";
+  process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY = "false";
+  let checkpoint;
+  const original = documentClient.send;
+  documentClient.send = async command => {
+    if (command instanceof GetCommand) return {};
+    if (command instanceof ScanCommand) return { ScannedCount: 0, Items: [] };
+    if (command instanceof PutCommand) { checkpoint = command.input.Item; return {}; }
+    throw new Error("Unmocked DynamoDB command " + command.constructor.name);
+  };
+  t.after(() => {
+    documentClient.send = original;
+    if (oldTable === undefined) delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME = oldTable;
+    if (oldApply === undefined) delete process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY;
+    else process.env.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY = oldApply;
+  });
+
+  const report = await handler();
+  assert.equal(report.retired, 0);
+  assert.equal(checkpoint.sk, "DRY_RUN_STATE");
+  assert.equal(checkpoint.scanComplete, true);
+  assert.equal(checkpoint.lastCounts.eligibleCandidates, undefined, "scheduled state stores aggregate counts, not candidate IDs");
 });

@@ -101,7 +101,11 @@ period or recreate a retired `COMPLETED_TASK` row.
 
 The new scheduled `CompletedHistoryCleanupFunction` inspects at most ten pages
 of 25 evaluated items every day, paced at five read units/second and using a
-durable cursor in apply mode. Its stack parameter
+durable cursor in apply mode. While apply is disabled, the schedule also stores
+its cursor in a separate `DRY_RUN_STATE` checkpoint so successive daily runs
+continue through bounded windows instead of repeating the first page. This
+checkpoint stores only continuation metadata and aggregate counts; it never
+changes completion rows. Apply and dry-run cursors are independent. Its stack parameter
 `CompletedHistoryCleanupApply` defaults to **false** (dry-run only). It scans
 only candidate `COMPLETED_TASK` rows, groups the task's strongly consistent
 completion references, and retires all eligible task-side completion lookup
@@ -183,8 +187,10 @@ project comments have been retired.
 ### Verification and staged activation
 
 1. Deploy with `CompletedHistoryCleanupApply=false` and examine the daily
-   CloudWatch `terminal_completed_history_cleanup_report` counts. No
-   completed rows are written by this default schedule.
+   CloudWatch `terminal_completed_history_cleanup_report` counts. The dry-run
+   cursor advances across bounded daily windows and restarts after a complete
+   table pass. No completed rows are written by this default schedule; only
+   the separate continuation checkpoint is updated.
 2. Use an authorized read-only session to run `npm ci` then
    `npm run state:cleanup-completed -- --max-pages=40`. The output is a
    dry-run report with `eligible`, `retired`, `skipped_active`,
