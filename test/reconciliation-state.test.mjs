@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 process.env.STATE_TABLE_NAME ||= 'test-reconciliation-state';
-const { StateRepository, reconciliationSummary } = await import('../dist/repository.js');
+const { StateRepository, reconciliationDiagnosticOutcome, reconciliationSummary } = await import('../dist/repository.js');
 const { reconciliationDatabase } = await import('./support/reconciliation-state.mjs');
 
 const old = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -113,6 +113,31 @@ test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded,
   const workRows = await state.listReconciliationDiagnostics('work', 'old', 50);
   assert.ok(homeRows.items.every(item => item.profile === 'home' && item.taskId !== 'work-only-task'));
   assert.deepEqual(workRows.items.map(item => item.taskId), ['work-only-task']);
+});
+
+test('consolidated duplicates and Calendar mutation-budget exhaustion persist actionable item identities', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  assert.equal(reconciliationDiagnosticOutcome('todoist_snapshot_consolidated_duplicate_ignored'), 'blocked');
+  assert.equal(reconciliationDiagnosticOutcome('calendar_snapshot_reconcile_mutation_budget_exhausted'), 'blocked');
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-duplicate',
+    'todoist_snapshot_consolidated_duplicate_ignored', {
+      taskId: 'discarded-task', discardedTaskId: 'discarded-task', retainedTaskId: 'retained-task', decisionId: 'decision-1',
+    });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-budget',
+    'calendar_snapshot_reconcile_mutation_budget_exhausted', { eventId: 'blocked-event', reason: 'mutation_budget_exhausted' });
+
+  const { items } = await state.listReconciliationDiagnostics('home', 'old');
+  const duplicate = items.find(item => item.action === 'todoist_snapshot_consolidated_duplicate_ignored');
+  const budget = items.find(item => item.action === 'calendar_snapshot_reconcile_mutation_budget_exhausted');
+  assert.equal(duplicate.outcome, 'blocked');
+  assert.equal(duplicate.taskId, 'discarded-task');
+  assert.equal(duplicate.detail.discardedTaskId, 'discarded-task');
+  assert.equal(duplicate.detail.retainedTaskId, 'retained-task');
+  assert.equal(duplicate.detail.decisionId, 'decision-1');
+  assert.equal(budget.outcome, 'blocked');
+  assert.equal(budget.eventId, 'blocked-event');
+  assert.equal(budget.reason, 'mutation_budget_exhausted');
 });
 
 test('worker failure context is retained separately from its free-form error', async (t) => {

@@ -109,7 +109,7 @@ export function reconciliationDiagnosticOutcome(action: string): ReconciliationD
     && !["todoist_snapshot_consolidated_duplicate_ignored", "todoist_snapshot_future_series_split_pending"].includes(action)) return undefined;
   if (action.includes("recurring_deferred")) return "deferred";
   if (/(?:conflict|ambiguous|ownership|disappeared)/.test(action)) return "conflict";
-  if (/(?:blocked|sync_control|pending|missing_after_repair|circuit_open)/.test(action)) return "blocked";
+  if (/(?:blocked|sync_control|pending|missing_after_repair|circuit_open|consolidated_duplicate_ignored|mutation_budget_exhausted)/.test(action)) return "blocked";
   if (action.includes("_deferred")) return "deferred";
   return undefined;
 }
@@ -303,7 +303,7 @@ export class StateRepository {
       ? [...new Set(value.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 10_000))].slice(0, 100)
       : undefined;
     const safeDetail: Record<string, unknown> = {};
-    for (const name of ["calendarStatus", "tombstoneReason", "source", "reason", "taskUpdatedAt", "calendarUpdatedAt", "calendarEtag", "ownerTaskId"]) {
+    for (const name of ["calendarStatus", "tombstoneReason", "source", "reason", "taskUpdatedAt", "calendarUpdatedAt", "calendarEtag", "ownerTaskId", "discardedTaskId", "retainedTaskId", "decisionId"]) {
       const value = text(detail[name], 500);
       if (value) safeDetail[name] = value;
     }

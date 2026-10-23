@@ -156,7 +156,9 @@ export async function reconcileUnmappedCalendar(
 
   if (mutationBudget.exhausted) {
     finishSummary();
-    await state.audit(profile, "calendar_snapshot_reconcile_mutation_budget_exhausted", { summary, mutationBudget: mutationBudget.snapshot() });
+    await state.audit(profile, "calendar_snapshot_reconcile_mutation_budget_exhausted", {
+      reason: "mutation_budget_exhausted", summary, mutationBudget: mutationBudget.snapshot(),
+    });
     return summary;
   }
 
@@ -490,6 +492,7 @@ export async function reconcileUnmappedCalendar(
       summary.mutationCapReached = true;
       await state.audit(profile, "calendar_snapshot_reconcile_mutation_budget_exhausted", {
         eventId: event.id,
+        reason: "mutation_budget_exhausted",
         error: error.message,
         mutationBudget: mutationBudget.snapshot(),
       });

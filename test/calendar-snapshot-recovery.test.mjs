@@ -253,7 +253,9 @@ test("rejected worst-case reservation still keeps reconciliation pending", async
   assert.equal(summary.mutationCapReached, true);
   assert.equal(summary.providerMutations, 0);
   assert.equal(state.mappings.length, 0);
-  assert.ok(state.audits.some((entry) => entry.action === "calendar_snapshot_reconcile_mutation_budget_exhausted"));
+  const exhausted = state.audits.find((entry) => entry.action === "calendar_snapshot_reconcile_mutation_budget_exhausted");
+  assert.equal(exhausted.detail.eventId, event.id);
+  assert.equal(exhausted.detail.reason, "mutation_budget_exhausted");
 });
 
 test("recurrence snapshot guard recognises a competing recurring Todoist identity", async () => {

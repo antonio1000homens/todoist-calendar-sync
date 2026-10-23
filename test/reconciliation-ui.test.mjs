@@ -31,4 +31,7 @@ test('active run polling refreshes the inbox and announces terminal status witho
   assert.match(source, /Run: \{reconciliation\.summary\.runStatus\}; unresolved in this run: \{reconciliation\.summary\.runUnresolved\}\. Actionable review cases remaining: \{reconciliation\.summary\.actionableCaseCount\}\./);
   assert.ok(source.includes('Candidate tasks: {item.detail.candidateTaskIds.join(", ")}'));
   assert.ok(source.includes('Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}'));
+  assert.ok(source.includes('Discarded task: {item.detail.discardedTaskId}'));
+  assert.ok(source.includes('Retained task: {item.detail.retainedTaskId}'));
+  assert.ok(source.includes('Decision: {item.detail.decisionId}'));
 });

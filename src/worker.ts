@@ -392,7 +392,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
         if (!value || typeof value !== "object") return;
         for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
-          if (typeof item === "string" && ["taskId", "providerTaskId", "linkedTaskId", "ownerTaskId"].includes(name)) identityRefs.taskIds.add(item);
+          if (typeof item === "string" && ["taskId", "providerTaskId", "linkedTaskId", "ownerTaskId", "discardedTaskId", "retainedTaskId"].includes(name)) identityRefs.taskIds.add(item);
           if (typeof item === "string" && ["eventId", "providerEventId", "masterEventId", "activeInstanceId", "occurrenceId", "selectedEventId"].includes(name)) identityRefs.eventIds.add(item);
           if (typeof item === "string" && name === "seriesId") identityRefs.seriesIds.add(item);
           collectIdentityRefs(item, name);

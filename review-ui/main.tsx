@@ -320,6 +320,9 @@ function App() {
           <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
           {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
           {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
+          {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
+          {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
+          {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
           <span>Recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
         </li>)}
       </ul>}
