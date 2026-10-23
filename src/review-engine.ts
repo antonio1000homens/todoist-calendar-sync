@@ -5,7 +5,7 @@ import { defaultProviderClientFactory, ReconciliationMutationBudget, createBudge
 import { StateRepository } from "./repository.js";
 import { DynamoReconciliationStore } from "./reconciliation.js";
 import { ReviewStore, SyncControls, reviewHash } from "./review-store.js";
-import { entityKey, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
+import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
 import { hasCanonicalState, occurrenceStateMatches, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { upsertProjectMappingComment, deleteMappingComments } from "./mapping-comments.js";
 import { calendarRecurrenceMatchesTodoist, selectTodoistCurrentInstance, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
@@ -427,6 +427,19 @@ export class ReviewEngine {
       }
       return pending;
     };
+    // Legacy failed operations can predate the durable abandoned marker. Do not
+    // replay them unless persisted execution state proves a write may have begun.
+    if (["failed", "needs_review"].includes(operation.status) && !operationHasWriteEvidence(operation)) {
+      const snapshots = [...operation.preview.snapshots, ...(operation.claimSnapshots || [])];
+      const refs = snapshots.map(snapshot => snapshot.ref);
+      const queued = await queueDeferredRefresh(refs);
+      await this.controls.releaseUnapplied(refs, operation.id, snapshots, {
+        error: operation.error || "No provider write was recorded",
+        nextAction: "No provider write is recorded. Refresh affected items and create a new preview; this failed operation remains immutable for audit.",
+      }, queued);
+      operation.abandoned = true;
+      return operation;
+    }
     const step = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
       const saved = operation.steps[name];
       if (saved?.status === "done") return saved.result as T;
