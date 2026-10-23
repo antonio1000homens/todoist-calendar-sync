@@ -388,6 +388,7 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
+    const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
     if (match.task?.due?.is_recurring || sharedTaskIds.some((id) => id !== match.task?.id)) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {

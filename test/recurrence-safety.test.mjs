@@ -1016,7 +1016,7 @@ test("new genuinely Calendar-owned series creates one mirror across retries", as
   assert.equal(state.links[0].taskId,clients.todoistUpserts[0].id);
 });
 
-for (const status of ["cancelled", "flattened", "gone", "excluded", "todoist-owned"]) {
+for (const status of ["cancelled", "flattened", "gone", "excluded", "todoist-owned", "archived"]) {
   test(`stale series delta cannot create a mirror after master is ${status}`, async () => {
     const current = instance("current", "2099-01-01", "2099-01-02");
     const master = {id:MASTER,iCalUID:SERIES,summary:current.summary,recurrence:["RRULE:FREQ=YEARLY"],status:"confirmed"};
@@ -1025,6 +1025,7 @@ for (const status of ["cancelled", "flattened", "gone", "excluded", "todoist-own
     if (status === "gone") clients.events.delete(MASTER);
     if (status === "cancelled") clients.events.set(MASTER,{...master,status:"cancelled"});
     if (status === "flattened") clients.events.set(MASTER,{...master,recurrence:undefined});
+    if (status === "archived") clients.events.set(MASTER,{...master,extendedProperties:{shared:{syncHistoryOnly:"true"}}});
     if (status === "todoist-owned") clients.events.set(MASTER,{...master,extendedProperties:{shared:{syncRecurrenceOwner:"todoist",taskId:"annual-task"}}});
     if (status === "excluded") state.syncBlocked = async (_profile,ids) => ids.eventId === MASTER;
     const sync = new Synchronizer(state,undefined,async () => clients);
