@@ -1,3 +1,4 @@
+import { flattenMasterProjection, flattenStandalone } from "./recurrence-flatten.js";
 import { profiles } from "./config.js";
 import type { ProviderClientFactory } from "./mutation-budget.js";
 import { entityKey, type RepairOperation, type Side } from "./review-types.js";
@@ -55,8 +56,37 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
             : method === "createFutureMasterOnce" || method === "createRepairEventOnce" ? (args[0] as CalendarEvent).id
             : (args[1] as string|undefined) || (side === "calendar" ? (args[0] as CalendarEvent).id : undefined);
           const key = id ? entityKey({ profile, side, id }) : undefined;
-          const check = (object: ProviderObject | null) => {
+          const check = async (object: ProviderObject | null) => {
             if (key && Object.hasOwn(expected, key) && reviewHash(expected[key]) !== reviewHash(object)) {
+              // A response can be lost after the provider committed our exact
+              // approved flatten write. Recover only the persisted running step
+              // and its full expected mutation, never an arbitrary live edit.
+              const plan = operation.preview.flattenPlan;
+              const originalMaster = operation.preview.snapshots.find(s=>s.ref.side==="calendar" && s.ref.id===plan?.masterId)?.object as CalendarEvent|undefined;
+              const occurrence = operation.preview.snapshots.find(s=>s.ref.side==="calendar" && s.ref.id===plan?.occurrenceId)?.object as CalendarEvent|undefined;
+              const originalTask = operation.preview.snapshots.find(s=>s.ref.side==="todoist" && s.ref.id===plan?.taskId)?.object as TodoistTask|undefined;
+              const comparable = (value:ProviderObject) => { const copy = {...value} as Record<string,unknown>; for (const name of ["etag","updated","updated_at","sequence"]) delete copy[name]; return copy; };
+              let approvedRecovery = false;
+              if (plan && occurrence && object && profile === move.profile) {
+                if (side === "calendar" && id === plan.masterId && originalMaster && operation.steps["flatten-master"]?.status === "running") {
+                  const desired = comparable(flattenMasterProjection(plan,originalMaster,occurrence));
+                  const live = comparable(object);
+                  // Google omits an explicitly empty recurrence array.
+                  if (Array.isArray(desired.recurrence) && !desired.recurrence.length) delete desired.recurrence;
+                  if (Array.isArray(live.recurrence) && !live.recurrence.length) delete live.recurrence;
+                  approvedRecovery = reviewHash(desired) === reviewHash(live);
+                } else if (side === "calendar" && id === plan.standaloneId && operation.steps["flatten-standalone"]?.status === "running") {
+                  const live = object as CalendarEvent, desired = flattenStandalone(plan,occurrence);
+                  approvedRecovery = live.extendedProperties?.shared?.syncRepairId === operation.id && !live.recurrence?.length && !live.recurringEventId
+                    && live.end?.date === plan.end && hasCanonicalState(live,{...toTodoistTask(desired),id:plan.taskId})
+                    && Object.entries(desired.extendedProperties?.shared || {}).every(([name,value])=>live.extendedProperties?.shared?.[name]===value);
+                } else if (side === "todoist" && id === plan.taskId && originalTask && operation.steps["flatten-task"]?.status === "running") {
+                  const live = object as TodoistTask;
+                  approvedRecovery = !live.due?.is_recurring && hasCanonicalState(occurrence,live)
+                    && reviewHash({...comparable(live),due:null}) === reviewHash({...comparable(originalTask),due:null});
+                }
+              }
+              if (approvedRecovery) { expected[key] = object; await save(); return; }
               throw new Error(`Provider item ${key} changed after preview or the last recorded repair write; review live state before continuing`);
             }
           };
@@ -64,7 +94,7 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
             try { return side === "calendar" ? await clients.calendar.getEvent(id!) : await clients.todoist.getTask(id!); }
             catch (error) { if ([404,410].includes(Number((error as {status?:number}).status))) return null; throw error; }
           };
-          if (write && key && Object.hasOwn(expected, key)) check(await readLive());
+          if (write && key && Object.hasOwn(expected, key)) await check(await readLive());
           let result: unknown;
           try {
             if ((method === "upsertTask" || method === "upsertEvent") && !args[1]) {
@@ -98,10 +128,10 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
             } else result = await Reflect.apply(value, target, args);
           }
           catch (error) {
-            if (read && [404,410].includes(Number((error as {status?:number}).status))) check(null);
+            if (read && [404,410].includes(Number((error as {status?:number}).status))) await check(null);
             throw error;
           }
-          if (read) check(result as ProviderObject);
+          if (read) await check(result as ProviderObject);
           if (write) {
             const object = method.startsWith("delete") ? null
               : (result as ProviderObject|undefined)?.id ? result as ProviderObject : id ? await readLive() : undefined;

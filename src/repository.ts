@@ -620,6 +620,54 @@ export class StateRepository {
     return undefined;
   }
 
+  /** Replace approved recurrence indexes with a standalone pair in one conditional transaction. */
+  async commitFlattenMapping(input: { operationId:string; mapping:Mapping; previous:Mapping[]; links:RecurrenceLink[] }): Promise<boolean> {
+    const {mapping,previous,links,operationId} = input;
+    if (mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId || !mapping.updatedAt
+      || previous.some(m=>m.profile!==mapping.profile || !m.updatedAt)
+      || links.some(l=>l.profile!==mapping.profile || !l.updatedAt)) throw new Error("Flatten mapping identities or versions are incomplete");
+    const table = this.ensureTable(), receiptKey = key(`FLATTEN_REPAIR#${operationId}`);
+    const receipt = await client.send(new GetCommand({TableName:table,Key:receiptKey,ConsistentRead:true}));
+    if (receipt.Item) {
+      if (receipt.Item.taskId !== mapping.taskId || receipt.Item.eventId !== mapping.eventId || receipt.Item.profile !== mapping.profile) throw new Error("Flatten operation receipt belongs to another pair");
+      const rows = await Promise.all([key(`TASKOWNER#${mapping.taskId}`,"MAP"),key(`TASK#${mapping.profile}#${mapping.taskId}`,"MAP"),key(`EVENT#${mapping.profile}#${mapping.eventId}`,"MAP")].map(Key=>client.send(new GetCommand({TableName:table,Key,ConsistentRead:true}))));
+      return rows.every(({Item:m})=>m?.taskId===mapping.taskId && m?.eventId===mapping.eventId && m?.profile===mapping.profile && !m?.recurrenceOwner);
+    }
+    const rows = new Map<string,{key:Record<string,string>; old?:Mapping; item?:Record<string,unknown>}>();
+    const rowKey = (value:Record<string,string>) => JSON.stringify(value);
+    for (const old of previous) for (const k of [key(`EVENT#${old.profile}#${old.eventId}`,"MAP"),key(`TASK#${old.profile}#${old.taskId}`,"MAP"),key(`TASKOWNER#${old.taskId}`,"MAP")]) {
+      const prior = rows.get(rowKey(k));
+      if (prior?.old && (prior.old.taskId!==old.taskId || prior.old.eventId!==old.eventId)) throw new Error("Competing indexes in flatten preview");
+      rows.set(rowKey(k),{key:k,old});
+    }
+    for (const [k,attributes] of [[key(`EVENT#${mapping.profile}#${mapping.eventId}`,"MAP"),mappingEventLookupAttributes(mapping)],
+      [key(`TASK#${mapping.profile}#${mapping.taskId}`,"MAP"),mappingLookupAttributes(mapping)],
+      [key(`TASKOWNER#${mapping.taskId}`,"MAP"),mappingOwnerLookupAttributes(mapping)]] as const) {
+      rows.set(rowKey(k),{...rows.get(rowKey(k)),key:k,item:{...mapping,...k,...attributes}});
+    }
+    const tx: Array<Record<string,unknown>> = [];
+    for (const row of rows.values()) {
+      const old = row.old;
+      const condition = old ? {ConditionExpression:"#p = :p AND taskId = :t AND eventId = :e AND updatedAt = :v",ExpressionAttributeNames:{"#p":"profile"},ExpressionAttributeValues:{":p":old.profile,":t":old.taskId,":e":old.eventId,":v":old.updatedAt}}
+        : {ConditionExpression:"attribute_not_exists(pk)"};
+      tx.push(row.item ? {Put:{TableName:table,Item:row.item,...condition}} : {Delete:{TableName:table,Key:row.key,...condition}});
+    }
+    for (const link of links) tx.push({Delete:{TableName:table,Key:key(`RECURRENCE#${link.profile}#${link.seriesId}`),
+      ConditionExpression:"#p = :p AND taskId = :t AND eventId = :e AND updatedAt = :v AND #o = :o",ExpressionAttributeNames:{"#p":"profile","#o":"owner"},
+      ExpressionAttributeValues:{":p":link.profile,":t":link.taskId,":e":link.eventId,":v":link.updatedAt,":o":link.owner}}});
+    for (const profile of allProfiles) if (profile !== mapping.profile) tx.push({ConditionCheck:{TableName:table,Key:key(`TASK#${profile}#${mapping.taskId}`,"MAP"),ConditionExpression:"attribute_not_exists(pk)"}});
+    tx.push({ConditionCheck:{TableName:table,Key:key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),ConditionExpression:"attribute_not_exists(pk)"}});
+    tx.push({Put:{TableName:table,Item:{...receiptKey,profile:mapping.profile,taskId:mapping.taskId,eventId:mapping.eventId,updatedAt:now()},ConditionExpression:"attribute_not_exists(pk)"}});
+    try { await client.send(new TransactWriteCommand({TransactItems:tx as never})); return true; }
+    catch(error) {
+      const cancelled=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      if (conditionalFailure(error) || cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some(reason=>reason.Code==="ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every(reason=>reason.Code==="None" || reason.Code==="ConditionalCheckFailed")) return false;
+      throw error;
+    }
+  }
+
   async putMapping(mapping: Mapping): Promise<void> {
     const item = { ...mapping, updatedAt: now() };
     await client.send(new TransactWriteCommand({
