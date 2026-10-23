@@ -223,17 +223,54 @@ export class ReviewStore {
     if (preview.actor.subject !== actor.subject || preview.expiresAt * 1000 <= Date.now()) throw new Error("Preview expired or belongs to another operator");
     const id = reviewHash([actor.subject, preview.id, idempotencyKey]).slice(0, 32);
     const old = await this.getOperation(id); if (old) return old;
+    const caseStatus = preview.case?.status;
+    const terminalCase = ["resolved", "excluded", "dismissed"].includes(caseStatus || "");
+    const superseded = preview.case?.operationId && (caseStatus === "repairing" || terminalCase)
+      ? await this.getOperation(preview.case.operationId) : undefined;
+    const safelyAbandoned = superseded?.status === "failed" && superseded.abandoned === true
+      && !operationHasWriteEvidence(superseded);
+    const priorSucceeded = terminalCase && superseded?.status === "succeeded";
+    if (preview.case?.operationId && (caseStatus === "repairing" || terminalCase)
+      && !safelyAbandoned && !priorSucceeded) {
+      throw Object.assign(new Error("This case already has an active repair; refresh it and resume that operation"), { status:409 });
+    }
     const operation: RepairOperation = { id, preview, actor, attempt: 1, status: "queued", steps: {}, notificationPending: false,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     try { await this.db.send(new TransactWriteCommand({ TransactItems: [
       { Update: { TableName: reviewTable(), Key: key(`REPAIR_PREVIEW#${preview.id}`), UpdateExpression: "SET submittedOperation = :id",
         ConditionExpression: "attribute_not_exists(submittedOperation) OR submittedOperation = :id", ExpressionAttributeValues: { ":id": id } } },
       { Put: { TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${id}`) }, ConditionExpression: "attribute_not_exists(pk)" } },
+      // Reserve the case together with its queued operation. A fresh preview may
+      // deliberately replace a terminal disposition, but only the exact case
+      // revision it displayed; concurrent or stale submissions cannot steal it.
+      { Update: { TableName:reviewTable(), Key:key(`REVIEW_CASE#${preview.intent.caseId}`),
+        UpdateExpression:"SET #status = :repairing, operationId = :id, updatedAt = :now, lookupSk = :lookup",
+        ConditionExpression:"#status = :expectedStatus AND " + (preview.case.operationId === undefined ? "attribute_not_exists(operationId)" : "operationId = :expectedOperation") + (preview.case.updatedAt ? " AND updatedAt = :expectedUpdatedAt" : ""),
+        ExpressionAttributeNames:{"#status":"status"},
+        ExpressionAttributeValues:{":repairing":"repairing",":id":id,":now":operation.createdAt,
+          ":lookup":`REVIEW#OPEN#${preview.case.createdAt}#${preview.case.id}`,":expectedStatus":preview.case.status,
+          ...(preview.case.operationId === undefined ? {} : {":expectedOperation":preview.case.operationId}),
+          ...(preview.case.updatedAt ? {":expectedUpdatedAt":preview.case.updatedAt} : {})} } },
+      ...(safelyAbandoned ? [{ ConditionCheck:{ TableName:reviewTable(), Key:key(`REPAIR#${superseded.id}`),
+        ConditionExpression:"#status = :failed AND abandoned = :yes AND (attribute_not_exists(writeStarted) OR writeStarted = :no)",
+        ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":failed":"failed",":yes":true,":no":false} } }] : []),
     ] })); } catch (e) {
       const current = await this.getOperation(id); if (current) return current;
       const claimed = await this.getPreview(preview.id) as (RepairPreview & { submittedOperation?:string }) | undefined;
       if (claimed?.submittedOperation && claimed.submittedOperation !== id) {
         throw Object.assign(new Error("This preview was already submitted with a different idempotency key; create a fresh preview"), { status:409 });
+      }
+      const latestSuperseded = superseded ? await this.getOperation(superseded.id) : undefined;
+      if (safelyAbandoned && (!latestSuperseded?.abandoned || latestSuperseded.status !== "failed" || operationHasWriteEvidence(latestSuperseded))) {
+        throw Object.assign(new Error("This case already has an active repair; refresh it and resume that operation"), { status:409 });
+      }
+      const currentCase = await this.getCase(preview.intent.caseId);
+      if (!currentCase || currentCase.status !== preview.case.status || currentCase.operationId !== preview.case.operationId
+        || preview.case.updatedAt && currentCase.updatedAt !== preview.case.updatedAt) {
+        throw Object.assign(new Error("This case changed after preview; refresh the case and create a fresh preview"), { status:409 });
+      }
+      if (conditional(e) || (e as { name?:string }).name === "TransactionCanceledException") {
+        throw Object.assign(new Error("This case or repair changed while submitting; refresh the case and try again"), { status:409 });
       }
       throw e;
     }
@@ -275,7 +312,9 @@ export class ReviewStore {
           ConditionExpression:"#status <> :succeeded", ExpressionAttributeNames:{"#status":"status"}, ExpressionAttributeValues:{":succeeded":"succeeded"} } },
         { Update:{ TableName:reviewTable(), Key:key(`REVIEW_CASE#${current.id}`),
           UpdateExpression:"SET #status = :status, #result = :result, updatedAt = :now, operationId = :id, lookupSk = :lookup",
+          ConditionExpression:"#status = :repairing AND operationId = :id",
           ExpressionAttributeNames:{"#status":"status","#result":"result"}, ExpressionAttributeValues:{
+            ":repairing":"repairing",
             ":status":operation.preview.intent.action === "exclude" ? "excluded" : "resolved", ":result":"Repair verified against current provider state",
             ":now":now, ":id":operation.id, ":lookup":`REVIEW#CLOSED#${current.createdAt}#${current.id}`,
           } } },
