@@ -138,6 +138,8 @@ test("recurrence validation errors are routed to nearby controls", () => {
   assert.equal(repairValidationField("Creating a counterpart for a Calendar series requires Calendar recurrence ownership"),"owner");
   assert.equal(repairValidationField("Changing a Calendar series to Todoist ownership requires a future-only preview"),"scope");
   assert.equal(repairValidationField("Fields differ: choose Todoist or Calendar as the source"),"winner");
+  assert.equal(repairValidationField("Use Todoist fields for a Todoist-owned yearly Calendar series repair"),"winner");
+  assert.equal(repairValidationField("Creating a yearly Calendar series from a standalone event requires Future occurrences (preserve history)"),"scope");
   assert.equal(repairValidationField("Calendar repair sources must be confirmed; choose a live event"),"eventId");
   assert.equal(repairValidationField("Verification requires live Todoist task task-1; refresh affected items"),"taskId");
   assert.equal(repairValidationField("Verification requires live Calendar event event-1; refresh affected items"),"eventId");

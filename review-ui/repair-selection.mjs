@@ -85,9 +85,9 @@ export function repairRecurrenceOwnerRequirement(form, details, action) {
 
 // Map actionable API validation to the adjacent form control, not just the page notice.
 export function repairValidationField(message) {
-  if (/^Changing a Calendar series to Todoist ownership requires a future-only preview|^Choose the Calendar master to repair a whole series|^Select the Calendar master for a future-only repair|^Use a master-level recurrence repair/.test(message || "")) return "scope";
+  if (/^Creating a yearly Calendar series from a standalone event requires Future occurrences|^Changing a Calendar series to Todoist ownership requires a future-only preview|^Choose the Calendar master to repair a whole series|^Select the Calendar master for a future-only repair|^Use a master-level recurrence repair/.test(message || "")) return "scope";
   if (/^Choose which provider owns the recurrence|^Choose Todoist recurrence ownership|^Creating a counterpart for a Calendar (series|occurrence) requires Calendar recurrence ownership|^Todoist recurrence ownership requires/.test(message || "")) return "owner";
-  if (/^Fields differ:|^Use Calendar fields for/.test(message || "")) return "winner";
+  if (/^Use Todoist fields for a Todoist-owned yearly Calendar series repair|^Fields differ:|^Use Calendar fields for/.test(message || "")) return "winner";
   if (/^Verification requires live Todoist/.test(message || "")) return "taskId";
   if (/^Verification requires live Calendar|^Selected pair does not match/.test(message || "")) return "eventId";
   if (/^Calendar series has no active occurrence|^Choose the active Calendar occurrence|^Calendar repair sources must be confirmed/.test(message || "")) return "eventId";
