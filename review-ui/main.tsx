@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { createReviewApiClient, isAbortError } from "./api-client.mjs";
+import { createReviewApiClient, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
@@ -123,18 +123,21 @@ function App() {
     if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
     let cancelled=false;
     let timer:number;
+    let pollFailures=0;
     const poll=async()=>{
       try {
         const data=await refreshReconciliation(reconcileProfile);
-        await refresh();
         if(cancelled)return;
+        pollFailures=0;
         const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
         const terminal=["succeeded","needs_review","failed"].includes(runStatus);
-        if(terminal||!data.reconciliation?.pending) setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
-        else timer=window.setTimeout(poll,1500);
-      } catch(e:any) { if(!cancelled){setMessage(e.message);timer=window.setTimeout(poll,3000);} }
+        if(terminal||!data.reconciliation?.pending) {
+          setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
+          await refresh();
+        } else timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
+      } catch(e:any) { if(!cancelled){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));} }
     };
-    timer=window.setTimeout(poll,1500);
+    timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
     return ()=>{cancelled=true;window.clearTimeout(timer);};
   },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
   const providerLink=(item:ProviderObject|undefined) => {

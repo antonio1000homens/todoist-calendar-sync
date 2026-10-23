@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { createReviewApiClient, isAbortError } from "../review-ui/api-client.mjs";
+import { createReviewApiClient, isAbortError, reconciliationPollDelayMs } from "../review-ui/api-client.mjs";
 
 const ok = data => Response.json(data);
 const throttled = headers => new Response("Lambda throttled", { status: 429, headers });
@@ -161,4 +161,11 @@ test("UI requests only the selected case and keeps failed detail panels out of r
   assert.match(source, /Retry case details/);
   assert.match(source, /disabled=\{busy\|\|!details\}/);
   assert.match(source, /!details\?<div className="notice detail-load"/);
+});
+
+test("reconciliation status polling starts slowly and backs off under repeated 429s",()=>{
+  assert.deepEqual([0,1,2,3,4,5,8].map(reconciliationPollDelayMs),[5000,10000,20000,40000,60000,60000,60000]);
+  const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  assert.match(source,/if\(terminal\|\|!data\.reconciliation\?\.pending\)[\s\S]*?await refresh\(\)/);
+  assert.doesNotMatch(source,/else timer=window\.setTimeout\(poll,1500\)/);
 });

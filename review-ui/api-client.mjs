@@ -2,6 +2,10 @@
 // Serialize this tab's calls and retry only safe reads when Lambda returns 429.
 const abortError = () => new DOMException("Review request cancelled", "AbortError");
 export const isAbortError = error => error?.name === "AbortError";
+export function reconciliationPollDelayMs(attempt = 0) {
+  const normalized = Math.max(0, Math.floor(attempt));
+  return Math.min(60_000, 5_000 * 2 ** normalized);
+}
 
 export function delay(ms, signal) {
   if (signal?.aborted) return Promise.reject(abortError());
