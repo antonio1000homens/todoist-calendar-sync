@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { profileLookupQueryInput } from "../dist/dynamodb-capacity.js";
+import { profileLookupPacingDelayMs, profileLookupQueryInput } from "../dist/dynamodb-capacity.js";
 
 const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
 const cleanupSource = await readFile(new URL("../scripts/cleanup-routine-audit.mjs", import.meta.url), "utf8");
@@ -29,6 +29,12 @@ test("profile lookup query guardrail bounds pages and requests consumed capacity
   });
   assert.equal(unrelated.Limit, 1000);
   assert.equal(unrelated.ReturnConsumedCapacity, undefined);
+});
+
+test("deadline-bound profile lookup pacing cannot sleep beyond the health-check budget", () => {
+  const now = 10_000;
+  assert.equal(profileLookupPacingDelayMs(100, 0, now + 1_000, now), 1_000);
+  assert.equal(profileLookupPacingDelayMs(100, 0, now - 1, now), 0);
 });
 
 test("mutating migration and cleanup scripts fail closed without an explicit table", () => {

@@ -5,7 +5,7 @@ import {
   QueryCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient, pacedScan } from "./dynamodb-capacity.js";
+import { documentClient, pacedScan, withProfileLookupDeadline } from "./dynamodb-capacity.js";
 import { secureParameter } from "./config.js";
 import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBudgetExhausted, ReconciliationMutationBudget, type ProviderClientFactory } from "./mutation-budget.js";
 import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResult } from "./queue.js";
@@ -549,7 +549,7 @@ export class ManualDecisionStore {
         totalPages += 1;
         let result: any;
         try {
-          result = await documentClient.send(new QueryCommand({
+          result = await documentClient.send(new QueryCommand(withProfileLookupDeadline({
             TableName: table,
             IndexName: PROFILE_LOOKUP_INDEX_NAME,
             KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :prefix)",
@@ -564,7 +564,7 @@ export class ManualDecisionStore {
             ExclusiveStartKey: cursor,
             Limit: pageLimit,
             ReturnConsumedCapacity: "TOTAL",
-          }));
+          }, deadlineAtMs)));
         } catch (error) {
           console.error(JSON.stringify({
             service: "todoist-calendar-sync-health",
