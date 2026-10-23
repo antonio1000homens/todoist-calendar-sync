@@ -84,6 +84,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const taskRequests = new Map(), splits = new Map();
   const get = (map, id) => { if (!map.has(id)) throw Object.assign(new Error("Not found"), { status: 404 }); return clone(map.get(id)); };
   const stateMethods = {
+    async assertHistoricalSeriesUnowned() {},
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async listCompletedCalendarProjectionsByTaskAnyProfile() { return []; },
@@ -116,6 +117,12 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       mappingMap.set(mapping.taskId,clone(mapping));
       eventMappingMap.set(`${mapping.profile}:${mapping.eventId}`,clone(mapping));ownerMappingMap.set(mapping.taskId,clone(mapping));
       recurrences.set(link.seriesId,clone(link));
+      return true;
+    },
+    async commitFlattenMapping({mapping,previous,links}) {
+      for (const m of previous) { mappingMap.delete(m.taskId); eventMappingMap.delete(`${m.profile}:${m.eventId}`); ownerMappingMap.delete(m.taskId); }
+      for (const l of links) recurrences.delete(l.seriesId);
+      mappingMap.set(mapping.taskId,clone(mapping)); eventMappingMap.set(`${mapping.profile}:${mapping.eventId}`,clone(mapping)); ownerMappingMap.set(mapping.taskId,clone(mapping));
       return true;
     },
     async deleteRecurrenceLink(_profile, id) { recurrences.delete(id); },
@@ -154,6 +161,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       async getEvent(id) { return get(eventMap, id); },
       async findByTodoistTaskId(taskId) { return clone([...eventMap.values()].find(value=>value.extendedProperties?.shared?.taskId===taskId)); },
       async listDelta() { return { items: clone([...eventMap.values()]) }; },
+      async listExplicitSeriesExceptions() { return []; },
       async listInstances(id) { return clone([...eventMap.values()].filter(value => value.recurringEventId === id)); },
       async getTimeZone() { return "Europe/London"; },
       async listOccurrencesInWindow(from,to) {
@@ -1496,6 +1504,135 @@ test("same-date annualizing can resume after the Calendar update but before read
   assert.equal(h.taskMap.size,1);
 });
 
+function flattenFixture() {
+  const master = event("flatten-master",{summary:"Birthday",description:"",start:{date:"2026-08-16"},end:{date:"2026-08-17"},recurrence:["RRULE:FREQ=YEARLY"]});
+  const occurrence = event("flatten-instance",{summary:"Birthday",description:"",start:{date:"2027-08-16"},end:{date:"2027-08-17"},recurringEventId:master.id,originalStartTime:{date:"2027-08-16"}});
+  const recurring = task("task",{content:"Birthday",description:"",due:{date:"2027-08-16",is_recurring:true,string:"every year"}});
+  return {master,occurrence,recurring,input:intent({action:"flatten",eventId:occurrence.id,scope:"future"})};
+}
+test("explicit flatten keeps the selected yearly occurrence and caps historical master",async t=>{
+  const f=flattenFixture(), h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  const result=await h.execute(f.input);
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.equal(h.taskMap.get("task").due.is_recurring,undefined);
+  const mapping=h.mappingMap.get("task"), standalone=h.eventMap.get(mapping.eventId);
+  assert.equal(standalone.start.date,"2027-08-16");
+  assert.equal(standalone.recurrence,undefined);
+  assert.equal(standalone.recurringEventId,undefined);
+  assert.equal(h.eventMap.get(f.master.id).recurrence[0],"RRULE:FREQ=YEARLY;UNTIL=20270815");
+  assert.equal(h.eventMap.get(f.master.id).extendedProperties.shared.syncHistoryOnly,"true");
+  assert.equal(h.recurrences.size,0);
+  assert.equal(h.ownerMappingMap.get("task").eventId,mapping.eventId);
+});
+
+for (const boundary of ["master","standalone","task","mapping"]) test(`flatten resumes a lost ${boundary} acknowledgement without duplicates`,async t=>{
+  const f=flattenFixture(), h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  const provider=boundary==="task"?h.clients.todoist:boundary==="mapping"?StateRepository.prototype:h.clients.calendar;
+  const method=boundary==="master"?"upsertEventIfUnchanged":boundary==="standalone"?"createRepairEventOnce":boundary==="task"?"upsertTask":"commitFlattenMapping";
+  const original=provider[method];let lost=false;
+  provider[method]=async function(...args){const result=await original.apply(this,args);if(!lost){lost=true;throw new Error("Lost acknowledgement");}return result;};
+  t.after(()=>{provider[method]=original;});
+  const first=await h.execute(f.input);
+  assert.equal(first.status,"needs_review",JSON.stringify(first));
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.equal(h.writes.filter(w=>w[0]==="create-event").length,1);
+  assert.equal(h.writes.filter(w=>w[0]==="task").length,1);
+  assert.equal(h.mappingMap.size,1);
+});
+
+test("flatten transfers a deleted mirror mapping and preserves unrelated historical standalone",async t=>{
+  const f=flattenFixture(), history=event("unrelated-history",{start:{date:"2026-08-16"},end:{date:"2026-08-17"}});
+  const previous={profile:"home",taskId:"deleted-mirror",eventId:f.occurrence.id,recurrenceOwner:"calendar",seriesId:"series",masterEventId:f.master.id,activeInstanceId:f.occurrence.id,updatedAt:"version-1"};
+  const h=harness(t,{events:[{...f.master,iCalUID:"series"},f.occurrence,history],tasks:[{...f.recurring,due:{date:"2027-08-16"}}],mappings:[previous],recurrence:{...previous,owner:"calendar"}});
+  const result=await h.execute(f.input);
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.equal(h.mappingMap.has("deleted-mirror"),false);
+  assert.equal(h.ownerMappingMap.has("deleted-mirror"),false);
+  assert.equal(h.recurrences.size,0);
+  assert.deepEqual(h.eventMap.get(history.id),history);
+});
+
+test("flatten refuses unsupported rules, overridden occurrences and resolved cases",async t=>{
+  const f=flattenFixture(), h=harness(t,{events:[{...f.master,recurrence:["RRULE:FREQ=YEARLY;COUNT=4"]},f.occurrence],tasks:[f.recurring]});
+  await assert.rejects(()=>h.engine.preview(actor,f.input),/YEARLY|COUNT/);
+  h.eventMap.set(f.master.id,f.master);
+  h.clients.calendar.listExplicitSeriesExceptions=async()=>[{...f.occurrence,summary:"Exception"}];
+  await assert.rejects(()=>h.engine.preview(actor,f.input),/exceptions/);
+  h.clients.calendar.listExplicitSeriesExceptions=async()=>[];
+  h.engine.store.getCase=async()=>({id:"case",profile:"home",status:"resolved"});
+  await assert.rejects(()=>h.engine.preview(actor,f.input),/unresolved/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("flatten first occurrence removes recurrence in place and preserves unrelated metadata",async t=>{
+  const f=flattenFixture();f.master.start={date:"2027-08-16"};f.master.end={date:"2027-08-17"};
+  f.master.extendedProperties={private:{other:"private"},shared:{custom:"retained",syncAnotherApp:"retained",taskId:"task",syncRecurrenceOwner:"todoist"}};
+  const h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  const result=await h.execute(f.input);
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  const stored=h.eventMap.get(f.master.id);
+  assert.deepEqual(stored.recurrence,[]);
+  assert.equal(stored.extendedProperties.private.other,"private");
+  assert.equal(stored.extendedProperties.shared.syncAnotherApp,"retained");
+  assert.equal(h.mappingMap.get("task").eventId,f.master.id);
+  assert.equal(h.writes.filter(w=>w[0]==="create-event").length,0);
+});
+
+test("flatten detaches a stale cancelled standalone mapping without changing that provider object",async t=>{
+  const f=flattenFixture(), cancelled=event("cancelled-old",{status:"cancelled"});
+  const old={profile:"home",taskId:"task",eventId:cancelled.id,updatedAt:"old-version"};
+  const h=harness(t,{events:[f.master,f.occurrence,cancelled],tasks:[f.recurring],mappings:[old]});
+  const result=await h.execute(f.input);
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.deepEqual(h.eventMap.get(cancelled.id),cancelled);
+  assert.equal(h.eventMappingMap.has(`home:${cancelled.id}`),false);
+  assert.notEqual(h.mappingMap.get("task").eventId,cancelled.id);
+});
+
+test("flatten refuses provider edits after cap and retains its recovery barriers",async t=>{
+  const f=flattenFixture(),h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  const write=h.clients.calendar.upsertEventIfUnchanged;
+  h.clients.calendar.upsertEventIfUnchanged=async(...args)=>{await write(...args);h.eventMap.get(f.master.id).summary="External edit";throw new Error("Lost response");};
+  assert.equal((await h.execute(f.input)).status,"needs_review");
+  const resumed=await h.engine.execute("repair");
+  assert.equal(resumed.status,"needs_review");
+  assert.equal(h.eventMap.get(f.master.id).summary,"External edit");
+  assert.equal(h.controlsMap.get("home:todoist:task").activeRepair,"repair");
+  assert.equal(h.writes.filter(w=>w[0]==="create-event").length,0);
+});
+
+for (const firstOccurrence of [false,true]) test(`flatten remains stable across delayed Calendar instance and Todoist notifications (in-place: ${firstOccurrence})`,async t=>{
+  const f=flattenFixture();if(firstOccurrence){f.master.start={date:"2027-08-16"};f.master.end={date:"2027-08-17"};}
+  const h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring]});
+  assert.equal((await h.execute(f.input)).status,"succeeded");
+  const mapped=clone(h.mappingMap.get("task")), before=h.writes.length;
+  h.clients.calendar.listDelta=async()=>({items:[f.occurrence]});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"delayed-calendar",kind:"calendar",profile:"home",mode:"aws",receivedAt:"2026-10-23T14:00:00Z",headers:{},body:""});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"delayed-task",kind:"todoist",profile:"home",mode:"aws",headers:{},body:JSON.stringify({event_name:"item:updated",event_data:f.recurring})});
+  assert.deepEqual(h.mappingMap.get("task"),mapped);
+  assert.equal(h.writes.length,before);
+});
+
+test("flatten keeps an explicitly unchanged historical one-off byte-for-byte and fences its stale shared task link",async t=>{
+  const f=flattenFixture(),history=event("linked-history",{summary:"Birthday",description:"",start:{date:"2026-08-16"},end:{date:"2026-08-17"},extendedProperties:{shared:{taskId:"task"}}});
+  const h=harness(t,{events:[f.master,f.occurrence,history],tasks:[f.recurring]});
+  const result=await h.execute({...f.input,leftovers:{"home:calendar:linked-history":"unchanged"}});
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  const mapped=clone(h.mappingMap.get("task")), before=h.writes.length;
+  h.clients.calendar.listDelta=async()=>({items:[history]});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"history-delta",kind:"calendar",profile:"home",mode:"aws",headers:{},body:""});
+  assert.deepEqual(h.eventMap.get(history.id),history);
+  assert.deepEqual(h.mappingMap.get("task"),mapped);
+  assert.equal(h.writes.length,before);
+});
+
+test("flatten blocks another live task named by the series even without a mapping",async t=>{
+  const f=flattenFixture();f.master.extendedProperties={shared:{taskId:"another-live-task"}};
+  const h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring,task("another-live-task")]});
+  await assert.rejects(()=>h.engine.preview(actor,f.input),/another live Todoist task/);
+  assert.deepEqual(h.writes,[]);
+});
 
 test("an explicit Todoist-only disposition survives repeat snapshot and webhook projection and a cancelled stray counterpart",async t=>{
   const h=harness(t,{events:[event("history",{start:{date:"2026-03-01"},end:{date:"2026-03-08"}})],tasks:[task("current",{due:{date:"2027-03-01"}})]});

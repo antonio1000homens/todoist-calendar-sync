@@ -672,7 +672,15 @@ export class Synchronizer {
     // still run; unbound deleted instances cannot resurrect Todoist tasks.
     if (!archived && event.recurringEventId && event.status !== "cancelled") {
       const { calendar } = await this.clients(delivery.profile);
-      const parent = await calendar.getEvent(event.recurringEventId);
+      let parent: CalendarEvent;
+      try { parent = await calendar.getEvent(event.recurringEventId); }
+      catch(error) {
+        if (!calendarEventGoneOnDirectRead(error)) throw error;
+        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:event.recurringEventId});
+      }
+      if (parent.status === "cancelled" || !parent.recurrence?.length) {
+        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:parent.id});
+      }
       archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
     }
     if (archived) {
@@ -927,6 +935,12 @@ export class Synchronizer {
       try { task = await todoist.getTask(linkedTaskId); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; }
     }
     if (!task) task = matchingTask(event, await todoist.listTasks());
+    if (task) {
+      const owner = await this.state.getMappingByTaskAnyProfile(task.id);
+      if (owner && (owner.profile !== delivery.profile || ![owner.eventId,owner.masterEventId,owner.activeInstanceId].includes(event.id))) {
+        return this.state.audit(delivery.profile,"calendar_task_link_ambiguous_conflict",{eventId:event.id,taskId:task.id,ownerProfile:owner.profile,mappedEventId:owner.eventId});
+      }
+    }
     if (task && await this.state.syncBlocked(delivery.profile, { taskId:task.id, eventId:event.id })) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:event.id, taskId:task.id });
     }

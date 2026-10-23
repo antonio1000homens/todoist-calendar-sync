@@ -134,6 +134,7 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
   const hasTask = Boolean(form.taskId && form.verifiedTaskId === form.taskId);
   const hasEvent = Boolean(form.eventId && form.verifiedEventId === form.eventId);
   switch (action) {
+    case "flatten":
     case "link":
     case "transfer":
     case "verify": return hasTask && hasEvent;

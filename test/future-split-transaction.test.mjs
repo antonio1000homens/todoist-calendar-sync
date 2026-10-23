@@ -179,3 +179,36 @@ test("completed instance history in another profile blocks historical master reu
     );
   } finally { documentClient.send = original; }
 });
+
+test("flatten transaction conditionally retires recurrence and all previous indexes alongside a receipt", async () => {
+  const original = documentClient.send; const calls=[];
+  documentClient.send=async command=>{calls.push(command);return {};};
+  try {
+    const next={profile:"antonio",taskId:"retained",eventId:"standalone",updatedAt:"approved-version"};
+    const previous={...mapping,taskId:"deleted-mirror",eventId:"old-occurrence",recurrenceOwner:"calendar",seriesId:"old-series"};
+    const previousLink={...link,owner:"calendar",taskId:previous.taskId,eventId:previous.eventId,seriesId:previous.seriesId};
+    assert.equal(await new StateRepository().commitFlattenMapping({operationId:"flatten-test",mapping:next,previous:[previous],links:[previousLink]}),true);
+    const transaction=calls.find(c=>c.constructor.name==="TransactWriteCommand").input.TransactItems;
+    const puts=transaction.filter(x=>x.Put).map(x=>x.Put);
+    const deletes=transaction.filter(x=>x.Delete).map(x=>x.Delete);
+    assert.deepEqual(puts.map(x=>x.Item.pk).sort(),["EVENT#antonio#standalone","FLATTEN_REPAIR#flatten-test","TASK#antonio#retained","TASKOWNER#retained"]);
+    assert.deepEqual(deletes.map(x=>x.Key.pk).sort(),["EVENT#antonio#old-occurrence","RECURRENCE#antonio#old-series","TASK#antonio#deleted-mirror","TASKOWNER#deleted-mirror"]);
+    assert.ok(puts.every(x=>x.ConditionExpression==="attribute_not_exists(pk)"));
+    assert.ok(deletes.every(x=>x.ConditionExpression.includes("updatedAt = :v")));
+    for (const item of [...puts,...deletes]) {
+      const used=[...new Set(item.ConditionExpression.match(/:[a-z]+/g)||[])].sort();
+      assert.deepEqual(Object.keys(item.ExpressionAttributeValues||{}).sort(),used);
+    }
+  } finally {documentClient.send=original;}
+});
+
+test("flatten refuses transaction races and validates every mapping index after a committed receipt", async () => {
+  const original=documentClient.send;
+  const next={profile:"antonio",taskId:"retained",eventId:"standalone",updatedAt:"approved-version"};
+  try {
+    documentClient.send=async command=>{if(command.constructor.name==="TransactWriteCommand")throw Object.assign(new Error("race"),{name:"TransactionCanceledException",CancellationReasons:[{Code:"ConditionalCheckFailed"}]});return {};};
+    assert.equal(await new StateRepository().commitFlattenMapping({operationId:"flatten-test",mapping:next,previous:[],links:[]}),false);
+    documentClient.send=async command=>({Item:command.input.Key.pk.startsWith("FLATTEN_REPAIR#")?next:command.input.Key.pk.startsWith("TASK#")?{...next,eventId:"changed"}:next});
+    assert.equal(await new StateRepository().commitFlattenMapping({operationId:"flatten-test",mapping:next,previous:[],links:[]}),false);
+  } finally {documentClient.send=original;}
+});
