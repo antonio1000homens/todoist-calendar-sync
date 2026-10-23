@@ -199,7 +199,7 @@ export async function applyStandaloneAnnualRepair(
             syncHistorySuccessorId: plan.masterId,
           },
         },
-      }, source.id, source.etag);
+      }, plan.sourceId, source.etag!);
       assertStandaloneHistory(preserved, plan, task.id);
     }
     const projected = toCalendarEvent(task);
@@ -210,7 +210,7 @@ export async function applyStandaloneAnnualRepair(
         syncSplitVersion:"standalone-1", todoistAnchorEnd:plan.end,
         todoistAnchorTimeZone:zone,
       } },
-    }, source.id);
+    }, plan.sourceId);
   } else if (started) {
     master = source;
   } else {
@@ -222,7 +222,7 @@ export async function applyStandaloneAnnualRepair(
         ...source.extendedProperties?.shared,...projected.extendedProperties?.shared,
         todoistAnchorEnd:plan.end, todoistAnchorTimeZone:zone,
       }},
-    }, source.id, source.etag);
+    }, plan.sourceId, source.etag!);
   }
   if (master.id !== plan.masterId || master.start?.date !== plan.start
     || master.end?.date !== plan.end || !calendarRecurrenceMatchesTodoist(master, task)
