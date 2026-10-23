@@ -136,16 +136,24 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   assert.equal(inbox.status,200);
   assert.deepEqual(inbox.body.items.map(item=>item.id),["case-1"]);
 
-  t.mock.method(StateRepository.prototype,"getReconciliationState",async()=>({profile:"home",generation:"generation-1"}));
+  t.mock.method(StateRepository.prototype,"getReconciliationState",async profile=>({profile,generation:"generation-1"}));
   t.mock.method(StateRepository.prototype,"listReconciliationDiagnostics",async(profile,generation,limit,after)=>({
-    items:[{profile,generation,action:"todoist_snapshot_reconcile_unmapped_conflict",outcome:"conflict",taskId:"task-7",eventId:"event-7",reason:"title_mismatch",caseId:"case-1",caseStatus:"dismissed"}],
+    items:[{profile,generation,action:"todoist_snapshot_reconcile_unmapped_conflict",outcome:"conflict",
+      taskId:profile==="home"?"task-7":"work-only-task",eventId:profile==="home"?"event-7":"work-only-event",
+      reason:"title_mismatch",...(profile==="home"?{caseId:"case-1",caseStatus:"dismissed"}:{})}],
     next:after?undefined:"ITEM#"+"a".repeat(64),
   }));
   const diagnostics=await jsonResponse(await handler(event("/review/api/reconciliation/diagnostics?profile=home","GET",headers)));
   assert.equal(diagnostics.status,200);
   assert.equal(diagnostics.body.generation,"generation-1");
+  assert.deepEqual(diagnostics.body.items.map(item=>item.taskId),["task-7"]);
+  assert.ok(diagnostics.body.items.every(item=>item.profile==="home"));
   assert.equal(diagnostics.body.items[0].caseStatus,"open","the endpoint uses the current case state, not the state captured when the run observed it");
   assert.match(diagnostics.body.next,/^ITEM#[a-f0-9]{64}$/);
+  const workDiagnostics=await jsonResponse(await handler(event("/review/api/reconciliation/diagnostics?profile=work","GET",headers)));
+  assert.equal(workDiagnostics.status,200);
+  assert.deepEqual(workDiagnostics.body.items.map(item=>item.taskId),["work-only-task"]);
+  assert.ok(workDiagnostics.body.items.every(item=>item.profile==="work"));
   const badDiagnostics=await jsonResponse(await handler(event("/review/api/reconciliation/diagnostics?profile=home&after=invalid","GET",headers)));
   assert.equal(badDiagnostics.status,400);
 
