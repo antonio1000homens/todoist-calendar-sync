@@ -31,11 +31,11 @@ export function reconcileRepairSelection(item, snapshots, previous) {
     return { id, verified: id };
   };
   const task = resolve("todoist", current.taskId, current.manualTask,
-    [item.taskId, item.decision?.taskId, context.providerTaskId, mapping?.taskId]);
+    [mapping?.taskId, item.decision?.taskId, context.providerTaskId, item.taskId]);
   const event = resolve("calendar", current.eventId, current.manualEvent,
-    [item.eventId, item.decision?.eventId, context.providerEventId,
-      item.decision?.activeInstanceId, mapping?.activeInstanceId,
-      mapping?.eventId, item.decision?.masterEventId, mapping?.masterEventId]);
+    [mapping?.activeInstanceId, mapping?.eventId, mapping?.masterEventId,
+      item.decision?.activeInstanceId, item.decision?.eventId, context.providerEventId,
+      item.decision?.masterEventId, item.eventId]);
   return { ...current, taskId:task.id, verifiedTaskId:task.verified,
     eventId:event.id, verifiedEventId:event.verified,
     // A provider refresh takes precedence over earlier search evidence. Never
@@ -102,7 +102,6 @@ export function operationResumeEligibility(operation) {
   const steps = operation.steps || {};
   const hasWriteEvidence = Object.keys(steps).some(name => name !== "validated")
     || Object.values(operation.creations || {}).length > 0
-    || Object.values(operation.expectedProviders || {}).some(value => value !== undefined)
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
   if (operation.abandoned) return hasWriteEvidence ? "none" : "fresh-preview";

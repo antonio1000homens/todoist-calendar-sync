@@ -54,7 +54,6 @@ export interface RepairOperation {
 export function operationHasWriteEvidence(operation: RepairOperation): boolean {
   return Object.keys(operation.steps || {}).some(name => name !== "validated")
     || Object.keys(operation.creations || {}).length > 0
-    || Object.values(operation.expectedProviders || {}).some(value => value !== undefined)
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
 }

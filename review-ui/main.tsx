@@ -187,7 +187,6 @@ function App() {
       if(operationResumeEligibility(operation)==="fresh-preview") {
         const refreshedSelection=reconcileRepairSelection(selected,result.snapshots,emptyRepairSelection(selected));
         setRepairSelection(refreshedSelection);
-        setAction("verify");setOwner("");setWinner("none");setScope("occurrence");
         setMessage(`Current provider items refreshed. The failed operation ${operation?.id} remains unchanged. Review the current Todoist and Calendar IDs, then create a new preview.`);
       }
     }

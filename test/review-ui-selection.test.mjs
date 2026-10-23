@@ -86,6 +86,19 @@ test("search selection is confirmed explicitly but only for the current case", (
   assert.equal(refreshed.verifiedTaskId,"search-result");
 });
 
+test("fresh-preview refresh derives IDs from the current mapping rather than a stale manual pair", () => {
+  const item=caseFor("refresh-case","home","old-task","old-event");
+  item.decision.mappingSnapshot={taskId:"current-task",activeInstanceId:"current-event"};
+  const stale=editRepairSelection(emptyRepairSelection(item),"todoist","old-task",true);
+  const snapshots=[
+    live("home","todoist","old-task"),live("home","todoist","current-task"),
+    live("home","calendar","old-event"),live("home","calendar","current-event"),
+  ];
+  const refreshed=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.deepEqual([refreshed.taskId,refreshed.eventId],["current-task","current-event"]);
+  assert.deepEqual([stale.taskId,stale.eventId],["old-task",""]);
+});
+
 test("a missing Todoist or Calendar disposition triggers an affected-items refresh", () => {
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for home:todoist:duplicate"),"home:todoist:duplicate");
   assert.equal(missingDispositionReference("Choose Create counterpart or Exclude for work:calendar:master_20270301"),"work:calendar:master_20270301");
@@ -204,12 +217,14 @@ test("review UI renders approved historical and future RRULEs and expiry before 
 
 test("failed repair resume requires recorded write evidence", () => {
   assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}}}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}},expectedProviders:{"home:calendar:event":{id:"event"}}}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"failed",steps:{},outcomes:[]}),"resume");
   assert.equal(operationResumeEligibility({status:"failed",steps:{},abandoned:true}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{validated:{status:"done"}},abandoned:true}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"failed",steps:{"provider-write":{status:"running"}},abandoned:true}),"none");
   assert.equal(operationResumeEligibility({status:"needs_review",steps:{validated:{status:"done"}}}),"fresh-preview");
+  assert.equal(operationResumeEligibility({status:"needs_review",steps:{validated:{status:"done"}},expectedProviders:{"home:calendar:event":{id:"event"}}}),"fresh-preview");
   assert.equal(operationResumeEligibility({status:"needs_review",steps:{"provider-write":{status:"running"}}}),"resume");
   assert.equal(operationResumeEligibility({status:"queued",steps:{}}),"resume");
 });
