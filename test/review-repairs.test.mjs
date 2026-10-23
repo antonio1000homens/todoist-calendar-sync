@@ -1613,3 +1613,23 @@ for (const firstOccurrence of [false,true]) test(`flatten remains stable across 
   assert.deepEqual(h.mappingMap.get("task"),mapped);
   assert.equal(h.writes.length,before);
 });
+
+test("flatten keeps an explicitly unchanged historical one-off byte-for-byte and fences its stale shared task link",async t=>{
+  const f=flattenFixture(),history=event("linked-history",{summary:"Birthday",description:"",start:{date:"2026-08-16"},end:{date:"2026-08-17"},extendedProperties:{shared:{taskId:"task"}}});
+  const h=harness(t,{events:[f.master,f.occurrence,history],tasks:[f.recurring]});
+  const result=await h.execute({...f.input,leftovers:{"home:calendar:linked-history":"unchanged"}});
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  const mapped=clone(h.mappingMap.get("task")), before=h.writes.length;
+  h.clients.calendar.listDelta=async()=>({items:[history]});
+  await new Synchronizer(new StateRepository(),undefined,async()=>h.clients).process({id:"history-delta",kind:"calendar",profile:"home",mode:"aws",headers:{},body:""});
+  assert.deepEqual(h.eventMap.get(history.id),history);
+  assert.deepEqual(h.mappingMap.get("task"),mapped);
+  assert.equal(h.writes.length,before);
+});
+
+test("flatten blocks another live task named by the series even without a mapping",async t=>{
+  const f=flattenFixture();f.master.extendedProperties={shared:{taskId:"another-live-task"}};
+  const h=harness(t,{events:[f.master,f.occurrence],tasks:[f.recurring,task("another-live-task")]});
+  await assert.rejects(()=>h.engine.preview(actor,f.input),/another live Todoist task/);
+  assert.deepEqual(h.writes,[]);
+});

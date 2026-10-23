@@ -935,6 +935,12 @@ export class Synchronizer {
       try { task = await todoist.getTask(linkedTaskId); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; }
     }
     if (!task) task = matchingTask(event, await todoist.listTasks());
+    if (task) {
+      const owner = await this.state.getMappingByTaskAnyProfile(task.id);
+      if (owner && (owner.profile !== delivery.profile || ![owner.eventId,owner.masterEventId,owner.activeInstanceId].includes(event.id))) {
+        return this.state.audit(delivery.profile,"calendar_task_link_ambiguous_conflict",{eventId:event.id,taskId:task.id,ownerProfile:owner.profile,mappedEventId:owner.eventId});
+      }
+    }
     if (task && await this.state.syncBlocked(delivery.profile, { taskId:task.id, eventId:event.id })) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:event.id, taskId:task.id });
     }

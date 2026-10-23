@@ -365,6 +365,8 @@ export class ReviewEngine {
         if ((await provider.calendar.listExplicitSeriesExceptions(master.id)).length) throw new Error("Explicit Calendar series exceptions require separate review before flattening");
       } catch(error) { invalidRepairIntent(error instanceof Error ? error.message : "Unsupported flatten repair"); }
       if (preview.flattenPlan!.standaloneId !== master.id && snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===preview.flattenPlan!.standaloneId && s.object)) invalidRepairIntent("The deterministic standalone ID already exists; resume its original repair instead");
+      const providerTaskIds = [master.extendedProperties?.shared?.taskId,event.extendedProperties?.shared?.taskId].filter(Boolean);
+      if (snapshots.some(s=>s.ref.side==="todoist" && s.ref.id!==task.id && s.object && providerTaskIds.includes(s.ref.id))) invalidRepairIntent("The series still names another live Todoist task; resolve its exact ownership before flattening");
       const previousMappings = [...new Map(snapshots.filter(s=>s.mapping).map(s=>[s.mapping!.taskId,s.mapping!])).values()];
       for (const mapping of previousMappings) {
         if (mapping.profile !== intent.profile || ![task.id,masterSnapshot.recurrence?.taskId].includes(mapping.taskId)) invalidRepairIntent("Competing mapping is not attributable to the selected pair");
