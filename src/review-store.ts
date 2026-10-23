@@ -3,6 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
+import { retainedConflictIdentity } from "./audit-policy.js";
 import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
@@ -71,20 +72,38 @@ export class ReviewStore {
         ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": "REVIEW#OPEN#" }, Limit: 50,
         ...(cursor ? { ExclusiveStartKey: cursor } : {}) }));
       for (const candidate of (page.Items || []) as ReviewCase[]) {
-        if (!candidate.id.startsWith("incident-") || candidate.conflictKey !== conflictKey) continue;
-        incidents.push(candidate);
+        if (!candidate.id.startsWith("incident-")) continue;
+        if (candidate.conflictKey === conflictKey) {
+          incidents.push(candidate);
+          continue;
+        }
+        // Older incident rows predate conflictKey. Recover identity only from
+        // their retained audit record; never infer it from an incomplete case
+        // summary, since missing revisions could hide a changed conflict.
+        if (candidate.conflictKey || !candidate.sourceAuditKey) continue;
+        const audit = await this.get<Record<string, unknown>>(candidate.sourceAuditKey);
+        const detail = audit?.detail && typeof audit.detail === "object"
+          ? audit.detail as Record<string, unknown> : undefined;
+        const action = typeof audit?.action === "string" ? audit.action : undefined;
+        const identity = action && detail ? retainedConflictIdentity(action, detail) : undefined;
+        if (identity && reviewHash(identity) === conflictKey) incidents.push(candidate);
       }
       cursor = page.LastEvaluatedKey as Record<string, unknown> | undefined;
     } while (cursor);
     for (const candidate of incidents) {
       try {
+        const condition = candidate.sourceAuditKey
+          ? "#s = :open AND (conflictKey = :conflictKey OR attribute_not_exists(conflictKey)) AND sourceAuditKey = :sourceAuditKey"
+          : "#s = :open AND conflictKey = :conflictKey";
+        const values: Record<string, unknown> = { ":closed": "dismissed", ":open": "open", ":conflictKey": conflictKey,
+          ":result": `Coalesced into review case ${keeperId}`, ":keeper": keeperId, ":now": new Date().toISOString(),
+          ":lookup": `REVIEW#CLOSED#${candidate.createdAt}#${candidate.id}` };
+        if (candidate.sourceAuditKey) values[":sourceAuditKey"] = candidate.sourceAuditKey;
         await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${candidate.id}`),
-          UpdateExpression: "SET #s = :closed, #r = :result, coalescedInto = :keeper, updatedAt = :now, lookupSk = :lookup",
-          ConditionExpression: "#s = :open AND conflictKey = :conflictKey",
+          UpdateExpression: "SET #s = :closed, #r = :result, conflictKey = :conflictKey, coalescedInto = :keeper, updatedAt = :now, lookupSk = :lookup",
+          ConditionExpression: condition,
           ExpressionAttributeNames: { "#s": "status", "#r": "result" },
-          ExpressionAttributeValues: { ":closed": "dismissed", ":open": "open", ":conflictKey": conflictKey,
-            ":result": `Coalesced into review case ${keeperId}`, ":keeper": keeperId, ":now": new Date().toISOString(),
-            ":lookup": `REVIEW#CLOSED#${candidate.createdAt}#${candidate.id}` } }));
+          ExpressionAttributeValues: values }));
       } catch (error) { if (!conditional(error)) throw error; }
     }
   }
