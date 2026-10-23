@@ -54,85 +54,98 @@ test("fence and journal are retained until mapping restoration completes",async(
   assert.deepEqual(events,["restore"]);
 });
 
-test("store alone creates lifecycle receipts after real adapter actions and gates delete on trusted time",async()=>{
+test("worker adapters are bound at construction and request arguments cannot replace lifecycle evidence",async()=>{
   let now=10_000,leases=[{id:"writer"}],fence,failDisable=true,failRestore=true,failSaveAfterRelease=true;
   const states=new Map([["uuid-enabled","Enabled"],["uuid-disabled","Enabled"]]),events=[];
   const db=memoryDb(storedQueuedOperation());
   const realNow=Date.now;Date.now=()=>now;
-  const store=new ErasureOperationStore(db,()=>"unused-confirmation");
+  let deletionReadback={providersAbsent:false,stateAbsent:true},snapshotOverride;
   const adapters={
+    listWorkerMappings:async()=>[
+      {id:"uuid-enabled",state:"Enabled",eventSourceArn:"arn:aws:sqs:eu-west-2:123:worker"},
+      {id:"uuid-disabled",state:"Disabled",eventSourceArn:"arn:aws:sqs:eu-west-2:123:worker"},
+    ],
     disableMappings:async ids=>{events.push(["disable",ids]);if(failDisable){failDisable=false;throw new Error("transient disable failure");}
       for(const id of ids)states.set(id,"Disabled");},
     mappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
     inspectFence:async()=>({fence,leases}),
+    readMappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
+    readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,inventory:db.item.inventory}),
+    verifyDeletion:async()=>deletionReadback,
     beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
     restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
       for(const id of ids)states.set(id,"Enabled");},
     finishFence:async(profile,id)=>{events.push(["finish",profile,id]);fence=undefined;},
   };
+  const store=new ErasureOperationStore(db,()=>"unused-confirmation",adapters);
+  adapters.disableMappings=async()=>events.push("mutated adapter after construction");
   try{
     assert.equal(store.saveLifecycle,undefined,"no public method can write arbitrary phase/evidence");
-    await store.startFencedLifecycle("op",30,async()=>[
-      {id:"uuid-enabled",state:"Enabled",eventSourceArn:"arn:aws:sqs:eu-west-2:123:worker"},
-      {id:"uuid-disabled",state:"Disabled",eventSourceArn:"arn:aws:sqs:eu-west-2:123:worker"},
-    ]);
+    const attacker={listWorkerMappings:async()=>[],disableMappings:async()=>events.push("attacker adapter")};
+    await store.startFencedLifecycle("op",30,attacker);
     assert.equal(db.item.status,"fencing");
     assert.deepEqual(db.item.lifecycle.enabledMappingIds,["uuid-enabled"]);
     assert.match(db.calls.at(-1).input.ConditionExpression,/attribute_not_exists\(lifecycle\)/);
 
-    let result=await store.advanceFencedLifecycle("op",adapters,{phase:"ready_for_delete",now:0,evidence:{forged:true}});
+    let result=await store.advanceFencedLifecycle("op",attacker,{phase:"ready_for_delete",now:0,evidence:{forged:true}});
     assert.equal(result.phase,"disable_mappings");
     assert.match(db.item.lifecycle.lastError,/transient disable failure/);
     assert.equal(db.item.lifecycle.evidence.mappingsDisabled,undefined);
     now=db.item.lifecycle.nextRunAt;
-    assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"confirm_disabled");
+    assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"confirm_disabled");
     const receipt=db.item.lifecycle.evidence.mappingsDisableRequested;
     assert.equal(receipt.operationId,"op");assert.equal(receipt.phase,"mappingsDisableRequested");
 
-    assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"drain_before_fence");
-    result=await store.advanceFencedLifecycle("op",adapters);assert.equal(result.phase,"drain_before_fence");assert.equal(result.waiting,true);
+    assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"drain_before_fence");
+    result=await store.advanceFencedLifecycle("op",attacker);assert.equal(result.phase,"drain_before_fence");assert.equal(result.waiting,true);
     const pollAt=db.item.lifecycle.nextRunAt;
     const beforeWait=events.length;
     // Extra caller parameters cannot supply a clock or skip the durable deadline.
-    assert.equal((await store.advanceFencedLifecycle("op",adapters,0)).waiting,true);assert.equal(events.length,beforeWait);
-    now=pollAt;leases=[];assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"install_fence");
-    assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"wait_worker_timeout");
+    assert.equal((await store.advanceFencedLifecycle("op",attacker,0)).waiting,true);assert.equal(events.length,beforeWait);
+    now=pollAt;leases=[];assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"install_fence");
+    assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"wait_worker_timeout");
     const deadline=db.item.lifecycle.nextRunAt;
-    now=deadline-1;assert.equal((await store.advanceFencedLifecycle("op",adapters)).waiting,true);
-    now=deadline;assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"drain_after_timeout");
+    now=deadline-1;assert.equal((await store.advanceFencedLifecycle("op",attacker)).waiting,true);
+    now=deadline;assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"drain_after_timeout");
     fence=undefined;
-    result=await store.advanceFencedLifecycle("op",adapters);
+    result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"drain_after_timeout");assert.match(db.item.lifecycle.lastError,/fence is missing/);
     assert.equal(db.item.lifecycle.evidence.postTimeoutDrain,undefined);
     now=db.item.lifecycle.nextRunAt;fence={operationId:"different-operation"};
-    result=await store.advanceFencedLifecycle("op",adapters);
+    result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"drain_after_timeout");assert.match(db.item.lifecycle.lastError,/different erasure operation/);
     now=db.item.lifecycle.nextRunAt;fence={operationId:"op"};
-    leases=[{id:"late-writer"}];result=await store.advanceFencedLifecycle("op",adapters);assert.equal(result.phase,"drain_after_timeout");
-    now=db.item.lifecycle.nextRunAt;leases=[];result=await store.advanceFencedLifecycle("op",adapters);
+    leases=[{id:"late-writer"}];result=await store.advanceFencedLifecycle("op",attacker);assert.equal(result.phase,"drain_after_timeout");
+    now=db.item.lifecycle.nextRunAt;leases=[];result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"ready_for_delete");assert.equal(db.item.status,"deleting");
 
-    const fresh={profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,inventory:db.item.inventory};
-    const gateReader=(overrides={})=>({readFreshSnapshot:async()=>overrides.snapshot??fresh,
-      readMappingStates:async ids=>ids.map(id=>({id,state:overrides.mappingState??states.get(id)})),
-      inspectFence:async()=>({fence:Object.hasOwn(overrides,"fence")?overrides.fence:fence,leases:overrides.leases??leases})});
-    await assert.rejects(store.assertReadyForDelete("op",gateReader({snapshot:{...fresh,inventory:[{...fresh.inventory[0],digest:"changed"}]}})),/not ready/);
-    await assert.rejects(store.assertReadyForDelete("op",gateReader({mappingState:"Enabled"})),/not ready/);
-    await assert.rejects(store.assertReadyForDelete("op",gateReader({fence:{operationId:"different-operation"}})),/not ready/);
-    await assert.rejects(store.assertReadyForDelete("op",gateReader({fence:undefined,leases:[{id:"new-writer"}]})),/not ready/);
-    await store.assertReadyForDelete("op",gateReader());
+    snapshotOverride={profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
+      inventory:[{...db.item.inventory[0],digest:"changed"}]};
+    await assert.rejects(store.assertReadyForDelete("op",attacker),/not ready/);
+    snapshotOverride=undefined;
+    states.set("uuid-enabled","Enabled");
+    await assert.rejects(store.assertReadyForDelete("op",attacker),/not ready/);
+    states.set("uuid-enabled","Disabled");
+    fence={operationId:"different-operation"};
+    await assert.rejects(store.assertReadyForDelete("op",attacker),/not ready/);
+    fence={operationId:"op"};
+    leases=[{id:"new-writer"}];
+    await assert.rejects(store.assertReadyForDelete("op",attacker),/not ready/);
+    leases=[];
+    await store.assertReadyForDelete("op",attacker);
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified,undefined);
     await assert.rejects(store.transition("op","deleting","verifying"),/Fenced lifecycle status transitions/);
-    await assert.rejects(store.markDeletionVerified("op",{verifyDeletion:async()=>({providersAbsent:false,stateAbsent:true})}),/readback is not clear/);
+    await assert.rejects(store.markDeletionVerified("op",attacker),/readback is not clear/);
     assert.equal(db.item.lifecycle.phase,"ready_for_delete");
-    await store.markDeletionVerified("op",{verifyDeletion:async()=>({providersAbsent:true,stateAbsent:true})});
+    deletionReadback={providersAbsent:true,stateAbsent:true};
+    await store.markDeletionVerified("op",attacker);
     assert.equal(db.item.lifecycle.phase,"restore_mappings");assert.equal(db.item.status,"verifying");
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified.operationId,"op");
 
-    result=await store.advanceFencedLifecycle("op",adapters);assert.equal(result.phase,"restore_mappings");
+    result=await store.advanceFencedLifecycle("op",attacker);assert.equal(result.phase,"restore_mappings");
     assert.match(db.item.lifecycle.lastError,/transient restore failure/);
-    now=db.item.lifecycle.nextRunAt;assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"confirm_restored");
-    assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"release_fence");
+    now=db.item.lifecycle.nextRunAt;assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"confirm_restored");
+    assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"release_fence");
     db.send=async command=>{
       if(command.constructor.name.includes("Get"))return {Item:db.item};
       if(command.constructor.name.includes("Update")&&failSaveAfterRelease&&command.input.ExpressionAttributeValues[":lifecycle"]?.phase==="complete"){
@@ -144,9 +157,9 @@ test("store alone creates lifecycle receipts after real adapter actions and gate
       }
       return {};
     };
-    await assert.rejects(store.advanceFencedLifecycle("op",adapters),/simulated process crash/);
+    await assert.rejects(store.advanceFencedLifecycle("op",attacker),/simulated process crash/);
     assert.equal(db.item.lifecycle.phase,"release_fence","failed persistence leaves durable phase unchanged");
-    now=db.item.lifecycle.nextRunAt;result=await store.advanceFencedLifecycle("op",adapters);
+    now=db.item.lifecycle.nextRunAt;result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"complete");assert.equal(db.item.status,"succeeded");
     assert.equal(events.filter(event=>event[0]==="finish").length,1,"retry accepts an already-released fence");
     assert.ok(!events.some(event=>event[0]==="delete"),"lifecycle does not perform provider deletion");

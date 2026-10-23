@@ -56,6 +56,8 @@ export interface ErasureSnapshotReader {
   readMappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
   inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
 }
+/** Bind these process-trusted adapters when constructing the worker service, never per request. */
+export interface ErasureWorkerAdapters extends FencedLifecycleAdapters, ErasureDeletionVerifier, ErasureSnapshotReader {}
 
 const transitions: Record<ErasureOperationStatus, ErasureOperationStatus[]> = {
   previewed: ["queued"], queued: ["fencing", "partial_failure"], fencing: ["deleting", "partial_failure"],
@@ -106,7 +108,20 @@ const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
 
 /** Exact preview is immutable after submission; workers use conditional status changes. */
 export class ErasureOperationStore {
-  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID) {}
+  #workerAdapters?: ErasureWorkerAdapters;
+  /**
+   * Worker adapters are privileged process dependencies. Construct a worker-scoped store
+   * in trusted service wiring; never accept adapter objects from an HTTP/job request.
+   */
+  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID,
+    workerAdapters?: ErasureWorkerAdapters) {
+    this.#workerAdapters=workerAdapters?Object.freeze({...workerAdapters}):undefined;
+  }
+
+  #worker(): ErasureWorkerAdapters {
+    if(!this.#workerAdapters) throw new Error("Trusted erasure worker adapters are not configured");
+    return this.#workerAdapters;
+  }
 
   async issueConfirmation(preview: ErasurePreview, lifetimeMs = 5 * 60_000): Promise<{
     confirmationId: string; previewFingerprint: string; expiresAt: number;
@@ -166,15 +181,14 @@ export class ErasureOperationStore {
         ...(patch.requestId!==undefined?{":requestId":patch.requestId}:{})}}));
   }
 
-  async startFencedLifecycle(id: string, timeoutSeconds: number,
-    listWorkerMappings: () => Promise<FencedMapping[]>): Promise<void> {
+  async startFencedLifecycle(id: string, timeoutSeconds: number): Promise<void> {
     if(!Number.isInteger(timeoutSeconds) || timeoutSeconds<1) throw new Error("Invalid worker timeout");
     const current=await this.get(id);
     if(!current || current.status!=="queued" || current.lifecycle
       || !current.confirmationId || current.confirmationFingerprint!==current.previewFingerprint
       || current.previewFingerprint!==erasurePreviewFingerprint(current))
       throw new Error("Erasure operation is not ready to begin fencing");
-    const mappings=await listWorkerMappings();
+    const mappings=await this.#worker().listWorkerMappings();
     if(!mappings.length || mappings.some(item=>!item.id || !["Enabled","Disabled"].includes(item.state)
       || !item.eventSourceArn.includes(":sqs:")) || new Set(mappings.map(item=>item.id)).size!==mappings.length)
       throw new Error("Worker SQS mapping inventory is missing, ambiguous, or invalid");
@@ -190,13 +204,14 @@ export class ErasureOperationStore {
   }
 
   /** Execute one trusted adapter action/readback and persist its opaque receipt with a CAS. */
-  async advanceFencedLifecycle(id: string, adapters: Omit<FencedLifecycleAdapters,"listWorkerMappings">): Promise<{
+  async advanceFencedLifecycle(id: string): Promise<{
     phase: FencedLifecyclePhase; nextRunAt: number; status: ErasureOperationStatus; waiting: boolean;
   }> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
     if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
+    const adapters=this.#worker();
     const now=Date.now();
     if(current.nextRunAt>now) return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:true};
     let next:FencedLifecycle;
@@ -273,21 +288,22 @@ export class ErasureOperationStore {
     return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus,waiting:next.nextRunAt>now};
   }
 
-  async markDeletionVerified(id: string, verifier: ErasureDeletionVerifier): Promise<void> {
+  async markDeletionVerified(id: string): Promise<void> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
     if(!operation || operation.status!=="deleting" || current?.phase!=="ready_for_delete")
       throw new Error("Erasure is not ready for post-deletion verification");
     const now=Date.now();
-    const result=await verifier.verifyDeletion(operation);
+    const result=await this.#worker().verifyDeletion(operation);
     if(!result.providersAbsent || !result.stateAbsent) throw new Error("Deletion postflight readback is not clear; retain the profile fence");
     const next=this.#advance(operation.operationId,current,"restore_mappings",now,"providerDeletionVerified");
     await this.#persistLifecycle(operation,next,"verifying",now);
   }
 
-  async assertReadyForDelete(id: string, reader: ErasureSnapshotReader): Promise<void> {
+  async assertReadyForDelete(id: string): Promise<void> {
     const operation=await this.get(id);
     if(!operation) throw new Error("Erasure operation was not found");
+    const reader=this.#worker();
     const [freshSnapshot,mappingStates,fenceState]=await Promise.all([
       reader.readFreshSnapshot(operation),reader.readMappingStates(operation.lifecycle?.mappingIds??[]),reader.inspectFence(operation.profile),
     ]);
