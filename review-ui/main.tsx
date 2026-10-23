@@ -77,7 +77,7 @@ function App() {
   const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
   const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
   const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
-  const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data.reconciliation); };
+  const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data); return data; };
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
@@ -119,10 +119,24 @@ function App() {
     refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
   },[reconcileProfile]);
   useEffect(() => {
-    if (!operation || !["queued","running"].includes(operation.status)) return;
-    const timer=window.setTimeout(()=>api(`operations/${encodeURIComponent(operation.id)}`).then(data=>setOperation(data.operation)).catch(e=>setMessage(e.message)),1500);
-    return ()=>window.clearTimeout(timer);
-  },[operation]);
+    const currentRunStatus=reconciliation?.summary?.runStatus||reconciliation?.reconciliation?.status;
+    if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
+    let cancelled=false;
+    let timer:number;
+    const poll=async()=>{
+      try {
+        const data=await refreshReconciliation(reconcileProfile);
+        await refresh();
+        if(cancelled)return;
+        const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
+        const terminal=["succeeded","needs_review","failed"].includes(runStatus);
+        if(terminal||!data.reconciliation?.pending) setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
+        else timer=window.setTimeout(poll,1500);
+      } catch(e:any) { if(!cancelled){setMessage(e.message);timer=window.setTimeout(poll,3000);} }
+    };
+    timer=window.setTimeout(poll,1500);
+    return ()=>{cancelled=true;window.clearTimeout(timer);};
+  },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
   const providerLink=(item:ProviderObject|undefined) => {
     const href=item?.url||item?.htmlLink;
     if (!href) return undefined;
@@ -242,7 +256,7 @@ function App() {
     if(selected?.decision?.type==="operational_reconciliation_stuck"
       && !window.confirm(`Request reconciliation for ${targetProfile}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
     setBusy(true);setMessage("");
-    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:targetProfile})});setReconciliation(result.reconciliation);const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${targetProfile}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}.`); }
+    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:targetProfile})});setReconciliation({reconciliation:result.run,summary:result.summary});const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${targetProfile}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain; run outcome and inbox status are tracked separately.`); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const dismissAlert=async () => {
@@ -262,6 +276,7 @@ function App() {
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
     {message && <p className="notice" role="status">{message}</p>}
+    {reconciliation?.summary&&<p className="notice" role="status">Run: {reconciliation.summary.runStatus}; unresolved in this run: {reconciliation.summary.runUnresolved}. Actionable review cases remaining: {reconciliation.summary.actionableCaseCount}.</p>}
     <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>

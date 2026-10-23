@@ -53,6 +53,10 @@ export async function checkReconciliationHealth(
         }
       }
       if (!current) continue;
+      // A stuck alert describes one run. Once a later generation replaces it,
+      // or the alerted run reaches a terminal state, it is stale; it must not
+      // remain actionable alongside the current run.
+      await manual.retireStaleReconciliationIncidents(profile,current.generation,current.pending);
       const runStatus = reconciliationRunStatus(current);
 
       if (!current.pending || !["queued", "running", "failed"].includes(runStatus)) continue;

@@ -72,22 +72,33 @@ test("logEvent emits one valid structured JSON record without unsafe fields", ()
 
 test("conflict fingerprints distinguish mismatch categories and preserve long candidate IDs", () => {
   const action = "todoist_snapshot_reconcile_unmapped_conflict";
-  const base = { taskId: "task", eventId: "event" };
+  const base = { taskId: "task", eventId: "event", taskUpdatedAt:"2026-10-22T10:00:00Z", calendarEtag:"etag-1" };
   assert.notEqual(
     retainedConflictIdentity(action, { ...base, mismatchCategories: ["title_mismatch"] }),
     retainedConflictIdentity(action, { ...base, mismatchCategories: ["start_mismatch"] }),
   );
   const longIdA = "a".repeat(260);
   const longIdB = "b".repeat(260);
-  assert.notEqual(
-    retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdA] }),
-    retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdB] }),
-  );
+  assert.equal(retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
+    taskId: "task", candidateEventIds: ["abcde", longIdA], taskUpdatedAt:"2026-10-22T10:00:00Z",
+  }), undefined, "candidate-only observations have no revision for every ambiguous candidate");
+  const stablePair = { taskId:"task", eventId:"event", mismatchCategories:["title_mismatch"], taskUpdatedAt:"2026-10-22T10:00:00Z", calendarEtag:"etag-1" };
+  assert.equal(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair }));
+  assert.notEqual(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair, taskUpdatedAt:"2026-10-23T10:00:00Z" }));
+  assert.notEqual(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair, calendarEtag:"etag-2" }));
+  assert.equal(retainedConflictIdentity(action, { ...stablePair, taskUpdatedAt:undefined }), undefined);
+  assert.equal(retainedConflictIdentity(action, { ...stablePair, mismatchCategories:[] }), undefined);
+  const cancelledAction = "todoist_snapshot_reconcile_cancelled_projection_blocked";
+  const cancelled = { taskId:"task", eventId:"event", taskUpdatedAt:"2026-10-22T10:00:00Z",
+    calendarEtag:"etag-1", tombstoneReason:"user_deleted" };
+  assert.notEqual(retainedConflictIdentity(cancelledAction,cancelled),
+    retainedConflictIdentity(cancelledAction,{...cancelled,tombstoneReason:"project_exit"}));
 });
 
 test("a resolved conflict reappearing unchanged receives a new retained incident ID", () => {
   const fingerprint = retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_conflict", {
     taskId: "task-1", eventId: "event-1", mismatchCategories: ["title_mismatch"],
+    taskUpdatedAt:"2026-10-22T10:00:00Z", calendarEtag:"etag-1",
   });
   assert.ok(fingerprint);
   const first = retainedConflictIncidentId(undefined, fingerprint, "incident-1");

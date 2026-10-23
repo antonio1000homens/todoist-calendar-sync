@@ -100,6 +100,16 @@ export function reconciliationRunStatus(run: ReconciliationState): NonNullable<R
   return run.status || (run.lastFailedAt ? "failed" : run.pending ? "queued" : "succeeded");
 }
 
+/** A run outcome and the review inbox are separate dimensions. */
+export function reconciliationSummary(run: ReconciliationState | undefined, actionableCaseCount: number) {
+  return {
+    runStatus: run ? reconciliationRunStatus(run) : "not_started",
+    runUnresolved: run?.unresolved ?? 0,
+    actionableCaseCount,
+    inboxClear: actionableCaseCount === 0,
+  };
+}
+
 function key(pk: string, sk = "STATE"): { pk: string; sk: string } {
   return { pk, sk };
 }
