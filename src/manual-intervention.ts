@@ -1002,11 +1002,16 @@ export class ManualInterventionService {
       const alertedGeneration = typeof incident.context?.reconciliationGeneration === "string"
         ? incident.context.reconciliationGeneration : undefined;
       if (!alertedGeneration || (alertedGeneration === generation && pending)) continue;
-      await this.store.finish(incident.decisionId, "resolved",
-        `This reconciliation alert is no longer actionable: generation ${alertedGeneration} was superseded or reached a terminal state. Current generation: ${generation}.`,
-        "reconciliation-health").catch((error) => {
-          if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
-        });
+      const resolution = `This reconciliation alert is no longer actionable: generation ${alertedGeneration} was superseded or reached a terminal state. Current generation: ${generation}.`;
+      try {
+        await this.store.finish(incident.decisionId, "resolved", resolution, "reconciliation-health");
+      } catch (error) {
+        if ((error as { name?: string }).name !== "ConditionalCheckFailedException") throw error;
+        const existing = await this.store.get(incident.decisionId);
+        if (existing?.status !== "resolved") continue;
+      }
+      const finished = await this.store.get(incident.decisionId);
+      if (finished?.status === "resolved") await this.notifier.updateResolution(finished, finished.resolution || resolution);
     }
   }
 

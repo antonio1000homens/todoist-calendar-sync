@@ -140,8 +140,10 @@ test('fresh progress suppresses a delayed-but-active monitor alert', async (t) =
 });
 
 test('a later terminal generation marks only its older stuck-run alert stale', async (t) => {
+  const calls = fakeSlack(t);
   const store = new Store();
   store.decisions.set('old-stuck', decision({ decisionId: 'old-stuck', type: 'operational_reconciliation_stuck',
+    slackChannelId: 'CTEST', slackMessageTs: '1.000',
     context: { reconciliationGeneration: 'old-generation' } }));
   store.decisions.set('other-case', decision({ decisionId: 'other-case', type: 'both_sides_changed',
     context: {} }));
@@ -151,6 +153,26 @@ test('a later terminal generation marks only its older stuck-run alert stale', a
   assert.equal(store.decisions.get('old-stuck').status, 'resolved');
   assert.match(store.decisions.get('old-stuck').resolution, /no longer actionable/);
   assert.equal(store.decisions.get('other-case').status, 'pending');
+  const incidentUpdate = calls.find(({ method, payload }) => method === 'chat.update' && payload.ts === '1.000');
+  assert.ok(incidentUpdate);
+  assert.equal((incidentUpdate.payload.blocks || []).some((block) => block.type === 'actions'), false);
+});
+
+test('stale retirement updates Slack after a concurrent successful finish', async (t) => {
+  const calls = fakeSlack(t);
+  const store = new Store();
+  const incident = decision({ decisionId: 'old-stuck', type: 'operational_reconciliation_stuck',
+    slackChannelId: 'CTEST', slackMessageTs: '1.000', context: { reconciliationGeneration: 'old-generation' } });
+  store.decisions.set(incident.decisionId, incident);
+  const finish = store.finish.bind(store);
+  store.finish = async (...args) => {
+    await finish(...args);
+    throw Object.assign(new Error('conditional write lost after commit'), { name: 'ConditionalCheckFailedException' });
+  };
+  const service = new ManualInterventionService(store, new SlackManualNotifier(store));
+  await service.retireStaleReconciliationIncidents('home', 'new-generation', false);
+  assert.equal(store.decisions.get(incident.decisionId).status, 'resolved');
+  assert.ok(calls.some(({ method, payload }) => method === 'chat.update' && payload.ts === '1.000'));
 });
 
 test('notification retry reuses its reply and tolerates an already-resolved incident after a new generation starts', async (t) => {
