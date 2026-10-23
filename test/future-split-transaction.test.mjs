@@ -15,6 +15,21 @@ const link = {
   taskId: "smoke-task", eventId: "new-series", updatedAt: mapping.updatedAt,
 };
 
+test("expired-UNTIL split completion sends only expression values used by its expressions", async () => {
+  const original = documentClient.send;
+  let captured;
+  documentClient.send = async (command) => { captured = command; return {}; };
+  try {
+    await new StateRepository().completeFutureSeriesSplit("antonio", "smoke-task", "new-series");
+    assert.equal(captured.constructor.name, "UpdateCommand");
+    const input = captured.input;
+    const used = (input.UpdateExpression + " " + input.ConditionExpression).match(/:[A-Za-z]+\b/g) || [];
+    const expected = [...new Set(used.filter(name => Object.hasOwn(input.ExpressionAttributeValues, name)))];
+    assert.deepEqual(Object.keys(input.ExpressionAttributeValues).sort(), expected.sort());
+    assert.equal(input.ExpressionAttributeValues[":done"], "completed");
+  } finally { documentClient.send = original; }
+});
+
 test("future mapping transaction conditionally claims owner, mapping indexes and recurrence link together", async () => {
   const original = documentClient.send;
   let captured;

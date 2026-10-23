@@ -712,7 +712,7 @@ export class StateRepository {
       ConditionExpression: "profile = :profile AND newMasterId = :newMaster AND taskId = :task AND #status IN (:pending, :done)",
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: {
-        ":done": "completed", ":pending": "pending", ":profile": profile, ":now": now(),
+        ":done": "completed", ":pending": "pending", ":profile": profile,
         ":expire": ttl(90), ":newMaster": newMasterId, ":task": taskId,
       },
     }));
