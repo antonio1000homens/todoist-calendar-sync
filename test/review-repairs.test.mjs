@@ -838,7 +838,7 @@ test("fresh preview supersedes a failed selected-pair mismatch only when validat
   const h=harness(t,{events:[event("event"),event("current")]});
   const staleIntent=intent({eventId:"event"});
   const oldPreview=await h.engine.preview(actor,staleIntent);
-  const oldOperation={id:"stale-repair",status:"failed",attempt:2,steps:{validated:{id:"validated",status:"done"}},
+  const oldOperation={id:"stale-repair",actor, status:"failed",attempt:2,steps:{validated:{id:"validated",status:"done"}},
     error:"Selected pair does not match the current mapping; expected Calendar event old-event",
     preview:oldPreview,notificationPending:false};
   h.operations.set(oldOperation.id,clone(oldOperation));
@@ -854,6 +854,22 @@ test("fresh preview supersedes a failed selected-pair mismatch only when validat
   assert.deepEqual(h.operations.get(oldOperation.id).preview.intent,oldPreview.intent,
     "supersession must preserve the failed operation's selected-pair audit record");
   assert.equal(h.operations.get(oldOperation.id).steps.validated.status,"done");
+  assert.deepEqual(h.writes,[]);
+});
+
+test("another actor cannot supersede a failed no-write repair", async t => {
+  const h=harness(t),preview=await h.engine.preview(actor,intent());
+  const oldOperation={id:"stale-repair",actor,status:"failed",attempt:2,
+    steps:{validated:{id:"validated",status:"done"}},preview,error:"Selected pair mismatch",notificationPending:false};
+  h.operations.set(oldOperation.id,clone(oldOperation));
+  for(const snapshot of preview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:oldOperation.id});
+
+  await assert.rejects(h.engine.preview({subject:"other-operator",email:"other@example.test"},intent()),
+    /incomplete repair owns an affected item; resume that operation first/);
+
+  assert.equal(h.calls.filter(call=>call[0]==="release-unapplied").length,0);
+  assert.ok(preview.snapshots.every(snapshot=>h.controlsMap.get(refKey(snapshot.ref)).activeRepair===oldOperation.id));
+  assert.equal(h.operations.get(oldOperation.id).abandoned,undefined);
   assert.deepEqual(h.writes,[]);
 });
 
@@ -877,7 +893,7 @@ test("fresh preview refuses a partial-write failure and preserves its resume bar
 
 test("superseded preview rereads current provider versions and the new operation rejects a later edit", async t => {
   const h=harness(t),oldPreview=await h.engine.preview(actor,intent());
-  const oldOperation={id:"stale-repair",status:"failed",attempt:2,
+  const oldOperation={id:"stale-repair",actor,status:"failed",attempt:2,
     steps:{validated:{id:"validated",status:"done"}},preview:oldPreview,error:"Selected pair mismatch",notificationPending:false};
   h.operations.set(oldOperation.id,oldOperation);
   for(const snapshot of oldPreview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:oldOperation.id});
@@ -896,7 +912,7 @@ test("superseded preview rereads current provider versions and the new operation
 
 test("a stale sync-control version prevents superseding a no-write operation", async t => {
   const h=harness(t),preview=await h.engine.preview(actor,intent());
-  const old={id:"stale-repair",status:"failed",attempt:2,
+  const old={id:"stale-repair",actor,status:"failed",attempt:2,
     steps:{validated:{id:"validated",status:"done"}},preview,error:"Selected pair mismatch",notificationPending:false};
   h.operations.set(old.id,old);
   for(const snapshot of preview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{

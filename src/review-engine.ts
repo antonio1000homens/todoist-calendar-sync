@@ -77,7 +77,7 @@ export class ReviewEngine {
     }
     return pending;
   }
-  private async releaseLegacyNoWriteClaims(snapshots: ReviewSnapshot[]): Promise<boolean> {
+  private async releaseLegacyNoWriteClaims(actor: ReviewActor, snapshots: ReviewSnapshot[]): Promise<boolean> {
     const owners = [...new Set(snapshots.map(snapshot => snapshot.control?.activeRepair).filter((id): id is string => typeof id === "string"))];
     if (!owners.length) return false;
     for (const id of owners) {
@@ -85,7 +85,8 @@ export class ReviewEngine {
       // Only legacy failed attempts with the durable, read-only validation
       // checkpoint can be superseded. Any other checkpoint may have crossed a
       // provider or mapping write boundary and must retain its resume barrier.
-      if (!operation || operation.id !== id || operation.status !== "failed" || operation.abandoned
+      if (!operation || operation.id !== id || operation.actor?.subject !== actor.subject
+        || operation.status !== "failed" || operation.abandoned
         || operation.steps?.validated?.status !== "done" || operationHasWriteEvidence(operation)) {
         invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
       }
@@ -247,7 +248,7 @@ export class ReviewEngine {
       }
     }
     if (snapshots.some(s => s.control?.activeRepair)) {
-      if (!await this.releaseLegacyNoWriteClaims(snapshots)) invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
+      if (!await this.releaseLegacyNoWriteClaims(actor, snapshots)) invalidRepairIntent("An incomplete repair owns an affected item; resume that operation first");
       // Release is conditional and atomic with the old operation's terminal
       // audit marker. Re-read provider versions, mappings, and controls so the
       // newly created preview is never based on the pre-release snapshot.
