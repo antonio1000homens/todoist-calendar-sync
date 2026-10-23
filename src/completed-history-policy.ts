@@ -23,6 +23,12 @@ export function terminalCompletionDecision(
     || !p.eventId || typeof p.completedAt !== "string"
     || !Number.isFinite(Date.parse(p.completedAt))
     || Date.parse(p.completedAt) > nowMs)) return "ambiguous";
+  // A missing owner does not prove that this was a one-off. Partially written
+  // or legacy recurrence metadata must fail closed rather than be interpreted
+  // as terminal standalone history. The same applies to an orphaned terminal
+  // certificate bit: it is meaningful only with a known recurrence owner.
+  if (projections.some((p) => !p.recurrenceOwner
+    && (p.seriesId || p.masterEventId || p.originalStart || p.terminalVerified))) return "ambiguous";
   const newest = projections.reduce((a, b) =>
     Date.parse(a.completedAt) >= Date.parse(b.completedAt) ? a : b);
   // A rolling / RRULE occurrence has *not* ended the series. Only an explicit

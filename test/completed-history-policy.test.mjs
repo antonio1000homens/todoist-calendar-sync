@@ -29,6 +29,17 @@ test("all three profiles support one-off terminal cleanup and malformed state fa
   assert.equal(terminalCompletionDecision([oneOff({ completedAt: "2026-10-31T12:00:00Z" })], boundary), "ambiguous");
 });
 
+test("partial recurrence identity never falls through to one-off cleanup", () => {
+  for (const extra of [
+    { seriesId: "series-1" },
+    { masterEventId: "master-1" },
+    { originalStart: "2026-10-01" },
+    { terminalVerified: true },
+  ]) {
+    assert.equal(terminalCompletionDecision([oneOff(extra)], boundary), "ambiguous");
+  }
+});
+
 test("weekly/yearly active recurrence occurrence history is never terminal by age", () => {
   for (const owner of ["calendar", "todoist"]) {
     const previous = oneOff({ recurrenceOwner: owner, seriesId: "series-1" });
