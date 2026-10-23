@@ -65,7 +65,6 @@ export function planStandaloneAnnualRepair(
     throw new Error("Calendar event is already archived history; use its recorded successor instead");
   }
   const sameDay = start === due;
-  const desired = toCalendarEvent(task, sameDay ? source : undefined);
   const duration = Math.round((day(end) - day(start)) / 86400000);
   const mode = sameDay ? "annualize-in-place" : "keep-history";
   const masterId = sameDay ? source.id : createHash("sha256")
@@ -82,6 +81,7 @@ export function planStandaloneAnnualRepair(
 export async function verifyStandaloneAnnualOwnership(
   profile: Profile, task: TodoistTask, source: CalendarEvent,
   plan: StandaloneAnnualPlan, pair: ProviderClients, state: StateRepository,
+  allowApprovedResume = false,
 ): Promise<void> {
   const [taskMapping, sourceMapping, link, tombstone, completed, history, otherTasks, occurrences, linked] = await Promise.all([
     state.getMappingByTaskAnyProfile(task.id), state.getMappingByEvent(profile, source.id),
@@ -96,7 +96,7 @@ export async function verifyStandaloneAnnualOwnership(
   if (taskMapping || sourceMapping || link || tombstone || completed || history.length) {
     throw new Error("The selected task or historical event already has a mapping, recurrence owner or completed-history record; use a guarded ownership transfer, not a new-series repair");
   }
-  if (linked && linked.id !== source.id) {
+  if (linked && linked.id !== source.id && !(allowApprovedResume && linked.id === plan.masterId)) {
     throw new Error(`Another Calendar projection already claims this task (${linked.id}); select its recurring master or resolve duplicates`);
   }
   if (otherTasks.some(other => other.id !== task.id && !other.is_deleted && !other.is_completed
@@ -105,6 +105,7 @@ export async function verifyStandaloneAnnualOwnership(
   }
   const conflicting = occurrences.find(item => item.status !== "cancelled"
     && item.id !== source.id && item.recurringEventId !== source.id
+    && !(allowApprovedResume && (item.id === plan.masterId || item.recurringEventId === plan.masterId))
     && normalize(item.summary) === normalize(task.content));
   if (conflicting) {
     throw new Error(conflicting.recurringEventId
@@ -135,15 +136,53 @@ export async function applyStandaloneAnnualRepair(
     pair.calendar.getEvent(approvedSource.id),
     pair.calendar.getTimeZone(),
   ]);
-  if (zone !== plan.timeZone || hashTask(task) !== plan.taskFingerprint
-    || source.id !== approvedSource.id || source.etag !== plan.sourceEtag) {
+  if (zone !== plan.timeZone || hashTask(task) !== plan.taskFingerprint || source.id !== approvedSource.id) {
     throw new Error("Todoist or Calendar provider state changed after preview; refresh before applying an annual repair");
   }
-  const recalculated = planStandaloneAnnualRepair(profile, task, source, zone);
-  for (const field of ["masterId", "mode", "rule", "start", "end", "originalStart", "originalEnd"] as const) {
-    if (recalculated[field] !== plan[field]) throw new Error(`Approved annual repair changed (${field}); refresh the preview`);
+  const started = source.etag !== plan.sourceEtag;
+  if (started) {
+    const marker = await state.getFutureSeriesSplitAnyProfile(task.id);
+    if (!marker || marker.status !== "pending" || marker.profile !== profile
+      || marker.taskId !== task.id || marker.oldMasterId !== plan.sourceId
+      || marker.newMasterId !== plan.masterId
+      || marker.previousOccurrence !== (plan.mode === "keep-history" ? plan.originalStart : undefined)) {
+      throw new Error("Annual repair provider was modified without its exact pending split guard; manual review required");
+    }
+    if (plan.mode === "keep-history") {
+      assertStandaloneHistory(source, plan, task.id);
+      if (source.summary !== approvedSource.summary || source.description !== approvedSource.description) {
+        throw new Error("Historical standalone fields changed after the approved repair");
+      }
+    } else if (source.id !== plan.masterId || source.status !== "confirmed"
+      || source.start?.date !== plan.start || source.end?.date !== plan.end
+      || !calendarRecurrenceMatchesTodoist(source, task) || !hasCanonicalState(source, task)) {
+      throw new Error("Already annualized standalone master differs from the approved recurring task");
+    }
+    // A previous attempt may have committed the four mapping indexes before
+    // losing the completion acknowledgement. Only the same exact ownership can resume.
+    const previous = await state.getMappingByTaskAnyProfile(task.id);
+    if (previous) {
+      const link = await state.getRecurrenceLink(profile,task.id);
+      if (previous.profile !== profile || previous.eventId !== plan.masterId
+        || previous.masterEventId !== plan.masterId || previous.seriesId !== task.id
+        || previous.recurrenceOwner !== "todoist" || link?.taskId !== task.id
+        || link.masterEventId !== plan.masterId || link.activeInstanceId !== previous.activeInstanceId) {
+        throw new Error("Another mapping owns the partial annual repair; manual recovery required");
+      }
+      const complete = await pair.calendar.getEvent(plan.masterId);
+      if (!calendarRecurrenceMatchesTodoist(complete, task) || !hasCanonicalState(complete,task)) {
+        throw new Error("Annual series differs from the committed mapping");
+      }
+      await state.completeFutureSeriesSplit(profile, task.id, plan.masterId);
+      return {mapping:previous,master:complete};
+    }
+  } else {
+    const recalculated = planStandaloneAnnualRepair(profile, task, source, zone);
+    for (const field of ["masterId", "mode", "rule", "start", "end", "originalStart", "originalEnd"] as const) {
+      if (recalculated[field] !== plan[field]) throw new Error(`Approved annual repair changed (${field}); refresh the preview`);
+    }
   }
-  await verifyStandaloneAnnualOwnership(profile, task, source, plan, pair, state);
+  await verifyStandaloneAnnualOwnership(profile, task, source, plan, pair, state, started);
   // Fence Todoist deliveries before Calendar becomes a visible recurring master.
   await state.beginFutureSeriesSplit(profile, task.id, source.id, plan.masterId,
     plan.mode === "keep-history" ? plan.originalStart : undefined);
@@ -152,15 +191,17 @@ export async function applyStandaloneAnnualRepair(
     const shared = { ...(source.extendedProperties?.shared || {}) };
     delete shared.taskId; delete shared.taskUrl; delete shared.syncRecurrenceOwner;
     delete shared.todoistRecurrence; delete shared.todoistAnchorStart; delete shared.todoistAnchorEnd;
-    const preserved = await pair.calendar.upsertEventIfUnchanged({
-      ...source, extendedProperties: {
-        ...source.extendedProperties, shared: {
-          ...shared, syncHistoryOnly: "true", syncHistoryTaskId: task.id,
-          syncHistorySuccessorId: plan.masterId,
+    if (!started) {
+      const preserved = await pair.calendar.upsertEventIfUnchanged({
+        ...source, extendedProperties: {
+          ...source.extendedProperties, shared: {
+            ...shared, syncHistoryOnly: "true", syncHistoryTaskId: task.id,
+            syncHistorySuccessorId: plan.masterId,
+          },
         },
-      },
-    }, source.id, source.etag);
-    assertStandaloneHistory(preserved, plan, task.id);
+      }, source.id, source.etag);
+      assertStandaloneHistory(preserved, plan, task.id);
+    }
     const projected = toCalendarEvent(task);
     master = await pair.calendar.createFutureMasterOnce({
       ...projected, id: plan.masterId, start: { date:plan.start }, end:{ date:plan.end },
@@ -170,6 +211,8 @@ export async function applyStandaloneAnnualRepair(
         todoistAnchorTimeZone:zone,
       } },
     }, source.id);
+  } else if (started) {
+    master = source;
   } else {
     const projected = toCalendarEvent(task, source);
     master = await pair.calendar.upsertEventIfUnchanged({
