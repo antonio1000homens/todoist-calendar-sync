@@ -302,6 +302,14 @@ export class GoogleCalendar {
     await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, { method: "DELETE" });
   }
 
+  /** Delete only the exact Calendar version approved by a repair preview. */
+  async deleteEventIfUnchanged(eventId: string, etag: string): Promise<void> {
+    if (!eventId || !etag) throw new Error("Manual Calendar deletion requires an exact event ID and ETag");
+    await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, {
+      method: "DELETE", headers: { "If-Match": etag },
+    });
+  }
+
   async watch(channelId: string, address: string, token: string): Promise<{ resourceId: string; expiration: string }> {
     return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/watch`, {
       method: "POST",

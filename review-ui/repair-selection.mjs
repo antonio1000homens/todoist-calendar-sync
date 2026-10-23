@@ -136,6 +136,7 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
   switch (action) {
     case "flatten":
     case "todoist-only":
+    case "todoist-only-delete-calendar":
     case "link":
     case "transfer":
     case "verify": return hasTask && hasEvent;

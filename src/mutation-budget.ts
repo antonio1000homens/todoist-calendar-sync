@@ -65,7 +65,7 @@ export class ReconciliationMutationBudget {
   }
 }
 
-const CALENDAR_MUTATIONS = new Set(["upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent"]);
+const CALENDAR_MUTATIONS = new Set(["upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
 const TODOIST_MUTATIONS = new Set([
   "upsertTask",
   "createTaskOnce",

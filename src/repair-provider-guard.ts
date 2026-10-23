@@ -7,7 +7,7 @@ import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 import { hasCanonicalState, startsMatch, toTodoistTask } from "./sync.js";
 
 type ProviderObject = CalendarEvent | TodoistTask;
-const calendarWrites = new Set(["upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent"]);
+const calendarWrites = new Set(["upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
 const taskWrites = new Set(["upsertTask", "updateRecurringOccurrence", "createTaskOnce", "moveTask", "deleteTask"]);
 
 /** Carry approved provider versions through our own writes and durable retries. */
@@ -85,6 +85,17 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
                   approvedRecovery = !live.due?.is_recurring && hasCanonicalState(occurrence,live)
                     && reviewHash({...comparable(live),due:null}) === reviewHash({...comparable(originalTask),due:null});
                 }
+              }
+              const deleteStepStatus = operation.steps[`delete-calendar-projection:${move.eventId}`]?.status;
+              if (move.action === "todoist-only-delete-calendar" && side === "calendar" && id === move.eventId
+                && object === null && (deleteStepStatus === "running" || deleteStepStatus === "done")) {
+                // Recover a lost acknowledgement only for the exact
+                // conditional delete persisted by this repair. A done step
+                // also authorizes absence while later cleanup checkpoints
+                // resume; neither case can target another Calendar ID.
+                expected[key] = null;
+                await save();
+                return;
               }
               if (approvedRecovery) { expected[key] = object; await save(); return; }
               throw new Error(`Provider item ${key} changed after preview or the last recorded repair write; review live state before continuing`);

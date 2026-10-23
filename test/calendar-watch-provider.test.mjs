@@ -33,3 +33,22 @@ test("Google Calendar watch creates and stops a webhook channel", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("manual Calendar deletion sends If-Match for the exact approved event version", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({url,init});
+    if (url.includes("oauth2.googleapis.com")) return Response.json({access_token:"test-access-token"});
+    return new Response(null,{status:204});
+  };
+  try {
+    const calendar = new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"home@example.test");
+    await calendar.deleteEventIfUnchanged("exact-event-id","etag-approved");
+    const deletion=calls.find(({init})=>init.method==="DELETE");
+    assert.match(deletion.url,/\/events\/exact-event-id$/);
+    assert.equal(deletion.init.headers.get("If-Match"),"etag-approved");
+  } finally {
+    globalThis.fetch=originalFetch;
+  }
+});
