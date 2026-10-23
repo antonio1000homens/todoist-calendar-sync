@@ -94,16 +94,18 @@ function providerBlockers(data: {
   task: any; event: any; linked: any; comments: any[]; legacy: any[]; malformed: any[];
 }, target: PurgeTarget, deleteCalendar: boolean): string[] {
   const blockers: string[] = [];
-  if (data.task?.id !== undefined && data.task.id !== target.taskId) blockers.push("Todoist returned a different task identity");
-  if (data.task?.project_id !== undefined && data.task.project_id !== profiles[target.profile].todoistProjectId)
-    blockers.push("Task belongs to a different Todoist project");
-  if (data.event?.id !== undefined && data.event.id !== target.eventId) blockers.push("Calendar returned a different event identity");
+  if (data.task && (typeof data.task.id !== "string" || data.task.id !== target.taskId))
+    blockers.push("Todoist response is missing or has a different task identity");
+  if (data.task && (typeof data.task.project_id !== "string" || data.task.project_id !== profiles[target.profile].todoistProjectId))
+    blockers.push("Todoist response is missing or has a different project identity");
+  if (data.event && (typeof data.event.id !== "string" || data.event.id !== target.eventId))
+    blockers.push("Calendar response is missing or has a different event identity");
   if (data.task?.due?.is_recurring) blockers.push("Recurring Todoist task: series must be investigated manually");
   if (data.event?.recurrence?.length || data.event?.recurringEventId) blockers.push("Recurring Calendar item: series/exception requires manual handling");
   if (data.event && !deleteCalendar) blockers.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
   if (data.event?.extendedProperties?.shared?.taskId && data.event.extendedProperties.shared.taskId !== target.taskId)
     blockers.push("Selected Calendar event is linked to a different Todoist task");
-  if (data.linked && (!target.eventId || data.linked.id !== target.eventId)) blockers.push("Another Calendar projection links to this task; manual inspection required");
+  if (data.linked && (!target.eventId || typeof data.linked.id !== "string" || data.linked.id !== target.eventId)) blockers.push("Another or unidentifiable Calendar projection links to this task; manual inspection required");
   if (data.linked && !deleteCalendar) blockers.push("A live Calendar projection would recreate the Todoist task unless separately deleted");
   if (data.linked?.recurrence?.length || data.linked?.recurringEventId) blockers.push("Linked Calendar recurrence needs manual handling");
   if (data.comments.some(item => item.profile !== target.profile || item.taskId !== target.taskId || item.eventId !== target.eventId || item.seriesId))
@@ -126,11 +128,15 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const plan = planPurge(rows, target);
   const missing = (error: unknown) => [404, 410].includes(Number((error as { status?: number })?.status));
   let task: any, event: any;
+  let taskMissing = false, eventMissing = false;
   try { task = await providerClients.todoist.getTask(target.taskId); }
-  catch (error) { if (!missing(error)) throw error; }
+  catch (error) { if (!missing(error)) throw error; taskMissing = true; }
   if (target.eventId) {
-    try { event = await providerClients.calendar.getEvent(target.eventId); if (event?.status === "cancelled") event = undefined; }
-    catch (error) { if (!missing(error)) throw error; }
+    try {
+      event = await providerClients.calendar.getEvent(target.eventId);
+      if (event?.status === "cancelled") { event = undefined; eventMissing = true; }
+    }
+    catch (error) { if (!missing(error)) throw error; eventMissing = true; }
   }
   const [linkedResult, projectComments] = await Promise.all([
     providerClients.calendar.findByTodoistTaskId(target.taskId),
@@ -155,6 +161,9 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     legacy, malformed: malformed.map(item => ({ id: item.comment.id, error: item.error })),
   };
   const blockers = [...new Set([...plan.blockers, ...providerBlockers(providerData, target, input.deleteCalendar)])].sort();
+  if (!task && !taskMissing) blockers.push("Todoist returned no task without an explicit not-found response");
+  if (target.eventId && !event && !eventMissing)
+    blockers.push("Calendar returned no event without an explicit not-found response");
   const protocol = await (dependencies.inspectFence || inspectErasureFence)(target.profile);
   const journal = await db.send(new GetCommand({ TableName: tableName(), Key: { pk: `ERASURE#${target.profile}`, sk: "JOURNAL" }, ConsistentRead: true }));
   if (journal.Item) blockers.push("A prior item-erasure journal exists for this profile; break-glass review is required before another preview");

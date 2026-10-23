@@ -40,3 +40,21 @@ test("unsafe recurrence or active fence blocks confirmation-ready preview", asyn
   assert.ok(preview.blockers.some(value=>value.includes("Recurring Todoist task")));
   assert.ok(preview.blockers.some(value=>value.includes("fence is active")));
 });
+
+test("malformed live provider responses cannot produce an exact preview", async t => {
+  for (const [name, todoistTask, calendarEvent, target] of [
+    ["empty Todoist response", {}, undefined, { profile:"home", taskId:"task-123", deleteCalendar:false }],
+    ["Todoist response without project identity", { id:"task-123" }, undefined, { profile:"home", taskId:"task-123", deleteCalendar:false }],
+    ["empty Calendar response", { id:"task-123", project_id:"test-home-project" }, {}, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
+    ["Calendar response without identity", { id:"task-123", project_id:"test-home-project" }, { status:"confirmed" }, { profile:"home", taskId:"task-123", eventId:"event-123", deleteCalendar:true }],
+  ]) {
+    await t.test(name, async () => {
+      const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[]}: {}};
+      const clients={todoist:{getTask:async()=>todoistTask,listProjectComments:async()=>[],listTaskComments:async()=>[]},
+        calendar:{getEvent:async()=>calendarEvent,findByTodoistTaskId:async()=>undefined}};
+      const preview=await buildErasurePreview(target,{db,clients,inspectFence:async()=>({leases:[]})});
+      assert.ok(preview.blockers.length>0);
+      assert.equal(preview.confirmation,undefined);
+    });
+  }
+});
