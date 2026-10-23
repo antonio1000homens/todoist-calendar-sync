@@ -12,7 +12,7 @@ import { DynamoDBDocumentClient, ScanCommand, GetCommand, DeleteCommand } from "
 import { profiles } from "../dist/config.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "../dist/mapping-comments.js";
-import { fingerprint, planPurge } from "./item-purge-policy.mjs";
+import { fingerprint, planPurge, publicInventoryRecord } from "./item-purge-policy.mjs";
 
 const argumentsMap = new Map();
 for (const argument of process.argv.slice(2)) {
@@ -145,9 +145,6 @@ function providerBlockers(data) {
   return blocks;
 }
 function output(data) { console.log(JSON.stringify(data, null, 2)); }
-function publicRecord(record) {
-  return {pk:record.pk,sk:record.sk,type:record.type,reasons:record.reasons,hazards:record.hazards};
-}
 try {
   const [initialScan, observed] = await Promise.all([scan(), providers()]);
   const plan = planPurge(initialScan.rows,target);
@@ -166,7 +163,7 @@ try {
       calendar:observed.event ? {id:observed.event.id,title:observed.event.summary,etag:observed.event.etag} : null,
       linkedCalendar:observed.linked ? {id:observed.linked.id,status:observed.linked.status} : null,
       matchingMappingComments:observed.comments.map(item=>item.id),matchingLegacyComments:observed.legacy.map(item=>item.id)},
-    scanned:initialScan.scanned, classificationCounts:plan.counts, records:plan.records.map(publicRecord), blockers,
+    scanned:initialScan.scanned, classificationCounts:plan.counts, records:plan.records.map(publicInventoryRecord), blockers,
     warning:"PURGE PERMANENTLY REMOVES AUDIT/HISTORY AND DISABLES HISTORICAL REPAIR/FORENSICS. Untagged delivery receipts or redacted historical records cannot be proven attributable; manually inspect queued deliveries and backups.",
     ...(blockers.length || inventoryOnly ? {} : {actionTimeConfirmation:"PERMANENTLY_ERASE_" + token}),
   });

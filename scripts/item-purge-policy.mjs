@@ -9,7 +9,7 @@ export const PURGE_FAMILIES = new Set([
   "EVENT", "TASK", "TASKOWNER", "BASELINE", "RECURRENCE", "CANONICAL",
   "CONFLICT_STATE", "REVIEW_CASE", "MANUAL", "REPAIR", "REPAIR_PREVIEW",
   "DELIVERY", "AUDIT", "PROJECTION", "COMPLETED_EVENT", "COMPLETED_TASK",
-  "FUTURE_SPLIT", "CONSOLIDATED_TASK", "REJECTED_PAIR", "SYNC_CONTROL",
+  "COMPLETED_SERIES", "FUTURE_SPLIT", "CONSOLIDATED_TASK", "REJECTED_PAIR", "SYNC_CONTROL",
   "VERSION",
 ]);
 const SHARED_FAMILIES = new Set(["RECONCILE", "RECONCILE_RUN", "RECONCILE_OUTCOME", "SYNC", "WATCH", "WATCH_CHANNEL", "CIRCUIT"]);
@@ -24,6 +24,10 @@ export const fingerprint = value => hash(JSON.stringify(stable(value)));
 const keyOf = row => JSON.stringify([row.pk, row.sk]);
 const kindOf = row => String(row.pk || "").split("#")[0];
 const tokens = value => String(value || "").split(/[#:/]/);
+export const publicInventoryRecord = record => ({
+  pk: record.pk, sk: record.sk, type: record.type, classification: record.classification,
+  reasons: record.reasons, hazards: record.hazards,
+});
 
 function visit(value, callback, path = "", depth = 0) {
   if (depth > 24) throw new Error("Deeply nested state record needs manual inspection");
@@ -40,7 +44,7 @@ function providerRefs(row) {
     const activeSide = node.side === "todoist" || node.side === "calendar" ? node.side : side;
     for (const [key, value] of Object.entries(node)) {
       if (typeof value === "string" && value) {
-        if (/^(taskId|providerTaskId|linkedTaskId|discardedTaskId)$/.test(key)) tasks.add(value);
+        if (/^(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId)$/.test(key)) tasks.add(value);
         if (/^(eventId|providerEventId|masterEventId|activeInstanceId|calendarProjectionId|oldMasterId|newMasterId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId)$/.test(key)) events.add(value);
         if (key === "seriesId") series.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "todoist") tasks.add(value);
@@ -85,7 +89,7 @@ export function planPurge(rows, target) {
     if (pk.startsWith("CONFLICT_STATE#" + profile + "#") && conflictHashes.has(pk.split("#").at(-1))) reasons.push("conflict identity hash");
     visit(row, (value, path) => {
       if (path === "pk" || path === "sk") return;
-      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|candidateTaskIds)(\[\d+\])?$/.test(path)
+      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId|candidateTaskIds)(\[\d+\])?$/.test(path)
         || /(^|\.)ref\.id$/.test(path) && path.includes("todoist");
       const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId|candidateEventIds)(\[\d+\])?$/.test(path);
       if (value === taskId && taskPath) reasons.push("task ID at " + path);
@@ -128,6 +132,22 @@ export function planPurge(rows, target) {
     for (const {row} of included.values()) visit(row, (value, path) => {
       if (path !== "pk" && path !== "sk" && typeof value === "string") references.add(value);
     });
+    const linkedKeys = new Map();
+    const linkedIncidentIds = new Set();
+    for (const {row} of included.values()) visit(row, (value, path) => {
+      if (typeof value !== "string") return;
+      const field = path.split(".").at(-1);
+      if (field === "incidentId") linkedIncidentIds.add(value);
+      const targetKey = field === "sourceAuditKey" ? value
+        : field === "decisionId" ? "MANUAL#" + value
+          : field === "caseId" ? "REVIEW_CASE#" + value
+            : field === "previewId" ? "REPAIR_PREVIEW#" + value
+              : field === "operationId" || field === "repairId" ? "REPAIR#" + value
+                : undefined;
+      if (targetKey) linkedKeys.set(targetKey, path);
+    });
+    const includedSeries = new Set();
+    for (const {row} of included.values()) for (const seriesId of providerRefs(row).series) includedSeries.add(seriesId);
     for (const row of rows) {
       const key = keyOf(row);
       if (included.has(key)) continue;
@@ -137,8 +157,12 @@ export function planPurge(rows, target) {
           reasons.push("references inventoried " + path);
       });
       if (references.has(row.pk)) reasons.push("referenced by inventoried record");
-      const suffix = row.pk.slice(kindOf(row).length + 1);
-      if (references.has(suffix)) reasons.push("linked operation or decision identifier");
+      if (linkedKeys.has(row.pk)) reasons.push("linked record at " + linkedKeys.get(row.pk));
+      if (kindOf(row) === "AUDIT" && tokens(row.pk).some(segment => linkedIncidentIds.has(segment)))
+        reasons.push("audit record for an inventoried incident");
+      if (kindOf(row) === "COMPLETED_SERIES"
+        && (includedSeries.has(row.seriesId) || includedSeries.has(tokens(row.pk).at(-1))))
+        reasons.push("completed-series certificate for an inventoried series");
       if (reasons.length) {
         included.set(key, { row, reasons: [...new Set(reasons)] });
         changed = true;
@@ -161,7 +185,11 @@ export function planPurge(rows, target) {
       classification = "unattributable";
       hazards.push("delivery receipt has no exact selected provider identity; replay safety cannot be proven");
     } else if (family === "DELIVERY") {
-      classification = "ambiguous";
+      classification = target.preserveTask && refs.tasks.has(taskId)
+        || [...protectedTaskIds].some(id => refs.tasks.has(id))
+        || [...protectedEventIds].some(id => refs.events.has(id))
+        || otherTaskIds.length || otherEventIds.length
+        ? "shared with protected state" : "selected-only";
       hazards.push("delivery receipt may be pending, delayed, or replayable; exact identity does not prove quiescence");
     } else if (target.preserveTask && (refs.tasks.has(taskId) || tokens(row.pk).includes(taskId))) {
       classification = "shared with protected state";
@@ -185,7 +213,7 @@ export function planPurge(rows, target) {
       hazards.push("unrecognised or profile-wide state family needs manual handling");
     }
     if (row.profile && row.profile !== profile) hazards.push("belongs to a different profile");
-    const scoped = new Set(["EVENT","TASK","BASELINE","RECURRENCE","CANONICAL","CONFLICT_STATE",
+    const scoped = new Set(["EVENT","TASK","BASELINE","RECURRENCE","CANONICAL","CONFLICT_STATE","COMPLETED_SERIES",
       "PROJECTION","COMPLETED_EVENT","COMPLETED_TASK","CONSOLIDATED_TASK","REJECTED_PAIR","AUDIT"]);
     if (scoped.has(family) && !row.pk.startsWith(family + "#" + profile + "#"))
       hazards.push("key belongs to a different profile");

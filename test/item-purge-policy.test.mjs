@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {createHash} from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import {planPurge, fingerprint} from "../scripts/item-purge-policy.mjs";
+import {planPurge, fingerprint, publicInventoryRecord} from "../scripts/item-purge-policy.mjs";
 
 test("standalone purge CLI parses without provider execution",()=>{
  assert.doesNotThrow(()=>execFileSync(process.execPath,["--check","scripts/purge-item.mjs"]));
@@ -157,6 +157,28 @@ test("transitive review and decision records remain connected to the selected oc
  assert.ok(plan.records.every(row=>row.classification==="selected-only"));
 });
 
+test("consolidated and owner-conflict records retain references to other task IDs",()=>{
+ const rows=[
+  record("CONSOLIDATED_TASK#home#discarded","STATE",{profile:"home",discardedTaskId:"task-123",retainedTaskId:"retained-task",cancelledEventId:"evt_123"}),
+  record("AUDIT#home#owner-conflict","STATE",{detail:{taskId:"task-123",eventId:"evt_123",ownerTaskId:"owner-task"}}),
+ ];
+ const plan=planPurge(rows,target);
+ assert.equal(plan.records.length,2);
+ assert.ok(plan.records.every(item=>item.classification==="shared with protected state"));
+ assert.ok(plan.blockers.length);
+});
+
+test("completed-series certificates are inventoried and protected through exact series identity",()=>{
+ const rows=[
+  record("EVENT#home#evt_123","MAP",{profile:"home",eventId:"evt_123",seriesId:"series-1"}),
+  record("COMPLETED_SERIES#home#series-1","STATE",{profile:"home",seriesId:"series-1",masterEventId:"master-1"}),
+ ];
+ const plan=planPurge(rows,target);
+ const certificate=plan.records.find(item=>item.type==="COMPLETED_SERIES");
+ assert.equal(certificate?.classification,"shared with protected state");
+ assert.ok(plan.blockers.some(blocker=>blocker.includes("recurring series")));
+});
+
 test("identity-free and target-linked pending deliveries are classified and block erasure",()=>{
  const rows=[
   record("DELIVERY#random-receipt","COMPLETED",{profile:"home",kind:"todoist-webhook"}),
@@ -165,10 +187,24 @@ test("identity-free and target-linked pending deliveries are classified and bloc
  const plan=planPurge(rows,target);
  const byKey=new Map(plan.records.map(row=>[row.pk,row]));
  assert.equal(byKey.get("DELIVERY#random-receipt").classification,"unattributable");
- assert.equal(byKey.get("DELIVERY#task-123:event-abc").classification,"ambiguous");
+ assert.equal(byKey.get("DELIVERY#task-123:event-abc").classification,"selected-only");
  assert.equal(plan.counts.unattributable,1);
- assert.equal(plan.counts.ambiguous,1);
+ assert.equal(plan.counts["selected-only"],1);
  assert.equal(plan.blockers.length,2);
+});
+
+test("public inventory rows expose the same classifications as their summary counts",()=>{
+ const inventoryRecord=planPurge([record("TASK#home#task-123","MAP",{profile:"home",taskId:"task-123"})],target).records[0];
+ assert.equal(publicInventoryRecord(inventoryRecord).classification,inventoryRecord.classification);
+});
+
+test("unrecognized partition-key suffixes do not create false cross-record links",()=>{
+ const rows=[
+  record("REVIEW_CASE#selected-case","STATE",{taskId:"task-123",decision:{decisionId:"decision-123"}}),
+  record("CUSTOM#decision-123","STATE",{value:"unrelated"}),
+ ];
+ const plan=planPurge(rows,target);
+ assert.deepEqual(plan.records.map(item=>item.pk),["REVIEW_CASE#selected-case"]);
 });
 
 test("unknown exact ID fields are included as ambiguous instead of treated as safe",()=>{
