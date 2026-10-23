@@ -440,6 +440,69 @@ test("Leave unchanged retains an affected provider object and verifies its exact
   assert.ok(!h.writes.some(write=>write[1]==="secondary"));
 });
 
+test("production Gabriel and Lennox series repair leaves the one-off event unchanged across worker replay", async t => {
+  const taskId="6grcrccwr2xcWFgC", masterId="5esubqbi6ahen8uaaplgk5us19", oneOffId="5hn12gif091r5dqusim31a5v1q";
+  const recurringTask=task(taskId,{content:"Write letter for Gabriel and Lennox",
+    due:{date:"2027-03-01",is_recurring:true,string:"every year"}});
+  const recurrenceMapping={profile:"home",taskId,eventId:masterId,recurrenceOwner:"todoist",seriesId:taskId,
+    masterEventId:masterId,activeInstanceId:`${masterId}_20270301`,originalStart:"2027-03-01",activeEffectiveStart:"2027-03-01"};
+  const master=event(masterId,{iCalUID:"gabriel-lennox-yearly",summary:recurringTask.content,
+    start:{date:"2027-03-01"},end:{date:"2027-03-08"},recurrence:["RRULE:FREQ=YEARLY"],
+    extendedProperties:{shared:{taskId,syncRecurrenceOwner:"todoist",todoistRecurrence:todoistRecurrenceKey(recurringTask)}}});
+  const active=event(`${masterId}_20270301`,{summary:recurringTask.content,start:{date:"2027-03-01"},end:{date:"2027-03-08"},
+    recurringEventId:masterId,originalStartTime:{date:"2027-03-01"},extendedProperties:{shared:master.extendedProperties.shared}});
+  const oneOff=event(oneOffId,{summary:recurringTask.content,start:{date:"2026-03-01"},end:{date:"2026-03-08"}});
+  const targetTask=task("repair-task",{content:"Repair another item",due:{date:"2026-11-01"}});
+  const targetEvent=event("repair-event",{summary:"Repair another item",start:{date:"2026-11-01"},end:{date:"2026-11-02"}});
+  const h=harness(t,{events:[master,active,oneOff,targetEvent],tasks:[recurringTask,targetTask],
+    mappings:[recurrenceMapping],recurrence:{...recurrenceMapping,owner:"todoist"}});
+  const refs=[{profile:"home",side:"todoist",id:targetTask.id},{profile:"home",side:"calendar",id:targetEvent.id},
+    {profile:"home",side:"todoist",id:taskId},{profile:"home",side:"calendar",id:masterId},
+    {profile:"home",side:"calendar",id:active.id},{profile:"home",side:"calendar",id:oneOffId}];
+  h.engine.collect=async()=>Promise.all(refs.map(ref=>h.engine.snapshot(ref)));
+  const unchanged={
+    [`home:todoist:${taskId}`]:"unchanged",[`home:calendar:${masterId}`]:"unchanged",
+    [`home:calendar:${active.id}`]:"unchanged",[`home:calendar:${oneOffId}`]:"unchanged",
+  };
+  const input=intent({taskId:targetTask.id,eventId:targetEvent.id,winner:"none",scope:"occurrence",leftovers:unchanged});
+  const preview=await h.engine.preview(actor,input);
+  for(const id of [taskId,masterId,active.id,oneOffId]) {
+    const key=`home:${id===taskId?"todoist":"calendar"}:${id}`;
+    const unchangedPlan=preview.itemPlan.find(item=>refKey(item.ref)===key);
+    assert.equal(unchangedPlan.operation,"Leave unchanged",key);
+    assert.equal(unchangedPlan.result,"Retain provider object, mapping, and sync control without changes",key);
+  }
+  const unchangedSnapshot=preview.snapshots.find(item=>refKey(item.ref)===`home:calendar:${oneOffId}`);
+  assert.equal(unchangedSnapshot.object.id,oneOffId);
+  assert.equal(unchangedSnapshot.object.status,"confirmed");
+  assert.deepEqual(unchangedSnapshot.object.start,{date:"2026-03-01"});
+  assert.deepEqual(unchangedSnapshot.object.end,{date:"2026-03-08"});
+
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",result.error);
+  assert.deepEqual(h.mappingMap.get(taskId),recurrenceMapping);
+  assert.deepEqual(h.recurrences.get(taskId),{...recurrenceMapping,owner:"todoist"});
+  assert.equal(h.taskMap.get(taskId).due.is_recurring,true);
+  assert.deepEqual(h.eventMap.get(masterId).recurrence,["RRULE:FREQ=YEARLY"]);
+  assert.deepEqual(h.eventMap.get(oneOffId),oneOff);
+  assert.equal(h.controlsMap.get(`home:calendar:${oneOffId}`)?.excluded,undefined);
+  assert.ok(result.outcomes.some(value=>value.entity===`home:calendar:${masterId}`&&value.outcome==="unchanged"));
+  assert.ok(result.outcomes.some(value=>value.entity===`home:calendar:${oneOffId}`&&value.outcome==="unchanged"));
+  assert.ok(!h.calls.some(call=>call[0]==="tombstone"));
+  assert.ok(!h.writes.some(write=>write.some(value=>[taskId,masterId,active.id,oneOffId].includes(value))));
+  assert.ok(!h.writes.some(write=>write.includes(oneOffId)));
+
+  const writeCount=h.writes.length;
+  const replay=await h.engine.execute("repair");
+  assert.equal(replay.status,"succeeded");
+  assert.equal(h.writes.length,writeCount,"redelivery of the completed worker operation must not repeat writes");
+  assert.equal(h.taskMap.get(taskId).due.is_recurring,true);
+  assert.deepEqual(h.eventMap.get(masterId).recurrence,["RRULE:FREQ=YEARLY"]);
+  assert.deepEqual(h.mappingMap.get(taskId),recurrenceMapping);
+  assert.deepEqual(h.eventMap.get(oneOffId),oneOff);
+});
+
 test("Leave unchanged retains the repair barrier if its sync control changes before release", async t => {
   const h=harness(t,{events:[event("event",{extendedProperties:{shared:{taskId:"task"}}}),
     event("secondary",{extendedProperties:{shared:{taskId:"event"}}})]});

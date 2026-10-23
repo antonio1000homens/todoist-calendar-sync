@@ -631,7 +631,9 @@ export class ReviewEngine {
         });
         await bind(intent.profile,await pair.todoist.getTask(originalTask!.id),await pair.calendar.getEvent(split.mapping.masterEventId||split.mapping.eventId),"todoist");
       } else if(intent.action!=="verify") {
-        const mappings=new Map(operation.preview.snapshots.filter(s=>s.mapping).map(s=>[`${s.mapping!.profile}:${s.mapping!.taskId}`,s.mapping!]));
+        const mappings=new Map(operation.preview.snapshots.filter(s=>s.mapping
+          && intent.leftovers[entityKey(s.ref)] !== "unchanged")
+          .map(s=>[`${s.mapping!.profile}:${s.mapping!.taskId}`,s.mapping!]));
         for(const mapping of mappings.values()) await step(`detach:${mapping.profile}:${mapping.taskId}`,async()=> {
           const clients=await factory(mapping.profile);await writeGate(mapping.profile);await this.controls.reject(mapping.profile,mapping.taskId,mapping.eventId,id);
           await trackedWrite(mapping.profile, () => deleteMappingComments(clients.todoist,mapping), count => count);
@@ -639,6 +641,7 @@ export class ReviewEngine {
           if(mapping.seriesId)await state.deleteRecurrenceLink(mapping.profile,mapping.seriesId);return true;
         });
         for(const snapshot of operation.preview.snapshots.filter(s=>s.ref.side==="calendar" && s.object
+          && intent.leftovers[entityKey(s.ref)] !== "unchanged"
           && !(intent.scope === "occurrence" && originalEvent?.recurringEventId === s.ref.id)
           && (s.ref.id===intent.eventId || [...mappings.values()].some(mapping=>mapping.eventId===s.ref.id))))await step(`unlink-metadata:${snapshot.ref.id}`,async()=> {
           const clients=await factory(snapshot.ref.profile),live=await clients.calendar.getEvent(snapshot.ref.id);
