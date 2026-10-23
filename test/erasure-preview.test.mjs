@@ -60,3 +60,21 @@ test("malformed live provider responses cannot produce an exact preview", async 
     });
   }
 });
+
+test("cancelled linked lookup results require the exact selected Calendar identity", async t => {
+  for (const [name, linked] of [
+    ["missing linked event identity", { status:"cancelled" }],
+    ["wrong linked event identity", { id:"other-event", status:"cancelled" }],
+  ]) {
+    await t.test(name, async () => {
+      const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[]}: {}};
+      const clients={todoist:{getTask:async()=>({id:"task-123",project_id:"test-home-project"}),
+          listProjectComments:async()=>[],listTaskComments:async()=>[]},
+        calendar:{getEvent:async()=>{throw Object.assign(new Error("missing"),{status:404});},
+          findByTodoistTaskId:async()=>linked}};
+      const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+        {db,clients,inspectFence:async()=>({leases:[]})});
+      assert.ok(preview.blockers.some(value=>value.includes("Calendar projection links")));
+    });
+  }
+});

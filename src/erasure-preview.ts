@@ -145,7 +145,11 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     providerClients.calendar.findByTodoistTaskId(target.taskId),
     providerClients.todoist.listProjectComments(profiles[target.profile].todoistProjectId, true),
   ]);
-  const linked = linkedResult?.status === "cancelled" ? undefined : linkedResult;
+  // A cancelled lookup result is absence only when it identifies the exact
+  // selected Calendar event. Without an explicit event target, or with an
+  // absent/mismatched ID, retain it so providerBlockers fails closed.
+  const linked = linkedResult?.status === "cancelled" && target.eventId && linkedResult.id === target.eventId
+    ? undefined : linkedResult;
   const indexed = buildProjectMappingIndex(projectComments);
   const relevant = indexed.parsed.filter(item => item.payload.taskId === target.taskId || item.payload.eventId === target.eventId);
   const malformed = indexed.malformed.filter(item => item.comment.content?.includes(target.taskId)
