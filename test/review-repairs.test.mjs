@@ -342,6 +342,8 @@ const transferIntent=(fixture, leftovers={})=>intent({action:"transfer",taskId:f
 
 test("Calendar-owned series transfer preserves the recurring birthday task and atomically reassigns all mapping indexes",async t=>{
   const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  assert.equal(f.master.start.date,"2023-07-17","the series master starts before the selected occurrence year");
+  assert.equal(f.active.start.date,f.annual.due.date,"the next selected annual occurrence matches the Todoist due date");
   const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged"});
   const preview=await h.engine.preview(actor,input);
   assert.deepEqual(preview.snapshots.map(s=>refKey(s.ref)),[
