@@ -45,6 +45,8 @@ export interface RepairOperation {
   status: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
   error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
+  /** Persisted before any non-validation execution step so no-write abandonment can race safely with retries. */
+  writeStarted?: boolean;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
   outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged" | "retained-unlinked"; checkedAt: string }>;
   /** Controls sampled before claiming extra, non-preview move destination locks. */
@@ -54,7 +56,8 @@ export interface RepairOperation {
   creations?: Record<string, { profile:Profile; side:Side; requestId:string; fingerprint:string; startedAt:string; result?:TodoistTask|CalendarEvent }>;
 }
 export function operationHasWriteEvidence(operation: RepairOperation): boolean {
-  return Object.keys(operation.steps || {}).some(name => name !== "validated")
+  return operation.writeStarted === true
+    || Object.keys(operation.steps || {}).some(name => name !== "validated")
     || Object.keys(operation.creations || {}).length > 0
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;

@@ -338,7 +338,10 @@ export class SyncControls {
     // A crash or lost response cannot replay a previously validated preview.
     const operationMarker = { Update: { TableName: reviewTable(), Key: key(`REPAIR#${operationId}`),
       UpdateExpression: 'SET abandoned = :yes, #status = :failed, #error = :error, nextAction = :next, updatedAt = :now, notificationPending = :yes, notificationText = :notice, lookupSk = :lookup',
-      ConditionExpression: 'attribute_exists(pk) AND #status <> :succeeded AND attribute_not_exists(abandoned)',
+      // A concurrently retried operation may have passed read-only validation
+      // after the preview inspected it. Its next execution step persists this
+      // marker before doing work, so abandonment cannot release its barrier.
+      ConditionExpression: 'attribute_exists(pk) AND #status <> :succeeded AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted)',
       ExpressionAttributeNames: { '#status': 'status', '#error': 'error' },
       ExpressionAttributeValues: { ':yes': true, ':failed': 'failed', ':succeeded': 'succeeded', ':error': failure.error, ':next': failure.nextAction, ':now': new Date().toISOString(),
         ':notice': `Failed: ${failure.error}`, ':lookup': `REPAIR#NOTIFY#${operationId}` }

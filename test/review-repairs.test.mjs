@@ -834,6 +834,83 @@ test("a post-validation failure with no repair writes releases ownership and per
   assert.ok(next.id);
 });
 
+test("fresh preview supersedes a failed selected-pair mismatch only when validated is the sole checkpoint", async t => {
+  const h=harness(t,{events:[event("event"),event("current")]});
+  const staleIntent=intent({eventId:"event"});
+  const oldPreview=await h.engine.preview(actor,staleIntent);
+  const oldOperation={id:"stale-repair",status:"failed",attempt:2,steps:{validated:{id:"validated",status:"done"}},
+    error:"Selected pair does not match the current mapping; expected Calendar event old-event",
+    preview:oldPreview,notificationPending:false};
+  h.operations.set(oldOperation.id,clone(oldOperation));
+  h.mappingMap.set("task",{profile:"home",taskId:"task",eventId:"current"});
+  for(const snapshot of oldPreview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:oldOperation.id});
+
+  const fresh=await h.engine.preview(actor,intent({eventId:"current"}));
+
+  assert.ok(fresh.id);
+  assert.equal(fresh.snapshots.find(snapshot=>snapshot.ref.side==="todoist").mapping.eventId,"current");
+  assert.ok(fresh.snapshots.every(snapshot=>snapshot.control?.activeRepair===undefined));
+  assert.equal(h.calls.filter(call=>call[0]==="release-unapplied").length,1);
+  assert.deepEqual(h.operations.get(oldOperation.id).preview.intent,oldPreview.intent,
+    "supersession must preserve the failed operation's selected-pair audit record");
+  assert.equal(h.operations.get(oldOperation.id).steps.validated.status,"done");
+  assert.deepEqual(h.writes,[]);
+});
+
+test("fresh preview refuses a partial-write failure and preserves its resume barrier", async t => {
+  const h=harness(t),preview=await h.engine.preview(actor,intent());
+  const partial={id:"partial-repair",status:"failed",attempt:1,
+    steps:{validated:{id:"validated",status:"done"},"calendar-write":{id:"calendar-write",status:"done"}},
+    preview,error:"Todoist update failed after Calendar write",notificationPending:false};
+  h.operations.set(partial.id,partial);
+  for(const snapshot of preview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:partial.id});
+
+  await assert.rejects(h.engine.preview(actor,intent()),/incomplete repair owns an affected item; resume that operation first/);
+
+  assert.equal(h.calls.filter(call=>call[0]==="release-unapplied").length,0);
+  assert.ok(preview.snapshots.every(snapshot=>h.controlsMap.get(refKey(snapshot.ref)).activeRepair===partial.id));
+  assert.equal(h.operations.get(partial.id).steps["calendar-write"].status,"done");
+});
+
+test("superseded preview rereads current provider versions and the new operation rejects a later edit", async t => {
+  const h=harness(t),oldPreview=await h.engine.preview(actor,intent());
+  const oldOperation={id:"stale-repair",status:"failed",attempt:2,
+    steps:{validated:{id:"validated",status:"done"}},preview:oldPreview,error:"Selected pair mismatch",notificationPending:false};
+  h.operations.set(oldOperation.id,oldOperation);
+  for(const snapshot of oldPreview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:oldOperation.id});
+  h.taskMap.get("task").content="Changed before fresh preview";
+
+  const fresh=await h.engine.preview(actor,intent({winner:"todoist"}));
+
+  assert.equal(fresh.snapshots.find(snapshot=>snapshot.ref.side==="todoist").object.content,"Changed before fresh preview");
+  h.operations.set("fresh-repair",{id:"fresh-repair",status:"queued",steps:{},preview:fresh});
+  h.taskMap.get("task").content="Changed after fresh preview";
+  const result=await h.engine.execute("fresh-repair");
+  assert.equal(result.status,"failed");
+  assert.match(result.error,/Provider state or ownership changed after preview/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("a stale sync-control version prevents superseding a no-write operation", async t => {
+  const h=harness(t),preview=await h.engine.preview(actor,intent());
+  const old={id:"stale-repair",status:"failed",attempt:2,
+    steps:{validated:{id:"validated",status:"done"}},preview,error:"Selected pair mismatch",notificationPending:false};
+  h.operations.set(old.id,old);
+  for(const snapshot of preview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{
+    ...snapshot.control,activeRepair:old.id,providerUpdatedAt:"version-after-preview"});
+  h.controls.releaseUnapplied=async(refs,id,snapshots)=>{
+    assert.equal(id,old.id);
+    assert.ok(refs.every(ref=>snapshots.find(snapshot=>refKey(snapshot.ref)===refKey(ref))));
+    assert.ok(snapshots.some(snapshot=>snapshot.control?.providerUpdatedAt!==h.controlsMap.get(refKey(snapshot.ref))?.providerUpdatedAt));
+    throw new Error("ConditionalCheckFailedException: provider control version changed");
+  };
+
+  await assert.rejects(h.engine.preview(actor,intent()),/could not be safely superseded/);
+
+  assert.ok(preview.snapshots.every(snapshot=>h.controlsMap.get(refKey(snapshot.ref)).activeRepair===old.id));
+  assert.deepEqual(h.writes,[]);
+});
+
 for (const action of ["exclude","separate","move"]) test(`read-only ${action} validation failure releases every claimed lock`,async t=>{
   const h=action==="move"?moveHarness(t):harness(t);
   const selected=action==="move"?h.input:action==="separate"
