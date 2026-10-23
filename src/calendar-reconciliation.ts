@@ -92,11 +92,14 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
  */
 export function recurringTaskIdentityCandidates(event: CalendarEvent, tasks: TodoistTask[]): string[] {
   const title = normalizedText(event.summary).toLocaleLowerCase();
-  if (!title || !(event.start?.date || event.start?.dateTime)) return [];
+  const sharedTaskId = event.extendedProperties?.shared?.taskId;
+  if (!sharedTaskId && (!title || !(event.start?.date || event.start?.dateTime))) return [];
   return tasks
     .filter((task) => Boolean(task.due?.is_recurring)
-      && normalizedText(task.content).toLocaleLowerCase() === title
-      && startsMatch(event, task))
+      && (task.id === sharedTaskId
+        || (Boolean(title)
+          && normalizedText(task.content).toLocaleLowerCase() === title
+          && startsMatch(event, task))))
     .map((task) => task.id)
     .sort();
 }
