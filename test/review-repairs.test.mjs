@@ -73,7 +73,7 @@ test("repair keeps its barrier when a pending provider refresh cannot be queued"
 
 // Exercise the real preview/execute/provider conversion paths with in-memory
 // provider and repository seams. Unexpected external calls fail these tests.
-function harness(t, { events = [event()], tasks = [task()], mappings = [], recurrence, decision } = {}) {
+function harness(t, { events = [event()], tasks = [task()], mappings = [], recurrence, decision, caseStatus = "open" } = {}) {
   const eventMap = new Map(events.map(value => [value.id, clone(value)]));
   const taskMap = new Map(tasks.map(value => [value.id, clone(value)]));
   const mappingMap = new Map(mappings.map(value => [value.taskId, clone(value)]));
@@ -129,7 +129,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     },
     async deleteRecurrenceLink(_profile, id) { recurrences.delete(id); },
     async putMapping(value) { mappingMap.set(value.taskId, clone(value)); },
-    async deleteMapping(value) { mappingMap.delete(value.taskId); },
+    async deleteMapping(value) { mappingMap.delete(value.taskId); eventMappingMap.delete(`${value.profile}:${value.eventId}`); ownerMappingMap.delete(value.taskId); },
     async mutationAllowed() { return true; },
     async recordMutation() {},
     async deleteCalendarProjectionTombstone() {},
@@ -199,6 +199,10 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
         const next={...clone(value),status:"confirmed",etag:"created-etag",extendedProperties:{...value.extendedProperties,shared:{...value.extendedProperties?.shared,syncRepairId:operationId}}};
         eventMap.set(value.id,next); writes.push(["create-event", value.id]); return clone(next);
       },
+      async deleteEventIfUnchanged(id,etag) {
+        assert.equal(eventMap.get(id)?.etag,etag,"Calendar deletion uses the exact previewed ETag");
+        eventMap.delete(id); writes.push(["delete-event",id]);
+      },
       async upsertEvent() { assert.fail("Unexpected anonymous Calendar write"); },
     },
     todoist: {
@@ -220,7 +224,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     },
   };
   const store = {
-    async getCase() { return { id: "case", profile: "home", decision }; },
+    async getCase() { return { id: "case", profile: "home", status:caseStatus, decision }; },
     async putPreview() {},
     async getOperation(id) { return operations.get(id); },
     async saveOperation(operation) { operations.set(operation.id, clone(operation)); },
@@ -1801,4 +1805,88 @@ test("Todoist-only flatten rejects stale links or recurrence ownership before wr
   const h=harness(t,{events:[history],tasks:[annual]});
   await assert.rejects(h.engine.preview(actor,intent({action:"todoist-only",taskId:annual.id,eventId:history.id,scope:"future"})),/no mapping, recurrence ownership, or stale Calendar task identity/);
   assert.deepEqual(h.writes,[]);
+});
+
+test("explicit Calendar projection deletion retains the exact Todoist task and fences webhook/reconciliation recreation",async t=>{
+  const current=task("keep-task"), projection=event("projection",{extendedProperties:{shared:{taskId:current.id}}});
+  const mapping={profile:"home",taskId:current.id,eventId:projection.id};
+  const h=harness(t,{events:[projection],tasks:[current],mappings:[mapping]});
+  const before=clone(h.taskMap.get(current.id));
+  const result=await h.execute(intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:projection.id,scope:"occurrence"}));
+  assert.equal(result.status,"succeeded",result.error);
+  assert.deepEqual(h.taskMap.get(current.id),before,"the exact Todoist item is retained without a provider write");
+  assert.equal(h.eventMap.has(projection.id),false);
+  assert.equal(h.mappingMap.size,0);
+  assert.equal(h.controlsMap.get(`home:todoist:${current.id}`).excluded,true);
+  assert.equal(h.controlsMap.get(`home:calendar:${projection.id}`).excluded,true);
+  assert.equal(h.controls.rejected.has(`home:${current.id}:${projection.id}`),true);
+  assert.deepEqual(h.writes,[["delete-event",projection.id]]);
+
+  const controls=new SyncControls();
+  controls.control=async ref=>h.controlsMap.get(refKey(ref));
+  t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
+  const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
+  const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
+  h.clients.calendar.listDelta=async()=>({items:[{...projection,status:"cancelled"}]});
+  for(let run=0;run<3;run++) {
+    assert.equal(await reconciler.reconcileUnmappedTask("home",h.taskMap.get(current.id),h.clients),"blocked");
+    await synchronizer.process({id:`calendar-delete-repeat-${run}`,kind:"calendar",profile:"home",mode:"aws",headers:{},body:""});
+    await synchronizer.process({id:`todoist-update-repeat-${run}`,kind:"todoist",profile:"home",mode:"aws",headers:{},body:JSON.stringify({event_name:"item:updated",event_data:h.taskMap.get(current.id)})});
+  }
+  assert.deepEqual(h.taskMap.get(current.id),before);
+  assert.equal(h.eventMap.has(projection.id),false);
+  assert.deepEqual(h.writes,[["delete-event",projection.id]],"repeat webhook and snapshot paths never recreate the Calendar projection");
+});
+
+test("closed case fresh preview rejects stale Calendar IDs and accepts the current exact mapping",async t=>{
+  const current=task("keep-task"), projection=event("current-projection"), stale=event("stale-projection");
+  const h=harness(t,{events:[projection],tasks:[current],mappings:[{profile:"home",taskId:current.id,eventId:projection.id}],caseStatus:"resolved"});
+  h.engine.store.getCase=async()=>({id:"case",profile:"home",status:"resolved"});
+  await assert.rejects(h.engine.preview(actor,intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:stale.id})),/exact current standalone mapping/);
+  const fresh=await h.engine.preview(actor,intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:projection.id}));
+  assert.deepEqual(fresh.intent.eventId,projection.id);
+  h.operations.set("fresh-exact-preview",{id:"fresh-exact-preview",status:"queued",steps:{},preview:fresh});
+  const applied=await h.engine.execute("fresh-exact-preview");
+  assert.equal(applied.status,"succeeded",applied.error);
+  assert.deepEqual(h.writes,[["delete-event",projection.id]]);
+});
+
+test("conditional Calendar deletion failure retains Todoist and does not detach its exact mapping",async t=>{
+  const current=task("keep-task"),projection=event("projection");
+  const mapping={profile:"home",taskId:current.id,eventId:projection.id};
+  const h=harness(t,{events:[projection],tasks:[current],mappings:[mapping]});
+  const beforeTask=clone(h.taskMap.get(current.id)),beforeEvent=clone(h.eventMap.get(projection.id));
+  const preview=await h.engine.preview(actor,intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:projection.id}));
+  h.operations.set("conditional-failure",{id:"conditional-failure",status:"queued",steps:{},preview});
+  h.clients.calendar.deleteEventIfUnchanged=async()=>{throw Object.assign(new Error("Precondition failed"),{status:412});};
+  const result=await h.engine.execute("conditional-failure");
+  assert.notEqual(result.status,"succeeded");
+  assert.deepEqual(h.taskMap.get(current.id),beforeTask);
+  assert.deepEqual(h.eventMap.get(projection.id),beforeEvent);
+  assert.deepEqual(h.mappingMap.get(current.id),mapping,"conditional mismatch does not detach the still-live mapping");
+  assert.deepEqual(h.writes,[]);
+});
+
+test("lost conditional-delete acknowledgement resumes from exact absence without deleting Todoist",async t=>{
+  const current=task("keep-task"),projection=event("projection");
+  const mapping={profile:"home",taskId:current.id,eventId:projection.id};
+  const h=harness(t,{events:[projection],tasks:[current],mappings:[mapping]});
+  const beforeTask=clone(h.taskMap.get(current.id));
+  const preview=await h.engine.preview(actor,intent({action:"todoist-only-delete-calendar",taskId:current.id,eventId:projection.id}));
+  h.operations.set("lost-delete-ack",{id:"lost-delete-ack",status:"queued",steps:{},preview});
+  let first=true;
+  h.clients.calendar.deleteEventIfUnchanged=async(id,etag)=>{
+    assert.equal(h.eventMap.get(id)?.etag,etag);
+    h.eventMap.delete(id);
+    if(first){first=false;throw new Error("Calendar committed deletion but response was lost");}
+  };
+  const failed=await h.engine.execute("lost-delete-ack");
+  assert.notEqual(failed.status,"succeeded");
+  assert.equal(h.operations.get("lost-delete-ack").steps[`delete-calendar-projection:${projection.id}`].status,"running");
+  const resumed=await h.engine.execute("lost-delete-ack");
+  assert.equal(resumed.status,"succeeded",resumed.error);
+  assert.deepEqual(h.taskMap.get(current.id),beforeTask);
+  assert.equal(h.eventMap.has(projection.id),false);
+  assert.equal(h.mappingMap.size,0);
 });
