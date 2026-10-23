@@ -53,6 +53,8 @@ export interface ErasureDeletionVerifier {
 }
 export interface ErasureSnapshotReader {
   readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId">>;
+  readMappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
 }
 
 const transitions: Record<ErasureOperationStatus, ErasureOperationStatus[]> = {
@@ -104,9 +106,7 @@ const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
 
 /** Exact preview is immutable after submission; workers use conditional status changes. */
 export class ErasureOperationStore {
-  #now: () => number;
-  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID,
-    nowForTests: () => number = Date.now) { this.#now=nowForTests; }
+  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID) {}
 
   async issueConfirmation(preview: ErasurePreview, lifetimeMs = 5 * 60_000): Promise<{
     confirmationId: string; previewFingerprint: string; expiresAt: number;
@@ -114,7 +114,7 @@ export class ErasureOperationStore {
     if (!preview.operationId || preview.selectedActions.deleteTodoist !== true
       || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
       || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
-    const now=this.#now();
+    const now=Date.now();
     const confirmationId=this.newConfirmationId();
     const previewFingerprint=erasurePreviewFingerprint(preview);
     const expiresAt=now+lifetimeMs;
@@ -126,7 +126,7 @@ export class ErasureOperationStore {
   }
 
   async create(operation: ErasureOperation): Promise<void> {
-    const now=this.#now();
+    const now=Date.now();
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
       || operation.lifecycle!==undefined
       || operation.confirmationFingerprint !== operation.previewFingerprint
@@ -181,12 +181,12 @@ export class ErasureOperationStore {
     const mappingIds=mappings.map(item=>item.id).sort();
     const lifecycle:FencedLifecycle={phase:"disable_mappings",mappingIds,
       enabledMappingIds:mappings.filter(item=>item.state==="Enabled").map(item=>item.id).sort(),
-      timeoutSeconds,pollMs:defaultFencePollMs,nextRunAt:this.#now(),evidence:{}};
+      timeoutSeconds,pollMs:defaultFencePollMs,nextRunAt:Date.now(),evidence:{}};
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:fencing, lifecycle=:lifecycle, updatedAt=:updatedAt",
       ConditionExpression:"#status=:queued AND attribute_not_exists(lifecycle) AND previewFingerprint=:fingerprint",
       ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":queued":"queued",":fencing":"fencing",
-        ":lifecycle":lifecycle,":updatedAt":new Date(this.#now()).toISOString(),":fingerprint":current.previewFingerprint}}));
+        ":lifecycle":lifecycle,":updatedAt":new Date(Date.now()).toISOString(),":fingerprint":current.previewFingerprint}}));
   }
 
   /** Execute one trusted adapter action/readback and persist its opaque receipt with a CAS. */
@@ -197,7 +197,7 @@ export class ErasureOperationStore {
     const current=operation?.lifecycle;
     if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
-    const now=this.#now();
+    const now=Date.now();
     if(current.nextRunAt>now) return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:true};
     let next:FencedLifecycle;
     let nextStatus=operation.status;
@@ -229,7 +229,9 @@ export class ErasureOperationStore {
           next=this.#advance(operation.operationId,current,"drain_after_timeout",now,"workerTimeoutElapsed");
           break;
         case "drain_after_timeout": {
-          const {leases}=await adapters.inspectFence(operation.profile);
+          const {fence,leases}=await adapters.inspectFence(operation.profile);
+          if(fence?.operationId!==operation.operationId)
+            throw new Error("Profile fence is missing or owned by a different erasure operation");
           if(leases.length) next={...current,nextRunAt:now+current.pollMs};
           else {
             next=this.#advance(operation.operationId,current,"ready_for_delete",now,"postTimeoutDrain");
@@ -276,7 +278,7 @@ export class ErasureOperationStore {
     const current=operation?.lifecycle;
     if(!operation || operation.status!=="deleting" || current?.phase!=="ready_for_delete")
       throw new Error("Erasure is not ready for post-deletion verification");
-    const now=this.#now();
+    const now=Date.now();
     const result=await verifier.verifyDeletion(operation);
     if(!result.providersAbsent || !result.stateAbsent) throw new Error("Deletion postflight readback is not clear; retain the profile fence");
     const next=this.#advance(operation.operationId,current,"restore_mappings",now,"providerDeletionVerified");
@@ -286,11 +288,17 @@ export class ErasureOperationStore {
   async assertReadyForDelete(id: string, reader: ErasureSnapshotReader): Promise<void> {
     const operation=await this.get(id);
     if(!operation) throw new Error("Erasure operation was not found");
-    const freshSnapshot=await reader.readFreshSnapshot(operation);
+    const [freshSnapshot,mappingStates,fenceState]=await Promise.all([
+      reader.readFreshSnapshot(operation),reader.readMappingStates(operation.lifecycle?.mappingIds??[]),reader.inspectFence(operation.profile),
+    ]);
     const lifecycle=operation.lifecycle;
     const evidence=lifecycle?.evidence;
     const required: FencedEvidenceKey[]=["mappingsDisableRequested","mappingsDisabled","preFenceDrain","fenceInstalled","workerTimeoutElapsed","postTimeoutDrain"];
     const receipts=required.map(key=>evidence?.[key]);
+    const expectedMappingIds=lifecycle?.mappingIds??[];
+    const currentMappings=new Map(mappingStates.map(mapping=>[mapping.id,mapping.state]));
+    const mappingsStillDisabled=expectedMappingIds.length>0 && currentMappings.size===expectedMappingIds.length
+      &&expectedMappingIds.every(mappingId=>currentMappings.get(mappingId)==="Disabled");
     const validReceipts=receipts.every((receipt,index)=>receipt?.operationId===operation.operationId
       && receipt.phase===required[index] && /^[0-9a-f-]{36}$/i.test(receipt.receiptId));
     const times=receipts.map(receipt=>receipt?.completedAt);
@@ -298,6 +306,7 @@ export class ErasureOperationStore {
       || !operation.confirmationId || operation.confirmationFingerprint!==operation.previewFingerprint
       || operation.previewFingerprint!==erasurePreviewFingerprint(operation)
       || operation.previewFingerprint!==erasurePreviewFingerprint(freshSnapshot)
+      || !mappingsStillDisabled || fenceState.fence?.operationId!==operation.operationId || fenceState.leases.length!==0
       || !validReceipts || times.some((time,index)=>!Number.isFinite(time)
         || (index>0 && (time as number)<(times[index-1] as number)))
       || (times[4] as number)<(times[3] as number)+lifecycle.timeoutSeconds*1000+2000)

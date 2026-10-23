@@ -58,7 +58,8 @@ test("store alone creates lifecycle receipts after real adapter actions and gate
   let now=10_000,leases=[{id:"writer"}],fence,failDisable=true,failRestore=true,failSaveAfterRelease=true;
   const states=new Map([["uuid-enabled","Enabled"],["uuid-disabled","Enabled"]]),events=[];
   const db=memoryDb(storedQueuedOperation());
-  const store=new ErasureOperationStore(db,()=>"unused-confirmation",()=>now);
+  const realNow=Date.now;Date.now=()=>now;
+  const store=new ErasureOperationStore(db,()=>"unused-confirmation");
   const adapters={
     disableMappings:async ids=>{events.push(["disable",ids]);if(failDisable){failDisable=false;throw new Error("transient disable failure");}
       for(const id of ids)states.set(id,"Disabled");},
@@ -99,13 +100,27 @@ test("store alone creates lifecycle receipts after real adapter actions and gate
     const deadline=db.item.lifecycle.nextRunAt;
     now=deadline-1;assert.equal((await store.advanceFencedLifecycle("op",adapters)).waiting,true);
     now=deadline;assert.equal((await store.advanceFencedLifecycle("op",adapters)).phase,"drain_after_timeout");
+    fence=undefined;
+    result=await store.advanceFencedLifecycle("op",adapters);
+    assert.equal(result.phase,"drain_after_timeout");assert.match(db.item.lifecycle.lastError,/fence is missing/);
+    assert.equal(db.item.lifecycle.evidence.postTimeoutDrain,undefined);
+    now=db.item.lifecycle.nextRunAt;fence={operationId:"different-operation"};
+    result=await store.advanceFencedLifecycle("op",adapters);
+    assert.equal(result.phase,"drain_after_timeout");assert.match(db.item.lifecycle.lastError,/different erasure operation/);
+    now=db.item.lifecycle.nextRunAt;fence={operationId:"op"};
     leases=[{id:"late-writer"}];result=await store.advanceFencedLifecycle("op",adapters);assert.equal(result.phase,"drain_after_timeout");
     now=db.item.lifecycle.nextRunAt;leases=[];result=await store.advanceFencedLifecycle("op",adapters);
     assert.equal(result.phase,"ready_for_delete");assert.equal(db.item.status,"deleting");
 
     const fresh={profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,inventory:db.item.inventory};
-    await assert.rejects(store.assertReadyForDelete("op",{readFreshSnapshot:async()=>({...fresh,inventory:[{...fresh.inventory[0],digest:"changed"}]})}),/not ready/);
-    await store.assertReadyForDelete("op",{readFreshSnapshot:async()=>fresh});
+    const gateReader=(overrides={})=>({readFreshSnapshot:async()=>overrides.snapshot??fresh,
+      readMappingStates:async ids=>ids.map(id=>({id,state:overrides.mappingState??states.get(id)})),
+      inspectFence:async()=>({fence:Object.hasOwn(overrides,"fence")?overrides.fence:fence,leases:overrides.leases??leases})});
+    await assert.rejects(store.assertReadyForDelete("op",gateReader({snapshot:{...fresh,inventory:[{...fresh.inventory[0],digest:"changed"}]}})),/not ready/);
+    await assert.rejects(store.assertReadyForDelete("op",gateReader({mappingState:"Enabled"})),/not ready/);
+    await assert.rejects(store.assertReadyForDelete("op",gateReader({fence:{operationId:"different-operation"}})),/not ready/);
+    await assert.rejects(store.assertReadyForDelete("op",gateReader({fence:undefined,leases:[{id:"new-writer"}]})),/not ready/);
+    await store.assertReadyForDelete("op",gateReader());
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified,undefined);
     await assert.rejects(store.transition("op","deleting","verifying"),/Fenced lifecycle status transitions/);
     await assert.rejects(store.markDeletionVerified("op",{verifyDeletion:async()=>({providersAbsent:false,stateAbsent:true})}),/readback is not clear/);
@@ -135,7 +150,7 @@ test("store alone creates lifecycle receipts after real adapter actions and gate
     assert.equal(result.phase,"complete");assert.equal(db.item.status,"succeeded");
     assert.equal(events.filter(event=>event[0]==="finish").length,1,"retry accepts an already-released fence");
     assert.ok(!events.some(event=>event[0]==="delete"),"lifecycle does not perform provider deletion");
-  }finally{if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
+  }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
 
 test("trusted clock controls confirmation issue and consume; caller timestamps cannot replay expiration",async()=>{
@@ -154,7 +169,8 @@ test("trusted clock controls confirmation issue and consume; caller timestamps c
     if(command.constructor.name.includes("Get"))return {Item:operations.get(command.input.Key.pk)};
     return {};
   }};
-  const store=new ErasureOperationStore(db,()=>"one-time-token",()=>now);
+  const realNow=Date.now;Date.now=()=>now;
+  const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const issued=await store.issueConfirmation({operationId:"op",...preview},5000);
     const complete={operationId:"op",...preview,...issued,confirmationFingerprint:issued.previewFingerprint,status:"previewed",createdAt:"now",updatedAt:"now"};
@@ -162,7 +178,7 @@ test("trusted clock controls confirmation issue and consume; caller timestamps c
     now=7000;
     await assert.rejects(store.create(complete,1),/transaction condition failed/);
     assert.equal(operations.size,0,"extra forged timestamp argument has no effect");
-  }finally{if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
+  }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
 
 test("durable operation store digests immutable preview content and atomically consumes confirmation once",async()=>{
@@ -182,7 +198,8 @@ test("durable operation store digests immutable preview content and atomically c
     if(command.constructor.name.includes("Get"))return {Item:operations.get(command.input.Key.pk)};
     return {};
   }};
-  const store=new ErasureOperationStore(db,()=>"one-time-token",()=>now);
+  const realNow=Date.now;Date.now=()=>now;
+  const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const source={operationId:"op",...preview};const issued=await store.issueConfirmation(source);
     const complete={...source,...issued,confirmationFingerprint:issued.previewFingerprint,status:"previewed",createdAt:"now",updatedAt:"now"};
@@ -195,5 +212,5 @@ test("durable operation store digests immutable preview content and atomically c
     assert.equal(confirmations.get("ERASURE_CONFIRMATION#op").status,"consumed");
     await store.transition("op","previewed","queued",{requestId:"request"});
     assert.equal(calls.at(-1).input.ConditionExpression,"#status=:expected AND previewFingerprint=:fingerprint");
-  }finally{if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
+  }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
