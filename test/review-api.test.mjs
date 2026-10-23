@@ -184,6 +184,7 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
     assert.equal(queueCalls.length,0);
   }
 
+  t.mock.method(ReviewStore.prototype,"dismissCase",async(id,result)=>{caseUpdates.push([id,"dismissed",result]);return {...caseItem,status:"dismissed",result};});
   const dismissed=await jsonResponse(await handler(event("/review/api/cases/case-1/dismiss","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
   },{})));
