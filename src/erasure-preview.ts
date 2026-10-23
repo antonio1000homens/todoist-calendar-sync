@@ -5,8 +5,9 @@ import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
-import { erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
+import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
+import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
 export interface ErasurePreviewRequest {
@@ -25,6 +26,8 @@ export interface ErasurePreviewResult {
   providerSnapshotFingerprint: string;
   inventoryDigest: string;
   inventory: ErasureOperation["inventory"];
+  actionPlan: NonNullable<ErasureOperation["actionPlan"]>;
+  backupRetentionNotice: string;
   classificationCounts: Record<string, number>;
   blockers: string[];
   confirmation?: { confirmationId: string; expiresAt: number };
@@ -36,6 +39,8 @@ type Dependencies = {
   inspectFence?: typeof inspectErasureFence;
   newOperationId?: () => string;
   ignoreOperationId?: string;
+  allowFenceOperationId?: string;
+  allowJournalOperationId?: string;
   scanDeadlineMs?: number;
   sleep?: (ms: number) => Promise<void>;
 };
@@ -126,11 +131,11 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     && !(dependencies.ignoreOperationId && (row.pk===`ERASURE_OPERATION#${dependencies.ignoreOperationId}`
       || row.pk===`ERASURE_CONFIRMATION#${dependencies.ignoreOperationId}`)));
   const plan = planPurge(rows, target);
-  const missing = (error: unknown) => [404, 410].includes(Number((error as { status?: number })?.status));
+  const todoistMissing = (error: unknown) => Number((error as { status?: number })?.status) === 404;
   let task: any, event: any;
   let taskMissing = false, eventMissing = false;
   try { task = await providerClients.todoist.getTask(target.taskId); }
-  catch (error) { if (!missing(error)) throw error; taskMissing = true; }
+  catch (error) { if (!todoistMissing(error)) throw error; taskMissing = true; }
   if (target.eventId) {
     try {
       event = await providerClients.calendar.getEvent(target.eventId);
@@ -139,7 +144,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       // mismatched response must flow through providerBlockers and fail closed.
       if (event?.status === "cancelled" && event.id === target.eventId) { event = undefined; eventMissing = true; }
     }
-    catch (error) { if (!missing(error)) throw error; eventMissing = true; }
+    catch (error) { if (!calendarEventGoneOnDirectRead(error)) throw error; eventMissing = true; }
   }
   const [linkedResult, projectComments] = await Promise.all([
     providerClients.calendar.findByTodoistTaskId(target.taskId),
@@ -154,17 +159,17 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const relevant = indexed.parsed.filter(item => item.payload.taskId === target.taskId || item.payload.eventId === target.eventId);
   const malformed = indexed.malformed.filter(item => item.comment.content?.includes(target.taskId)
     || (target.eventId && item.comment.content?.includes(target.eventId)));
-  let legacy: Array<{ id: string; eventId?: string }> = [];
-  if (task) {
-    const comments = await providerClients.todoist.listTaskComments(target.taskId);
-    legacy = comments.filter(comment => LEGACY_TASK_COMMENT_MARKERS.has(String(comment.content || "").split(/\r?\n/)[0]))
-      .map(comment => ({ id: comment.id, eventId: String(comment.content || "").split(/\r?\n/)
-        .find(line => line.startsWith("calendarEventId="))?.slice("calendarEventId=".length) }));
-  }
+  // Task-scoped comments may outlive a task. Inventory them even when the
+  // task itself is already absent, so deletion can prove no breadcrumb remains.
+  const taskComments = await providerClients.todoist.listTaskComments(target.taskId);
+  const legacy: Array<{ id: string; eventId?: string; digest: string }> = taskComments
+    .filter(comment => LEGACY_TASK_COMMENT_MARKERS.has(String(comment.content || "").split(/\r?\n/)[0]))
+    .map(comment => ({ id: comment.id, digest: fingerprint(comment.content), eventId: String(comment.content || "").split(/\r?\n/)
+      .find(line => line.startsWith("calendarEventId="))?.slice("calendarEventId=".length) }));
   const providerData = {
     task, event, linked,
-    comments: relevant.map(item => ({ id: item.comment.id, profile: item.payload.profile, taskId: item.payload.taskId,
-      eventId: item.payload.eventId, seriesId: item.payload.seriesId })),
+    comments: relevant.map(item => ({ id: item.comment.id, contentDigest: fingerprint(item.comment.content),
+      profile: item.payload.profile, taskId: item.payload.taskId, eventId: item.payload.eventId, seriesId: item.payload.seriesId })),
     legacy, malformed: malformed.map(item => ({ id: item.comment.id, error: item.error })),
   };
   const blockers = [...new Set([...plan.blockers, ...providerBlockers(providerData, target, input.deleteCalendar)])].sort();
@@ -173,21 +178,31 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     blockers.push("Calendar returned no event without an explicit not-found response");
   const protocol = await (dependencies.inspectFence || inspectErasureFence)(target.profile);
   const journal = await db.send(new GetCommand({ TableName: tableName(), Key: { pk: `ERASURE#${target.profile}`, sk: "JOURNAL" }, ConsistentRead: true }));
-  if (journal.Item) blockers.push("A prior item-erasure journal exists for this profile; break-glass review is required before another preview");
-  if (protocol.fence) blockers.push("A profile erasure fence is active; preserve protections and use the break-glass recovery procedure");
+  if (journal.Item && journal.Item.operationId !== dependencies.allowJournalOperationId)
+    blockers.push("A prior item-erasure journal exists for this profile; break-glass review is required before another preview");
+  if (protocol.fence && protocol.fence.operationId !== dependencies.allowFenceOperationId)
+    blockers.push("A profile erasure fence is active; preserve protections and use the break-glass recovery procedure");
   if (protocol.leases.length) blockers.push("Provider work leases are active; retry only after they have drained");
   const operationId = (dependencies.newOperationId || randomUUID)();
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
   const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
     digest: record.digest, classification: record.classification }));
   const providerSnapshotFingerprint = fingerprint(providerData);
+  const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
+    calendarEvent: event ? { id: target.eventId!, digest: fingerprint(event) } : undefined,
+    comments: [
+      ...relevant.map(item => ({ id: item.comment.id, kind: "project" as const, digest: fingerprint(item.comment.content) })),
+      ...legacy.map(item => ({ id: item.id, kind: "task" as const, digest: item.digest })),
+    ].sort((a,b)=>a.id.localeCompare(b.id)) };
   const operationPreview = { operationId, profile: target.profile, target: { ...target, deleteCalendar: input.deleteCalendar },
-    selectedActions, inventory, providerSnapshotFingerprint };
+    selectedActions, inventory, providerSnapshotFingerprint, actionPlan };
   return {
     operationId, profile: target.profile, target: operationPreview.target, selectedActions,
     previewFingerprint: erasurePreviewFingerprint(operationPreview), providerSnapshotFingerprint, inventoryDigest: plan.inventoryDigest,
     inventory: plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
       digest: record.digest, classification: record.classification })),
+    actionPlan,
+    backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
   };
 }

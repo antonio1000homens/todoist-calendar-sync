@@ -72,6 +72,8 @@ test("worker respects durable next-run time and stops before provider deletion",
     advances.push(id);
     return { phase: "install_fence", nextRunAt: Date.now() + 75_000, status: "fencing", waiting: true };
   });
+  const deletionStarts=[];
+  t.mock.method(ErasureOperationStore.prototype,"beginDeletion",async id=>deletionStarts.push(id));
   let gateReads=0;
   t.mock.method(ErasureOperationStore.prototype, "assertReadyForDelete", async () => { gateReads++; });
   t.mock.method(SQSClient.prototype, "send", async command => { sent.push(command.input); return {}; });
@@ -85,8 +87,8 @@ test("worker respects durable next-run time and stops before provider deletion",
     sent.length = 0;
     result = await handler({ Records: [record('{"version":1,"operationId":"op_2"}')], awsRequestId: "req" });
     assert.deepEqual(result, { batchItemFailures: [] });
-    assert.equal(sent.length, 0, "the fencing worker stops for the separate confirmed deletion slice");
-    assert.equal(gateReads,1,"the full action-time gate is reread before the worker reports ready");
+    assert.equal(sent.length, 1, "the worker queues the first deletion step only after the full action-time gate");
+    assert.deepEqual(deletionStarts,["op_2"]);
     assert.deepEqual(advances, ["op_2"]);
   } finally {
     if (oldQueue === undefined) delete process.env.ERASURE_OPERATION_QUEUE_URL; else process.env.ERASURE_OPERATION_QUEUE_URL = oldQueue;

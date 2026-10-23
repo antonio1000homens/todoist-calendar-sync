@@ -6,8 +6,9 @@ import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
-import { ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
+import { ERASURE_BACKUP_RETENTION_NOTICE, ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import { buildErasurePreview } from "./erasure-preview.js";
+import { acquireErasureProtocolLease, getErasureEpoch } from "./erasure-protocol.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
@@ -126,9 +127,11 @@ async function enqueueRepair(operationId: string, selectedProfile: Profile, atte
 export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   buildErasurePreview?: typeof buildErasurePreview;
   createErasureOperationStore?: () => ErasureOperationStore;
+  acquireManualWriteLease?: (selectedProfile:Profile)=>Promise<()=>Promise<void>>;
 } = {}): Promise<LambdaFunctionURLResult> {
   const previewBuilder = dependencies.buildErasurePreview || buildErasurePreview;
   const erasureStore = () => dependencies.createErasureOperationStore?.() || new ErasureOperationStore();
+  const manualWriteLeases:(()=>Promise<void>)[]=[];
   try {
     const path = event.rawPath || "/";
     if (!path.startsWith("/review/api/")) return response(404,{error:"not_found"});
@@ -137,6 +140,19 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     const segments = path.slice("/review/api/".length).split("/").filter(Boolean).map(decodeURIComponent);
     const body = method === "POST" ? bodyJson(event) : undefined;
     const actor = await authenticate(event, method === "POST");
+    // Every manual provider/state mutation participates in the same admission
+    // barrier as sync work. Acquire all profiles because repair intents can
+    // name a destination profile distinct from their source case profile.
+    // Erasure API calls themselves only create/read durable preparation state.
+    const erasurePreparationRoute = segments[0] === "erasure-previews"
+      || segments[0] === "erasure-operations";
+    if(method === "POST" && !erasurePreparationRoute && process.env.ERASURE_PROTOCOL_VERSION === "1") {
+      for(const selectedProfile of REVIEW_PROFILES) {
+        const acquire=dependencies.acquireManualWriteLease || (async (profile:Profile) =>
+          acquireErasureProtocolLease(profile,"admission",undefined,await getErasureEpoch(profile)));
+        manualWriteLeases.push(await acquire(selectedProfile));
+      }
+    }
     const store = new ReviewStore();
 
     if ((method === "GET" && segments[0] === "erasure-operations" && segments.length === 2)
@@ -146,7 +162,14 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
         providerDeletionReady:operation.providerDeletionReady===true,
+        backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
+        deletionProgress:operation.lifecycle?.deletionProgress?{
+          stage:operation.lifecycle.deletionProgress.stage,
+          commentsCompleted:operation.lifecycle.deletionProgress.commentIndex,
+          stateRowsCompleted:operation.lifecycle.deletionProgress.stateIndex,
+        }:undefined,
+        ...(operation.lifecycle?.lastError?{lastError:operation.lifecycle.lastError}:{}),
         ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
           message:ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
@@ -154,7 +177,6 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
       if (operation.status === "previewed" && operation.providerDeletionReady !== true)
         fail(409,"The provider deletion and postflight workflow is not available; this preview remains durable but cannot be queued");
-      if (operation.lifecycle?.phase === "ready_for_delete") fail(409,"Fencing is complete; provider deletion requires the separate confirmed deletion workflow");
       if (!["previewed","queued","fencing","deleting","verifying"].includes(operation.status))
         fail(409,"This erasure operation cannot be started or resumed");
       if (operation.status === "previewed") {
@@ -188,9 +210,11 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           if (error instanceof Error && error.message.includes("too large for one durable operation")) fail(413,error.message);
           throw error;
         }
-        return response(200,{preview:{...preview,confirmation:{confirmationId:issued.confirmationId,expiresAt:issued.expiresAt}}});
+        const {actionPlan,...safePreview}=preview;
+        return response(200,{preview:{...safePreview,confirmation:{confirmationId:issued.confirmationId,expiresAt:issued.expiresAt}}});
       }
-      return response(200,{preview});
+      const {actionPlan,...safePreview}=preview;
+      return response(200,{preview:safePreview});
     }
 
     if (method === "POST" && segments[0] === "erasure-operations" && segments.length === 1) {
@@ -209,7 +233,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const now=new Date().toISOString();
       const operation = {operationId:current.operationId,profile:current.profile,target:current.target,
         selectedActions:current.selectedActions,providerSnapshotFingerprint:current.providerSnapshotFingerprint,
-        inventory:current.inventory,previewFingerprint:current.previewFingerprint,
+        inventory:current.inventory,actionPlan:issued.actionPlan,previewFingerprint:current.previewFingerprint,
         providerDeletionReady:false,
         confirmationId:body.confirmationId,confirmationFingerprint:current.previewFingerprint,
         status:"previewed" as const,createdAt:now,updatedAt:now};
@@ -217,7 +241,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       catch { fail(409,"The confirmation expired, was already used, or the operation changed; request a fresh preview"); }
       return response(201,{operation:{operationId:operation.operationId,status:operation.status,
         previewFingerprint:operation.previewFingerprint,inventoryCount:operation.inventory.length,
-        queueReady:false,providerDeletionReady:false}});
+        queueReady:false,providerDeletionReady:false,backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE}});
     }
 
     if (method === "GET" && segments[0] === "cases" && segments.length === 1) {
@@ -395,5 +419,9 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       stack:error instanceof Error?error.stack:undefined,
     }));
     return response(status,{error:status<500?error instanceof Error?error.message:"request_rejected":"review_api_failed"});
+  } finally {
+    const released=await Promise.allSettled(manualWriteLeases.reverse().map(release=>release()));
+    const failed=released.find((item):item is PromiseRejectedResult=>item.status==="rejected");
+    if(failed) throw failed.reason;
   }
 }

@@ -7,7 +7,13 @@ import type { Profile } from "./types.js";
 export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure" | "review_required";
 export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "drain_before_fence"
   | "install_fence" | "wait_worker_timeout" | "drain_after_timeout" | "ready_for_delete"
-  | "restore_mappings" | "confirm_restored" | "release_fence" | "complete";
+  | "delete" | "verify_deletion" | "restore_mappings" | "confirm_restored" | "release_fence" | "complete";
+export interface ErasureDeletionProgress {
+  stage: "comments" | "todoist" | "calendar" | "state" | "verify";
+  commentIndex: number;
+  stateIndex: number;
+  startedAt: number;
+}
 export interface FencedLifecycle {
   phase: FencedLifecyclePhase;
   mappingIds: string[];
@@ -17,9 +23,10 @@ export interface FencedLifecycle {
   nextRunAt: number;
   lastError?: string;
   evidence: Partial<Record<FencedEvidenceKey, FencedReceipt>>;
+  deletionProgress?: ErasureDeletionProgress;
 }
 export type FencedEvidenceKey = "mappingsDisableRequested" | "mappingsDisabled" | "preFenceDrain" | "fenceInstalled"
-  | "workerTimeoutElapsed" | "postTimeoutDrain" | "providerDeletionVerified" | "mappingsRestored" | "fenceReleased";
+  | "workerTimeoutElapsed" | "postTimeoutDrain" | "deletionStarted" | "providerDeletionVerified" | "mappingsRestored" | "fenceReleased";
 export interface FencedReceipt { operationId: string; phase: FencedEvidenceKey; receiptId: string; completedAt: number }
 export interface ErasureOperation {
   operationId: string;
@@ -33,6 +40,8 @@ export interface ErasureOperation {
   providerDeletionReady?: boolean;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
   inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string }>;
+  /** Exact temporary provider deletion inputs; removed together with the operation on success. */
+  actionPlan: ErasureActionPlan;
   status: ErasureOperationStatus;
   lifecycle?: FencedLifecycle;
   createdAt: string;
@@ -40,6 +49,11 @@ export interface ErasureOperation {
   requestId?: string;
   result?: Record<string, unknown>;
   error?: string;
+}
+export interface ErasureActionPlan {
+  todoistTask?: { id: string; digest: string };
+  calendarEvent?: { id: string; digest: string };
+  comments: Array<{ id: string; kind: "project" | "task"; digest: string }>;
 }
 export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
 export interface FencedLifecycleAdapters {
@@ -55,12 +69,16 @@ export interface ErasureDeletionVerifier {
   verifyDeletion(operation: ErasureOperation): Promise<{ providersAbsent: boolean; stateAbsent: boolean }>;
 }
 export interface ErasureSnapshotReader {
-  readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId">>;
+  readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId"> & {blockers?:string[]}>;
   readMappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
   inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
 }
+export interface ErasureDeletionStepResult { progress: ErasureDeletionProgress; complete: boolean }
+export interface ErasureDeletionWorker {
+  executeDeletionStep?(operation:ErasureOperation,progress:ErasureDeletionProgress):Promise<ErasureDeletionStepResult>;
+}
 /** Bind these process-trusted adapters when constructing the worker service, never per request. */
-export interface ErasureWorkerAdapters extends FencedLifecycleAdapters, ErasureDeletionVerifier, ErasureSnapshotReader {}
+export interface ErasureWorkerAdapters extends FencedLifecycleAdapters, ErasureDeletionVerifier, ErasureSnapshotReader, ErasureDeletionWorker {}
 
 export class ErasureGateDriftError extends Error {
   constructor() {
@@ -70,6 +88,7 @@ export class ErasureGateDriftError extends Error {
 }
 
 export const ERASURE_REVIEW_REQUIRED_MESSAGE="Operator break-glass recovery is required. Preserve any protections that remain, inspect the actual profile fence and worker mapping state, and escalate if either is missing, changed, or cannot be verified. Do not start a fresh preview until service admission is restored; this operation cannot be resumed.";
+export const ERASURE_BACKUP_RETENTION_NOTICE="Erasure removes live-table rows only. DynamoDB point-in-time recovery remains enabled with a 35-day recovery window, so deleted data may remain recoverable from backups during that period.";
 
 const transitions: Record<ErasureOperationStatus, ErasureOperationStatus[]> = {
   previewed: ["queued"], queued: ["fencing", "partial_failure"], fencing: ["deleting", "partial_failure"],
@@ -85,7 +104,16 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
 function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
-type ErasurePreview = Pick<ErasureOperation, "operationId" | "profile" | "target" | "selectedActions" | "inventory" | "providerSnapshotFingerprint">;
+function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"target"|"selectedActions">):boolean {
+  if(!plan||!Array.isArray(plan.comments)) return false;
+  if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
+  if(plan.calendarEvent&&(!operation.selectedActions.deleteCalendar||plan.calendarEvent.id!==operation.target.eventId
+    ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.digest))) return false;
+  const ids=new Set<string>();
+  return plan.comments.every(item=>typeof item.id==="string"&&item.id.length>0&&!ids.has(item.id)
+    &&(ids.add(item.id),true)&&(item.kind==="project"||item.kind==="task")&&/^[a-f0-9]{64}$/.test(item.digest));
+}
+type ErasurePreview = Pick<ErasureOperation, "operationId" | "profile" | "target" | "selectedActions" | "inventory" | "providerSnapshotFingerprint" | "actionPlan">;
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") {
@@ -96,7 +124,7 @@ function canonical(value: unknown): string {
 }
 export function erasurePreviewFingerprint(preview: Omit<ErasurePreview, "operationId">): string {
   const content={version:1,profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,
-    providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory};
+    providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory,actionPlan:preview.actionPlan};
   return createHash("sha256").update(canonical(content)).digest("hex");
 }
 function stateTable(): string {
@@ -112,7 +140,9 @@ const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   install_fence:["install_fence","wait_worker_timeout"],
   wait_worker_timeout:["drain_after_timeout"],
   drain_after_timeout:["drain_after_timeout","ready_for_delete"],
-  ready_for_delete:["restore_mappings"],
+  ready_for_delete:["delete"],
+  delete:["delete","verify_deletion"],
+  verify_deletion:["restore_mappings"],
   restore_mappings:["restore_mappings","confirm_restored"],
   confirm_restored:["confirm_restored","release_fence"],
   release_fence:["release_fence","complete"],
@@ -139,6 +169,7 @@ export class ErasureOperationStore {
       verifyDeletion:workerAdapters.verifyDeletion.bind(workerAdapters),
       readFreshSnapshot:workerAdapters.readFreshSnapshot.bind(workerAdapters),
       readMappingStates:workerAdapters.readMappingStates.bind(workerAdapters),
+      ...(workerAdapters.executeDeletionStep ? {executeDeletionStep:workerAdapters.executeDeletionStep.bind(workerAdapters)} : {}),
     }):undefined;
   }
 
@@ -151,6 +182,7 @@ export class ErasureOperationStore {
     confirmationId: string; previewFingerprint: string; expiresAt: number;
   }> {
     if (!preview.operationId || !/^[a-f0-9]{64}$/.test(preview.providerSnapshotFingerprint)
+      || !validActionPlan(preview.actionPlan,preview)
       || preview.selectedActions.deleteTodoist !== true
       || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
       || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
@@ -163,7 +195,7 @@ export class ErasureOperationStore {
     await this.db.send(new TransactWriteCommand({TransactItems:[{Put:{TableName:stateTable(),Item:{
       ...confirmationKey(preview.operationId),operationId:preview.operationId,confirmationId,previewFingerprint,
       preview:{profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,
-        providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory},
+        providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory,actionPlan:preview.actionPlan},
       status:"issued",expiresAt,createdAt:new Date(now).toISOString(),
     },ConditionExpression:"attribute_not_exists(pk)"}}]}));
     return {confirmationId,previewFingerprint,expiresAt};
@@ -171,14 +203,16 @@ export class ErasureOperationStore {
 
   async getIssuedPreview(operationId: string, confirmationId: string): Promise<{
     profile: Profile; target: ErasureOperation["target"]; selectedActions: ErasureOperation["selectedActions"];
-    providerSnapshotFingerprint: string; inventory: ErasureOperation["inventory"]; previewFingerprint: string;
+    providerSnapshotFingerprint: string; inventory: ErasureOperation["inventory"]; actionPlan: ErasureActionPlan; previewFingerprint: string;
   } | undefined> {
     const result=await this.db.send(new GetCommand({TableName:stateTable(),Key:confirmationKey(operationId),ConsistentRead:true}));
     const item=result.Item;
     if(!item || item.status!=="issued" || item.operationId!==operationId || item.confirmationId!==confirmationId
       || typeof item.expiresAt!=="number" || item.expiresAt<=Date.now() || !item.preview) return undefined;
     const preview=item.preview as {profile:Profile;target:ErasureOperation["target"];
-      selectedActions:ErasureOperation["selectedActions"];providerSnapshotFingerprint:string;inventory:ErasureOperation["inventory"]};
+      selectedActions:ErasureOperation["selectedActions"];providerSnapshotFingerprint:string;inventory:ErasureOperation["inventory"];actionPlan:ErasureActionPlan};
+    if(!validActionPlan(preview.actionPlan,preview)
+      ||erasurePreviewFingerprint(preview)!==item.previewFingerprint) return undefined;
     return {...preview,previewFingerprint:item.previewFingerprint as string};
   }
 
@@ -186,7 +220,7 @@ export class ErasureOperationStore {
     const now=Date.now();
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
       || operation.lifecycle!==undefined
-      || operation.providerDeletionReady!==false
+      || !validActionPlan(operation.actionPlan,operation)
       || !/^[a-f0-9]{64}$/.test(operation.providerSnapshotFingerprint)
       || operation.confirmationFingerprint !== operation.previewFingerprint
       || operation.selectedActions.deleteTodoist !== true
@@ -298,6 +332,21 @@ export class ErasureOperationStore {
           }
           break;
         }
+        case "delete": {
+          if(!adapters.executeDeletionStep) throw new Error("Trusted erasure deletion adapter is not configured");
+          const result=await adapters.executeDeletionStep(operation,current.deletionProgress
+            ||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now});
+          if(result.complete) next=this.#advance(operation.operationId,current,"verify_deletion",now);
+          else next={...current,deletionProgress:result.progress,nextRunAt:now};
+          break;
+        }
+        case "verify_deletion": {
+          const result=await adapters.verifyDeletion(operation);
+          if(!result.providersAbsent||!result.stateAbsent) throw new ErasureGateDriftError();
+          next=this.#advance(operation.operationId,current,"restore_mappings",now,"providerDeletionVerified");
+          nextStatus="verifying";
+          break;
+        }
         case "ready_for_delete":
         case "complete":
           return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:false};
@@ -317,8 +366,14 @@ export class ErasureOperationStore {
           const {fence,leases}=await adapters.inspectFence(operation.profile);
           if(leases.length) next={...current,nextRunAt:now+current.pollMs};
           else if(fence && fence.operationId!==operation.operationId) throw new Error("A different operation owns the profile fence");
+          else if(!fence) throw new ErasureGateDriftError();
           else {
-            if(fence) await adapters.finishFence(operation.profile,operation.operationId);
+            const finalRead=await adapters.verifyDeletion(operation);
+            if(!finalRead.providersAbsent||!finalRead.stateAbsent) throw new ErasureGateDriftError();
+            if(fence) {
+              await this.#finishAndEraseOperation(operation);
+              return {phase:"complete",nextRunAt:now,status:"succeeded",waiting:false};
+            }
             next=this.#advance(operation.operationId,current,"complete",now,"fenceReleased");
             nextStatus="succeeded";
           }
@@ -326,22 +381,27 @@ export class ErasureOperationStore {
         }
       }
     } catch(error) {
+      if(error instanceof ErasureGateDriftError) {
+        next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
+        nextStatus="review_required";
+      } else {
       next={...current,nextRunAt:now+current.pollMs,lastError:error instanceof Error?error.message:String(error)};
+      }
     }
     await this.#persistLifecycle(operation,next,nextStatus,now);
     return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus,waiting:next.nextRunAt>now};
   }
 
-  async markDeletionVerified(id: string): Promise<void> {
+  async beginDeletion(id:string):Promise<void> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
-    if(!operation || operation.status!=="deleting" || current?.phase!=="ready_for_delete")
-      throw new Error("Erasure is not ready for post-deletion verification");
+    if(!operation||operation.status!=="deleting"||current?.phase!=="ready_for_delete")
+      throw new Error("Erasure operation is no longer at the deletion gate");
+    await this.assertReadyForDelete(id);
     const now=Date.now();
-    const result=await this.#worker().verifyDeletion(operation);
-    if(!result.providersAbsent || !result.stateAbsent) throw new Error("Deletion postflight readback is not clear; retain the profile fence");
-    const next=this.#advance(operation.operationId,current,"restore_mappings",now,"providerDeletionVerified");
-    await this.#persistLifecycle(operation,next,"verifying",now);
+    const next=this.#advance(operation.operationId,current,"delete",now,"deletionStarted");
+    next.deletionProgress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:now};
+    await this.#persistLifecycle(operation,next,"deleting",now);
   }
 
   async assertReadyForDelete(id: string): Promise<void> {
@@ -366,6 +426,7 @@ export class ErasureOperationStore {
       || !operation.confirmationId || operation.confirmationFingerprint!==operation.previewFingerprint
       || operation.previewFingerprint!==erasurePreviewFingerprint(operation)
       || operation.previewFingerprint!==erasurePreviewFingerprint(freshSnapshot)
+      || Boolean(freshSnapshot.blockers?.length)
       || !mappingsStillDisabled || fenceState.fence?.operationId!==operation.operationId || fenceState.leases.length!==0
       || !validReceipts || times.some((time,index)=>!Number.isFinite(time)
         || (index>0 && (time as number)<(times[index-1] as number)))
@@ -412,7 +473,8 @@ export class ErasureOperationStore {
       "install_fence->wait_worker_timeout":"fenceInstalled",
       "wait_worker_timeout->drain_after_timeout":"workerTimeoutElapsed",
       "drain_after_timeout->ready_for_delete":"postTimeoutDrain",
-      "ready_for_delete->restore_mappings":"providerDeletionVerified",
+      "ready_for_delete->delete":"deletionStarted",
+      "verify_deletion->restore_mappings":"providerDeletionVerified",
       "confirm_restored->release_fence":"mappingsRestored",
       "release_fence->complete":"fenceReleased",
     } as Partial<Record<string,FencedEvidenceKey>>)[`${current.phase}->${candidate.phase}`];
@@ -432,9 +494,20 @@ export class ErasureOperationStore {
       &&candidate.phase==="ready_for_delete"&&nextStatus==="deleting";
     const validSuccess=operation.status==="verifying"&&current.phase==="release_fence"
       &&candidate.phase==="complete"&&nextStatus==="succeeded";
-    const validVerify=operation.status==="deleting"&&current.phase==="ready_for_delete"
+    const validVerify=operation.status==="deleting"&&current.phase==="verify_deletion"
       &&candidate.phase==="restore_mappings"&&nextStatus==="verifying";
-    if(nextStatus!==operation.status&&!validDelete&&!validSuccess&&!validVerify) throw new Error("Invalid lifecycle operation status transition");
+    const validReview=operation.status==="deleting"&&nextStatus==="review_required"
+      &&["ready_for_delete","delete","verify_deletion"].includes(current.phase);
+    if(nextStatus!==operation.status&&!validDelete&&!validSuccess&&!validVerify&&!validReview) throw new Error("Invalid lifecycle operation status transition");
+    if(current.phase==="delete") {
+      const before=current.deletionProgress||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:0};
+      const after=candidate.deletionProgress;
+      const rank={comments:0,todoist:1,calendar:2,state:3,verify:4} as const;
+      if(!after||after.startedAt!==before.startedAt||rank[after.stage]<rank[before.stage]
+        ||after.commentIndex<before.commentIndex||after.stateIndex<before.stateIndex
+        ||after.commentIndex>operation.actionPlan.comments.length||after.stateIndex>operation.inventory.length)
+        throw new Error("Deletion progress must advance monotonically within the confirmed inventory");
+    }
     if(candidate.nextRunAt<now) throw new Error("Durable next-run time cannot be backdated");
     if(candidate.phase==="wait_worker_timeout"&&candidate.nextRunAt!==
       (candidate.evidence.fenceInstalled?.completedAt??0)+candidate.timeoutSeconds*1000+2000)
@@ -445,6 +518,22 @@ export class ErasureOperationStore {
       ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":expected":operation.status,
         ":next":nextStatus,":phase":current.phase,":lifecycle":candidate,":updatedAt":new Date(now).toISOString(),
         ":fingerprint":operation.previewFingerprint}}));
+  }
+
+  async #finishAndEraseOperation(operation:ErasureOperation):Promise<void> {
+    const fence=await this.#worker().inspectFence(operation.profile);
+    if(fence.fence?.operationId!==operation.operationId||fence.leases.length)
+      throw new ErasureGateDriftError();
+    await this.db.send(new TransactWriteCommand({TransactItems:[
+      {Delete:{TableName:stateTable(),Key:operationKey(operation.operationId),
+        ConditionExpression:"#status=:verifying AND lifecycle.#phase=:release AND previewFingerprint=:fingerprint",
+        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":verifying":"verifying",":release":"release_fence",":fingerprint":operation.previewFingerprint}}},
+      {Delete:{TableName:stateTable(),Key:confirmationKey(operation.operationId),
+        ConditionExpression:"#status=:consumed AND operationId=:operationId",
+        ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":consumed":"consumed",":operationId":operation.operationId}}},
+      {Delete:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"FENCE"},
+        ConditionExpression:"operationId=:operationId",ExpressionAttributeValues:{":operationId":operation.operationId}}},
+    ]}));
   }
 }
 

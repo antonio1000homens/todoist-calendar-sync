@@ -7,6 +7,7 @@ const operation={operationId:"op",profile:"home",target:{taskId:"task",deleteCal
   status:"previewed",createdAt:"2026-10-23T00:00:00Z",updatedAt:"2026-10-23T00:00:00Z"};
 const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
+  actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},comments:[]},
   inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row-v1",classification:"selected"}]};
 const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
@@ -105,8 +106,9 @@ test("worker adapters are bound at construction and request arguments cannot rep
     inspectFence:async()=>({fence,leases}),
     readMappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
     readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
-      providerSnapshotFingerprint:db.item.providerSnapshotFingerprint,inventory:db.item.inventory}),
+      providerSnapshotFingerprint:db.item.providerSnapshotFingerprint,inventory:db.item.inventory,actionPlan:db.item.actionPlan}),
     verifyDeletion:async()=>deletionReadback,
+    executeDeletionStep:async(_operation,progress)=>({complete:true,progress:{...progress,stage:"state",stateIndex:0}}),
     beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
     restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
       for(const id of ids)states.set(id,"Enabled");},
@@ -154,7 +156,7 @@ test("worker adapters are bound at construction and request arguments cannot rep
     now=db.item.lifecycle.nextRunAt;leases=[];result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"ready_for_delete");assert.equal(db.item.status,"deleting");
 
-    snapshotOverride={profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
+    snapshotOverride={profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,actionPlan:db.item.actionPlan,
       inventory:[{...db.item.inventory[0],digest:"changed"}]};
     await assert.rejects(store.assertReadyForDelete("op",attacker),/not ready/);
     snapshotOverride=undefined;
@@ -170,10 +172,12 @@ test("worker adapters are bound at construction and request arguments cannot rep
     await store.assertReadyForDelete("op",attacker);
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified,undefined);
     await assert.rejects(store.transition("op","deleting","verifying"),/Fenced lifecycle status transitions/);
-    await assert.rejects(store.markDeletionVerified("op",attacker),/readback is not clear/);
-    assert.equal(db.item.lifecycle.phase,"ready_for_delete");
+    await store.beginDeletion("op");
+    assert.equal(db.item.lifecycle.phase,"delete");
     deletionReadback={providersAbsent:true,stateAbsent:true};
-    await store.markDeletionVerified("op",attacker);
+    result=await store.advanceFencedLifecycle("op",attacker);
+    assert.equal(result.phase,"verify_deletion");
+    await store.advanceFencedLifecycle("op",attacker);
     assert.equal(db.item.lifecycle.phase,"restore_mappings");assert.equal(db.item.status,"verifying");
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified.operationId,"op");
 
@@ -183,8 +187,8 @@ test("worker adapters are bound at construction and request arguments cannot rep
     assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"release_fence");
     db.send=async command=>{
       if(command.constructor.name.includes("Get"))return {Item:db.item};
-      if(command.constructor.name.includes("Update")&&failSaveAfterRelease&&command.input.ExpressionAttributeValues[":lifecycle"]?.phase==="complete"){
-        failSaveAfterRelease=false;throw new Error("simulated process crash after fence release");
+      if(command.constructor.name.includes("TransactWrite")&&failSaveAfterRelease){
+        failSaveAfterRelease=false;throw new Error("simulated process crash before atomic operation cleanup");
       }
       if(command.constructor.name.includes("Update")){
         const values=command.input.ExpressionAttributeValues;
@@ -192,12 +196,14 @@ test("worker adapters are bound at construction and request arguments cannot rep
       }
       return {};
     };
-    await assert.rejects(store.advanceFencedLifecycle("op",attacker),/simulated process crash/);
-    assert.equal(db.item.lifecycle.phase,"release_fence","failed persistence leaves durable phase unchanged");
+    result=await store.advanceFencedLifecycle("op",attacker);
+    assert.equal(result.phase,"release_fence");
+    assert.match(db.item.lifecycle.lastError,/simulated process crash/);
+    assert.equal(db.item.lifecycle.phase,"release_fence","failed atomic cleanup leaves durable phase unchanged");
     now=db.item.lifecycle.nextRunAt;result=await store.advanceFencedLifecycle("op",attacker);
-    assert.equal(result.phase,"complete");assert.equal(db.item.status,"succeeded");
-    assert.equal(events.filter(event=>event[0]==="finish").length,1,"retry accepts an already-released fence");
-    assert.ok(!events.some(event=>event[0]==="delete"),"lifecycle does not perform provider deletion");
+    assert.equal(result.phase,"complete");assert.equal(result.status,"succeeded");
+    assert.equal(events.filter(event=>event[0]==="finish").length,0,"the fence is removed atomically with operation cleanup");
+    assert.ok(!events.some(event=>event[0]==="delete"),"provider deletion is delegated to the bound deletion adapter");
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
 
@@ -249,7 +255,7 @@ test("trusted clock controls confirmation issue and consume; caller timestamps c
   const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const issued=await store.issueConfirmation({operationId:"op",...preview},5000);
-    const complete={operationId:"op",...preview,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:false,status:"previewed",createdAt:"now",updatedAt:"now"};
+    const complete={operationId:"op",...preview,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:true,status:"previewed",createdAt:"now",updatedAt:"now"};
     assert.equal(confirmations.get("ERASURE_CONFIRMATION#op").createdAt,new Date(now).toISOString());
     now=7000;
     await assert.rejects(store.create(complete,1),/transaction condition failed/);
@@ -278,7 +284,7 @@ test("durable operation store digests immutable preview content and atomically c
   const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const source={operationId:"op",...preview};const issued=await store.issueConfirmation(source);
-    const complete={...source,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:false,status:"previewed",createdAt:"now",updatedAt:"now"};
+    const complete={...source,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:true,status:"previewed",createdAt:"now",updatedAt:"now"};
     assert.equal(issued.previewFingerprint,erasurePreviewFingerprint(source));
     await assert.rejects(store.create({...complete,target:{...complete.target,taskId:"other-task"}}),/Invalid erasure operation preview/);
     await assert.rejects(store.create({...complete,inventory:[{...complete.inventory[0],digest:"row-v2"}]}),/Invalid erasure operation preview/);

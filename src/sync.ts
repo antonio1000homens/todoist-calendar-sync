@@ -50,7 +50,7 @@ export function calendarResourceAlreadyDeleted(error: unknown): boolean {
  * resource, even when Google omits the structured "deleted" reason. Never use
  * this for events.list / expired sync tokens, or for an unverified DELETE.
  */
-function calendarEventGoneOnDirectRead(error: unknown): boolean {
+export function calendarEventGoneOnDirectRead(error: unknown): boolean {
   if (calendarResourceAlreadyDeleted(error)) return true;
   const provider = error as { status?: number; body?: string };
   if (Number(provider.status) !== 410) return false;
