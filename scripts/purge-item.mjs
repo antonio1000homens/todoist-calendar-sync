@@ -16,6 +16,7 @@ import { profiles } from "../dist/config.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "../dist/mapping-comments.js";
 import { beginErasureFence, finishErasureProtocol, inspectErasureFence } from "../dist/erasure-protocol.js";
+import { enterFencedErasure, finishFencedErasure } from "../dist/erasure-executor.js";
 import { restoreMappings } from "./erasure-mappings.mjs";
 import { fingerprint, planPurge, publicInventoryRecord } from "./item-purge-policy.mjs";
 
@@ -280,14 +281,8 @@ try {
   // Disable the SQS event source before fencing. An already-running worker
   // drains normally; a racing direct invocation is serialized by the fence
   // transaction and remains visible as a writer lease until its finally block.
-  await disableWorkerMappings(currentMappings);
-  await waitForLeaseDrain();
-  await beginErasureFence(profile,operationId);
-  // The fence covers protocol-aware executions. This wait also lets any
-  // invocation that started before the deployment marker was checked reach
-  // Lambda's hard timeout before provider deletion begins.
-  await sleep((deployment.timeoutSeconds * 1000) + 2000);
-  await waitForLeaseDrain();
+  await enterFencedErasure({profile,operationId,mappings:currentMappings,timeoutSeconds:deployment.timeoutSeconds,
+    disableMappings:disableWorkerMappings,waitForLeaseDrain,beginFence:beginErasureFence,pause:sleep});
   // Explicit second fresh read at action time. No changes are permitted between
   // the displayed preview and the first provider mutation.
   const [secondScan, secondProvider] = await Promise.all([scan(),providers()]);
@@ -359,8 +354,8 @@ try {
     }
     // Restore under the retained fence and journal. If this fails or the final
     // transaction response is lost, a retry still knows the original UUIDs.
-    await restoreWorkerMappings(enabledMappings);
-    await finishErasureProtocol(profile,operationId,journalKey);
+    await finishFencedErasure({enabledMappingIds:enabledMappings,restoreMappings:restoreWorkerMappings,
+      finishFence:()=>finishErasureProtocol(profile,operationId,journalKey)});
     output({status:"succeeded",deletedProvider:result.deletedProvider,alreadyAbsent:result.alreadyAbsent,deletedComments:result.deletedComments,deletedState:result.deletedState,
       retainedPerItemOperationRecord:false,workerMappingsRestored:enabledMappings.length});
   } catch (error) {
