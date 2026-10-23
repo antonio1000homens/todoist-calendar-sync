@@ -45,10 +45,7 @@ export function auditExpiresAt(nowMs = Date.now()): number {
  * provider state remains unresolved. Their CloudWatch observations are never deduplicated. */
 const DEDUPED_CONFLICT_ACTIONS = new Set([
   "todoist_snapshot_reconcile_unmapped_conflict",
-  "todoist_snapshot_reconcile_unmapped_ambiguous",
   "todoist_snapshot_reconcile_cancelled_projection_blocked",
-  "calendar_snapshot_recurring_identity_conflict",
-  "calendar_task_link_ambiguous_conflict",
 ]);
 
 export function retainedConflictEntity(detail: Record<string, unknown>): string | undefined {
@@ -61,6 +58,14 @@ export function retainedConflictEntity(detail: Record<string, unknown>): string 
 
 export function retainedConflictIdentity(action: string, detail: Record<string, unknown>): string | undefined {
   if (!DEDUPED_CONFLICT_ACTIONS.has(action) || !retainedConflictEntity(detail)) return undefined;
+  // Only collapse observations when the producer supplies provider versions
+  // for both sides. Candidate-only conflicts do not have revision data, so
+  // their identity is not strong enough to distinguish changed state.
+  if (typeof detail.taskUpdatedAt !== "string" || !detail.taskUpdatedAt
+    || (typeof detail.calendarUpdatedAt !== "string" || !detail.calendarUpdatedAt)
+      && (typeof detail.calendarEtag !== "string" || !detail.calendarEtag)) return undefined;
+  if (action === "todoist_snapshot_reconcile_unmapped_conflict"
+    && (!Array.isArray(detail.mismatchCategories) || detail.mismatchCategories.length === 0)) return undefined;
   const ids = (field: string): string[] => Array.isArray(detail[field])
     ? [...new Set((detail[field] as unknown[]).filter((value): value is string => typeof value === "string" && value.length > 0 && value.length <= 10_000 && /^[A-Za-z0-9_.-]+$/.test(value)))].sort()
     : [];
@@ -73,6 +78,10 @@ export function retainedConflictIdentity(action: string, detail: Record<string, 
     eventId: typeof detail.eventId === "string" ? detail.eventId : "",
     seriesId: typeof detail.seriesId === "string" ? detail.seriesId : "",
     calendarStatus: typeof detail.calendarStatus === "string" ? detail.calendarStatus : "",
+    tombstoneReason: typeof detail.tombstoneReason === "string" ? detail.tombstoneReason : "",
+    taskUpdatedAt: typeof detail.taskUpdatedAt === "string" ? detail.taskUpdatedAt : "",
+    calendarUpdatedAt: typeof detail.calendarUpdatedAt === "string" ? detail.calendarUpdatedAt : "",
+    calendarEtag: typeof detail.calendarEtag === "string" ? detail.calendarEtag : "",
     mismatchCategories: categories,
     candidateEventIds: ids("candidateEventIds"),
     candidateTaskIds: ids("candidateTaskIds"),

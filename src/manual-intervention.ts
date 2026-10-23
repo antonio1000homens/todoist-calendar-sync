@@ -18,9 +18,10 @@ import { normalizedText } from "./security.js";
 import { deleteMappingComments } from "./mapping-comments.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit, type FutureSeriesSplitPlan } from "./recurrence-split.js";
+import { retainedConflictIdentity } from "./audit-policy.js";
 
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
-import { ReviewStore } from "./review-store.js";
+import { ReviewStore, reviewHash } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -1134,7 +1135,10 @@ export class ManualInterventionService {
     if (mode === "prompt" && contextEnricher) {
       // Avoid provider reads for disabled/observe/auto policies and repeated deterministic decisions.
       const existing = await this.store.get(key.decisionId);
-      if (existing) return { decision: existing, mode };
+      if (existing) {
+        if (typeof existing.context?.conflictKey === "string") await new ReviewStore().observeDecision(existing);
+        return { decision: existing, mode };
+      }
       try {
         decisionContext = { ...context, ...await contextEnricher() };
       } catch (error) {
@@ -1396,6 +1400,8 @@ export class ManualInterventionService {
     }
 
     const recurringConflict = type === "todoist_unmapped_conflict" || type === "todoist_cancelled_projection_blocked";
+    const conflictIdentity = retainedConflictIdentity(action, detail);
+    const conflictKey = conflictIdentity ? reviewHash(conflictIdentity) : undefined;
     const candidateEventIds = Array.isArray(detail.candidateEventIds)
       ? [...new Set(detail.candidateEventIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
       : [];
@@ -1408,7 +1414,7 @@ export class ManualInterventionService {
       profile,
       type,
       recurringConflict
-        ? { taskId, eventId, seriesId, category: type, candidateEventIds, candidateTaskIds }
+        ? { taskId, eventId, seriesId, category: type, candidateEventIds, candidateTaskIds, conflictKey }
         : { action, eventId, taskId, seriesId, detail },
       {
         sourceDeliveryId: delivery.id,
@@ -1419,7 +1425,7 @@ export class ManualInterventionService {
         masterEventId: typeof detail.masterEventId === "string" ? detail.masterEventId : undefined,
         activeInstanceId: typeof detail.activeInstanceId === "string" ? detail.activeInstanceId : undefined,
       },
-      context,
+      { ...context, ...(conflictKey ? { conflictKey } : {}) },
       canEnrichConflict
         ? async () => {
             const pair = await this.providerClients(profile);

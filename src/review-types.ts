@@ -9,6 +9,8 @@ export interface ReviewCase {
   id: string; profile: Profile; title: string; reason: string;
   status: "open" | "dismissed" | "repairing" | "resolved" | "excluded";
   decision?: ManualDecision; taskId?: string; eventId?: string;
+  /** Hash of the active provider-pair conflict state used to coalesce audit and decision cases. */
+  conflictKey?: string; sourceAuditKey?: string; coalescedInto?: string;
   createdAt: string; updatedAt: string; operationId?: string; result?: string;
   reconciliationGeneration?: string;
   progressCheckpoint?: { phase?: "mapped" | "unmapped" | "calendar"; sequence?: number; deliveryId?: string;

@@ -3,6 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
+import { retainedConflictIdentity } from "./audit-policy.js";
 import { entityKey, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
@@ -20,7 +21,13 @@ export class ReviewStore {
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const id = decision.decisionId, existing = await this.getCase(id);
-    if (existing) return;
+    const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
+    if (existing) {
+      if (existing.status === "open" && conflictKey && existing.conflictKey === conflictKey) {
+        await this.coalesceConflictIncidents(existing.profile, conflictKey, id);
+      }
+      return;
+    }
     const context = decision.context || {};
     const item: ReviewCase = {
       id, profile: decision.profile, title: decision.type.replaceAll("_", " "), reason: decision.sourceAuditAction || decision.type,
@@ -29,14 +36,27 @@ export class ReviewStore {
         : "open",
       decision, taskId: decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined),
       eventId: decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined),
+      conflictKey,
       reconciliationGeneration: typeof context.reconciliationGeneration === "string" ? context.reconciliationGeneration : undefined,
       progressCheckpoint: context.progressCheckpoint && typeof context.progressCheckpoint === "object"
         ? context.progressCheckpoint as ReviewCase["progressCheckpoint"] : undefined,
       createdAt: decision.createdAt, updatedAt: new Date().toISOString(),
     };
+    let winner: ReviewCase | undefined = item;
     try { await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
       lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "open" ? "OPEN" : "CLOSED"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
-    catch (e) { if (!conditional(e)) throw e; }
+    catch (e) {
+      if (!conditional(e)) throw e;
+      // A competing writer may have stored a terminal case or a different
+      // identity under this deterministic decision id. Never coalesce from
+      // our stale local copy after losing the conditional put.
+      winner = await this.getCase(id);
+      if (!winner) throw new Error("Review case disappeared after a conditional write conflict");
+    }
+    const winnerKey = typeof winner.conflictKey === "string" ? winner.conflictKey : undefined;
+    if (winner.status === "open" && conflictKey && winnerKey === conflictKey) {
+      await this.coalesceConflictIncidents(winner.profile, winnerKey, id);
+    }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
@@ -49,11 +69,81 @@ export class ReviewStore {
       status: "open", taskId: typeof detail.taskId === "string" ? detail.taskId : undefined,
       eventId: typeof detail.eventId === "string" ? detail.eventId : undefined,
       createdAt, updatedAt: new Date().toISOString(),
+      conflictKey: reviewHash(fingerprint),
     };
     try {
       await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`), sourceAuditKey: auditKey,
         lookupPk: `PROFILE#${profile}`, lookupSk: `REVIEW#OPEN#${createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" }));
     } catch (error) { if (!conditional(error)) throw error; }
+    const stored = await this.getCase(id);
+    if (stored?.status === "open" && stored.sourceAuditKey === auditKey
+      && (!stored.conflictKey || stored.conflictKey === item.conflictKey)) {
+      if (!stored.conflictKey) {
+        try {
+          await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${id}`),
+            UpdateExpression: "SET conflictKey = :conflictKey",
+            ConditionExpression: "#s = :open AND attribute_not_exists(conflictKey) AND sourceAuditKey = :auditKey",
+            ExpressionAttributeNames: { "#s": "status" },
+            ExpressionAttributeValues: { ":open": "open", ":auditKey": auditKey, ":conflictKey": item.conflictKey } }));
+        } catch (error) { if (!conditional(error)) throw error; }
+      }
+      // This base-table row is the strongly consistent lookup path used during
+      // coalescing; it avoids depending on immediate GSI propagation.
+      await this.db.send(new PutCommand({ TableName: reviewTable(), Item: {
+        pk: `REVIEW_CONFLICT#${profile}#${item.conflictKey}`, sk: `INCIDENT#${id}`,
+        incidentId: id, profile, conflictKey: item.conflictKey,
+      } }));
+    }
+  }
+  private async coalesceConflictIncidents(profile: Profile, conflictKey: string, keeperId: string): Promise<void> {
+    const incidents: ReviewCase[] = [];
+    const page = await this.db.send(new QueryCommand({ TableName: reviewTable(),
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": `REVIEW_CONFLICT#${profile}#${conflictKey}`, ":prefix": "INCIDENT#" },
+      ConsistentRead: true }));
+    for (const pointer of (page.Items || []) as Array<{ incidentId?: string }>) {
+      if (!pointer.incidentId) continue;
+      const candidate = await this.getCase(pointer.incidentId);
+      if (candidate?.status === "open" && candidate.conflictKey === conflictKey) incidents.push(candidate);
+    }
+    // One-time migration path for old rows that predate the durable pointer.
+    // If GSI propagation lags, a later observeDecision retries this lookup;
+    // newly written incidents never depend on that GSI.
+    if (!incidents.length) {
+      const legacyPage = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
+        KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)",
+        ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": "REVIEW#OPEN#" }, Limit: 50 }));
+      for (const candidate of (legacyPage.Items || []) as ReviewCase[]) {
+        if (!candidate.id.startsWith("incident-") || candidate.conflictKey || !candidate.sourceAuditKey) continue;
+        const audit = await this.get<Record<string, unknown>>(candidate.sourceAuditKey);
+        const detail = audit?.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : undefined;
+        const action = typeof audit?.action === "string" ? audit.action : undefined;
+        const identity = action && detail ? retainedConflictIdentity(action, detail) : undefined;
+        if (identity && reviewHash(identity) === conflictKey) incidents.push(candidate);
+      }
+    }
+    for (const candidate of incidents) {
+      try {
+        const condition = candidate.sourceAuditKey
+          ? "#s = :open AND (conflictKey = :conflictKey OR attribute_not_exists(conflictKey)) AND sourceAuditKey = :sourceAuditKey"
+          : "#s = :open AND conflictKey = :conflictKey";
+        const values: Record<string, unknown> = { ":closed": "dismissed", ":open": "open", ":conflictKey": conflictKey,
+          ":result": `Coalesced into review case ${keeperId}`, ":keeper": keeperId, ":now": new Date().toISOString(),
+          ":lookup": `REVIEW#CLOSED#${candidate.createdAt}#${candidate.id}` };
+        if (candidate.sourceAuditKey) values[":sourceAuditKey"] = candidate.sourceAuditKey;
+        await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${candidate.id}`),
+          UpdateExpression: "SET #s = :closed, #r = :result, conflictKey = :conflictKey, coalescedInto = :keeper, updatedAt = :now, lookupSk = :lookup",
+          ConditionExpression: condition,
+          ExpressionAttributeNames: { "#s": "status", "#r": "result" },
+          ExpressionAttributeValues: values }));
+        if (candidate.sourceAuditKey) {
+          await this.db.send(new PutCommand({ TableName: reviewTable(), Item: {
+            pk: `REVIEW_CONFLICT#${profile}#${conflictKey}`, sk: `INCIDENT#${candidate.id}`,
+            incidentId: candidate.id, profile, conflictKey,
+          } }));
+        }
+      } catch (error) { if (!conditional(error)) throw error; }
+    }
   }
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
   async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {

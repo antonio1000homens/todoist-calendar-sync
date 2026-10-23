@@ -560,7 +560,8 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   assert.ok(notifier.updated.at(-1).blocks, 'resolved prompt should offer future policy controls');
 });
 
-test('unmapped conflict creates one stable non-destructive manual decision', async () => {
+test('unmapped conflict creates one stable non-destructive manual decision', async (t) => {
+  t.mock.method(ReviewStore.prototype, 'observeDecision', async () => {});
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
@@ -573,7 +574,8 @@ test('unmapped conflict creates one stable non-destructive manual decision', asy
     new FakePolicyStore(),
   );
   const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-1' };
-  const detail = { taskId: 'task-1', eventId: 'legacy-event' };
+  const detail = { taskId: 'task-1', eventId: 'legacy-event', mismatchCategories:['title_mismatch'],
+    taskUpdatedAt:'2026-09-07T13:59:00.000Z', calendarEtag:'etag-1' };
   await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
   await service.observeAudit({ ...delivery, id: 'reconcile-2' }, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
   assert.equal(notifier.posted.length, 1);
@@ -581,6 +583,7 @@ test('unmapped conflict creates one stable non-destructive manual decision', asy
   assert.equal(decision.type, 'todoist_unmapped_conflict');
   assert.equal(decision.context.taskTitle, 'Renew annually');
   assert.equal(decision.context.todoistRecurring, true);
+  assert.match(decision.context.conflictKey, /^[a-f0-9]{64}$/);
   assert.deepEqual(decision.permittedActions.map((action) => action.id), [
     'use_todoist_recurrence', 'split_future_todoist', 'use_calendar_version', 'keep_separate', 'reconcile_now',
   ]);
