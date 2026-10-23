@@ -91,9 +91,9 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getCalendarProjectionTombstone() { return undefined; },
     async getConsolidatedTask() { return undefined; },
     async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
-    async getMappingByTaskAnyProfile(id) { return clone(mappingMap.get(id)); },
+    async getMappingByTaskAnyProfile(id) { return clone(ownerMappingMap.get(id)); },
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
-    async getMappingByEvent(profile, id) { return clone([...mappingMap.values()].find(value => value.profile === profile && value.eventId === id)); },
+    async getMappingByEvent(profile, id) { return clone(eventMappingMap.get(`${profile}:${id}`)||[...mappingMap.values()].find(value=>value.profile===profile&&value.eventId===id)); },
     async getRecurrenceLink(_profile, id) { return clone(recurrences.get(id)); },
     async getRecurrenceLinkByTaskAnyProfile(id) { return clone([...recurrences.values()].find(value => value.taskId === id)); },
     async listRecurrenceLinks(profile) { return clone([...recurrences.values()].filter(value => value.profile === profile)); },
@@ -128,8 +128,18 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       return true;
     },
     async deleteRecurrenceLink(_profile, id) { recurrences.delete(id); },
-    async putMapping(value) { mappingMap.set(value.taskId, clone(value)); },
+    async putMapping(value) { mappingMap.set(value.taskId, clone(value)); eventMappingMap.set(`${value.profile}:${value.eventId}`,clone(value)); ownerMappingMap.set(value.taskId,clone(value)); },
     async deleteMapping(value) { mappingMap.delete(value.taskId); eventMappingMap.delete(`${value.profile}:${value.eventId}`); ownerMappingMap.delete(value.taskId); },
+    async commitElapsedCalendarHistoryDetach({profile,eventId,taskId,eventMapping,taskMapping,retainedEventMappings=[]}) {
+      const currentEvent=eventMappingMap.get(`${profile}:${eventId}`);
+      if(JSON.stringify(currentEvent||null)!==JSON.stringify(eventMapping||null))return false;
+      if(JSON.stringify(mappingMap.get(taskId)||null)!==JSON.stringify(taskMapping||null)
+        ||JSON.stringify(ownerMappingMap.get(taskId)||null)!==JSON.stringify(taskMapping||null))return false;
+      for(const mapping of retainedEventMappings) if(JSON.stringify(eventMappingMap.get(`${profile}:${mapping.eventId}`)||null)!==JSON.stringify(mapping))return false;
+      eventMappingMap.delete(`${profile}:${eventId}`);
+      if(taskMapping?.eventId===eventId){mappingMap.delete(taskId);ownerMappingMap.delete(taskId);}
+      return true;
+    },
     async mutationAllowed() { return true; },
     async recordMutation() {},
     async deleteCalendarProjectionTombstone() {},
@@ -278,6 +288,46 @@ function moveHarness(t,{existing=true}={}) {
   const execute=async()=>{const preview=await engine.preview(actor,input);h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});return engine.execute("repair");};
   return {...h,engine,execute,input,destination,destinationEvents};
 }
+
+test("elapsed Calendar history repair removes only the old event link and preserves the future task indexes",async t=>{
+  const oldMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const futureMapping={profile:"home",taskId:"task",eventId:"future",updatedAt:"2026-10-02T00:00:00Z"};
+  const oldEvent=event("elapsed",{summary:"Vehicle tax",start:{date:"2025-05-02"},end:{date:"2025-05-03"},
+    extendedProperties:{shared:{taskId:"task",taskUrl:"https://todoist.example/task",syncSource:"todoist-calendar-sync",custom:"keep"}}});
+  const future=event("future",{summary:"Vehicle tax",start:{date:"2099-05-02"},end:{date:"2099-05-03"},
+    extendedProperties:{shared:{taskId:"task",taskUrl:"https://todoist.example/task",syncSource:"todoist-calendar-sync"}}});
+  const h=harness(t,{events:[oldEvent,future],tasks:[task("task",{content:"Vehicle tax",due:{date:"2099-05-02"}})],mappings:[oldMapping,futureMapping]});
+  const input=intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed",scope:"future"});
+  const preview=await h.engine.preview(actor,input);
+  assert.equal(preview.elapsedCalendarHistoryPlan.eventId,"elapsed");
+  assert.equal(preview.elapsedCalendarHistoryPlan.retainedTaskMapping.eventId,"future");
+  assert.ok(preview.changes.some(change=>change.includes("Retain exact current/future mapping")&&change.includes("future")));
+  assert.ok(preview.itemPlan.find(item=>item.ref.id==="future").result.includes("unchanged"));
+
+  const result=await h.execute(input);
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.eventMap.get("elapsed").status,"confirmed");
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.syncHistoryOnly,"true");
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.taskId,undefined);
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.taskUrl,undefined);
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.custom,"keep");
+  assert.equal(h.eventMappingMap.has("home:elapsed"),false);
+  assert.equal(h.eventMappingMap.get("home:future").eventId,"future");
+  assert.equal(h.mappingMap.get("task").eventId,"future");
+  assert.equal(h.ownerMappingMap.get("task").eventId,"future");
+  assert.deepEqual(h.writes,[ ["event","elapsed"] ]);
+});
+
+test("elapsed Calendar history preview fails closed when task and owner indexes disagree",async t=>{
+  const oldMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const futureMapping={profile:"home",taskId:"task",eventId:"future",updatedAt:"2026-10-02T00:00:00Z"};
+  const h=harness(t,{events:[event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},extendedProperties:{shared:{taskId:"task"}}}),
+      event("future",{start:{date:"2099-05-02"},end:{date:"2099-05-03"},extendedProperties:{shared:{taskId:"task"}}})],
+    tasks:[task("task")],mappings:[oldMapping,futureMapping]});
+  h.ownerMappingMap.set("task",{...futureMapping,updatedAt:"2026-10-03T00:00:00Z"});
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/mapping indexes disagree/);
+  assert.deepEqual(h.writes,[]);
+});
 
 test("a move previews, claims, and verifies its existing destination Calendar projection",async t=>{
   const h=moveHarness(t),preview=await h.engine.preview(actor,h.input);
@@ -958,7 +1008,8 @@ test("fresh preview supersedes a failed selected-pair mismatch only when validat
     error:"Selected pair does not match the current mapping; expected Calendar event old-event",
     preview:oldPreview,notificationPending:false};
   h.operations.set(oldOperation.id,clone(oldOperation));
-  h.mappingMap.set("task",{profile:"home",taskId:"task",eventId:"current"});
+  const currentMapping={profile:"home",taskId:"task",eventId:"current"};
+  h.mappingMap.set("task",currentMapping);h.ownerMappingMap.set("task",currentMapping);h.eventMappingMap.set("home:current",currentMapping);
   for(const snapshot of oldPreview.snapshots)h.controlsMap.set(refKey(snapshot.ref),{...snapshot.control,activeRepair:oldOperation.id});
 
   const fresh=await h.engine.preview(actor,intent({eventId:"current"}));

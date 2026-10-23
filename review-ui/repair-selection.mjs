@@ -142,6 +142,7 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
     case "verify": return hasTask && hasEvent;
     case "create": return hasTask !== hasEvent;
     case "move": return hasTask;
+    case "calendar-history-only": return hasEvent;
     case "decision": return Boolean(decisionAction) && (hasTask || hasEvent);
     case "separate":
     case "exclude": return hasTask || hasEvent;
