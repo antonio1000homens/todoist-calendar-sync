@@ -553,6 +553,9 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
     failure: error instanceof Error ? error.message : String(error),
     deliveryId: delivery.id,
   };
+  // Keep the durable repair reference on the incident. The operation itself is
+  // loaded by the review API; never copy its plan or provider payload here.
+  if (delivery.kind === "repair" && delivery.repair?.operationId) context.repairOperationId = delivery.repair.operationId;
   // Keep the provider identifiers from the failed delivery itself. Provider
   // errors often omit these, even though the queued webhook has them.
   if (delivery.orphan) {

@@ -97,6 +97,9 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   const operation={id:"operation-1",preview,actor:preview.actor,status:"queued",steps:{},notificationPending:false};
   t.mock.method(ReviewStore.prototype,"listCases",async profile=>({items:profile==="home"?[caseItem]:[],cursor:undefined}));
   t.mock.method(ReviewStore.prototype,"getCase",async id=>id==="case-1"?caseItem:undefined);
+  const getOperationMock=t.mock.method(ReviewStore.prototype,"getOperation",async id=>id==="dlq-operation"?{
+    id,preview:{id:"dlq-preview",intent:{caseId:"case-1",profile:"home",action:"link",taskId:"dlq-task",eventId:"dlq-event"},itemPlan:[{ref:{profile:"home",side:"todoist",id:"dlq-task"},operation:"retain",result:"linked"}]},status:"failed",
+  }:undefined);
   const caseUpdates=[];
   t.mock.method(ReviewStore.prototype,"updateCase",async(...args)=>{caseUpdates.push(args);});
   const previewWithValidation = ReviewEngine.prototype.preview;
@@ -111,6 +114,11 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
     {ref:{profile:"home",side:"todoist",id:"task-1"},object:{id:"task-1",content:"Test task",project_id:"test-home-project"}},
     {ref:{profile:"home",side:"calendar",id:"cancelled-event"},object:{id:"cancelled-event",summary:"Cancelled event",status:"cancelled"}},
   ] : ["occurrence","series-master"].includes(intent.eventId) ? recurringSnapshots : []);
+  const collectMock=ReviewEngine.prototype.collect;
+  t.mock.method(ReviewEngine.prototype,"collect",async function(intent,decision){
+    if(intent.taskId==="dlq-task"&&intent.eventId==="dlq-event") return [{ref:{profile:"home",side:"todoist",id:"dlq-task"},object:{id:"dlq-task",content:"Fresh task"}}];
+    return collectMock.call(this,intent,decision);
+  });
   t.mock.method(ReviewEngine.prototype,"preview",async function(actor,intent) {
     return ["cancelled-event","occurrence","series-master"].includes(intent.eventId)
       ? previewWithValidation.call(this,actor,intent)
@@ -126,6 +134,20 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   const inbox = await jsonResponse(await handler(event("/review/api/cases?profile=all","GET",headers)));
   assert.equal(inbox.status,200);
   assert.deepEqual(inbox.body.items.map(item=>item.id),["case-1"]);
+
+  const dlqCase={...caseItem,decision:{type:"operational_dlq",profile:"home",context:{kind:"repair",repairOperationId:"dlq-operation"}}};
+  t.mock.method(ReviewStore.prototype,"getCase",async id=>id==="case-1"?dlqCase:undefined);
+  const hydrated=await jsonResponse(await handler(event("/review/api/cases/case-1","GET",headers)));
+  assert.equal(hydrated.status,200,JSON.stringify(hydrated.body));
+  assert.equal(hydrated.body.item.repairContext.operationId,"dlq-operation");
+  assert.equal(hydrated.body.snapshots[0].object.content,"Fresh task");
+  for(const bad of [undefined,{id:"dlq-operation",status:"failed",preview:{id:"p",intent:{caseId:"other",profile:"home"}}},{id:"dlq-operation",status:"failed",preview:{id:"p",intent:{caseId:"case-1",profile:"work"}}}]){
+    getOperationMock.mock.mockImplementation(async()=>bad);
+    const rejected=await jsonResponse(await handler(event("/review/api/cases/case-1","GET",headers)));
+    assert.equal(rejected.status,409);
+    assert.match(rejected.body.error,/does not match|unavailable/);
+  }
+  getOperationMock.mock.mockImplementation(async id=>id==="dlq-operation"?{id,preview:{id:"dlq-preview",intent:{caseId:"case-1",profile:"home",action:"link",taskId:"dlq-task",eventId:"dlq-event"},itemPlan:[]},status:"failed"}:undefined);
 
   const previewResult = await jsonResponse(await handler(event("/review/api/cases/case-1/previews","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",

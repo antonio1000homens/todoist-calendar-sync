@@ -250,6 +250,14 @@ export class ReviewEngine {
       changes.push(`Move task to ${intent.targetProfile}; apply existing project-transition rules to its Calendar projection`);
       warnings.push("The source projection follows the existing project-move lifecycle, shown as displaced below.");
     } else if (intent.action === "link") {
+      // Calendar occurrence projections are date-only. Applying one to an
+      // existing recurring Todoist task can move its due date to that
+      // occurrence and alter the recurring schedule. Refuse this occurrence
+      // repair until it can preserve the Todoist recurrence anchor.
+      if (task?.due?.is_recurring && !preview.annualPlan && intent.owner === "calendar"
+        && event?.recurringEventId) {
+        invalidRepairIntent("Cannot link a recurring Todoist task to a Calendar-owned series: this repair would replace its recurrence with a one-off due date. Preserve Todoist recurrence ownership or use a recurrence-preserving repair.");
+      }
       if (intent.winner === "none" && !preview.annualPlan && !hasCanonicalState(event!, task!)) invalidRepairIntent("Fields differ: choose Todoist or Calendar as the source");
       if (event?.recurringEventId && intent.scope !== "occurrence") invalidRepairIntent("Choose the Calendar master to repair a whole series");
       if (event?.recurrence?.length) {

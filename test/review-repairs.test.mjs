@@ -431,6 +431,18 @@ test("rebinding a Calendar master clears rejection of the persisted task/instanc
   assert.deepEqual(result.verified, [{ profile: "home", taskId: "task", eventId: "active" }]);
 });
 
+test("preview blocks linking a yearly Todoist task to a Calendar-owned yearly occurrence", async (t) => {
+  const fixture = seriesFixture();
+  fixture.events[0] = { ...fixture.events[0], recurrence: ["RRULE:FREQ=YEARLY"], start: { date: "2027-05-02" } };
+  fixture.events[1] = { ...fixture.events[1], start: { date: "2027-05-02" },
+    originalStartTime: { date: "2027-05-02" } };
+  const yearlyTask = task("task", { due: { date: "2027-05-02", string: "every year", is_recurring: true } });
+  const h = harness(t, { events: fixture.events, tasks: [yearlyTask] });
+  const input = intent({ eventId: "active", owner: "calendar", winner: "todoist", scope: "occurrence" });
+  await assert.rejects(h.engine.preview(actor, input), /replace its recurrence with a one-off due date/);
+  assert.deepEqual(h.writes, []);
+});
+
 test("counterpart creation from the active occurrence preserves Calendar ownership and its master", async (t) => {
   const fixture = seriesFixture();
   const h = harness(t, { events: fixture.events, tasks: [] });
@@ -963,6 +975,40 @@ test("same-date yearly standalone becomes its existing master rather than a seco
   assert.deepEqual(h.eventMap.get("event").recurrence,["RRULE:FREQ=YEARLY"]);
   assert.equal(h.mappingMap.get("task").masterEventId,"event");
   assert.ok(!h.writes.some(w=>w[0]==="create-task" || w[0]==="create-future-master"));
+});
+
+test("car MOT annualization preview shows an exact 2027 RRULE and links the existing task",async t=>{
+  const taskId="68mWcM4gfvVM4fC3", eventId="brhi6mp7np0blm2cmcb3spl8b0";
+  const h=harness(t,{
+    events:[event(eventId,{summary:"car Mot Expiry",description:"Annual vehicle test",
+      start:{date:"2027-02-25"},end:{date:"2027-02-26"}})],
+    tasks:[task(taskId,{content:"car Mot Expiry",description:"Annual vehicle test",
+      due:{date:"2027-02-25",is_recurring:true,string:"every year"}})],
+  });
+  h.clients.calendar.getTimeZone=async()=>"Europe/London";
+  const input=intent({taskId,eventId,owner:"todoist",winner:"todoist",scope:"future"});
+  const preview=await h.engine.preview(actor,input);
+
+  assert.equal(preview.annualPlan.mode,"annualize-in-place");
+  assert.equal(preview.annualPlan.masterId,eventId);
+  assert.equal(preview.annualPlan.start,"2027-02-25");
+  assert.equal(preview.annualPlan.end,"2027-02-26");
+  assert.equal(preview.annualPlan.timeZone,"Europe/London");
+  assert.equal(preview.annualPlan.rule,"RRULE:FREQ=YEARLY");
+  assert.ok(preview.changes.some(change=>change.includes("DTSTART 2027-02-25")
+    && change.includes("RRULE:FREQ=YEARLY") && change.includes("timezone Europe/London")
+    && change.includes(`master ID ${eventId}`)));
+  assert.ok(preview.changes.some(change=>change.includes(`map existing Todoist task ${taskId}`)));
+  assert.deepEqual(h.writes,[]);
+
+  const result=await h.execute(input);
+  assert.equal(result.status,"succeeded",result.error);
+  assert.deepEqual(h.eventMap.get(eventId).recurrence,["RRULE:FREQ=YEARLY"]);
+  assert.equal(h.mappingMap.get(taskId).masterEventId,eventId);
+  assert.equal(h.mappingMap.get(taskId).eventId,eventId);
+  assert.equal(h.mappingMap.get(taskId).activeInstanceId,`${eventId}_instance`);
+  assert.equal(h.taskMap.size,1);
+  assert.ok(!h.writes.some(write=>write[0]==="create-task" || write[0]==="create-future-master"));
 });
 
 test("yearly standalone refuses duplicate mirrors, existing series, unsupported rules and already owned histories before writes",async t=>{
