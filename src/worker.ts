@@ -355,6 +355,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let releaseWriterLease: (() => Promise<void>) | undefined;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
+    let suppressCompletionReceipt = false;
     try {
       delivery = JSON.parse(record.body) as Delivery;
       state = new StateRepository();
@@ -405,7 +406,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         if (delivery.manual.targetType === "task") identityRefs.taskIds.add(delivery.manual.targetId);
         if (delivery.manual.targetType === "event") identityRefs.eventIds.add(delivery.manual.targetId);
       }
-      const markCompleted = () => state!.markDeliveryCompleted(delivery!.id, delivery!.profile, delivery!.kind, {
+      const markCompleted = () => suppressCompletionReceipt ? Promise.resolve() : state!.markDeliveryCompleted(delivery!.id, delivery!.profile, delivery!.kind, {
         taskIds: [...identityRefs.taskIds], eventIds: [...identityRefs.eventIds],
         seriesIds: [...identityRefs.seriesIds], generation: identityRefs.generation,
       });
@@ -425,9 +426,15 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // decisions. Notification failure never suppresses the underlying audit.
       const audit = state.audit.bind(state);
       state.audit = async (profile, action, detail) => {
+        if (action === "todoist_erased_item_replay_suppressed") {
+          suppressCompletionReceipt = true;
+          identityRefs.taskIds.clear();
+          identityRefs.eventIds.clear();
+          identityRefs.seriesIds.clear();
+        }
         collectIdentityRefs(detail);
         await audit(profile, action, detail);
-        if (delivery) await manual?.observeAudit(delivery, profile, action, detail);
+        if (delivery && action !== "todoist_erased_item_replay_suppressed") await manual?.observeAudit(delivery, profile, action, detail);
       };
 
       // A Calendar delta must never advance its incremental cursor past changes

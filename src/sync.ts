@@ -1188,6 +1188,19 @@ export class Synchronizer {
       task = current;
     }
     const existingMapping = await this.state.getMappingByTaskAnyProfile(task.id);
+    const completedHistory = lifecycle.action !== "upsert" && !existingMapping
+      ? await this.state.listCompletedCalendarProjectionsByTask?.(delivery.profile, task.id) || []
+      : [];
+    if (lifecycle.action !== "upsert" && !existingMapping && !completedHistory.length) {
+      try {
+        await (await this.clients(delivery.profile)).todoist.getTask(task.id);
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 404) {
+          return this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+        }
+        throw error;
+      }
+    }
     const controlProfile = existingMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: task.id, eventId: existingMapping?.eventId })) {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });

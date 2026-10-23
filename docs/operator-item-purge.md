@@ -74,10 +74,13 @@ Completed delivery receipts now carry exact task/event/series references
 observed from the delivery and its audit details. The purge deletes receipts
 that reference the selected object. Legacy receipts without identity references
 remain blockers until their normal retention expires. Todoist upsert deliveries
-re-read the exact task before projection; a 404 is recorded as a no-op, so a
-queued or retried webhook cannot recreate a task that has been erased. Calendar
-replay reads current Calendar state through the provider sync token, so a
-deleted object is absent from the fetched delta.
+re-read the exact task before projection; a 404 is suppressed. Unmapped
+completion/deletion deliveries are also suppressed when Todoist confirms a 404
+and no retained completion history exists. These recognized erased-item
+replays produce identity-free audit telemetry and skip completion receipts, so
+they cannot recreate target-identifying DynamoDB rows. Calendar replay reads
+current Calendar state through the provider sync token, so a deleted object is
+absent from the fetched delta.
 
 Run apply only with a fresh preview and the explicit confirmation values:
 

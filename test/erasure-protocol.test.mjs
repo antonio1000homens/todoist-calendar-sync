@@ -5,6 +5,7 @@ import { acquireErasureProtocolLease, beginErasureFence, ErasureFenceActiveError
 import { restoreMappings } from "../scripts/erasure-mappings.mjs";
 import { StateRepository } from "../dist/repository.js";
 import { handler } from "../dist/worker.js";
+import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -197,4 +198,38 @@ test("fence-denied reconcile delivery cannot write failure state without a write
   }
   assert.equal(audit.mock.callCount(), 0);
   assert.equal(complete.mock.callCount(), 0);
+});
+
+test("erased-item webhook replay writes no identity-bearing completion receipt", async (t) => {
+  const originalSend = documentClient.send;
+  const previousVersion = process.env.ERASURE_PROTOCOL_VERSION;
+  const previousTable = process.env.STATE_TABLE_NAME;
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
+  process.env.STATE_TABLE_NAME = "test-state";
+  documentClient.send = async command => {
+    if (command.constructor.name === "GetCommand" && command.input.Key.sk === "EPOCH") return { Item: { epoch: 1 } };
+    return {};
+  };
+  const audit = t.mock.method(StateRepository.prototype, "audit", async () => {});
+  const completed = t.mock.method(StateRepository.prototype, "markDeliveryCompleted", async () => {});
+  t.mock.method(OrphanRecoveringSynchronizer.prototype, "process", async function (delivery) {
+    await this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+  });
+  t.after(() => {
+    documentClient.send = originalSend;
+    if (previousVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION = previousVersion;
+    if (previousTable === undefined) delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME = previousTable;
+  });
+  const delivery = {
+    id: "todoist-webhook-id", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: new Date().toISOString(), headers: {}, erasureEpoch: 1,
+    body: JSON.stringify({ event_name: "item:updated", event_data: { id: "erased-task-id" } }),
+  };
+  const result = await handler({ Records: [{ messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} }] }, { awsRequestId: "request-erased" });
+  assert.deepEqual(result.batchItemFailures, []);
+  assert.equal(audit.mock.callCount(), 1);
+  assert.deepEqual(audit.mock.calls[0].arguments[2], {});
+  assert.equal(completed.mock.callCount(), 0);
 });
