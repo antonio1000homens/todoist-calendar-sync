@@ -22,11 +22,26 @@ for (const argument of process.argv.slice(2)) {
   argumentsMap.set(key, rest.length ? rest.join("=") : true);
 }
 const allowed = new Set(["profile", "task-id", "event-id", "delete-calendar", "apply",
-  "confirm", "confirm-task", "confirm-calendar", "ack-deliveries-quiesced"]);
+  "confirm", "confirm-task", "confirm-calendar", "ack-deliveries-quiesced",
+  "inventory-only", "preserve-task", "protect-event-ids"]);
 for (const name of argumentsMap.keys()) if (!allowed.has(name)) throw new Error("Unknown argument: " + name);
 const stringArg = name => typeof argumentsMap.get(name) === "string" ? argumentsMap.get(name) : undefined;
 const flag = name => argumentsMap.get(name) === true;
 const profile = stringArg("profile"), taskId = stringArg("task-id"), eventId = stringArg("event-id");
+const inventoryOnly = flag("inventory-only");
+const preserveTask = flag("preserve-task");
+const protectedEventIds = (stringArg("protect-event-ids") || "").split(",").filter(Boolean);
+for (const name of ["inventory-only", "preserve-task", "delete-calendar", "apply", "ack-deliveries-quiesced"])
+  if (argumentsMap.has(name) && !flag(name)) throw new Error("--" + name + " is a flag");
+if (argumentsMap.has("protect-event-ids") && (!stringArg("protect-event-ids")
+  || protectedEventIds.some(id => !/^[A-Za-z0-9_.-]{1,1024}$/.test(id))))
+  throw new Error("--protect-event-ids must be a comma-separated list of exact Calendar IDs");
+if (flag("apply") && (preserveTask || protectedEventIds.length))
+  throw new Error("Protected-item inventory is read-only; no destructive executor supports preserved-item selection");
+if (inventoryOnly && flag("apply")) throw new Error("--inventory-only never supports apply");
+if (inventoryOnly && flag("delete-calendar")) throw new Error("--inventory-only cannot request a provider deletion");
+if ((preserveTask || protectedEventIds.length) && !inventoryOnly)
+  throw new Error("--preserve-task and --protect-event-ids require --inventory-only");
 const table = process.env.STATE_TABLE_NAME?.trim();
 if (!table) throw new Error("STATE_TABLE_NAME must be explicitly configured");
 if (!profile || !taskId) throw new Error("--profile and --task-id are required");
@@ -36,7 +51,8 @@ if (argumentsMap.has("apply") && !flag("apply")) throw new Error("--apply is a f
 if (flag("apply") !== Boolean(stringArg("confirm"))) throw new Error("A confirmation token is only valid with --apply");
 if (!flag("apply") && ["confirm-task", "confirm-calendar", "ack-deliveries-quiesced"].some(name => argumentsMap.has(name)))
   throw new Error("Action-time confirmations are only valid with --apply");
-const target = { profile, taskId, ...(eventId ? {eventId} : {}) };
+const target = { profile, taskId, ...(eventId ? {eventId} : {}), ...(preserveTask ? {preserveTask:true} : {}),
+  ...(protectedEventIds.length ? {protectedEventIds} : {}) };
 planPurge([], target); // Validate the exact selectors before any external calls.
 const raw = new DynamoDBClient({ maxAttempts: 5, retryMode: "standard" });
 const db = DynamoDBDocumentClient.from(raw, { marshallOptions: { removeUndefinedValues: true } });
@@ -109,15 +125,15 @@ function providerBlockers(data) {
   if (data.task?.project_id !== undefined && data.task.project_id !== profiles[profile].todoistProjectId)
     blocks.push("Task belongs to a different Todoist project");
   if (data.event?.id !== undefined && data.event.id !== eventId) blocks.push("Calendar returned a different event identity");
-  if (data.task?.due?.is_recurring) blocks.push("Recurring Todoist task: series must be investigated manually");
+  if (data.task?.due?.is_recurring && !inventoryOnly) blocks.push("Recurring Todoist task: series must be investigated manually");
   if (data.event?.recurrence?.length || data.event?.recurringEventId)
     blocks.push("Recurring Calendar item: series/exception requires manual handling");
-  if (data.event && !flag("delete-calendar")) blocks.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
+  if (data.event && !flag("delete-calendar") && !inventoryOnly) blocks.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
   if (data.event?.extendedProperties?.shared?.taskId && data.event.extendedProperties.shared.taskId !== taskId)
     blocks.push("Selected Calendar event is linked to a different Todoist task");
   if (data.linked && (!eventId || data.linked.id !== eventId))
     blocks.push("Another Calendar projection links to this task; manual inspection required");
-  if (data.linked && !flag("delete-calendar"))
+  if (data.linked && !flag("delete-calendar") && !inventoryOnly)
     blocks.push("A live Calendar projection would recreate the Todoist task unless separately deleted");
   if (data.linked?.recurrence?.length || data.linked?.recurringEventId)
     blocks.push("Linked Calendar recurrence needs manual handling");
@@ -144,15 +160,15 @@ try {
     providerDigest:fingerprint(observed),
   }).slice(0,24);
   output({
-    mode:flag("apply") ? "apply" : "preview", target, table,
-    selectedActions:{deleteTodoist:true,deleteCalendar:flag("delete-calendar")},
+    mode:flag("apply") ? "apply" : inventoryOnly ? "inventory-only" : "preview", target, table,
+    selectedActions:{deleteTodoist:!inventoryOnly && !preserveTask,deleteCalendar:!inventoryOnly && flag("delete-calendar")},
     providerBefore:{todoist:observed.task ? {id:observed.task.id,title:observed.task.content,updatedAt:observed.task.updated_at} : null,
       calendar:observed.event ? {id:observed.event.id,title:observed.event.summary,etag:observed.event.etag} : null,
       linkedCalendar:observed.linked ? {id:observed.linked.id,status:observed.linked.status} : null,
       matchingMappingComments:observed.comments.map(item=>item.id),matchingLegacyComments:observed.legacy.map(item=>item.id)},
-    scanned:initialScan.scanned, records:plan.records.map(publicRecord), blockers,
+    scanned:initialScan.scanned, classificationCounts:plan.counts, records:plan.records.map(publicRecord), blockers,
     warning:"PURGE PERMANENTLY REMOVES AUDIT/HISTORY AND DISABLES HISTORICAL REPAIR/FORENSICS. Untagged delivery receipts or redacted historical records cannot be proven attributable; manually inspect queued deliveries and backups.",
-    ...(blockers.length ? {} : {actionTimeConfirmation:"PERMANENTLY_ERASE_" + token}),
+    ...(blockers.length || inventoryOnly ? {} : {actionTimeConfirmation:"PERMANENTLY_ERASE_" + token}),
   });
   if (!flag("apply")) process.exit(0);
   if (blockers.length) throw new Error("Refused: unsafe or shared state in preview");
