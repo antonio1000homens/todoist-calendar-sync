@@ -339,6 +339,26 @@ test("elapsed Calendar history rejects recurrence metadata on matching task-side
   assert.deepEqual(h.writes,[]);
 });
 
+test("elapsed Calendar history rejects recurrenceId on the selected event mapping",async t=>{
+  const eventMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z",recurrenceId:"series"};
+  const plainTaskMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const h=harness(t,{events:[event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},extendedProperties:{shared:{taskId:"task"}}})],
+    tasks:[task("task")],mappings:[plainTaskMapping]});
+  h.eventMappingMap.set("home:elapsed",eventMapping);
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/recurrence-owned/);
+  assert.deepEqual(h.writes,[]);
+});
+
+test("elapsed Calendar history rejects recurrenceId on matching task-side mappings",async t=>{
+  const eventMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
+  const taskMapping={...eventMapping,recurrenceId:"series"};
+  const h=harness(t,{events:[event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},extendedProperties:{shared:{taskId:"task"}}})],
+    tasks:[task("task")],mappings:[taskMapping]});
+  h.eventMappingMap.set("home:elapsed",eventMapping);
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/recurring task mapping/);
+  assert.deepEqual(h.writes,[]);
+});
+
 test("elapsed Calendar history classifies all-day retained counterparts in the Calendar timezone",async t=>{
   const oldMapping={profile:"home",taskId:"task",eventId:"elapsed",updatedAt:"2026-10-01T00:00:00Z"};
   const staleCounterpartMapping={profile:"home",taskId:"task",eventId:"old-all-day",updatedAt:"2026-10-02T00:00:00Z"};

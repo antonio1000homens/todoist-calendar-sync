@@ -354,7 +354,7 @@ export class ReviewEngine {
       if(!calendarEventHasElapsed(selectedEvent,Date.now(),timeZone)) invalidRepairIntent("The selected Calendar event has not fully elapsed in its Calendar timezone");
       const eventMapping=selected!.mapping;
       if(eventMapping&&(eventMapping.profile!==intent.profile||eventMapping.eventId!==intent.eventId||eventMapping.taskId!==linkedTaskId
-        ||eventMapping.recurrenceOwner||eventMapping.seriesId||eventMapping.masterEventId||eventMapping.activeInstanceId||!eventMapping.updatedAt)) {
+        ||eventMapping.recurrenceOwner||eventMapping.recurrenceId||eventMapping.seriesId||eventMapping.masterEventId||eventMapping.activeInstanceId||!eventMapping.updatedAt)) {
         invalidRepairIntent("The elapsed event mapping is ambiguous or recurrence-owned; refresh and resolve the mapping split first");
       }
       const taskSnapshot=snapshots.find(s=>s.ref.profile===intent.profile&&s.ref.side==="todoist"&&s.ref.id===linkedTaskId);
@@ -365,7 +365,7 @@ export class ReviewEngine {
         ||reviewHash(mappingPayload(taskSnapshot.mapping as Mapping|undefined))!==reviewHash(mappingPayload(ownerMapping))) {
         invalidRepairIntent("The task and owner mapping indexes disagree; do not detach until a fresh mapping repair resolves them");
       }
-      if(taskMapping&&taskMapping.eventId===intent.eventId&&(taskMapping.recurrenceOwner||taskMapping.seriesId
+      if(taskMapping&&taskMapping.eventId===intent.eventId&&(taskMapping.recurrenceOwner||taskMapping.recurrenceId||taskMapping.seriesId
         ||taskMapping.masterEventId||taskMapping.activeInstanceId)) {
         invalidRepairIntent("The selected event is still owned by a recurring task mapping; resolve recurrence ownership before detaching history");
       }
