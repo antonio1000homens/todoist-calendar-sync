@@ -7,6 +7,7 @@ import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
 import { ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
+import { buildErasurePreview } from "./erasure-preview.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
@@ -122,7 +123,12 @@ async function enqueueRepair(operationId: string, selectedProfile: Profile, atte
   await enqueueDelivery(delivery);
 }
 
-export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunctionURLResult> {
+export async function handler(event: LambdaFunctionURLEvent, dependencies: {
+  buildErasurePreview?: typeof buildErasurePreview;
+  createErasureOperationStore?: () => ErasureOperationStore;
+} = {}): Promise<LambdaFunctionURLResult> {
+  const previewBuilder = dependencies.buildErasurePreview || buildErasurePreview;
+  const erasureStore = () => dependencies.createErasureOperationStore?.() || new ErasureOperationStore();
   try {
     const path = event.rawPath || "/";
     if (!path.startsWith("/review/api/")) return response(404,{error:"not_found"});
@@ -135,23 +141,26 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
 
     if ((method === "GET" && segments[0] === "erasure-operations" && segments.length === 2)
       || (method === "POST" && segments[0] === "erasure-operations" && segments[2] === "start" && segments.length === 3)) {
-      const operation = await new ErasureOperationStore().get(segments[1]);
+      const operationStore = erasureStore();
+      const operation = await operationStore.get(segments[1]);
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
+        providerDeletionReady:operation.providerDeletionReady===true,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
         ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
           message:ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
       if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
       if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
+      if (operation.status === "previewed" && operation.providerDeletionReady !== true)
+        fail(409,"The provider deletion and postflight workflow is not available; this preview remains durable but cannot be queued");
       if (operation.lifecycle?.phase === "ready_for_delete") fail(409,"Fencing is complete; provider deletion requires the separate confirmed deletion workflow");
       if (!["previewed","queued","fencing","deleting","verifying"].includes(operation.status))
         fail(409,"This erasure operation cannot be started or resumed");
       if (operation.status === "previewed") {
-        const erasureStore=new ErasureOperationStore();
-        try { await erasureStore.transition(operation.operationId,"previewed","queued"); }
+        try { await operationStore.transition(operation.operationId,"previewed","queued"); }
         catch {
-          const latest=await erasureStore.get(operation.operationId);
+          const latest=await operationStore.get(operation.operationId);
           if (latest?.status !== "queued") throw new Error("Erasure operation changed while it was being started; refresh before retrying");
         }
       }
@@ -162,6 +171,53 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
       }
       return response(202,{operation:{operationId:operation.operationId,status:operation.status === "previewed"?"queued":operation.status,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt}});
+    }
+
+    if (method === "POST" && segments[0] === "erasure-previews" && segments.length === 1) {
+      const allowed = ["profile","taskId","eventId","deleteCalendar"];
+      if (Object.keys(body || {}).some(key => !allowed.includes(key))
+        || typeof body?.profile !== "string" || typeof body?.taskId !== "string"
+        || (body?.eventId !== undefined && typeof body.eventId !== "string")
+        || typeof body?.deleteCalendar !== "boolean") fail(400,"Exact erasure target and action selections are required");
+      const preview = await previewBuilder({profile:profile(body.profile),taskId:body.taskId,
+        ...(typeof body.eventId === "string" ? {eventId:body.eventId} : {}),deleteCalendar:body.deleteCalendar});
+      if (!preview.blockers.length) {
+        let issued;
+        try { issued = await erasureStore().issueConfirmation(preview); }
+        catch (error) {
+          if (error instanceof Error && error.message.includes("too large for one durable operation")) fail(413,error.message);
+          throw error;
+        }
+        return response(200,{preview:{...preview,confirmation:{confirmationId:issued.confirmationId,expiresAt:issued.expiresAt}}});
+      }
+      return response(200,{preview});
+    }
+
+    if (method === "POST" && segments[0] === "erasure-operations" && segments.length === 1) {
+      if (Object.keys(body || {}).sort().join(",") !== "confirmationId,operationId"
+        || typeof body?.operationId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.operationId)
+        || typeof body?.confirmationId !== "string" || body.confirmationId.length > 256)
+        fail(400,"A preview operation ID and its single-use confirmation are required");
+      const operationStore = erasureStore();
+      const issued = await operationStore.getIssuedPreview(body.operationId,body.confirmationId);
+      if (!issued) fail(409,"The preview confirmation is missing, expired, or already used; request a fresh preview");
+      const current = await previewBuilder({profile:issued.profile,taskId:issued.target.taskId,
+        ...(issued.target.eventId ? {eventId:issued.target.eventId} : {}),deleteCalendar:issued.selectedActions.deleteCalendar},
+        {newOperationId:()=>body!.operationId as string,ignoreOperationId:body.operationId});
+      if (current.blockers.length || current.previewFingerprint !== issued.previewFingerprint)
+        fail(409,"The exact provider/state inventory changed or became unsafe; request a fresh preview");
+      const now=new Date().toISOString();
+      const operation = {operationId:current.operationId,profile:current.profile,target:current.target,
+        selectedActions:current.selectedActions,providerSnapshotFingerprint:current.providerSnapshotFingerprint,
+        inventory:current.inventory,previewFingerprint:current.previewFingerprint,
+        providerDeletionReady:false,
+        confirmationId:body.confirmationId,confirmationFingerprint:current.previewFingerprint,
+        status:"previewed" as const,createdAt:now,updatedAt:now};
+      try { await operationStore.create(operation); }
+      catch { fail(409,"The confirmation expired, was already used, or the operation changed; request a fresh preview"); }
+      return response(201,{operation:{operationId:operation.operationId,status:operation.status,
+        previewFingerprint:operation.previewFingerprint,inventoryCount:operation.inventory.length,
+        queueReady:false,providerDeletionReady:false}});
     }
 
     if (method === "GET" && segments[0] === "cases" && segments.length === 1) {

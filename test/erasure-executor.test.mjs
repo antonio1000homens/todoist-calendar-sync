@@ -6,7 +6,8 @@ import { advanceErasureOperation, enterFencedErasure, erasurePreviewFingerprint,
 const operation={operationId:"op",profile:"home",target:{taskId:"task",deleteCalendar:false},previewFingerprint:"digest",
   status:"previewed",createdAt:"2026-10-23T00:00:00Z",updatedAt:"2026-10-23T00:00:00Z"};
 const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
-  selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row-v1",classification:"selected"}]};
+  selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
+  inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row-v1",classification:"selected"}]};
 const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
   let item=seed;
@@ -27,7 +28,7 @@ function memoryDb(seed){
 function storedQueuedOperation(){
   const digest=erasurePreviewFingerprint(preview);
   return {...preview,operationId:"op",previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"one-time",
-    status:"queued",createdAt:"now",updatedAt:"now"};
+    providerDeletionReady:true,status:"queued",createdAt:"now",updatedAt:"now"};
 }
 
  test("erasure operation contract permits only the resumable forward lifecycle",()=>{
@@ -103,7 +104,8 @@ test("worker adapters are bound at construction and request arguments cannot rep
     mappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
     inspectFence:async()=>({fence,leases}),
     readMappingStates:async ids=>ids.map(id=>({id,state:states.get(id)})),
-    readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,inventory:db.item.inventory}),
+    readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
+      providerSnapshotFingerprint:db.item.providerSnapshotFingerprint,inventory:db.item.inventory}),
     verifyDeletion:async()=>deletionReadback,
     beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
     restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
@@ -214,7 +216,7 @@ test("trusted class-based worker adapters retain their instance state after bind
     async finishFence(){}
     async verifyDeletion(){return {providersAbsent:true,stateAbsent:true};}
     async readFreshSnapshot(operation){return {profile:operation.profile,target:operation.target,
-      selectedActions:operation.selectedActions,inventory:operation.inventory};}
+      selectedActions:operation.selectedActions,providerSnapshotFingerprint:operation.providerSnapshotFingerprint,inventory:operation.inventory};}
     async readMappingStates(ids){return ids.map(id=>({id,state:this.mappingInventory.find(item=>item.id===id)?.state}));}
   }
   const adapters=new StatefulWorkerAdapters();
@@ -247,7 +249,7 @@ test("trusted clock controls confirmation issue and consume; caller timestamps c
   const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const issued=await store.issueConfirmation({operationId:"op",...preview},5000);
-    const complete={operationId:"op",...preview,...issued,confirmationFingerprint:issued.previewFingerprint,status:"previewed",createdAt:"now",updatedAt:"now"};
+    const complete={operationId:"op",...preview,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:false,status:"previewed",createdAt:"now",updatedAt:"now"};
     assert.equal(confirmations.get("ERASURE_CONFIRMATION#op").createdAt,new Date(now).toISOString());
     now=7000;
     await assert.rejects(store.create(complete,1),/transaction condition failed/);
@@ -276,7 +278,7 @@ test("durable operation store digests immutable preview content and atomically c
   const store=new ErasureOperationStore(db,()=>"one-time-token");
   try{
     const source={operationId:"op",...preview};const issued=await store.issueConfirmation(source);
-    const complete={...source,...issued,confirmationFingerprint:issued.previewFingerprint,status:"previewed",createdAt:"now",updatedAt:"now"};
+    const complete={...source,...issued,confirmationFingerprint:issued.previewFingerprint,providerDeletionReady:false,status:"previewed",createdAt:"now",updatedAt:"now"};
     assert.equal(issued.previewFingerprint,erasurePreviewFingerprint(source));
     await assert.rejects(store.create({...complete,target:{...complete.target,taskId:"other-task"}}),/Invalid erasure operation preview/);
     await assert.rejects(store.create({...complete,inventory:[{...complete.inventory[0],digest:"row-v2"}]}),/Invalid erasure operation preview/);
