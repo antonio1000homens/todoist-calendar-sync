@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import {
   GetCommand,
   PutCommand,
+  QueryCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { documentClient, pacedScan } from "./dynamodb-capacity.js";
+import { documentClient, pacedScan, withProfileLookupDeadline } from "./dynamodb-capacity.js";
 import { secureParameter } from "./config.js";
 import { createBudgetedClientFactory, defaultProviderClientFactory, isMutationBudgetExhausted, ReconciliationMutationBudget, type ProviderClientFactory } from "./mutation-budget.js";
 import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResult } from "./queue.js";
@@ -19,6 +20,14 @@ import { deleteMappingComments } from "./mapping-comments.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit, type FutureSeriesSplitPlan } from "./recurrence-split.js";
 import { retainedConflictIdentity } from "./audit-policy.js";
+import {
+  MANUAL_PENDING_LOOKUP_PREFIX,
+  manualPendingLookupAttributes,
+  PROFILE_LOOKUP_INDEX_NAME,
+  PROFILE_LOOKUP_MIGRATION_VERSION,
+  PROFILE_LOOKUP_READY_KEY,
+  PROFILE_LOOKUP_READY_SORT_KEY,
+} from "./profile-lookup.js";
 
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
@@ -34,6 +43,8 @@ function futureSplitDescription(plan: FutureSeriesSplitPlan, anchor?: string): s
 }
 const DEFAULT_DECISION_RETENTION_DAYS = 30;
 const DEFAULT_DECISION_DEADLINE_DAYS = 7;
+const PENDING_DECISION_QUERY_PAGE_LIMIT = 25;
+const PENDING_DECISION_QUERY_MAX_PAGES = 12;
 const MAX_MANUAL_BULK_MUTATIONS = 10;
 const MANUAL_CALENDAR_MUTATIONS = new Set([
   "upsertEvent", "upsertEventIfUnchanged", "createFutureMasterOnce", "deleteEvent",
@@ -431,6 +442,7 @@ export class ManualDecisionStore {
         pk: `MANUAL#${decision.decisionId}`,
         sk: "STATE",
         ...decision,
+        ...manualPendingLookupAttributes(decision),
         expiresAt: epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
@@ -450,23 +462,9 @@ export class ManualDecisionStore {
     }));
   }
 
-  async listPending(profile?: Profile): Promise<ManualDecision[]> {
-    const values: Record<string, unknown> = { ":prefix": "MANUAL#", ":pending": "pending" };
-    let filter = "begins_with(pk, :prefix) AND #status = :pending";
-    if (profile) {
-      filter += " AND #profile = :profile";
-      values[":profile"] = profile;
-    }
-    const result = await pacedScan<StoredDecision>({
-      TableName: tableName(),
-      FilterExpression: filter,
-      ExpressionAttributeNames: { "#status": "status", "#profile": "profile" },
-      ExpressionAttributeValues: values,
-    }, {
-      operation: "list_pending_manual_decisions",
-      profile,
-    });
-    return result.items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  async listPending(profile?: Profile, options: { deadlineAtMs?: number; requestId?: string; maxPagesPerProfile?: number } = {}): Promise<ManualDecision[]> {
+    const result = await this.listPendingIndexed(profile, options);
+    return result.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async setSlackLocation(decisionId: string, channel: string, ts: string): Promise<void> {
@@ -482,7 +480,7 @@ export class ManualDecisionStore {
     await documentClient.send(new UpdateCommand({
       TableName: tableName(),
       Key: { pk: `MANUAL#${decisionId}`, sk: "STATE" },
-      UpdateExpression: "SET #status = :status, resolution = :resolution, resolvedAt = :resolvedAt, resolvedBySlackUserId = :user, expiresAt = :expiresAt",
+      UpdateExpression: "SET #status = :status, resolution = :resolution, resolvedAt = :resolvedAt, resolvedBySlackUserId = :user, expiresAt = :expiresAt REMOVE lookupPk, lookupSk",
       ConditionExpression: "#status = :pending",
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: {
@@ -501,6 +499,163 @@ export class ManualDecisionStore {
       try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
       catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
     }
+  }
+
+  private async listPendingIndexed(
+    profile: Profile | undefined,
+    options: { deadlineAtMs?: number; requestId?: string; maxPagesPerProfile?: number },
+  ): Promise<ManualDecision[]> {
+    const startedAt = Date.now();
+    const deadlineAtMs = options.deadlineAtMs ?? startedAt + 20_000;
+    const requestId = options.requestId;
+    const maxPagesPerProfile = Math.max(1, Math.floor(options.maxPagesPerProfile || PENDING_DECISION_QUERY_MAX_PAGES));
+    const pageLimit = PENDING_DECISION_QUERY_PAGE_LIMIT;
+    const table = tableName();
+    const completeByProfile: Record<string, boolean> = {};
+    const results: ManualDecision[] = [];
+    const owners: Profile[] = profile ? [profile] : ["home", "antonio", "work"];
+    let totalPages = 0;
+    let examined = 0;
+
+    if (Date.now() >= deadlineAtMs) {
+      console.warn(JSON.stringify({
+        service: "todoist-calendar-sync-health",
+        event: "list_pending_manual_decisions_incomplete",
+        operation: "list_pending_manual_decisions",
+        profile,
+        requestId,
+        pages: 0,
+        itemsExamined: 0,
+        itemsReturned: 0,
+        elapsedMs: Date.now() - startedAt,
+        complete: false,
+        reason: "deadline_budget_exhausted",
+      }));
+      throw new Error("Pending manual-decision lookup deadline exhausted");
+    }
+    let ready: any;
+    try {
+      ready = await documentClient.send(new GetCommand({
+        TableName: table,
+        Key: { pk: PROFILE_LOOKUP_READY_KEY, sk: PROFILE_LOOKUP_READY_SORT_KEY },
+        ConsistentRead: true,
+      }), { abortSignal: AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now())) });
+    } catch (error) {
+      console.error(JSON.stringify({
+        service: "todoist-calendar-sync-health",
+        event: "list_pending_manual_decisions_incomplete",
+        operation: "list_pending_manual_decisions",
+        profile,
+        requestId,
+        pages: 0,
+        itemsExamined: 0,
+        itemsReturned: 0,
+        elapsedMs: Date.now() - startedAt,
+        complete: false,
+        reason: Date.now() >= deadlineAtMs ? "deadline_budget_exhausted" : "readiness_check_failed",
+        error: error instanceof Error ? error.name : "unknown_error",
+      }));
+      throw error;
+    }
+    if (Number(ready.Item?.version || 0) < PROFILE_LOOKUP_MIGRATION_VERSION) {
+      console.warn(JSON.stringify({
+        service: "todoist-calendar-sync-health",
+        event: "list_pending_manual_decisions_incomplete",
+        operation: "list_pending_manual_decisions",
+        profile,
+        requestId,
+        pages: 0,
+        itemsExamined: 0,
+        itemsReturned: 0,
+        elapsedMs: Date.now() - startedAt,
+        complete: false,
+        reason: "profile_lookup_index_not_ready",
+      }));
+      throw new Error("Pending manual-decision index is not ready; results are incomplete");
+    }
+
+    for (const owner of owners) {
+      let cursor: Record<string, unknown> | undefined;
+      let ownerComplete = false;
+      let ownerPages = 0;
+      do {
+        if (Date.now() >= deadlineAtMs || ownerPages >= maxPagesPerProfile) break;
+        ownerPages += 1;
+        totalPages += 1;
+        let result: any;
+        try {
+          result = await documentClient.send(new QueryCommand(withProfileLookupDeadline({
+            TableName: table,
+            IndexName: PROFILE_LOOKUP_INDEX_NAME,
+            KeyConditionExpression: "lookupPk = :lookupPk AND begins_with(lookupSk, :prefix)",
+            FilterExpression: "#profile = :profile AND #status = :pending",
+            ExpressionAttributeNames: { "#profile": "profile", "#status": "status" },
+            ExpressionAttributeValues: {
+              ":lookupPk": `PROFILE#${owner}`,
+              ":profile": owner,
+              ":prefix": MANUAL_PENDING_LOOKUP_PREFIX,
+              ":pending": "pending",
+            },
+            ExclusiveStartKey: cursor,
+            Limit: pageLimit,
+            ReturnConsumedCapacity: "TOTAL",
+          }, deadlineAtMs)), { abortSignal: AbortSignal.timeout(Math.max(1, deadlineAtMs - Date.now())) });
+        } catch (error) {
+          const deadlineExpired = Date.now() >= deadlineAtMs;
+          console.error(JSON.stringify({
+            service: "todoist-calendar-sync-health",
+            event: "list_pending_manual_decisions_incomplete",
+            operation: "list_pending_manual_decisions",
+            profile: owner,
+            requestId,
+            pages: ownerPages,
+            itemsExamined: examined,
+            itemsReturned: results.length,
+            elapsedMs: Date.now() - startedAt,
+            complete: false,
+            reason: deadlineExpired ? "deadline_budget_exhausted" : "query_failed",
+            error: error instanceof Error ? error.name : "unknown_error",
+          }));
+          if (deadlineExpired) throw new Error(`Pending manual-decision lookup deadline exhausted for ${owner}`, { cause: error });
+          throw error;
+        }
+        examined += Number(result.ScannedCount ?? result.Count ?? result.Items?.length ?? 0);
+        results.push(...((result.Items || []) as ManualDecision[]));
+        cursor = result.LastEvaluatedKey;
+        if (!cursor) ownerComplete = true;
+      } while (cursor);
+      completeByProfile[owner] = ownerComplete;
+      if (!ownerComplete) {
+        console.warn(JSON.stringify({
+          service: "todoist-calendar-sync-health",
+          event: "list_pending_manual_decisions_incomplete",
+          operation: "list_pending_manual_decisions",
+          profile: owner,
+          requestId,
+          pages: ownerPages,
+          itemsExamined: examined,
+          itemsReturned: results.length,
+          elapsedMs: Date.now() - startedAt,
+          complete: false,
+          reason: Date.now() >= deadlineAtMs ? "deadline_budget_exhausted" : "page_budget_exhausted",
+        }));
+        throw new Error(`Pending manual-decision lookup incomplete for ${owner}`);
+      }
+    }
+    console.log(JSON.stringify({
+      service: "todoist-calendar-sync-health",
+      event: "list_pending_manual_decisions_complete",
+      operation: "list_pending_manual_decisions",
+      profile,
+      requestId,
+      pages: totalPages,
+      itemsExamined: examined,
+      itemsReturned: results.length,
+      elapsedMs: Date.now() - startedAt,
+      complete: Object.values(completeByProfile).every(Boolean),
+      completeByProfile,
+    }));
+    return results;
   }
 }
 
@@ -997,8 +1152,13 @@ export class ManualInterventionService {
     if (incident?.status === "resolved") await this.notifier.updateResolution(incident, resolution);
   }
 
-  async retireStaleReconciliationIncidents(profile: Profile, generation: string, pending: boolean): Promise<void> {
-    for (const incident of await this.store.listPending(profile)) {
+  async retireStaleReconciliationIncidents(
+    profile: Profile,
+    generation: string,
+    pending: boolean,
+    lookupOptions: { deadlineAtMs?: number; requestId?: string } = {},
+  ): Promise<void> {
+    for (const incident of await this.store.listPending(profile, lookupOptions)) {
       if (incident.type !== "operational_reconciliation_stuck") continue;
       const alertedGeneration = typeof incident.context?.reconciliationGeneration === "string"
         ? incident.context.reconciliationGeneration : undefined;

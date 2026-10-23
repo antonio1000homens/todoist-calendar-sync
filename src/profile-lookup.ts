@@ -5,7 +5,8 @@ import { logEvent } from "./observability.js";
 export const PROFILE_LOOKUP_INDEX_NAME = "ProfileLookupIndex";
 export const PROFILE_LOOKUP_READY_KEY = "SYSTEM#PROFILE_LOOKUP_INDEX";
 export const PROFILE_LOOKUP_READY_SORT_KEY = "READY";
-export const PROFILE_LOOKUP_MIGRATION_VERSION = 1;
+export const PROFILE_LOOKUP_MIGRATION_VERSION = 2;
+export const MANUAL_PENDING_LOOKUP_PREFIX = "MANUAL#PENDING#";
 
 export interface ProfileLookupParity {
   missing: string[];
@@ -29,6 +30,29 @@ export function mappingLookupSk(kind: "event" | "task" | "owner", id: string): s
 
 export function recurrenceLookupSk(seriesId: string): string {
   return `RECURRENCE#${seriesId}`;
+}
+
+export function manualPendingLookupAttributes(input: Pick<{ profile: Profile; decisionId: string; createdAt: string }, "profile" | "decisionId" | "createdAt">): Record<string, string> {
+  return {
+    lookupPk: profileLookupPk(input.profile),
+    lookupSk: `${MANUAL_PENDING_LOOKUP_PREFIX}${input.createdAt}#${input.decisionId}`,
+  };
+}
+
+export function profileLookupBackfillCondition(lookup: { lookupSk: string }): {
+  expression: string;
+  names?: Record<string, string>;
+  values: Record<string, string>;
+} {
+  const base = "attribute_exists(pk) AND attribute_exists(sk) AND attribute_not_exists(lookupPk) AND attribute_not_exists(lookupSk)";
+  if (!lookup.lookupSk.startsWith(MANUAL_PENDING_LOOKUP_PREFIX)) {
+    return { expression: base, values: {} };
+  }
+  return {
+    expression: `${base} AND #status = :pending`,
+    names: { "#status": "status" },
+    values: { ":pending": "pending" },
+  };
 }
 
 export function mappingLookupAttributes(mapping: Pick<Mapping, "profile" | "eventId" | "taskId">): Record<string, string> {

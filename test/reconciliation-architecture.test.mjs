@@ -140,6 +140,6 @@ test("profile lookup GSI is additive and validated hot paths are query-only", ()
   assert.doesNotMatch(reconciliationSource, /list_reconciliation_mappings_scan_fallback|pacedScan/);
   assert.match(reconciliationSource, /mappingLookupQueryInput\(table, profile\)/);
   assert.match(backfillSource, /Limit:\s*25/);
-  assert.match(backfillSource, /attribute_not_exists\(lookupPk\)/);
+  assert.match(backfillSource, /profileLookupBackfillCondition\(lookup\)/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
 });

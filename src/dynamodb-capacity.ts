@@ -13,6 +13,7 @@ const DEFAULT_SCAN_JITTER_MS = 50;
 const LARGE_ITEM_WARNING_BYTES = 16 * 1024;
 const LARGE_ITEM_CRITICAL_BYTES = 64 * 1024;
 const PROFILE_LOOKUP_INDEX_NAME = "ProfileLookupIndex";
+const boundedProfileLookupDeadlines = new WeakMap<object, number>();
 
 const baseClient = new DynamoDBClient({
   maxAttempts: 5,
@@ -133,6 +134,22 @@ export function profileLookupQueryInput(input: QueryCommandInput): QueryCommandI
   };
 }
 
+export function withProfileLookupDeadline(input: QueryCommandInput, deadlineAtMs: number): QueryCommandInput {
+  const marked = { ...input };
+  boundedProfileLookupDeadlines.set(marked, deadlineAtMs);
+  return marked;
+}
+
+export function profileLookupPacingDelayMs(
+  consumedCapacityUnits: number,
+  elapsedMs: number,
+  deadlineAtMs?: number,
+  now = Date.now(),
+): number {
+  const planned = pacingDelayMs(consumedCapacityUnits, elapsedMs, profileLookupQueryRcuBudgetPerSecond());
+  return deadlineAtMs === undefined ? planned : Math.min(planned, Math.max(0, deadlineAtMs - now));
+}
+
 documentClient.middlewareStack.add(
   (next, context) => async (args) => {
     const input = args.input as QueryCommandInput;
@@ -141,6 +158,7 @@ documentClient.middlewareStack.add(
     }
 
     const pacedInput = profileLookupQueryInput(input);
+    const deadlineAtMs = boundedProfileLookupDeadlines.get(input);
     const startedAt = Date.now();
     const result = await next({ ...args, input: pacedInput });
     const output = result.output as {
@@ -151,7 +169,7 @@ documentClient.middlewareStack.add(
     const consumedCapacityUnits = Number(output.ConsumedCapacity?.CapacityUnits || 0);
     const nextPage = Boolean(output.LastEvaluatedKey);
     const waitMs = nextPage
-      ? pacingDelayMs(consumedCapacityUnits, Date.now() - startedAt, profileLookupQueryRcuBudgetPerSecond())
+      ? profileLookupPacingDelayMs(consumedCapacityUnits, Date.now() - startedAt, deadlineAtMs)
       : 0;
 
     console.log(JSON.stringify({
