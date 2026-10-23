@@ -198,6 +198,7 @@ export class ReviewEngine {
     if (intent.action === "link" && task?.due?.is_recurring && event && !event.recurrence?.length && !event.recurringEventId
       && intent.owner === "todoist") {
       if (intent.scope !== "future") invalidRepairIntent("Creating a yearly Calendar series from a standalone event requires Future occurrences (preserve history)");
+      if (intent.winner !== "todoist") invalidRepairIntent("Use Todoist fields for a Todoist-owned yearly Calendar series repair");
       const provider = await this.clients(intent.profile);
       try {
         const zone = await provider.calendar.getTimeZone();
