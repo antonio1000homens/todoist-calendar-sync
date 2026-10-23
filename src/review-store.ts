@@ -254,10 +254,13 @@ export class ReviewStore {
       if (claimed?.submittedOperation && claimed.submittedOperation !== id) {
         throw Object.assign(new Error("This preview was already submitted with a different idempotency key; create a fresh preview"), { status:409 });
       }
+      const latestSuperseded = superseded ? await this.getOperation(superseded.id) : undefined;
+      if (superseded && (!latestSuperseded?.abandoned || latestSuperseded.status !== "failed" || operationHasWriteEvidence(latestSuperseded))) {
+        throw Object.assign(new Error("This case already has an active repair; refresh it and resume that operation"), { status:409 });
+      }
       const currentCase = await this.getCase(preview.intent.caseId);
       if (!currentCase || currentCase.status !== preview.case.status || currentCase.operationId !== preview.case.operationId
         || preview.case.updatedAt && currentCase.updatedAt !== preview.case.updatedAt) {
-        throw Object.assign(new Error("The case changed after preview; refresh affected items and create a fresh preview"), { status:409 });
       }
       throw e;
     }
