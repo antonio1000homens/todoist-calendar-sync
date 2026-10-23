@@ -100,15 +100,23 @@ test("delete readiness requires the stored preview digest and completed fence",(
   const ready={...preview,operationId:"op",previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"once",
     status:"deleting",createdAt:"now",updatedAt:"now",lifecycle:initialFencedLifecycle({mappingIds:["uuid"],enabledMappingIds:[],timeoutSeconds:30})};
   ready.lifecycle.phase="ready_for_delete";
+  ready.lifecycle.evidence={mappingsDisableRequestedAt:1000,mappingsDisabledAt:1000,preFenceDrainAt:1000,
+    fenceInstalledAt:1000,workerTimeoutElapsedAt:33000,postTimeoutDrainAt:33000};
   const fresh={profile:ready.profile,target:ready.target,selectedActions:ready.selectedActions,inventory:ready.inventory};
   assert.doesNotThrow(()=>assertErasureReadyForDelete(ready,fresh));
   assert.throws(()=>assertErasureReadyForDelete({...ready,target:{...ready.target,taskId:"changed"}},fresh),/confirmation, inventory, or fenced lifecycle changed/);
   assert.throws(()=>assertErasureReadyForDelete(ready,{...fresh,inventory:[{type:"changed"}]}),/confirmation, inventory, or fenced lifecycle changed/);
   assert.throws(()=>assertErasureReadyForDelete({...ready,lifecycle:{...ready.lifecycle,phase:"wait_worker_timeout"}},fresh),/confirmation, inventory, or fenced lifecycle changed/);
+  assert.throws(()=>assertErasureReadyForDelete({...ready,lifecycle:{...ready.lifecycle,evidence:{}}},fresh),/confirmation, inventory, or fenced lifecycle changed/);
 });
 
 test("operation store atomically starts and advances the durable fence phase",async()=>{
-  const calls=[];let item={...operation,status:"queued",previewFingerprint:"digest"};
+  const calls=[];
+  const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
+    selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[]};
+  const digest=erasurePreviewFingerprint(preview);
+  let item={...preview,operationId:"op",status:"queued",previewFingerprint:digest,confirmationFingerprint:digest,
+    confirmationId:"one-time",createdAt:"now",updatedAt:"now"};
   const db={send:async command=>{
     calls.push(command);
     if(command.constructor.name.includes("Get"))return {Item:item};
@@ -124,7 +132,14 @@ test("operation store atomically starts and advances the durable fence phase",as
     await store.startFencedLifecycle("op",lifecycle,123);
     assert.equal(item.status,"fencing");assert.equal(item.lifecycle.phase,"disable_mappings");
     assert.match(calls.at(-1).input.ConditionExpression,/attribute_not_exists\(lifecycle\)/);
+    const skipped={...lifecycle,phase:"ready_for_delete",nextRunAt:124,evidence:{mappingsDisableRequestedAt:123,
+      mappingsDisabledAt:123,preFenceDrainAt:123,fenceInstalledAt:123,workerTimeoutElapsedAt:33123,postTimeoutDrainAt:33123}};
+    await assert.rejects(store.saveLifecycle("op","fencing","disable_mappings",skipped,"deleting",33123),/Invalid fenced lifecycle phase/);
+    const changedIdentity={...lifecycle,phase:"confirm_disabled",mappingIds:["attacker"],enabledMappingIds:["attacker"],
+      nextRunAt:124,evidence:{mappingsDisableRequestedAt:123}};
+    await assert.rejects(store.saveLifecycle("op","fencing","disable_mappings",changedIdentity,"fencing",124),/identity and timeout are immutable/);
     const next={...lifecycle,phase:"confirm_disabled",nextRunAt:124};
+    next.evidence={mappingsDisableRequestedAt:123};
     await store.saveLifecycle("op","fencing","disable_mappings",next,"fencing",124);
     assert.equal(item.lifecycle.phase,"confirm_disabled");
     assert.match(calls.at(-1).input.ConditionExpression,/lifecycle.#phase=:phase/);
