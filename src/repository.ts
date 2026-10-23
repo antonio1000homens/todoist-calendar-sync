@@ -1,4 +1,4 @@
-import { ReviewStore as SyncReviewStore, SyncControls } from "./review-store.js";
+import { ReviewStore as SyncReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { createHash } from "node:crypto";
 import {
   DeleteCommand,
@@ -85,6 +85,33 @@ export interface ReconciliationState {
   pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
   /** Refreshes requested after this run started; they require a fresh generation. */
   followUpRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
+}
+
+export interface ReconciliationDiagnostic {
+  profile: Profile;
+  generation: string;
+  action: string;
+  outcome: "conflict" | "blocked" | "deferred";
+  reason: string;
+  taskId?: string;
+  eventId?: string;
+  seriesId?: string;
+  recurrenceOwner?: string;
+  caseId?: string;
+  caseStatus?: string;
+  observedAt: string;
+  sourceDeliveryId: string;
+  detail: Record<string, unknown>;
+}
+
+export function reconciliationDiagnosticOutcome(action: string): ReconciliationDiagnostic["outcome"] | undefined {
+  if (!action.startsWith("todoist_snapshot_reconcile_") && !action.startsWith("calendar_snapshot_")
+    && !["todoist_snapshot_consolidated_duplicate_ignored", "todoist_snapshot_future_series_split_pending"].includes(action)) return undefined;
+  if (action.includes("recurring_deferred")) return "deferred";
+  if (/(?:conflict|ambiguous|ownership|disappeared)/.test(action)) return "conflict";
+  if (/(?:blocked|sync_control|pending|missing_after_repair|circuit_open)/.test(action)) return "blocked";
+  if (action.includes("_deferred")) return "deferred";
+  return undefined;
 }
 
 function mergePendingRefreshRefs(
@@ -262,6 +289,62 @@ export class StateRepository {
     }));
     if (!result.Item || typeof result.Item.generation !== "string") return undefined;
     return result.Item as ReconciliationState;
+  }
+
+  async recordReconciliationDiagnostic(
+    profile: Profile, generation: string, sourceDeliveryId: string, action: string,
+    detail: Record<string, unknown>, manual?: { caseId?: string; caseStatus?: string },
+  ): Promise<void> {
+    const outcome = reconciliationDiagnosticOutcome(action);
+    if (!outcome || !generation || generation.length > 200) return;
+    const text = (value: unknown, max = 10_000): string | undefined =>
+      typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f]/.test(value) ? value : undefined;
+    const list = (value: unknown): string[] | undefined => Array.isArray(value)
+      ? [...new Set(value.filter((item): item is string => typeof item === "string" && item.length > 0 && item.length <= 10_000))].slice(0, 100)
+      : undefined;
+    const safeDetail: Record<string, unknown> = {};
+    for (const name of ["calendarStatus", "tombstoneReason", "source", "reason", "taskUpdatedAt", "calendarUpdatedAt", "calendarEtag", "ownerTaskId"]) {
+      const value = text(detail[name], 500);
+      if (value) safeDetail[name] = value;
+    }
+    for (const name of ["candidateEventIds", "candidateTaskIds", "mismatchCategories"]) {
+      const values = list(detail[name]);
+      if (values?.length) safeDetail[name] = values;
+    }
+    const taskId = text(detail.taskId), eventId = text(detail.eventId), seriesId = text(detail.seriesId);
+    const recurrenceOwner = text(detail.recurrenceOwner, 40);
+    if (!taskId && !eventId && !seriesId && !list(detail.candidateEventIds)?.length && !list(detail.candidateTaskIds)?.length
+      && !action.includes("circuit_open")) return;
+    const diagnostic: ReconciliationDiagnostic = {
+      profile, generation, sourceDeliveryId, action, outcome,
+      reason: text(detail.reason, 500) || action,
+      ...(taskId ? { taskId } : {}), ...(eventId ? { eventId } : {}), ...(seriesId ? { seriesId } : {}),
+      ...(recurrenceOwner ? { recurrenceOwner } : {}),
+      ...(manual?.caseId ? { caseId: manual.caseId } : {}), ...(manual?.caseStatus ? { caseStatus: manual.caseStatus } : {}),
+      observedAt: now(), detail: safeDetail,
+    };
+    const fingerprint = createHash("sha256").update(JSON.stringify({
+      action, taskId, eventId, seriesId, recurrenceOwner, detail: safeDetail,
+    })).digest("hex");
+    try {
+      await client.send(new PutCommand({
+        TableName: this.ensureTable(),
+        Item: { ...diagnostic, ...key(`RECONCILE_DIAGNOSTIC#${profile}#${generation}`, `ITEM#${fingerprint}`), expiresAt: ttl(90) },
+        ConditionExpression: "attribute_not_exists(pk)",
+      }));
+    } catch (error) { if (!conditionalFailure(error)) throw error; }
+  }
+
+  async listReconciliationDiagnostics(profile: Profile, generation: string, limit = 50, after?: string) {
+    const pk = `RECONCILE_DIAGNOSTIC#${profile}#${generation}`;
+    const result = await client.send(new QueryCommand({
+      TableName: this.ensureTable(),
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": pk, ":prefix": "ITEM#" },
+      Limit: Math.max(1, Math.min(50, Math.floor(limit))),
+      ...(after ? { ExclusiveStartKey: key(pk, after) } : {}),
+    }));
+    return { items: (result.Items || []) as ReconciliationDiagnostic[], next: result.LastEvaluatedKey?.sk as string | undefined };
   }
 
   async requestReconciliation(
@@ -1853,6 +1936,23 @@ export class StateRepository {
       }
     }
     throw new Error("Conflict lifecycle changed repeatedly while assigning an incident");
+  }
+
+  async getConflictIncidentCase(profile: Profile, action: string, detail: Record<string, unknown>): Promise<{ caseId:string; caseStatus:string } | undefined> {
+    const fingerprint = retainedConflictIdentity(action, detail);
+    const entity = retainedConflictEntity(detail);
+    if (!fingerprint || !entity) return undefined;
+    const entityHash = createHash("sha256").update(entity).digest("hex");
+    const stateResult = await client.send(new GetCommand({
+      TableName:this.ensureTable(), Key:key(`CONFLICT_STATE#${profile}#${entityHash}`), ConsistentRead:true,
+    }));
+    const lifecycle = stateResult.Item as { fingerprint?:string; incidentId?:string } | undefined;
+    const fingerprintHash = createHash("sha256").update(fingerprint).digest("hex");
+    if (lifecycle?.fingerprint !== fingerprintHash || !lifecycle.incidentId) return undefined;
+    const auditKey = `AUDIT#${profile}#CONFLICT#${fingerprintHash}#${lifecycle.incidentId}`;
+    const caseId = `incident-${reviewHash(auditKey).slice(0,32)}`;
+    const item = await new SyncReviewStore().getCase(caseId);
+    return { caseId, caseStatus:item?.status || "case_not_found" };
   }
 
   /** End the active incident only after reconciliation has verified recovery. */

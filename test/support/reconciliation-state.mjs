@@ -44,9 +44,17 @@ export function reconciliationDatabase(t, initial = []) {
     const type = command.constructor.name;
     if (type === 'GetCommand') return { Item: structuredClone(items.get(identity(input.Key))) };
     if (type === 'QueryCommand') {
-      const rows = [...items.values()].filter((row) => row.pk === input.ExpressionAttributeValues[':pk'])
+      const diagnosticPrefix = input.ExpressionAttributeValues[':prefix'] === 'ITEM#';
+      const rows = [...items.values()].filter((row) => row.pk === input.ExpressionAttributeValues[':pk']
+        && (!diagnosticPrefix || row.sk.startsWith('ITEM#')))
         .sort((a, b) => a.sk.localeCompare(b.sk));
       const start = input.ExclusiveStartKey ? rows.findIndex((row) => row.sk === input.ExclusiveStartKey.sk) + 1 : 0;
+      if (diagnosticPrefix) {
+        const selected = rows.slice(start, start + (input.Limit || 100));
+        const last = selected.at(-1);
+        return { Items: structuredClone(selected),
+          LastEvaluatedKey: last && start + selected.length < rows.length ? { pk: last.pk, sk: last.sk } : undefined };
+      }
       const row = rows[start];
       return {
         Items: row?.notificationPending ? [structuredClone(row)] : [],

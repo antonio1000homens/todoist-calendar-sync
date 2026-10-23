@@ -166,9 +166,12 @@ export async function reconcileUnmappedCalendar(
   const now = Date.now();
   const reservedTaskIds = new Set<string>();
 
-  const canMutate = async (): Promise<boolean> => {
+  const canMutate = async (eventId?:string, taskId?:string): Promise<boolean> => {
     if (!await state.mutationAllowed(profile)) {
       summary.blocked += 1;
+      await state.audit(profile,"calendar_snapshot_reconcile_mutation_gate_blocked",{
+        eventId,taskId,reason:"mutation_gate_closed",
+      });
       return false;
     }
     return true;
@@ -183,7 +186,7 @@ export async function reconcileUnmappedCalendar(
   };
   const rollbackCreatedTask = async (event: CalendarEvent, task: TodoistTask, fallback: Mapping, stage: string): Promise<void> => {
     try {
-      if (!await canMutate()) throw new Error("Mutation circuit is open; task rollback is deferred");
+      if (!await canMutate(event.id,task.id)) throw new Error("Mutation circuit is open; task rollback is deferred");
       await pair.todoist.deleteTask(task.id);
       await state.recordMutation(profile);
     } catch (error) {
@@ -284,7 +287,7 @@ export async function reconcileUnmappedCalendar(
         }
         if (historical.task) {
           if (await controlsBlockRecovery([event.id],historical.task.id)) return;
-          if (!await canMutate()) return;
+          if (!await canMutate(event.id,historical.task.id)) return;
           if (await completionBlocksRecovery(event.id, true)) return;
           if (await controlsBlockRecovery([event.id],historical.task.id)) return;
           task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
@@ -296,7 +299,7 @@ export async function reconcileUnmappedCalendar(
 
     if (!task) {
       if (await controlsBlockRecovery([event.id])) return;
-      if (!await canMutate()) return;
+      if (!await canMutate(event.id)) return;
       if (await completionBlocksRecovery(event.id, true)) return;
       if (await controlsBlockRecovery([event.id])) return;
       task = await pair.todoist.upsertTask(toTodoistTask(event));
@@ -319,7 +322,7 @@ export async function reconcileUnmappedCalendar(
       updatedAt: new Date().toISOString(),
     };
     let mapping = draftMapping;
-    if (await canMutate()) {
+    if (await canMutate(event.id,task.id)) {
       if (await completionBlocksRecovery(event.id, true)) return;
       const existingComment = await pair.todoist.findComment(task.id, event.id);
       if (await controlsBlockRecovery([event.id],task.id)) {
@@ -333,7 +336,7 @@ export async function reconcileUnmappedCalendar(
       if (await controlsBlockRecovery([event.id],task.id)) {
         if (created) await rollbackCreatedTask(event,task,mapping,"after_comment_write");
         else if (!existingComment) {
-          try { if (!await canMutate()) throw new Error("Mutation circuit is open; comment rollback is deferred"); await pair.todoist.deleteComment(comment.id); await state.recordMutation(profile); }
+          try { if (!await canMutate(event.id,task.id)) throw new Error("Mutation circuit is open; comment rollback is deferred"); await pair.todoist.deleteComment(comment.id); await state.recordMutation(profile); }
           catch (error) { await state.putMapping(mapping); await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,commentId:comment.id,stage:"after_comment_write",error:error instanceof Error?error.message:String(error)}); }
         } else await state.putMapping(mapping);
         return;
@@ -410,7 +413,7 @@ export async function reconcileUnmappedCalendar(
         return;
       }
       if (await controlsBlockRecovery([master.id,active.id])) return;
-      if (!await canMutate()) return;
+      if (!await canMutate(master.id)) return;
       if (await completionBlocksRecovery(active.id, true)) return;
       if (await controlsBlockRecovery([master.id,active.id])) return;
       task = await pair.todoist.upsertTask(toTodoistTask(active));

@@ -510,10 +510,22 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
-    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) return "blocked";
+    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
+        taskId: mapping.taskId, eventId: mapping.eventId, reason: "active_review_control",
+        recurrenceOwner: mapping.recurrenceOwner, seriesId: mapping.seriesId,
+      });
+      return "blocked";
+    }
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
-    if (mapping.recurrenceOwner) return "recurring_deferred";
+    if (mapping.recurrenceOwner) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_recurring_deferred", {
+        taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
+        recurrenceOwner: mapping.recurrenceOwner, reason: "recurrence_owned_mapping_deferred",
+      });
+      return "recurring_deferred";
+    }
 
     const task = listedTask || await this.currentTask(clients.todoist, mapping.taskId);
     if (task) {
@@ -608,12 +620,17 @@ export class SnapshotReconciler {
   }
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
-    if (await this.state.syncBlocked(profile, { taskId: task.id })) return "blocked";
+    if (await this.state.syncBlocked(profile, { taskId: task.id })) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
+        taskId: task.id, reason: "active_review_control",
+      });
+      return "blocked";
+    }
     if (!hasDue(task)) return "noop";
     const consolidation = await this.state.getConsolidatedTask?.(profile, task.id);
     if (consolidation) {
       await this.state.audit(profile, "todoist_snapshot_consolidated_duplicate_ignored", {
-        discardedTaskId: task.id, retainedTaskId: consolidation.retainedTaskId,
+        taskId: task.id, discardedTaskId: task.id, retainedTaskId: consolidation.retainedTaskId,
         decisionId: consolidation.decisionId,
       });
       return "blocked";
@@ -639,7 +656,12 @@ export class SnapshotReconciler {
       });
       return "conflict";
     }
-    if (existing && await this.state.syncBlocked(profile, { taskId: task.id, eventId: existing.id })) return "blocked";
+    if (existing && await this.state.syncBlocked(profile, { taskId: task.id, eventId: existing.id })) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
+        taskId: task.id, eventId: existing.id, reason: "active_review_control",
+      });
+      return "blocked";
+    }
     const genericTombstoneRecreationAllowed = Boolean(
       tombstone
       && tombstone.reason !== "project_exit"
@@ -753,7 +775,12 @@ export class SnapshotReconciler {
 
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
     const mapping = await this.state.getMappingByTask(profile, task.id);
-    if (!mapping) return "blocked";
+    if (!mapping) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_missing_after_repair", {
+        taskId: task.id, reason: "projection_repair_did_not_persist_mapping",
+      });
+      return "blocked";
+    }
     const stored = await this.currentEvent(clients.calendar, mapping.eventId);
     if (stored && !isBlockedCalendarStatus(stored) && stored.status !== "cancelled") {
       await this.store.putBaseline(profile, task.id, task, stored);

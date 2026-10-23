@@ -5,6 +5,7 @@ import { SQSClient } from "@aws-sdk/client-sqs";
 import { handler, reconciliationAlertRelation } from "../dist/review-api.js";
 import { ReviewStore } from "../dist/review-store.js";
 import { ReviewEngine } from "../dist/review-engine.js";
+import { StateRepository } from "../dist/repository.js";
 
 const issuer = "https://alf1000.cloudflareaccess.com";
 const audience = "review-audience-test";
@@ -134,6 +135,19 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   const inbox = await jsonResponse(await handler(event("/review/api/cases?profile=all","GET",headers)));
   assert.equal(inbox.status,200);
   assert.deepEqual(inbox.body.items.map(item=>item.id),["case-1"]);
+
+  t.mock.method(StateRepository.prototype,"getReconciliationState",async()=>({profile:"home",generation:"generation-1"}));
+  t.mock.method(StateRepository.prototype,"listReconciliationDiagnostics",async(profile,generation,limit,after)=>({
+    items:[{profile,generation,action:"todoist_snapshot_reconcile_unmapped_conflict",outcome:"conflict",taskId:"task-7",eventId:"event-7",reason:"title_mismatch",caseId:"case-1",caseStatus:"dismissed"}],
+    next:after?undefined:"ITEM#"+"a".repeat(64),
+  }));
+  const diagnostics=await jsonResponse(await handler(event("/review/api/reconciliation/diagnostics?profile=home","GET",headers)));
+  assert.equal(diagnostics.status,200);
+  assert.equal(diagnostics.body.generation,"generation-1");
+  assert.equal(diagnostics.body.items[0].caseStatus,"open","the endpoint uses the current case state, not the state captured when the run observed it");
+  assert.match(diagnostics.body.next,/^ITEM#[a-f0-9]{64}$/);
+  const badDiagnostics=await jsonResponse(await handler(event("/review/api/reconciliation/diagnostics?profile=home&after=invalid","GET",headers)));
+  assert.equal(badDiagnostics.status,400);
 
   const dlqCase={...caseItem,decision:{type:"operational_dlq",profile:"home",context:{kind:"repair",repairOperationId:"dlq-operation"}}};
   t.mock.method(ReviewStore.prototype,"getCase",async id=>id==="case-1"?dlqCase:undefined);

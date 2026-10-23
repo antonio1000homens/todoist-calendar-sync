@@ -80,6 +80,35 @@ test('reconciliation diagnostics persist accepted delivery, checkpoint, and next
   assert.equal(saved.nextContinuation.afterTaskId, 'task-50');
 });
 
+test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded, and retain case status', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  const detail = { taskId: 'task-7', eventId: 'e'.repeat(256), seriesId: 'series-7', recurrenceOwner: 'calendar',
+    taskUpdatedAt: 'task-v1', calendarEtag: 'etag-v1', mismatchCategories: ['start_mismatch'], taskTitle: 'sensitive title' };
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-1', 'todoist_snapshot_reconcile_unmapped_conflict', detail,
+    { caseId: 'home-decision-1', caseStatus: 'dismissed' });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-2', 'todoist_snapshot_reconcile_unmapped_conflict', detail,
+    { caseId: 'home-decision-1', caseStatus: 'dismissed' });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-3', 'todoist_snapshot_reconcile_unmapped_conflict',
+    { ...detail, calendarEtag: 'etag-v2' }, { caseId: 'home-decision-2', caseStatus: 'open' });
+  await state.recordReconciliationDiagnostic('home', 'new-generation', 'delivery-4', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-5', 'todoist_snapshot_reconcile_baseline_established', detail);
+
+  const first = await state.listReconciliationDiagnostics('home', 'old', 1);
+  assert.equal(first.items.length, 1);
+  assert.ok(first.next);
+  const second = await state.listReconciliationDiagnostics('home', 'old', 1, first.next);
+  assert.equal(second.items.length, 1);
+  assert.equal(second.next, undefined);
+  assert.equal(first.items[0].outcome, 'conflict');
+  assert.equal(first.items[0].taskId, 'task-7');
+  assert.equal(first.items[0].eventId, detail.eventId);
+  assert.equal(first.items[0].recurrenceOwner, 'calendar');
+  assert.equal(first.items[0].detail.taskTitle, undefined);
+  assert.deepEqual(new Set([first.items[0].caseStatus, second.items[0].caseStatus]), new Set(['dismissed','open']));
+  assert.equal((await state.listReconciliationDiagnostics('home', 'new-generation')).items.length, 1);
+});
+
 test('worker failure context is retained separately from its free-form error', async (t) => {
   const db = reconciliationDatabase(t, [run()]);
   await new StateRepository().recordReconciliationFailure('home', 'old', 'provider failure details', {
