@@ -496,8 +496,12 @@ export class ReviewEngine {
       && !event.recurringEventId && !event.recurrence?.length) {
       const oldEvent = snapshots.find(snapshot => snapshot.ref.profile === intent.profile
         && snapshot.ref.side === "calendar" && snapshot.ref.id === selectedTaskSnapshot.mapping!.eventId);
-      if (oldEvent?.mapping?.taskId === task.id && oldEvent.mapping.eventId === selectedTaskSnapshot.mapping.eventId
-        && intent.leftovers[entityKey(oldEvent.ref)] === "unchanged") {
+      if (intent.leftovers[entityKey({ profile:intent.profile, side:"calendar", id:selectedTaskSnapshot.mapping.eventId })] === "unchanged") {
+        if (!oldEvent || !oldEvent.object || oldEvent.mapping?.profile !== intent.profile
+          || oldEvent.mapping.taskId !== task.id || oldEvent.mapping.eventId !== selectedTaskSnapshot.mapping.eventId
+          || oldEvent.mapping.updatedAt !== selectedTaskSnapshot.mapping.updatedAt) {
+          invalidRepairIntent(`The selected task points to Calendar event ${selectedTaskSnapshot.mapping.eventId}, but that event's mapping index is missing or disagrees; refresh the affected items and choose Exclude to retain it while detaching the stale association`);
+        }
         invalidRepairIntent(`Cannot leave the currently mapped Calendar event ${oldEvent.ref.id} and its mapping unchanged while linking Todoist task ${task.id} to ${event.id}; choose Exclude to retain the old event while detaching its obsolete mapping`);
       }
     }
