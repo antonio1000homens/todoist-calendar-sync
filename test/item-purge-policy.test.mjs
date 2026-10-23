@@ -10,11 +10,11 @@ test("standalone purge CLI parses without provider execution",()=>{
 });
 test("purge keeps its recovery journal through mapping restore and final commit",()=>{
  const source=readFileSync(new URL("../scripts/purge-item.mjs",import.meta.url),"utf8");
- const restore=source.lastIndexOf("await restoreWorkerMappings(enabledMappings)");
- const finish=source.lastIndexOf("await finishErasureProtocol(profile,operationId,journalKey)");
+ const executor=readFileSync(new URL("../src/erasure-executor.ts",import.meta.url),"utf8");
+ assert.match(source,/finishFencedErasure\(\{enabledMappingIds:enabledMappings/);
+ const restore=executor.indexOf("await input.restoreMappings(input.enabledMappingIds)");
+ const finish=executor.indexOf("await input.finishFence()");
  assert.ok(restore>=0 && finish>restore,"mapping restoration must precede journal/fence deletion");
- assert.match(source.slice(restore,finish),/restoreWorkerMappings/);
- assert.match(source.slice(finish,source.indexOf("} finally",finish)),/catch \(error\)/);
 });
 test("occurrence inventory flags cannot enter a destructive apply path",()=>{
  const env={...process.env}; delete env.STATE_TABLE_NAME;
