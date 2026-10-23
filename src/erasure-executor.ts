@@ -16,17 +16,11 @@ export interface FencedLifecycle {
   pollMs: number;
   nextRunAt: number;
   lastError?: string;
-  evidence: {
-    mappingsDisableRequestedAt?: number;
-    mappingsDisabledAt?: number;
-    preFenceDrainAt?: number;
-    fenceInstalledAt?: number;
-    workerTimeoutElapsedAt?: number;
-    postTimeoutDrainAt?: number;
-    mappingsRestoredAt?: number;
-    fenceReleasedAt?: number;
-  };
+  evidence: Partial<Record<FencedEvidenceKey, FencedReceipt>>;
 }
+export type FencedEvidenceKey = "mappingsDisableRequested" | "mappingsDisabled" | "preFenceDrain" | "fenceInstalled"
+  | "workerTimeoutElapsed" | "postTimeoutDrain" | "providerDeletionVerified" | "mappingsRestored" | "fenceReleased";
+export interface FencedReceipt { operationId: string; phase: FencedEvidenceKey; receiptId: string; completedAt: number }
 export interface ErasureOperation {
   operationId: string;
   profile: Profile;
@@ -43,6 +37,22 @@ export interface ErasureOperation {
   requestId?: string;
   result?: Record<string, unknown>;
   error?: string;
+}
+export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
+export interface FencedLifecycleAdapters {
+  listWorkerMappings(): Promise<FencedMapping[]>;
+  disableMappings(ids: string[]): Promise<void>;
+  mappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
+  beginFence(profile: string, operationId: string): Promise<void>;
+  restoreMappings(ids: string[]): Promise<void>;
+  finishFence(profile: string, operationId: string): Promise<void>;
+}
+export interface ErasureDeletionVerifier {
+  verifyDeletion(operation: ErasureOperation): Promise<{ providersAbsent: boolean; stateAbsent: boolean }>;
+}
+export interface ErasureSnapshotReader {
+  readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId">>;
 }
 
 const transitions: Record<ErasureOperationStatus, ErasureOperationStatus[]> = {
@@ -77,7 +87,7 @@ function stateTable(): string {
   if (!value) throw new Error("STATE_TABLE_NAME is required");
   return value;
 }
-
+const defaultFencePollMs=5_000;
 const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   disable_mappings:["disable_mappings","confirm_disabled"],
   confirm_disabled:["confirm_disabled","drain_before_fence"],
@@ -91,71 +101,20 @@ const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   release_fence:["release_fence","complete"],
   complete:["complete"],
 };
-const lifecycleEvidenceKeys: Array<keyof FencedLifecycle["evidence"]>=["mappingsDisableRequestedAt","mappingsDisabledAt","preFenceDrainAt","fenceInstalledAt",
-  "workerTimeoutElapsedAt","postTimeoutDrainAt","mappingsRestoredAt","fenceReleasedAt"];
-const phaseEvidence: Partial<Record<`${FencedLifecyclePhase}->${FencedLifecyclePhase}`,keyof FencedLifecycle["evidence"]>>={
-  "disable_mappings->confirm_disabled":"mappingsDisableRequestedAt",
-  "confirm_disabled->drain_before_fence":"mappingsDisabledAt",
-  "drain_before_fence->install_fence":"preFenceDrainAt",
-  "install_fence->wait_worker_timeout":"fenceInstalledAt",
-  "wait_worker_timeout->drain_after_timeout":"workerTimeoutElapsedAt",
-  "drain_after_timeout->ready_for_delete":"postTimeoutDrainAt",
-  "confirm_restored->release_fence":"mappingsRestoredAt",
-  "release_fence->complete":"fenceReleasedAt",
-};
-function validateInitialFencedLifecycle(lifecycle: FencedLifecycle): void {
-  if(lifecycle.phase!=="disable_mappings" || !lifecycle.mappingIds.length
-    || lifecycle.mappingIds.some((id,index)=>!id || lifecycle.mappingIds.indexOf(id)!==index)
-    || lifecycle.enabledMappingIds.some((id,index)=>!lifecycle.mappingIds.includes(id)
-      || lifecycle.enabledMappingIds.indexOf(id)!==index)
-    || !Number.isInteger(lifecycle.timeoutSeconds) || lifecycle.timeoutSeconds<1
-    || !Number.isInteger(lifecycle.pollMs) || lifecycle.pollMs<1000 || lifecycle.pollMs>60_000
-    || !Number.isFinite(lifecycle.nextRunAt) || lifecycle.nextRunAt<0
-    || lifecycleEvidenceKeys.some(key=>lifecycle.evidence?.[key]!==undefined))
-    throw new Error("Invalid initial fenced lifecycle");
-}
-function validateLifecycleAdvance(current: FencedLifecycle, next: FencedLifecycle,
-  expectedStatus: ErasureOperationStatus, nextStatus: ErasureOperationStatus, now: number): void {
-  if(JSON.stringify(current.mappingIds)!==JSON.stringify(next.mappingIds)
-    || JSON.stringify(current.enabledMappingIds)!==JSON.stringify(next.enabledMappingIds)
-    || current.timeoutSeconds!==next.timeoutSeconds || current.pollMs!==next.pollMs)
-    throw new Error("Fenced lifecycle mapping identity and timeout are immutable");
-  if(!lifecyclePhaseEdges[current.phase].includes(next.phase)) throw new Error(`Invalid fenced lifecycle phase ${current.phase} -> ${next.phase}`);
-  const edge=`${current.phase}->${next.phase}` as const;
-  const requiredEvidence=phaseEvidence[edge];
-  for(const key of lifecycleEvidenceKeys) {
-    const before=current.evidence?.[key],after=next.evidence?.[key];
-    if(before!==after && (key!==requiredEvidence || before!==undefined || !Number.isFinite(after)))
-      throw new Error("Fenced lifecycle evidence is immutable outside its verified phase transition");
-  }
-  if(requiredEvidence && !Number.isFinite(next.evidence?.[requiredEvidence]))
-    throw new Error(`Missing persisted evidence for ${current.phase} -> ${next.phase}`);
-  if(requiredEvidence) {
-    const timestamp=next.evidence[requiredEvidence] as number;
-    if(timestamp<current.nextRunAt || timestamp>now) throw new Error("Fenced lifecycle evidence timestamp is outside the current phase window");
-  }
-  if(next.nextRunAt<now) throw new Error("Fenced lifecycle next-run time cannot be backdated");
-  if(next.phase==="wait_worker_timeout" && next.nextRunAt!==(next.evidence.fenceInstalledAt as number)+next.timeoutSeconds*1000+2000)
-    throw new Error("Worker timeout must be scheduled from persisted fence installation evidence");
-  if(nextStatus!==expectedStatus) {
-    const validDelete=expectedStatus==="fencing" && current.phase==="drain_after_timeout"
-      && next.phase==="ready_for_delete" && nextStatus==="deleting";
-    const validSuccess=expectedStatus==="verifying" && current.phase==="release_fence"
-      && next.phase==="complete" && nextStatus==="succeeded";
-    if(!validDelete && !validSuccess) throw new Error("Invalid fenced lifecycle operation status transition");
-  }
-}
 
 /** Exact preview is immutable after submission; workers use conditional status changes. */
 export class ErasureOperationStore {
-  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID) {}
+  #now: () => number;
+  constructor(private readonly db = documentClient, private readonly newConfirmationId = randomUUID,
+    nowForTests: () => number = Date.now) { this.#now=nowForTests; }
 
-  async issueConfirmation(preview: ErasurePreview, now = Date.now(), lifetimeMs = 5 * 60_000): Promise<{
+  async issueConfirmation(preview: ErasurePreview, lifetimeMs = 5 * 60_000): Promise<{
     confirmationId: string; previewFingerprint: string; expiresAt: number;
   }> {
     if (!preview.operationId || preview.selectedActions.deleteTodoist !== true
       || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
       || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
+    const now=this.#now();
     const confirmationId=this.newConfirmationId();
     const previewFingerprint=erasurePreviewFingerprint(preview);
     const expiresAt=now+lifetimeMs;
@@ -166,8 +125,10 @@ export class ErasureOperationStore {
     return {confirmationId,previewFingerprint,expiresAt};
   }
 
-  async create(operation: ErasureOperation, now = Date.now()): Promise<void> {
+  async create(operation: ErasureOperation): Promise<void> {
+    const now=this.#now();
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
+      || operation.lifecycle!==undefined
       || operation.confirmationFingerprint !== operation.previewFingerprint
       || operation.selectedActions.deleteTodoist !== true
       || operation.selectedActions.deleteCalendar !== operation.target.deleteCalendar
@@ -192,6 +153,8 @@ export class ErasureOperationStore {
     patch: Partial<Pick<ErasureOperation,"requestId"|"result"|"error">> = {}): Promise<void> {
     const current=await this.get(id);
     if(!current||current.status!==expected) throw new Error("Erasure operation state changed; refresh before continuing");
+    if(next==="fencing" || current.lifecycle)
+      throw new Error("Fenced lifecycle status transitions must use the action-verifying lifecycle service");
     const updated=advanceErasureOperation(current,next,patch);
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:next, updatedAt=:updatedAt"+(patch.error!==undefined?", error=:error":"")
@@ -203,182 +166,202 @@ export class ErasureOperationStore {
         ...(patch.requestId!==undefined?{":requestId":patch.requestId}:{})}}));
   }
 
-  async startFencedLifecycle(id: string, lifecycle: FencedLifecycle, now = Date.now()): Promise<void> {
-    validateInitialFencedLifecycle(lifecycle);
+  async startFencedLifecycle(id: string, timeoutSeconds: number,
+    listWorkerMappings: () => Promise<FencedMapping[]>): Promise<void> {
+    if(!Number.isInteger(timeoutSeconds) || timeoutSeconds<1) throw new Error("Invalid worker timeout");
     const current=await this.get(id);
     if(!current || current.status!=="queued" || current.lifecycle
       || !current.confirmationId || current.confirmationFingerprint!==current.previewFingerprint
       || current.previewFingerprint!==erasurePreviewFingerprint(current))
       throw new Error("Erasure operation is not ready to begin fencing");
+    const mappings=await listWorkerMappings();
+    if(!mappings.length || mappings.some(item=>!item.id || !["Enabled","Disabled"].includes(item.state)
+      || !item.eventSourceArn.includes(":sqs:")) || new Set(mappings.map(item=>item.id)).size!==mappings.length)
+      throw new Error("Worker SQS mapping inventory is missing, ambiguous, or invalid");
+    const mappingIds=mappings.map(item=>item.id).sort();
+    const lifecycle:FencedLifecycle={phase:"disable_mappings",mappingIds,
+      enabledMappingIds:mappings.filter(item=>item.state==="Enabled").map(item=>item.id).sort(),
+      timeoutSeconds,pollMs:defaultFencePollMs,nextRunAt:this.#now(),evidence:{}};
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:fencing, lifecycle=:lifecycle, updatedAt=:updatedAt",
       ConditionExpression:"#status=:queued AND attribute_not_exists(lifecycle) AND previewFingerprint=:fingerprint",
       ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":queued":"queued",":fencing":"fencing",
-        ":lifecycle":lifecycle,":updatedAt":new Date(now).toISOString(),":fingerprint":current.previewFingerprint}}));
+        ":lifecycle":lifecycle,":updatedAt":new Date(this.#now()).toISOString(),":fingerprint":current.previewFingerprint}}));
   }
 
-  /** CAS one durable fencing phase and optionally its operation status. */
-  async saveLifecycle(id: string, expectedStatus: ErasureOperationStatus, expectedPhase: FencedLifecyclePhase,
-    lifecycle: FencedLifecycle, nextStatus: ErasureOperationStatus = expectedStatus, now = Date.now()): Promise<void> {
-    const current=await this.get(id);
-    if(!current || current.status!==expectedStatus || current.lifecycle?.phase!==expectedPhase)
-      throw new Error("Erasure lifecycle changed; refresh before continuing");
-    validateLifecycleAdvance(current.lifecycle,lifecycle,expectedStatus,nextStatus,now);
-    if(!Number.isFinite(lifecycle.nextRunAt) || lifecycle.nextRunAt<0) throw new Error("Invalid durable erasure next-run time");
-    if(nextStatus!==expectedStatus && !transitions[expectedStatus].includes(nextStatus))
-      throw new Error(`Invalid erasure operation transition ${expectedStatus} -> ${nextStatus}`);
-    await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
+  /** Execute one trusted adapter action/readback and persist its opaque receipt with a CAS. */
+  async advanceFencedLifecycle(id: string, adapters: Omit<FencedLifecycleAdapters,"listWorkerMappings">): Promise<{
+    phase: FencedLifecyclePhase; nextRunAt: number; status: ErasureOperationStatus; waiting: boolean;
+  }> {
+    const operation=await this.get(id);
+    const current=operation?.lifecycle;
+    if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
+      throw new Error("Operation is not in a resumable fenced lifecycle state");
+    const now=this.#now();
+    if(current.nextRunAt>now) return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:true};
+    let next:FencedLifecycle;
+    let nextStatus=operation.status;
+    try {
+      switch(current.phase) {
+        case "disable_mappings":
+          await adapters.disableMappings(current.mappingIds);
+          next=this.#advance(operation.operationId,current,"confirm_disabled",now,"mappingsDisableRequested");
+          break;
+        case "confirm_disabled": {
+          const states=await adapters.mappingStates(current.mappingIds);
+          if(current.mappingIds.some(mappingId=>states.find(item=>item.id===mappingId)?.state!=="Disabled"))
+            next={...current,nextRunAt:now+current.pollMs};
+          else next=this.#advance(operation.operationId,current,"drain_before_fence",now,"mappingsDisabled");
+          break;
+        }
+        case "drain_before_fence": {
+          const {leases}=await adapters.inspectFence(operation.profile);
+          if(leases.length) next={...current,nextRunAt:now+current.pollMs};
+          else next=this.#advance(operation.operationId,current,"install_fence",now,"preFenceDrain");
+          break;
+        }
+        case "install_fence":
+          await adapters.beginFence(operation.profile,operation.operationId);
+          next=this.#advance(operation.operationId,current,"wait_worker_timeout",now,"fenceInstalled");
+          next.nextRunAt=now+current.timeoutSeconds*1000+2000;
+          break;
+        case "wait_worker_timeout":
+          next=this.#advance(operation.operationId,current,"drain_after_timeout",now,"workerTimeoutElapsed");
+          break;
+        case "drain_after_timeout": {
+          const {leases}=await adapters.inspectFence(operation.profile);
+          if(leases.length) next={...current,nextRunAt:now+current.pollMs};
+          else {
+            next=this.#advance(operation.operationId,current,"ready_for_delete",now,"postTimeoutDrain");
+            nextStatus="deleting";
+          }
+          break;
+        }
+        case "ready_for_delete":
+        case "complete":
+          return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:false};
+        case "restore_mappings":
+          await adapters.restoreMappings(current.enabledMappingIds);
+          next=this.#advance(operation.operationId,current,"confirm_restored",now);
+          break;
+        case "confirm_restored": {
+          const states=await adapters.mappingStates(current.mappingIds);
+          const originallyEnabled=new Set(current.enabledMappingIds);
+          if(current.mappingIds.some(mappingId=>states.find(item=>item.id===mappingId)?.state!==
+            (originallyEnabled.has(mappingId)?"Enabled":"Disabled"))) next={...current,nextRunAt:now+current.pollMs};
+          else next=this.#advance(operation.operationId,current,"release_fence",now,"mappingsRestored");
+          break;
+        }
+        case "release_fence": {
+          const {fence,leases}=await adapters.inspectFence(operation.profile);
+          if(leases.length) next={...current,nextRunAt:now+current.pollMs};
+          else if(fence && fence.operationId!==operation.operationId) throw new Error("A different operation owns the profile fence");
+          else {
+            if(fence) await adapters.finishFence(operation.profile,operation.operationId);
+            next=this.#advance(operation.operationId,current,"complete",now,"fenceReleased");
+            nextStatus="succeeded";
+          }
+          break;
+        }
+      }
+    } catch(error) {
+      next={...current,nextRunAt:now+current.pollMs,lastError:error instanceof Error?error.message:String(error)};
+    }
+    await this.#persistLifecycle(operation,next,nextStatus,now);
+    return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus,waiting:next.nextRunAt>now};
+  }
+
+  async markDeletionVerified(id: string, verifier: ErasureDeletionVerifier): Promise<void> {
+    const operation=await this.get(id);
+    const current=operation?.lifecycle;
+    if(!operation || operation.status!=="deleting" || current?.phase!=="ready_for_delete")
+      throw new Error("Erasure is not ready for post-deletion verification");
+    const now=this.#now();
+    const result=await verifier.verifyDeletion(operation);
+    if(!result.providersAbsent || !result.stateAbsent) throw new Error("Deletion postflight readback is not clear; retain the profile fence");
+    const next=this.#advance(operation.operationId,current,"restore_mappings",now,"providerDeletionVerified");
+    await this.#persistLifecycle(operation,next,"verifying",now);
+  }
+
+  async assertReadyForDelete(id: string, reader: ErasureSnapshotReader): Promise<void> {
+    const operation=await this.get(id);
+    if(!operation) throw new Error("Erasure operation was not found");
+    const freshSnapshot=await reader.readFreshSnapshot(operation);
+    const lifecycle=operation.lifecycle;
+    const evidence=lifecycle?.evidence;
+    const required: FencedEvidenceKey[]=["mappingsDisableRequested","mappingsDisabled","preFenceDrain","fenceInstalled","workerTimeoutElapsed","postTimeoutDrain"];
+    const receipts=required.map(key=>evidence?.[key]);
+    const validReceipts=receipts.every((receipt,index)=>receipt?.operationId===operation.operationId
+      && receipt.phase===required[index] && /^[0-9a-f-]{36}$/i.test(receipt.receiptId));
+    const times=receipts.map(receipt=>receipt?.completedAt);
+    if(operation.status!=="deleting" || lifecycle?.phase!=="ready_for_delete"
+      || !operation.confirmationId || operation.confirmationFingerprint!==operation.previewFingerprint
+      || operation.previewFingerprint!==erasurePreviewFingerprint(operation)
+      || operation.previewFingerprint!==erasurePreviewFingerprint(freshSnapshot)
+      || !validReceipts || times.some((time,index)=>!Number.isFinite(time)
+        || (index>0 && (time as number)<(times[index-1] as number)))
+      || (times[4] as number)<(times[3] as number)+lifecycle.timeoutSeconds*1000+2000)
+      throw new Error("Erasure is not ready: persisted action receipts, confirmation, inventory, or lifecycle changed");
+  }
+
+  #advance(operationId:string,current: FencedLifecycle, phase: FencedLifecyclePhase, now: number,
+    evidenceKey?: FencedEvidenceKey): FencedLifecycle {
+    const evidence={...current.evidence};
+    if(evidenceKey) evidence[evidenceKey]={operationId,phase:evidenceKey,receiptId:randomUUID(),completedAt:now};
+    const next={...current,phase,nextRunAt:now,evidence};
+    delete next.lastError;
+    return next;
+  }
+
+  async #persistLifecycle(operation: ErasureOperation, candidate: FencedLifecycle,
+    nextStatus: ErasureOperationStatus, now: number): Promise<void> {
+    const current=operation.lifecycle;
+    if(!current || !lifecyclePhaseEdges[current.phase].includes(candidate.phase)
+      || JSON.stringify(current.mappingIds)!==JSON.stringify(candidate.mappingIds)
+      || JSON.stringify(current.enabledMappingIds)!==JSON.stringify(candidate.enabledMappingIds)
+      || current.timeoutSeconds!==candidate.timeoutSeconds || current.pollMs!==candidate.pollMs)
+      throw new Error("Invalid fenced lifecycle transition or immutable mapping inventory change");
+    const required=({
+      "disable_mappings->confirm_disabled":"mappingsDisableRequested",
+      "confirm_disabled->drain_before_fence":"mappingsDisabled",
+      "drain_before_fence->install_fence":"preFenceDrain",
+      "install_fence->wait_worker_timeout":"fenceInstalled",
+      "wait_worker_timeout->drain_after_timeout":"workerTimeoutElapsed",
+      "drain_after_timeout->ready_for_delete":"postTimeoutDrain",
+      "ready_for_delete->restore_mappings":"providerDeletionVerified",
+      "confirm_restored->release_fence":"mappingsRestored",
+      "release_fence->complete":"fenceReleased",
+    } as Partial<Record<string,FencedEvidenceKey>>)[`${current.phase}->${candidate.phase}`];
+    for(const key of Object.keys(current.evidence) as FencedEvidenceKey[])
+      if(JSON.stringify(candidate.evidence[key])!==JSON.stringify(current.evidence[key]))
+        throw new Error("Persisted lifecycle receipts cannot be changed or removed");
+    for(const key of Object.keys(candidate.evidence) as FencedEvidenceKey[])
+      if(current.evidence[key]===undefined && key!==required)
+        throw new Error("A lifecycle receipt can only be written by its verified phase action");
+    if(required) {
+      const receipt=candidate.evidence[required];
+      if(!receipt || receipt.operationId!==operation.operationId || receipt.phase!==required
+        || !/^[0-9a-f-]{36}$/i.test(receipt.receiptId) || receipt.completedAt<current.nextRunAt || receipt.completedAt>now)
+        throw new Error("Lifecycle phase did not produce its required operation-bound receipt");
+    }
+    const validDelete=operation.status==="fencing"&&current.phase==="drain_after_timeout"
+      &&candidate.phase==="ready_for_delete"&&nextStatus==="deleting";
+    const validSuccess=operation.status==="verifying"&&current.phase==="release_fence"
+      &&candidate.phase==="complete"&&nextStatus==="succeeded";
+    const validVerify=operation.status==="deleting"&&current.phase==="ready_for_delete"
+      &&candidate.phase==="restore_mappings"&&nextStatus==="verifying";
+    if(nextStatus!==operation.status&&!validDelete&&!validSuccess&&!validVerify) throw new Error("Invalid lifecycle operation status transition");
+    if(candidate.nextRunAt<now) throw new Error("Durable next-run time cannot be backdated");
+    if(candidate.phase==="wait_worker_timeout"&&candidate.nextRunAt!==
+      (candidate.evidence.fenceInstalled?.completedAt??0)+candidate.timeoutSeconds*1000+2000)
+      throw new Error("Worker timeout must start at persisted fence installation time");
+    await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
       UpdateExpression:"SET #status=:next, lifecycle=:lifecycle, updatedAt=:updatedAt",
       ConditionExpression:"#status=:expected AND lifecycle.#phase=:phase AND previewFingerprint=:fingerprint",
-      ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":expected":expectedStatus,
-        ":next":nextStatus,":phase":expectedPhase,":lifecycle":lifecycle,":updatedAt":new Date(now).toISOString(),
-        ":fingerprint":current.previewFingerprint}}));
+      ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":expected":operation.status,
+        ":next":nextStatus,":phase":current.phase,":lifecycle":candidate,":updatedAt":new Date(now).toISOString(),
+        ":fingerprint":operation.previewFingerprint}}));
   }
-}
-
-export interface FencedLifecycleDependencies {
-  now(): number;
-  disableMappings(ids: string[]): Promise<void>;
-  mappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
-  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
-  beginFence(profile: string, operationId: string): Promise<void>;
-  restoreMappings(ids: string[]): Promise<void>;
-  finishFence(profile: string, operationId: string): Promise<void>;
-  save(expectedStatus: ErasureOperationStatus, expectedPhase: FencedLifecyclePhase,
-    next: FencedLifecycle, nextStatus?: ErasureOperationStatus): Promise<void>;
-}
-
-const defaultFencePollMs=5_000;
-function nextPhase(current: FencedLifecycle, phase: FencedLifecyclePhase, now: number,
-  patch: Partial<FencedLifecycle> = {}): FencedLifecycle {
-  const next={...current,...patch,phase,nextRunAt:now};
-  delete next.lastError;
-  return next;
-}
-
-export function initialFencedLifecycle(input: { mappingIds: string[]; enabledMappingIds: string[]; timeoutSeconds: number }, now=Date.now()): FencedLifecycle {
-  const mappingIds=[...new Set(input.mappingIds)].sort();
-  const enabledMappingIds=[...new Set(input.enabledMappingIds)].sort();
-  if(!mappingIds.length || mappingIds.some(id=>!id) || enabledMappingIds.some(id=>!mappingIds.includes(id))
-    || !Number.isInteger(input.timeoutSeconds) || input.timeoutSeconds<1) throw new Error("Invalid fenced lifecycle mapping inventory");
-  return {phase:"disable_mappings",mappingIds,enabledMappingIds,timeoutSeconds:input.timeoutSeconds,
-    pollMs:defaultFencePollMs,nextRunAt:now,evidence:{}};
-}
-
-/**
- * Perform at most one bounded phase per invocation. All external actions are
- * idempotent or followed by a readback phase so an ambiguous crash is safe to
- * retry. A failure retains the current phase and schedules a durable retry.
- */
-export async function advanceFencedLifecycle(input: {
-  operation: Pick<ErasureOperation,"operationId"|"profile"|"status"|"lifecycle">;
-  dependencies: FencedLifecycleDependencies;
-}): Promise<{ phase: FencedLifecyclePhase; nextRunAt: number; status: ErasureOperationStatus; waiting: boolean }> {
-  const {operation,dependencies:dep}=input;
-  const current=operation.lifecycle;
-  if(!current) throw new Error("Fenced lifecycle is not initialized");
-  if(operation.status!=="fencing" && operation.status!=="deleting" && operation.status!=="verifying")
-    throw new Error("Operation is not in a resumable fenced lifecycle state");
-  const now=dep.now();
-  if(current.nextRunAt>now) return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:true};
-
-  let next: FencedLifecycle;
-  let nextStatus: ErasureOperationStatus|undefined;
-  try {
-    switch(current.phase) {
-      case "disable_mappings":
-        await dep.disableMappings(current.mappingIds);
-        next=nextPhase(current,"confirm_disabled",now,{evidence:{...current.evidence,mappingsDisableRequestedAt:now}});
-        break;
-      case "confirm_disabled": {
-        const states=await dep.mappingStates(current.mappingIds);
-        if(current.mappingIds.some(id=>states.find(item=>item.id===id)?.state!=="Disabled"))
-          next={...current,nextRunAt:now+current.pollMs};
-        else next=nextPhase(current,"drain_before_fence",now,{evidence:{...current.evidence,mappingsDisabledAt:now}});
-        break;
-      }
-      case "drain_before_fence": {
-        const {leases}=await dep.inspectFence(operation.profile);
-        if(leases.length) next={...current,nextRunAt:now+current.pollMs};
-        else next=nextPhase(current,"install_fence",now,{evidence:{...current.evidence,preFenceDrainAt:now}});
-        break;
-      }
-      case "install_fence":
-        await dep.beginFence(operation.profile,operation.operationId);
-        next={...current,phase:"wait_worker_timeout",nextRunAt:now+current.timeoutSeconds*1000+2000};
-        next.evidence={...current.evidence,fenceInstalledAt:now};
-        delete next.lastError;
-        break;
-      case "wait_worker_timeout":
-        next=nextPhase(current,"drain_after_timeout",now,{evidence:{...current.evidence,workerTimeoutElapsedAt:now}});
-        break;
-      case "drain_after_timeout": {
-        const {leases}=await dep.inspectFence(operation.profile);
-        if(leases.length) next={...current,nextRunAt:now+current.pollMs};
-        else {
-          next=nextPhase(current,"ready_for_delete",now,{evidence:{...current.evidence,postTimeoutDrainAt:now}});
-          nextStatus="deleting";
-        }
-        break;
-      }
-      case "ready_for_delete":
-      case "complete":
-        return {phase:current.phase,nextRunAt:current.nextRunAt,status:operation.status,waiting:false};
-      case "restore_mappings":
-        await dep.restoreMappings(current.enabledMappingIds);
-        next=nextPhase(current,"confirm_restored",now);
-        break;
-      case "confirm_restored": {
-        const states=await dep.mappingStates(current.mappingIds);
-        const enabled=new Set(current.enabledMappingIds);
-        if(current.mappingIds.some(id=>states.find(item=>item.id===id)?.state!==(enabled.has(id)?"Enabled":"Disabled")))
-          next={...current,nextRunAt:now+current.pollMs};
-        else next=nextPhase(current,"release_fence",now,{evidence:{...current.evidence,mappingsRestoredAt:now}});
-        break;
-      }
-      case "release_fence": {
-        const {fence,leases}=await dep.inspectFence(operation.profile);
-        if(leases.length) next={...current,nextRunAt:now+current.pollMs};
-        else if(fence && fence.operationId!==operation.operationId) throw new Error("A different operation owns the profile fence");
-        else {
-          // Missing fence means a previous invocation released it and crashed
-          // before persisting the phase; treat that ambiguous response safely.
-          if(fence) await dep.finishFence(operation.profile,operation.operationId);
-          next=nextPhase(current,"complete",now,{evidence:{...current.evidence,fenceReleasedAt:now}});
-          nextStatus="succeeded";
-        }
-        break;
-      }
-    }
-  } catch(error) {
-    next={...current,nextRunAt:now+current.pollMs,lastError:error instanceof Error?error.message:String(error)};
-  }
-  await dep.save(operation.status,current.phase,next,nextStatus);
-  return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus??operation.status,waiting:next.nextRunAt>now};
-}
-
-export function beginFencedRestoreLifecycle(current: FencedLifecycle, now=Date.now()): FencedLifecycle {
-  if(current.phase!=="ready_for_delete") throw new Error("Provider deletion has not reached its fenced lifecycle boundary");
-  return nextPhase(current,"restore_mappings",now);
-}
-
-/** Require the exact consumed preview plus a fresh readback immediately before provider mutation. */
-export function assertErasureReadyForDelete(operation: ErasureOperation,
-  freshSnapshot: Omit<ErasurePreview,"operationId">): void {
-  const evidence=operation.lifecycle?.evidence;
-  const evidenceTimeline=[evidence?.mappingsDisableRequestedAt,evidence?.mappingsDisabledAt,evidence?.preFenceDrainAt,
-    evidence?.fenceInstalledAt,evidence?.workerTimeoutElapsedAt,evidence?.postTimeoutDrainAt];
-  if(operation.status!=="deleting" || operation.lifecycle?.phase!=="ready_for_delete"
-    || !operation.confirmationId || operation.confirmationFingerprint!==operation.previewFingerprint
-    || operation.previewFingerprint!==erasurePreviewFingerprint(operation)
-    || operation.previewFingerprint!==erasurePreviewFingerprint(freshSnapshot)
-    || !Number.isFinite(evidence?.mappingsDisabledAt) || !Number.isFinite(evidence?.preFenceDrainAt)
-    || !Number.isFinite(evidence?.mappingsDisableRequestedAt)
-    || !Number.isFinite(evidence?.fenceInstalledAt) || !Number.isFinite(evidence?.workerTimeoutElapsedAt)
-    || !Number.isFinite(evidence?.postTimeoutDrainAt)
-    || evidenceTimeline.some((timestamp,index)=>index>0 && (timestamp as number)<(evidenceTimeline[index-1] as number))
-    || (evidence?.workerTimeoutElapsedAt??0)<(evidence?.fenceInstalledAt??0)+operation.lifecycle.timeoutSeconds*1000+2000)
-    throw new Error("Erasure is not ready: confirmation, inventory, or fenced lifecycle changed");
 }
 
 export async function enterFencedErasure(input: {
