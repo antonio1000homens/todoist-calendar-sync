@@ -392,7 +392,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
         if (!value || typeof value !== "object") return;
         for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
-          if (typeof item === "string" && ["taskId", "providerTaskId", "linkedTaskId", "ownerTaskId"].includes(name)) identityRefs.taskIds.add(item);
+          if (typeof item === "string" && ["taskId", "providerTaskId", "linkedTaskId", "ownerTaskId", "discardedTaskId", "retainedTaskId"].includes(name)) identityRefs.taskIds.add(item);
           if (typeof item === "string" && ["eventId", "providerEventId", "masterEventId", "activeInstanceId", "occurrenceId", "selectedEventId"].includes(name)) identityRefs.eventIds.add(item);
           if (typeof item === "string" && name === "seriesId") identityRefs.seriesIds.add(item);
           collectIdentityRefs(item, name);
@@ -434,7 +434,29 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
         collectIdentityRefs(detail);
         await audit(profile, action, detail);
-        if (delivery && action !== "todoist_erased_item_replay_suppressed") await manual?.observeAudit(delivery, profile, action, detail);
+        if (delivery && action !== "todoist_erased_item_replay_suppressed") {
+          const observedCase = await manual?.observeAudit(delivery, profile, action, detail);
+          if (delivery.kind === "reconcile" && delivery.reconcile?.generation) {
+            try {
+              let linkedCase = observedCase;
+              if (!linkedCase?.caseId) {
+                try { linkedCase = await state!.getConflictIncidentCase(profile, action, detail) || linkedCase; }
+                catch (error) {
+                  log("reconciliation_case_link_lookup_failed", { profile, generation:delivery.reconcile.generation,
+                    deliveryId:delivery.id, action, error:serializeError(error) });
+                }
+              }
+              linkedCase ||= { caseStatus: "detector_unavailable" };
+              await state!.recordReconciliationDiagnostic(profile, delivery.reconcile.generation, delivery.id, action, detail,
+                linkedCase);
+            } catch (error) {
+              log("reconciliation_item_diagnostic_persist_failed", {
+                profile, generation: delivery.reconcile.generation, deliveryId: delivery.id, action,
+                error: serializeError(error),
+              });
+            }
+          }
+        }
       };
 
       // A Calendar delta must never advance its incremental cursor past changes

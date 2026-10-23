@@ -1554,8 +1554,9 @@ export class ManualInterventionService {
     profile: Profile,
     action: string,
     detail: Record<string, unknown>,
-  ): Promise<void> {
-    if (!this.enabled || delivery.kind === "manual") return;
+  ): Promise<{ caseId?: string; caseStatus: string }> {
+    if (!this.enabled) return { caseStatus: "detector_disabled" };
+    if (delivery.kind === "manual") return { caseStatus: "not_applicable" };
     let type: ManualDecisionType | undefined;
     if (action === "calendar_snapshot_unmapped_ambiguous") type = "calendar_snapshot_unmapped_ambiguous";
     else if (action === "calendar_snapshot_recurring_ambiguous") type = "calendar_snapshot_recurring_ambiguous";
@@ -1564,7 +1565,7 @@ export class ManualInterventionService {
     else if (action === "todoist_snapshot_reconcile_cancelled_projection_blocked") type = "todoist_cancelled_projection_blocked";
     else if (action === "reconciliation_mutation_budget_exhausted" || action === "calendar_snapshot_reconcile_mutation_budget_exhausted") type = "operational_mutation_budget";
     else if (action.includes("circuit_open") || action.includes("circuit_deferred")) type = "operational_circuit_open";
-    if (!type) return;
+    if (!type) return { caseStatus: "not_actionable" };
 
     const eventId = typeof detail.eventId === "string" ? detail.eventId : undefined;
     const taskId = typeof detail.taskId === "string" ? detail.taskId : undefined;
@@ -1597,7 +1598,7 @@ export class ManualInterventionService {
       : [];
     const canEnrichConflict = recurringConflict
       && Boolean(taskId || eventId || candidateEventIds.length || candidateTaskIds.length);
-    await this.createDecision(
+    const observed = await this.createDecision(
       profile,
       type,
       recurringConflict
@@ -1707,6 +1708,13 @@ export class ManualInterventionService {
           }
         : undefined,
     );
+    const decision = observed.decision;
+    if (!decision) return { caseStatus: observed.mode === "off" ? "policy_off" : observed.mode === "observe" ? "observe_only" : "not_created" };
+    const dismissed = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
+    const status = decision.status === "pending" ? "open"
+      : decision.status === "resolved" && dismissed.has(String(decision.resolution || "").toLowerCase()) ? "dismissed"
+        : decision.status;
+    return { caseId: decision.decisionId, caseStatus: status };
   }
 
   async reportDeliveryFailure(delivery: Delivery | undefined, error: unknown): Promise<void> {

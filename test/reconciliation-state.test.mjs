@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 process.env.STATE_TABLE_NAME ||= 'test-reconciliation-state';
-const { StateRepository, reconciliationSummary } = await import('../dist/repository.js');
+const { StateRepository, reconciliationDiagnosticOutcome, reconciliationSummary } = await import('../dist/repository.js');
 const { reconciliationDatabase } = await import('./support/reconciliation-state.mjs');
 
 const old = new Date(Date.now() - 30 * 60_000).toISOString();
@@ -78,6 +78,66 @@ test('reconciliation diagnostics persist accepted delivery, checkpoint, and next
   assert.equal(saved.progressCheckpoint.afterTaskId, 'task-25');
   assert.equal(saved.nextContinuation.deliveryId, 'reconcile:home:old:chunk:2');
   assert.equal(saved.nextContinuation.afterTaskId, 'task-50');
+});
+
+test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded, and retain case status', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  const detail = { taskId: 'task-7', eventId: 'e'.repeat(256), seriesId: 'series-7', recurrenceOwner: 'calendar',
+    taskUpdatedAt: 'task-v1', calendarEtag: 'etag-v1', mismatchCategories: ['start_mismatch'], taskTitle: 'sensitive title' };
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-1', 'todoist_snapshot_reconcile_unmapped_conflict', detail,
+    { caseId: 'home-decision-1', caseStatus: 'dismissed' });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-2', 'todoist_snapshot_reconcile_unmapped_conflict', detail,
+    { caseId: 'home-decision-1', caseStatus: 'dismissed' });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-3', 'todoist_snapshot_reconcile_unmapped_conflict',
+    { ...detail, calendarEtag: 'etag-v2' }, { caseId: 'home-decision-2', caseStatus: 'open' });
+  await state.recordReconciliationDiagnostic('home', 'new-generation', 'delivery-4', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
+  await state.recordReconciliationDiagnostic('work', 'old', 'delivery-work', 'todoist_snapshot_reconcile_unmapped_conflict',
+    { taskId: 'work-only-task', eventId: 'work-only-event' });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-5', 'todoist_snapshot_reconcile_baseline_established', detail);
+
+  const first = await state.listReconciliationDiagnostics('home', 'old', 1);
+  assert.equal(first.items.length, 1);
+  assert.ok(first.next);
+  const second = await state.listReconciliationDiagnostics('home', 'old', 1, first.next);
+  assert.equal(second.items.length, 1);
+  assert.equal(second.next, undefined);
+  assert.equal(first.items[0].outcome, 'conflict');
+  assert.equal(first.items[0].taskId, 'task-7');
+  assert.equal(first.items[0].eventId, detail.eventId);
+  assert.equal(first.items[0].recurrenceOwner, 'calendar');
+  assert.equal(first.items[0].detail.taskTitle, undefined);
+  assert.deepEqual(new Set([first.items[0].caseStatus, second.items[0].caseStatus]), new Set(['dismissed','open']));
+  assert.equal((await state.listReconciliationDiagnostics('home', 'new-generation')).items.length, 1);
+  const homeRows = await state.listReconciliationDiagnostics('home', 'old', 50);
+  const workRows = await state.listReconciliationDiagnostics('work', 'old', 50);
+  assert.ok(homeRows.items.every(item => item.profile === 'home' && item.taskId !== 'work-only-task'));
+  assert.deepEqual(workRows.items.map(item => item.taskId), ['work-only-task']);
+});
+
+test('consolidated duplicates and Calendar mutation-budget exhaustion persist actionable item identities', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  assert.equal(reconciliationDiagnosticOutcome('todoist_snapshot_consolidated_duplicate_ignored'), 'blocked');
+  assert.equal(reconciliationDiagnosticOutcome('calendar_snapshot_reconcile_mutation_budget_exhausted'), 'blocked');
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-duplicate',
+    'todoist_snapshot_consolidated_duplicate_ignored', {
+      taskId: 'discarded-task', discardedTaskId: 'discarded-task', retainedTaskId: 'retained-task', decisionId: 'decision-1',
+    });
+  await state.recordReconciliationDiagnostic('home', 'old', 'delivery-budget',
+    'calendar_snapshot_reconcile_mutation_budget_exhausted', { eventId: 'blocked-event', reason: 'mutation_budget_exhausted' });
+
+  const { items } = await state.listReconciliationDiagnostics('home', 'old');
+  const duplicate = items.find(item => item.action === 'todoist_snapshot_consolidated_duplicate_ignored');
+  const budget = items.find(item => item.action === 'calendar_snapshot_reconcile_mutation_budget_exhausted');
+  assert.equal(duplicate.outcome, 'blocked');
+  assert.equal(duplicate.taskId, 'discarded-task');
+  assert.equal(duplicate.detail.discardedTaskId, 'discarded-task');
+  assert.equal(duplicate.detail.retainedTaskId, 'retained-task');
+  assert.equal(duplicate.detail.decisionId, 'decision-1');
+  assert.equal(budget.outcome, 'blocked');
+  assert.equal(budget.eventId, 'blocked-event');
+  assert.equal(budget.reason, 'mutation_budget_exhausted');
 });
 
 test('worker failure context is retained separately from its free-form error', async (t) => {

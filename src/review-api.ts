@@ -345,6 +345,24 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       }
       return response(202,{operation,queueDelivery:{enqueued:true,attempt:operation.attempt}});
     }
+    if (method === "GET" && segments[0] === "reconciliation" && segments[1] === "diagnostics" && segments.length === 2) {
+      const selected = profile(event.queryStringParameters?.profile || null);
+      const state = new StateRepository();
+      const current = await state.getReconciliationState(selected);
+      const generation = event.queryStringParameters?.generation || current?.generation;
+      if (!generation || !/^[A-Za-z0-9._-]{1,200}$/.test(generation)) fail(400,"A valid reconciliation generation is required");
+      const rawLimit = Number(event.queryStringParameters?.limit || 50);
+      if (!Number.isFinite(rawLimit) || rawLimit < 1 || rawLimit > 50) fail(400,"Diagnostic page limit must be between 1 and 50");
+      const after = event.queryStringParameters?.after;
+      if (after && !/^ITEM#[a-f0-9]{64}$/.test(after)) fail(400,"Invalid reconciliation diagnostic cursor");
+      const result = await state.listReconciliationDiagnostics(selected,generation,rawLimit,after);
+      const items = await Promise.all(result.items.map(async item => {
+        if (!item.caseId) return item;
+        const currentCase = await store.getCase(item.caseId);
+        return { ...item, caseStatus: currentCase?.status || item.caseStatus || "case_not_found" };
+      }));
+      return response(200,{profile:selected,generation,items,next:result.next});
+    }
     if (method === "GET" && segments[0] === "reconciliation" && segments.length === 1) {
       const selected=profile(event.queryStringParameters?.profile || null);
       const [reconciliation, actionableCaseCount] = await Promise.all([

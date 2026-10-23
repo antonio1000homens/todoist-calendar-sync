@@ -32,6 +32,7 @@ function App() {
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
   const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
+  const [reconciliationDiagnostics,setReconciliationDiagnostics] = useState<any[]>([]), [diagnosticCursor,setDiagnosticCursor] = useState<string>();
   const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
@@ -78,7 +79,24 @@ function App() {
   const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
   const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
   const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
-  const refreshReconciliation = async (forProfile:string) => { const data=await api(`reconciliation?profile=${forProfile}`); setReconciliation(data); return data; };
+  const refreshReconciliation = async (forProfile:string) => {
+    const data=await api(`reconciliation?profile=${forProfile}`);
+    setReconciliation(data);
+    const generation=data.reconciliation?.generation;
+    if(generation){
+      const diagnostics=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}`);
+      setReconciliationDiagnostics(diagnostics.items||[]);setDiagnosticCursor(diagnostics.next);
+    } else {setReconciliationDiagnostics([]);setDiagnosticCursor(undefined);}
+    return data;
+  };
+  const loadMoreReconciliationDiagnostics = async () => {
+    const generation=reconciliation?.reconciliation?.generation;
+    if(!generation||!diagnosticCursor)return;
+    try {
+      const next=await api(`reconciliation/diagnostics?profile=${reconcileProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(diagnosticCursor)}`);
+      setReconciliationDiagnostics(current=>[...current,...(next.items||[])]);setDiagnosticCursor(next.next);
+    } catch(error:any) {setMessage(error.message);}
+  };
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
@@ -294,6 +312,22 @@ function App() {
     </header>
     {message && <p className="notice" role="status">{message}</p>}
     {reconciliation?.summary&&<p className="notice" role="status">Run: {reconciliation.summary.runStatus}; unresolved in this run: {reconciliation.summary.runUnresolved}. Actionable review cases remaining: {reconciliation.summary.actionableCaseCount}.</p>}
+    {reconciliation?.reconciliation?.generation&&<section className="preview reconciliation-items"><h2>Unresolved items for this run</h2>
+      <p>Generation {reconciliation.reconciliation.generation}. Provider objects are not changed by this report.</p>
+      {reconciliationDiagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
+        {reconciliationDiagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
+          <strong>{item.outcome.replaceAll("_"," ")}</strong> · {item.reason.replaceAll("_"," ")}<br/>
+          <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
+          {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
+          {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
+          {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
+          {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
+          {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
+          <span>Recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
+        </li>)}
+      </ul>}
+      {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more unresolved items</button>}
+    </section>}
     <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>

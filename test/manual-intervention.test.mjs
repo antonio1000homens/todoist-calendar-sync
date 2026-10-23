@@ -594,6 +594,32 @@ test('unmapped conflict creates one stable non-destructive manual decision', asy
   assert.ok(decision.permittedActions.every((action) => !action.autoAllowed));
 });
 
+test('changed provider state after dismissal creates a new case while unchanged repeats coalesce', async (t) => {
+  t.mock.method(ReviewStore.prototype, 'observeDecision', async () => {});
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions=new FakeDecisionStore(),notifier=new FakeNotifier();
+  const service=new ManualInterventionService(decisions,notifier,async()=>({
+    todoist:{async getTask(){return {id:'task-1',content:'Annual task',due:{date:'2027-01-01',is_recurring:true}};}},
+    calendar:{async getEvent(){return {id:'event-1',status:'confirmed',summary:'Changed event',start:{date:'2027-01-02'}};}},
+  }),new FakePolicyStore());
+  const delivery={...todoistDeleteDelivery(),kind:'reconcile',id:'reconcile-state-change',reconcile:{generation:'generation-2',reason:'manual'}};
+  const first=await service.observeAudit(delivery,'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
+    taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch'],taskUpdatedAt:'task-v1',calendarEtag:'etag-v1',
+  });
+  await decisions.finish(first.caseId,'resolved','dismiss');
+  const changed=await service.observeAudit(delivery,'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
+    taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch','start_mismatch'],taskUpdatedAt:'task-v2',calendarEtag:'etag-v2',
+  });
+  const repeated=await service.observeAudit({...delivery,id:'reconcile-state-change-2'},'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
+    taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch','start_mismatch'],taskUpdatedAt:'task-v2',calendarEtag:'etag-v2',
+  });
+  assert.notEqual(first.caseId,changed.caseId);
+  assert.equal(first.caseStatus,'open');
+  assert.equal(changed.caseStatus,'open');
+  assert.equal(repeated.caseId,changed.caseId);
+  assert.equal(notifier.posted.length,2);
+});
+
 test('cancelled Calendar projection conflict is a distinct manual decision type', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
