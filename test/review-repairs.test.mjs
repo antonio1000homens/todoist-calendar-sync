@@ -204,6 +204,17 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
         }
         return clone(next);
       },
+      async updateSharedEventPropertiesIfUnchanged(id, etag, updates) {
+        const current=eventMap.get(id);
+        assert.equal(current?.etag,etag);
+        const shared={...(current.extendedProperties?.shared||{})};
+        for(const [name,value] of Object.entries(updates)) {
+          if(value===null)delete shared[name];else shared[name]=value;
+        }
+        const next={...clone(current),etag:`etag-metadata-${writes.length}`,
+          extendedProperties:{...(current.extendedProperties||{}),shared}};
+        eventMap.set(id,next);writes.push(["instance-metadata",id]);return clone(next);
+      },
       async createRepairEventOnce(value,operationId) {
         if(eventMap.has(value.id))return get(eventMap,value.id);
         const next={...clone(value),status:"confirmed",etag:"created-etag",extendedProperties:{...value.extendedProperties,shared:{...value.extendedProperties?.shared,syncRepairId:operationId}}};
@@ -316,6 +327,59 @@ test("elapsed Calendar history repair removes only the old event link and preser
   assert.equal(h.mappingMap.get("task").eventId,"future");
   assert.equal(h.ownerMappingMap.get("task").eventId,"future");
   assert.deepEqual(h.writes,[ ["event","elapsed"] ]);
+});
+
+test("elapsed occurrence in a Calendar-owned series becomes history without changing its master or future mapping",async t=>{
+  const mapping={profile:"home",taskId:"task",eventId:"active",recurrenceOwner:"calendar",seriesId:"calendar-series",
+    masterEventId:"master",activeInstanceId:"active",calendarProgressVersion:1,updatedAt:"2026-10-02T00:00:00Z"};
+  const shared={taskId:"task",taskUrl:"https://todoist.example/task",syncSource:"todoist-calendar-sync",
+    syncRecurrenceOwner:"calendar",custom:"keep"};
+  const master=event("master",{iCalUID:"calendar-series",recurrence:["RRULE:FREQ=WEEKLY"],start:{date:"2025-01-01"},end:{date:"2025-01-02"},
+    extendedProperties:{shared:{...shared}}});
+  const elapsed=event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},recurringEventId:"master",
+    originalStartTime:{date:"2025-05-02"},extendedProperties:{shared:{...shared}}});
+  const active=event("active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurringEventId:"master",
+    originalStartTime:{date:"2099-12-18"},extendedProperties:{shared:{...shared}}});
+  const link={...mapping,owner:"calendar",updatedAt:"2026-10-04T00:00:00Z"};
+  const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[mapping],recurrence:link});
+  const masterBefore=clone(h.eventMap.get("master")),activeBefore=clone(h.eventMap.get("active"));
+  const mappingBefore=clone(h.mappingMap.get("task")),linkBefore=clone(h.recurrences.get("calendar-series"));
+  const input=intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed",scope:"occurrence"});
+  const preview=await h.engine.preview(actor,input);
+  assert.equal(preview.elapsedCalendarHistoryPlan.recurringMasterId,"master");
+  assert.ok(preview.changes.some(change=>change.includes("Keep Calendar master master and its RRULE unchanged")));
+
+  const result=await h.execute(input);
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.eventMap.get("elapsed").status,"confirmed");
+  assert.equal(h.eventMap.get("elapsed").recurringEventId,"master");
+  assert.deepEqual(h.eventMap.get("elapsed").originalStartTime,{date:"2025-05-02"});
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.syncHistoryOnly,"true");
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.taskId,undefined);
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.syncRecurrenceOwner,undefined);
+  assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.custom,"keep");
+  assert.deepEqual(h.eventMap.get("master"),masterBefore);
+  assert.deepEqual(h.eventMap.get("active"),activeBefore);
+  assert.deepEqual(h.mappingMap.get("task"),mappingBefore);
+  assert.deepEqual(h.eventMappingMap.get("home:active"),mappingBefore);
+  assert.deepEqual(h.ownerMappingMap.get("task"),mappingBefore);
+  assert.deepEqual(h.recurrences.get("calendar-series"),linkBefore);
+  assert.deepEqual(h.writes,[["instance-metadata","elapsed"]]);
+});
+
+test("elapsed recurring occurrence refuses a conflicting event mapping before provider writes",async t=>{
+  const mapping={profile:"home",taskId:"task",eventId:"active",recurrenceOwner:"calendar",seriesId:"calendar-series",
+    masterEventId:"master",activeInstanceId:"active",calendarProgressVersion:1,updatedAt:"2026-10-02T00:00:00Z"};
+  const shared={taskId:"task",syncRecurrenceOwner:"calendar"};
+  const master=event("master",{iCalUID:"calendar-series",recurrence:["RRULE:FREQ=WEEKLY"],extendedProperties:{shared:{...shared}}});
+  const elapsed=event("elapsed",{start:{date:"2025-05-02"},end:{date:"2025-05-03"},recurringEventId:"master",
+    originalStartTime:{date:"2025-05-02"},extendedProperties:{shared:{...shared}}});
+  const active=event("active",{start:{date:"2099-12-18"},end:{date:"2099-12-21"},recurringEventId:"master",
+    originalStartTime:{date:"2099-12-18"},extendedProperties:{shared:{...shared}}});
+  const h=harness(t,{events:[master,elapsed,active],tasks:[task("task")],mappings:[mapping],recurrence:{...mapping,owner:"calendar"}});
+  h.eventMappingMap.set("home:elapsed",{...mapping,eventId:"elapsed",activeInstanceId:"active",updatedAt:"2026-10-03T00:00:00Z"});
+  await assert.rejects(h.engine.preview(actor,intent({action:"calendar-history-only",taskId:"task",eventId:"elapsed"})),/own event mapping/);
+  assert.deepEqual(h.writes,[]);
 });
 
 test("elapsed Calendar history preview fails closed when task and owner indexes disagree",async t=>{

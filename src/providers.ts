@@ -298,6 +298,19 @@ export class GoogleCalendar {
     );
   }
 
+  /** Patch only shared identity keys on one exact event or recurring instance. */
+  async updateSharedEventPropertiesIfUnchanged(
+    eventId: string,
+    etag: string,
+    shared: Record<string, string | null>,
+  ): Promise<CalendarEvent> {
+    if (!eventId || !etag || !Object.keys(shared).length) throw new Error("Manual Calendar metadata update requires an exact event ID, ETag, and properties");
+    return this.request(
+      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`,
+      { method: "PATCH", headers: { "If-Match": etag }, body: JSON.stringify({ extendedProperties: { shared } }) },
+    );
+  }
+
   async deleteEvent(eventId: string, etag?: string): Promise<void> {
     await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, {
       method: "DELETE", ...(etag ? { headers: { "If-Match": etag } } : {}),
