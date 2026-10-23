@@ -20,7 +20,11 @@ export class ReviewStore {
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const id = decision.decisionId, existing = await this.getCase(id);
-    if (existing) return;
+    const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
+    if (existing) {
+      if (existing.status === "open" && conflictKey) await this.coalesceConflictIncidents(decision.profile, conflictKey, id);
+      return;
+    }
     const context = decision.context || {};
     const item: ReviewCase = {
       id, profile: decision.profile, title: decision.type.replaceAll("_", " "), reason: decision.sourceAuditAction || decision.type,
@@ -29,6 +33,7 @@ export class ReviewStore {
         : "open",
       decision, taskId: decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined),
       eventId: decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined),
+      conflictKey,
       reconciliationGeneration: typeof context.reconciliationGeneration === "string" ? context.reconciliationGeneration : undefined,
       progressCheckpoint: context.progressCheckpoint && typeof context.progressCheckpoint === "object"
         ? context.progressCheckpoint as ReviewCase["progressCheckpoint"] : undefined,
@@ -37,6 +42,7 @@ export class ReviewStore {
     try { await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`),
       lookupPk: `PROFILE#${item.profile}`, lookupSk: `REVIEW#${item.status === "open" ? "OPEN" : "CLOSED"}#${item.createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" })); }
     catch (e) { if (!conditional(e)) throw e; }
+    if (item.status === "open" && conflictKey) await this.coalesceConflictIncidents(item.profile, conflictKey, id);
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
@@ -49,11 +55,38 @@ export class ReviewStore {
       status: "open", taskId: typeof detail.taskId === "string" ? detail.taskId : undefined,
       eventId: typeof detail.eventId === "string" ? detail.eventId : undefined,
       createdAt, updatedAt: new Date().toISOString(),
+      conflictKey: reviewHash(fingerprint),
     };
     try {
       await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...item, ...key(`REVIEW_CASE#${id}`), sourceAuditKey: auditKey,
         lookupPk: `PROFILE#${profile}`, lookupSk: `REVIEW#OPEN#${createdAt}#${id}` }, ConditionExpression: "attribute_not_exists(pk)" }));
     } catch (error) { if (!conditional(error)) throw error; }
+  }
+  private async coalesceConflictIncidents(profile: Profile, conflictKey: string, keeperId: string): Promise<void> {
+    let cursor: Record<string, unknown> | undefined;
+    const incidents: ReviewCase[] = [];
+    do {
+      const page = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
+        KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)",
+        ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": "REVIEW#OPEN#" }, Limit: 50,
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}) }));
+      for (const candidate of (page.Items || []) as ReviewCase[]) {
+        if (!candidate.id.startsWith("incident-") || candidate.conflictKey !== conflictKey) continue;
+        incidents.push(candidate);
+      }
+      cursor = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (cursor);
+    for (const candidate of incidents) {
+      try {
+        await this.db.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`REVIEW_CASE#${candidate.id}`),
+          UpdateExpression: "SET #s = :closed, #r = :result, coalescedInto = :keeper, updatedAt = :now, lookupSk = :lookup",
+          ConditionExpression: "#s = :open AND conflictKey = :conflictKey",
+          ExpressionAttributeNames: { "#s": "status", "#r": "result" },
+          ExpressionAttributeValues: { ":closed": "dismissed", ":open": "open", ":conflictKey": conflictKey,
+            ":result": `Coalesced into review case ${keeperId}`, ":keeper": keeperId, ":now": new Date().toISOString(),
+            ":lookup": `REVIEW#CLOSED#${candidate.createdAt}#${candidate.id}` } }));
+      } catch (error) { if (!conditional(error)) throw error; }
+    }
   }
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
   async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {

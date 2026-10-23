@@ -83,6 +83,10 @@ test("conflict fingerprints distinguish mismatch categories and preserve long ca
     retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdA] }),
     retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", { taskId: "task", candidateEventIds: ["abcde", longIdB] }),
   );
+  const stablePair = { taskId:"task", eventId:"event", mismatchCategories:["title_mismatch"], taskUpdatedAt:"2026-10-22T10:00:00Z", calendarEtag:"etag-1" };
+  assert.equal(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair }));
+  assert.notEqual(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair, taskUpdatedAt:"2026-10-23T10:00:00Z" }));
+  assert.notEqual(retainedConflictIdentity(action, stablePair), retainedConflictIdentity(action, { ...stablePair, calendarEtag:"etag-2" }));
 });
 
 test("a resolved conflict reappearing unchanged receives a new retained incident ID", () => {

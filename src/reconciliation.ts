@@ -660,6 +660,9 @@ export class SnapshotReconciler {
         taskId: task.id,
         eventId: existing.id,
         tombstoneReason: tombstone?.reason,
+        taskUpdatedAt: task.updated_at,
+        calendarUpdatedAt: existing.updated,
+        calendarEtag: existing.etag,
       });
       return "blocked";
     }
@@ -695,6 +698,9 @@ export class SnapshotReconciler {
         taskId: task.id,
         eventId: existing.id,
         mismatchCategories: unmappedMismatchCategories(existing, task),
+        taskUpdatedAt: task.updated_at,
+        calendarUpdatedAt: existing.updated,
+        calendarEtag: existing.etag,
       });
       return "conflict";
     }

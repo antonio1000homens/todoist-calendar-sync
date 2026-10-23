@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { PutCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ReviewStore } from "../dist/review-store.js";
 
@@ -40,4 +40,29 @@ test("dismissed manual choices remain history while completed repairs are resolv
   assert.match(sent[0].input.Item.lookupSk,/^REVIEW#CLOSED#/);
   assert.equal(sent[1].input.Item.status,"resolved");
   assert.match(sent[1].input.Item.lookupSk,/^REVIEW#CLOSED#/);
+});
+
+test("an open manual decision coalesces its matching audit incident while retaining the incident row", async (t) => {
+  process.env.STATE_TABLE_NAME = "review-seed-test";
+  const sent = [];
+  const conflictKey = "same-conflict-state";
+  t.mock.method(ReviewStore.prototype, "getCase", async () => undefined);
+  t.mock.method(documentClient, "send", async (command) => {
+    sent.push(command);
+    if (command instanceof QueryCommand) return { Items: [{ id:"incident-old", profile:"home", status:"open", conflictKey,
+      createdAt:"2026-10-22T10:00:00.000Z" }] };
+    return {};
+  });
+  const decision = { decisionId:"home-conflict", profile:"home", type:"todoist_unmapped_conflict", severity:"warning",
+    status:"pending", createdAt:"2026-10-23T10:00:00.000Z", decisionDeadline:"2026-10-30T10:00:00.000Z",
+    context:{ conflictKey }, fingerprint:"decision-fingerprint", permittedActions:[], taskId:"task-1", eventId:"event-1" };
+
+  await new ReviewStore().observeDecision(decision);
+
+  assert.ok(sent.some((command) => command instanceof PutCommand && command.input.Item.id === decision.decisionId));
+  const coalescing = sent.find((command) => command instanceof UpdateCommand);
+  assert.ok(coalescing);
+  assert.equal(coalescing.input.Key.pk, "REVIEW_CASE#incident-old");
+  assert.equal(coalescing.input.ExpressionAttributeValues[":keeper"], decision.decisionId);
+  assert.match(coalescing.input.UpdateExpression, /coalescedInto/);
 });
