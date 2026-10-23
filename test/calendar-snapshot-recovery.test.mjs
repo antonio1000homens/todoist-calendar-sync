@@ -391,3 +391,34 @@ test("Calendar import rolls back a newly created task when controls change befor
   assert.equal(summary.blocked,1);assert.equal(clients.created,1);assert.equal(clients.deletions,1);
   assert.equal(clients.tasks.length,0);assert.equal(clients.comments,0);assert.equal(state.mappings.length,0);
 });
+
+for (const shape of ["missing-shared-task", "different-canonical-task"]) {
+  test(`snapshot recurrence recovery preserves exact occurrence identity: ${shape}`, async () => {
+    const master = {...futureEvent("owned-series",15,"Reminder"),recurrence:["RRULE:FREQ=YEARLY"]};
+    const occurrence = {...futureEvent("owned-occurrence",15,"Reminder"),recurringEventId:master.id,extendedProperties:{shared:{taskId:"original-task"}}};
+    const state = fakeState();
+    const clients = fakeClients([master],shape === "different-canonical-task" ? [{id:"unrelated-task",content:"Reminder",due:{date:"2099-01-15"}}] : []);
+    clients.pair.calendar.listInstances = async () => [occurrence];
+    await reconcileUnmappedCalendar("home",state,async () => clients.pair);
+    await reconcileUnmappedCalendar("home",state,async () => clients.pair);
+    assert.equal(clients.created,0);
+    assert.equal(state.mappings.length,0);
+    assert.ok(state.audits.some(({action,detail}) => action === "calendar_snapshot_recurring_identity_conflict" && detail.candidateTaskIds.includes("original-task")));
+  });
+}
+
+for (const shared of [true,false]) {
+  test(`snapshot refuses an unsupported recurring canonical task (shared identity: ${shared})`, async () => {
+    const master = {...futureEvent("unsupported-series",15,"Reminder"),recurrence:["RRULE:FREQ=YEARLY"]};
+    const occurrence = {...futureEvent("unsupported-occurrence",15,"Reminder"),recurringEventId:master.id,
+      ...(shared ? {extendedProperties:{shared:{taskId:"original-task"}}} : {})};
+    const recurring = {id:"original-task",content:"Reminder",description:"",due:{date:"2099-01-15",is_recurring:true,string:"every! 365 days"}};
+    const state = fakeState(), clients = fakeClients([master],[recurring]);
+    clients.pair.calendar.listInstances = async () => [occurrence];
+    const summary = await reconcileUnmappedCalendar("home",state,async () => clients.pair);
+    assert.equal(summary.conflicts,1);
+    assert.equal(clients.created,0);
+    assert.equal(state.mappings.length,0);
+    assert.ok(state.audits.some(({action,detail}) => action === "calendar_snapshot_recurring_identity_conflict" && detail.candidateTaskIds.includes(recurring.id)));
+  });
+}

@@ -18,8 +18,7 @@ import {
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { hasCanonicalState, selectCalendarRecurrenceInstance, startsMatch, toTodoistTask } from "./sync.js";
-import { normalizedText } from "./security.js";
+import { hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -84,25 +83,6 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
   };
 }
 
-/**
- * Canonical matching deliberately excludes a recurring Todoist task when
- * considering a Calendar-owned active occurrence. That exclusion must not
- * be interpreted as permission to create a duplicate non-recurring task.
- * This conservative identity collision check is a guard, not a rebind.
- */
-export function recurringTaskIdentityCandidates(event: CalendarEvent, tasks: TodoistTask[]): string[] {
-  const title = normalizedText(event.summary).toLocaleLowerCase();
-  const sharedTaskId = event.extendedProperties?.shared?.taskId;
-  if (!sharedTaskId && (!title || !(event.start?.date || event.start?.dateTime))) return [];
-  return tasks
-    .filter((task) => Boolean(task.due?.is_recurring)
-      && (task.id === sharedTaskId
-        || (Boolean(title)
-          && normalizedText(task.content).toLocaleLowerCase() === title
-          && startsMatch(event, task))))
-    .map((task) => task.id)
-    .sort();
-}
 
 function originalStart(event: CalendarEvent): string | undefined {
   return event.originalStartTime?.dateTime
@@ -408,6 +388,15 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
+    const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
+    if (match.task?.due?.is_recurring || sharedTaskIds.some((id) => id !== match.task?.id)) {
+      summary.conflicts += 1;
+      await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+        seriesId, masterEventId: master.id, eventId: active.id,
+        candidateTaskIds: [...new Set([...sharedTaskIds, ...(match.task?.due?.is_recurring ? [match.task.id] : [])])].sort(),
+      });
+      return;
+    }
     let task = match.task;
     let created = false;
     if (!task) {
@@ -527,3 +516,5 @@ export async function reconcileUnmappedCalendar(
   );
   return summary;
 }
+
+export { recurringTaskIdentityCandidates } from "./sync.js";
