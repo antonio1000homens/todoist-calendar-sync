@@ -234,8 +234,8 @@ export class ReviewStore {
       await this.db.send(new TransactWriteCommand({ TransactItems: [
         ...[...new Map(releases.map(item => [entityKey(item.ref), item])).values()].map(item => ({ Update: {
           TableName:reviewTable(), Key:key(`SYNC_CONTROL#${entityKey(item.ref)}`),
-          UpdateExpression:`SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair`,
-          ConditionExpression:"activeRepair = :id", ExpressionAttributeValues:{ ":id":operation.id, ":now":now, ":version":item.providerUpdatedAt || "", ...(item.clearExclusion ? {":false":false} : {}) },
+          UpdateExpression:item.preserveControlState ? "REMOVE activeRepair" : `SET fencedAt = :now, providerUpdatedAt = :version${item.clearExclusion ? ", excluded = :false" : ""} REMOVE activeRepair`,
+          ConditionExpression:"activeRepair = :id", ExpressionAttributeValues:item.preserveControlState ? { ":id":operation.id } : { ":id":operation.id, ":now":now, ":version":item.providerUpdatedAt || "", ...(item.clearExclusion ? {":false":false} : {}) },
         } })),
         { Put:{ TableName:reviewTable(), Item:{ ...completed, ...key(`REPAIR#${operation.id}`),
           lookupPk:`PROFILE#${operation.preview.intent.profile}`, lookupSk:`REPAIR#NOTIFY#${operation.id}` },

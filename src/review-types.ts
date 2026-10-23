@@ -22,7 +22,7 @@ export interface RepairIntent {
   taskId?: string; eventId?: string;
   winner: Side | "none";
   owner?: Side; scope: "occurrence" | "series" | "future";
-  leftovers: Record<string, "exclude" | "create">;
+  leftovers: Record<string, "exclude" | "create" | "unchanged">;
   decisionAction?: string; targetProfile?: Profile;
 }
 export interface ReviewSnapshot {
@@ -46,7 +46,7 @@ export interface RepairOperation {
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
   error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
-  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded"; checkedAt: string }>;
+  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged"; checkedAt: string }>;
   /** Controls sampled before claiming extra, non-preview move destination locks. */
   claimSnapshots?: ReviewSnapshot[];
   expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;
@@ -59,6 +59,6 @@ export function operationHasWriteEvidence(operation: RepairOperation): boolean {
     || operation.outcomes !== undefined || operation.verified !== undefined
     || operation.recurrenceBindings !== undefined;
 }
-export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean }
+export interface RepairRelease { ref: EntityRef; providerUpdatedAt?: string; clearExclusion?: boolean; preserveControlState?: boolean }
 export function entityKey(ref: EntityRef): string { return `${ref.profile}:${ref.side}:${ref.id}`; }
 export const REVIEW_PROFILES: Profile[] = ["home", "antonio", "work"];

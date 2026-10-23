@@ -135,6 +135,6 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
 // Preview validation may discover a mapped item outside the original case snapshots.
 // Refresh the complete affected set rather than guessing a safe disposition.
 export function missingDispositionReference(message) {
-  const match = /^Choose Create counterpart or Exclude for (home|antonio|work):(todoist|calendar):([^\s]+)$/.exec(message || '');
+  const match = /^Choose Create counterpart(?: or Exclude|, Exclude, or Leave unchanged) for (home|antonio|work):(todoist|calendar):([^\s]+)$/.exec(message || '');
   return match ? `${match[1]}:${match[2]}:${match[3]}` : undefined;
 }
