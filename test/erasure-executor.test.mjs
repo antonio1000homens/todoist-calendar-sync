@@ -38,6 +38,35 @@ function storedQueuedOperation(){
   assert.throws(()=>advanceErasureOperation({...operation,status:"succeeded"},"queued"),/Invalid/);
 });
 
+test("deletion gate drift is persisted as review-required with a CAS and cannot be restarted",async()=>{
+  const old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const item={...storedQueuedOperation(),status:"deleting",previewFingerprint:"fingerprint",
+    lifecycle:{phase:"ready_for_delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:1,evidence:{}}};
+  const calls=[];
+  const db={async send(command){calls.push(command);
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const input=command.input,values=input.ExpressionAttributeValues;
+      assert.equal(input.ConditionExpression,"#status=:deleting AND lifecycle.#phase=:ready AND previewFingerprint=:fingerprint");
+      assert.equal(values[":deleting"],"deleting");assert.equal(values[":ready"],"ready_for_delete");
+      assert.equal(values[":fingerprint"],"fingerprint");
+      item.status=values[":reviewRequired"];item.error=values[":error"];item.lifecycle.lastError=values[":error"];
+      return {};
+    }
+    throw new Error("Unexpected database command");
+  }};
+  try{
+    const store=new ErasureOperationStore(db);
+    await store.markReviewRequired("op");
+    assert.equal(item.status,"review_required");
+    assert.match(item.error,/fresh preview and confirmation/);
+    assert.equal(item.lifecycle.lastError,item.error);
+    await assert.rejects(store.markReviewRequired("op"),/no longer at the deletion review gate/);
+    assert.equal(calls.filter(command=>command.constructor.name.includes("Update")).length,1);
+  }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
+});
+
 test("fenced executor disables admission, drains, fences, waits out old workers, then drains again",async()=>{
   const events=[];
   await enterFencedErasure({profile:"home",operationId:"op",mappings:["uuid"],timeoutSeconds:30,

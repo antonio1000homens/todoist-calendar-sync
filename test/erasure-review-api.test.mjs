@@ -51,4 +51,17 @@ test("authenticated review API starts only stored confirmed operations and retur
   const body=JSON.parse(status.body);
   assert.equal(status.statusCode,200);assert.equal(body.operation.status,"queued");
   assert.equal("inventory" in body.operation,false);assert.equal("confirmationId" in body.operation,false);
+
+  operation.status="review_required";
+  operation.lifecycle={phase:"ready_for_delete",nextRunAt:Date.now()};
+  const reviewStatus=await handler(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
+  const reviewBody=JSON.parse(reviewStatus.body);
+  assert.equal(reviewStatus.statusCode,200);
+  assert.equal(reviewBody.operation.status,"review_required");
+  assert.equal(reviewBody.operation.recoveryRequired,true);
+  assert.match(reviewBody.operation.message,/fresh preview and confirmation/);
+  const resume=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  assert.equal(resume.statusCode,409);
+  assert.match(JSON.parse(resume.body).error,/fresh preview and confirmation/);
+  assert.equal(sent.length,2,"review-required operations cannot requeue the stale confirmation");
 });

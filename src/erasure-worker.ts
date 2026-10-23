@@ -2,7 +2,7 @@ import type { SQSHandler, SQSRecord } from "aws-lambda";
 import { GetEventSourceMappingCommand, GetFunctionConfigurationCommand, LambdaClient,
   ListEventSourceMappingsCommand, UpdateEventSourceMappingCommand } from "@aws-sdk/client-lambda";
 import { documentClient } from "./dynamodb-capacity.js";
-import { ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
+import { ErasureGateDriftError, ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
 import { enqueueErasureOperation } from "./erasure-queue.js";
 
@@ -82,6 +82,8 @@ export async function processErasureOperation(operationId: string): Promise<{
 }> {
   let operation=await store.get(operationId);
   if(!operation) throw new Error("Erasure operation was not found");
+  if(operation.status==="succeeded"||operation.status==="review_required")
+    return {status:operation.status,phase:operation.lifecycle?.phase,scheduled:false};
   if(operation.status==="previewed") {
     await store.transition(operationId,"previewed","queued");
     operation=await store.get(operationId);
@@ -100,13 +102,25 @@ export async function processErasureOperation(operationId: string): Promise<{
     throw new Error("Active erasure operation has no fenced lifecycle");
   }
   if(operation.lifecycle.phase==="ready_for_delete") {
-    await store.assertReadyForDelete(operationId);
+    try { await store.assertReadyForDelete(operationId); }
+    catch(error) {
+      if(!(error instanceof ErasureGateDriftError)) throw error;
+      await store.markReviewRequired(operationId);
+      return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
+    }
     return {status:operation.status,phase:operation.lifecycle.phase,scheduled:false};
   }
   if(operation.lifecycle.phase==="complete") return {status:operation.status,phase:operation.lifecycle.phase,scheduled:false};
 
   const result=await store.advanceFencedLifecycle(operationId);
-  if(result.phase==="ready_for_delete") await store.assertReadyForDelete(operationId);
+  if(result.phase==="ready_for_delete") {
+    try { await store.assertReadyForDelete(operationId); }
+    catch(error) {
+      if(!(error instanceof ErasureGateDriftError)) throw error;
+      await store.markReviewRequired(operationId);
+      return {status:"review_required",phase:result.phase,scheduled:false};
+    }
+  }
   if(result.phase!=="ready_for_delete"&&result.phase!=="complete"&&result.status!=="succeeded")
     await enqueueErasureOperation(operationId,result.nextRunAt);
   return {...result,scheduled:result.phase!=="ready_for_delete"&&result.phase!=="complete"&&result.status!=="succeeded"};

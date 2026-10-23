@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { LambdaClient } from "@aws-sdk/client-lambda";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { documentClient } from "../dist/dynamodb-capacity.js";
-import { ErasureOperationStore } from "../dist/erasure-executor.js";
+import { ErasureGateDriftError, ErasureOperationStore } from "../dist/erasure-executor.js";
 import { handler, parseErasureQueueRecord } from "../dist/erasure-worker.js";
 
 const record = (body, messageId = "message-1") => ({ body, messageId, receiptHandle: "receipt", attributes: {}, messageAttributes: {}, md5OfBody: "digest", eventSource: "aws:sqs", eventSourceARN: "arn:aws:sqs:eu-west-2:123:erasure", awsRegion: "eu-west-2" });
@@ -72,6 +72,41 @@ test("worker respects durable next-run time and stops before provider deletion",
   } finally {
     if (oldQueue === undefined) delete process.env.ERASURE_OPERATION_QUEUE_URL; else process.env.ERASURE_OPERATION_QUEUE_URL = oldQueue;
   }
+});
+
+test("failed action-time gate becomes durable review-required state and cannot be resumed", async t => {
+  let operation = { operationId:"op_drift",status:"deleting",lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()} };
+  let gateReads=0,reviewMarks=0;
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>operation);
+  t.mock.method(ErasureOperationStore.prototype,"assertReadyForDelete",async()=>{
+    gateReads++;
+    throw new ErasureGateDriftError();
+  });
+  t.mock.method(ErasureOperationStore.prototype,"markReviewRequired",async()=>{
+    reviewMarks++;
+    operation={...operation,status:"review_required"};
+  });
+  const result=await handler({Records:[record('{"version":1,"operationId":"op_drift"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[]},"the failed gate is durably recorded before acknowledging the message");
+  assert.equal(operation.status,"review_required");
+  assert.equal(reviewMarks,1);
+  assert.equal(gateReads,1);
+
+  const duplicate=await handler({Records:[record('{"version":1,"operationId":"op_drift"}')],awsRequestId:"req-duplicate"});
+  assert.deepEqual(duplicate,{batchItemFailures:[]});
+  assert.equal(gateReads,1,"a duplicate delivery cannot retry a stale deletion gate");
+  assert.equal(reviewMarks,1);
+});
+
+test("transient action-time gate read failures are retried instead of marked review-required", async t => {
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({operationId:"op_read",status:"deleting",
+    lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()}}));
+  let reviewMarks=0;
+  t.mock.method(ErasureOperationStore.prototype,"assertReadyForDelete",async()=>{throw new Error("DynamoDB throttled");});
+  t.mock.method(ErasureOperationStore.prototype,"markReviewRequired",async()=>{reviewMarks++;});
+  const result=await handler({Records:[record('{"version":1,"operationId":"op_read"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:"message-1"}]});
+  assert.equal(reviewMarks,0,"only a definite invariant mismatch is terminal");
 });
 
 test("malformed and failed erasure messages are retried through partial batch failure", async t => {
