@@ -33,6 +33,14 @@ test("unique current provider items replace unresolved historical case hints", (
   assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"verify"),true);
 });
 
+test("Todoist-only flatten requires both the exact task and historical Calendar item", () => {
+  const item=caseFor("case","home","task","history");
+  const snapshots=[live("home","todoist","task"),live("home","calendar","history",{status:"confirmed"})];
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"todoist-only"),true);
+  assert.equal(repairPreviewAllowed({...form,eventId:"",verifiedEventId:""},item,detailsFor(item,snapshots),"todoist-only"),false);
+});
+
 test("ambiguous or missing live IDs fail closed instead of choosing a random linked item", () => {
   const item=caseFor("case","work",undefined,undefined);
   const snapshots=[live("work","todoist","a"),live("work","todoist","b"),live("work","calendar","c")];
