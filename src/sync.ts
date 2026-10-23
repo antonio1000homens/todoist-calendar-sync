@@ -1036,8 +1036,7 @@ export class Synchronizer {
       if (!calendarEventGoneOnDirectRead(error)) throw error;
       return this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
     }
-    if (master.status === "cancelled" || !master.recurrence?.length) {
-      return this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
+    if (master.status === "cancelled" || !master.recurrence?.length || master.extendedProperties?.shared?.syncHistoryOnly === "true") {
     }
     if (isTodoistOwnedCalendarRecurrence(master)) {
       return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
