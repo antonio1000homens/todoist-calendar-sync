@@ -514,8 +514,9 @@ export class ErasureOperationStore {
       &&candidate.phase==="complete"&&nextStatus==="succeeded";
     const validVerify=operation.status==="deleting"&&current.phase==="verify_deletion"
       &&candidate.phase==="restore_mappings"&&nextStatus==="verifying";
-    const validReview=operation.status==="deleting"&&nextStatus==="review_required"
-      &&["ready_for_delete","delete","verify_deletion"].includes(current.phase);
+    const validReview=nextStatus==="review_required"&&(
+      (operation.status==="deleting"&&["ready_for_delete","delete","verify_deletion"].includes(current.phase))
+      ||(operation.status==="verifying"&&current.phase==="release_fence"));
     if(nextStatus!==operation.status&&!validDelete&&!validSuccess&&!validVerify&&!validReview) throw new Error("Invalid lifecycle operation status transition");
     if(current.phase==="delete") {
       const before=current.deletionProgress||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:0};

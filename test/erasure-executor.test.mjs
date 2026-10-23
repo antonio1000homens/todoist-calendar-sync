@@ -96,6 +96,32 @@ test("revoked readiness stops active lifecycle work and retains its fence for br
   assert.match(item.lifecycle.lastError,/break-glass recovery is required/);
 });
 
+test("gate drift during release-fence verification persists review-required without clearing the fence",async()=>{
+  const item={...storedQueuedOperation(),providerDeletionReady:true,status:"verifying",
+    lifecycle:{phase:"release_fence",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{mappingsRestored:{operationId:"op",phase:"mappingsRestored",
+        receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:1}}}};
+  const db=memoryDb(item),events=[],fence={operationId:"op"};
+  const adapters={
+    listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async ids=>ids.map(id=>({id,state:"Enabled"})),
+    inspectFence:async()=>{events.push("inspect");return {fence,leases:[]};},
+    beginFence:async()=>{},restoreMappings:async()=>{},finishFence:async()=>{events.push("finishFence");},
+    verifyDeletion:async()=>{events.push("verifyDeletion");return {providersAbsent:false,stateAbsent:true};},
+    readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
+  };
+  const store=new ErasureOperationStore(db,()=>"unused",adapters);
+  const result=await store.advanceFencedLifecycle("op");
+  assert.equal(result.status,"review_required");
+  assert.equal(result.phase,"release_fence");
+  assert.equal(db.item.status,"review_required");
+  assert.equal(db.item.lifecycle.phase,"release_fence");
+  assert.match(db.item.lifecycle.lastError,/break-glass recovery is required/);
+  assert.deepEqual(events,["inspect","verifyDeletion"],"gate drift must stop before fence release or cleanup");
+  assert.deepEqual(fence,{operationId:"op"});
+  assert.equal(db.calls.some(command=>command.constructor.name.includes("TransactWrite")
+    ||command.constructor.name.includes("Delete")),false,"operation and fence cleanup must not run");
+});
+
 test("fenced executor disables admission, drains, fences, waits out old workers, then drains again",async()=>{
   const events=[];
   await enterFencedErasure({profile:"home",operationId:"op",mappings:["uuid"],timeoutSeconds:30,
