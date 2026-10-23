@@ -424,6 +424,19 @@ test("task-only review detail hydrates its existing recurrence owner and active 
   assert.deepEqual(h.writes, [], "hydration performs reads only");
 });
 
+test("transfer preview rejects a series already assigned to the selected Todoist task", async t => {
+  const f = birthdayTransferFixture();
+  f.master = { ...f.master, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"] };
+  const link = { ...f.recurrence, taskId: f.annual.id, activeInstanceId: f.active.id, eventId: f.active.id };
+  const h = harness(t, { events: [f.master, f.active], tasks: [f.annual], recurrence: link });
+
+  await assert.rejects(
+    h.engine.preview(actor, transferIntent(f)),
+    /already owns the selected Calendar series occurrence/,
+  );
+  assert.deepEqual(h.writes, [], "an already-correct recurrence association needs no provider write");
+});
+
 test("series transfer refuses an unowned Calendar recurrence without a recurrence link or ownership metadata",async t=>{
   const f=birthdayTransferFixture();
   f.master={...f.master,extendedProperties:{shared:{taskId:f.displaced.id}}};

@@ -192,7 +192,7 @@ export class ReviewEngine {
         if (snapshot.mapping.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.mapping.masterEventId });
       }
       if (ref.side === "todoist" && snapshot.recurrence) {
-        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId });
+        if (snapshot.recurrence.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId });
         add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.activeInstanceId || snapshot.recurrence.eventId });
       }
       if (ref.side === "calendar" && snapshot.object) {
@@ -329,6 +329,11 @@ export class ReviewEngine {
       const selectedTaskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === task.id);
       if (selectedTaskSnapshot?.mapping) invalidRepairIntent("The selected recurring Todoist task already has a mapping; resolve that exact association before transfer");
       const seriesId = event.iCalUID || event.id;
+      if (masterSnapshot.recurrence?.owner === "calendar" && masterSnapshot.recurrence.seriesId === seriesId
+        && masterSnapshot.recurrence.taskId === task.id
+        && (masterSnapshot.recurrence.activeInstanceId || masterSnapshot.recurrence.eventId) === occurrence.id) {
+        invalidRepairIntent("This Todoist task already owns the selected Calendar series occurrence; refresh the case and apply its pending decision instead of transferring the association");
+      }
       const calendarOwnerVerified = (masterSnapshot.recurrence?.owner === "calendar"
         && masterSnapshot.recurrence.seriesId === seriesId)
         || event.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";
