@@ -255,6 +255,16 @@ export class ReviewEngine {
         if (!snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===id)) snapshots.push(await this.snapshot({profile:intent.profile,side:"calendar",id}));
       }
     }
+    for (const snapshot of snapshots) {
+      const recurrence = snapshot.recurrence;
+      if (!recurrence) continue;
+      for (const refId of [recurrence.masterEventId, recurrence.activeInstanceId || recurrence.eventId]) {
+        if (!refId) continue;
+        const related = snapshots.find(candidate => candidate.ref.profile === recurrence.profile
+          && candidate.ref.side === "calendar" && candidate.ref.id === refId);
+        if (related && !related.recurrence) related.recurrence = recurrence;
+      }
+    }
     return snapshots.sort((a,b) => entityKey(a.ref).localeCompare(entityKey(b.ref)));
   }
   async preview(actor: ReviewActor, intent: RepairIntent): Promise<RepairPreview> {

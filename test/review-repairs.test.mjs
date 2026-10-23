@@ -420,7 +420,9 @@ test("task-only review detail hydrates its existing recurrence owner and active 
   assert.equal(taskSnapshot.recurrence.taskId, f.annual.id);
   assert.equal(taskSnapshot.recurrence.owner, "calendar");
   assert.ok(snapshots.some(snapshot => snapshot.ref.side === "calendar" && snapshot.ref.id === f.master.id));
-  assert.ok(snapshots.some(snapshot => snapshot.ref.side === "calendar" && snapshot.ref.id === f.active.id));
+  const activeSnapshot = snapshots.find(snapshot => snapshot.ref.side === "calendar" && snapshot.ref.id === f.active.id);
+  assert.ok(activeSnapshot);
+  assert.equal(activeSnapshot.recurrence.taskId, f.annual.id);
   assert.deepEqual(h.writes, [], "hydration performs reads only");
 });
 
