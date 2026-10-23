@@ -137,6 +137,11 @@ export class ReviewEngine {
     if (mapping && mapping.profile !== ref.profile) invalidRepairIntent(`Item belongs to ${mapping.profile}; use Move to profile instead`);
     if (ref.side === "todoist" && object && (object as TodoistTask).project_id !== profiles[ref.profile].todoistProjectId) invalidRepairIntent("Task is outside the selected profile's project");
     const snapshot: ReviewSnapshot = { ref, object, mapping, checkedAt: at(), control: await this.controls.control(ref) as Record<string, unknown> | undefined };
+    if (ref.side === "todoist" && object && !mapping && (object as TodoistTask).due?.is_recurring) {
+      const recurrence = await this.state.getRecurrenceLinkByTaskAnyProfile(ref.id);
+      if (recurrence && recurrence.profile !== ref.profile) invalidRepairIntent(`Item belongs to ${recurrence.profile}; use Move to profile instead`);
+      snapshot.recurrence = recurrence;
+    }
     if (ref.side === "calendar" && (object as CalendarEvent|null)?.recurrence?.length) {
       const event = object as CalendarEvent;
       const taskId = mapping?.taskId || event.extendedProperties?.shared?.taskId;
@@ -185,6 +190,10 @@ export class ReviewEngine {
         add({ profile: snapshot.mapping.profile, side: "todoist", id: snapshot.mapping.taskId });
         add({ profile: snapshot.mapping.profile, side: "calendar", id: snapshot.mapping.eventId });
         if (snapshot.mapping.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.mapping.masterEventId });
+      }
+      if (ref.side === "todoist" && snapshot.recurrence) {
+        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId });
+        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.activeInstanceId || snapshot.recurrence.eventId });
       }
       if (ref.side === "calendar" && snapshot.object) {
         const event = snapshot.object as CalendarEvent;
