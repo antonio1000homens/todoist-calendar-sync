@@ -23,8 +23,10 @@ const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|eligibleCandid
 const SAFE_RECURRENCE_EXPECTED_KEYS = new Set(["frequency", "weekday", "time", "startDate", "endDate"]);
 const SAFE_RECURRENCE_OBSERVED_KEYS = new Set([
   "recurring", "dueDate", "recurrenceParsed", "frequency", "weekday", "time", "startDate", "endDate",
-  "startYearOmitted", "endYearOmitted",
+  "startYearOmitted", "endYearOmitted", "phraseKind", "weekdayRecognized", "startDateParsed", "endDateParsed",
+  "timePresent", "timeParsed",
 ]);
+const SAFE_RECURRENCE_PHRASE_KINDS = new Set(["starting_ending", "from_until", "starting_only", "ending_only", "other"]);
 const SAFE_WEEKDAYS = new Set(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]);
 
 function safeString(value: unknown): string | undefined {
@@ -76,7 +78,12 @@ function sanitizeRecurrenceDiagnostic(value: unknown, observed: boolean): Record
     } else if (key === "dueDate") {
       const date = safeRecurrenceDateTime(field);
       if (date) safe[key] = date;
+    } else if (key === "phraseKind") {
+      if (typeof field === "string" && SAFE_RECURRENCE_PHRASE_KINDS.has(field)) safe[key] = field;
     } else if (["recurring", "recurrenceParsed", "startYearOmitted", "endYearOmitted"].includes(key)
+      && typeof field === "boolean") {
+      safe[key] = field;
+    } else if (["weekdayRecognized", "startDateParsed", "endDateParsed", "timePresent", "timeParsed"].includes(key)
       && typeof field === "boolean") {
       safe[key] = field;
     }

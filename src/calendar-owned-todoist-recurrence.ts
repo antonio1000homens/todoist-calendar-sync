@@ -53,6 +53,22 @@ interface ParsedWeeklySchedule {
   end: ParsedDate;
 }
 
+type WeeklyPhraseKind = "starting_ending" | "from_until" | "starting_only" | "ending_only" | "other";
+
+interface WeeklyScheduleParseDiagnostics {
+  phraseKind: WeeklyPhraseKind;
+  weekdayRecognized: boolean;
+  startDateParsed: boolean;
+  endDateParsed: boolean;
+  timePresent: boolean;
+  timeParsed: boolean;
+}
+
+interface WeeklyScheduleParseResult {
+  schedule?: ParsedWeeklySchedule;
+  diagnostics: WeeklyScheduleParseDiagnostics;
+}
+
 function parseNaturalDate(value: string): ParsedDate | undefined {
   const normalized = value.trim().toLowerCase().replace(/,/g, "").replace(/(\d)(st|nd|rd|th)\b/g, "$1");
   const iso = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -84,17 +100,45 @@ function parseTime(value: string | undefined): string | undefined {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-function parseWeeklySchedule(value: string | undefined): ParsedWeeklySchedule | undefined {
-  if (!value) return undefined;
+function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleParseResult {
+  const emptyDiagnostics: WeeklyScheduleParseDiagnostics = {
+    phraseKind: "other", weekdayRecognized: false,
+    startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
+  };
+  if (!value) return { diagnostics: emptyDiagnostics };
   const normalized = value.trim().replace(/\s+/g, " ");
+  const weekdayMatch = normalized.match(/^every\s+([a-z]+)\b/i);
+  const weekday = weekdayMatch ? weekdayLookup.get(weekdayMatch[1].toLowerCase()) : undefined;
+  const hasStarting = /\bstarting\b/i.test(normalized);
+  const hasEnding = /\bending\b/i.test(normalized);
+  const hasFrom = /\bfrom\b/i.test(normalized);
+  const hasUntil = /\b(?:until|to)\b/i.test(normalized);
+  const phraseKind: WeeklyPhraseKind = hasStarting && hasEnding ? "starting_ending"
+    : hasFrom && hasUntil ? "from_until"
+      : hasStarting ? "starting_only"
+        : hasEnding ? "ending_only" : "other";
+  const beforeDates = normalized.split(/\b(?:starting|from)\b/i, 1)[0];
+  const timePresent = Boolean(weekdayMatch && /\bat\b/i.test(beforeDates.slice(weekdayMatch[0].length)));
   const match = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+starting\s+(.+?)\s+(?:and\s+)?ending\s+(.+)$/i);
-  if (!match) return undefined;
-  const weekday = weekdayLookup.get(match[1].toLowerCase());
-  const start = parseNaturalDate(match[3]);
-  const end = parseNaturalDate(match[4]);
-  const time = match[2] === undefined ? undefined : parseTime(match[2]);
-  if (!weekday || !start || !end || (match[2] !== undefined && !time)) return undefined;
-  return { weekday, ...(time ? { time } : {}), start, end };
+  const startText = match?.[3];
+  const endText = match?.[4];
+  const start = startText ? parseNaturalDate(startText) : undefined;
+  const end = endText ? parseNaturalDate(endText) : undefined;
+  const time = match?.[2] === undefined ? undefined : parseTime(match[2]);
+  const diagnostics: WeeklyScheduleParseDiagnostics = {
+    phraseKind,
+    weekdayRecognized: Boolean(weekday),
+    startDateParsed: Boolean(start),
+    endDateParsed: Boolean(end),
+    timePresent,
+    timeParsed: !timePresent || Boolean(time),
+  };
+  if (!match || !weekday || !start || !end || (match[2] !== undefined && !time)) return { diagnostics };
+  return { schedule: { weekday, ...(time ? { time } : {}), start, end }, diagnostics };
+}
+
+function parseWeeklySchedule(value: string | undefined): ParsedWeeklySchedule | undefined {
+  return parseWeeklyScheduleDetailed(value).schedule;
 }
 
 function sameDate(expected: ParsedDate, observed: ParsedDate, allowYearOmission: boolean): boolean {
@@ -261,7 +305,8 @@ export function calendarOwnedRecurringTaskReadback(
   recurrence: CalendarOwnedTodoistRecurrence,
 ): CalendarOwnedRecurringTaskReadback {
   const expectedSchedule = parseWeeklySchedule(recurrence.dueString);
-  const observedSchedule = parseWeeklySchedule(task.due?.string);
+  const observedParse = parseWeeklyScheduleDetailed(task.due?.string);
+  const observedSchedule = observedParse.schedule;
   const allowYearOmission = Boolean(expectedSchedule?.start.year
     && expectedSchedule.start.year === expectedSchedule.end.year);
   const expected = {
@@ -277,6 +322,7 @@ export function calendarOwnedRecurringTaskReadback(
     recurring: Boolean(task.due?.is_recurring),
     ...(task.due?.date || task.due?.datetime ? { dueDate: task.due.date || task.due.datetime } : {}),
     recurrenceParsed: Boolean(observedSchedule),
+    ...observedParse.diagnostics,
     ...(observedSchedule ? {
       frequency: "weekly" as const,
       weekday: observedSchedule.weekday,

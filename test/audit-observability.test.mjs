@@ -73,6 +73,8 @@ test("telemetry retains only safe expected and observed recurrence scalars", () 
       recurring: true, dueDate: "2026-11-04", recurrenceParsed: true,
       frequency: "weekly", weekday: "Wednesday", time: "09:00",
       startDate: "11-04", endDate: "11-25", startYearOmitted: true, endYearOmitted: true,
+      phraseKind: "from_until", weekdayRecognized: true, startDateParsed: true,
+      endDateParsed: true, timePresent: true, timeParsed: true,
       dueString: "every Wednesday with private notes", taskTitle: "private task title", payload: { token: "secret" },
     },
     title: "private task title",
@@ -88,6 +90,8 @@ test("telemetry retains only safe expected and observed recurrence scalars", () 
       recurring: true, dueDate: "2026-11-04", recurrenceParsed: true,
       frequency: "weekly", weekday: "Wednesday", time: "09:00",
       startDate: "11-04", endDate: "11-25", startYearOmitted: true, endYearOmitted: true,
+      phraseKind: "from_until", weekdayRecognized: true, startDateParsed: true,
+      endDateParsed: true, timePresent: true, timeParsed: true,
     },
   });
 
@@ -95,6 +99,10 @@ test("telemetry retains only safe expected and observed recurrence scalars", () 
     expected: { frequency: "daily", weekday: "private", time: "the task says 9", startDate: "2030-02-30" },
     observed: { dueDate: "private event notes", startDate: "raw due string", recurring: "yes", surprise: "secret" },
   }), {});
+  assert.deepEqual(sanitizeTelemetryDetail({ observed: {
+    phraseKind: "every Wednesday starting private phrase", weekdayRecognized: "yes",
+    startDateParsed: true, endDateParsed: false, timePresent: true, timeParsed: false,
+  } }), { observed: { startDateParsed: true, endDateParsed: false, timePresent: true, timeParsed: false } });
   assert.deepEqual(sanitizeTelemetryDetail({ observed: { dueDate: "2026-11-04T09:00:00Z" } }), {
     observed: { dueDate: "2026-11-04T09:00:00Z" },
   });
@@ -107,8 +115,12 @@ test("logEvent preserves safe recurrence diagnostics while excluding raw due str
   try {
     logEvent("calendar_recurrence_todoist_readback_mismatch", {
       expected: { frequency: "weekly", weekday: "Wednesday", startDate: "2026-11-04", endDate: "2026-11-25" },
-      observed: { recurring: true, dueDate: "2026-11-04", recurrenceParsed: false },
-      dueString: "raw Todoist recurrence text",
+      observed: {
+        recurring: true, dueDate: "2026-11-04", recurrenceParsed: false,
+        phraseKind: "starting_ending", weekdayRecognized: true,
+        startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
+      },
+      dueString: "raw Todoist recurrence text that must not appear in logs",
       taskTitle: "private task title",
     }, "state-repository");
   } finally {
@@ -119,7 +131,11 @@ test("logEvent preserves safe recurrence diagnostics while excluding raw due str
     event: "calendar_recurrence_todoist_readback_mismatch",
     component: "state-repository",
     expected: { frequency: "weekly", weekday: "Wednesday", startDate: "2026-11-04", endDate: "2026-11-25" },
-    observed: { recurring: true, dueDate: "2026-11-04", recurrenceParsed: false },
+    observed: {
+      recurring: true, dueDate: "2026-11-04", recurrenceParsed: false,
+      phraseKind: "starting_ending", weekdayRecognized: true,
+      startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
+    },
   });
 });
 

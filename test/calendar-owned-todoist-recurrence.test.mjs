@@ -114,6 +114,21 @@ test("recurring task readback accepts Todoist date-text normalization but reject
   assert.equal(diagnostic.observed.startYearOmitted, true);
   assert.equal(diagnostic.observed.endYearOmitted, true);
   assert.equal("dueString" in diagnostic.observed, false);
+  const unrecognized = calendarOwnedRecurringTaskReadback({
+    ...task,
+    due: { ...task.due, string: "every Wednesday starting on 4 Nov 2026 and ending on 25 Nov 2026" },
+  }, active, recurrence);
+  assert.deepEqual({
+    phraseKind: unrecognized.observed.phraseKind,
+    weekdayRecognized: unrecognized.observed.weekdayRecognized,
+    startDateParsed: unrecognized.observed.startDateParsed,
+    endDateParsed: unrecognized.observed.endDateParsed,
+    timePresent: unrecognized.observed.timePresent,
+    timeParsed: unrecognized.observed.timeParsed,
+  }, {
+    phraseKind: "starting_ending", weekdayRecognized: true,
+    startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
+  });
   const wrongEnd = mismatch({ string: "every Wednesday at 2pm starting Nov 4 and ending Nov 26" });
   assert.equal(wrongEnd.expected.endDate, "2026-11-25");
   assert.equal(wrongEnd.observed.endDate, "11-26");
