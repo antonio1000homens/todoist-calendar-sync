@@ -420,6 +420,13 @@ test("translates common interval, weekday and timed recurrence phrases", () => {
   assert.equal(todoistRecurrenceToRrule({ id: "f", content: "F", due: { datetime: "2026-09-19T09:30:00+01:00", timezone: "Europe/London", string: "every 2 weeks 09:30", is_recurring: true } }), "RRULE:FREQ=WEEKLY;INTERVAL=2");
 });
 
+test("translates an anchored annual month-day Todoist recurrence", () => {
+  const task = { id: "annual-date", content: "Annual date", due: { date: "2027-11-01", string: "every November 1", is_recurring: true } };
+  assert.equal(todoistRecurrenceToRrule(task), "RRULE:FREQ=YEARLY");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, date: "2027-11-02" } }), undefined,
+    "a month-day rule that conflicts with its due-date anchor must remain unsupported");
+});
+
 test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {
   const task = {
     id: "trampoline",
