@@ -431,6 +431,8 @@ test("translates an anchored annual month-day Todoist recurrence", () => {
     "an offset datetime without a named timezone keeps the provider's written local date");
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), undefined,
     "a named timezone converts the instant to its local recurrence date before comparing the anchor");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T12:30:00+00:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), "RRULE:FREQ=YEARLY",
+    "a named timezone accepts an instant whose local date matches the recurrence anchor");
 });
 
 test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {
