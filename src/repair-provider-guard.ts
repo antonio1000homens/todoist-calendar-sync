@@ -9,6 +9,16 @@ import { hasCanonicalState, startsMatch, toTodoistTask } from "./sync.js";
 type ProviderObject = CalendarEvent | TodoistTask;
 const calendarWrites = new Set(["upsertEvent", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
 const taskWrites = new Set(["upsertTask", "updateRecurringOccurrence", "createTaskOnce", "moveTask", "deleteTask"]);
+function clearTodoistCalendarIdentity(event:CalendarEvent):CalendarEvent {
+  const shared={...event.extendedProperties?.shared};
+  for(const name of Object.keys(shared)) if(["taskId","taskUrl","originalSummary"].includes(name)||name.startsWith("sync")||name.startsWith("todoist")) delete shared[name];
+  return {...event,extendedProperties:{...event.extendedProperties,shared}};
+}
+function withoutCalendarVersion(event:CalendarEvent):CalendarEvent {
+  const value={...event} as CalendarEvent & {updated?:string;sequence?:number};
+  delete value.etag;delete value.updated;delete value.sequence;
+  return value;
+}
 
 /** Carry approved provider versions through our own writes and durable retries. */
 export function guardRepairProviders(operation: RepairOperation, factory: ProviderClientFactory, save: () => Promise<void>): ProviderClientFactory {
@@ -94,6 +104,41 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
                 // also authorizes absence while later cleanup checkpoints
                 // resume; neither case can target another Calendar ID.
                 expected[key] = null;
+                await save();
+                return;
+              }
+              const transferDisposition=operation.preview.intent.leftovers[key];
+              const transferDeleteStatus=operation.steps[`transfer-delete-provider:${key}`]?.status;
+              if(move.action==="transfer"&&transferDisposition==="delete"&&object===null
+                &&(transferDeleteStatus==="running"||transferDeleteStatus==="done")) {
+                // Generic transfer deletion checkpoints name the full entity
+                // key, so a retry can accept absence only for that selected ID.
+                expected[key]=null;
+                await save();
+                return;
+              }
+              const displacedDeleteStatus = operation.steps[`transfer-delete-displaced-task:${id}`]?.status;
+              if (side === "todoist" && object === null
+                && (displacedDeleteStatus === "running" || displacedDeleteStatus === "done")) {
+                // A Todoist delete may succeed while its acknowledgement is
+                // lost. Persist the exact ID's absence so subsequent reads and
+                // retries can finish cleanup without issuing another delete.
+                expected[key] = null;
+                await save();
+                return;
+              }
+              const counterpartMetadataStatus=operation.steps[`transfer-delete-counterpart-metadata:${id}`]?.status;
+              const deletedTodoistCounterpart=operation.preview.intent.action==="transfer"&&side==="calendar"
+                &&operation.preview.snapshots.some(snapshot=>snapshot.ref.side==="todoist"
+                  &&operation.preview.intent.leftovers[entityKey(snapshot.ref)]==="delete"&&snapshot.mapping?.eventId===id);
+              const counterpartSnapshot=operation.preview.snapshots.find(snapshot=>snapshot.ref.profile===profile&&snapshot.ref.side==="calendar"&&snapshot.ref.id===id)?.object as CalendarEvent|undefined;
+              if(deletedTodoistCounterpart&&object&&counterpartSnapshot
+                &&(counterpartMetadataStatus==="running"||counterpartMetadataStatus==="done")
+                &&reviewHash(withoutCalendarVersion(object))===reviewHash(withoutCalendarVersion(clearTodoistCalendarIdentity(counterpartSnapshot)))) {
+                // Recover the exact post-write Calendar metadata after a lost
+                // upsert acknowledgement; any content/version-independent
+                // difference still fails closed.
+                expected[key]=object;
                 await save();
                 return;
               }

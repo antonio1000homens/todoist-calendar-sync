@@ -39,8 +39,10 @@ export function dispositionOptions(value, action) {
   const identity = providerIdentity(value);
   if (!identity.identified) return [];
   const ordinary = identity.selectable ? ["create", "exclude", "unchanged"] : ["exclude", "unchanged"];
-  return action === "transfer" && value?.ref?.side === "todoist" && value?.mapping?.recurrenceOwner === "calendar"
-    ? [...(identity.selectable ? ["create", "exclude"] : ["exclude"]), "retain-unlinked"] : ordinary;
+  if (action !== "transfer") return ordinary;
+  if (identity.selectable && value?.ref?.side === "todoist" && value?.mapping?.recurrenceOwner === "calendar")
+    return ["create", "exclude", "retain-unlinked", "delete"];
+  return identity.selectable ? [...ordinary, "delete"] : ordinary;
 }
 
 export function scopeLabel(scope) {
@@ -55,5 +57,6 @@ export function previewEffect(snapshot, intent, plan) {
   if (disposition === "exclude") return { operation:"Exclude", result:"Excluded from syncing" };
   if (disposition === "unchanged") return { operation:"Leave unchanged", result:"Retain provider object, mapping, and sync control without changes" };
   if (disposition === "retain-unlinked") return { operation:"Retain provider item and detach its old mapping", result:"Keep this exact provider object unchanged; detach only its obsolete mapping, ownership, comments, and baseline links" };
+  if (disposition === "delete") return { operation:"Delete exact one-off and purge attributable state", result:"Apply only after the preview verifies this exact object has no recurrence or retained completion history" };
   return { operation:"Selected repair / contextual item", result:"See planned changes below" };
 }

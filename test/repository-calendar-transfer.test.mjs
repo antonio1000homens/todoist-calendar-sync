@@ -51,6 +51,31 @@ test("conditional transfer conflict returns false without treating a cancellatio
   assert.equal(await new StateRepository().transferCalendarSeriesMapping(f),false);
 });
 
+test("exact one-off mapping deletion conditions all three indexes on the previewed version",async t=>{
+  const mapping={profile:"home",taskId:"duplicate-task",eventId:"duplicate-event",updatedAt:"2026-10-24T12:00:00.000Z"};
+  let transaction;
+  t.mock.method(documentClient,"send",async command=>{transaction=command.input.TransactItems;return {};});
+  assert.equal(await new StateRepository().deleteMappingIfUnchanged(mapping),true);
+  assert.equal(transaction.length,3);
+  assert.deepEqual(transaction.map(item=>Object.values(item)[0].Key.pk).sort(),[
+    "EVENT#home#duplicate-event","TASK#home#duplicate-task","TASKOWNER#duplicate-task",
+  ]);
+  for(const item of transaction) {
+    const deletion=Object.values(item)[0];
+    assert.match(deletion.ConditionExpression,/updatedAt = :updated/);
+    assert.match(deletion.ConditionExpression,/attribute_not_exists\(seriesId\)/);
+  }
+});
+
+test("exact one-off mapping cleanup refuses a partial index set rather than erasing newer ownership",async t=>{
+  const mapping={profile:"home",taskId:"duplicate-task",eventId:"duplicate-event",updatedAt:"2026-10-24T12:00:00.000Z"};
+  t.mock.method(documentClient,"send",async command=>{
+    if(command.input.TransactItems) throw Object.assign(new Error("stale mapping"),{name:"TransactionCanceledException"});
+    return command.input.Key.pk==="EVENT#home#duplicate-event"?{Item:{pk:"EVENT#home#duplicate-event",taskId:"other-task"}}:{};
+  });
+  assert.equal(await new StateRepository().deleteMappingIfUnchanged(mapping),false);
+});
+
 test("Calendar series mapping repair atomically restores missing indexes for its existing owner",async t=>{
   const f=transferFixture();
   const expectedLink={...f.expectedLink,taskId:f.mapping.taskId};

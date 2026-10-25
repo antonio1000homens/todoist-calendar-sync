@@ -1,4 +1,4 @@
-import { GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { normalizedText } from "./security.js";
 import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
@@ -108,6 +108,7 @@ function retentionDays(): number {
 export interface CanonicalIdentityRepository {
   get(profile: Profile, side: CanonicalIdentitySide, providerId: string): Promise<CanonicalIdentityRecord | undefined>;
   put(profile: Profile, side: CanonicalIdentitySide, providerId: string, identity: CanonicalIdentity): Promise<void>;
+  deleteIfUnchanged(record: CanonicalIdentityRecord): Promise<boolean>;
 }
 
 export class CanonicalIdentityStore implements CanonicalIdentityRepository {
@@ -146,5 +147,21 @@ export class CanonicalIdentityStore implements CanonicalIdentityRepository {
         expiresAt,
       },
     }));
+  }
+
+  async deleteIfUnchanged(record:CanonicalIdentityRecord):Promise<boolean> {
+    if(!this.table) return false;
+    try {
+      await documentClient.send(new DeleteCommand({TableName:this.table,Key:identityKey(record.profile,record.side,record.providerId),
+        ConditionExpression:"#profile = :profile AND #side = :side AND providerId = :provider AND updatedAt = :updated AND #identity = :identity",
+        ExpressionAttributeNames:{"#profile":"profile","#side":"side","#identity":"identity"},
+        ExpressionAttributeValues:{":profile":record.profile,":side":record.side,":provider":record.providerId,":updated":record.updatedAt,":identity":record.identity}}));
+      return true;
+    } catch(error) {
+      if((error as {name?:string}).name!=="ConditionalCheckFailedException") throw error;
+      // A conditional miss is not proof that this repair deleted the row.
+      // The caller's persisted deletion step handles an absent row on retry.
+      return false;
+    }
   }
 }

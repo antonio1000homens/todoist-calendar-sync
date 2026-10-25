@@ -23,7 +23,7 @@ export interface RepairIntent {
   taskId?: string; eventId?: string;
   winner: Side | "none";
   owner?: Side; scope: "occurrence" | "series" | "future";
-  leftovers: Record<string, "exclude" | "create" | "unchanged" | "retain-unlinked">;
+  leftovers: Record<string, "exclude" | "create" | "unchanged" | "retain-unlinked" | "delete">;
   decisionAction?: string; targetProfile?: Profile;
 }
 export interface ReviewSnapshot {
@@ -38,6 +38,7 @@ export interface RepairPreview {
   snapshots: ReviewSnapshot[]; fingerprint: string; createdAt: string; expiresAt: number;
   changes: string[]; warnings: string[]; flattenPlan?: RecurrenceFlattenPlan; splitPlan?: FutureSeriesSplitPlan; annualPlan?: StandaloneAnnualPlan;
   elapsedCalendarHistoryPlan?: { eventId:string; taskId:string; timeZone?:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedTaskMapping?:Mapping; retainedEventMappings?:Mapping[]; recurringMasterId?:string; activeInstanceId?:string; recurringMapping?:Mapping; recurrenceLink?:RecurrenceLink };
+  oneOffDeletionPlans?: Array<{ref:EntityRef; mapping?:Mapping; baseline:unknown|null; canonical:unknown|null}>;
   /** Exact provider refs and per-object planned effects, matched to frozen snapshots. */
   itemPlan: Array<{ ref:EntityRef; operation:string; result:string }>;
 }
@@ -46,11 +47,11 @@ export interface RepairOperation {
   id: string; preview: RepairPreview; actor: ReviewActor; attempt: number;
   status: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
-  error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
+  error?: string; nextAction?: string; abandoned?: boolean; nonResumable?: boolean; notificationPending: boolean; notificationReplyTs?: string;
   /** Persisted before any non-validation execution step so no-write abandonment can race safely with retries. */
   writeStarted?: boolean;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;
-  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged" | "retained-unlinked"; checkedAt: string }>;
+  outcomes?: Array<{ entity: string; outcome: "missing" | "history" | "excluded" | "unchanged" | "retained-unlinked" | "deleted"; checkedAt: string }>;
   /** Controls sampled before claiming extra, non-preview move destination locks. */
   claimSnapshots?: ReviewSnapshot[];
   expectedProviders?: Record<string, TodoistTask | CalendarEvent | null>;
