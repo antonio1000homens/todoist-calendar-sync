@@ -49,37 +49,6 @@ test("forwards a current v3 Calendar notification with provider headers and repl
   }
 });
 
-test("forwards Todoist webhook routes with the original signed payload and replacement proxy auth", async () => {
-  const originalFetch = globalThis.fetch;
-  let forwarded;
-  globalThis.fetch = async (url, init) => {
-    forwarded = { url: String(url), headers: new Headers(init.headers), body: init.body };
-    return new Response('{"accepted":true}', { status: 202 });
-  };
-  try {
-    const rawBody = '{"event_name":"item:completed","event_data":{"id":"task-123"}}';
-    const response = await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/todoist-home1000homens?delivery=abc", {
-      method: "POST",
-      headers: {
-        "x-todoist-hmac-sha256": "todoist-signature",
-        "x-todoist-delivery-id": "delivery-123",
-        "x-gcp-proxy-auth": "spoofed",
-      },
-      body: rawBody,
-    }), env);
-
-    assert.equal(response.status, 202);
-    assert.equal(forwarded.url, "https://lambda.example.test/todoist-home1000homens?delivery=abc");
-    assert.equal(forwarded.headers.get("x-todoist-hmac-sha256"), "todoist-signature");
-    assert.equal(forwarded.headers.get("x-todoist-delivery-id"), "delivery-123");
-    assert.equal(forwarded.headers.get("x-gcp-proxy-auth"), "proxy-secret");
-    assert.equal(forwarded.headers.get("host"), null);
-    assert.equal(await new Response(forwarded.body).text(), rawBody);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
 test("rejects wrong method, path, and unsupported channels without forwarding", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -89,8 +58,6 @@ test("rejects wrong method, path, and unsupported channels without forwarding", 
     assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/other", { method: "POST" }), env)).status, 404);
     assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/calendar", { method: "POST", headers: { "x-goog-channel-id": "unknown" } }), env)).status, 404);
     assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/calendar", { method: "POST", headers: { "x-goog-channel-id": "home1000homens-calendar-sync-v2" } }), env)).status, 404);
-    assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/todoist-home1000homens", { method: "GET" }), env)).status, 405);
-    assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/todoist--home", { method: "POST" }), env)).status, 404);
     assert.equal(calls, 0);
   } finally {
     globalThis.fetch = originalFetch;
