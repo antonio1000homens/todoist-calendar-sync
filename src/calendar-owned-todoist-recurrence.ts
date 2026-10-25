@@ -100,7 +100,7 @@ function parseTime(value: string | undefined): string | undefined {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleParseResult {
+function parseWeeklyScheduleDetailed(value: string | undefined, currentDueDate?: string): WeeklyScheduleParseResult {
   const emptyDiagnostics: WeeklyScheduleParseDiagnostics = {
     phraseKind: "other", weekdayRecognized: false,
     startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
@@ -126,6 +126,17 @@ function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleP
     : undefined;
   const parsedTime = timeCandidate ? parseTime(timeCandidate) : undefined;
   const match = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+starting\s+(.+?)\s+(?:and\s+)?ending\s+(.+)$/i);
+  // Todoist normalizes some finite rules to an ending-only phrase. Its Help
+  // Center defines that form as starting today and ending inclusively; the
+  // API's due.date is the current iteration, so use that date as the anchor.
+  // Only accept a date-only due value here: interpreting a timestamp would
+  // require timezone conversion and could shift an all-day Calendar date.
+  const endingOnly = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+ending\s+(.+)$/i);
+  const currentDueMatch = currentDueDate?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const currentDue = currentDueMatch && currentDueDate
+    && new Date(`${currentDueDate}T00:00:00Z`).toISOString().slice(0, 10) === currentDueDate
+    ? parseNaturalDate(currentDueDate) : undefined;
+  const endingOnlyEnd = endingOnly ? parseNaturalDate(endingOnly[3]) : undefined;
   const startText = match?.[3];
   const endText = match?.[4];
   const boundedDates = normalized.match(/\b(?:starting|from)\s+(.+?)\s+(?:and\s+)?(?:ending|until|to)\s+(.+)$/i);
@@ -138,11 +149,20 @@ function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleP
   const diagnostics: WeeklyScheduleParseDiagnostics = {
     phraseKind,
     weekdayRecognized: Boolean(weekday),
-    startDateParsed: Boolean(start),
-    endDateParsed: Boolean(end),
+    startDateParsed: Boolean(phraseKind === "ending_only" ? currentDue : start),
+    endDateParsed: Boolean(phraseKind === "ending_only" ? endingOnlyEnd : end),
     timePresent,
-    timeParsed: !timePresent || Boolean(parsedTime),
+    timeParsed: phraseKind === "ending_only"
+      ? !endingOnly || endingOnly[2] === undefined || Boolean(parseTime(endingOnly[2]))
+      : !timePresent || Boolean(parsedTime),
   };
+  if (phraseKind === "ending_only") {
+    const endingWeekday = endingOnly ? weekdayLookup.get(endingOnly[1].toLowerCase()) : undefined;
+    const endingTime = endingOnly?.[2] === undefined ? undefined : parseTime(endingOnly[2]);
+    if (!endingOnly || !endingWeekday || !currentDue || !endingOnlyEnd
+      || (endingOnly[2] !== undefined && !endingTime)) return { diagnostics };
+    return { schedule: { weekday: endingWeekday, ...(endingTime ? { time: endingTime } : {}), start: currentDue, end: endingOnlyEnd }, diagnostics };
+  }
   if (!match || !weekday || !start || !end || (match[2] !== undefined && !time)) return { diagnostics };
   return { schedule: { weekday, ...(time ? { time } : {}), start, end }, diagnostics };
 }
@@ -292,7 +312,7 @@ export function matchesCalendarOwnedRecurringRule(
   recurrence: CalendarOwnedTodoistRecurrence,
 ): boolean {
   const expected = parseWeeklySchedule(recurrence.dueString);
-  const observed = parseWeeklySchedule(task.due?.string);
+  const observed = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date).schedule;
   const allowYearOmission = Boolean(expected?.start.year && expected.start.year === expected.end.year);
   return Boolean(task.due?.is_recurring && expected && observed
     && expected.weekday === observed.weekday
@@ -315,7 +335,7 @@ export function calendarOwnedRecurringTaskReadback(
   recurrence: CalendarOwnedTodoistRecurrence,
 ): CalendarOwnedRecurringTaskReadback {
   const expectedSchedule = parseWeeklySchedule(recurrence.dueString);
-  const observedParse = parseWeeklyScheduleDetailed(task.due?.string);
+  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date);
   const observedSchedule = observedParse.schedule;
   const allowYearOmission = Boolean(expectedSchedule?.start.year
     && expectedSchedule.start.year === expectedSchedule.end.year);

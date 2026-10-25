@@ -165,6 +165,40 @@ test("recurring task readback accepts Todoist date-text normalization but reject
   assert.equal("dueString" in wrongEnd.observed, false);
 });
 
+test("ending-only Todoist readback uses the current date as the inclusive weekly start anchor", () => {
+  const master = { id: "all-day-master", summary: "Task", start: { date: "2026-11-05" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"] };
+  const active = {
+    id: "all-day-first", recurringEventId: master.id, status: "confirmed",
+    originalStartTime: { date: "2026-11-05" }, start: { date: "2026-11-05" },
+  };
+  const schedule = ["2026-11-05", "2026-11-12", "2026-11-19", "2026-11-26"].map((date, index) => ({
+    id: `all-day-${index}`, recurringEventId: master.id, status: "confirmed",
+    originalStartTime: { date }, start: { date },
+  }));
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  const task = { id: "task", content: "Task", due: {
+    date: "2026-11-05", is_recurring: true, string: "every Thursday ending 26 Nov 2026",
+  } };
+
+  const accepted = calendarOwnedRecurringTaskReadback(task, active, recurrence);
+  assert.equal(accepted.matches, true);
+  assert.deepEqual({ weekday: accepted.observed.weekday, startDate: accepted.observed.startDate, endDate: accepted.observed.endDate }, {
+    weekday: "Thursday", startDate: "2026-11-05", endDate: "2026-11-26",
+  });
+  assert.equal("dueString" in accepted.observed, false);
+  assert.equal("string" in accepted.observed, false);
+
+  const readback = (due) => calendarOwnedRecurringTaskReadback({ ...task, due: { ...task.due, ...due } }, active, recurrence);
+  assert.equal(readback({ string: "every Thursday ending 25 Nov 2026" }).matches, false, "wrong inclusive end is rejected");
+  assert.equal(readback({ date: "2026-11-12" }).matches, false, "wrong current iteration is rejected");
+  assert.equal(readback({ date: "2026-02-31" }).matches, false, "malformed current date is rejected");
+  assert.equal(readback({ date: undefined }).matches, false, "missing current date is rejected");
+  assert.equal(readback({ string: "every Thursday ending sometime" }).matches, false, "malformed ending is rejected");
+  assert.equal(readback({ string: "every Friday ending 26 Nov 2026" }).matches, false, "wrong weekday is rejected");
+  assert.equal(readback({ is_recurring: false }).matches, false, "non-recurring tasks are rejected");
+  assert.equal(readback({ datetime: "2026-11-05T00:00:00Z", date: undefined }).matches, false, "timestamp-only anchors fail closed");
+});
+
 test("Todoist timezone lookup reads only user resource and exposes the IANA timezone", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
