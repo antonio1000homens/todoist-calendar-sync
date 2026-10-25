@@ -1241,7 +1241,7 @@ export class Synchronizer {
     // even when it belongs to another project/profile or is now a one-off.
     const conflictingIds = [...new Set(candidates.filter((id) => id !== task?.id).concat(sharedTaskIds.filter((id) => id !== task?.id)))];
     const mappedRecurringMatches = Boolean(calendarRecurrence && task && task.id === existing?.taskId
-      && matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence));
+      && matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone));
     if ((task?.due?.is_recurring && !mappedRecurringMatches) || conflictingIds.length) {
       return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
         seriesId, masterEventId: master.id, eventId: active.id,
@@ -1257,7 +1257,7 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
     }
     if (task && existing?.activeInstanceId === active.id
-      && (calendarRecurrence ? matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence) : hasCanonicalState(active, task))) {
+      && (calendarRecurrence ? matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone) : hasCanonicalState(active, task))) {
       return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
     }
     if (await this.calendarMutationBlockedByCompletion(delivery, active.id)) return;
@@ -1270,7 +1270,7 @@ export class Synchronizer {
     const nextTask = await todoist.upsertTask(
       calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence) : toTodoistTask(active), task?.id,
     );
-    const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence) : undefined;
+    const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence, calendarTimeZone) : undefined;
     if (readback && !readback.matches) {
       if (!task) {
         await todoist.deleteTask(nextTask.id).catch((error: unknown) => {
@@ -1528,7 +1528,7 @@ export class Synchronizer {
         ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
         : await todoist.upsertTask(toTodoistTask(next));
       const readback = currentCalendarRecurrence
-        ? calendarOwnedRecurringTaskReadback(nextTask, next, currentCalendarRecurrence)
+        ? calendarOwnedRecurringTaskReadback(nextTask, next, currentCalendarRecurrence, verifiedCalendarTimeZone)
         : undefined;
       if (readback && !readback.matches) {
         return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {

@@ -305,8 +305,9 @@ export function matchesCalendarOwnedRecurringTask(
   task: TodoistTask,
   event: CalendarEvent,
   recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
 ): boolean {
-  return calendarOwnedRecurringTaskReadback(task, event, recurrence).matches;
+  return calendarOwnedRecurringTaskReadback(task, event, recurrence, verifiedTimeZone).matches;
 }
 
 export function matchesCalendarOwnedRecurringRule(
@@ -335,6 +336,7 @@ export function calendarOwnedRecurringTaskReadback(
   task: TodoistTask,
   event: CalendarEvent,
   recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
 ): CalendarOwnedRecurringTaskReadback {
   const expectedSchedule = parseWeeklySchedule(recurrence.dueString);
   const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date);
@@ -370,23 +372,24 @@ export function calendarOwnedRecurringTaskReadback(
     && expectedSchedule.time === observedSchedule.time
     && sameDate(expectedSchedule.start, observedSchedule.start, allowYearOmission)
     && sameDate(expectedSchedule.end, observedSchedule.end, allowYearOmission)
-    && startsMatchCalendarEvent(event, task));
+    && startsMatchCalendarEvent(event, task, verifiedTimeZone));
   return { matches, expected, observed };
 }
 
-function startsMatchCalendarEvent(event: CalendarEvent, task: TodoistTask): boolean {
+function startsMatchCalendarEvent(event: CalendarEvent, task: TodoistTask, verifiedTimeZone?: string): boolean {
   if (event.start?.date && task.due?.date) return event.start.date === task.due.date;
   const eventStart = event.start?.dateTime;
   const taskStart = task.due?.datetime || task.due?.date;
   if (!eventStart || !taskStart) return false;
   const localTaskTime = taskStart.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.\d+)?$/);
   if (localTaskTime && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(taskStart)) {
-    const zone = event.start?.timeZone || task.due?.timezone;
-    if (!zone || task.due?.timezone !== zone) return false;
+    const eventTimeZone = event.start?.timeZone;
+    if (!verifiedTimeZone || !eventTimeZone || verifiedTimeZone !== eventTimeZone
+      || (task.due?.timezone && task.due.timezone !== verifiedTimeZone)) return false;
     const instant = Date.parse(eventStart);
     if (!Number.isFinite(instant)) return false;
     const parts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+      timeZone: verifiedTimeZone, year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
     }).formatToParts(new Date(instant));
     const part = (type: string) => parts.find((value) => value.type === type)?.value;
