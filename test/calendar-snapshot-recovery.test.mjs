@@ -158,7 +158,7 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(summary.conflicts, 0);
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].due.is_recurring, true);
-  assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026");
+  assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2026 and ending 25 Nov 2026");
   assert.equal(state.mappings.length, 1);
   assert.equal(state.mappings[0].taskId, "one-task");
   assert.equal(state.mappings[0].recurrenceOwner, "calendar");
@@ -217,16 +217,27 @@ test("snapshot recovery imports an all-day finite recurrence using the verified 
     todoist: {
       async listTasks() { return tasks; },
       async getTimeZone() { return "Europe/London"; },
-      async upsertTask(payload) { const task = { id: "all-day-task", ...structuredClone(payload) }; tasks.push(task); return task; },
+      async upsertTask(payload) {
+        // Todoist returns due.string as human-readable text, which may omit
+        // years or normalize connectives while due.date remains canonical.
+        const task = { id: "all-day-task", ...structuredClone(payload) };
+        task.due.string = "every Wednesday starting 2 Sep and ending 23 Sep";
+        tasks.push(task);
+        return task;
+      },
+      async deleteTask(id) { const index = tasks.findIndex((task) => task.id === id); if (index >= 0) tasks.splice(index, 1); },
       async findComment() { return undefined; }, async upsertComment() { return { id: "comment" }; },
     },
   };
   const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
   assert.equal(summary.imported, 1);
+  assert.equal(summary.conflicts, 0);
   assert.ok(calendarZoneReads >= 1);
   assert.equal(tasks[0].due.date, "2099-09-02");
   assert.equal(tasks[0].due.datetime, undefined);
-  assert.equal(tasks[0].due.string, "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099");
+  assert.equal(tasks[0].due.string, "every Wednesday starting 2 Sep and ending 23 Sep");
+  assert.equal(state.mappings[0].taskId, "all-day-task");
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"), false);
 });
 
 test("all-day recurrence timezone mismatch fails closed before Todoist or mapping writes", async () => {

@@ -17,6 +17,7 @@ import {
 import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import {
   calendarOwnedRecurringTaskPayload,
+  calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   matchesCalendarOwnedRecurringRule,
@@ -1269,7 +1270,8 @@ export class Synchronizer {
     const nextTask = await todoist.upsertTask(
       calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence) : toTodoistTask(active), task?.id,
     );
-    if (calendarRecurrence && !matchesCalendarOwnedRecurringTask(nextTask, active, calendarRecurrence)) {
+    const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence) : undefined;
+    if (readback && !readback.matches) {
       if (!task) {
         await todoist.deleteTask(nextTask.id).catch((error: unknown) => {
           if (Number((error as { status?: number }).status) !== 404) throw error;
@@ -1279,6 +1281,8 @@ export class Synchronizer {
       }
       return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,
+        expected: readback.expected,
+        observed: readback.observed,
       });
     }
     const mapping: Mapping = {
@@ -1523,10 +1527,15 @@ export class Synchronizer {
       const nextTask = currentCalendarRecurrence && currentRecurringTask
         ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
         : await todoist.upsertTask(toTodoistTask(next));
-      if (currentCalendarRecurrence && !matchesCalendarOwnedRecurringTask(nextTask, next, currentCalendarRecurrence)) {
+      const readback = currentCalendarRecurrence
+        ? calendarOwnedRecurringTaskReadback(nextTask, next, currentCalendarRecurrence)
+        : undefined;
+      if (readback && !readback.matches) {
         return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
           seriesId: mapping.seriesId, masterEventId: mapping.masterEventId,
           eventId: next.id, taskId: nextTask.id,
+          expected: readback.expected,
+          observed: readback.observed,
         });
       }
       const nextMapping: Mapping = {
