@@ -19,7 +19,7 @@ const SAFE_BOOLEAN_KEYS = new Set([
   "continued", "pending", "success", "exhausted",
 ]);
 
-const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|mismatchCategories)$|(?:^|_)(?:changedFields|fields)$/;
+const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|eligibleCandidateTaskIds|mappedCandidateTaskIds|reservedCandidateTaskIds|mismatchCategories)$|(?:^|_)(?:changedFields|fields)$/;
 const SAFE_RECURRENCE_EXPECTED_KEYS = new Set(["frequency", "weekday", "time", "startDate", "endDate"]);
 const SAFE_RECURRENCE_OBSERVED_KEYS = new Set([
   "recurring", "dueDate", "recurrenceParsed", "frequency", "weekday", "time", "startDate", "endDate",

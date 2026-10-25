@@ -46,6 +46,21 @@ test("telemetry sanitization retains correlation metadata and drops content/payl
   });
 });
 
+test("telemetry retains classified candidate task IDs without accepting arbitrary arrays", () => {
+  assert.deepEqual(sanitizeTelemetryDetail({
+    candidateTaskIds: ["task-a", "task-b"],
+    eligibleCandidateTaskIds: ["task-a"],
+    mappedCandidateTaskIds: ["task-b"],
+    reservedCandidateTaskIds: ["task-c", "not a safe id"],
+    taskTitles: ["private task title"],
+  }), {
+    candidateTaskIds: ["task-a", "task-b"],
+    eligibleCandidateTaskIds: ["task-a"],
+    mappedCandidateTaskIds: ["task-b"],
+    reservedCandidateTaskIds: ["task-c"],
+  });
+});
+
 test("telemetry retains only safe expected and observed recurrence scalars", () => {
   const sanitized = sanitizeTelemetryDetail({
     eventId: "event-1",

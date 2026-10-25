@@ -212,17 +212,33 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
 
-  const eligibleUniqueTask = async (matches: TodoistTask[], eventIds: string[]): Promise<{ task?: TodoistTask; ambiguous: boolean; blocked?:boolean; candidateTaskIds: string[] }> => {
+  const eligibleUniqueTask = async (matches: TodoistTask[], eventIds: string[]): Promise<{
+    task?: TodoistTask;
+    ambiguous: boolean;
+    blocked?: boolean;
+    candidateTaskIds: string[];
+    eligibleCandidateTaskIds: string[];
+    mappedCandidateTaskIds: string[];
+    reservedCandidateTaskIds: string[];
+  }> => {
     const eligible: TodoistTask[] = [];
+    const mapped: string[] = [];
+    const reserved: string[] = [];
     let ownershipConflict = false;
     for (const candidate of matches) {
-      if (await controlsBlockRecovery(eventIds,candidate.id)) return {ambiguous:false,blocked:true,candidateTaskIds:matches.map(task=>task.id)};
-      if (reservedTaskIds.has(candidate.id)) {
-        ownershipConflict = true;
-        continue;
-      }
+      if (await controlsBlockRecovery(eventIds,candidate.id)) return {
+        ambiguous: false,
+        blocked: true,
+        candidateTaskIds: matches.map((task) => task.id).sort(),
+        eligibleCandidateTaskIds: [],
+        mappedCandidateTaskIds: [],
+        reservedCandidateTaskIds: [],
+      };
+      const isReserved = reservedTaskIds.has(candidate.id);
       const existing = await state.getMappingByTaskAnyProfile(candidate.id);
-      if (existing) {
+      if (isReserved) reserved.push(candidate.id);
+      if (existing) mapped.push(candidate.id);
+      if (isReserved || existing) {
         ownershipConflict = true;
         continue;
       }
@@ -231,7 +247,10 @@ export async function reconcileUnmappedCalendar(
     return {
       task: eligible.length === 1 && !ownershipConflict ? eligible[0] : undefined,
       ambiguous: eligible.length > 1 || ownershipConflict,
-      candidateTaskIds: eligible.map((task) => task.id).sort(),
+      candidateTaskIds: matches.map((task) => task.id).sort(),
+      eligibleCandidateTaskIds: eligible.map((task) => task.id).sort(),
+      mappedCandidateTaskIds: mapped.sort(),
+      reservedCandidateTaskIds: reserved.sort(),
     };
   };
 
@@ -262,7 +281,13 @@ export async function reconcileUnmappedCalendar(
     if (match.blocked) return;
     if (match.ambiguous) {
       summary.conflicts += 1;
-      await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", { eventId: event.id, candidateTaskIds: match.candidateTaskIds });
+      await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", {
+        eventId: event.id,
+        candidateTaskIds: match.candidateTaskIds,
+        eligibleCandidateTaskIds: match.eligibleCandidateTaskIds,
+        mappedCandidateTaskIds: match.mappedCandidateTaskIds,
+        reservedCandidateTaskIds: match.reservedCandidateTaskIds,
+      });
       return;
     }
 
@@ -282,6 +307,9 @@ export async function reconcileUnmappedCalendar(
             eventId: event.id,
             source: "snapshot_previous_identity",
             candidateTaskIds: historical.candidateTaskIds,
+            eligibleCandidateTaskIds: historical.eligibleCandidateTaskIds,
+            mappedCandidateTaskIds: historical.mappedCandidateTaskIds,
+            reservedCandidateTaskIds: historical.reservedCandidateTaskIds,
             previousIdentity,
             currentIdentity,
           });
@@ -437,7 +465,15 @@ export async function reconcileUnmappedCalendar(
     if (match.blocked) return;
     if (match.ambiguous) {
       summary.conflicts += 1;
-      await state.audit(profile, "calendar_snapshot_recurring_ambiguous", { seriesId, masterEventId: master.id, eventId: active.id });
+      await state.audit(profile, "calendar_snapshot_recurring_ambiguous", {
+        seriesId,
+        masterEventId: master.id,
+        eventId: active.id,
+        candidateTaskIds: match.candidateTaskIds,
+        eligibleCandidateTaskIds: match.eligibleCandidateTaskIds,
+        mappedCandidateTaskIds: match.mappedCandidateTaskIds,
+        reservedCandidateTaskIds: match.reservedCandidateTaskIds,
+      });
       return;
     }
 

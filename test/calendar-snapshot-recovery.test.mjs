@@ -356,7 +356,11 @@ test("snapshot recovery treats multiple canonical Todoist matches as a conflict 
   assert.equal(clients.created, 0);
   assert.equal(clients.comments, 0);
   assert.equal(state.mappings.length, 0);
-  assert.ok(state.audits.some((entry) => entry.action === "calendar_snapshot_unmapped_ambiguous"));
+  const audit = state.audits.find((entry) => entry.action === "calendar_snapshot_unmapped_ambiguous");
+  assert.deepEqual(audit.detail.candidateTaskIds, ["task-a", "task-b"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, ["task-a", "task-b"]);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, []);
+  assert.deepEqual(audit.detail.reservedCandidateTaskIds, []);
 });
 
 test("snapshot recovery never reuses one task for two canonical Calendar events", async () => {
@@ -388,6 +392,11 @@ test("snapshot recovery will not bind a canonical task already owned by another 
   assert.equal(summary.rebound, 0);
   assert.equal(clients.created, 0);
   assert.equal(state.mappings.length, 1);
+  const audit = state.audits.find((entry) => entry.action === "calendar_snapshot_unmapped_ambiguous");
+  assert.deepEqual(audit.detail.candidateTaskIds, ["task-bound"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, []);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, ["task-bound"]);
+  assert.deepEqual(audit.detail.reservedCandidateTaskIds, []);
 });
 
 test("snapshot recovery stops provider writes at the ten-mutation budget", async () => {
@@ -445,6 +454,54 @@ test("recurrence snapshot guard recognises a competing recurring Todoist identit
   assert.ok(state.audits.some((entry) =>
     entry.action === "calendar_snapshot_recurring_identity_conflict"
     && entry.detail.candidateTaskIds.includes("original-yearly")));
+});
+
+test("ambiguous series recovery audits every canonical candidate and mapped ownership without writes", async () => {
+  const master = { ...futureEvent("ambiguous-series", 11, "Same appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
+  const occurrence = { ...futureEvent("ambiguous-series_20990111", 11, "Same appointment"), recurringEventId: master.id };
+  const candidate = (id) => ({ id, content: "Same appointment", description: "", project_id: "home-project", due: { date: "2099-01-11" } });
+  const state = fakeState();
+  state.mappings.push({ profile: "home", eventId: "already-mapped-event", taskId: "mapped-task", projectId: "home-project", updatedAt: "2099-01-01T00:00:00Z" });
+  const clients = fakeClients([master], [candidate("mapped-task"), candidate("eligible-task-a"), candidate("eligible-task-b")]);
+  clients.pair.calendar.listInstances = async () => [occurrence];
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.providerMutations, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(clients.comments, 0);
+  assert.deepEqual(state.mappings, [{ profile: "home", eventId: "already-mapped-event", taskId: "mapped-task", projectId: "home-project", updatedAt: "2099-01-01T00:00:00Z" }]);
+  assert.equal(state.mutations, 0);
+  const audit = state.audits.find((entry) => entry.action === "calendar_snapshot_recurring_ambiguous");
+  assert.deepEqual(audit.detail.candidateTaskIds, ["eligible-task-a", "eligible-task-b", "mapped-task"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, ["eligible-task-a", "eligible-task-b"]);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, ["mapped-task"]);
+  assert.deepEqual(audit.detail.reservedCandidateTaskIds, []);
+});
+
+test("ambiguous series recovery classifies reserved candidates without mutating the second series", async () => {
+  const firstMaster = { ...futureEvent("a-series", 11, "Same appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
+  const secondMaster = { ...futureEvent("b-series", 11, "Same appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
+  const firstOccurrence = { ...futureEvent("a-series_20990111", 11, "Same appointment"), recurringEventId: firstMaster.id };
+  const secondOccurrence = { ...futureEvent("b-series_20990111", 11, "Same appointment"), recurringEventId: secondMaster.id };
+  const state = fakeState();
+  const clients = fakeClients([firstMaster, secondMaster]);
+  clients.pair.calendar.listInstances = async (masterId) => [masterId === firstMaster.id ? firstOccurrence : secondOccurrence];
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.imported, 1);
+  assert.equal(summary.providerMutations, 1);
+  assert.equal(clients.created, 1);
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].eventId, firstOccurrence.id);
+  const audit = state.audits.find((entry) => entry.action === "calendar_snapshot_recurring_ambiguous");
+  assert.deepEqual(audit.detail.candidateTaskIds, ["created-1"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, []);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, ["created-1"]);
+  assert.deepEqual(audit.detail.reservedCandidateTaskIds, ["created-1"]);
 });
 
 test("recurrence snapshot guard trusts an exact shared task ID when title and start differ", async () => {
