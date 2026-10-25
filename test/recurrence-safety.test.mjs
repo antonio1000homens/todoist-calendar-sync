@@ -853,7 +853,7 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   const next = instance("instance-3", dates[2], addDay(dates[2]));
   const final = instance("instance-4", dates[3], addDay(dates[3]));
   for (const occurrence of [current, cancelled, next, final]) occurrence.summary = "Water plants";
-  const recurrenceText = "every Sunday starting 6 Sep 2099 and ending 27 Sep 2099";
+  const recurrenceText = "every Sunday ending 27 Sep 2099";
   const initialTask = {
     id: "task-calendar-owned", content: "Water plants", description: "", project_id: "home-project",
     due: { date: dates[0], is_recurring: true, string: recurrenceText },
@@ -880,6 +880,12 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(state.audits.some((entry) => entry.action === "todoist_noop_canonical_state"), true);
 
+  // Todoist advances its current due date to the next recurrence before the
+  // completion webhook is handled. Here that due date is the canceled slot.
+  tasks.set(initialTask.id, {
+    ...initialTask,
+    due: { ...initialTask.due, date: dates[1] },
+  });
   await sync.process({
     id: "todoist-recurring-complete", kind: "todoist", profile: PROFILE, mode: "aws",
     receivedAt: "2099-09-06T09:00:00Z", headers: {},

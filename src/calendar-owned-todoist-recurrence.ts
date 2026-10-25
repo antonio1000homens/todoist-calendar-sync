@@ -178,6 +178,33 @@ function sameDate(expected: ParsedDate, observed: ParsedDate, allowYearOmission:
     && (observed.year === expected.year || (allowYearOmission && observed.year === undefined));
 }
 
+function endingOnlyAnchorMatchesSeries(expected: ParsedWeeklySchedule, observed: ParsedWeeklySchedule): boolean {
+  if (expected.start.year === undefined || expected.end.year === undefined || observed.start.year === undefined) return false;
+  const dateOrdinal = (date: ParsedDate): number | undefined => {
+    if (date.year === undefined) return undefined;
+    const value = Date.UTC(date.year, date.month - 1, date.day);
+    const roundTrip = new Date(value);
+    if (roundTrip.getUTCFullYear() !== date.year || roundTrip.getUTCMonth() !== date.month - 1 || roundTrip.getUTCDate() !== date.day) return undefined;
+    return value / 86_400_000;
+  };
+  const first = dateOrdinal(expected.start);
+  const current = dateOrdinal(observed.start);
+  const last = dateOrdinal(expected.end);
+  if (first === undefined || current === undefined || last === undefined) return false;
+  const offset = current - first;
+  return offset >= 0 && current <= last && offset % 7 === 0;
+}
+
+function scheduleStartMatches(
+  expected: ParsedWeeklySchedule,
+  observed: ParsedWeeklySchedule,
+  allowYearOmission: boolean,
+  phraseKind: WeeklyPhraseKind,
+): boolean {
+  return sameDate(expected.start, observed.start, allowYearOmission)
+    || (phraseKind === "ending_only" && endingOnlyAnchorMatchesSeries(expected, observed));
+}
+
 function formatParsedDate(date: ParsedDate): string {
   return `${date.year ? `${date.year}-` : ""}${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}`;
 }
@@ -315,12 +342,13 @@ export function matchesCalendarOwnedRecurringRule(
   recurrence: CalendarOwnedTodoistRecurrence,
 ): boolean {
   const expected = parseWeeklySchedule(recurrence.dueString);
-  const observed = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date).schedule;
+  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date);
+  const observed = observedParse.schedule;
   const allowYearOmission = Boolean(expected?.start.year && expected.start.year === expected.end.year);
   return Boolean(task.due?.is_recurring && expected && observed
     && expected.weekday === observed.weekday
     && expected.time === observed.time
-    && sameDate(expected.start, observed.start, allowYearOmission)
+    && scheduleStartMatches(expected, observed, allowYearOmission, observedParse.diagnostics.phraseKind)
     && sameDate(expected.end, observed.end, allowYearOmission));
 }
 
@@ -370,7 +398,7 @@ export function calendarOwnedRecurringTaskReadback(
   const matches = Boolean(task.due?.is_recurring && expectedSchedule && observedSchedule
     && expectedSchedule.weekday === observedSchedule.weekday
     && expectedSchedule.time === observedSchedule.time
-    && sameDate(expectedSchedule.start, observedSchedule.start, allowYearOmission)
+    && scheduleStartMatches(expectedSchedule, observedSchedule, allowYearOmission, observedParse.diagnostics.phraseKind)
     && sameDate(expectedSchedule.end, observedSchedule.end, allowYearOmission)
     && startsMatchCalendarEvent(event, task, verifiedTimeZone));
   return { matches, expected, observed };

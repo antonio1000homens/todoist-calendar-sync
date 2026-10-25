@@ -197,6 +197,18 @@ test("ending-only Todoist readback uses the current date as the inclusive weekly
   assert.equal(readback({ string: "every Friday ending 26 Nov 2026" }).matches, false, "wrong weekday is rejected");
   assert.equal(readback({ is_recurring: false }).matches, false, "non-recurring tasks are rejected");
   assert.equal(readback({ datetime: "2026-11-05T00:00:00Z", date: undefined }).matches, false, "timestamp-only anchors fail closed");
+
+  const advancedTask = { ...task, due: { ...task.due, date: "2026-11-12" } };
+  assert.equal(matchesCalendarOwnedRecurringRule(advancedTask, recurrence), true,
+    "Todoist may advance its ending-only anchor before the completion webhook is handled");
+  assert.equal(calendarOwnedRecurringTaskReadback(advancedTask, schedule[1], recurrence).matches, true,
+    "an advanced current occurrence remains a valid recurrence readback");
+  assert.equal(matchesCalendarOwnedRecurringRule({
+    ...advancedTask, due: { ...advancedTask.due, date: "2026-11-06" },
+  }, recurrence), false, "a due date outside the weekly series cadence is rejected");
+  assert.equal(matchesCalendarOwnedRecurringRule({
+    ...advancedTask, due: { ...advancedTask.due, date: "2026-12-03" },
+  }, recurrence), false, "a due date beyond the finite series is rejected");
 });
 
 test("ending-only timed recurrence accepts Todoist's local datetime as the current date anchor", () => {
