@@ -1,4 +1,5 @@
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
+import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
@@ -768,28 +769,49 @@ export class Synchronizer {
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
-    // resolve that identity before any mapping discovery or Todoist mutation.
+    // resolve that identity before any provider mutation.
     let archived = event.extendedProperties?.shared?.syncHistoryOnly === "true";
-    // A cancelled instance can reference an already-deleted master. Its
-    // existing cancellation logic (including stale-instance safeguards) must
-    // still run; unbound deleted instances cannot resurrect Todoist tasks.
-    if (!archived && event.recurringEventId && event.status !== "cancelled") {
-      let parent: CalendarEvent;
-      try { parent = await calendar.getEvent(event.recurringEventId); }
+    if (archived) {
+      return this.state.audit(delivery.profile, "calendar_archived_series_delta_ignored", {
+        eventId: event.id, masterEventId: event.recurringEventId || event.id,
+      });
+    }
+    let ownershipEvent = event;
+    let mapping = event.status === "cancelled" && !event.recurringEventId
+      ? await this.state.getMappingByEvent(delivery.profile, event.id)
+      : undefined;
+    const knownMasterEventId = event.recurringEventId || mapping?.masterEventId;
+    // Resolve the master for cancellations too: Google may omit organizer
+    // metadata and recurrence IDs from a cancelled occurrence. Use the
+    // persisted mapping as a fallback source of the master identity.
+    if (!archived && knownMasterEventId) {
+      let parent: CalendarEvent | undefined;
+      try { parent = await calendar.getEvent(knownMasterEventId); }
       catch(error) {
         if (!calendarEventGoneOnDirectRead(error)) throw error;
-        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:event.recurringEventId});
+        if (event.status !== "cancelled") {
+          return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:knownMasterEventId});
+        }
+        if (mapping?.masterEventId) {
+          return this.state.audit(delivery.profile, "calendar_cancelled_copy_owner_unverified", {
+            eventId: event.id, masterEventId: knownMasterEventId, reason: "master_missing",
+          });
+        }
       }
-      if (parent.status === "cancelled" || !parent.recurrence?.length) {
-        return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:parent.id});
+      if (parent) {
+        ownershipEvent = parent;
+        if (event.status !== "cancelled" && (parent.status === "cancelled" || !parent.recurrence?.length)) {
+          return this.state.audit(delivery.profile,"calendar_stale_series_instance_ignored",{eventId:event.id,masterEventId:parent.id});
+        }
+        archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
       }
-      archived = parent.extendedProperties?.shared?.syncHistoryOnly === "true";
     }
     if (archived) {
       return this.state.audit(delivery.profile, "calendar_archived_series_delta_ignored", {
         eventId: event.id, masterEventId: event.recurringEventId || event.id,
       });
     }
+    mapping ||= await this.state.getMappingByEvent(delivery.profile, event.id);
     if (!event.recurringEventId && !event.recurrence?.length && event.status !== "cancelled") {
       const endIsAllDay = Boolean(event.end?.date && !event.end.dateTime);
       const calendar = endIsAllDay ? (await this.clients(delivery.profile)).calendar : undefined;
@@ -810,10 +832,24 @@ export class Synchronizer {
         completedAt: completedProjection.completedAt,
       });
     }
-    let mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
     let parentMapping = event.recurringEventId
       ? await this.state.getMappingByEvent(delivery.profile, event.recurringEventId)
       : undefined;
+    const seriesId = event.iCalUID || event.recurringEventId || event.id;
+    const existingRecurrenceLink = event.recurrence?.length || event.recurringEventId
+      ? await this.state.getRecurrenceLink(delivery.profile, seriesId)
+      : undefined;
+    const originProfile = otherProfileCalendarOrganizer(delivery.profile, ownershipEvent);
+    const suppressCrossProfileCopy = event.status === "cancelled"
+      || (!mapping && !parentMapping && !existingRecurrenceLink);
+    if (originProfile && suppressCrossProfileCopy) {
+      return this.state.audit(delivery.profile, "calendar_cross_profile_copy_ignored", {
+        eventId: event.id,
+        ...(event.recurringEventId ? { masterEventId: event.recurringEventId } : {}),
+        fromProfile: delivery.profile,
+        toProfile: originProfile,
+      });
+    }
     const linkedTaskId = event.extendedProperties?.shared?.taskId;
     if (await this.state.syncBlocked(delivery.profile, {
       taskId: mapping?.taskId || parentMapping?.taskId || linkedTaskId,
