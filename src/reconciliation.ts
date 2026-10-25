@@ -270,12 +270,13 @@ export class DynamoReconciliationStore implements ReconciliationStore {
     }));
   }
 
-  async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined):Promise<boolean> {
+  async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined,allowAbsentAfterCheckpoint=false):Promise<boolean> {
     if(!tableName) throw new Error("STATE_TABLE_NAME is not configured");
     const key= {pk:`BASELINE#${profile}#TASK#${taskId}`,sk:"RECONCILE"};
     const current=await documentClient.send(new GetCommand({TableName:tableName,Key:key,ConsistentRead:true}));
     if(!expected) return !current.Item;
-    if(!current.Item || reviewHash(current.Item.baseline)!==reviewHash(expected) || current.Item.updatedAt!==expected.updatedAt) return false;
+    if(!current.Item) return allowAbsentAfterCheckpoint;
+    if(reviewHash(current.Item.baseline)!==reviewHash(expected) || current.Item.updatedAt!==expected.updatedAt) return false;
     try {
       await documentClient.send(new DeleteCommand({TableName:tableName,Key:key,
         ConditionExpression:"updatedAt = :updated AND baseline = :baseline",

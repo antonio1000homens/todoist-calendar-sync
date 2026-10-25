@@ -6,7 +6,7 @@ import { StateRepository } from "../dist/repository.js";
 import { SnapshotReconciler, DynamoReconciliationStore } from "../dist/reconciliation.js";
 import { CanonicalIdentityStore } from "../dist/canonical-identity.js";
 import { Synchronizer } from "../dist/sync.js";
-import { ReviewStore, SyncControls } from "../dist/review-store.js";
+import { ReviewStore, SyncControls, reviewHash } from "../dist/review-store.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { todoistRecurrenceKey, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { ManualDecisionStore, ManualInterventionService } from "../dist/manual-intervention.js";
@@ -651,6 +651,172 @@ test("lost Todoist delete acknowledgement resumes from exact task absence",async
   const second=await h.engine.execute("repair");
   assert.equal(second.status,"succeeded",JSON.stringify(second));
   assert.equal(h.writes.filter(row=>row[0]==="delete-task"&&row[1]===f.displaced.id).length,1);
+});
+
+test("displaced-task baseline purge resumes after lost acknowledgement and later provider failure",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const baseline={todoist:{content:"old"},calendar:{summary:"old"},updatedAt:"2026-10-24T12:00:00.000Z"};
+  let liveBaseline=clone(baseline),baselineCalls=0,taskDeleteCalls=0;
+  const originalGet=DynamoReconciliationStore.prototype.getBaseline,originalDelete=DynamoReconciliationStore.prototype.deleteBaselineIfUnchanged;
+  DynamoReconciliationStore.prototype.getBaseline=async()=>clone(liveBaseline);
+  DynamoReconciliationStore.prototype.deleteBaselineIfUnchanged=async(_profile,_taskId,expected,allowAbsent)=>{
+    baselineCalls++;
+    if(reviewHash(expected)!==reviewHash(baseline))return false;
+    if(!liveBaseline)return allowAbsent===true;
+    if(reviewHash(liveBaseline)!==reviewHash(expected))return false;
+    liveBaseline=undefined;
+    if(baselineCalls===1)throw new Error("baseline delete acknowledgement lost");
+    return true;
+  };
+  const originalIdentityGet=CanonicalIdentityStore.prototype.get;
+  CanonicalIdentityStore.prototype.get=async()=>undefined;
+  t.after(()=>{DynamoReconciliationStore.prototype.getBaseline=originalGet;DynamoReconciliationStore.prototype.deleteBaselineIfUnchanged=originalDelete;CanonicalIdentityStore.prototype.get=originalIdentityGet;});
+  const preview=await h.engine.preview(actor,transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"}));
+  assert.deepEqual(preview.oneOffDeletionPlans[0].baseline,baseline);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.clients.todoist.deleteTask=async id=>{taskDeleteCalls++;if(taskDeleteCalls===1)throw new Error("temporary Todoist failure");h.taskMap.delete(id);h.writes.push(["delete-task",id]);};
+  const first=await h.engine.execute("repair");
+  assert.notEqual(first.status,"succeeded",JSON.stringify(first));
+  assert.equal(liveBaseline,undefined);
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(baselineCalls,2,"the retry accepts absence only at the still-running exact purge checkpoint");
+  assert.equal(taskDeleteCalls,2);
+});
+
+test("displaced-task canonical purge resumes after later Todoist deletion failure",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const canonical={profile:"home",side:"todoist",providerId:f.displaced.id,identity:{content:"Birthday",due:{date:"2027-07-17"}},updatedAt:"2026-10-24T12:00:00.000Z"};
+  let liveIdentity=clone(canonical),deleteCalls=0;
+  const originalGet=CanonicalIdentityStore.prototype.get,originalDelete=CanonicalIdentityStore.prototype.deleteIfUnchanged;
+  CanonicalIdentityStore.prototype.get=async(_profile,_side,id)=>id===canonical.providerId?clone(liveIdentity):undefined;
+  CanonicalIdentityStore.prototype.deleteIfUnchanged=async record=>{
+    if(reviewHash(record)!==reviewHash(canonical)||reviewHash(liveIdentity)!==reviewHash(canonical))return false;
+    liveIdentity=undefined;return true;
+  };
+  t.after(()=>{CanonicalIdentityStore.prototype.get=originalGet;CanonicalIdentityStore.prototype.deleteIfUnchanged=originalDelete;});
+  const preview=await h.engine.preview(actor,transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"}));
+  assert.deepEqual(preview.oneOffDeletionPlans[0].canonical,canonical);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.clients.todoist.deleteTask=async id=>{deleteCalls++;if(deleteCalls===1)throw new Error("temporary Todoist failure");h.taskMap.delete(id);h.writes.push(["delete-task",id]);};
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(liveIdentity,undefined);
+  assert.equal((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(deleteCalls,2);
+});
+
+test("standalone-task canonical purge resumes after later Calendar metadata failure",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"},extendedProperties:{shared:{taskId:duplicateTask.id}}});
+  const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
+  const canonical={profile:"home",side:"todoist",providerId:duplicateTask.id,identity:{content:"Duplicate",due:{date:"2027-07-17"}},updatedAt:"2026-10-24T12:00:00.000Z"};
+  let liveIdentity=clone(canonical),metadataCalls=0;
+  const originalGet=CanonicalIdentityStore.prototype.get,originalDelete=CanonicalIdentityStore.prototype.deleteIfUnchanged;
+  CanonicalIdentityStore.prototype.get=async(_profile,_side,id)=>id===canonical.providerId?clone(liveIdentity):undefined;
+  CanonicalIdentityStore.prototype.deleteIfUnchanged=async record=>{
+    if(reviewHash(record)!==reviewHash(canonical)||reviewHash(liveIdentity)!==reviewHash(canonical))return false;
+    liveIdentity=undefined;return true;
+  };
+  t.after(()=>{CanonicalIdentityStore.prototype.get=originalGet;CanonicalIdentityStore.prototype.deleteIfUnchanged=originalDelete;});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+  }));
+  assert.deepEqual(preview.oneOffDeletionPlans.find(plan=>plan.ref.id===duplicateTask.id).canonical,canonical);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const upsert=h.clients.calendar.upsertEventIfUnchanged;
+  h.clients.calendar.upsertEventIfUnchanged=async(...args)=>{metadataCalls++;if(metadataCalls===3)throw new Error("temporary Calendar failure");return upsert(...args);};
+  const first=await h.engine.execute("repair");
+  assert.notEqual(first.status,"succeeded",JSON.stringify(first));
+  assert.equal(liveIdentity,undefined,JSON.stringify(first));
+  assert.equal(h.taskMap.has(duplicateTask.id),false);
+  assert.equal((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(metadataCalls,4);
+});
+
+test("new or changed cleanup rows after preview block exact provider deletion",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
+  let activeMode="baseline",canonicalTargetId=duplicateEvent.id,liveBaseline,liveIdentity;
+  const originalBaselineGet=DynamoReconciliationStore.prototype.getBaseline,originalIdentityGet=CanonicalIdentityStore.prototype.get;
+  DynamoReconciliationStore.prototype.getBaseline=async(_profile,id)=>activeMode==="baseline"&&id===duplicateTask.id?clone(liveBaseline):undefined;
+  CanonicalIdentityStore.prototype.get=async(_profile,_side,id)=>activeMode==="canonical"&&id===canonicalTargetId?clone(liveIdentity):undefined;
+  t.after(()=>{DynamoReconciliationStore.prototype.getBaseline=originalBaselineGet;CanonicalIdentityStore.prototype.get=originalIdentityGet;});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const baseline={todoist:{content:"new"},calendar:{summary:"new"},updatedAt:"2026-10-25T12:00:00.000Z"};
+  const canonical={profile:"home",side:"calendar",providerId:duplicateEvent.id,identity:{summary:"new"},updatedAt:"2026-10-25T12:00:00.000Z"};
+  liveBaseline=baseline;
+  const result=await h.engine.execute("repair");
+  assert.notEqual(result.status,"succeeded");
+  assert.equal(h.eventMap.has(duplicateEvent.id),true,"a new baseline row blocks provider deletion before its first side effect");
+  activeMode="canonical";liveBaseline=undefined;liveIdentity=canonical;
+  const f2=birthdayTransferFixture(),task2=task("duplicate-task-2",{content:f2.annual.content,description:f2.annual.description,due:{date:"2027-07-17"}});
+  const event2=event("duplicate-event-2",{summary:f2.annual.content,description:f2.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping2={profile:"home",taskId:task2.id,eventId:event2.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h2=harness(t,{events:[f2.master,f2.active,f2.standalone,event2],tasks:[f2.annual,f2.displaced,task2],mappings:[f2.mapping,mapping2],recurrence:f2.recurrence});
+  canonicalTargetId=event2.id;
+  liveIdentity=undefined;
+  const h2CanonicalGet=CanonicalIdentityStore.prototype.get;
+  CanonicalIdentityStore.prototype.get=async(profile,side,id)=>id===event2.id?clone(liveIdentity):h2CanonicalGet.call(new CanonicalIdentityStore(),profile,side,id);
+  const preview2=await h2.engine.preview(actor,transferIntent(f2,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"unchanged",
+  }));
+  liveIdentity={...canonical,providerId:event2.id};
+  h2.operations.set("repair",{id:"repair",status:"queued",steps:{},preview:preview2});
+  const second=await h2.engine.execute("repair");
+  assert.notEqual(second.status,"succeeded");
+  assert.equal(h2.eventMap.has(event2.id),true,"a new canonical row blocks provider deletion before its first side effect");
+});
+
+test("changed previewed baseline and canonical rows block exact provider deletion",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("changed-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("changed-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
+  const baseline={todoist:{content:"approved"},calendar:{summary:"approved"},updatedAt:"2026-10-24T12:00:00.000Z"};
+  let liveBaseline=clone(baseline),mode="baseline";
+  const originalBaselineGet=DynamoReconciliationStore.prototype.getBaseline,originalIdentityGet=CanonicalIdentityStore.prototype.get;
+  DynamoReconciliationStore.prototype.getBaseline=async(_profile,id)=>mode==="baseline"&&id===duplicateTask.id?clone(liveBaseline):undefined;
+  DynamoReconciliationStore.prototype.deleteBaselineIfUnchanged=async()=>false;
+  const canonical={profile:"home",side:"calendar",providerId:duplicateEvent.id,identity:{summary:"approved"},updatedAt:"2026-10-24T12:00:00.000Z"};
+  let liveIdentity;
+  CanonicalIdentityStore.prototype.get=async(_profile,_side,id)=>mode==="canonical"&&id===duplicateEvent.id?clone(liveIdentity):undefined;
+  t.after(()=>{DynamoReconciliationStore.prototype.getBaseline=originalBaselineGet;CanonicalIdentityStore.prototype.get=originalIdentityGet;});
+  const makeIntent=fixture=>transferIntent(fixture,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:changed-event":"delete","home:todoist:changed-task":"unchanged",
+  });
+  const preview=await h.engine.preview(actor,makeIntent(f));
+  assert.deepEqual(preview.oneOffDeletionPlans[0].baseline,baseline);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  liveBaseline={...baseline,updatedAt:"2026-10-25T12:00:00.000Z"};
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(h.eventMap.has(duplicateEvent.id),true,"a changed baseline blocks provider deletion");
+
+  const f2=birthdayTransferFixture(),task2=task("changed-task-2",{content:f2.annual.content,description:f2.annual.description,due:{date:"2027-07-17"}});
+  const event2=event("changed-event-2",{summary:f2.annual.content,description:f2.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping2={profile:"home",taskId:task2.id,eventId:event2.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h2=harness(t,{events:[f2.master,f2.active,f2.standalone,event2],tasks:[f2.annual,f2.displaced,task2],mappings:[f2.mapping,mapping2],recurrence:f2.recurrence});
+  mode="canonical";
+  const identity2={...canonical,providerId:event2.id};liveIdentity=clone(identity2);
+  const currentIdentityGet=CanonicalIdentityStore.prototype.get;
+  CanonicalIdentityStore.prototype.get=async(profile,side,id)=>id===event2.id?clone(liveIdentity):currentIdentityGet.call(new CanonicalIdentityStore(),profile,side,id);
+  const preview2=await h2.engine.preview(actor,transferIntent(f2,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"unchanged",
+  }));
+  h2.operations.set("repair-2",{id:"repair-2",status:"queued",steps:{},preview:preview2});
+  liveIdentity={...identity2,updatedAt:"2026-10-25T12:00:00.000Z"};
+  assert.notEqual((await h2.engine.execute("repair-2")).status,"succeeded");
+  assert.equal(h2.eventMap.has(event2.id),true,"a changed canonical identity blocks provider deletion");
 });
 
 test("deletion preview rejects retained history, recurring objects and provider edits after preview",async t=>{

@@ -159,8 +159,9 @@ export class CanonicalIdentityStore implements CanonicalIdentityRepository {
       return true;
     } catch(error) {
       if((error as {name?:string}).name!=="ConditionalCheckFailedException") throw error;
-      const current=await this.get(record.profile,record.side,record.providerId);
-      return !current;
+      // A conditional miss is not proof that this repair deleted the row.
+      // The caller's persisted deletion step handles an absent row on retry.
+      return false;
     }
   }
 }

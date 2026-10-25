@@ -1717,10 +1717,12 @@ export class ReviewEngine {
               ? deleteExactMappingComments(oldClient.todoist,previous)
               : deleteMappingComments(oldClient.todoist, previous), count => count);
           });
-          await step(`transfer-delete-old-baseline:${previous.taskId}`, async () => {
+          const previousBaselineStep=`transfer-delete-old-baseline:${previous.taskId}`;
+          const previousBaselineWasRunning=operation.steps[previousBaselineStep]?.status==="running";
+          await step(previousBaselineStep, async () => {
             const store=new DynamoReconciliationStore();
             if(exactDisposition!=="delete") return store.deleteBaseline(previous.profile,previous.taskId);
-            const removed=await store.deleteBaselineIfUnchanged(previous.profile,previous.taskId,previousDeletePlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined);
+            const removed=await store.deleteBaselineIfUnchanged(previous.profile,previous.taskId,previousDeletePlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,previousBaselineWasRunning);
             if(!removed) throw new Error(`Baseline for deleted Todoist task ${previous.taskId} changed after preview; refresh before purge`);
             return true;
           });
@@ -1732,12 +1734,16 @@ export class ReviewEngine {
             await this.controls.exclude(oldTaskSnapshot.ref,true,id);
             const identityPlan=previousDeletePlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
             const identities=new CanonicalIdentityStore();
-            const currentIdentity=await identities.get(previous.profile,"todoist",previous.taskId);
-            if(identityPlan&&reviewHash(currentIdentity)!==reviewHash(identityPlan)) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed after preview`);
-            if(!identityPlan&&currentIdentity) throw new Error(`A new canonical identity for deleted Todoist task ${previous.taskId} appeared after preview`);
-            if(identityPlan) await step(`transfer-delete-old-canonical:${previous.taskId}`,async()=> {
-              const removed=await identities.deleteIfUnchanged(identityPlan);
-              if(!removed) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed during purge`);
+            const previousCanonicalStep=`transfer-delete-old-canonical:${previous.taskId}`;
+            const previousCanonicalWasRunning=operation.steps[previousCanonicalStep]?.status==="running";
+            await step(previousCanonicalStep,async()=> {
+              const currentIdentity=await identities.get(previous.profile,"todoist",previous.taskId);
+              if(identityPlan) {
+                if(!currentIdentity&&previousCanonicalWasRunning) return true;
+                if(reviewHash(currentIdentity)!==reviewHash(identityPlan)) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed after preview`);
+                const removed=await identities.deleteIfUnchanged(identityPlan);
+                if(!removed) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed during purge`);
+              } else if(currentIdentity) throw new Error(`A new canonical identity for deleted Todoist task ${previous.taskId} appeared after preview`);
               return true;
             });
             await step(`transfer-delete-displaced-task:${previous.taskId}`, async () => {
@@ -1796,6 +1802,24 @@ export class ReviewEngine {
             if (!isDisplacedTask) {
               await this.controls.exclude(snapshot.ref,true,id);
               if (mapping) await this.controls.reject(mapping.profile,mapping.taskId,mapping.eventId,id);
+              const deletionPlan=operation.preview.oneOffDeletionPlans?.find(value=>entityKey(value.ref)===entityKey(snapshot.ref));
+              const baselineTaskId=mapping?.taskId || (snapshot.ref.side==="todoist"?snapshot.ref.id:undefined);
+              const baselineStep=baselineTaskId?`transfer-delete-baseline:${baselineTaskId}`:undefined;
+              const baselineCheckpoint=baselineStep&&operation.steps[baselineStep]?.status;
+              const expectedBaseline=deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined;
+              if(baselineTaskId) {
+                const currentBaseline=await new DynamoReconciliationStore().getBaseline(mapping?.profile||snapshot.ref.profile,baselineTaskId);
+                const baselineMatches=reviewHash(currentBaseline??null)===reviewHash(expectedBaseline??null)
+                  || Boolean(expectedBaseline&&(baselineCheckpoint==="running"||baselineCheckpoint==="done")&&!currentBaseline);
+                if(!baselineMatches) throw new Error(`Baseline for ${baselineTaskId} changed after preview`);
+              }
+              const identityPlan=deletionPlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
+              const canonicalCheckpointName=`transfer-delete-canonical:${entityKey(snapshot.ref)}`;
+              const canonicalCheckpoint=operation.steps[canonicalCheckpointName]?.status;
+              const currentIdentity=await new CanonicalIdentityStore().get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id);
+              const identityMatches=reviewHash(currentIdentity??null)===reviewHash(identityPlan??null)
+                || Boolean(identityPlan&&(canonicalCheckpoint==="running"||canonicalCheckpoint==="done")&&!currentIdentity);
+              if(!identityMatches) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed after preview`);
               await step(deleteName,async()=> {
                 const clientPair = await factory(snapshot.ref.profile);
                 let live:TodoistTask|CalendarEvent|null = null;
@@ -1830,21 +1854,27 @@ export class ReviewEngine {
                   return trackedWrite(mapping.profile,()=>deleteExactMappingComments(oldClient.todoist,mapping),count=>count);
                 });
               }
-              const deletionPlan=operation.preview.oneOffDeletionPlans?.find(value=>entityKey(value.ref)===entityKey(snapshot.ref));
-              const baselineTaskId=mapping?.taskId || (snapshot.ref.side==="todoist"?snapshot.ref.id:undefined);
-              if(baselineTaskId) await step(`transfer-delete-baseline:${baselineTaskId}`,async()=> {
+              if(baselineTaskId) {
+                const baselineStep=`transfer-delete-baseline:${baselineTaskId}`;
+                const baselineWasRunning=operation.steps[baselineStep]?.status==="running";
+                await step(baselineStep,async()=> {
                 const removed=await new DynamoReconciliationStore().deleteBaselineIfUnchanged(mapping?.profile||snapshot.ref.profile,baselineTaskId,
-                  deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined);
+                  deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,baselineWasRunning);
                 if(!removed) throw new Error(`Baseline for ${baselineTaskId} changed after preview`);
                 return true;
-              });
-              const identityPlan=deletionPlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
-              const identityStore=new CanonicalIdentityStore(),currentIdentity=await identityStore.get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id);
-              if(identityPlan&&reviewHash(identityPlan)!==reviewHash(currentIdentity)) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed after preview`);
-              if(!identityPlan&&currentIdentity) throw new Error(`A canonical identity for ${entityKey(snapshot.ref)} appeared after preview`);
-              if(identityPlan) await step(`transfer-delete-canonical:${entityKey(snapshot.ref)}`,async()=> {
-                const removed=await identityStore.deleteIfUnchanged(identityPlan);
-                if(!removed) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed during purge`);
+                });
+              }
+              const identityStore=new CanonicalIdentityStore();
+              const canonicalStep=`transfer-delete-canonical:${entityKey(snapshot.ref)}`;
+              const canonicalWasRunning=operation.steps[canonicalStep]?.status==="running";
+              await step(canonicalStep,async()=> {
+                const currentIdentity=await identityStore.get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id);
+                if(identityPlan) {
+                  if(!currentIdentity&&canonicalWasRunning) return true;
+                  if(reviewHash(identityPlan)!==reviewHash(currentIdentity)) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed after preview`);
+                  const removed=await identityStore.deleteIfUnchanged(identityPlan);
+                  if(!removed) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed during purge`);
+                } else if(currentIdentity) throw new Error(`A canonical identity for ${entityKey(snapshot.ref)} appeared after preview`);
                 return true;
               });
               const counterpartRef = mapping ? snapshot.ref.side === "todoist"
