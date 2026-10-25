@@ -552,6 +552,7 @@ export class ReviewEngine {
       ? snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === masterSnapshot?.calendarProjectionId)?.object as CalendarEvent | undefined
       : undefined;
     const calendarFieldSource = approvedCalendarOccurrence || event;
+    let reconstitutingOwnedSeriesIndexes = false;
     if (intent.action === "transfer") {
       if (!task || !event) invalidRepairIntent("Series transfer requires a live Todoist task and Calendar series master");
       if (intent.owner !== "calendar" || intent.scope !== "future" || intent.winner !== "none") invalidRepairIntent("Series transfer requires Calendar ownership, Future occurrences (preserve history), and Keep current fields");
@@ -566,11 +567,10 @@ export class ReviewEngine {
       const selectedTaskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === task.id);
       if (selectedTaskSnapshot?.mapping) invalidRepairIntent("The selected recurring Todoist task already has a mapping; resolve that exact association before transfer");
       const seriesId = event.iCalUID || event.id;
-      if (masterSnapshot.recurrence?.owner === "calendar" && masterSnapshot.recurrence.seriesId === seriesId
+      const alreadyOwnedByTarget = masterSnapshot.recurrence?.owner === "calendar" && masterSnapshot.recurrence.seriesId === seriesId
         && masterSnapshot.recurrence.taskId === task.id
-        && (masterSnapshot.recurrence.activeInstanceId || masterSnapshot.recurrence.eventId) === occurrence.id) {
-        invalidRepairIntent("This Todoist task already owns the selected Calendar series occurrence; refresh the case and apply its pending decision instead of transferring the association");
-      }
+        && (masterSnapshot.recurrence.activeInstanceId || masterSnapshot.recurrence.eventId) === occurrence.id;
+      reconstitutingOwnedSeriesIndexes = alreadyOwnedByTarget;
       const calendarOwnerVerified = (masterSnapshot.recurrence?.owner === "calendar"
         && masterSnapshot.recurrence.seriesId === seriesId)
         || event.extendedProperties?.shared?.syncRecurrenceOwner === "calendar";
@@ -579,6 +579,9 @@ export class ReviewEngine {
       const oldTaskId = masterSnapshot.recurrence?.taskId;
       const seriesMappings = [...new Map(snapshots.map(s => s.mapping).filter((m): m is Mapping => Boolean(m)
         && m!.recurrenceOwner === "calendar" && m!.seriesId === seriesId).map(m => [`${m.taskId}:${m.eventId}:${m.updatedAt}`,m])).values()];
+      if (alreadyOwnedByTarget && (seriesMappings.length || snapshots.some(s => s.mapping?.taskId === task.id))) {
+        invalidRepairIntent("The Calendar recurrence already names this Todoist task, but mapping indexes are partially present; refresh the affected items and resolve the split mapping before transfer");
+      }
       if (seriesMappings.length > 1) invalidRepairIntent("Multiple mappings claim this Calendar series; resolve the competing associations before transfer");
       const previous = seriesMappings.find(m => m.taskId === oldTaskId && [event.id, masterSnapshot.calendarProjectionId].includes(m.eventId));
       if (oldTaskId && oldTaskId !== task.id && !previous) invalidRepairIntent("The displaced recurrence mapping is missing or ambiguous; use a fresh preview or the stale-mapping recovery workflow");
@@ -744,7 +747,9 @@ export class ReviewEngine {
       changes.push(`Move task to ${intent.targetProfile}; apply existing project-transition rules to its Calendar projection`);
       warnings.push("The source projection follows the existing project-move lifecycle, shown as displaced below.");
     } else if (intent.action === "transfer") {
-      changes.push(`Preserve recurring Todoist task ${task!.id} exactly and transfer the Calendar-owned series association to its verified active occurrence`);
+      changes.push(reconstitutingOwnedSeriesIndexes
+        ? `Preserve recurring Todoist task ${task!.id} and Calendar series; reconstruct missing mapping indexes for the already-owned active occurrence`
+        : `Preserve recurring Todoist task ${task!.id} exactly and transfer the Calendar-owned series association to its verified active occurrence`);
       changes.push(`Calendar series ${event!.id} and RRULE remain unchanged; no recurrence is created, split, or annualized`);
     } else if (intent.action === "link") {
       // Calendar occurrence projections are date-only. Applying one to an
@@ -953,8 +958,12 @@ export class ReviewEngine {
         operation = "Flatten exact occurrence to a verified one-off pair";
         result = `Map task ${intent.taskId} to standalone ${preview.flattenPlan!.standaloneId}; remove recurrence on both providers`;
       } else if (intent.action === "transfer" && selected) {
-        operation = "Transfer existing Calendar series to recurring Todoist task";
-        result = `Preserve Todoist recurrence and map task ${intent.taskId} to active Calendar occurrence ${masterSnapshot?.calendarProjectionId} under master ${intent.eventId}`;
+        operation = reconstitutingOwnedSeriesIndexes
+          ? "Rebuild missing indexes for the existing Calendar series association"
+          : "Transfer existing Calendar series to recurring Todoist task";
+        result = reconstitutingOwnedSeriesIndexes
+          ? `Keep existing recurrence ownership and restore the missing EVENT, TASK, and TASKOWNER mappings for task ${intent.taskId} and active occurrence ${masterSnapshot?.calendarProjectionId}`
+          : `Preserve Todoist recurrence and map task ${intent.taskId} to active Calendar occurrence ${masterSnapshot?.calendarProjectionId} under master ${intent.eventId}`;
       } else if (intent.action === "link" && selected) {
         operation = "Link selected provider object";
         const activeCalendarId = preview.annualPlan?.masterId || (event?.recurrence?.length && intent.owner === "calendar" && masterSnapshot?.calendarProjectionId

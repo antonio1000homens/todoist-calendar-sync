@@ -50,3 +50,31 @@ test("conditional transfer conflict returns false without treating a cancellatio
   });
   assert.equal(await new StateRepository().transferCalendarSeriesMapping(f),false);
 });
+
+test("Calendar series mapping repair atomically restores missing indexes for its existing owner",async t=>{
+  const f=transferFixture();
+  const expectedLink={...f.expectedLink,taskId:f.mapping.taskId};
+  const mapping={...f.mapping};
+  const link={...f.link};
+  let transaction;
+  t.mock.method(documentClient,"send",async command=>{
+    const input=command.input;
+    if(input.TransactItems){transaction=input.TransactItems;return {};}
+    if(input.Key?.pk===`TASK#home#${mapping.taskId}`)return {};
+    if(input.Key?.pk===`RECURRENCE#home#${mapping.seriesId}`)return {Item:expectedLink};
+    assert.fail(`Unexpected DynamoDB request ${JSON.stringify(input)}`);
+  });
+
+  const result=await new StateRepository().transferCalendarSeriesMapping({expectedLink,mapping,link});
+  assert.equal(result,true);
+  assert.equal(transaction.filter(item=>item.Delete).length,0,"repair must not delete a displaced task or history row");
+  for(const prefix of ["EVENT#home#active","TASK#home#annual-task","TASKOWNER#annual-task"]) {
+    assert.ok(transaction.some(item=>item.Put?.Item.pk===prefix),`transaction restores ${prefix}`);
+  }
+  const recurrencePut=transaction.find(item=>item.Put?.Item.pk==="RECURRENCE#home#birthday-series").Put;
+  assert.match(recurrencePut.ConditionExpression,/taskId = :oldTask/);
+  assert.match(recurrencePut.ConditionExpression,/#masterEvent/);
+  assert.match(recurrencePut.ConditionExpression,/#activeInstance/);
+  assert.match(recurrencePut.ConditionExpression,/updatedAt = :oldLinkUpdated/);
+  assert.equal(recurrencePut.ExpressionAttributeValues[":oldTask"],mapping.taskId);
+});
