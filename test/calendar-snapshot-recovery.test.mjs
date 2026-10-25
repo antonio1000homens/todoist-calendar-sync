@@ -143,7 +143,7 @@ test("snapshot recovery skips an accepted copy of another profile's recurrence b
 test("snapshot recovery still imports a recurrence organized outside configured profiles", async () => {
   const master = {
     ...futureEvent("external-master", 10, "External recurring reminder"),
-    organizer: { email: "organizer@example.org", self: false },
+    organizer: { email: "organizer@example.test", self: false },
     iCalUID: "external-series",
     recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
   };
