@@ -370,6 +370,15 @@ test("clears stale timed Todoist fields when Calendar becomes all-day", () => {
     due_datetime: "2026-09-01T09:30:00Z",
     due_timezone: "Europe/London",
   });
+  assert.deepEqual(todoistTaskPayload({ content: "Recurring", due: {
+    date: "2026-11-04", datetime: "2026-11-04T14:00:00Z", timezone: "Europe/London",
+    string: "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026", lang: "en", is_recurring: true,
+  } }), {
+    content: "Recurring",
+    description: "",
+    due_string: "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026",
+    due_lang: "en",
+  });
 });
 
 test("projects supported Todoist recurrence as a Calendar RRULE master", () => {

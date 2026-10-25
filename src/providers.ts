@@ -379,6 +379,21 @@ export class Todoist {
     }
   }
 
+  /** Read only the configured account timezone. Never retain or log the user resource. */
+  async getTimeZone(): Promise<string> {
+    const headers = new Headers({ authorization: `Bearer ${this.token}` });
+    headers.set("content-type", "application/x-www-form-urlencoded");
+    const body = new URLSearchParams({ sync_token: "*", resource_types: JSON.stringify(["user"]) });
+    const result = await responseJson<{ user?: { timezone?: string; tz_info?: { timezone?: string } } }>(
+      await fetch(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body }),
+    );
+    const timeZone = result?.user?.tz_info?.timezone || result?.user?.timezone;
+    if (!timeZone) throw new Error("Todoist account timezone is missing");
+    try { new Intl.DateTimeFormat("en-GB", { timeZone }); }
+    catch { throw new Error("Todoist account timezone is invalid"); }
+    return timeZone;
+  }
+
   async listTasks(projectId = todoistProjectForToken(this.token)): Promise<TodoistTask[]> {
     const tasks: TodoistTask[] = [];
     let cursor: string | undefined;
@@ -617,6 +632,11 @@ export function todoistTaskPayload(task: Omit<TodoistTask, "id">): Record<string
     description: task.description || "",
   };
   if (task.project_id) payload.project_id = task.project_id;
+  if (task.due?.is_recurring && task.due.string) {
+    payload.due_string = task.due.string;
+    if (task.due.lang) payload.due_lang = task.due.lang;
+    return payload;
+  }
   if (task.due?.datetime) {
     payload.due_datetime = task.due.datetime;
     payload.due_timezone = task.due.timezone || "Europe/London";
