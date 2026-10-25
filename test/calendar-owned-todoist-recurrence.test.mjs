@@ -114,6 +114,51 @@ test("recurring task readback accepts Todoist date-text normalization but reject
   assert.equal(diagnostic.observed.startYearOmitted, true);
   assert.equal(diagnostic.observed.endYearOmitted, true);
   assert.equal("dueString" in diagnostic.observed, false);
+  const unrecognized = calendarOwnedRecurringTaskReadback({
+    ...task,
+    due: { ...task.due, string: "every Wednesday at 2pm starting on 4 Nov 2026 and ending on 25 Nov 2026" },
+  }, active, recurrence);
+  assert.deepEqual({
+    phraseKind: unrecognized.observed.phraseKind,
+    weekdayRecognized: unrecognized.observed.weekdayRecognized,
+    startDateParsed: unrecognized.observed.startDateParsed,
+    endDateParsed: unrecognized.observed.endDateParsed,
+    timePresent: unrecognized.observed.timePresent,
+    timeParsed: unrecognized.observed.timeParsed,
+  }, {
+    phraseKind: "starting_on_ending_on", weekdayRecognized: true,
+    startDateParsed: true, endDateParsed: true, timePresent: true, timeParsed: true,
+  });
+  const invalidStart = calendarOwnedRecurringTaskReadback({
+    ...task,
+    due: { ...task.due, string: "every Wednesday starting on nonsense and ending on 25 Nov 2026" },
+  }, active, recurrence);
+  assert.equal(invalidStart.observed.startDateParsed, false);
+  assert.equal(invalidStart.observed.endDateParsed, true);
+  assert.equal(invalidStart.observed.weekdayRecognized, true);
+  const invalidTime = calendarOwnedRecurringTaskReadback({
+    ...task,
+    due: { ...task.due, string: "every Wednesday at nonsense starting on 4 Nov 2026 and ending on 25 Nov 2026" },
+  }, active, recurrence);
+  assert.equal(invalidTime.observed.startDateParsed, true);
+  assert.equal(invalidTime.observed.endDateParsed, true);
+  assert.equal(invalidTime.observed.timePresent, true);
+  assert.equal(invalidTime.observed.timeParsed, false);
+  const fromUntil = calendarOwnedRecurringTaskReadback({
+    ...task,
+    due: { ...task.due, string: "every Wednesday at 2pm from 4 Nov 2026 until 25 Nov 2026" },
+  }, active, recurrence);
+  assert.deepEqual({
+    phraseKind: fromUntil.observed.phraseKind,
+    weekdayRecognized: fromUntil.observed.weekdayRecognized,
+    startDateParsed: fromUntil.observed.startDateParsed,
+    endDateParsed: fromUntil.observed.endDateParsed,
+    timePresent: fromUntil.observed.timePresent,
+    timeParsed: fromUntil.observed.timeParsed,
+  }, {
+    phraseKind: "from_until", weekdayRecognized: true,
+    startDateParsed: true, endDateParsed: true, timePresent: true, timeParsed: true,
+  });
   const wrongEnd = mismatch({ string: "every Wednesday at 2pm starting Nov 4 and ending Nov 26" });
   assert.equal(wrongEnd.expected.endDate, "2026-11-25");
   assert.equal(wrongEnd.observed.endDate, "11-26");
