@@ -209,6 +209,20 @@ test("ending-only Todoist readback uses the current date as the inclusive weekly
   assert.equal(matchesCalendarOwnedRecurringRule({
     ...advancedTask, due: { ...advancedTask.due, date: "2026-12-03" },
   }, recurrence), false, "a due date beyond the finite series is rejected");
+
+  const zonedAdvancedTask = {
+    ...task,
+    due: { ...task.due, date: "2026-11-13T02:00:00Z" },
+  };
+  assert.equal(matchesCalendarOwnedRecurringRule(zonedAdvancedTask, recurrence, "America/Los_Angeles"), true,
+    "a verified timezone converts Todoist's zoned completion readback to the correct local recurrence date");
+  assert.equal(matchesCalendarOwnedRecurringRule(zonedAdvancedTask, recurrence), false,
+    "zoned timestamps fail closed when no timezone has been verified");
+  assert.equal(matchesCalendarOwnedRecurringRule(zonedAdvancedTask, recurrence, "Not/A_Timezone"), false,
+    "an invalid timezone fails closed instead of throwing");
+  const zonedReadback = calendarOwnedRecurringTaskReadback(zonedAdvancedTask, active, recurrence, "America/Los_Angeles");
+  assert.equal(zonedReadback.observed.startDate, "2026-11-12",
+    "the anchor is derived from the timezone-local date across a UTC date boundary");
 });
 
 test("ending-only timed recurrence accepts Todoist's local datetime as the current date anchor", () => {
