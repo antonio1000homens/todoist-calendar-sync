@@ -116,6 +116,83 @@ test("snapshot recovery imports one future unmapped Calendar event and binds it"
   assert.equal(state.mutations, 2);
 });
 
+test("snapshot recovery creates one finite weekly Todoist recurrence when account and Calendar zones match", async () => {
+  const master = {
+    id: "finite-master", iCalUID: "finite-series", status: "confirmed", summary: "Task", description: "",
+    start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
+    end: { dateTime: "2026-11-04T14:15:00Z", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const occurrences = [4, 11, 18, 25].map((day) => ({
+    id: `finite-${day}`, status: "confirmed", summary: "Task", description: "",
+    recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+    start: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+    end: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:15:00Z`, timeZone: "Europe/London" },
+  }));
+  const state = fakeState();
+  const tasks = [];
+  const clients = {
+    calendar: {
+      async listDelta() { return { items: [master] }; },
+      async listInstances() { return occurrences; },
+      async getTimeZone() { return "Europe/London"; },
+    },
+    todoist: {
+      async listTasks() { return tasks.map((task) => structuredClone(task)); },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask(payload) {
+        const task = { id: "one-task", project_id: "home-project", ...structuredClone(payload) };
+        tasks.push(task);
+        return structuredClone(task);
+      },
+      async deleteTask(id) { const index = tasks.findIndex((task) => task.id === id); if (index >= 0) tasks.splice(index, 1); },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+  assert.equal(summary.imported, 1);
+  assert.equal(summary.conflicts, 0);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].due.is_recurring, true);
+  assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026");
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].taskId, "one-task");
+  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+});
+
+test("snapshot recovery fails closed without creating a timed recurrence when Todoist and Calendar zones differ", async () => {
+  const master = {
+    id: "finite-master", iCalUID: "finite-series", status: "confirmed", summary: "Task", description: "",
+    start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const occurrences = [4, 11, 18, 25].map((day) => ({
+    id: `finite-${day}`, status: "confirmed", recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+    start: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+  }));
+  const state = fakeState();
+  let creates = 0;
+  const clients = {
+    calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; } },
+    todoist: {
+      async listTasks() { return []; },
+      async getTimeZone() { return "America/New_York"; },
+      async upsertTask() { creates += 1; throw new Error("must not create"); },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(creates, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
+});
+
 test("snapshot recovery skips elapsed Calendar history and imports the future event", async () => {
   const historical = {
     id: "elapsed", status: "confirmed", summary: "Historical event", description: "",

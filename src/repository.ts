@@ -774,6 +774,105 @@ export class StateRepository {
   }
 
   /**
+   * Atomically bind a Calendar-owned recurring task to its next occurrence,
+   * commit completion progress, and remove the previous occurrence index.
+   * Provider advancement must already have been read back and verified.
+   */
+  async advanceCalendarSeriesMapping(input: {
+    previous: Mapping;
+    mapping: Mapping;
+    expectedLink: RecurrenceLink;
+    link: RecurrenceLink;
+  }): Promise<boolean> {
+    const { previous, mapping, expectedLink, link } = input;
+    if (previous.profile !== mapping.profile || previous.taskId !== mapping.taskId
+      || previous.eventId === mapping.eventId || previous.recurrenceOwner !== "calendar"
+      || mapping.recurrenceOwner !== "calendar" || !previous.seriesId
+      || !previous.masterEventId || previous.seriesId !== mapping.seriesId || previous.masterEventId !== mapping.masterEventId
+      || expectedLink.owner !== "calendar" || expectedLink.profile !== previous.profile
+      || expectedLink.seriesId !== previous.seriesId || expectedLink.taskId !== previous.taskId
+      || expectedLink.eventId !== previous.eventId || expectedLink.masterEventId !== previous.masterEventId
+      || expectedLink.activeInstanceId !== previous.activeInstanceId || !expectedLink.updatedAt
+      || link.owner !== "calendar" || link.profile !== mapping.profile
+      || link.seriesId !== mapping.seriesId || link.taskId !== mapping.taskId
+      || link.eventId !== mapping.eventId || link.masterEventId !== mapping.masterEventId
+      || link.activeInstanceId !== mapping.activeInstanceId
+      || link.completedThroughOriginalStart !== mapping.completedThroughOriginalStart
+      || link.calendarProgressVersion !== mapping.calendarProgressVersion
+      || !previous.updatedAt || !mapping.updatedAt) {
+      throw new Error("Calendar recurrence mapping advance identities are inconsistent");
+    }
+    const table = this.ensureTable();
+    const oldValues = {
+      ":profile": previous.profile, ":task": previous.taskId, ":event": previous.eventId,
+      ":updated": previous.updatedAt, ":owner": "calendar", ":series": previous.seriesId,
+      ":master": previous.masterEventId,
+    };
+    const sameOld = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master";
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: {
+        TableName: table, Key: key(`EVENT#${previous.profile}#${previous.eventId}`, "MAP"),
+        ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: oldValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+        ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: oldValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+        ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: oldValues,
+      } },
+      { Put: {
+        TableName: table,
+        Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
+        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND #owner = :owner AND updatedAt = :updated",
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: {
+          ":profile": expectedLink.profile, ":task": expectedLink.taskId,
+          ":event": expectedLink.eventId, ":owner": "calendar", ":updated": expectedLink.updatedAt,
+        },
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`PROJECTION#${mapping.profile}#TASK#${mapping.taskId}`, "TOMBSTONE"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+      { ConditionCheck: {
+        TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } },
+    ];
+    for (const profile of allProfiles) {
+      if (profile === mapping.profile) continue;
+      tx.push({ ConditionCheck: {
+        TableName: table, Key: key(`TASK#${profile}#${mapping.taskId}`, "MAP"),
+        ConditionExpression: "attribute_not_exists(pk)",
+      } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
+      if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Transfer one Calendar-owned series association from its displaced task to
    * an already-recurring Todoist task without changing either provider's
    * recurrence. The series occurrence index, task indexes, and recurrence

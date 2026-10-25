@@ -16,6 +16,12 @@ import {
   type CanonicalIdentityRepository,
 } from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
+import {
+  calendarOwnedRecurringTaskPayload,
+  calendarOwnedTodoistRecurrence,
+  finiteWeeklyCalendarRuleCandidate,
+  matchesCalendarOwnedRecurringTask,
+} from "./calendar-owned-todoist-recurrence.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
@@ -363,7 +369,13 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
-    const instances = await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
+    const boundedFiniteWeekly = finiteWeeklyCalendarRuleCandidate(master);
+    const instances = boundedFiniteWeekly
+      ? await pair.calendar.listInstances(master.id)
+      : await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
+    const calendarTimeZone = master.start?.dateTime
+      ? master.start.timeZone || (pair.calendar.getTimeZone ? await pair.calendar.getTimeZone() : undefined)
+      : "UTC";
     const active = selectCalendarRecurrenceInstance(instances, undefined, now);
     if (!active || active.status === "cancelled" || calendarEventHasElapsed(active, now, calendarTimeZone)) {
       summary.skipped += 1;
@@ -375,6 +387,34 @@ export async function reconcileUnmappedCalendar(
       return;
     }
     if (await completionBlocksRecovery(active.id)) return;
+
+    const recurrence = boundedFiniteWeekly && calendarTimeZone
+      ? calendarOwnedTodoistRecurrence(master, instances, calendarTimeZone)
+      : undefined;
+    if (!recurrence) {
+      await state.audit(profile, "calendar_recurrence_todoist_rule_unsupported", {
+        seriesId, masterEventId: master.id, reason: boundedFiniteWeekly
+          ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
+      });
+    }
+    if (recurrence && master.start?.dateTime) {
+      let todoistTimeZone: string;
+      try { todoistTimeZone = await pair.todoist.getTimeZone(); }
+      catch (error) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_recurrence_todoist_timezone_unverified", {
+          seriesId, masterEventId: master.id, calendarTimeZone, error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+      if (todoistTimeZone !== calendarTimeZone) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_recurrence_todoist_timezone_mismatch", {
+          seriesId, masterEventId: master.id, calendarTimeZone, todoistTimeZone,
+        });
+        return;
+      }
+    }
 
     const match = await findCanonicalTask(active,[master.id,active.id]);
     if (match.blocked) return;
@@ -409,10 +449,36 @@ export async function reconcileUnmappedCalendar(
       if (!await canMutate(master.id)) return;
       if (await completionBlocksRecovery(active.id, true)) return;
       if (await controlsBlockRecovery([master.id,active.id])) return;
-      task = await pair.todoist.upsertTask(toTodoistTask(active));
+      task = await pair.todoist.upsertTask(recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence) : toTodoistTask(active));
       tasks.push(task);
       await state.recordMutation(profile);
       created = true;
+    } else if (recurrence) {
+      task = await pair.todoist.upsertTask(calendarOwnedRecurringTaskPayload(active, recurrence), task.id);
+      await state.recordMutation(profile);
+    }
+    if (recurrence && !matchesCalendarOwnedRecurringTask(task, active, recurrence)) {
+      summary.conflicts += 1;
+      if (created) await rollbackCreatedTask(active, task, {
+        profile, eventId: active.id, taskId: task.id, projectId: task.project_id,
+        recurrenceOwner: "calendar", seriesId, masterEventId: master.id, activeInstanceId: active.id,
+        originalStart: originalStart(active), updatedAt: new Date().toISOString(),
+      }, "recurring_task_readback_mismatch");
+      else {
+        try {
+          await pair.todoist.upsertTask(toTodoistTask(active), task.id);
+          await state.recordMutation(profile);
+        } catch (error) {
+          await state.audit(profile, "calendar_recurrence_todoist_restore_deferred", {
+            seriesId, masterEventId: master.id, taskId: task.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      await state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
+        seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
+      });
+      return;
     }
     reservedTaskIds.add(task.id);
 

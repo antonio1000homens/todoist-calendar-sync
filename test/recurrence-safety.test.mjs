@@ -113,6 +113,18 @@ class FakeState {
     this.storeMapping(mapping);
   }
 
+  async advanceCalendarSeriesMapping({ previous, mapping, link }) {
+    const active = this.mappingsByTask.get(previous.taskId);
+    const recurrence = this.links.find((item) => item.profile === previous.profile && item.seriesId === previous.seriesId);
+    if (active?.eventId !== previous.eventId || recurrence?.eventId !== previous.eventId) return false;
+    this.operations.push(`advance-mapping:${mapping.taskId}:${mapping.eventId}`);
+    this.mappingsByEvent.delete(previous.eventId);
+    this.storeMapping(mapping);
+    this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
+    this.links.push(structuredClone(link));
+    return true;
+  }
+
   async deleteMapping(mapping) {
     this.operations.push(`delete-mapping:${mapping.taskId}:${mapping.eventId}`);
     this.mappingsByTask.delete(mapping.taskId);
