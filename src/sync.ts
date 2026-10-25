@@ -1858,6 +1858,11 @@ export class Synchronizer {
     if (!recurringDateEdit && existingEvent && hasCanonicalState(existingEvent, task)) {
       const todoistRecurring = Boolean(task.due?.is_recurring);
       const todoistRrule = Boolean(desiredRrule && existingEvent.recurrence?.length);
+      // A Calendar-owned recurrence may be echoed back by Todoist with an
+      // ending-only recurrence phrase that we cannot convert to an RRULE.
+      // Preserve its verified master link instead of transferring ownership
+      // merely because Todoist marks the due date as recurring.
+      const preservedCalendarMapping = mapping?.recurrenceOwner === "calendar" && mapping.masterEventId ? mapping : undefined;
       let active: CalendarEvent | undefined;
       if (todoistRrule) {
         const instances = await calendar.listInstances(existingEvent.id);
@@ -1869,6 +1874,7 @@ export class Synchronizer {
           : selectTodoistCurrentInstance(instances, task);
       }
       const nextMapping: Mapping = {
+        ...(preservedCalendarMapping || {}),
         profile: delivery.profile,
         eventId: existingEvent.id,
         taskId: task.id,
@@ -1878,16 +1884,16 @@ export class Synchronizer {
         commentId: mapping?.commentId,
         mappingRevision: mapping?.mappingRevision,
         recurrenceId: existingEvent.recurringEventId,
-        recurrenceOwner: todoistRecurring ? "todoist" : undefined,
-        seriesId: todoistRecurring ? task.id : undefined,
-        masterEventId: todoistRrule ? existingEvent.id : undefined,
-        activeInstanceId: todoistRrule ? active?.id : todoistRecurring ? existingEvent.id : undefined,
-        originalStart: todoistRrule ? (active ? eventStart(active) : mapping?.originalStart) : todoistRecurring ? eventStart(existingEvent) : undefined,
-        activeEffectiveStart: todoistRrule ? (active ? eventEffectiveStart(active) : mapping?.activeEffectiveStart) : todoistRecurring ? eventEffectiveStart(existingEvent) : undefined,
+        recurrenceOwner: preservedCalendarMapping ? "calendar" : todoistRecurring ? "todoist" : undefined,
+        seriesId: preservedCalendarMapping ? preservedCalendarMapping.seriesId : todoistRecurring ? task.id : undefined,
+        masterEventId: preservedCalendarMapping ? preservedCalendarMapping.masterEventId : todoistRrule ? existingEvent.id : undefined,
+        activeInstanceId: preservedCalendarMapping ? preservedCalendarMapping.activeInstanceId : todoistRrule ? active?.id : todoistRecurring ? existingEvent.id : undefined,
+        originalStart: preservedCalendarMapping ? preservedCalendarMapping.originalStart : todoistRrule ? (active ? eventStart(active) : mapping?.originalStart) : todoistRecurring ? eventStart(existingEvent) : undefined,
+        activeEffectiveStart: preservedCalendarMapping ? preservedCalendarMapping.activeEffectiveStart : todoistRrule ? (active ? eventEffectiveStart(active) : mapping?.activeEffectiveStart) : todoistRecurring ? eventEffectiveStart(existingEvent) : undefined,
         updatedAt: new Date().toISOString(),
       };
       await this.state.putMapping(nextMapping);
-      if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
+      if (todoistRecurring && !preservedCalendarMapping) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
       const completedProjection = await this.getCompletedProjection(delivery.profile, existingEvent.id);
       if (completedProjection?.taskId === task.id) await this.deleteCompletedProjection(completedProjection);
