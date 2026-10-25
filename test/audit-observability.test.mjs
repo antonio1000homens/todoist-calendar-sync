@@ -79,6 +79,18 @@ test("conflict fingerprints distinguish mismatch categories and preserve long ca
   );
   const longIdA = "a".repeat(260);
   const longIdB = "b".repeat(260);
+  const longCandidatesA = { ...base, mismatchCategories:["title_mismatch"], candidateEventIds:["abcde", longIdA] };
+  const longCandidatesB = { ...base, mismatchCategories:["title_mismatch"], candidateEventIds:["abcde", longIdB] };
+  assert.notEqual(
+    retainedConflictIdentity(action, longCandidatesA),
+    retainedConflictIdentity(action, longCandidatesB),
+    "distinct long provider IDs must remain distinct in the pre-sanitized fingerprint",
+  );
+  assert.deepEqual(
+    sanitizeTelemetryDetail(longCandidatesA),
+    sanitizeTelemetryDetail(longCandidatesB),
+    "long candidate IDs remain excluded from persisted/logged telemetry",
+  );
   assert.equal(retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_ambiguous", {
     taskId: "task", candidateEventIds: ["abcde", longIdA], taskUpdatedAt:"2026-10-22T10:00:00Z",
   }), undefined, "candidate-only observations have no revision for every ambiguous candidate");
