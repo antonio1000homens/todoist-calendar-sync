@@ -91,7 +91,7 @@ export interface ManualActionDefinition {
   id: string;
   label: string;
   destructive?: boolean;
-  /** Explicitly eligible for unattended execution after the user saves an auto policy. */
+  /** Explicitly eligible for unattended execution under an approved policy or catalog default. */
   autoAllowed?: boolean;
 }
 
@@ -101,6 +101,7 @@ export interface ManualDecisionPolicy {
   actions: ManualActionDefinition[];
   detection: "pre_mutation" | "audit_conflict" | "operational" | "future";
   defaultMode?: InterventionResponseMode;
+  defaultAction?: string;
 }
 
 const actions = (...items: Array<[string, string, boolean?, boolean?]>): ManualActionDefinition[] =>
@@ -133,8 +134,10 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Todoist recurrence deleted — Calendar projection still exists",
     severity: "destructive",
     detection: "pre_mutation",
+    defaultMode: "auto",
+    defaultAction: "delete_calendar_series",
     actions: actions(
-      ["delete_calendar_series", "Delete Calendar series", true],
+      ["delete_calendar_series", "Delete Calendar series", true, true],
       ["keep_calendar_unlinked", "Keep Calendar and unlink", false, true],
       ["restore_todoist_task", "Restore Todoist task", false, true],
     ),
@@ -1103,7 +1106,11 @@ export class SlackManualNotifier {
     if (!slackEnabled()) return;
     const fresh = await this.store.get(decision.decisionId) || decision;
     if (!fresh.slackChannelId || !fresh.slackMessageTs) {
-      await this.postText(`${MANUAL_DECISION_CATALOG[fresh.type].title}\n${contextLines(fresh).join("\n")}\n${text}\n${technicalContextText(fresh)}`);
+      try {
+        await this.postText(`${MANUAL_DECISION_CATALOG[fresh.type].title}\n${contextLines(fresh).join("\n")}\n${text}\n${technicalContextText(fresh)}`);
+      } catch (error) {
+        console.error(JSON.stringify({ service: "todoist-calendar-sync-manual", event: "slack_resolution_post_failed", decisionId: decision.decisionId, error: error instanceof Error ? error.message : String(error) }));
+      }
       return;
     }
     try {
@@ -1301,7 +1308,11 @@ export class ManualInterventionService {
   ): Promise<{ decision?: ManualDecision; mode: InterventionResponseMode }> {
     const catalog = MANUAL_DECISION_CATALOG[type];
     const seriesId = typeof fields.seriesId === "string" ? fields.seriesId : undefined;
-    const effective = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
+    const resolvedPolicy = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
+    const effective = {
+      ...resolvedPolicy,
+      defaultAction: resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
+    };
     if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
 
     let mode = effective.mode;
@@ -1805,7 +1816,9 @@ export class ManualInterventionService {
   ): Promise<void> {
     await this.store.finish(decision.decisionId, "resolved", resolution, slackUserId);
     const resolvedBy = slackUserId === "AUTO_POLICY" ? "saved intervention policy" : slackUserId ? `<@${slackUserId}>` : "operator";
-    const text = `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nA full reconciliation was not started. Use the reconciliation action when you are ready to verify provider state.`;
+    const text = decision.type === "todoist_owned_recurrence_task_deleted" && resolution === "delete_calendar_series"
+      ? `✅ Todoist recurrence deletion completed. The Todoist task is absent, the mapped Calendar series was deleted (or was already absent), and the sync mapping was removed.\n*Todoist task:* \`${decision.taskId || "unknown"}\`\n*Calendar series:* \`${decision.masterEventId || decision.eventId || "unknown"}\`\n*Series ID:* \`${decision.seriesId || "unknown"}\`\nIf this deletion was unintended, recreate the task and Calendar series manually.`
+      : `✅ Resolved by ${resolvedBy}\n*Result:* ${actionLabel(decision, resolution)}\nA full reconciliation was not started. Use the reconciliation action when you are ready to verify provider state.`;
     const policyBlocks = slackUserId === "AUTO_POLICY" ? [] : (this.resolutionPolicyBlocks(decision, resolution) || []);
     await this.notifier.updateResolution(decision, text, decisionResolutionBlocks(decision, text, policyBlocks));
   }
