@@ -53,7 +53,7 @@ interface ParsedWeeklySchedule {
   end: ParsedDate;
 }
 
-type WeeklyPhraseKind = "starting_ending" | "from_until" | "starting_only" | "ending_only" | "other";
+type WeeklyPhraseKind = "starting_ending" | "starting_on_ending_on" | "from_until" | "starting_only" | "ending_only" | "other";
 
 interface WeeklyScheduleParseDiagnostics {
   phraseKind: WeeklyPhraseKind;
@@ -113,17 +113,27 @@ function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleP
   const hasEnding = /\bending\b/i.test(normalized);
   const hasFrom = /\bfrom\b/i.test(normalized);
   const hasUntil = /\b(?:until|to)\b/i.test(normalized);
-  const phraseKind: WeeklyPhraseKind = hasStarting && hasEnding ? "starting_ending"
+  const startEndMatch = normalized.match(/\bstarting\s+(on\s+)?[\s\S]+?\s+(?:and\s+)?ending\s+(on\s+)?/i);
+  const phraseKind: WeeklyPhraseKind = hasStarting && hasEnding
+    ? (startEndMatch?.[1] || startEndMatch?.[2] ? "starting_on_ending_on" : "starting_ending")
     : hasFrom && hasUntil ? "from_until"
       : hasStarting ? "starting_only"
         : hasEnding ? "ending_only" : "other";
   const beforeDates = normalized.split(/\b(?:starting|from)\b/i, 1)[0];
   const timePresent = Boolean(weekdayMatch && /\bat\b/i.test(beforeDates.slice(weekdayMatch[0].length)));
+  const timeCandidate = timePresent
+    ? beforeDates.slice(weekdayMatch?.[0].length || 0).match(/\bat\s+(.+)$/i)?.[1]?.trim()
+    : undefined;
+  const parsedTime = timeCandidate ? parseTime(timeCandidate) : undefined;
   const match = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+starting\s+(.+?)\s+(?:and\s+)?ending\s+(.+)$/i);
   const startText = match?.[3];
   const endText = match?.[4];
-  const start = startText ? parseNaturalDate(startText) : undefined;
-  const end = endText ? parseNaturalDate(endText) : undefined;
+  const boundedDates = normalized.match(/\b(?:starting|from)\s+(.+?)\s+(?:and\s+)?(?:ending|until|to)\s+(.+)$/i);
+  const parseDateCandidate = (candidate: string | undefined): ParsedDate | undefined => candidate
+    ? parseNaturalDate(candidate.trim().replace(/^on\s+/i, ""))
+    : undefined;
+  const start = parseDateCandidate(boundedDates?.[1] || startText);
+  const end = parseDateCandidate(boundedDates?.[2] || endText);
   const time = match?.[2] === undefined ? undefined : parseTime(match[2]);
   const diagnostics: WeeklyScheduleParseDiagnostics = {
     phraseKind,
@@ -131,7 +141,7 @@ function parseWeeklyScheduleDetailed(value: string | undefined): WeeklyScheduleP
     startDateParsed: Boolean(start),
     endDateParsed: Boolean(end),
     timePresent,
-    timeParsed: !timePresent || Boolean(time),
+    timeParsed: !timePresent || Boolean(parsedTime),
   };
   if (!match || !weekday || !start || !end || (match[2] !== undefined && !time)) return { diagnostics };
   return { schedule: { weekday, ...(time ? { time } : {}), start, end }, diagnostics };

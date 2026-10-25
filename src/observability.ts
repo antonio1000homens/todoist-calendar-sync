@@ -26,7 +26,9 @@ const SAFE_RECURRENCE_OBSERVED_KEYS = new Set([
   "startYearOmitted", "endYearOmitted", "phraseKind", "weekdayRecognized", "startDateParsed", "endDateParsed",
   "timePresent", "timeParsed",
 ]);
-const SAFE_RECURRENCE_PHRASE_KINDS = new Set(["starting_ending", "from_until", "starting_only", "ending_only", "other"]);
+const SAFE_RECURRENCE_PHRASE_KINDS = new Set([
+  "starting_ending", "starting_on_ending_on", "from_until", "starting_only", "ending_only", "other",
+]);
 const SAFE_WEEKDAYS = new Set(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]);
 
 function safeString(value: unknown): string | undefined {
