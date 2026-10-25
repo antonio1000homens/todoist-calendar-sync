@@ -699,6 +699,11 @@ export class StateRepository {
     return result.Item as Mapping | undefined;
   }
 
+  async getTaskOwnerMapping(taskId: string): Promise<Mapping | undefined> {
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP"), ConsistentRead: true }));
+    return result.Item as Mapping | undefined;
+  }
+
   async getMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
     const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;

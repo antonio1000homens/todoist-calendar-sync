@@ -305,9 +305,10 @@ export class ReviewEngine {
           snapshots.push(snapshot);
           // Surface the exact mapped task too; matching only discovers a
           // candidate and never chooses its disposition or transfers its link.
-          if (snapshot.mapping && !snapshots.some(s => s.ref.side === "todoist" && s.ref.id === snapshot.mapping!.taskId)) {
+          const surfacedTaskId=snapshot.mapping?.taskId||(snapshot.object as CalendarEvent|null)?.extendedProperties?.shared?.taskId;
+          if (surfacedTaskId && !snapshots.some(s => s.ref.side === "todoist" && s.ref.id === surfacedTaskId)) {
             if (snapshots.length >= 20) invalidRepairIntent("Too many affected items for one transfer; narrow the selection");
-            snapshots.push(await this.snapshot({profile:intent.profile,side:"todoist",id:snapshot.mapping.taskId}));
+            snapshots.push(await this.snapshot({profile:intent.profile,side:"todoist",id:surfacedTaskId}));
           }
         }
       }
@@ -687,12 +688,17 @@ export class ReviewEngine {
         const snapshot = snapshots.find(value => entityKey(value.ref) === key);
         if (!snapshot?.object || selectedRefs.has(key)) invalidRepairIntent(`Exact deletion target ${key} is missing or overlaps the selected annual series`);
         const expected=snapshot.mapping;
+        if(snapshot.ref.side==="todoist"&&!expected) {
+          const orphanedCalendar=snapshots.find(value=>value.ref.side==="calendar"&&value.object
+            &&(value.object as CalendarEvent).extendedProperties?.shared?.taskId===snapshot.ref.id);
+          if(orphanedCalendar) invalidRepairIntent(`Todoist deletion target ${key} is referenced by Calendar event ${orphanedCalendar.ref.id} without a verified mapping; resolve that provider identity before deletion`);
+        }
         const eventId=snapshot.ref.side==="calendar"?snapshot.ref.id:expected?.eventId;
         const taskId=snapshot.ref.side==="todoist"?snapshot.ref.id:expected?.taskId;
         const [eventIndex,taskIndex,ownerIndex]=await Promise.all([
           eventId?this.state.getMappingByEvent(intent.profile,eventId):Promise.resolve(undefined),
           taskId?this.state.getMappingByTask(intent.profile,taskId):Promise.resolve(undefined),
-          taskId?this.state.getMappingByTaskAnyProfile(taskId):Promise.resolve(undefined),
+          taskId?this.state.getTaskOwnerMapping(taskId):Promise.resolve(undefined),
         ]);
         const exact=expected&&[eventIndex,taskIndex,ownerIndex].every(value=>value&&reviewHash(mappingPayload(value))===reviewHash(mappingPayload(expected)));
         const empty=!expected&&!eventIndex&&!taskIndex&&!ownerIndex;

@@ -93,6 +93,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getConsolidatedTask() { return undefined; },
     async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
     async getMappingByTaskAnyProfile(id) { return clone(ownerMappingMap.get(id)); },
+    async getTaskOwnerMapping(id) { return clone(ownerMappingMap.get(id)); },
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone(eventMappingMap.get(`${profile}:${id}`)||[...mappingMap.values()].find(value=>value.profile===profile&&value.eventId===id)); },
     async listMappings(profile) { return clone([...mappingMap.values()].filter(value=>value.profile===profile)); },
@@ -587,6 +588,25 @@ test("exact deletion preview requires complete exact EVENT TASK and cross-profil
   StateRepository.prototype.getMappingByEvent=originalEvent;
   StateRepository.prototype.getMappingByTaskAnyProfile=async function(taskId){const value=await originalOwner.call(this,taskId);return taskId===duplicateTask.id?{...mapping,profile:"work"}:value;};
   await assert.rejects(h.engine.preview(actor,input),/belongs to work|cross-profile|mapping/);
+});
+
+test("exact deletion preview rejects a missing TASKOWNER row despite matching TASK and EVENT rows",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  t.mock.method(StateRepository.prototype,"getTaskOwnerMapping",async function(taskId){return taskId===duplicateTask.id?undefined:h.ownerMappingMap.get(taskId);});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged","home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude"});
+  await assert.rejects(h.engine.preview(actor,input),/missing, partial, duplicate, cross-profile, or stale mapping indexes/);
+});
+
+test("Todoist delete rejects surfaced Calendar task metadata without a verified mapping",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const linkedEvent=event("unmapped-linked-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"},extendedProperties:{shared:{taskId:duplicateTask.id,taskUrl:`https://app.todoist.com/app/task/${duplicateTask.id}`,syncSource:"todoist-calendar-sync"}}});
+  const h=harness(t,{events:[f.master,f.active,f.standalone,linkedEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping],recurrence:f.recurrence});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged","home:todoist:duplicate-task":"delete"});
+  await assert.rejects(h.engine.preview(actor,input),/referenced by Calendar event unmapped-linked-event without a verified mapping/);
+  assert.equal(h.writes.length,0);
 });
 
 test("exact deletion rejects recurrenceId mappings and unchanged mapped counterparts",async t=>{
