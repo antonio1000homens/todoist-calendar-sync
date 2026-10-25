@@ -129,13 +129,15 @@ function parseWeeklyScheduleDetailed(value: string | undefined, currentDueDate?:
   // Todoist normalizes some finite rules to an ending-only phrase. Its Help
   // Center defines that form as starting today and ending inclusively; the
   // API's due.date is the current iteration, so use that date as the anchor.
-  // Only accept a date-only due value here: interpreting a timestamp would
-  // require timezone conversion and could shift an all-day Calendar date.
+  // All-day Calendar tasks use a date-only due value. Timed Todoist tasks can
+  // return a local datetime in `due.date`; its calendar date is safe to use as
+  // the anchor because the caller verifies the provider and Calendar zones.
   const endingOnly = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+ending\s+(.+)$/i);
-  const currentDueMatch = currentDueDate?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  const currentDue = currentDueMatch && currentDueDate
-    && new Date(`${currentDueDate}T00:00:00Z`).toISOString().slice(0, 10) === currentDueDate
-    ? parseNaturalDate(currentDueDate) : undefined;
+  const currentDueMatch = currentDueDate?.match(/^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$)/);
+  const currentDueText = currentDueMatch?.[1];
+  const currentDue = currentDueText
+    && new Date(`${currentDueText}T00:00:00Z`).toISOString().slice(0, 10) === currentDueText
+    ? parseNaturalDate(currentDueText) : undefined;
   const endingOnlyEnd = endingOnly ? parseNaturalDate(endingOnly[3]) : undefined;
   const startText = match?.[3];
   const endText = match?.[4];
@@ -377,6 +379,21 @@ function startsMatchCalendarEvent(event: CalendarEvent, task: TodoistTask): bool
   const eventStart = event.start?.dateTime;
   const taskStart = task.due?.datetime || task.due?.date;
   if (!eventStart || !taskStart) return false;
+  const localTaskTime = taskStart.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.\d+)?$/);
+  if (localTaskTime && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(taskStart)) {
+    const zone = event.start?.timeZone || task.due?.timezone;
+    if (!zone || task.due?.timezone !== zone) return false;
+    const instant = Date.parse(eventStart);
+    if (!Number.isFinite(instant)) return false;
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    }).formatToParts(new Date(instant));
+    const part = (type: string) => parts.find((value) => value.type === type)?.value;
+    const eventLocalTime = `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}`;
+    const taskWallTime = localTaskTime[1].length === 16 ? `${localTaskTime[1]}:00` : localTaskTime[1];
+    return eventLocalTime === taskWallTime;
+  }
   const left = Date.parse(eventStart);
   const right = Date.parse(taskStart);
   return Number.isFinite(left) && Number.isFinite(right) ? left === right : eventStart.slice(0, 19) === taskStart.slice(0, 19);

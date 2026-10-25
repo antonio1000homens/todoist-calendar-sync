@@ -199,6 +199,30 @@ test("ending-only Todoist readback uses the current date as the inclusive weekly
   assert.equal(readback({ datetime: "2026-11-05T00:00:00Z", date: undefined }).matches, false, "timestamp-only anchors fail closed");
 });
 
+test("ending-only timed recurrence accepts Todoist's local datetime as the current date anchor", () => {
+  const master = weeklyMaster("2026-11-05T14:00:00Z");
+  const schedule = instances([
+    "2026-11-05T14:00:00Z", "2026-11-12T14:00:00Z",
+    "2026-11-19T14:00:00Z", "2026-11-26T14:00:00Z",
+  ]);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  const active = schedule[0];
+  const task = { id: "task", content: "Task", due: {
+    date: "2026-11-05T14:00:00", datetime: "2026-11-05T14:00:00",
+    timezone: "Europe/London", is_recurring: true,
+    string: "every Thursday at 2pm ending 26 Nov 2026",
+  } };
+
+  const accepted = calendarOwnedRecurringTaskReadback(task, active, recurrence);
+  assert.equal(accepted.matches, true);
+  assert.deepEqual({ weekday: accepted.observed.weekday, time: accepted.observed.time, startDate: accepted.observed.startDate, endDate: accepted.observed.endDate }, {
+    weekday: "Thursday", time: "14:00", startDate: "2026-11-05", endDate: "2026-11-26",
+  });
+  assert.equal(calendarOwnedRecurringTaskReadback({
+    ...task, due: { ...task.due, timezone: "America/New_York" },
+  }, active, recurrence).matches, false, "a local datetime is rejected when provider and Calendar zones differ");
+});
+
 test("Todoist timezone lookup reads only user resource and exposes the IANA timezone", async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
