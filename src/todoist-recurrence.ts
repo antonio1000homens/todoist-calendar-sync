@@ -91,10 +91,17 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
     const day = Number(monthDay[2]);
     const dueDate = task.due?.date?.slice(0, 10)
       || (task.due?.datetime
-        ? localDateTime(task.due.datetime, task.due.timezone || "UTC").slice(0, 10)
+        ? task.due.timezone
+          ? localDateTime(task.due.datetime, task.due.timezone).slice(0, 10)
+          : task.due.datetime.slice(0, 10)
         : undefined);
     const anchor = dueDate?.match(/^\d{4}-(\d{2})-(\d{2})$/);
-    if (!month || day < 1 || day > 31 || !anchor
+    const parsedAnchor = anchor && dueDate
+      ? new Date(`${dueDate}T00:00:00.000Z`)
+      : undefined;
+    if (!month || day < 1 || day > 31 || !anchor || !parsedAnchor
+      || Number.isNaN(parsedAnchor.getTime())
+      || parsedAnchor.toISOString().slice(0, 10) !== dueDate
       || Number(anchor[1]) !== month || Number(anchor[2]) !== day) return undefined;
     return "RRULE:FREQ=YEARLY";
   }

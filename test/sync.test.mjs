@@ -425,6 +425,14 @@ test("translates an anchored annual month-day Todoist recurrence", () => {
   assert.equal(todoistRecurrenceToRrule(task), "RRULE:FREQ=YEARLY");
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, date: "2027-11-02" } }), undefined,
     "a month-day rule that conflicts with its due-date anchor must remain unsupported");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, date: "2027-02-31", string: "every February 31" } }), undefined,
+    "an impossible calendar date must not become a yearly rule");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", string: "every November 1", is_recurring: true } }), "RRULE:FREQ=YEARLY",
+    "an offset datetime without a named timezone keeps the provider's written local date");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), undefined,
+    "a named timezone converts the instant to its local recurrence date before comparing the anchor");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T12:30:00+00:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), "RRULE:FREQ=YEARLY",
+    "a named timezone accepts an instant whose local date matches the recurrence anchor");
 });
 
 test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {
