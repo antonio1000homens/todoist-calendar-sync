@@ -213,14 +213,47 @@ test("ending-only timed recurrence accepts Todoist's local datetime as the curre
     string: "every Thursday at 2pm ending 26 Nov 2026",
   } };
 
-  const accepted = calendarOwnedRecurringTaskReadback(task, active, recurrence);
+  const accepted = calendarOwnedRecurringTaskReadback(task, active, recurrence, "Europe/London");
   assert.equal(accepted.matches, true);
   assert.deepEqual({ weekday: accepted.observed.weekday, time: accepted.observed.time, startDate: accepted.observed.startDate, endDate: accepted.observed.endDate }, {
     weekday: "Thursday", time: "14:00", startDate: "2026-11-05", endDate: "2026-11-26",
   });
   assert.equal(calendarOwnedRecurringTaskReadback({
     ...task, due: { ...task.due, timezone: "America/New_York" },
-  }, active, recurrence).matches, false, "a local datetime is rejected when provider and Calendar zones differ");
+  }, active, recurrence, "Europe/London").matches, false, "an explicit due timezone mismatch is rejected");
+  assert.equal(calendarOwnedRecurringTaskReadback({
+    ...task, due: { ...task.due, timezone: undefined },
+  }, active, recurrence).matches, false, "a zone-less local datetime requires an independently verified timezone");
+  assert.equal(calendarOwnedRecurringTaskReadback({
+    ...task, due: { ...task.due, timezone: undefined },
+  }, active, recurrence, "America/New_York").matches, false, "a verified timezone mismatch is rejected");
+});
+
+test("production-shaped timed recurrence readback accepts zone-less Todoist due only with verified matching zone", () => {
+  const master = weeklyMaster("2026-11-05T09:00:00Z");
+  const schedule = instances([
+    "2026-11-05T09:00:00Z", "2026-11-12T09:00:00Z",
+    "2026-11-19T09:00:00Z", "2026-11-26T09:00:00Z",
+  ]);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  const task = { id: "task", content: "Task", due: {
+    date: "2026-11-05T09:00:00", datetime: "2026-11-05T09:00:00",
+    is_recurring: true, string: "every Thursday at 9am ending 26 Nov 2026",
+  } };
+
+  const missingVerification = calendarOwnedRecurringTaskReadback(task, schedule[0], recurrence);
+  assert.equal(missingVerification.expected.weekday, "Thursday");
+  assert.equal(missingVerification.expected.time, "09:00");
+  assert.equal(missingVerification.expected.startDate, "2026-11-05");
+  assert.equal(missingVerification.expected.endDate, "2026-11-26");
+  assert.equal(missingVerification.observed.weekday, "Thursday");
+  assert.equal(missingVerification.observed.time, "09:00");
+  assert.equal(missingVerification.observed.startDate, "2026-11-05");
+  assert.equal(missingVerification.observed.endDate, "2026-11-26");
+  assert.equal(missingVerification.matches, false, "matching visible schedule fields are insufficient without verified zone context");
+
+  assert.equal(calendarOwnedRecurringTaskReadback(task, schedule[0], recurrence, "Europe/London").matches, true);
+  assert.equal(calendarOwnedRecurringTaskReadback(task, schedule[0], recurrence, "America/Los_Angeles").matches, false);
 });
 
 test("Todoist timezone lookup reads only user resource and exposes the IANA timezone", async (t) => {

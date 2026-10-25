@@ -510,7 +510,7 @@ export async function reconcileUnmappedCalendar(
       task = await pair.todoist.upsertTask(calendarOwnedRecurringTaskPayload(active, recurrence), task.id);
       await state.recordMutation(profile);
     }
-    const readback = recurrence ? calendarOwnedRecurringTaskReadback(task, active, recurrence) : undefined;
+    const readback = recurrence ? calendarOwnedRecurringTaskReadback(task, active, recurrence, seriesTimeZone) : undefined;
     if (readback && !readback.matches) {
       summary.conflicts += 1;
       if (created) await rollbackCreatedTask(active, task, {

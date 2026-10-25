@@ -164,6 +164,62 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(state.mappings[0].recurrenceOwner, "calendar");
 });
 
+test("snapshot recovery retains an ending-only recurrence returned with a zone-less local due datetime", async () => {
+  const master = {
+    id: "verified-zone-master", iCalUID: "verified-zone-series", status: "confirmed", summary: "Task", description: "",
+    start: { dateTime: "2026-11-05T09:00:00Z", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const occurrences = [5, 12, 19, 26].map((day) => ({
+    id: `verified-zone-${day}`, status: "confirmed", summary: "Task", description: "",
+    recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { dateTime: `2026-11-${String(day).padStart(2, "0")}T09:00:00Z`, timeZone: "Europe/London" },
+    start: { dateTime: `2026-11-${String(day).padStart(2, "0")}T09:00:00Z`, timeZone: "Europe/London" },
+  }));
+  const state = fakeState();
+  const tasks = [];
+  let deletes = 0;
+  const clients = {
+    calendar: {
+      async listDelta() { return { items: [master] }; },
+      async listInstances() { return occurrences; },
+      async getTimeZone() { return "Europe/London"; },
+    },
+    todoist: {
+      async listTasks() { return tasks.map((task) => structuredClone(task)); },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask() {
+        // Model Todoist's normalized API readback: it retains the local due
+        // datetime and recurrence text but omits due.timezone.
+        const task = {
+          id: "normalized-local-task", project_id: "home-project", content: "Task", description: "",
+          due: {
+            date: "2026-11-05T09:00:00", datetime: "2026-11-05T09:00:00",
+            is_recurring: true, string: "every Thursday at 9am ending 26 Nov 2026",
+          },
+        };
+        tasks.push(task);
+        return structuredClone(task);
+      },
+      async deleteTask(id) { deletes += 1; const index = tasks.findIndex((task) => task.id === id); if (index >= 0) tasks.splice(index, 1); },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id: "comment" }; },
+    },
+  };
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+
+  assert.equal(summary.imported, 1);
+  assert.equal(summary.conflicts, 0);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].id, "normalized-local-task");
+  assert.equal(deletes, 0, "a matching provider readback must not be rolled back");
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].taskId, "normalized-local-task");
+  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"), false);
+});
+
 test("snapshot recovery fails closed without creating a timed recurrence when Todoist and Calendar zones differ", async () => {
   const master = {
     id: "finite-master", iCalUID: "finite-series", status: "confirmed", summary: "Task", description: "",
