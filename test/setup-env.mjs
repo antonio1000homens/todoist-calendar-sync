@@ -1,4 +1,7 @@
-process.env.SYNC_PROFILE_CONFIG_JSON ||= JSON.stringify({
+// Keep test fixtures isolated from environment-specific deployment config.
+// Deploy workflows intentionally inject production profile routes/project IDs
+// into every step, including `npm test`; those values do not belong in tests.
+process.env.SYNC_PROFILE_CONFIG_JSON = JSON.stringify({
   home: {
     calendarId: 'home@example.test',
     channelId: 'test-home-channel',
