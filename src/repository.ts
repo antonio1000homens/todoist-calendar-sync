@@ -894,7 +894,11 @@ export class StateRepository {
       || (previous && (previous.profile !== mapping.profile || previous.recurrenceOwner !== "calendar"
         || previous.seriesId !== mapping.seriesId || previous.masterEventId !== mapping.masterEventId))
       || (expectedLink && (expectedLink.owner !== "calendar" || expectedLink.profile !== mapping.profile
-        || expectedLink.seriesId !== mapping.seriesId || expectedLink.taskId !== previous?.taskId))) {
+        || expectedLink.seriesId !== mapping.seriesId
+        || expectedLink.taskId !== (previous?.taskId ?? mapping.taskId)
+        || expectedLink.eventId !== mapping.eventId
+        || expectedLink.taskId === mapping.taskId && (expectedLink.masterEventId !== mapping.masterEventId
+          || expectedLink.activeInstanceId !== mapping.activeInstanceId)))) {
       throw new Error("Invalid Calendar series transfer mapping");
     }
     const currentTarget = await this.getMappingByTask(mapping.profile, mapping.taskId);
@@ -912,6 +916,25 @@ export class StateRepository {
     const oldIdentityValues = previous ? {
       ":oldProfile": previous.profile, ":oldTask": previous.taskId,
       ":oldEvent": previous.eventId, ":oldUpdated": previous.updatedAt,
+    } : undefined;
+    const repairingCurrentOwner = expectedLink?.taskId === mapping.taskId;
+    const expectedLinkCondition = expectedLink ? {
+      ConditionExpression: [
+        "#owner = :oldOwner", "taskId = :oldTask", "eventId = :oldEvent",
+        ...(repairingCurrentOwner ? ["#masterEvent = :oldMasterEvent", "#activeInstance = :oldActiveInstance"] : []),
+        "updatedAt = :oldLinkUpdated",
+      ].join(" AND "),
+      ExpressionAttributeNames: {
+        "#owner": "owner",
+        ...(repairingCurrentOwner ? { "#masterEvent": "masterEventId", "#activeInstance": "activeInstanceId" } : {}),
+      },
+      ExpressionAttributeValues: {
+        ":oldOwner": expectedLink.owner, ":oldTask": expectedLink.taskId,
+        ":oldEvent": expectedLink.eventId, ":oldLinkUpdated": expectedLink.updatedAt,
+        ...(repairingCurrentOwner ? {
+          ":oldMasterEvent": expectedLink.masterEventId, ":oldActiveInstance": expectedLink.activeInstanceId,
+        } : {}),
+      },
     } : undefined;
     const items: Array<Record<string, unknown>> = [];
     if (previous) {
@@ -970,14 +993,7 @@ export class StateRepository {
       { Put: {
         TableName: table,
         Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
-        ...(expectedLink ? {
-          ConditionExpression: "#owner = :oldOwner AND taskId = :oldTask AND eventId = :oldEvent AND updatedAt = :oldLinkUpdated",
-          ExpressionAttributeNames: { "#owner": "owner" },
-          ExpressionAttributeValues: {
-            ":oldOwner": expectedLink.owner, ":oldTask": expectedLink.taskId,
-            ":oldEvent": expectedLink.eventId, ":oldLinkUpdated": expectedLink.updatedAt,
-          },
-        } : { ConditionExpression: "attribute_not_exists(pk)" }),
+        ...(expectedLinkCondition || { ConditionExpression: "attribute_not_exists(pk)" }),
       } },
     );
     for (const profile of allProfiles) {

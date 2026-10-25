@@ -637,17 +637,45 @@ test("task-only review detail hydrates its existing recurrence owner and active 
   assert.deepEqual(h.writes, [], "hydration performs reads only");
 });
 
-test("transfer preview rejects a series already assigned to the selected Todoist task", async t => {
+test("series transfer repairs missing mapping indexes when Calendar ownership already names the selected task", async t => {
   const f = birthdayTransferFixture();
-  f.master = { ...f.master, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"] };
+  f.master = { ...f.master, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"],
+    extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"calendar"}} };
+  f.active = { ...f.active, extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"calendar"}} };
   const link = { ...f.recurrence, taskId: f.annual.id, activeInstanceId: f.active.id, eventId: f.active.id };
   const h = harness(t, { events: [f.master, f.active], tasks: [f.annual], recurrence: link });
 
-  await assert.rejects(
-    h.engine.preview(actor, transferIntent(f)),
-    /already owns the selected Calendar series occurrence/,
-  );
-  assert.deepEqual(h.writes, [], "an already-correct recurrence association needs no provider write");
+  const preview = await h.engine.preview(actor, transferIntent(f));
+  assert.ok(preview.changes.some(change => change.includes("reconstruct missing mapping indexes")));
+  assert.ok(preview.itemPlan.some(row => row.ref.id === f.annual.id
+    && row.operation === "Rebuild missing indexes for the existing Calendar series association"));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result = await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.mappingMap.get(f.annual.id).masterEventId,f.master.id);
+  assert.equal(h.eventMappingMap.get(`home:${f.active.id}`).taskId,f.annual.id);
+  assert.equal(h.ownerMappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.recurrences.get(f.master.iCalUID).taskId,f.annual.id);
+  assert.deepEqual(h.taskMap.get(f.annual.id).due,f.annual.due);
+  assert.deepEqual(h.eventMap.get(f.master.id).recurrence,f.master.recurrence);
+  assert.equal(h.writes.some(row=>row[0]==="create-task"||row[0]==="create-event"),false);
+});
+
+test("series transfer fails closed when an already-owned recurrence has partial mapping indexes", async t => {
+  const f = birthdayTransferFixture();
+  f.master = { ...f.master, recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"],
+    extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"calendar"}} };
+  f.active = { ...f.active, extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"calendar"}} };
+  const link = { ...f.recurrence, taskId: f.annual.id, activeInstanceId: f.active.id, eventId: f.active.id };
+  const h = harness(t, { events: [f.master, f.active], tasks: [f.annual], recurrence: link });
+  h.eventMappingMap.set(`home:${f.active.id}`, {
+    profile:"home",taskId:f.annual.id,eventId:f.active.id,recurrenceOwner:"calendar",seriesId:f.master.iCalUID,
+    masterEventId:f.master.id,activeInstanceId:f.active.id,updatedAt:"partial-index-version",
+  });
+
+  await assert.rejects(h.engine.preview(actor, transferIntent(f)),/mapping indexes are partially present/);
+  assert.deepEqual(h.writes,[]);
 });
 
 test("series transfer refuses an unowned Calendar recurrence without a recurrence link or ownership metadata",async t=>{
