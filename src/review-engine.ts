@@ -1858,10 +1858,10 @@ export class ReviewEngine {
                 const baselineStep=`transfer-delete-baseline:${baselineTaskId}`;
                 const baselineWasRunning=operation.steps[baselineStep]?.status==="running";
                 await step(baselineStep,async()=> {
-                const removed=await new DynamoReconciliationStore().deleteBaselineIfUnchanged(mapping?.profile||snapshot.ref.profile,baselineTaskId,
-                  deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,baselineWasRunning);
-                if(!removed) throw new Error(`Baseline for ${baselineTaskId} changed after preview`);
-                return true;
+                  const removed=await new DynamoReconciliationStore().deleteBaselineIfUnchanged(mapping?.profile||snapshot.ref.profile,baselineTaskId,
+                    deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,baselineWasRunning);
+                  if(!removed) throw new Error(`Baseline for ${baselineTaskId} changed after preview`);
+                  return true;
                 });
               }
               const identityStore=new CanonicalIdentityStore();
@@ -1887,7 +1887,13 @@ export class ReviewEngine {
                   await step(`transfer-delete-counterpart-metadata:${counterpart.ref.id}`,async()=> {
                     const clientPair=await factory(counterpart.ref.profile),event=await clientPair.calendar.getEvent(counterpart.ref.id);
                     const expected=counterpart.object as CalendarEvent;
-                    if (reviewHash(event)!==reviewHash(expected) && reviewHash(event)!==reviewHash(clearTodoistCalendarIdentity(expected))) {
+                    const withoutVersion=(value:CalendarEvent)=>{
+                      const result={...value} as CalendarEvent & {updated?:string;sequence?:number};
+                      delete result.etag;delete result.updated;delete result.sequence;
+                      return result;
+                    };
+                    if (reviewHash(withoutVersion(event))!==reviewHash(withoutVersion(expected))
+                      && reviewHash(withoutVersion(event))!==reviewHash(withoutVersion(clearTodoistCalendarIdentity(expected)))) {
                       throw new Error(`Calendar counterpart ${event.id} changed after exact Todoist deletion`);
                     }
                     const shared=event.extendedProperties?.shared||{};

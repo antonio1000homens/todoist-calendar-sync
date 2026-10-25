@@ -616,6 +616,109 @@ test("transfer deletes only the selected standalone Calendar duplicate and retai
   assert.ok(result.outcomes.some(row=>row.entity==="home:calendar:duplicate-event"&&row.outcome==="deleted"));
 });
 
+test("generic transfer Todoist deletion resumes after a lost acknowledgement",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  let calls=0;
+  h.clients.todoist.deleteTask=async id=>{calls++;h.taskMap.delete(id);h.writes.push(["delete-task",id]);if(calls===1)throw new Error("Todoist committed deletion but response was lost");};
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(h.operations.get("repair").steps["transfer-delete-provider:home:todoist:duplicate-task"].status,"running");
+  const resumed=await h.engine.execute("repair");
+  assert.equal(resumed.status,"succeeded",JSON.stringify(resumed));
+  assert.equal(calls,1,"resume accepts absence only for the exact persisted deletion step");
+  assert.equal(h.taskMap.has(duplicateTask.id),false);
+});
+
+test("generic transfer Calendar deletion resumes after a lost acknowledgement",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  let calls=0;
+  h.clients.calendar.deleteEventIfUnchanged=async(id,etag)=>{assert.equal(h.eventMap.get(id)?.etag,etag);calls++;h.eventMap.delete(id);h.writes.push(["delete-event",id]);if(calls===1)throw new Error("Calendar committed deletion but response was lost");};
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(h.operations.get("repair").steps["transfer-delete-provider:home:calendar:duplicate-event"].status,"running");
+  const resumed=await h.engine.execute("repair");
+  assert.equal(resumed.status,"succeeded",JSON.stringify(resumed));
+  assert.equal(calls,1,"resume accepts absence only for the exact persisted deletion step");
+  assert.equal(h.eventMap.has(duplicateEvent.id),false);
+});
+
+test("generic transfer deletion still rejects a target missing before its checkpoint and changed targets",async t=>{
+  const f=birthdayTransferFixture(),duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.eventMap.delete(duplicateEvent.id);
+  const missing=await h.engine.execute("repair");
+  assert.notEqual(missing.status,"succeeded");
+  assert.equal(missing.steps["transfer-delete-provider:home:calendar:duplicate-event"],undefined);
+
+  const f2=birthdayTransferFixture(),event2=event("changed-event",{summary:f2.annual.content,description:f2.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const task2=task("changed-task",{content:f2.annual.content,description:f2.annual.description,due:{date:"2027-07-17"}});
+  const mapping2={profile:"home",taskId:task2.id,eventId:event2.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h2=harness(t,{events:[f2.master,f2.active,f2.standalone,event2],tasks:[f2.annual,f2.displaced,task2],mappings:[f2.mapping,mapping2],recurrence:f2.recurrence});
+  const preview2=await h2.engine.preview(actor,transferIntent(f2,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:changed-event":"delete","home:todoist:changed-task":"unchanged",
+  }));
+  h2.operations.set("repair",{id:"repair",status:"queued",steps:{},preview:preview2});
+  h2.eventMap.get(event2.id).summary="Changed after preview";
+  const changed=await h2.engine.execute("repair");
+  assert.notEqual(changed.status,"succeeded");
+  assert.equal(h2.eventMap.get(event2.id).summary,"Changed after preview");
+  assert.equal(h2.writes.some(write=>write[0]==="delete-event"&&write[1]===event2.id),false);
+});
+
+test("counterpart Calendar metadata upsert resumes after a lost acknowledgement",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"},
+    extendedProperties:{shared:{taskId:duplicateTask.id,taskUrl:`https://app.todoist.com/app/task/${duplicateTask.id}`,syncSource:"todoist-calendar-sync"}}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const upsert=h.clients.calendar.upsertEventIfUnchanged;
+  let calls=0;
+  h.clients.calendar.upsertEventIfUnchanged=async(value,id,etag)=>{
+    const result=await upsert(value,id,etag);
+    if(id===duplicateEvent.id&&calls++===0)throw new Error("Calendar metadata committed but response was lost");
+    return result;
+  };
+  assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
+  assert.equal(h.operations.get("repair").steps[`transfer-delete-counterpart-metadata:${duplicateEvent.id}`].status,"running");
+  const eventAfterWrite=clone(h.eventMap.get(duplicateEvent.id));
+  assert.equal(eventAfterWrite.extendedProperties.shared.taskId,undefined);
+  h.eventMap.get(duplicateEvent.id).summary="Unrelated Calendar edit";
+  const unrelated=await h.engine.execute("repair");
+  assert.notEqual(unrelated.status,"succeeded");
+  assert.equal(h.eventMap.get(duplicateEvent.id).summary,"Unrelated Calendar edit");
+  h.eventMap.set(duplicateEvent.id,eventAfterWrite);
+  const resumed=await h.engine.execute("repair");
+  assert.equal(resumed.status,"succeeded",JSON.stringify(resumed));
+  assert.equal(calls,1,"the exact post-write state is accepted without repeating the upsert");
+});
+
 test("exact deletion resumes after provider deletion when mapping cleanup is temporarily unavailable",async t=>{
   const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
   const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
