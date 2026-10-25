@@ -1351,11 +1351,9 @@ export class Synchronizer {
         ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
         updatedAt: new Date().toISOString(),
       };
-      // Persist the completion boundary before mutating Calendar or binding a
-      // successor. A retry can then never roll the logical series backwards.
-      await this.state.putMapping(progressMapping);
-      if (progressMapping.seriesId) await this.state.putRecurrenceLink(recurrenceLink(progressMapping, "calendar"));
-
+      // Keep the old active mapping retryable while reading Calendar and
+      // verifying/updating Todoist. The completion boundary is committed with
+      // the successor mapping only after provider work succeeds below.
       const retained = completedCalendarProjection(progressMapping, delivery.receivedAt);
       await this.putCompletedProjection(retained);
       await this.state.audit(delivery.profile, "calendar_recurrence_completed_occurrence_retained", {
@@ -1404,10 +1402,10 @@ export class Synchronizer {
         ? nextActiveInstance(instances, progressMapping.completedThroughOriginalStart)
         : nextActiveInstance(instances, mapping.originalStart);
       if (!next) {
-        await this.state.deleteMapping(progressMapping);
         // An empty instances window alone is NOT proof of recurrence exhaustion.
         // Require a finite RRULE on the fresh Calendar master and atomically
-        // retire exactly the old progress link while certifying this completion.
+        // retire exactly the unchanged recurrence link before removing the
+        // mapping. If proof is unavailable, leave the old mapping retryable.
         let master: CalendarEvent | undefined;
         try { master = await calendar.getEvent?.(mapping.masterEventId); }
         catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
@@ -1416,8 +1414,8 @@ export class Synchronizer {
         );
         const link = mapping.seriesId ? await this.state.getRecurrenceLink?.(delivery.profile, mapping.seriesId) : undefined;
         if (finite && link && link.masterEventId === mapping.masterEventId
-          && link.completedThroughOriginalStart === progressMapping.completedThroughOriginalStart
           && await this.state.verifyTerminalCompletedCalendarProjection?.(retained, link)) {
+          await this.state.deleteMapping(mapping);
           return this.state.audit(delivery.profile, "calendar_finite_recurrence_terminal_verified", {
             seriesId: mapping.seriesId, taskId: task.id, eventId: retained.eventId,
           });
@@ -1429,6 +1427,12 @@ export class Synchronizer {
       const nextTask = currentCalendarRecurrence && currentRecurringTask
         ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
         : await todoist.upsertTask(toTodoistTask(next));
+      if (currentCalendarRecurrence && !matchesCalendarOwnedRecurringTask(nextTask, next, currentCalendarRecurrence)) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
+          seriesId: mapping.seriesId, masterEventId: mapping.masterEventId,
+          eventId: next.id, taskId: nextTask.id,
+        });
+      }
       const nextMapping: Mapping = {
         profile: delivery.profile,
         eventId: next.id,
@@ -1444,9 +1448,11 @@ export class Synchronizer {
         ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
         updatedAt: new Date().toISOString(),
       };
-      await this.state.deleteMapping(progressMapping);
-      await this.state.putMapping(nextMapping);
       await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
+      await this.state.putMapping(nextMapping);
+      // TASK/TASKOWNER now point to the successor; deleteMapping protects
+      // those newer indexes while removing only the completed EVENT row.
+      await this.state.deleteMapping(mapping);
       await this.state.recordMutation(delivery.profile);
       return this.state.audit(delivery.profile, "calendar_recurrence_completed_rolled", {
         seriesId: mapping.seriesId,
