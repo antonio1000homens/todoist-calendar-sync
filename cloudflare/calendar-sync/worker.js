@@ -1,5 +1,6 @@
 const ALLOWED_HOST = "calendar-sync.alf-broadcast.co.uk";
 const CALENDAR_PATH = "/calendar";
+const TODOIST_ROUTE = /^\/todoist(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$/;
 const REVIEW_API_PREFIX = "/review/api/";
 const PROXY_AUTH_HEADER = "x-gcp-proxy-auth";
 
@@ -66,17 +67,21 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
-    if (url.pathname !== CALENDAR_PATH) return errorResponse("not_found", 404);
+    const isCalendar = url.pathname === CALENDAR_PATH;
+    const isTodoist = TODOIST_ROUTE.test(url.pathname);
+    if (!isCalendar && !isTodoist) return errorResponse("not_found", 404);
     if (request.method !== "POST") return errorResponse("method_not_allowed", 405);
 
-    const channelId = request.headers.get("x-goog-channel-id") || "";
-    if (!profileForChannel(channelId)) return errorResponse("unsupported_calendar_channel", 404);
+    if (isCalendar) {
+      const channelId = request.headers.get("x-goog-channel-id") || "";
+      if (!profileForChannel(channelId)) return errorResponse("unsupported_calendar_channel", 404);
+    }
     if (!env.TODOIST_CALENDAR_SYNC_AWS_INGRESS_URL || !env.TODOIST_CALENDAR_SYNC_PROXY_SHARED_SECRET) {
       return errorResponse("calendar_sync_proxy_not_configured", 503);
     }
 
     const target = new URL(env.TODOIST_CALENDAR_SYNC_AWS_INGRESS_URL);
-    target.pathname = CALENDAR_PATH;
+    target.pathname = url.pathname;
     target.search = url.search;
     const body = await request.arrayBuffer();
     try {
