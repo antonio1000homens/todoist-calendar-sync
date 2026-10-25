@@ -892,6 +892,8 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   assert.equal(state.links[0].activeInstanceId, next.id);
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(clients.calendarUpserts.length, 0, "completion must advance the existing Calendar series without creating a standalone event");
+  assert.deepEqual(clients.calendarDeletes, []);
+  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;COUNT=4"]);
   assert.equal(clients.events.has(final.id), true);
 });
 
