@@ -677,16 +677,26 @@ export class ReviewEngine {
         && !snapshots.some(s => entityKey(s.ref) === key && s.mapping?.taskId === oldTaskId))) invalidRepairIntent("Retain unlinked is allowed only for the exact displaced task mapping");
     }
     if (intent.action === "transfer") {
-      const selectedIds = new Set([intent.taskId, intent.eventId, masterSnapshot?.calendarProjectionId].filter((value): value is string => Boolean(value)));
-      const profileMappings=Object.values(intent.leftovers).includes("delete")?await this.state.listMappings(intent.profile):[];
+      const selectedRefs = new Set([
+        {profile:intent.profile,side:"todoist" as const,id:intent.taskId!},
+        {profile:intent.profile,side:"calendar" as const,id:intent.eventId!},
+        ...(masterSnapshot?.calendarProjectionId?[{profile:intent.profile,side:"calendar" as const,id:masterSnapshot.calendarProjectionId}]:[]),
+      ].map(entityKey));
       const profileRecurrences=Object.values(intent.leftovers).includes("delete")?await this.state.listRecurrenceLinks(intent.profile):[];
       for (const [key, disposition] of Object.entries(intent.leftovers)) if (disposition === "delete") {
         const snapshot = snapshots.find(value => entityKey(value.ref) === key);
-        if (!snapshot?.object || selectedIds.has(snapshot.ref.id)) invalidRepairIntent(`Exact deletion target ${key} is missing or overlaps the selected annual series`);
-        const indexedMappings=profileMappings.filter(mapping=>snapshot.ref.side==="todoist"
-          ? mapping.taskId===snapshot.ref.id : mapping.eventId===snapshot.ref.id);
-        if(snapshot.mapping ? indexedMappings.length!==1||reviewHash(mappingPayload(indexedMappings[0]))!==reviewHash(mappingPayload(snapshot.mapping))
-          : indexedMappings.length!==0) invalidRepairIntent(`Deletion target ${key} has missing, partial, duplicate, or stale mapping indexes`);
+        if (!snapshot?.object || selectedRefs.has(key)) invalidRepairIntent(`Exact deletion target ${key} is missing or overlaps the selected annual series`);
+        const expected=snapshot.mapping;
+        const eventId=snapshot.ref.side==="calendar"?snapshot.ref.id:expected?.eventId;
+        const taskId=snapshot.ref.side==="todoist"?snapshot.ref.id:expected?.taskId;
+        const [eventIndex,taskIndex,ownerIndex]=await Promise.all([
+          eventId?this.state.getMappingByEvent(intent.profile,eventId):Promise.resolve(undefined),
+          taskId?this.state.getMappingByTask(intent.profile,taskId):Promise.resolve(undefined),
+          taskId?this.state.getMappingByTaskAnyProfile(taskId):Promise.resolve(undefined),
+        ]);
+        const exact=expected&&[eventIndex,taskIndex,ownerIndex].every(value=>value&&reviewHash(mappingPayload(value))===reviewHash(mappingPayload(expected)));
+        const empty=!expected&&!eventIndex&&!taskIndex&&!ownerIndex;
+        if(!exact&&!empty) invalidRepairIntent(`Deletion target ${key} has missing, partial, duplicate, cross-profile, or stale mapping indexes`);
         if(profileRecurrences.some(link=>snapshot.ref.side==="todoist"?link.taskId===snapshot.ref.id
           :[link.masterEventId,link.activeInstanceId,link.eventId].includes(snapshot.ref.id))) {
           const displaced=Boolean(snapshot.ref.side==="todoist"&&snapshot.mapping&&masterSnapshot?.recurrence
@@ -708,7 +718,7 @@ export class ReviewEngine {
           if (!candidate.due || candidate.due.is_recurring || candidate.is_deleted || candidate.is_completed) {
             invalidRepairIntent(`Todoist deletion target ${key} is completed, deleted, undated, or recurring; only an active one-off can be deleted`);
           }
-          if (snapshot.recurrence || snapshot.mapping?.recurrenceOwner || snapshot.mapping?.seriesId || snapshot.mapping?.masterEventId || snapshot.mapping?.activeInstanceId) {
+          if (snapshot.recurrence || snapshot.mapping?.recurrenceOwner || snapshot.mapping?.recurrenceId || snapshot.mapping?.seriesId || snapshot.mapping?.masterEventId || snapshot.mapping?.activeInstanceId) {
             // The previously mapped duplicate is allowed only when the transfer itself atomically replaces that exact mapping.
             const isDisplacedMapping = Boolean(snapshot.mapping && masterSnapshot?.recurrence
               && snapshot.mapping.taskId === masterSnapshot.recurrence.taskId
@@ -721,7 +731,7 @@ export class ReviewEngine {
         if (snapshot.mapping && (!snapshot.mapping.updatedAt || snapshot.mapping.profile !== intent.profile)) {
           invalidRepairIntent(`Deletion target ${key} has a partial or cross-profile mapping`);
         }
-        if (snapshot.mapping && (snapshot.mapping.recurrenceOwner || snapshot.mapping.seriesId
+        if (snapshot.mapping && (snapshot.mapping.recurrenceOwner || snapshot.mapping.recurrenceId || snapshot.mapping.seriesId
           || snapshot.mapping.masterEventId || snapshot.mapping.activeInstanceId)) {
           const isDisplacedTask = snapshot.ref.side === "todoist" && snapshot.mapping.taskId === masterSnapshot?.recurrence?.taskId
             && snapshot.mapping.seriesId === masterSnapshot.recurrence.seriesId
@@ -736,6 +746,7 @@ export class ReviewEngine {
           if (!counterpart?.object || !counterpart.mapping || reviewHash(mappingPayload(counterpart.mapping)) !== reviewHash(mappingPayload(snapshot.mapping))) {
             invalidRepairIntent(`Deletion target ${key} has an incomplete or disagreeing counterpart mapping`);
           }
+          if(!selectedRefs.has(entityKey(counterpartRef))&&intent.leftovers[entityKey(counterpartRef)]!=="exclude") invalidRepairIntent(`Deletion target ${key} has a mapped counterpart; explicitly choose Exclude for ${entityKey(counterpartRef)} so it cannot recreate the deleted object`);
           if(snapshot.ref.side==="todoist") {
             const mappedEvent=counterpart!.object as CalendarEvent;
             const isDisplaced=Boolean(masterSnapshot?.recurrence&&snapshot.mapping.taskId===masterSnapshot.recurrence.taskId
@@ -1189,7 +1200,7 @@ export class ReviewEngine {
     if (operation.status === "succeeded") return operation;
     // Already-abandoned deliveries are terminal: complete the FIFO receipt rather than
     // throwing a 409 into the dead-letter queue on retry/redelivery.
-    if (operation.abandoned) return operation;
+    if (operation.abandoned || operation.nonResumable) return operation;
     let { intent } = operation.preview;
     const state = new StateRepository(id);
     const rawFactory = this.clients;
@@ -1711,41 +1722,10 @@ export class ReviewEngine {
         if (previous) {
           const previousDeletePlan=operation.preview.oneOffDeletionPlans?.find(value=>value.ref.side==="todoist"&&value.ref.id===previous.taskId);
           await this.controls.reject(previous.profile, previous.taskId, previous.eventId, id);
-          await step(`transfer-delete-old-comment:${previous.taskId}`, async () => {
-            const oldClient = await factory(previous.profile);
-            return trackedWrite(previous.profile, () => exactDisposition==="delete"
-              ? deleteExactMappingComments(oldClient.todoist,previous)
-              : deleteMappingComments(oldClient.todoist, previous), count => count);
-          });
-          const previousBaselineStep=`transfer-delete-old-baseline:${previous.taskId}`;
-          const previousBaselineWasRunning=operation.steps[previousBaselineStep]?.status==="running";
-          await step(previousBaselineStep, async () => {
-            const store=new DynamoReconciliationStore();
-            if(exactDisposition!=="delete") return store.deleteBaseline(previous.profile,previous.taskId);
-            const removed=await store.deleteBaselineIfUnchanged(previous.profile,previous.taskId,previousDeletePlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,previousBaselineWasRunning);
-            if(!removed) throw new Error(`Baseline for deleted Todoist task ${previous.taskId} changed after preview; refresh before purge`);
-            return true;
-          });
-          if (exactDisposition === "retain-unlinked") await this.controls.exclude({profile:previous.profile,side:"todoist",id:previous.taskId},true,id);
           if (exactDisposition === "delete") {
             const oldTaskSnapshot = operation.preview.snapshots.find(s => s.ref.side === "todoist" && s.ref.id === previous.taskId);
             if (!oldTaskSnapshot?.object) throw new Error("The exact displaced Todoist deletion target is missing from the approved preview");
             const oldTask = oldTaskSnapshot.object as TodoistTask;
-            await this.controls.exclude(oldTaskSnapshot.ref,true,id);
-            const identityPlan=previousDeletePlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
-            const identities=new CanonicalIdentityStore();
-            const previousCanonicalStep=`transfer-delete-old-canonical:${previous.taskId}`;
-            const previousCanonicalWasRunning=operation.steps[previousCanonicalStep]?.status==="running";
-            await step(previousCanonicalStep,async()=> {
-              const currentIdentity=await identities.get(previous.profile,"todoist",previous.taskId);
-              if(identityPlan) {
-                if(!currentIdentity&&previousCanonicalWasRunning) return true;
-                if(reviewHash(currentIdentity)!==reviewHash(identityPlan)) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed after preview`);
-                const removed=await identities.deleteIfUnchanged(identityPlan);
-                if(!removed) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed during purge`);
-              } else if(currentIdentity) throw new Error(`A new canonical identity for deleted Todoist task ${previous.taskId} appeared after preview`);
-              return true;
-            });
             await step(`transfer-delete-displaced-task:${previous.taskId}`, async () => {
               let live:TodoistTask|undefined;
               try { live = await pair.todoist.getTask(previous.taskId); }
@@ -1760,7 +1740,39 @@ export class ReviewEngine {
               catch (error) { if (!missing(error)) throw error; }
               return true;
             });
+            await this.controls.exclude(oldTaskSnapshot.ref,true,id);
           }
+          await step(`transfer-delete-old-comment:${previous.taskId}`, async () => {
+            const oldClient = await factory(previous.profile);
+            return trackedWrite(previous.profile, () => exactDisposition==="delete"
+              ? deleteExactMappingComments(oldClient.todoist,previous)
+              : deleteMappingComments(oldClient.todoist, previous), count => count);
+          });
+          const previousBaselineStep=`transfer-delete-old-baseline:${previous.taskId}`;
+          const previousBaselineWasRunning=operation.steps[previousBaselineStep]?.status==="running";
+          await step(previousBaselineStep, async () => {
+            const store=new DynamoReconciliationStore();
+            if(exactDisposition!=="delete") return store.deleteBaseline(previous.profile,previous.taskId);
+            return store.deleteBaselineIfUnchanged(previous.profile,previous.taskId,previousDeletePlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined,previousBaselineWasRunning);
+          });
+          if (exactDisposition === "retain-unlinked") await this.controls.exclude({profile:previous.profile,side:"todoist",id:previous.taskId},true,id);
+          if (exactDisposition === "delete") {
+            const identityPlan=previousDeletePlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
+            const identities=new CanonicalIdentityStore();
+            const previousCanonicalStep=`transfer-delete-old-canonical:${previous.taskId}`;
+            const previousCanonicalWasRunning=operation.steps[previousCanonicalStep]?.status==="running";
+            await step(previousCanonicalStep,async()=> {
+              const currentIdentity=await identities.get(previous.profile,"todoist",previous.taskId);
+              if(identityPlan) {
+                if(!currentIdentity&&previousCanonicalWasRunning) return true;
+                if(reviewHash(currentIdentity)!==reviewHash(identityPlan)) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed after preview`);
+                const removed=await identities.deleteIfUnchanged(identityPlan);
+                if(!removed) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed during purge`);
+              } else if(currentIdentity) throw new Error(`A new canonical identity for deleted Todoist task ${previous.taskId} appeared after preview`);
+              return true;
+            });
+          }
+
         }
         await this.controls.allow(intent.profile,targetTask.id,activeId);
         const mappedComment = await step(`transfer-project-comment:${targetTask.id}`, async () => {
@@ -1846,7 +1858,13 @@ export class ReviewEngine {
               if (mapping) {
                 await step(`transfer-delete-mapping:${mapping.taskId}`,async()=>{
                   const removed=await state.deleteMappingIfUnchanged(mapping);
-                  if(!removed) throw new Error(`Mapping ${mapping.taskId} ↔ ${mapping.eventId} changed after preview; no newer indexes were removed`);
+                  if(!removed) {
+                    operation.nonResumable=true;
+                    operation.error=`Mapping ${mapping.taskId} ↔ ${mapping.eventId} changed after provider deletion; no newer indexes were removed`;
+                    operation.nextAction="Provider deletion may already have occurred, but mapping rows changed. Do not resume; inspect live provider and mapping state, then create a new review operation.";
+                    await this.store.saveOperation(operation);
+                    throw new Error(operation.error);
+                  }
                   return true;
                 });
                 await step(`transfer-delete-comment:${mapping.taskId}`,async()=> {
@@ -2361,7 +2379,7 @@ export class ReviewEngine {
       if (releaseError) operation.error += `; repair barriers were retained because safe release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`;
       operation.nextAction = operation.abandoned
         ? abandonedNextAction
-        : 'Repair ownership remains protected; inspect live state and resume only when the recorded changes are understood.';
+        : operation.nextAction || 'Repair ownership remains protected; inspect live state and resume only when the recorded changes are understood.';
       try {
         await this.store.updateCase(intent.caseId, 'open', operation.error, id);
       } catch (updateError) {

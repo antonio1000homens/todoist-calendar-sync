@@ -47,7 +47,7 @@ export interface RepairOperation {
   id: string; preview: RepairPreview; actor: ReviewActor; attempt: number;
   status: "queued" | "running" | "succeeded" | "needs_review" | "failed";
   createdAt: string; updatedAt: string; steps: Record<string, RepairStep>;
-  error?: string; nextAction?: string; abandoned?: boolean; notificationPending: boolean; notificationReplyTs?: string;
+  error?: string; nextAction?: string; abandoned?: boolean; nonResumable?: boolean; notificationPending: boolean; notificationReplyTs?: string;
   /** Persisted before any non-validation execution step so no-write abandonment can race safely with retries. */
   writeStarted?: boolean;
   notificationText?: string; verified?: Array<{ taskId: string; eventId: string; profile: Profile }>;

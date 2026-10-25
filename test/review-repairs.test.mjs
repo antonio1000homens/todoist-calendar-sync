@@ -574,6 +574,39 @@ function birthdayTransferFixture() {
 const transferIntent=(fixture, leftovers={})=>intent({action:"transfer",taskId:fixture.annual.id,eventId:fixture.master.id,
   winner:"none",owner:"calendar",scope:"future",leftovers});
 
+test("exact deletion preview requires complete exact EVENT TASK and cross-profile TASKOWNER indexes",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const originalEvent=StateRepository.prototype.getMappingByEvent,originalOwner=StateRepository.prototype.getMappingByTaskAnyProfile;
+  StateRepository.prototype.getMappingByEvent=async function(profile,id){const value=await originalEvent.call(this,profile,id);return id===duplicateEvent.id?undefined:value;};
+  t.after(()=>{StateRepository.prototype.getMappingByEvent=originalEvent;StateRepository.prototype.getMappingByTaskAnyProfile=originalOwner;});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged","home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude"});
+  await assert.rejects(h.engine.preview(actor,input),/mapping|identify|partial|cross-profile/);
+  StateRepository.prototype.getMappingByEvent=originalEvent;
+  StateRepository.prototype.getMappingByTaskAnyProfile=async function(taskId){const value=await originalOwner.call(this,taskId);return taskId===duplicateTask.id?{...mapping,profile:"work"}:value;};
+  await assert.rejects(h.engine.preview(actor,input),/belongs to work|cross-profile|mapping/);
+});
+
+test("exact deletion rejects recurrenceId mappings and unchanged mapped counterparts",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const mapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z",recurrenceId:"orphan-series"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
+  const base={"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged","home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude"};
+  await assert.rejects(h.engine.preview(actor,transferIntent(f,base)),/recurrence-linked state|recurrence mapping state/);
+  const plain={...mapping};delete plain.recurrenceId;h.mappingMap.set(duplicateTask.id,plain);h.ownerMappingMap.set(duplicateTask.id,plain);h.eventMappingMap.set(`home:${duplicateEvent.id}`,plain);
+  await assert.rejects(h.engine.preview(actor,transferIntent(f,{...base,"home:todoist:duplicate-task":"unchanged"})),/explicitly choose Exclude/);
+});
+
+test("Calendar delete fails closed when provider task identity has no verified mapping",async t=>{
+  const f=birthdayTransferFixture(),duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"},extendedProperties:{shared:{taskId:"unmapped-task"}}});
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged","home:calendar:duplicate-event":"delete"});
+  await assert.rejects(h.engine.preview(actor,input),/conflicting task metadata and mapping|verified mapping/);
+});
+
 test("transfer can delete the exact displaced one-off task and purge only its mapping state",async t=>{
   const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
   const input=transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"});
@@ -603,7 +636,7 @@ test("transfer deletes only the selected standalone Calendar duplicate and retai
   const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   const result=await h.engine.execute("repair");
@@ -623,7 +656,7 @@ test("generic transfer Todoist deletion resumes after a lost acknowledgement",as
   const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   let calls=0;
@@ -643,7 +676,7 @@ test("generic transfer Calendar deletion resumes after a lost acknowledgement",a
   const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   let calls=0;
@@ -663,7 +696,7 @@ test("generic transfer deletion still rejects a target missing before its checkp
   const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   h.eventMap.delete(duplicateEvent.id);
@@ -677,7 +710,7 @@ test("generic transfer deletion still rejects a target missing before its checkp
   const h2=harness(t,{events:[f2.master,f2.active,f2.standalone,event2],tasks:[f2.annual,f2.displaced,task2],mappings:[f2.mapping,mapping2],recurrence:f2.recurrence});
   const preview2=await h2.engine.preview(actor,transferIntent(f2,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:changed-event":"delete","home:todoist:changed-task":"unchanged",
+    "home:calendar:changed-event":"delete","home:todoist:changed-task":"exclude",
   }));
   h2.operations.set("repair",{id:"repair",status:"queued",steps:{},preview:preview2});
   h2.eventMap.get(event2.id).summary="Changed after preview";
@@ -695,7 +728,7 @@ test("counterpart Calendar metadata upsert resumes after a lost acknowledgement"
   const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,mapping],recurrence:f.recurrence});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   const upsert=h.clients.calendar.upsertEventIfUnchanged;
@@ -719,7 +752,7 @@ test("counterpart Calendar metadata upsert resumes after a lost acknowledgement"
   assert.equal(calls,1,"the exact post-write state is accepted without repeating the upsert");
 });
 
-test("exact deletion resumes after provider deletion when mapping cleanup is temporarily unavailable",async t=>{
+test("exact deletion stops resuming when mapping indexes no longer match after provider deletion",async t=>{
   const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
   const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
   const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
@@ -729,7 +762,7 @@ test("exact deletion resumes after provider deletion when mapping cleanup is tem
   t.after(()=>{StateRepository.prototype.deleteMappingIfUnchanged=original;});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   const first=await h.engine.execute("repair");
@@ -737,9 +770,11 @@ test("exact deletion resumes after provider deletion when mapping cleanup is tem
   assert.equal(h.eventMap.has(duplicateEvent.id),false,"the exact event deletion crossed its durable step boundary");
   assert.equal(h.mappingMap.has(duplicateTask.id),true,"stale mapping remains until its conditional cleanup succeeds");
   const second=await h.engine.execute("repair");
-  assert.equal(second.status,"succeeded",JSON.stringify(second));
-  assert.equal(h.mappingMap.has(duplicateTask.id),false);
-  assert.equal(h.writes.filter(row=>row[0]==="delete-event"&&row[1]===duplicateEvent.id).length,1,"retry does not issue a second provider deletion");
+  assert.equal(second.status,"needs_review");
+  assert.equal(second.nonResumable,true);
+  assert.match(second.nextAction,/Do not resume/);
+  assert.equal(h.mappingMap.has(duplicateTask.id),true);
+  assert.equal(h.writes.filter(row=>row[0]==="delete-event"&&row[1]===duplicateEvent.id).length,1,"terminal stale-index state never repeats provider deletion");
 });
 
 test("lost Todoist delete acknowledgement resumes from exact task absence",async t=>{
@@ -780,7 +815,7 @@ test("displaced-task baseline purge resumes after lost acknowledgement and later
   h.clients.todoist.deleteTask=async id=>{taskDeleteCalls++;if(taskDeleteCalls===1)throw new Error("temporary Todoist failure");h.taskMap.delete(id);h.writes.push(["delete-task",id]);};
   const first=await h.engine.execute("repair");
   assert.notEqual(first.status,"succeeded",JSON.stringify(first));
-  assert.equal(liveBaseline,undefined);
+  assert.deepEqual(liveBaseline,baseline,"baseline cleanup waits until the displaced provider task is deleted");
   assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
   assert.equal((await h.engine.execute("repair")).status,"succeeded");
   assert.equal(baselineCalls,2,"the retry accepts absence only at the still-running exact purge checkpoint");
@@ -803,7 +838,7 @@ test("displaced-task canonical purge resumes after later Todoist deletion failur
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   h.clients.todoist.deleteTask=async id=>{deleteCalls++;if(deleteCalls===1)throw new Error("temporary Todoist failure");h.taskMap.delete(id);h.writes.push(["delete-task",id]);};
   assert.notEqual((await h.engine.execute("repair")).status,"succeeded");
-  assert.equal(liveIdentity,undefined);
+  assert.deepEqual(liveIdentity,canonical,"canonical identity cleanup waits until the displaced provider task is deleted");
   assert.equal((await h.engine.execute("repair")).status,"succeeded");
   assert.equal(deleteCalls,2);
 });
@@ -824,7 +859,7 @@ test("standalone-task canonical purge resumes after later Calendar metadata fail
   t.after(()=>{CanonicalIdentityStore.prototype.get=originalGet;CanonicalIdentityStore.prototype.deleteIfUnchanged=originalDelete;});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"unchanged",
+    "home:todoist:duplicate-task":"delete","home:calendar:duplicate-event":"exclude",
   }));
   assert.deepEqual(preview.oneOffDeletionPlans.find(plan=>plan.ref.id===duplicateTask.id).canonical,canonical);
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
@@ -850,7 +885,7 @@ test("new or changed cleanup rows after preview block exact provider deletion",a
   t.after(()=>{DynamoReconciliationStore.prototype.getBaseline=originalBaselineGet;CanonicalIdentityStore.prototype.get=originalIdentityGet;});
   const preview=await h.engine.preview(actor,transferIntent(f,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"exclude",
   }));
   h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
   const baseline={todoist:{content:"new"},calendar:{summary:"new"},updatedAt:"2026-10-25T12:00:00.000Z"};
@@ -870,7 +905,7 @@ test("new or changed cleanup rows after preview block exact provider deletion",a
   CanonicalIdentityStore.prototype.get=async(profile,side,id)=>id===event2.id?clone(liveIdentity):h2CanonicalGet.call(new CanonicalIdentityStore(),profile,side,id);
   const preview2=await h2.engine.preview(actor,transferIntent(f2,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"unchanged",
+    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"exclude",
   }));
   liveIdentity={...canonical,providerId:event2.id};
   h2.operations.set("repair",{id:"repair",status:"queued",steps:{},preview:preview2});
@@ -895,7 +930,7 @@ test("changed previewed baseline and canonical rows block exact provider deletio
   t.after(()=>{DynamoReconciliationStore.prototype.getBaseline=originalBaselineGet;CanonicalIdentityStore.prototype.get=originalIdentityGet;});
   const makeIntent=fixture=>transferIntent(fixture,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    "home:calendar:changed-event":"delete","home:todoist:changed-task":"unchanged",
+    "home:calendar:changed-event":"delete","home:todoist:changed-task":"exclude",
   });
   const preview=await h.engine.preview(actor,makeIntent(f));
   assert.deepEqual(preview.oneOffDeletionPlans[0].baseline,baseline);
@@ -914,7 +949,7 @@ test("changed previewed baseline and canonical rows block exact provider deletio
   CanonicalIdentityStore.prototype.get=async(profile,side,id)=>id===event2.id?clone(liveIdentity):currentIdentityGet.call(new CanonicalIdentityStore(),profile,side,id);
   const preview2=await h2.engine.preview(actor,transferIntent(f2,{
     "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
-    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"unchanged",
+    ["home:calendar:"+event2.id]:"delete",["home:todoist:"+task2.id]:"exclude",
   }));
   h2.operations.set("repair-2",{id:"repair-2",status:"queued",steps:{},preview:preview2});
   liveIdentity={...identity2,updatedAt:"2026-10-25T12:00:00.000Z"};
