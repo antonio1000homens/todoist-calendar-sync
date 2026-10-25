@@ -842,6 +842,59 @@ test("completion skips a deleted future Calendar occurrence", async () => {
   assert.equal(state.links[0].activeEffectiveStart, "2026-09-08");
 });
 
+test("Todoist canonical echo preserves Calendar recurrence ownership before completion skips a canceled occurrence", async () => {
+  const dates = ["2099-09-06", "2099-09-13", "2099-09-20", "2099-09-27"];
+  const master = {
+    id: MASTER, iCalUID: SERIES, summary: "Water plants", status: "confirmed",
+    start: { date: dates[0] }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const current = instance("instance-1", dates[0], addDay(dates[0]));
+  const cancelled = instance("instance-2", dates[1], addDay(dates[1]), "cancelled");
+  const next = instance("instance-3", dates[2], addDay(dates[2]));
+  const final = instance("instance-4", dates[3], addDay(dates[3]));
+  for (const occurrence of [current, cancelled, next, final]) occurrence.summary = "Water plants";
+  const recurrenceText = "every Sunday starting 6 Sep 2099 and ending 27 Sep 2099";
+  const initialTask = {
+    id: "task-calendar-owned", content: "Water plants", description: "", project_id: "home-project",
+    due: { date: dates[0], is_recurring: true, string: recurrenceText },
+  };
+  const link = linkFor(current, initialTask.id);
+  const state = new FakeState(link);
+  const tasks = new Map([[initialTask.id, structuredClone(initialTask)]]);
+  const clients = fakeClients(state, [current, cancelled, next, final], tasks, undefined, [master]);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "todoist-recurring-echo", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-06T08:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:added", event_data: initialTask }),
+  });
+
+  assert.equal(state.mappingsByTask.get(initialTask.id).recurrenceOwner, "calendar");
+  assert.equal(state.mappingsByTask.get(initialTask.id).masterEventId, MASTER);
+  assert.equal(state.mappingsByTask.get(initialTask.id).seriesId, SERIES);
+  assert.equal(state.mappingsByTask.get(initialTask.id).activeInstanceId, current.id);
+  assert.equal(state.mappingsByTask.get(initialTask.id).originalStart, dates[0]);
+  assert.equal(state.mappingsByTask.get(initialTask.id).activeEffectiveStart, dates[0]);
+  assert.equal(state.links[0].owner, "calendar");
+  assert.equal(state.links[0].masterEventId, MASTER);
+  assert.equal(state.audits.some((entry) => entry.action === "todoist_noop_canonical_state"), true);
+
+  await sync.process({
+    id: "todoist-recurring-complete", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-06T09:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: initialTask, event_data_extra: { old_item: initialTask } }),
+  });
+
+  assert.equal(clients.todoistRecurringUpdates.length, 1);
+  assert.equal(clients.todoistRecurringUpdates[0].stored.due.date, dates[2]);
+  assert.equal(state.links[0].owner, "calendar");
+  assert.equal(state.links[0].activeInstanceId, next.id);
+  assert.equal(state.links[0].masterEventId, MASTER);
+  assert.equal(clients.calendarUpserts.length, 0, "completion must advance the existing Calendar series without creating a standalone event");
+  assert.equal(clients.events.has(final.id), true);
+});
+
 test("moved Calendar exception can cross another occurrence without changing logical identity", () => {
   const taskId = "task-recurring";
   const masterId = "todoist-master";
