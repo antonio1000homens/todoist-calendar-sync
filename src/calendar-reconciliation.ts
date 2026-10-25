@@ -1,4 +1,5 @@
 import { profiles } from "./config.js";
+import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference } from "./mapping-comments.js";
 import {
   createBudgetedClientFactory,
@@ -277,6 +278,14 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
+    const originProfile = otherProfileCalendarOrganizer(profile, event);
+    if (originProfile) {
+      summary.skipped += 1;
+      await state.audit(profile, "calendar_cross_profile_copy_ignored", {
+        eventId: event.id, fromProfile: profile, toProfile: originProfile,
+      });
+      return;
+    }
     const match = await findCanonicalTask(event);
     if (match.blocked) return;
     if (match.ambiguous) {
@@ -398,6 +407,14 @@ export async function reconcileUnmappedCalendar(
     const seriesId = master.iCalUID || master.id;
     if (await state.getRecurrenceLink(profile, seriesId)) {
       summary.skipped += 1;
+      return;
+    }
+    const originProfile = otherProfileCalendarOrganizer(profile, master);
+    if (originProfile) {
+      summary.skipped += 1;
+      await state.audit(profile, "calendar_cross_profile_copy_ignored", {
+        seriesId, masterEventId: master.id, fromProfile: profile, toProfile: originProfile,
+      });
       return;
     }
     const boundedFiniteWeekly = finiteWeeklyCalendarRuleCandidate(master);

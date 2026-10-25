@@ -383,6 +383,125 @@ test("Calendar master re-anchor updates the same Todoist mirror once under repea
   assert.equal(state.links[0].calendarProgressVersion, 1);
 });
 
+test("a Home-owned recurrence mirrored to Antonio creates exactly one Todoist task", async () => {
+  const master = {
+    id: MASTER,
+    status: "confirmed",
+    organizer: { email: "home@example.test", self: true },
+    summary: "Shared recurring reminder",
+    description: "",
+    iCalUID: SERIES,
+    start: { date: "2099-09-02" },
+    end: { date: "2099-09-03" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const active = instance("home-active", "2099-09-02", "2099-09-03");
+  const homeState = new FakeState();
+  const homeClients = fakeClients(homeState, [active], undefined, master);
+  const homeSync = new Synchronizer(homeState, undefined, async () => homeClients);
+
+  await homeSync.process({
+    id: "home-owned-event",
+    kind: "calendar",
+    profile: "home",
+    mode: "aws",
+    receivedAt: "2099-08-30T12:00:00Z",
+    headers: {},
+    body: "",
+  });
+
+  const antonioState = new FakeState();
+  const antonioClients = fakeClients(antonioState, [active], undefined, master);
+  const antonioSync = new Synchronizer(antonioState, undefined, async () => antonioClients);
+  await antonioSync.process({
+    id: "antonio-accepted-home-event",
+    kind: "calendar",
+    profile: "antonio",
+    mode: "aws",
+    receivedAt: "2099-08-30T12:00:00Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.equal(homeClients.todoistUpserts.length + antonioClients.todoistUpserts.length, 1);
+  assert.equal(homeClients.todoistUpserts.length, 1);
+  assert.deepEqual(antonioClients.todoistUpserts, []);
+  assert.ok(antonioState.audits.some((entry) => entry.action === "calendar_cross_profile_copy_ignored"
+    && entry.detail.fromProfile === "antonio" && entry.detail.toProfile === "home"));
+});
+
+test("cross-profile organizer suppression leaves an existing mapped series active", async () => {
+  const master = {
+    id: MASTER,
+    status: "confirmed",
+    organizer: { email: "home@example.test", self: false },
+    summary: "Previously mapped shared reminder",
+    description: "",
+    iCalUID: SERIES,
+    start: { date: "2099-09-02" },
+    end: { date: "2099-09-03" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const active = instance("antonio-active", "2099-09-02", "2099-09-03");
+  const link = linkFor(active, { profile: "antonio" });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [active], link, master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "antonio-existing-home-series",
+    kind: "calendar",
+    profile: "antonio",
+    mode: "aws",
+    receivedAt: "2099-08-30T12:00:00Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.ok(!state.audits.some((entry) => entry.action === "calendar_cross_profile_copy_ignored"));
+});
+
+test("cancelling an already mapped copy cannot delete its task when the master belongs to another profile", async () => {
+  const master = {
+    id: MASTER,
+    status: "confirmed",
+    organizer: { email: "home@example.test", self: false },
+    summary: "Previously mapped shared reminder",
+    description: "",
+    iCalUID: SERIES,
+    start: { date: "2099-09-02" },
+    end: { date: "2099-09-03" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const cancelled = instance("antonio-cancelled", "2099-09-02", "2099-09-03", "cancelled");
+  delete cancelled.recurringEventId;
+  delete cancelled.iCalUID;
+  const successor = instance("antonio-successor", "2099-09-09", "2099-09-10");
+  const link = linkFor(cancelled, { profile: "antonio" });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [cancelled, successor], link, master);
+  clients.calendar.listDelta = async () => ({ items: [structuredClone(cancelled)], nextSyncToken: "next" });
+  clients.calendar.getEvent = async (id) => id === MASTER ? structuredClone(master)
+    : [cancelled, successor].find((item) => item.id === id);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process({
+    id: "antonio-cancelled-home-copy",
+    kind: "calendar",
+    profile: "antonio",
+    mode: "aws",
+    receivedAt: "2099-09-02T12:00:00Z",
+    headers: {},
+    body: "",
+  });
+
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.deepEqual(clients.calendarDeletes, []);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_cross_profile_copy_ignored"
+    && entry.detail.toProfile === "home"));
+});
+
 test("legacy Calendar master re-anchor remains pinned and emits the dedicated suppression audit", async () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");

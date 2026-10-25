@@ -118,6 +118,52 @@ test("snapshot recovery imports one future unmapped Calendar event and binds it"
   assert.equal(state.mutations, 2);
 });
 
+test("snapshot recovery skips an accepted copy of another profile's recurrence before reading instances", async () => {
+  const master = {
+    ...futureEvent("home-master", 10, "Shared recurring reminder"),
+    organizer: { email: "home@example.test", self: false },
+    iCalUID: "home-series",
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const state = fakeState();
+  const clients = fakeClients([master]);
+
+  const summary = await reconcileUnmappedCalendar("antonio", state, async () => clients.pair);
+
+  assert.equal(summary.skipped, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(summary.rebound, 0);
+  assert.equal(clients.listInstancesCalls, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(clients.comments, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_cross_profile_copy_ignored"
+    && entry.profile === "antonio" && entry.detail.toProfile === "home"));
+});
+
+test("snapshot recovery still imports a recurrence organized outside configured profiles", async () => {
+  const master = {
+    ...futureEvent("external-master", 10, "External recurring reminder"),
+    organizer: { email: "organizer@example.org", self: false },
+    iCalUID: "external-series",
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const active = {
+    ...futureEvent("external-active", 10, master.summary),
+    recurringEventId: master.id,
+    iCalUID: master.iCalUID,
+    originalStartTime: { date: master.start.date },
+  };
+  const state = fakeState();
+  const clients = fakeClients([master]);
+  clients.pair.calendar.listInstances = async () => [active];
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.imported, 1);
+  assert.equal(clients.created, 1);
+  assert.ok(!state.audits.some((entry) => entry.action === "calendar_cross_profile_copy_ignored"));
+});
+
 test("snapshot recovery creates one finite weekly Todoist recurrence when account and Calendar zones match", async () => {
   const master = {
     id: "finite-master", iCalUID: "finite-series", status: "confirmed", summary: "Task", description: "",
