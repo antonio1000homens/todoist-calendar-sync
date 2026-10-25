@@ -79,7 +79,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const mappingMap = new Map(mappings.map(value => [value.taskId, clone(value)]));
   const eventMappingMap = new Map(mappings.map(value => [`${value.profile}:${value.eventId}`,clone(value)]));
   const ownerMappingMap = new Map(mappings.map(value => [value.taskId,clone(value)]));
-  const recurrences = new Map(recurrence ? [[recurrence.seriesId, clone(recurrence)]] : []);
+  const recurrences = new Map((Array.isArray(recurrence) ? recurrence : recurrence ? [recurrence] : []).map(value => [value.seriesId, clone(value)]));
   const controlsMap = new Map(), versions = new Map(), operations = new Map(), writes = [], calls = [], baselines = [];
   const taskRequests = new Map(), splits = new Map();
   const get = (map, id) => { if (!map.has(id)) throw Object.assign(new Error("Not found"), { status: 404 }); return clone(map.get(id)); };
@@ -113,13 +113,16 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       mappingMap.set(mapping.taskId,clone(mapping));recurrences.set(link.seriesId,clone(link));return true;
     },
     async putRecurrenceLink(value) { recurrences.set(value.seriesId, clone(value)); },
-    async transferCalendarSeriesMapping({previous,expectedLink,mapping,link}) {
+    async transferCalendarSeriesMapping({previous,replaced,replacedLink,expectedLink,mapping,link}) {
       const target=mappingMap.get(mapping.taskId), liveLink=recurrences.get(link.seriesId);
-      if(target?.eventId===mapping.eventId&&target?.recurrenceOwner==="calendar"&&liveLink?.taskId===mapping.taskId)return true;
-      if(target || (previous && (mappingMap.get(previous.taskId)?.updatedAt!==previous.updatedAt
+      if(!replaced&&target?.eventId===mapping.eventId&&target?.recurrenceOwner==="calendar"&&liveLink?.taskId===mapping.taskId)return true;
+      if((replaced&&(target?.updatedAt!==replaced.updatedAt||target?.eventId!==replaced.eventId
+          ||recurrences.get(replacedLink?.seriesId)?.updatedAt!==replacedLink?.updatedAt))
+        ||(!replaced&&target) || (previous && (mappingMap.get(previous.taskId)?.updatedAt!==previous.updatedAt
         || mappingMap.get(previous.taskId)?.eventId!==previous.eventId))
         || (expectedLink && (liveLink?.taskId!==expectedLink.taskId||liveLink?.updatedAt!==expectedLink.updatedAt))) return false;
       if(previous){mappingMap.delete(previous.taskId);eventMappingMap.delete(`${previous.profile}:${previous.eventId}`);ownerMappingMap.delete(previous.taskId);}
+      if(replaced){eventMappingMap.delete(`${replaced.profile}:${replaced.eventId}`);recurrences.delete(replacedLink.seriesId);}
       mappingMap.set(mapping.taskId,clone(mapping));
       eventMappingMap.set(`${mapping.profile}:${mapping.eventId}`,clone(mapping));ownerMappingMap.set(mapping.taskId,clone(mapping));
       recurrences.set(link.seriesId,clone(link));
@@ -321,7 +324,7 @@ test("elapsed Calendar history repair removes only the old event link and preser
   assert.ok(preview.itemPlan.find(item=>item.ref.id==="future").result.includes("unchanged"));
 
   const result=await h.execute(input);
-  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
   assert.equal(h.eventMap.get("elapsed").status,"confirmed");
   assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.syncHistoryOnly,"true");
   assert.equal(h.eventMap.get("elapsed").extendedProperties.shared.taskId,undefined);
@@ -617,6 +620,7 @@ test("series transfer accepts Todoist every November 1 against the matching annu
   f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
   f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
   f.standalone={...f.standalone,start:{date:"2027-11-01"},end:{date:"2027-11-02"}};
+  f.standalone={...f.standalone,start:{date:"2027-11-01"},end:{date:"2027-11-02"}};
   f.mapping={...f.mapping,originalStart:"2027-11-01",activeEffectiveStart:"2027-11-01",completedThroughOriginalStart:"2026-11-01"};
   f.recurrence={...f.mapping,owner:"calendar"};
   const h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
@@ -633,6 +637,140 @@ test("series transfer accepts Todoist every November 1 against the matching annu
   assert.equal(h.recurrences.get(f.master.iCalUID).taskId,f.annual.id);
   assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
   assert.deepEqual(h.eventMap.get(f.standalone.id),f.standalone);
+});
+
+function mappedTodoistOwnedSource(f) {
+  const sourceMaster=event("old-todoist-master",{iCalUID:"old-todoist-ical",summary:f.annual.content,description:f.annual.description,
+    start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:[todoistRecurrenceToRrule(f.annual)],
+    extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"todoist",todoistRecurrence:todoistRecurrenceKey(f.annual),
+      todoistAnchorStart:"2023-11-01",todoistAnchorEnd:"2023-11-02"}}});
+  const sourceOccurrence=event("old-todoist-occurrence",{summary:f.annual.content,description:f.annual.description,
+    start:{date:f.annual.due.date},end:{date:"2027-11-02"},recurringEventId:sourceMaster.id,
+    originalStartTime:{date:f.annual.due.date},extendedProperties:{shared:{taskId:f.annual.id,syncRecurrenceOwner:"todoist"}}});
+  const sourceMapping={profile:"home",taskId:f.annual.id,eventId:sourceMaster.id,projectId:profiles.home.todoistProjectId,
+    recurrenceOwner:"todoist",seriesId:f.annual.id,masterEventId:sourceMaster.id,activeInstanceId:sourceOccurrence.id,
+    updatedAt:"2026-10-24T12:00:00.000Z"};
+  const sourceLink={profile:"home",owner:"todoist",seriesId:f.annual.id,taskId:f.annual.id,eventId:sourceMaster.id,
+    masterEventId:sourceMaster.id,activeInstanceId:sourceOccurrence.id,updatedAt:"2026-10-24T12:00:01.000Z"};
+  return {sourceMaster,sourceOccurrence,sourceMapping,sourceLink};
+}
+
+test("transfer replaces a mapped Todoist-owned series with a verified Calendar-owned series without flattening",async t=>{
+  const f=birthdayTransferFixture();
+  f.annual={...f.annual,due:{date:"2027-11-01",is_recurring:true,string:"every November 1"}};
+  f.displaced={...f.displaced,due:{date:"2027-11-01"}};
+  f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
+  f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
+  f.standalone={...f.standalone,start:{date:"2027-11-01"},end:{date:"2027-11-02"}};
+  f.mapping={...f.mapping,originalStart:"2027-11-01",activeEffectiveStart:"2027-11-01",completedThroughOriginalStart:"2026-11-01"};
+  f.recurrence={...f.mapping,owner:"calendar"};
+  const old=mappedTodoistOwnedSource(f), input=transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:old-todoist-master":"exclude","home:calendar:old-todoist-occurrence":"exclude",
+  });
+  assert.equal(old.sourceMapping.eventId,old.sourceMaster.id,"the EVENT mapping points to the recurring master");
+  assert.equal(old.sourceMapping.activeInstanceId,old.sourceOccurrence.id,"the active occurrence is stored separately");
+  assert.equal(old.sourceLink.eventId,old.sourceMaster.id,"the recurrence link retains the master as its event ID");
+  const h=harness(t,{events:[f.master,f.active,f.standalone,old.sourceMaster,old.sourceOccurrence],
+    tasks:[f.annual,f.displaced],mappings:[f.mapping,old.sourceMapping],recurrence:[f.recurrence,old.sourceLink]});
+  const preview=await h.engine.preview(actor,input);
+  assert.ok(preview.itemPlan.some(row=>row.ref.id===old.sourceMaster.id&&row.operation==="Detach and exclude the old Todoist-owned series item"));
+  assert.ok(preview.itemPlan.some(row=>row.ref.id===old.sourceOccurrence.id&&row.operation==="Detach and exclude the old Todoist-owned series item"));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.deepEqual(h.taskMap.get(f.annual.id).due,f.annual.due,"the Todoist recurrence remains intact");
+  assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
+  assert.deepEqual(h.eventMap.get(old.sourceMaster.id).recurrence,old.sourceMaster.recurrence,"the old series rule is not flattened");
+  assert.deepEqual(h.eventMap.get(old.sourceOccurrence.id).start,old.sourceOccurrence.start);
+  assert.equal(h.eventMap.get(old.sourceMaster.id).extendedProperties.shared.taskId,undefined);
+  assert.equal(h.eventMap.get(old.sourceOccurrence.id).extendedProperties.shared.taskId,undefined);
+  assert.equal(h.recurrences.has(old.sourceLink.seriesId),false,"the stale Todoist-owned recurrence link is removed");
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.eventMappingMap.has(`home:${old.sourceMaster.id}`),false);
+  assert.equal(h.ownerMappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.recurrences.get(f.master.iCalUID).taskId,f.annual.id);
+  assert.equal(h.controlsMap.get(`home:calendar:${old.sourceMaster.id}`)?.excluded,true);
+  assert.equal(h.controlsMap.get(`home:calendar:${old.sourceOccurrence.id}`)?.excluded,true);
+  assert.equal(h.writes.some(write=>write[0]==="create-event"||write[0]==="create-task"||write[0]==="flatten"),false);
+});
+
+test("mapped series transfer resumes cleanup after the old master is detached but its occurrence write fails",async t=>{
+  const f=birthdayTransferFixture();
+  f.annual={...f.annual,due:{date:"2027-11-01",is_recurring:true,string:"every November 1"}};
+  f.displaced={...f.displaced,due:{date:"2027-11-01"}};
+  f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
+  f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
+  f.standalone={...f.standalone,start:{date:"2027-11-01"},end:{date:"2027-11-02"}};
+  f.mapping={...f.mapping,originalStart:"2027-11-01",activeEffectiveStart:"2027-11-01",completedThroughOriginalStart:"2026-11-01"};
+  f.recurrence={...f.mapping,owner:"calendar"};
+  const old=mappedTodoistOwnedSource(f),input=transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:old-todoist-master":"exclude","home:calendar:old-todoist-occurrence":"exclude",
+  });
+  const h=harness(t,{events:[f.master,f.active,f.standalone,old.sourceMaster,old.sourceOccurrence],
+    tasks:[f.annual,f.displaced],mappings:[f.mapping,old.sourceMapping],recurrence:[f.recurrence,old.sourceLink]});
+  const preview=await h.engine.preview(actor,input);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const transfer=StateRepository.prototype.transferCalendarSeriesMapping;
+  let transferCalls=0,failOldOccurrence=true;
+  StateRepository.prototype.transferCalendarSeriesMapping=async function(...args){transferCalls++;return transfer.call(this,...args);};
+  t.after(()=>{StateRepository.prototype.transferCalendarSeriesMapping=transfer;});
+  const write=h.clients.calendar.upsertEventIfUnchanged;
+  h.clients.calendar.upsertEventIfUnchanged=async(value,eventId,...args)=>{
+    if(eventId===old.sourceOccurrence.id&&failOldOccurrence){
+      failOldOccurrence=false;
+      throw new Error("Old Calendar occurrence write failed after master detach");
+    }
+    return write(value,eventId,...args);
+  };
+
+  const first=await h.engine.execute("repair");
+  assert.equal(first.status,"needs_review");
+  assert.equal(first.steps[`transfer-mapping:${f.master.iCalUID}`]?.status,"done","the atomic mapping commit checkpoint is durable");
+  assert.equal(first.steps[`transfer-unlink-old-todoist-series:${old.sourceMaster.id}`]?.status,"running");
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.eventMappingMap.has(`home:${old.sourceMaster.id}`),false);
+  assert.equal(h.recurrences.has(old.sourceLink.seriesId),false);
+  assert.equal(h.eventMap.get(old.sourceMaster.id).extendedProperties.shared.taskId,undefined);
+  assert.equal(h.eventMap.get(old.sourceOccurrence.id).extendedProperties.shared.taskId,f.annual.id);
+  assert.equal(h.controlsMap.get(`home:calendar:${old.sourceMaster.id}`)?.excluded,undefined);
+  assert.ok(h.controlsMap.get("home:todoist:annual-task").activeRepair,"the failed cross-provider operation remains resumable");
+  const retry=await h.engine.execute("repair");
+  assert.equal(retry.status,"succeeded",retry.error);
+  assert.equal(transferCalls,1,"resume trusts the saved mapping-step receipt and does not reinstall the transfer");
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.eventMappingMap.get(`home:${f.active.id}`).taskId,f.annual.id);
+  assert.equal(h.eventMappingMap.has(`home:${old.sourceMaster.id}`),false);
+  assert.equal(h.ownerMappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal([...h.eventMappingMap.values()].filter(mapping=>mapping.taskId===f.annual.id).length,1,"no duplicate target mapping is created");
+  assert.equal(h.recurrences.has(old.sourceLink.seriesId),false,"the retired Todoist recurrence link stays deleted");
+  assert.equal(h.eventMap.get(old.sourceMaster.id).extendedProperties.shared.taskId,undefined);
+  assert.equal(h.eventMap.get(old.sourceOccurrence.id).extendedProperties.shared.taskId,undefined);
+  assert.deepEqual(h.eventMap.get(old.sourceMaster.id).recurrence,old.sourceMaster.recurrence,"the old RRULE is preserved");
+  assert.ok(h.controlsMap.get(`home:calendar:${old.sourceMaster.id}`).excluded);
+  assert.ok(h.controlsMap.get(`home:calendar:${old.sourceOccurrence.id}`).excluded);
+  assert.ok([...h.controlsMap.values()].every(control=>!control.activeRepair));
+});
+
+test("mapped recurring transfer requires complete, matching source mapping indexes and explicit old-series exclusions",async t=>{
+  const f=birthdayTransferFixture();
+  f.annual={...f.annual,due:{date:"2027-11-01",is_recurring:true,string:"every November 1"}};
+  f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
+  f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
+  f.mapping={...f.mapping,originalStart:"2027-11-01",activeEffectiveStart:"2027-11-01"};
+  f.recurrence={...f.mapping,owner:"calendar"};
+  const old=mappedTodoistOwnedSource(f),base=transferIntent(f);
+  const makeHarness=(sourceMapping=old.sourceMapping,sourceLink=old.sourceLink)=>harness(t,{events:[f.master,f.active,old.sourceMaster,old.sourceOccurrence],
+    tasks:[f.annual,f.displaced],mappings:[f.mapping,sourceMapping],recurrence:[f.recurrence,sourceLink]});
+  await assert.rejects(makeHarness({...old.sourceMapping,eventId:"wrong-event"}).engine.preview(actor,base),/non-equivalent or incomplete existing association/);
+  await assert.rejects(makeHarness(old.sourceMapping,{...old.sourceLink,eventId:"stale-occurrence"}).engine.preview(actor,base),/incomplete, stale, or inconsistent/);
+  const partial=makeHarness();
+  partial.eventMappingMap.set(`home:${old.sourceOccurrence.id}`,{...old.sourceMapping,updatedAt:"split-event-index-version"});
+  await assert.rejects(partial.engine.preview(actor,base),/incomplete, stale, or inconsistent/);
+  const h=makeHarness();
+  await assert.rejects(h.engine.preview(actor,base),/Choose Exclude from syncing for the exact old Todoist-owned series item/);
+  assert.deepEqual(h.writes,[]);
 });
 
 test("task-only review detail hydrates its existing recurrence owner and active Calendar occurrence", async t => {
