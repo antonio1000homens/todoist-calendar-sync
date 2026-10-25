@@ -21,6 +21,7 @@ import {
   finiteWeeklyCalendarRuleCandidate,
   matchesCalendarOwnedRecurringRule,
   matchesCalendarOwnedRecurringTask,
+  resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
@@ -336,8 +337,9 @@ export function calendarEventHasElapsed(event: CalendarEvent, now = Date.now(), 
   return Number.isFinite(endTime) && endTime <= now;
 }
 
-export function calendarOccurrenceHasEnded(event: CalendarEvent, now = Date.now()): boolean {
+export function calendarOccurrenceHasEnded(event: CalendarEvent, now = Date.now(), timeZone?: string): boolean {
   if (event.status === "cancelled") return true;
+  if (event.end?.date && !event.end.dateTime && timeZone) return calendarEventHasElapsed(event, now, timeZone);
   const end = eventEnd(event);
   const endTime = end ? Date.parse(end) : Number.NaN;
   // Missing/invalid end data is treated conservatively: do not advance a live
@@ -363,10 +365,10 @@ function logicalStartAfter(value: string, boundary: string): boolean {
   return compareLogicalStarts(value, boundary) > 0;
 }
 
-function nextActiveInstance(instances: CalendarEvent[], after?: string, now = Date.now()): CalendarEvent | undefined {
+function nextActiveInstance(instances: CalendarEvent[], after?: string, now = Date.now(), timeZone?: string): CalendarEvent | undefined {
   return instances
     .filter((event) => event.status !== "cancelled" && Boolean(eventStart(event)))
-    .filter((event) => !calendarOccurrenceHasEnded(event, now))
+    .filter((event) => !calendarOccurrenceHasEnded(event, now, timeZone))
     .filter((event) => !after || logicalStartAfter(eventStart(event) || "", after))
     .sort((a, b) => compareLogicalStarts(eventStart(a) || "", eventStart(b) || ""))[0];
 }
@@ -375,15 +377,16 @@ export function selectCalendarRecurrenceInstance(
   instances: CalendarEvent[],
   existing?: Pick<RecurrenceLink, "activeInstanceId" | "originalStart" | "calendarProgressVersion" | "completedThroughOriginalStart">,
   now = Date.now(),
+  timeZone?: string,
 ): CalendarEvent | undefined {
   if (existing?.calendarProgressVersion === 1) {
-    return nextActiveInstance(instances, existing.completedThroughOriginalStart, now);
+    return nextActiveInstance(instances, existing.completedThroughOriginalStart, now, timeZone);
   }
   if (existing?.activeInstanceId) {
     const current = instances.find((event) => event.id === existing.activeInstanceId);
-    if (current && current.status !== "cancelled" && !calendarOccurrenceHasEnded(current, now)) return current;
+    if (current && current.status !== "cancelled" && !calendarOccurrenceHasEnded(current, now, timeZone)) return current;
   }
-  return nextActiveInstance(instances, existing?.originalStart, now);
+  return nextActiveInstance(instances, existing?.originalStart, now, timeZone);
 }
 
 export function suppressedLegacyCalendarRecurrenceCandidate(
@@ -1115,9 +1118,18 @@ export class Synchronizer {
     const existing = await this.state.getRecurrenceLink(delivery.profile, seriesId);
     const instances = await calendar.listInstances(master.id);
     const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
-    const calendarTimeZone = master.start?.dateTime
-      ? master.start.timeZone || (calendar.getTimeZone ? await calendar.getTimeZone() : undefined)
-      : "UTC";
+    let calendarTimeZone = master.start?.timeZone;
+    if (finiteWeekly) {
+      try { calendarTimeZone = await resolveCalendarTimeZone(master, calendar.getTimeZone?.bind(calendar)); }
+      catch (error) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_calendar_timezone_unverified", {
+          seriesId, masterEventId: master.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else if (!calendarTimeZone && calendar.getTimeZone) {
+      calendarTimeZone = await calendar.getTimeZone();
+    }
     const calendarRecurrence = finiteWeekly && calendarTimeZone
       ? calendarOwnedTodoistRecurrence(master, instances, calendarTimeZone)
       : undefined;
@@ -1127,7 +1139,7 @@ export class Synchronizer {
           ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
       });
     }
-    if (calendarRecurrence && master.start?.dateTime) {
+    if (calendarRecurrence) {
       let todoistTimeZone: string;
       try { todoistTimeZone = await todoist.getTimeZone(); }
       catch (error) {
@@ -1151,7 +1163,7 @@ export class Synchronizer {
         taskId: existing.taskId,
       });
     }
-    const active = selectCalendarRecurrenceInstance(instances, existing);
+    const active = selectCalendarRecurrenceInstance(instances, existing, Date.now(), calendarTimeZone);
     if (!active) return this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
     if (await this.state.syncBlocked(delivery.profile, { taskId:existing?.taskId, eventId:active.id })) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:active.id, taskId:existing?.taskId, masterEventId:master.id });
@@ -1366,6 +1378,7 @@ export class Synchronizer {
       let currentRecurringTask: TodoistTask | undefined;
       let currentCalendarRecurrence: ReturnType<typeof calendarOwnedTodoistRecurrence>;
       const recurrenceHint = Boolean(task.due?.is_recurring || payload.event_data_extra?.old_item?.due?.is_recurring);
+      let verifiedCalendarTimeZone: string | undefined;
       if (recurrenceHint) {
         try { currentRecurringTask = await todoist.getTask(task.id); }
         catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
@@ -1373,8 +1386,18 @@ export class Synchronizer {
           let master: CalendarEvent | undefined;
           try { master = await calendar.getEvent?.(mapping.masterEventId); }
           catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
-          const timeZone = master?.start?.timeZone || (calendar.getTimeZone ? await calendar.getTimeZone() : undefined);
+          let timeZone: string | undefined;
+          if (master) {
+            try { timeZone = await resolveCalendarTimeZone(master, calendar.getTimeZone?.bind(calendar)); }
+            catch (error) {
+              return this.state.audit(delivery.profile, "calendar_recurrence_calendar_timezone_unverified", {
+                seriesId: mapping.seriesId, masterEventId: mapping.masterEventId, taskId: task.id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
           if (master && timeZone) currentCalendarRecurrence = calendarOwnedTodoistRecurrence(master, instances, timeZone);
+          verifiedCalendarTimeZone = timeZone;
           if (!master || !timeZone || !currentCalendarRecurrence
             || !matchesCalendarOwnedRecurringRule(currentRecurringTask, currentCalendarRecurrence)) {
             return this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
@@ -1399,8 +1422,8 @@ export class Synchronizer {
         }
       }
       const next = progressMapping.calendarProgressVersion === 1
-        ? nextActiveInstance(instances, progressMapping.completedThroughOriginalStart)
-        : nextActiveInstance(instances, mapping.originalStart);
+        ? nextActiveInstance(instances, progressMapping.completedThroughOriginalStart, Date.now(), verifiedCalendarTimeZone)
+        : nextActiveInstance(instances, mapping.originalStart, Date.now(), verifiedCalendarTimeZone);
       if (!next) {
         // An empty instances window alone is NOT proof of recurrence exhaustion.
         // Require a finite RRULE on the fresh Calendar master and atomically

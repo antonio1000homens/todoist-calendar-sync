@@ -8,7 +8,19 @@ export interface CalendarOwnedTodoistRecurrence {
 }
 
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const weekdayCodes: Record<string, string> = { SU: "Sunday", MO: "Monday", TU: "Tuesday", WE: "Wednesday", TH: "Thursday", FR: "Friday", SA: "Saturday" };
+
+export async function resolveCalendarTimeZone(
+  master: CalendarEvent,
+  readCalendarTimeZone?: () => Promise<string>,
+): Promise<string> {
+  const timeZone = master.start?.timeZone || (readCalendarTimeZone ? await readCalendarTimeZone() : undefined);
+  if (!timeZone) throw new Error("Calendar timezone is unavailable");
+  try { new Intl.DateTimeFormat("en-GB", { timeZone }); }
+  catch { throw new Error("Calendar timezone is invalid"); }
+  return timeZone;
+}
 
 function localParts(value: string, timeZone: string): Record<string, string> {
   const date = value.length === 10 ? new Date(`${value}T00:00:00Z`) : new Date(value);
@@ -21,8 +33,13 @@ function localParts(value: string, timeZone: string): Record<string, string> {
 }
 
 function localDate(value: string, timeZone: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const [year, month, day] = value.split("-");
+    return `${Number(day)} ${monthNames[Number(month) - 1]} ${year}`;
+  }
   const parts = localParts(value, timeZone);
-  return `${parts.day} ${parts.month} ${parts.year}`;
+  const month = monthNames.find((name) => name.toLowerCase().startsWith(parts.month.toLowerCase().slice(0, 3))) || parts.month;
+  return `${parts.day} ${month} ${parts.year}`;
 }
 
 function ruleFields(rule: string): Record<string, string> | undefined {
@@ -90,7 +107,7 @@ export function calendarOwnedTodoistRecurrence(
 
   const time = startParts.hour ? ` at ${startParts.hour}:${startParts.minute}${(startParts.dayPeriod || "").toLowerCase()}` : "";
   const startDate = localDate(startValue, timeZone);
-  const endDate = endStart.length === 10 ? endStart : localDate(endStart, timeZone);
+  const endDate = localDate(endStart, timeZone);
   const dueString = `every ${weekday}${time} starting ${startDate} ending ${endDate}`;
   return { dueString, endDate, weekday, rule };
 }
