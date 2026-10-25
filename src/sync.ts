@@ -1448,11 +1448,27 @@ export class Synchronizer {
         ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
         updatedAt: new Date().toISOString(),
       };
-      await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
-      await this.state.putMapping(nextMapping);
-      // TASK/TASKOWNER now point to the successor; deleteMapping protects
-      // those newer indexes while removing only the completed EVENT row.
-      await this.state.deleteMapping(mapping);
+      const expectedLink = mapping.seriesId
+        ? await this.state.getRecurrenceLink(delivery.profile, mapping.seriesId)
+        : undefined;
+      if (!expectedLink) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_mapping_advance_deferred", {
+          seriesId: mapping.seriesId, taskId: task.id, eventId: mapping.eventId,
+          reason: "current_recurrence_link_missing",
+        });
+      }
+      const advanced = await this.state.advanceCalendarSeriesMapping({
+        previous: mapping,
+        mapping: nextMapping,
+        expectedLink,
+        link: recurrenceLink(nextMapping, "calendar"),
+      });
+      if (!advanced) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_mapping_advance_deferred", {
+          seriesId: mapping.seriesId, taskId: task.id, eventId: mapping.eventId,
+          reason: "mapping_or_recurrence_link_changed",
+        });
+      }
       await this.state.recordMutation(delivery.profile);
       return this.state.audit(delivery.profile, "calendar_recurrence_completed_rolled", {
         seriesId: mapping.seriesId,

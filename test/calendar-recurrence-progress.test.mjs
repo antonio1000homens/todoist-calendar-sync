@@ -86,6 +86,17 @@ class FakeState {
     this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
     this.links.push(structuredClone(link));
   }
+  async advanceCalendarSeriesMapping({ previous, mapping, link }) {
+    this.operations.push({ action: "advance-mapping", previous: structuredClone(previous), mapping: structuredClone(mapping), link: structuredClone(link) });
+    if (this.failAdvance) throw new Error("injected recurrence mapping transaction failure");
+    if (this.mappingsByEvent.get(previous.eventId)?.taskId !== previous.taskId
+      || this.links.find((item) => item.profile === previous.profile && item.seriesId === previous.seriesId)?.eventId !== previous.eventId) return false;
+    this.mappingsByEvent.delete(previous.eventId);
+    this.storeMapping(mapping);
+    this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
+    this.links.push(structuredClone(link));
+    return true;
+  }
   async deleteRecurrenceLink(profile, seriesId) {
     this.links = this.links.filter((link) => !(link.profile === profile && link.seriesId === seriesId));
   }
@@ -336,7 +347,7 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
 
   await sync.process(completedDelivery("complete-day-17", link.taskId, completed, "2099-09-17T12:00:00Z"));
 
-  const boundaryWrite = state.operations.findIndex((operation) => operation.action === "put-link" && operation.link.completedThroughOriginalStart === "2099-09-17");
+  const boundaryWrite = state.operations.findIndex((operation) => operation.action === "advance-mapping" && operation.link.completedThroughOriginalStart === "2099-09-17");
   const retainedWrite = state.operations.findIndex((operation) => operation.action === "put-completed" && operation.projection.eventId === completed.id);
   const taskAdvance = state.operations.findIndex((operation) => operation.action === "update-recurring" || operation.action === "upsert-task");
   const deleteCalendar = state.operations.findIndex((operation) => operation.action === "delete-calendar");
@@ -419,7 +430,7 @@ test("Calendar-owned finite weekly completion skips a canceled occurrence and ad
   assert.equal(clients.calendarUpserts.length, 0, "Calendar series remains untouched on replay");
 });
 
-for (const failurePoint of ["listInstances", "timezone", "update"]) {
+for (const failurePoint of ["listInstances", "timezone", "update", "advance"]) {
   test(`Calendar-owned completion retries after ${failurePoint} failure without losing its advance`, async () => {
     const scheduled = [4, 11, 18, 25].map((day, index) => instance(
       `retry-nov-${day}`, `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`,
@@ -441,6 +452,7 @@ for (const failurePoint of ["listInstances", "timezone", "update"]) {
     parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
     delivery.body = JSON.stringify(parsed);
     clients.failures[failurePoint] = true;
+    if (failurePoint === "advance") state.failAdvance = true;
 
     if (failurePoint === "timezone") await sync.process(delivery);
     else await assert.rejects(sync.process(delivery), /injected/);
@@ -449,6 +461,7 @@ for (const failurePoint of ["listInstances", "timezone", "update"]) {
     assert.equal(state.mappingsByTask.get(link.taskId).activeInstanceId, current.id);
 
     clients.failures[failurePoint] = false;
+    state.failAdvance = false;
     await sync.process(delivery);
     assert.equal(state.links[0].activeInstanceId, "retry-nov-18");
     assert.equal(state.links[0].completedThroughOriginalStart, "2026-11-04T14:00:00Z");
