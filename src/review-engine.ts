@@ -16,6 +16,7 @@ import { planStandaloneAnnualRepair, verifyStandaloneAnnualOwnership, applyStand
 import { ManualDecisionStore, ManualInterventionService, type ManualDecision } from "./manual-intervention.js";
 import { ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
 import { guardRepairProviders } from "./repair-provider-guard.js";
+import { finiteWeeklyCalendarRuleCandidate, resolveCalendarTimeZone } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedText } from "./security.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
@@ -181,7 +182,15 @@ export class ReviewEngine {
         try { task = await pair.todoist.getTask(taskId); } catch(error) { if (!missing(error)) throw error; }
         const activeId = snapshot.recurrence?.activeInstanceId || mapping?.activeInstanceId;
         snapshot.calendarProjectionId = task ? selectTodoistCurrentInstance(instances, task, activeId)?.id : activeId;
-      } else snapshot.calendarProjectionId = selectCalendarRecurrenceInstance(instances, snapshot.recurrence)?.id;
+      } else {
+        const needsVerifiedZone = finiteWeeklyCalendarRuleCandidate(event)
+          || instances.some((instance) => instance.end?.date && !instance.end.dateTime);
+        const timeZone = needsVerifiedZone
+          ? await resolveCalendarTimeZone(event, pair.calendar.getTimeZone.bind(pair.calendar))
+          : event.start?.timeZone;
+        if (needsVerifiedZone && await pair.todoist.getTimeZone() !== timeZone) throw new Error("Todoist and Calendar timezones differ; refresh the recurrence before reviewing it");
+        snapshot.calendarProjectionId = selectCalendarRecurrenceInstance(instances, snapshot.recurrence, Date.now(), timeZone)?.id;
+      }
     }
     return snapshot;
   }
@@ -1094,10 +1103,14 @@ export class ReviewEngine {
         const clients = await factory(profile);
         if ((event.recurrence?.length || event.recurringEventId) && owner === "calendar") {
           const master=event.recurringEventId?await clients.calendar.getEvent(event.recurringEventId):event;
+          const instances=await clients.calendar.listInstances(master.id);
+          const needsVerifiedZone=finiteWeeklyCalendarRuleCandidate(master)||instances.some((instance)=>instance.end?.date&&!instance.end.dateTime);
+          const timeZone=needsVerifiedZone?await resolveCalendarTimeZone(master,clients.calendar.getTimeZone.bind(clients.calendar)):master.start?.timeZone;
+          if(needsVerifiedZone&&await clients.todoist.getTimeZone()!==timeZone)throw new Error("Todoist and Calendar timezones differ; refresh the recurrence before repairing it");
           const seriesId = master.iCalUID || master.id;
           const existing = await state.getRecurrenceLink(profile, seriesId)
             || operation.preview.snapshots.find(s=>s.ref.profile===profile && s.ref.side==="calendar" && s.ref.id===master.id)?.recurrence;
-          projection = selectCalendarRecurrenceInstance(await clients.calendar.listInstances(master.id), existing)!;
+          projection = selectCalendarRecurrenceInstance(instances, existing, Date.now(), timeZone)!;
           if (!projection) throw new Error("Calendar series has no verifiable active occurrence");
           const approvedProjection = operation.preview.snapshots.find(s=>s.ref.profile===profile && s.ref.side==="calendar" && s.ref.id===master.id)?.calendarProjectionId;
           if (approvedProjection && projection.id !== approvedProjection && !["decision","move"].includes(intent.action)) throw new Error("The Calendar series active occurrence changed after preview; refresh the repair before changing its counterpart");
@@ -1643,7 +1656,7 @@ export class ReviewEngine {
               await bind(snapshot.ref.profile,task,event,task.due?.is_recurring?"todoist":undefined);
             } else {
               const event=await clients.calendar.getEvent(snapshot.ref.id);let source=event;
-              if(event.recurrence?.length){source=selectCalendarRecurrenceInstance(await clients.calendar.listInstances(event.id))!;if(!source)throw new Error("No active occurrence to mirror");}
+              if(event.recurrence?.length){const instances=await clients.calendar.listInstances(event.id);const needsVerifiedZone=finiteWeeklyCalendarRuleCandidate(event)||instances.some((instance)=>instance.end?.date&&!instance.end.dateTime);const timeZone=needsVerifiedZone?await resolveCalendarTimeZone(event,clients.calendar.getTimeZone.bind(clients.calendar)):event.start?.timeZone;if(needsVerifiedZone&&await clients.todoist.getTimeZone()!==timeZone)throw new Error("Todoist and Calendar timezones differ; refresh the recurrence before repairing it");source=selectCalendarRecurrenceInstance(instances,undefined,Date.now(),timeZone)!;if(!source)throw new Error("No active occurrence to mirror");}
               const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id)));
               await bind(snapshot.ref.profile,task,event,event.recurrence?.length || event.recurringEventId ? "calendar":undefined);
             }

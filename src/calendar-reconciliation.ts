@@ -21,6 +21,7 @@ import {
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   matchesCalendarOwnedRecurringTask,
+  resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
@@ -160,9 +161,11 @@ export async function reconcileUnmappedCalendar(
   const tasks = await pair.todoist.listTasks();
   const snapshot = await pair.calendar.listDelta();
   const now = Date.now();
-  const calendarTimeZone = snapshot.items.some((event) => event.end?.date && !event.end.dateTime)
-    ? pair.calendar.getTimeZone ? await pair.calendar.getTimeZone() : undefined
-    : undefined;
+  let calendarTimeZone: string | undefined;
+  if (snapshot.items.some((event) => event.end?.date && !event.end.dateTime) && pair.calendar.getTimeZone) {
+    try { calendarTimeZone = await pair.calendar.getTimeZone(); }
+    catch { /* Per-item recurrence handling retries and records an actionable diagnostic. */ }
+  }
   const reservedTaskIds = new Set<string>();
 
   const canMutate = async (eventId?:string, taskId?:string): Promise<boolean> => {
@@ -373,11 +376,25 @@ export async function reconcileUnmappedCalendar(
     const instances = boundedFiniteWeekly
       ? await pair.calendar.listInstances(master.id)
       : await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
-    const calendarTimeZone = master.start?.dateTime
-      ? master.start.timeZone || (pair.calendar.getTimeZone ? await pair.calendar.getTimeZone() : undefined)
-      : "UTC";
-    const active = selectCalendarRecurrenceInstance(instances, undefined, now);
-    if (!active || active.status === "cancelled" || calendarEventHasElapsed(active, now, calendarTimeZone)) {
+    const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
+    let seriesTimeZone = master.start?.timeZone || calendarTimeZone;
+    let calendarTimeZoneError: string | undefined;
+    if (boundedFiniteWeekly || hasAllDayInstances) {
+      try { seriesTimeZone = await resolveCalendarTimeZone(master, pair.calendar.getTimeZone?.bind(pair.calendar)); }
+      catch (error) {
+        seriesTimeZone = undefined;
+        calendarTimeZoneError = error instanceof Error ? error.message : String(error);
+      }
+      if (!seriesTimeZone) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_recurrence_calendar_timezone_unverified", {
+          seriesId, masterEventId: master.id, error: calendarTimeZoneError || "Calendar timezone is unavailable",
+        });
+        return;
+      }
+    }
+    const active = selectCalendarRecurrenceInstance(instances, undefined, now, seriesTimeZone);
+    if (!active || active.status === "cancelled" || calendarEventHasElapsed(active, now, seriesTimeZone)) {
       summary.skipped += 1;
       return;
     }
@@ -388,8 +405,8 @@ export async function reconcileUnmappedCalendar(
     }
     if (await completionBlocksRecovery(active.id)) return;
 
-    const recurrence = boundedFiniteWeekly && calendarTimeZone
-      ? calendarOwnedTodoistRecurrence(master, instances, calendarTimeZone)
+    const recurrence = boundedFiniteWeekly && seriesTimeZone
+      ? calendarOwnedTodoistRecurrence(master, instances, seriesTimeZone)
       : undefined;
     if (!recurrence) {
       await state.audit(profile, "calendar_recurrence_todoist_rule_unsupported", {
@@ -397,20 +414,20 @@ export async function reconcileUnmappedCalendar(
           ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
       });
     }
-    if (recurrence && master.start?.dateTime) {
+    if (boundedFiniteWeekly || hasAllDayInstances) {
       let todoistTimeZone: string;
       try { todoistTimeZone = await pair.todoist.getTimeZone(); }
       catch (error) {
         summary.conflicts += 1;
         await state.audit(profile, "calendar_recurrence_todoist_timezone_unverified", {
-          seriesId, masterEventId: master.id, calendarTimeZone, error: error instanceof Error ? error.message : String(error),
+          seriesId, masterEventId: master.id, calendarTimeZone: seriesTimeZone, error: error instanceof Error ? error.message : String(error),
         });
         return;
       }
-      if (todoistTimeZone !== calendarTimeZone) {
+      if (todoistTimeZone !== seriesTimeZone) {
         summary.conflicts += 1;
         await state.audit(profile, "calendar_recurrence_todoist_timezone_mismatch", {
-          seriesId, masterEventId: master.id, calendarTimeZone, todoistTimeZone,
+          seriesId, masterEventId: master.id, calendarTimeZone: seriesTimeZone, todoistTimeZone,
         });
         return;
       }
@@ -529,6 +546,11 @@ export async function reconcileUnmappedCalendar(
         summary.skipped += 1;
       } else if (event.recurrence?.length) {
         await createOrBindSeries(event);
+      } else if (event.end?.date && !event.end.dateTime && !calendarTimeZone) {
+        summary.skipped += 1;
+        await state.audit(profile, "calendar_snapshot_calendar_timezone_unverified", {
+          eventId: event.id, reason: "Calendar resource timezone is unavailable for all-day event classification",
+        });
       } else if (calendarEventHasElapsed(event, now, calendarTimeZone)) {
         summary.skipped += 1;
       } else {

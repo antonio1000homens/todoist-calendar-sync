@@ -168,9 +168,16 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
         if (failures.listInstances) throw new Error("injected Calendar instance read failure");
         return instances.map((item) => structuredClone(item));
       },
-      async getTimeZone() { return "Europe/London"; },
+      async getTimeZone() {
+        if (failures.calendarTimezone) throw new Error("injected Calendar timezone read failure");
+        return failures.calendarTimeZone || "Europe/London";
+      },
       async deleteEvent(id) { calendarDeletes.push(id); state.operations.push({ action: "delete-calendar", id }); },
-      async getEvent(id) { return id === masterDelta?.id ? structuredClone(masterDelta) : instances.find((item) => item.id === id); },
+      async getEvent(id) {
+        if (id === masterDelta?.id) return structuredClone(masterDelta);
+        if (id === MASTER) return structuredClone(masterDelta || masterEvent());
+        return instances.find((item) => item.id === id);
+      },
       async findByTodoistTaskId() { return undefined; },
       async upsertEvent(event) { calendarUpserts.push(structuredClone(event)); return { ...structuredClone(event), id: event.id || "stored" }; },
     },
@@ -193,6 +200,10 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
       async findComment() { return undefined; },
       async upsertComment() { return { id: "comment" }; },
       async deleteComment() {},
+      async getTimeZone() {
+        if (failures.timezone) throw new Error("injected Todoist timezone read failure");
+        return failures.todoistTimeZone || "Europe/London";
+      },
       async updateRecurringOccurrence(task, occurrence) {
         if (failures.update) throw new Error("injected Todoist update failure");
         recurringUpdates.push({ taskId: task.id, occurrence: structuredClone(occurrence) });
@@ -210,7 +221,7 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
       },
       async getTimeZone() {
         if (failures.timezone) throw new Error("injected Todoist timezone read failure");
-        return "Europe/London";
+        return failures.todoistTimeZone || "Europe/London";
       },
     },
   };
@@ -254,23 +265,23 @@ test("legacy Calendar recurrence keeps a live mapped occurrence and exposes the 
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");
   const link = linkFor(current);
-  assert.equal(selectCalendarRecurrenceInstance([earlier, current], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "day-18");
-  assert.equal(suppressedLegacyCalendarRecurrenceCandidate([earlier, current], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "day-17");
+  assert.equal(selectCalendarRecurrenceInstance([earlier, current], link, Date.parse("2099-09-16T00:00:00Z"), "Europe/London")?.id, "day-18");
+  assert.equal(suppressedLegacyCalendarRecurrenceCandidate([earlier, current], link, Date.parse("2099-09-16T00:00:00Z"), "Europe/London")?.id, "day-17");
 });
 
 test("progress-aware Calendar recurrence re-anchors to the earliest uncompleted occurrence", () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");
   const link = linkFor(current, { calendarProgressVersion: 1 });
-  assert.equal(selectCalendarRecurrenceInstance([current, earlier], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "day-17");
-  assert.equal(suppressedLegacyCalendarRecurrenceCandidate([earlier, current], link, Date.parse("2099-09-16T00:00:00Z")), undefined);
+  assert.equal(selectCalendarRecurrenceInstance([current, earlier], link, Date.parse("2099-09-16T00:00:00Z"), "Europe/London")?.id, "day-17");
+  assert.equal(suppressedLegacyCalendarRecurrenceCandidate([earlier, current], link, Date.parse("2099-09-16T00:00:00Z"), "Europe/London"), undefined);
 });
 
 test("progress watermark permanently consumes occurrences at or before the completed logical start", () => {
   const completed = instance("completed", "2099-09-17", "2099-09-18");
   const successor = instance("successor", "2099-09-18", "2099-09-19");
   const link = linkFor(successor, { calendarProgressVersion: 1, completedThroughOriginalStart: "2099-09-17" });
-  assert.equal(selectCalendarRecurrenceInstance([completed, successor], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "successor");
+  assert.equal(selectCalendarRecurrenceInstance([completed, successor], link, Date.parse("2099-09-16T00:00:00Z"), "Europe/London")?.id, "successor");
 });
 
 test("timed completion boundaries compare logical instants across offsets", () => {
@@ -279,6 +290,70 @@ test("timed completion boundaries compare logical instants across offsets", () =
   const link = linkFor(later, { calendarProgressVersion: 1, completedThroughOriginalStart: "2099-09-17T09:00:00+01:00" });
   assert.equal(selectCalendarRecurrenceInstance([sameInstant, later], link, Date.parse("2099-09-16T00:00:00Z"))?.id, "later");
 });
+
+test("all-day selection uses Calendar local date at near-midnight UTC boundaries", () => {
+  const occurrence = instance("berlin-day", "2026-11-03", "2026-11-04");
+  const now = Date.parse("2026-11-03T23:30:00Z"); // already Nov 4 in Europe/Berlin
+  assert.equal(selectCalendarRecurrenceInstance([occurrence], undefined, now, "Europe/Berlin"), undefined);
+  assert.equal(selectCalendarRecurrenceInstance([occurrence], undefined, now, "UTC")?.id, "berlin-day");
+  assert.throws(() => selectCalendarRecurrenceInstance([occurrence], undefined, now), /Calendar timezone is required/);
+});
+
+for (const failure of ["calendarTimezone", "todoistTimeZone"]) {
+  test(`Calendar recurrence reconcile fails closed on all-day ${failure} uncertainty`, async () => {
+    const expired = instance("expired-day", "2026-11-03", "2026-11-04");
+    const next = instance("next-day", "2026-11-10", "2026-11-11");
+    const link = linkFor(expired);
+    const master = {
+      id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+      start: { date: "2026-11-03" }, end: { date: "2026-11-04" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    };
+    const state = new FakeState(link);
+    const clients = fakeClients(state, [expired, next], link, master);
+    clients.failures[failure] = failure === "todoistTimeZone" ? "Europe/Berlin" : true;
+    const sync = new Synchronizer(state, undefined, async () => clients);
+
+    await sync.reconcile(PROFILE);
+
+    assert.deepEqual(clients.todoistDeletes, []);
+    assert.deepEqual(clients.todoistUpserts, []);
+    assert.equal(state.links[0].activeInstanceId, expired.id);
+    assert.equal(state.mappingsByEvent.get(expired.id)?.taskId, link.taskId);
+    assert.ok(state.audits.some((entry) => entry.action === (failure === "calendarTimezone"
+      ? "calendar_recurrence_calendar_timezone_unverified" : "calendar_recurrence_todoist_timezone_mismatch")));
+  });
+}
+
+for (const failure of ["calendarTimezone", "todoistTimeZone"]) {
+  test(`deleting the active all-day Calendar occurrence leaves state untouched when ${failure} cannot be verified`, async () => {
+    const current = instance("cancelled-day", "2099-09-02", "2099-09-03", "cancelled");
+    const successor = instance("successor-day", "2099-09-09", "2099-09-10");
+    const master = {
+      id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+      start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    };
+    const link = linkFor(current);
+    const state = new FakeState(link);
+    const clients = fakeClients(state, [current, successor], link, current);
+    clients.calendar.listDelta = async () => ({ items: [structuredClone(current)], nextSyncToken: "next" });
+    clients.calendar.getEvent = async (id) => id === MASTER ? structuredClone(master)
+      : [current, successor].find((item) => item.id === id);
+    clients.failures[failure] = failure === "todoistTimeZone" ? "Europe/Berlin" : true;
+    const sync = new Synchronizer(state, undefined, async () => clients);
+
+    await sync.process({
+      id: `delete-all-day-${failure}`, kind: "calendar", profile: PROFILE, mode: "aws",
+      receivedAt: "2099-09-02T12:00:00Z", headers: {}, body: "",
+    });
+
+    assert.deepEqual(clients.todoistDeletes, []);
+    assert.deepEqual(clients.todoistUpserts, []);
+    assert.equal(state.links[0].activeInstanceId, current.id);
+    assert.equal(state.mappingsByEvent.get(current.id)?.taskId, link.taskId);
+    assert.ok(state.audits.some((entry) => entry.action === (failure === "calendarTimezone"
+      ? "calendar_recurrence_calendar_timezone_unverified" : "calendar_recurrence_todoist_timezone_mismatch")));
+  });
+}
 
 test("Calendar master re-anchor updates the same Todoist mirror once under repeated notifications", async () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
@@ -428,6 +503,130 @@ test("Calendar-owned finite weekly completion skips a canceled occurrence and ad
   assert.equal(clients.tasks.get(link.taskId).due.datetime, "2026-11-18T14:00:00Z");
   assert.equal(clients.recurringUpdates.length, 1, "replay must not advance the same task twice");
   assert.equal(clients.calendarUpserts.length, 0, "Calendar series remains untouched on replay");
+});
+
+test("Calendar-owned all-day weekly completion skips canceled dates and preserves the same Todoist task", async () => {
+  const scheduled = [2, 9, 16, 23].map((day, index) => instance(
+    `sep-${day}`, `2099-09-${String(day).padStart(2, "0")}`, `2099-09-${String(day + 1).padStart(2, "0")}`,
+    index === 1 ? "cancelled" : "confirmed",
+  ));
+  const master = {
+    id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const current = scheduled[0];
+  const recurringString = "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099";
+  const link = linkFor(current, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, scheduled, link, master, recurringString);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = completedDelivery("complete-sep-2", link.taskId, current, "2099-09-02T12:00:00Z");
+  const parsed = JSON.parse(delivery.body);
+  parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
+  delivery.body = JSON.stringify(parsed);
+
+  await sync.process(delivery);
+  const task = clients.tasks.get(link.taskId);
+  assert.equal(task.id, link.taskId);
+  assert.equal(task.due.date, "2099-09-16");
+  assert.equal(task.due.datetime, undefined);
+  assert.equal(task.due.string, recurringString);
+  assert.equal(state.links[0].activeInstanceId, "sep-16");
+  assert.equal(clients.calendarDeletes.length, 0);
+  assert.equal(clients.calendarUpserts.length, 0);
+});
+
+test("all-day completion timezone mismatch fails closed without Todoist or Calendar writes", async () => {
+  const scheduled = [2, 9, 16, 23].map((day, index) => instance(
+    `mismatch-${day}`, `2099-09-${String(day).padStart(2, "0")}`, `2099-09-${String(day + 1).padStart(2, "0")}`,
+    index === 1 ? "cancelled" : "confirmed",
+  ));
+  const master = {
+    id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const current = scheduled[0];
+  const recurrenceString = "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099";
+  const link = linkFor(current, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, scheduled, link, master, recurrenceString);
+  clients.failures.todoistTimeZone = "Europe/Berlin";
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = completedDelivery("all-day-zone-mismatch", link.taskId, current, "2099-09-02T12:00:00Z");
+  const parsed = JSON.parse(delivery.body);
+  parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
+  delivery.body = JSON.stringify(parsed);
+
+  await sync.process(delivery);
+  assert.equal(clients.recurringUpdates.length, 0);
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.equal(clients.calendarDeletes.length, 0);
+  assert.equal(state.links[0].activeInstanceId, current.id);
+  assert.equal(clients.tasks.get(link.taskId).due.date, "2099-09-02");
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
+});
+
+test("non-recurring Todoist completion of an all-day Calendar series also requires matching timezones", async () => {
+  const completed = instance("all-day-completed", "2099-09-02", "2099-09-03");
+  const successor = instance("all-day-successor", "2099-09-09", "2099-09-10");
+  const link = linkFor(completed, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [completed, successor], link, masterEvent());
+  clients.failures.todoistTimeZone = "Europe/Berlin";
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.process(completedDelivery("complete-all-day-nonrecurring", link.taskId, completed, "2099-09-02T12:00:00Z"));
+
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(clients.recurringUpdates.length, 0);
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.equal(state.links[0].activeInstanceId, completed.id);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
+});
+
+test("incremental import resolves all-day Calendar resource timezone before creating a recurring task", async () => {
+  const scheduled = [2, 9, 16, 23].map((day, index) => instance(
+    `incremental-${day}`, `2099-09-${String(day).padStart(2, "0")}`, `2099-09-${String(day + 1).padStart(2, "0")}`,
+    index === 1 ? "cancelled" : "confirmed",
+  ));
+  const master = {
+    id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, scheduled, undefined, master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await sync.process({
+    id: "incremental-all-day", kind: "calendar", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-01T10:00:00Z", headers: {}, body: "",
+  });
+  assert.equal(clients.todoistUpserts.length, 1);
+  assert.equal(clients.todoistUpserts[0].payload.due.date, "2099-09-02");
+  assert.equal(clients.todoistUpserts[0].payload.due.datetime, undefined);
+  assert.equal(clients.todoistUpserts[0].payload.due.string, "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099");
+  assert.equal(state.links[0].activeInstanceId, "incremental-2");
+});
+
+test("incremental all-day recurrence import fails closed on Todoist timezone mismatch", async () => {
+  const scheduled = [2, 9, 16, 23].map((day) => instance(
+    `incremental-${day}`, `2099-09-${String(day).padStart(2, "0")}`, `2099-09-${String(day + 1).padStart(2, "0")}`,
+  ));
+  const master = {
+    id: MASTER, status: "confirmed", summary: "Recurring reminder", description: "", iCalUID: SERIES,
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, scheduled, undefined, master);
+  clients.failures.todoistTimeZone = "Europe/Berlin";
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await sync.process({
+    id: "incremental-all-day-mismatch", kind: "calendar", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-01T10:00:00Z", headers: {}, body: "",
+  });
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(state.links.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
 });
 
 for (const failurePoint of ["listInstances", "timezone", "update", "advance"]) {

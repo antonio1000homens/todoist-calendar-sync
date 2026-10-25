@@ -49,9 +49,11 @@ function fakeClients(events, initialTasks = []) {
       calendar: {
         async listDelta() { return { items: events, nextSyncToken: "snapshot-token-must-be-ignored" }; },
         async listInstances() { listInstancesCalls += 1; return []; },
+        async getTimeZone() { return "Europe/London"; },
       },
       todoist: {
         async listTasks() { return tasks; },
+        async getTimeZone() { return "Europe/London"; },
         async upsertTask(task) {
           created += 1;
           const createdTask = { id: `created-${created}`, project_id: "home-project", ...task };
@@ -189,6 +191,68 @@ test("snapshot recovery fails closed without creating a timed recurrence when To
   assert.equal(summary.conflicts, 1);
   assert.equal(summary.imported, 0);
   assert.equal(creates, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
+});
+
+test("snapshot recovery imports an all-day finite recurrence using the verified Calendar resource timezone", async () => {
+  const master = {
+    id: "all-day-master", iCalUID: "all-day-series", status: "confirmed", summary: "All-day task", description: "",
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const occurrences = [2, 9, 16, 23].map((day, index) => ({
+    id: `all-day-${day}`, status: index === 1 ? "cancelled" : "confirmed", recurringEventId: master.id,
+    iCalUID: master.iCalUID, originalStartTime: { date: `2099-09-${String(day).padStart(2, "0")}` },
+    start: { date: `2099-09-${String(day).padStart(2, "0")}` }, end: { date: `2099-09-${String(day + 1).padStart(2, "0")}` },
+  }));
+  const state = fakeState();
+  const tasks = [];
+  let calendarZoneReads = 0;
+  const clients = {
+    calendar: {
+      async listDelta() { return { items: [master] }; },
+      async listInstances() { return occurrences; },
+      async getTimeZone() { calendarZoneReads += 1; return "Europe/London"; },
+    },
+    todoist: {
+      async listTasks() { return tasks; },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask(payload) { const task = { id: "all-day-task", ...structuredClone(payload) }; tasks.push(task); return task; },
+      async findComment() { return undefined; }, async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+  assert.equal(summary.imported, 1);
+  assert.ok(calendarZoneReads >= 1);
+  assert.equal(tasks[0].due.date, "2099-09-02");
+  assert.equal(tasks[0].due.datetime, undefined);
+  assert.equal(tasks[0].due.string, "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099");
+});
+
+test("all-day recurrence timezone mismatch fails closed before Todoist or mapping writes", async () => {
+  const master = {
+    id: "all-day-master", iCalUID: "all-day-series", status: "confirmed", summary: "All-day task", description: "",
+    start: { date: "2099-09-02" }, end: { date: "2099-09-03" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+  };
+  const occurrences = [2, 9, 16, 23].map((day) => ({
+    id: `all-day-${day}`, status: "confirmed", recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { date: `2099-09-${String(day).padStart(2, "0")}` },
+    start: { date: `2099-09-${String(day).padStart(2, "0")}` }, end: { date: `2099-09-${String(day + 1).padStart(2, "0")}` },
+  }));
+  const state = fakeState();
+  let writes = 0;
+  const clients = {
+    calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; }, async getTimeZone() { return "Europe/Berlin"; } },
+    todoist: {
+      async listTasks() { return []; }, async getTimeZone() { return "Europe/London"; },
+      async upsertTask() { writes += 1; throw new Error("must not write"); },
+      async findComment() { return undefined; }, async upsertComment() { writes += 1; },
+    },
+  };
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+  assert.equal(summary.conflicts, 1);
+  assert.equal(summary.imported, 0);
+  assert.equal(writes, 0);
   assert.equal(state.mappings.length, 0);
   assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
 });

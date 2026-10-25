@@ -49,6 +49,23 @@ test("weekly recurrence phrase preserves Calendar wall time through the London D
   assert.equal(recurrence.dueString, "every Sunday at 9:00am starting 21 Mar 2027 ending 11 Apr 2027");
 });
 
+test("all-day finite weekly recurrence preserves date-only Todoist due values", () => {
+  const master = { ...weeklyMaster("2099-09-02"), start: { date: "2099-09-02" } };
+  const schedule = [2, 9, 16, 23].map((day, index) => ({
+    id: `all-day-${day}`, recurringEventId: master.id, status: index === 1 ? "cancelled" : "confirmed",
+    originalStartTime: { date: `2099-09-${String(day).padStart(2, "0")}` },
+    start: { date: `2099-09-${String(day).padStart(2, "0")}` }, end: { date: `2099-09-${String(day + 1).padStart(2, "0")}` },
+  }));
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  assert.equal(recurrence.dueString, "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099");
+  const payload = calendarOwnedRecurringTaskPayload(schedule[0], recurrence);
+  assert.equal(payload.due.date, "2099-09-02");
+  assert.equal(payload.due.datetime, undefined);
+  assert.equal(matchesCalendarOwnedRecurringTask({
+    id: "task", content: "Task", due: { date: "2099-09-02", is_recurring: true, string: recurrence.dueString },
+  }, schedule[0], recurrence), true);
+});
+
 test("unsupported, unbounded, or incomplete weekly recurrence inventories fail closed", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=DAILY;COUNT=4");
   const schedule = instances(["2026-11-04T14:00:00Z"]);
