@@ -538,7 +538,7 @@ test("rejected worst-case reservation still keeps reconciliation pending", async
   assert.equal(exhausted.detail.reason, "mutation_budget_exhausted");
 });
 
-test("recurrence snapshot guard recognises a competing recurring Todoist identity", async () => {
+test("repeated recurrence snapshots keep a competing recurring Todoist identity fail-closed", async () => {
   const master = { ...futureEvent("annual-master", 11, "Fotmob expiry £2.60"), recurrence: ["RRULE:FREQ=YEARLY;INTERVAL=1"] };
   const occurrence = { ...futureEvent("annual-master_20990111", 11, "Fotmob expiry £2.60"), recurringEventId: master.id };
   const original = {
@@ -549,13 +549,24 @@ test("recurrence snapshot guard recognises a competing recurring Todoist identit
   const state = fakeState();
   const clients = fakeClients([master], [original]);
   clients.pair.calendar.listInstances = async () => [occurrence];
-  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
-  assert.equal(summary.conflicts, 1);
+  const summaries = [];
+  for (let snapshot = 0; snapshot < 2; snapshot += 1) {
+    summaries.push(await reconcileUnmappedCalendar("home", state, async () => clients.pair));
+  }
+  for (const summary of summaries) {
+    assert.equal(summary.conflicts, 1);
+    assert.equal(summary.imported, 0);
+    assert.equal(summary.providerMutations, 0);
+  }
   assert.equal(clients.created, 0);
+  assert.equal(clients.comments, 0);
   assert.equal(state.mappings.length, 0);
-  assert.ok(state.audits.some((entry) =>
-    entry.action === "calendar_snapshot_recurring_identity_conflict"
-    && entry.detail.candidateTaskIds.includes("original-yearly")));
+  assert.equal(state.mutations, 0);
+  const diagnostics = state.audits.filter((entry) => entry.action === "calendar_snapshot_recurring_identity_conflict");
+  assert.equal(diagnostics.length, 2);
+  for (const diagnostic of diagnostics) {
+    assert.deepEqual(diagnostic.detail.candidateTaskIds, ["original-yearly"]);
+  }
 });
 
 test("ambiguous series recovery audits every canonical candidate and mapped ownership without writes", async () => {
