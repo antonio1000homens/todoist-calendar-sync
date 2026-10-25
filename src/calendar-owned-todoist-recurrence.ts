@@ -100,7 +100,7 @@ function parseTime(value: string | undefined): string | undefined {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-function parseWeeklyScheduleDetailed(value: string | undefined, currentDueDate?: string): WeeklyScheduleParseResult {
+function parseWeeklyScheduleDetailed(value: string | undefined, currentDueDate?: string, timeZone?: string): WeeklyScheduleParseResult {
   const emptyDiagnostics: WeeklyScheduleParseDiagnostics = {
     phraseKind: "other", weekdayRecognized: false,
     startDateParsed: false, endDateParsed: false, timePresent: false, timeParsed: true,
@@ -133,8 +133,22 @@ function parseWeeklyScheduleDetailed(value: string | undefined, currentDueDate?:
   // return a local datetime in `due.date`; its calendar date is safe to use as
   // the anchor because the caller verifies the provider and Calendar zones.
   const endingOnly = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+ending\s+(.+)$/i);
-  const currentDueMatch = currentDueDate?.match(/^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$)/);
-  const currentDueText = currentDueMatch?.[1];
+  const localDueMatch = currentDueDate?.match(/^(\d{4}-\d{2}-\d{2})(?:$|T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$)/);
+  const zonedDueMatch = currentDueDate?.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i);
+  let currentDueText = localDueMatch?.[1];
+  if (!currentDueText && zonedDueMatch && timeZone) {
+    const instant = new Date(currentDueDate!);
+    if (Number.isFinite(instant.getTime())) {
+      try {
+        const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+          timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+        }).formatToParts(instant).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+        currentDueText = `${parts.year}-${parts.month}-${parts.day}`;
+      } catch {
+        // An invalid or unavailable zone must fail closed rather than throw.
+      }
+    }
+  }
   const currentDue = currentDueText
     && new Date(`${currentDueText}T00:00:00Z`).toISOString().slice(0, 10) === currentDueText
     ? parseNaturalDate(currentDueText) : undefined;
@@ -340,9 +354,10 @@ export function matchesCalendarOwnedRecurringTask(
 export function matchesCalendarOwnedRecurringRule(
   task: TodoistTask,
   recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
 ): boolean {
   const expected = parseWeeklySchedule(recurrence.dueString);
-  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date);
+  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date || task.due?.datetime, verifiedTimeZone);
   const observed = observedParse.schedule;
   const allowYearOmission = Boolean(expected?.start.year && expected.start.year === expected.end.year);
   return Boolean(task.due?.is_recurring && expected && observed
@@ -367,7 +382,7 @@ export function calendarOwnedRecurringTaskReadback(
   verifiedTimeZone?: string,
 ): CalendarOwnedRecurringTaskReadback {
   const expectedSchedule = parseWeeklySchedule(recurrence.dueString);
-  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date);
+  const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date || task.due?.datetime, verifiedTimeZone);
   const observedSchedule = observedParse.schedule;
   const allowYearOmission = Boolean(expectedSchedule?.start.year
     && expectedSchedule.start.year === expectedSchedule.end.year);

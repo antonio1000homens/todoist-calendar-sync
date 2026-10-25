@@ -1461,7 +1461,7 @@ export class Synchronizer {
           if (master && timeZone) currentCalendarRecurrence = calendarOwnedTodoistRecurrence(master, instances, timeZone);
           verifiedCalendarTimeZone = timeZone;
           if (!master || !timeZone || !currentCalendarRecurrence
-            || !matchesCalendarOwnedRecurringRule(currentRecurringTask, currentCalendarRecurrence)) {
+            || !matchesCalendarOwnedRecurringRule(currentRecurringTask, currentCalendarRecurrence, timeZone)) {
             return this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
               seriesId: mapping.seriesId, masterEventId: mapping.masterEventId, taskId: task.id,
               reason: "completed_task_recurrence_does_not_match_supported_calendar_rule",
