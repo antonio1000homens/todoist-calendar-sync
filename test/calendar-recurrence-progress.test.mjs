@@ -604,7 +604,7 @@ test("incremental import resolves all-day Calendar resource timezone before crea
   assert.equal(clients.todoistUpserts.length, 1);
   assert.equal(clients.todoistUpserts[0].payload.due.date, "2099-09-02");
   assert.equal(clients.todoistUpserts[0].payload.due.datetime, undefined);
-  assert.equal(clients.todoistUpserts[0].payload.due.string, "every Wednesday starting 2 Sep 2099 ending 23 Sep 2099");
+  assert.equal(clients.todoistUpserts[0].payload.due.string, "every Wednesday starting 2 Sep 2099 and ending 23 Sep 2099");
   assert.equal(state.links[0].activeInstanceId, "incremental-2");
 });
 

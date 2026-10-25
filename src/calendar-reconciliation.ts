@@ -18,9 +18,9 @@ import {
 import { StateRepository } from "./repository.js";
 import {
   calendarOwnedRecurringTaskPayload,
+  calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
-  matchesCalendarOwnedRecurringTask,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
@@ -474,7 +474,8 @@ export async function reconcileUnmappedCalendar(
       task = await pair.todoist.upsertTask(calendarOwnedRecurringTaskPayload(active, recurrence), task.id);
       await state.recordMutation(profile);
     }
-    if (recurrence && !matchesCalendarOwnedRecurringTask(task, active, recurrence)) {
+    const readback = recurrence ? calendarOwnedRecurringTaskReadback(task, active, recurrence) : undefined;
+    if (readback && !readback.matches) {
       summary.conflicts += 1;
       if (created) await rollbackCreatedTask(active, task, {
         profile, eventId: active.id, taskId: task.id, projectId: task.project_id,
@@ -494,6 +495,8 @@ export async function reconcileUnmappedCalendar(
       }
       await state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
+        expected: readback.expected,
+        observed: readback.observed,
       });
       return;
     }

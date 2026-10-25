@@ -7,9 +7,104 @@ export interface CalendarOwnedTodoistRecurrence {
   rule: string;
 }
 
+export interface CalendarOwnedRecurringTaskReadback {
+  matches: boolean;
+  expected: {
+    frequency: "weekly";
+    weekday?: string;
+    time?: string;
+    startDate?: string;
+    endDate?: string;
+  };
+  observed: {
+    recurring: boolean;
+    dueDate?: string;
+    recurrenceParsed: boolean;
+    frequency?: "weekly";
+    weekday?: string;
+    time?: string;
+    startDate?: string;
+    endDate?: string;
+    startYearOmitted?: boolean;
+    endYearOmitted?: boolean;
+  };
+}
+
 const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const longMonthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const weekdayCodes: Record<string, string> = { SU: "Sunday", MO: "Monday", TU: "Tuesday", WE: "Wednesday", TH: "Thursday", FR: "Friday", SA: "Saturday" };
+const weekdayLookup = new Map(weekdayNames.flatMap((name) => [[name.toLowerCase(), name], [name.slice(0, 3).toLowerCase(), name]]));
+const monthLookup = new Map(monthNames.flatMap((name, index) => [
+  [name.toLowerCase(), index + 1],
+  [longMonthNames[index].toLowerCase(), index + 1],
+]));
+
+interface ParsedDate {
+  day: number;
+  month: number;
+  year?: number;
+}
+
+interface ParsedWeeklySchedule {
+  weekday: string;
+  time?: string;
+  start: ParsedDate;
+  end: ParsedDate;
+}
+
+function parseNaturalDate(value: string): ParsedDate | undefined {
+  const normalized = value.trim().toLowerCase().replace(/,/g, "").replace(/(\d)(st|nd|rd|th)\b/g, "$1");
+  const iso = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return { year: Number(iso[1]), month: Number(iso[2]), day: Number(iso[3]) };
+  const dayFirst = normalized.match(/^(\d{1,2})\s+([a-z]+)(?:\s+(\d{4}))?$/);
+  const monthFirst = normalized.match(/^([a-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/);
+  const match = dayFirst || monthFirst;
+  if (!match) return undefined;
+  const day = Number(dayFirst ? match[1] : match[2]);
+  const monthText = (dayFirst ? match[2] : match[1]).replace(/\.$/, "");
+  const month = monthLookup.get(monthText);
+  const yearText = dayFirst ? match[3] : match[3];
+  const year = yearText ? Number(yearText) : undefined;
+  if (!month || day < 1 || day > 31 || (year !== undefined && (!Number.isInteger(year) || year < 1))) return undefined;
+  return { day, month, ...(year ? { year } : {}) };
+}
+
+function parseTime(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const match = value.trim().toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  if (!match) return undefined;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || "0");
+  if (minute > 59) return undefined;
+  if (match[3]) {
+    if (hour < 1 || hour > 12) return undefined;
+    hour = (hour % 12) + (match[3] === "pm" ? 12 : 0);
+  } else if (hour > 23) return undefined;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function parseWeeklySchedule(value: string | undefined): ParsedWeeklySchedule | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  const match = normalized.match(/^every\s+([a-z]+)(?:\s+at\s+(.+?))?\s+starting\s+(.+?)\s+(?:and\s+)?ending\s+(.+)$/i);
+  if (!match) return undefined;
+  const weekday = weekdayLookup.get(match[1].toLowerCase());
+  const start = parseNaturalDate(match[3]);
+  const end = parseNaturalDate(match[4]);
+  const time = match[2] === undefined ? undefined : parseTime(match[2]);
+  if (!weekday || !start || !end || (match[2] !== undefined && !time)) return undefined;
+  return { weekday, ...(time ? { time } : {}), start, end };
+}
+
+function sameDate(expected: ParsedDate, observed: ParsedDate, allowYearOmission: boolean): boolean {
+  return expected.day === observed.day && expected.month === observed.month
+    && (observed.year === expected.year || (allowYearOmission && observed.year === undefined));
+}
+
+function formatParsedDate(date: ParsedDate): string {
+  return `${date.year ? `${date.year}-` : ""}${String(date.month).padStart(2, "0")}-${String(date.day).padStart(2, "0")}`;
+}
 
 export async function resolveCalendarTimeZone(
   master: CalendarEvent,
@@ -108,7 +203,7 @@ export function calendarOwnedTodoistRecurrence(
   const time = startParts.hour ? ` at ${startParts.hour}:${startParts.minute}${(startParts.dayPeriod || "").toLowerCase()}` : "";
   const startDate = localDate(startValue, timeZone);
   const endDate = localDate(endStart, timeZone);
-  const dueString = `every ${weekday}${time} starting ${startDate} ending ${endDate}`;
+  const dueString = `every ${weekday}${time} starting ${startDate} and ending ${endDate}`;
   return { dueString, endDate, weekday, rule };
 }
 
@@ -135,18 +230,70 @@ export function matchesCalendarOwnedRecurringTask(
   event: CalendarEvent,
   recurrence: CalendarOwnedTodoistRecurrence,
 ): boolean {
-  return matchesCalendarOwnedRecurringRule(task, recurrence)
-    && startsMatchCalendarEvent(event, task);
+  return calendarOwnedRecurringTaskReadback(task, event, recurrence).matches;
 }
 
 export function matchesCalendarOwnedRecurringRule(
   task: TodoistTask,
   recurrence: CalendarOwnedTodoistRecurrence,
 ): boolean {
-  if (!task.due?.is_recurring || !task.due.string || !task.due.string.toLowerCase().includes("ending")) return false;
-  const normalized = task.due.string.toLowerCase().replace(/\s+/g, " ");
-  const expected = recurrence.dueString.toLowerCase().replace(/\s+/g, " ");
-  return normalized === expected;
+  const expected = parseWeeklySchedule(recurrence.dueString);
+  const observed = parseWeeklySchedule(task.due?.string);
+  const allowYearOmission = Boolean(expected?.start.year && expected.start.year === expected.end.year);
+  return Boolean(task.due?.is_recurring && expected && observed
+    && expected.weekday === observed.weekday
+    && expected.time === observed.time
+    && sameDate(expected.start, observed.start, allowYearOmission)
+    && sameDate(expected.end, observed.end, allowYearOmission));
+}
+
+/**
+ * Verify the structured recurrence meaning of Todoist's human-readable due
+ * string. Todoist documents `due.string` as a human-readable representation,
+ * not an echo of the exact request text. Accept its harmless month/year
+ * formatting normalization while requiring cadence and inclusive boundaries
+ * to remain the same. Omitted years are resolved against the expected dates;
+ * explicit different years remain a mismatch.
+ */
+export function calendarOwnedRecurringTaskReadback(
+  task: TodoistTask,
+  event: CalendarEvent,
+  recurrence: CalendarOwnedTodoistRecurrence,
+): CalendarOwnedRecurringTaskReadback {
+  const expectedSchedule = parseWeeklySchedule(recurrence.dueString);
+  const observedSchedule = parseWeeklySchedule(task.due?.string);
+  const allowYearOmission = Boolean(expectedSchedule?.start.year
+    && expectedSchedule.start.year === expectedSchedule.end.year);
+  const expected = {
+    frequency: "weekly" as const,
+    ...(expectedSchedule ? {
+      weekday: expectedSchedule.weekday,
+      ...(expectedSchedule.time ? { time: expectedSchedule.time } : {}),
+      startDate: formatParsedDate(expectedSchedule.start),
+      endDate: formatParsedDate(expectedSchedule.end),
+    } : {}),
+  };
+  const observed = {
+    recurring: Boolean(task.due?.is_recurring),
+    ...(task.due?.date || task.due?.datetime ? { dueDate: task.due.date || task.due.datetime } : {}),
+    recurrenceParsed: Boolean(observedSchedule),
+    ...(observedSchedule ? {
+      frequency: "weekly" as const,
+      weekday: observedSchedule.weekday,
+      ...(observedSchedule.time ? { time: observedSchedule.time } : {}),
+      startDate: formatParsedDate(observedSchedule.start),
+      endDate: formatParsedDate(observedSchedule.end),
+      startYearOmitted: observedSchedule.start.year === undefined,
+      endYearOmitted: observedSchedule.end.year === undefined,
+    } : {}),
+  };
+  const matches = Boolean(task.due?.is_recurring && expectedSchedule && observedSchedule
+    && expectedSchedule.weekday === observedSchedule.weekday
+    && expectedSchedule.time === observedSchedule.time
+    && sameDate(expectedSchedule.start, observedSchedule.start, allowYearOmission)
+    && sameDate(expectedSchedule.end, observedSchedule.end, allowYearOmission)
+    && startsMatchCalendarEvent(event, task));
+  return { matches, expected, observed };
 }
 
 function startsMatchCalendarEvent(event: CalendarEvent, task: TodoistTask): boolean {
