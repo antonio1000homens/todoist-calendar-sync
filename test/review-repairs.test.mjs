@@ -610,6 +610,31 @@ test("series transfer treats explicit INTERVAL=1 as equivalent to Todoist every 
   assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
 });
 
+test("series transfer accepts Todoist every November 1 against the matching annual Calendar occurrence",async t=>{
+  const f=birthdayTransferFixture();
+  f.annual={...f.annual,due:{date:"2027-11-01",is_recurring:true,string:"every November 1"}};
+  f.displaced={...f.displaced,due:{date:"2027-11-01"}};
+  f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY;INTERVAL=1"]};
+  f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
+  f.standalone={...f.standalone,start:{date:"2027-11-01"},end:{date:"2027-11-02"}};
+  f.mapping={...f.mapping,originalStart:"2027-11-01",activeEffectiveStart:"2027-11-01",completedThroughOriginalStart:"2026-11-01"};
+  f.recurrence={...f.mapping,owner:"calendar"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged"});
+  const preview=await h.engine.preview(actor,input);
+  assert.ok(preview.changes.some(change=>change.includes("transfer the Calendar-owned series association")));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",result.error);
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.mappingMap.get(f.annual.id).masterEventId,f.master.id);
+  assert.equal(h.eventMappingMap.get(`home:${f.active.id}`).taskId,f.annual.id);
+  assert.equal(h.ownerMappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.recurrences.get(f.master.iCalUID).taskId,f.annual.id);
+  assert.deepEqual(h.eventMap.get(f.master.id).recurrence,["RRULE:FREQ=YEARLY;INTERVAL=1"]);
+  assert.deepEqual(h.eventMap.get(f.standalone.id),f.standalone);
+});
+
 test("task-only review detail hydrates its existing recurrence owner and active Calendar occurrence", async t => {
   const f = birthdayTransferFixture();
   const link = { ...f.recurrence, taskId: f.annual.id };
