@@ -231,6 +231,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
       async upsertEvent() { assert.fail("Unexpected anonymous Calendar write"); },
     },
     todoist: {
+      async getTimeZone() { return "Europe/London"; },
       async getTask(id) { return get(taskMap, id); },
       async listTasks() { return clone([...taskMap.values()]); },
       async upsertTask(value, id) {

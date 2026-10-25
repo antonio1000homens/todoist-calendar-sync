@@ -376,9 +376,10 @@ export async function reconcileUnmappedCalendar(
     const instances = boundedFiniteWeekly
       ? await pair.calendar.listInstances(master.id)
       : await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
+    const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let seriesTimeZone = master.start?.timeZone || calendarTimeZone;
     let calendarTimeZoneError: string | undefined;
-    if (boundedFiniteWeekly) {
+    if (boundedFiniteWeekly || hasAllDayInstances) {
       try { seriesTimeZone = await resolveCalendarTimeZone(master, pair.calendar.getTimeZone?.bind(pair.calendar)); }
       catch (error) {
         seriesTimeZone = undefined;
@@ -413,7 +414,7 @@ export async function reconcileUnmappedCalendar(
           ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
       });
     }
-    if (recurrence) {
+    if (boundedFiniteWeekly || hasAllDayInstances) {
       let todoistTimeZone: string;
       try { todoistTimeZone = await pair.todoist.getTimeZone(); }
       catch (error) {

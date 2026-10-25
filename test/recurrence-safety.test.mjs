@@ -185,7 +185,14 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
   for (const event of [...instances, ...extraEvents, ...(deltaEvent ? [deltaEvent] : [])]) {
     events.set(event.id, structuredClone(event));
   }
+  if (!events.has(MASTER)) {
+    events.set(MASTER, {
+      id: MASTER, status: "confirmed", start: { date: "2026-09-06" },
+      recurrence: ["RRULE:FREQ=WEEKLY"],
+    });
+  }
   const calendar = {
+    async getTimeZone() { return "Europe/London"; },
     async listInstances() { return instances.map((event) => structuredClone(event)); },
     async listDelta() {
       return { items: deltaEvent ? [structuredClone(deltaEvent)] : [], nextSyncToken: "sync-next" };
@@ -211,6 +218,7 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     },
   };
   const todoist = {
+    async getTimeZone() { return "Europe/London"; },
     async getTask(id) {
       if (!tasks.has(id)) { const error = new Error("not found"); error.status = 404; throw error; }
       return structuredClone(tasks.get(id));
@@ -289,7 +297,7 @@ function todoistOwnedLink(master, active, taskId = "task-recurring") {
 test("selector keeps the linked occurrence until it actually ends", () => {
   const current = instance("current", "2099-01-01", "2099-01-02");
   const next = instance("next", "2100-01-01", "2100-01-02");
-  const selected = selectCalendarRecurrenceInstance([current, next], linkFor(current), Date.parse("2098-12-01T00:00:00Z"));
+  const selected = selectCalendarRecurrenceInstance([current, next], linkFor(current), Date.parse("2098-12-01T00:00:00Z"), "Europe/London");
   assert.equal(selected?.id, "current");
 });
 
@@ -297,7 +305,7 @@ test("selector skips expired history and chooses one current or future occurrenc
   const expired = instance("expired", "2000-01-01", "2000-01-02");
   const current = instance("current", "2099-01-01", "2099-01-02");
   const later = instance("later", "2100-01-01", "2100-01-02");
-  assert.equal(selectCalendarRecurrenceInstance([expired, current, later], undefined, Date.parse("2026-09-06T00:00:00Z"))?.id, "current");
+  assert.equal(selectCalendarRecurrenceInstance([expired, current, later], undefined, Date.parse("2026-09-06T00:00:00Z"), "Europe/London")?.id, "current");
 });
 
 test("repeated reconciliation cannot walk through future occurrences", async () => {

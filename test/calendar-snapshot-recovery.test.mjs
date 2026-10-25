@@ -53,6 +53,7 @@ function fakeClients(events, initialTasks = []) {
       },
       todoist: {
         async listTasks() { return tasks; },
+        async getTimeZone() { return "Europe/London"; },
         async upsertTask(task) {
           created += 1;
           const createdTask = { id: `created-${created}`, project_id: "home-project", ...task };
