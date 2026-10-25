@@ -46,6 +46,68 @@ test("telemetry sanitization retains correlation metadata and drops content/payl
   });
 });
 
+test("telemetry retains only safe expected and observed recurrence scalars", () => {
+  const sanitized = sanitizeTelemetryDetail({
+    eventId: "event-1",
+    expected: {
+      frequency: "weekly", weekday: "Wednesday", time: "09:00",
+      startDate: "2026-11-04", endDate: "2026-11-25",
+      dueString: "private task recurrence", title: "private task title", unexpected: { nested: "secret" },
+    },
+    observed: {
+      recurring: true, dueDate: "2026-11-04", recurrenceParsed: true,
+      frequency: "weekly", weekday: "Wednesday", time: "09:00",
+      startDate: "11-04", endDate: "11-25", startYearOmitted: true, endYearOmitted: true,
+      dueString: "every Wednesday with private notes", taskTitle: "private task title", payload: { token: "secret" },
+    },
+    title: "private task title",
+    dueString: "raw private due string",
+  });
+  assert.deepEqual(sanitized, {
+    eventId: "event-1",
+    expected: {
+      frequency: "weekly", weekday: "Wednesday", time: "09:00",
+      startDate: "2026-11-04", endDate: "2026-11-25",
+    },
+    observed: {
+      recurring: true, dueDate: "2026-11-04", recurrenceParsed: true,
+      frequency: "weekly", weekday: "Wednesday", time: "09:00",
+      startDate: "11-04", endDate: "11-25", startYearOmitted: true, endYearOmitted: true,
+    },
+  });
+
+  assert.deepEqual(sanitizeTelemetryDetail({
+    expected: { frequency: "daily", weekday: "private", time: "the task says 9", startDate: "2030-02-30" },
+    observed: { dueDate: "private event notes", startDate: "raw due string", recurring: "yes", surprise: "secret" },
+  }), {});
+  assert.deepEqual(sanitizeTelemetryDetail({ observed: { dueDate: "2026-11-04T09:00:00Z" } }), {
+    observed: { dueDate: "2026-11-04T09:00:00Z" },
+  });
+});
+
+test("logEvent preserves safe recurrence diagnostics while excluding raw due strings and task text", () => {
+  const original = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(line);
+  try {
+    logEvent("calendar_recurrence_todoist_readback_mismatch", {
+      expected: { frequency: "weekly", weekday: "Wednesday", startDate: "2026-11-04", endDate: "2026-11-25" },
+      observed: { recurring: true, dueDate: "2026-11-04", recurrenceParsed: false },
+      dueString: "raw Todoist recurrence text",
+      taskTitle: "private task title",
+    }, "state-repository");
+  } finally {
+    console.log = original;
+  }
+  assert.deepEqual(JSON.parse(lines[0]), {
+    level: "info",
+    event: "calendar_recurrence_todoist_readback_mismatch",
+    component: "state-repository",
+    expected: { frequency: "weekly", weekday: "Wednesday", startDate: "2026-11-04", endDate: "2026-11-25" },
+    observed: { recurring: true, dueDate: "2026-11-04", recurrenceParsed: false },
+  });
+});
+
 test("logEvent emits one valid structured JSON record without unsafe fields", () => {
   const original = console.log;
   const lines = [];
