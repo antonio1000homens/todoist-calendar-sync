@@ -8,7 +8,7 @@ import { DynamoReconciliationStore } from "./reconciliation.js";
 import { ReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
 import { calendarEventHasElapsed, hasCanonicalState, occurrenceStateMatches, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
-import { upsertProjectMappingComment, deleteMappingComments } from "./mapping-comments.js";
+import { upsertProjectMappingComment, deleteMappingComments, mappingCommentIds, parseMappingComment, isOwnedLegacyTaskMappingComment } from "./mapping-comments.js";
 import { calendarRecurrenceMatchesTodoist, selectTodoistCurrentInstance, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
@@ -64,6 +64,28 @@ function mappingPayload(mapping:Mapping|undefined):unknown {
   if(!mapping)return null;
   const {pk:_pk,sk:_sk,lookupPk:_lookupPk,lookupSk:_lookupSk,...payload}=mapping as Mapping & Record<string,unknown>;
   return payload;
+}
+async function deleteExactMappingComments(client:Awaited<ReturnType<ProviderClientFactory>>["todoist"],mapping:Mapping):Promise<number> {
+  let deleted=0;
+  const ids=mappingCommentIds(mapping);
+  for(const [kind,id] of [["project",ids.project],["legacy",ids.legacyTask]] as const) {
+    if(!id) continue;
+    let comment;
+    try { comment=await client.getComment(id); }
+    catch(error) { if(missing(error)) continue; throw error; }
+    const owned=kind==="project"
+      ? (()=>{const parsed=parseMappingComment(comment);return Boolean(parsed&&!(("error" in parsed))&&parsed.payload.profile===mapping.profile
+        &&parsed.payload.taskId===mapping.taskId&&parsed.payload.eventId===mapping.eventId
+        &&parsed.payload.seriesId===mapping.seriesId&&parsed.payload.masterEventId===mapping.masterEventId
+        &&parsed.payload.activeInstanceId===mapping.activeInstanceId);})()
+      : isOwnedLegacyTaskMappingComment(comment,mapping);
+    if(!owned) throw new Error(`Mapping comment ${id} no longer matches exact mapping ${mapping.taskId} ↔ ${mapping.eventId}`);
+    await client.deleteComment(id);
+    try { await client.getComment(id); throw new Error(`Mapping comment ${id} remains after deletion`); }
+    catch(error) { if(!missing(error)) throw error; }
+    deleted++;
+  }
+  return deleted;
 }
 function calendarSeriesRuleMatchesTodoistTask(event: CalendarEvent, task: TodoistTask): boolean {
   const rule = todoistRecurrenceToRrule(task);
@@ -315,7 +337,8 @@ export class ReviewEngine {
     if (!record || record.profile !== intent.profile) invalidRepairIntent("Conflict not found in this profile");
     if (!["flatten","todoist-only","todoist-only-delete-calendar","calendar-history-only","link","transfer","separate","create","exclude","decision","verify","move"].includes(intent.action)) invalidRepairIntent("Unknown repair action");
     if (!["none","todoist","calendar"].includes(intent.winner) || !["occurrence","series","future"].includes(intent.scope)) invalidRepairIntent("Invalid field winner or recurrence scope");
-    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
+    if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked","delete"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
+    if (Object.values(intent.leftovers).includes("delete") && intent.action !== "transfer") invalidRepairIntent("Exact deletion is available only for an explicitly selected one-off duplicate during a Calendar series transfer");
     if (intent.action !== "transfer" && Object.values(intent.leftovers).includes("retain-unlinked")) invalidRepairIntent("Retain unlinked is available only during an explicit Calendar series transfer");
     intent = decisionRepairIntent(intent, record.decision);
     let snapshots = await this.collect(intent, record.decision);
@@ -640,7 +663,7 @@ export class ReviewEngine {
       if (oldTaskId && oldTaskId !== task.id && !previous) invalidRepairIntent("The displaced recurrence mapping is missing or ambiguous; use a fresh preview or the stale-mapping recovery workflow");
       if (previous) {
         const disposition = intent.leftovers[entityKey({profile:previous.profile,side:"todoist",id:previous.taskId})];
-        if (!["retain-unlinked","exclude","create"].includes(String(disposition))) invalidRepairIntent("Choose an explicit disposition for the exact displaced Todoist task before transfer");
+        if (!["retain-unlinked","exclude","create","delete"].includes(String(disposition))) invalidRepairIntent("Choose an explicit disposition for the exact displaced Todoist task before transfer");
       }
       if (masterSnapshot.recurrence && !masterSnapshot.recurrence.updatedAt) invalidRepairIntent("The Calendar recurrence state has no version; refresh affected items before transfer");
       if (previous && (!previous.updatedAt || previous.profile !== intent.profile || previous.masterEventId !== event.id
@@ -652,6 +675,86 @@ export class ReviewEngine {
       if (!oldTaskId && snapshots.some(s => s.mapping?.recurrenceOwner === "calendar" && s.mapping.masterEventId === event.id)) invalidRepairIntent("A competing Calendar-owned mapping exists without matching recurrence state");
       if (Object.entries(intent.leftovers).some(([key, disposition]) => disposition === "retain-unlinked"
         && !snapshots.some(s => entityKey(s.ref) === key && s.mapping?.taskId === oldTaskId))) invalidRepairIntent("Retain unlinked is allowed only for the exact displaced task mapping");
+    }
+    if (intent.action === "transfer") {
+      const selectedIds = new Set([intent.taskId, intent.eventId, masterSnapshot?.calendarProjectionId].filter((value): value is string => Boolean(value)));
+      const profileMappings=Object.values(intent.leftovers).includes("delete")?await this.state.listMappings(intent.profile):[];
+      const profileRecurrences=Object.values(intent.leftovers).includes("delete")?await this.state.listRecurrenceLinks(intent.profile):[];
+      for (const [key, disposition] of Object.entries(intent.leftovers)) if (disposition === "delete") {
+        const snapshot = snapshots.find(value => entityKey(value.ref) === key);
+        if (!snapshot?.object || selectedIds.has(snapshot.ref.id)) invalidRepairIntent(`Exact deletion target ${key} is missing or overlaps the selected annual series`);
+        const indexedMappings=profileMappings.filter(mapping=>snapshot.ref.side==="todoist"
+          ? mapping.taskId===snapshot.ref.id : mapping.eventId===snapshot.ref.id);
+        if(snapshot.mapping ? indexedMappings.length!==1||reviewHash(mappingPayload(indexedMappings[0]))!==reviewHash(mappingPayload(snapshot.mapping))
+          : indexedMappings.length!==0) invalidRepairIntent(`Deletion target ${key} has missing, partial, duplicate, or stale mapping indexes`);
+        if(profileRecurrences.some(link=>snapshot.ref.side==="todoist"?link.taskId===snapshot.ref.id
+          :[link.masterEventId,link.activeInstanceId,link.eventId].includes(snapshot.ref.id))) {
+          const displaced=Boolean(snapshot.ref.side==="todoist"&&snapshot.mapping&&masterSnapshot?.recurrence
+            &&snapshot.mapping.taskId===masterSnapshot.recurrence.taskId&&snapshot.mapping.seriesId===masterSnapshot.recurrence.seriesId
+            &&snapshot.mapping.masterEventId===masterSnapshot.recurrence.masterEventId);
+          if(!displaced) invalidRepairIntent(`Deletion target ${key} is referenced by recurrence state; only the exact displaced one-off task may be detached by this transfer`);
+        }
+        if (snapshot.ref.side === "calendar") {
+          const candidate = snapshot.object as CalendarEvent;
+          if (candidate.status !== "confirmed" || !candidate.etag || candidate.recurrence?.length || candidate.recurringEventId
+            || candidate.extendedProperties?.shared?.syncRecurrenceOwner || candidate.extendedProperties?.shared?.todoistRecurrence) {
+            invalidRepairIntent(`Calendar deletion target ${key} is recurring, an occurrence, or carries recurrence ownership; only an exact standalone one-off can be deleted`);
+          }
+          if (candidate.extendedProperties?.shared?.taskId && candidate.extendedProperties.shared.taskId !== snapshot.mapping?.taskId) {
+            invalidRepairIntent(`Calendar deletion target ${key} has conflicting task metadata and mapping`);
+          }
+        } else {
+          const candidate = snapshot.object as TodoistTask;
+          if (!candidate.due || candidate.due.is_recurring || candidate.is_deleted || candidate.is_completed) {
+            invalidRepairIntent(`Todoist deletion target ${key} is completed, deleted, undated, or recurring; only an active one-off can be deleted`);
+          }
+          if (snapshot.recurrence || snapshot.mapping?.recurrenceOwner || snapshot.mapping?.seriesId || snapshot.mapping?.masterEventId || snapshot.mapping?.activeInstanceId) {
+            // The previously mapped duplicate is allowed only when the transfer itself atomically replaces that exact mapping.
+            const isDisplacedMapping = Boolean(snapshot.mapping && masterSnapshot?.recurrence
+              && snapshot.mapping.taskId === masterSnapshot.recurrence.taskId
+              && snapshot.mapping.seriesId === masterSnapshot.recurrence.seriesId
+              && snapshot.mapping.masterEventId === masterSnapshot.recurrence.masterEventId
+              && snapshot.mapping.updatedAt);
+            if (!isDisplacedMapping) invalidRepairIntent(`Todoist deletion target ${key} has recurrence-linked state outside the exact mapping being replaced`);
+          }
+        }
+        if (snapshot.mapping && (!snapshot.mapping.updatedAt || snapshot.mapping.profile !== intent.profile)) {
+          invalidRepairIntent(`Deletion target ${key} has a partial or cross-profile mapping`);
+        }
+        if (snapshot.mapping && (snapshot.mapping.recurrenceOwner || snapshot.mapping.seriesId
+          || snapshot.mapping.masterEventId || snapshot.mapping.activeInstanceId)) {
+          const isDisplacedTask = snapshot.ref.side === "todoist" && snapshot.mapping.taskId === masterSnapshot?.recurrence?.taskId
+            && snapshot.mapping.seriesId === masterSnapshot.recurrence.seriesId
+            && snapshot.mapping.masterEventId === masterSnapshot.recurrence.masterEventId;
+          if (!isDisplacedTask) invalidRepairIntent(`Deletion target ${key} has recurrence mapping state outside the exact displaced Todoist mapping`);
+        }
+        if (snapshot.mapping) {
+          const counterpartRef = snapshot.ref.side === "todoist"
+            ? {profile:snapshot.mapping.profile,side:"calendar" as const,id:snapshot.mapping.eventId}
+            : {profile:snapshot.mapping.profile,side:"todoist" as const,id:snapshot.mapping.taskId};
+          const counterpart = snapshots.find(value => entityKey(value.ref) === entityKey(counterpartRef));
+          if (!counterpart?.object || !counterpart.mapping || reviewHash(mappingPayload(counterpart.mapping)) !== reviewHash(mappingPayload(snapshot.mapping))) {
+            invalidRepairIntent(`Deletion target ${key} has an incomplete or disagreeing counterpart mapping`);
+          }
+          if(snapshot.ref.side==="todoist") {
+            const mappedEvent=counterpart!.object as CalendarEvent;
+            const isDisplaced=Boolean(masterSnapshot?.recurrence&&snapshot.mapping.taskId===masterSnapshot.recurrence.taskId
+              &&snapshot.mapping.seriesId===masterSnapshot.recurrence.seriesId&&snapshot.mapping.masterEventId===masterSnapshot.recurrence.masterEventId);
+            if(!isDisplaced&&(mappedEvent.status!=="confirmed"||!mappedEvent.etag||mappedEvent.recurrence?.length||mappedEvent.recurringEventId)) {
+              invalidRepairIntent(`Mapped Calendar counterpart ${counterpartRef.id} cannot be safely detached while deleting ${key}`);
+            }
+          }
+        }
+        if (snapshot.ref.side === "calendar" && await this.state.getCompletedCalendarProjectionByEvent(intent.profile,snapshot.ref.id)) {
+          invalidRepairIntent(`Calendar deletion target ${key} has retained completion history and is not eligible for no-history purge`);
+        }
+        if (snapshot.ref.side === "todoist" && (await this.state.listCompletedCalendarProjectionsByTaskAnyProfile(snapshot.ref.id)).length) {
+          invalidRepairIntent(`Todoist deletion target ${key} has retained completion history and is not eligible for no-history purge`);
+        }
+        if (snapshot.mapping && (await this.state.listCompletedCalendarProjectionsByTaskAnyProfile(snapshot.mapping.taskId)).length) {
+          invalidRepairIntent(`Mapped deletion target ${key} belongs to a task with retained completion history and is not eligible for no-history purge`);
+        }
+      }
     }
     if (intent.action === "link" && event?.recurringEventId && intent.owner === "todoist") {
       const parent = masterSnapshot?.object as CalendarEvent|undefined;
@@ -695,6 +798,19 @@ export class ReviewEngine {
     const preview: RepairPreview = { id: randomUUID(), actor, intent, case: record, snapshots, fingerprint: snapshotFingerprint(snapshots),
       createdAt: at(), expiresAt: Math.floor(Date.now()/1000)+600, changes, warnings, itemPlan: [],
       ...(elapsedCalendarHistoryPlan?{elapsedCalendarHistoryPlan}:{}) };
+    if(intent.action==="transfer"&&Object.values(intent.leftovers).includes("delete")) {
+      const reconciliation=new DynamoReconciliationStore(),identities=new CanonicalIdentityStore();
+      preview.oneOffDeletionPlans=[];
+      for(const [key,disposition] of Object.entries(intent.leftovers)) if(disposition==="delete") {
+        const snapshot=snapshots.find(value=>entityKey(value.ref)===key)!;
+        const mappedTaskId=snapshot.ref.side==="todoist"?snapshot.ref.id:snapshot.mapping?.taskId;
+        const [baseline,canonical]=await Promise.all([
+          mappedTaskId?reconciliation.getBaseline(snapshot.ref.profile,mappedTaskId):Promise.resolve(undefined),
+          identities.get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id),
+        ]);
+        preview.oneOffDeletionPlans.push({ref:snapshot.ref,mapping:snapshot.mapping,baseline:baseline??null,canonical:canonical??null});
+      }
+    }
     if (intent.action === "flatten") {
       if (record.status && record.status !== "open") invalidRepairIntent("Flatten is available only for unresolved open cases");
       if (!task || !event?.recurringEventId || !masterSnapshot?.object) invalidRepairIntent("Select the exact Calendar occurrence and live Todoist task to flatten");
@@ -1045,6 +1161,10 @@ export class ReviewEngine {
       } else if (disposition === "retain-unlinked") {
         operation = "Retain provider item and detach its old mapping";
         result = "Keep this exact provider object unchanged; detach only its obsolete mapping, ownership, comments, and baseline links";
+      } else if (disposition === "delete") {
+        operation = "Delete exact one-off provider object and purge attributable state";
+        const plan=preview.oneOffDeletionPlans?.find(value=>entityKey(value.ref)===key);
+        result = `Delete exact ${s.ref.side} ID ${s.ref.id}; remove ${plan?.mapping?`mapping ${plan.mapping.taskId} ↔ ${plan.mapping.eventId}, its identified comments, and task baseline ${plan.mapping.taskId}`:"no mapping indexes"}; purge only the previewed canonical identity; preserve selected annual task, master, occurrence, and mapping`;
       } else if (selected && intent.action === "separate") {
         operation = "Keep selected items separate";
         result = "Remove existing association; do not link the selected pair";
@@ -1467,7 +1587,7 @@ export class ReviewEngine {
           throw new Error("A competing mapping now owns this Calendar series or occurrence; no transfer was applied");
         }
         const exactDisposition = previous && intent.leftovers[entityKey({profile:previous.profile,side:"todoist",id:previous.taskId})];
-        if (previous && !["retain-unlinked","exclude","create"].includes(String(exactDisposition))) throw new Error("Choose an explicit disposition for the exact displaced Todoist task before transfer");
+        if (previous && !["retain-unlinked","exclude","create","delete"].includes(String(exactDisposition))) throw new Error("Choose an explicit disposition for the exact displaced Todoist task before transfer");
         const transferMapping: Mapping = {
           profile:intent.profile, taskId:targetTask.id, eventId:activeId,
           projectId:targetTask.project_id || profiles[intent.profile].todoistProjectId,
@@ -1589,13 +1709,52 @@ export class ReviewEngine {
           });
         }
         if (previous) {
+          const previousDeletePlan=operation.preview.oneOffDeletionPlans?.find(value=>value.ref.side==="todoist"&&value.ref.id===previous.taskId);
           await this.controls.reject(previous.profile, previous.taskId, previous.eventId, id);
           await step(`transfer-delete-old-comment:${previous.taskId}`, async () => {
             const oldClient = await factory(previous.profile);
-            return trackedWrite(previous.profile, () => deleteMappingComments(oldClient.todoist, previous), count => count);
+            return trackedWrite(previous.profile, () => exactDisposition==="delete"
+              ? deleteExactMappingComments(oldClient.todoist,previous)
+              : deleteMappingComments(oldClient.todoist, previous), count => count);
           });
-          await step(`transfer-delete-old-baseline:${previous.taskId}`, async () => new DynamoReconciliationStore().deleteBaseline(previous.profile, previous.taskId));
+          await step(`transfer-delete-old-baseline:${previous.taskId}`, async () => {
+            const store=new DynamoReconciliationStore();
+            if(exactDisposition!=="delete") return store.deleteBaseline(previous.profile,previous.taskId);
+            const removed=await store.deleteBaselineIfUnchanged(previous.profile,previous.taskId,previousDeletePlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined);
+            if(!removed) throw new Error(`Baseline for deleted Todoist task ${previous.taskId} changed after preview; refresh before purge`);
+            return true;
+          });
           if (exactDisposition === "retain-unlinked") await this.controls.exclude({profile:previous.profile,side:"todoist",id:previous.taskId},true,id);
+          if (exactDisposition === "delete") {
+            const oldTaskSnapshot = operation.preview.snapshots.find(s => s.ref.side === "todoist" && s.ref.id === previous.taskId);
+            if (!oldTaskSnapshot?.object) throw new Error("The exact displaced Todoist deletion target is missing from the approved preview");
+            const oldTask = oldTaskSnapshot.object as TodoistTask;
+            await this.controls.exclude(oldTaskSnapshot.ref,true,id);
+            const identityPlan=previousDeletePlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
+            const identities=new CanonicalIdentityStore();
+            const currentIdentity=await identities.get(previous.profile,"todoist",previous.taskId);
+            if(identityPlan&&reviewHash(currentIdentity)!==reviewHash(identityPlan)) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed after preview`);
+            if(!identityPlan&&currentIdentity) throw new Error(`A new canonical identity for deleted Todoist task ${previous.taskId} appeared after preview`);
+            if(identityPlan) await step(`transfer-delete-old-canonical:${previous.taskId}`,async()=> {
+              const removed=await identities.deleteIfUnchanged(identityPlan);
+              if(!removed) throw new Error(`Canonical identity for deleted Todoist task ${previous.taskId} changed during purge`);
+              return true;
+            });
+            await step(`transfer-delete-displaced-task:${previous.taskId}`, async () => {
+              let live:TodoistTask|undefined;
+              try { live = await pair.todoist.getTask(previous.taskId); }
+              catch (error) { if (!missing(error)) throw error; }
+              const saved = operation.steps[`transfer-delete-displaced-task:${previous.taskId}`];
+              if (!live && (saved?.status === "running" || saved?.status === "done")) return true;
+              if (!live || reviewHash(live) !== reviewHash(oldTask) || live.due?.is_recurring || live.is_deleted || live.is_completed) {
+                throw new Error(`Displaced task ${previous.taskId} changed after preview; no deletion was applied`);
+              }
+              await trackedWrite(previous.profile, () => pair.todoist.deleteTask(previous.taskId));
+              try { await pair.todoist.getTask(previous.taskId); throw new Error(`Todoist task ${previous.taskId} remains after deletion`); }
+              catch (error) { if (!missing(error)) throw error; }
+              return true;
+            });
+          }
         }
         await this.controls.allow(intent.profile,targetTask.id,activeId);
         const mappedComment = await step(`transfer-project-comment:${targetTask.id}`, async () => {
@@ -1630,6 +1789,88 @@ export class ReviewEngine {
         for (const snapshot of operation.preview.snapshots) {
           const disposition = intent.leftovers[entityKey(snapshot.ref)];
           if (!snapshot.object || !disposition || disposition === "retain-unlinked" || disposition === "unchanged") continue;
+          if (disposition === "delete") {
+            const isDisplacedTask = snapshot.ref.side === "todoist" && previous?.taskId === snapshot.ref.id;
+            const mapping = snapshot.mapping;
+            const deleteName = `transfer-delete-provider:${entityKey(snapshot.ref)}`;
+            if (!isDisplacedTask) {
+              await this.controls.exclude(snapshot.ref,true,id);
+              if (mapping) await this.controls.reject(mapping.profile,mapping.taskId,mapping.eventId,id);
+              await step(deleteName,async()=> {
+                const clientPair = await factory(snapshot.ref.profile);
+                let live:TodoistTask|CalendarEvent|null = null;
+                try { live = snapshot.ref.side === "todoist" ? await clientPair.todoist.getTask(snapshot.ref.id) : await clientPair.calendar.getEvent(snapshot.ref.id); }
+                catch(error) { if (!missing(error)) throw error; }
+                const saved=operation.steps[deleteName];
+                if (!live && (saved?.status === "running" || saved?.status === "done")) return true;
+                if (!live || reviewHash(live) !== reviewHash(snapshot.object)) throw new Error(`Exact deletion target ${entityKey(snapshot.ref)} changed after preview`);
+                if (snapshot.ref.side === "todoist") {
+                  const task=live as TodoistTask;
+                  if (!task.due || task.due.is_recurring || task.is_deleted || task.is_completed) throw new Error(`Todoist target ${snapshot.ref.id} is no longer an eligible one-off`);
+                  await trackedWrite(snapshot.ref.profile,()=>clientPair.todoist.deleteTask(snapshot.ref.id));
+                  try { await clientPair.todoist.getTask(snapshot.ref.id); throw new Error(`Todoist task ${snapshot.ref.id} remains after deletion`); }
+                  catch(error) { if (!missing(error)) throw error; }
+                } else {
+                  const event=live as CalendarEvent;
+                  if (event.status !== "confirmed" || event.recurrence?.length || event.recurringEventId || !event.etag) throw new Error(`Calendar target ${snapshot.ref.id} is no longer an eligible standalone one-off`);
+                  await trackedWrite(snapshot.ref.profile,()=>clientPair.calendar.deleteEventIfUnchanged(snapshot.ref.id,event.etag!));
+                  try { await clientPair.calendar.getEvent(snapshot.ref.id); throw new Error(`Calendar event ${snapshot.ref.id} remains after deletion`); }
+                  catch(error) { if (!missing(error)) throw error; }
+                }
+                return true;
+              });
+              if (mapping) {
+                await step(`transfer-delete-mapping:${mapping.taskId}`,async()=>{
+                  const removed=await state.deleteMappingIfUnchanged(mapping);
+                  if(!removed) throw new Error(`Mapping ${mapping.taskId} ↔ ${mapping.eventId} changed after preview; no newer indexes were removed`);
+                  return true;
+                });
+                await step(`transfer-delete-comment:${mapping.taskId}`,async()=> {
+                  const oldClient=await factory(mapping.profile);
+                  return trackedWrite(mapping.profile,()=>deleteExactMappingComments(oldClient.todoist,mapping),count=>count);
+                });
+              }
+              const deletionPlan=operation.preview.oneOffDeletionPlans?.find(value=>entityKey(value.ref)===entityKey(snapshot.ref));
+              const baselineTaskId=mapping?.taskId || (snapshot.ref.side==="todoist"?snapshot.ref.id:undefined);
+              if(baselineTaskId) await step(`transfer-delete-baseline:${baselineTaskId}`,async()=> {
+                const removed=await new DynamoReconciliationStore().deleteBaselineIfUnchanged(mapping?.profile||snapshot.ref.profile,baselineTaskId,
+                  deletionPlan?.baseline as import("./reconciliation.js").ReconciliationBaseline|null|undefined);
+                if(!removed) throw new Error(`Baseline for ${baselineTaskId} changed after preview`);
+                return true;
+              });
+              const identityPlan=deletionPlan?.canonical as import("./canonical-identity.js").CanonicalIdentityRecord|null|undefined;
+              const identityStore=new CanonicalIdentityStore(),currentIdentity=await identityStore.get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id);
+              if(identityPlan&&reviewHash(identityPlan)!==reviewHash(currentIdentity)) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed after preview`);
+              if(!identityPlan&&currentIdentity) throw new Error(`A canonical identity for ${entityKey(snapshot.ref)} appeared after preview`);
+              if(identityPlan) await step(`transfer-delete-canonical:${entityKey(snapshot.ref)}`,async()=> {
+                const removed=await identityStore.deleteIfUnchanged(identityPlan);
+                if(!removed) throw new Error(`Canonical identity for ${entityKey(snapshot.ref)} changed during purge`);
+                return true;
+              });
+              const counterpartRef = mapping ? snapshot.ref.side === "todoist"
+                ? {profile:mapping.profile,side:"calendar" as const,id:mapping.eventId}
+                : {profile:mapping.profile,side:"todoist" as const,id:mapping.taskId} : undefined;
+              const counterpart = counterpartRef && operation.preview.snapshots.find(value=>entityKey(value.ref)===entityKey(counterpartRef));
+              if (counterpart?.object) {
+                await this.controls.exclude(counterpart.ref,true,id);
+                if (snapshot.ref.side === "todoist" && counterpart.ref.side === "calendar") {
+                  await step(`transfer-delete-counterpart-metadata:${counterpart.ref.id}`,async()=> {
+                    const clientPair=await factory(counterpart.ref.profile),event=await clientPair.calendar.getEvent(counterpart.ref.id);
+                    const expected=counterpart.object as CalendarEvent;
+                    if (reviewHash(event)!==reviewHash(expected) && reviewHash(event)!==reviewHash(clearTodoistCalendarIdentity(expected))) {
+                      throw new Error(`Calendar counterpart ${event.id} changed after exact Todoist deletion`);
+                    }
+                    const shared=event.extendedProperties?.shared||{};
+                    if (shared.taskId || shared.syncRecurrenceOwner || Object.keys(shared).some(name=>name.startsWith("todoist"))) {
+                      await trackedWrite(counterpart.ref.profile,()=>clientPair.calendar.upsertEventIfUnchanged(clearTodoistCalendarIdentity(event),event.id,event.etag!));
+                    }
+                    return true;
+                  });
+                }
+              }
+            }
+            continue;
+          }
           if (disposition === "exclude") await step(`transfer-exclude:${entityKey(snapshot.ref)}`, () => this.controls.exclude(snapshot.ref,true,id));
           if (disposition === "create") {
             const clients = await factory(snapshot.ref.profile);
@@ -1805,6 +2046,28 @@ export class ReviewEngine {
       }
       const outcomes: NonNullable<RepairOperation["outcomes"]> = [];
       for(const snapshot of operation.preview.snapshots) {
+        if(intent.leftovers[entityKey(snapshot.ref)]==="delete") {
+          const current=await this.snapshot(snapshot.ref);
+          const stillExists=current.object && !(snapshot.ref.side==="calendar"&&(current.object as CalendarEvent).status==="cancelled");
+          if(stillExists) throw new Error(`Exact deletion target ${entityKey(snapshot.ref)} is still present after Apply`);
+          const deletionPlan=operation.preview.oneOffDeletionPlans?.find(value=>entityKey(value.ref)===entityKey(snapshot.ref));
+          if(!deletionPlan) throw new Error(`Exact deletion target ${entityKey(snapshot.ref)} has no persisted cleanup plan`);
+          const mapping=deletionPlan.mapping;
+          if(mapping) {
+            const [eventMapping,taskMapping,ownerMapping]=await Promise.all([
+              state.getMappingByEvent(mapping.profile,mapping.eventId),state.getMappingByTask(mapping.profile,mapping.taskId),state.getMappingByTaskAnyProfile(mapping.taskId),
+            ]);
+            if(eventMapping?.taskId===mapping.taskId || taskMapping?.eventId===mapping.eventId || ownerMapping?.profile===mapping.profile&&ownerMapping.eventId===mapping.eventId) {
+              throw new Error(`Mapping indexes for deleted object ${entityKey(snapshot.ref)} remain after purge`);
+            }
+          }
+          const baselineTaskId=mapping?.taskId || (snapshot.ref.side==="todoist"?snapshot.ref.id:undefined);
+          if(baselineTaskId&&await new DynamoReconciliationStore().getBaseline(mapping?.profile||snapshot.ref.profile,baselineTaskId)) throw new Error(`Baseline for deleted object ${entityKey(snapshot.ref)} remains after purge`);
+          const canonical=await new CanonicalIdentityStore().get(snapshot.ref.profile,snapshot.ref.side,snapshot.ref.id);
+          if(canonical) throw new Error(`Canonical identity for deleted object ${entityKey(snapshot.ref)} remains after purge`);
+          outcomes.push({entity:entityKey(snapshot.ref),outcome:"deleted",checkedAt:at()});
+          continue;
+        }
         const excluded=await this.controls.control(snapshot.ref);
         if(excluded?.excluded && intent.leftovers[entityKey(snapshot.ref)] !== "retain-unlinked") {outcomes.push({entity:entityKey(snapshot.ref),outcome:"excluded",checkedAt:at()});continue;}
         if(verified.some(v=>v.profile===snapshot.ref.profile&&(snapshot.ref.side==="todoist"?v.taskId===snapshot.ref.id:v.eventId===snapshot.ref.id))||["decision","move"].includes(intent.action))continue;
@@ -1932,6 +2195,12 @@ export class ReviewEngine {
       for(const outcome of outcomes){
         const snapshot=operation.preview.snapshots.find(item=>entityKey(item.ref)===outcome.entity);
         if(!snapshot)throw new Error(`Recorded outcome ${outcome.entity} is missing its preview reference`);
+        if(outcome.outcome==="deleted") {
+          const current=await this.snapshot(snapshot.ref);
+          if(current.object&&!(snapshot.ref.side==="calendar"&&(current.object as CalendarEvent).status==="cancelled")) throw new Error(`Deleted provider item ${outcome.entity} reappeared before release`);
+          if(current.mapping) throw new Error(`Deleted provider item ${outcome.entity} regained a mapping before release`);
+          continue;
+        }
         if(intent.action==="calendar-history-only") {
           const plan=operation.preview.elapsedCalendarHistoryPlan!,current=await this.snapshot(snapshot.ref);
           if(snapshot.ref.side==="calendar"&&snapshot.ref.id===plan.eventId) {

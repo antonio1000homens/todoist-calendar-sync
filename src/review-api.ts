@@ -85,10 +85,10 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
     return value;
   };
   if (body.leftovers !== undefined && (!body.leftovers || typeof body.leftovers !== "object" || Array.isArray(body.leftovers))) fail(400, "Invalid leftover dispositions");
-  const leftovers: Record<string,"exclude"|"create"|"unchanged"|"retain-unlinked"> = {};
+  const leftovers: Record<string,"exclude"|"create"|"unchanged"|"retain-unlinked"|"delete"> = {};
   for (const [key,value] of Object.entries((body.leftovers || {}) as Record<string,unknown>)) {
-    if (!/^(home|antonio|work):(todoist|calendar):.{1,1024}$/.test(key) || !["exclude","create","unchanged","retain-unlinked"].includes(String(value))) fail(400,"Invalid leftover disposition");
-    leftovers[key] = value as "exclude"|"create"|"unchanged"|"retain-unlinked";
+    if (!/^(home|antonio|work):(todoist|calendar):.{1,1024}$/.test(key) || !["exclude","create","unchanged","retain-unlinked","delete"].includes(String(value))) fail(400,"Invalid leftover disposition");
+    leftovers[key] = value as "exclude"|"create"|"unchanged"|"retain-unlinked"|"delete";
   }
   const decisionAction = typeof body.decisionAction === "string" ? body.decisionAction : undefined;
   const taskId = decisionAction?.startsWith("bind_task:") ? decisionAction.slice("bind_task:".length)

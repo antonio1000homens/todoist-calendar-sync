@@ -88,12 +88,14 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async listCompletedCalendarProjectionsByTaskAnyProfile() { return []; },
+    async listCompletedCalendarProjectionsByTask() { return []; },
     async getCalendarProjectionTombstone() { return undefined; },
     async getConsolidatedTask() { return undefined; },
     async putCalendarProjectionTombstone(...args) { calls.push(["tombstone",...args]); },
     async getMappingByTaskAnyProfile(id) { return clone(ownerMappingMap.get(id)); },
     async getMappingByTask(profile, id) { const value = mappingMap.get(id); return value?.profile === profile ? clone(value) : undefined; },
     async getMappingByEvent(profile, id) { return clone(eventMappingMap.get(`${profile}:${id}`)||[...mappingMap.values()].find(value=>value.profile===profile&&value.eventId===id)); },
+    async listMappings(profile) { return clone([...mappingMap.values()].filter(value=>value.profile===profile)); },
     async getRecurrenceLink(_profile, id) { return clone(recurrences.get(id)); },
     async getRecurrenceLinkByTaskAnyProfile(id) {
       const matches=[...recurrences.values()].filter(value=>value.taskId===id);
@@ -137,6 +139,7 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     async deleteRecurrenceLink(_profile, id) { recurrences.delete(id); },
     async putMapping(value) { mappingMap.set(value.taskId, clone(value)); eventMappingMap.set(`${value.profile}:${value.eventId}`,clone(value)); ownerMappingMap.set(value.taskId,clone(value)); },
     async deleteMapping(value) { mappingMap.delete(value.taskId); eventMappingMap.delete(`${value.profile}:${value.eventId}`); ownerMappingMap.delete(value.taskId); },
+    async deleteMappingIfUnchanged(value) { mappingMap.delete(value.taskId); eventMappingMap.delete(`${value.profile}:${value.eventId}`); ownerMappingMap.delete(value.taskId); return true; },
     async commitElapsedCalendarHistoryDetach({profile,eventId,taskId,eventMapping,taskMapping,retainedEventMappings=[]}) {
       const currentEvent=eventMappingMap.get(`${profile}:${eventId}`);
       if(JSON.stringify(currentEvent||null)!==JSON.stringify(eventMapping||null))return false;
@@ -162,6 +165,10 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   for (const [name, method] of Object.entries(stateMethods)) t.mock.method(StateRepository.prototype, name, method);
   t.mock.method(DynamoReconciliationStore.prototype, "putBaseline", async (...args) => { baselines.push(clone(args)); });
   t.mock.method(DynamoReconciliationStore.prototype, "deleteBaseline", async () => {});
+  t.mock.method(DynamoReconciliationStore.prototype, "getBaseline", async () => undefined);
+  t.mock.method(DynamoReconciliationStore.prototype, "deleteBaselineIfUnchanged", async () => true);
+  t.mock.method(CanonicalIdentityStore.prototype, "get", async () => undefined);
+  t.mock.method(CanonicalIdentityStore.prototype, "deleteIfUnchanged", async () => true);
   t.mock.method(CanonicalIdentityStore.prototype, "put", async () => {});
   const controls = {
     async control(ref) { return clone(controlsMap.get(refKey(ref))); },
@@ -236,6 +243,9 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
     todoist: {
       async getTimeZone() { return "Europe/London"; },
       async getTask(id) { return get(taskMap, id); },
+      async deleteTask(id) { taskMap.delete(id); writes.push(["delete-task",id]); },
+      async getComment(id) { throw Object.assign(new Error("Not found"),{status:404}); },
+      async deleteComment(id) { writes.push(["delete-comment",id]); },
       async listTasks() { return clone([...taskMap.values()]); },
       async upsertTask(value, id) {
         id ||= "created-task"; const next = { project_id:profiles.home.todoistProjectId, ...taskMap.get(id), ...clone(value), id, updated_at: "2026-10-21T14:00:00Z" };
@@ -563,6 +573,113 @@ function birthdayTransferFixture() {
 
 const transferIntent=(fixture, leftovers={})=>intent({action:"transfer",taskId:fixture.annual.id,eventId:fixture.master.id,
   winner:"none",owner:"calendar",scope:"future",leftovers});
+
+test("transfer can delete the exact displaced one-off task and purge only its mapping state",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"});
+  const preview=await h.engine.preview(actor,input);
+  const planned=preview.itemPlan.find(row=>row.ref.side==="todoist"&&row.ref.id===f.displaced.id);
+  assert.equal(planned.operation,"Delete exact one-off provider object and purge attributable state");
+  assert.match(planned.result,/old-oneoff/);
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.equal(h.taskMap.has(f.displaced.id),false);
+  assert.ok(h.taskMap.has(f.annual.id));
+  assert.deepEqual(h.eventMap.get(f.master.id).recurrence,f.master.recurrence);
+  assert.ok(h.eventMap.has(f.active.id));
+  assert.equal(h.mappingMap.get(f.annual.id).eventId,f.active.id);
+  assert.equal(h.mappingMap.has(f.displaced.id),false);
+  assert.ok(h.writes.some(row=>row[0]==="delete-task"&&row[1]===f.displaced.id));
+  assert.ok(result.outcomes.some(row=>row.entity==="home:todoist:old-oneoff"&&row.outcome==="deleted"));
+  assert.equal((await h.engine.execute("repair")).status,"succeeded","retry is idempotent after provider and state deletion");
+});
+
+test("transfer deletes only the selected standalone Calendar duplicate and retains its task",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,
+    start:{date:"2027-07-17"},end:{date:"2027-07-18"},extendedProperties:{shared:{taskId:duplicateTask.id}}});
+  const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.equal(result.status,"succeeded",JSON.stringify(result));
+  assert.equal(h.eventMap.has(duplicateEvent.id),false);
+  assert.ok(h.taskMap.has(duplicateTask.id));
+  assert.equal(h.mappingMap.has(duplicateTask.id),false);
+  assert.equal(h.controlsMap.get("home:todoist:duplicate-task")?.excluded,true,"the retained task cannot recreate the deleted event");
+  assert.ok(h.writes.some(row=>row[0]==="delete-event"&&row[1]===duplicateEvent.id));
+  assert.ok(result.outcomes.some(row=>row.entity==="home:calendar:duplicate-event"&&row.outcome==="deleted"));
+});
+
+test("exact deletion resumes after provider deletion when mapping cleanup is temporarily unavailable",async t=>{
+  const f=birthdayTransferFixture(),duplicateTask=task("duplicate-task",{content:f.annual.content,description:f.annual.description,due:{date:"2027-07-17"}});
+  const duplicateEvent=event("duplicate-event",{summary:f.annual.content,description:f.annual.description,start:{date:"2027-07-17"},end:{date:"2027-07-18"}});
+  const duplicateMapping={profile:"home",taskId:duplicateTask.id,eventId:duplicateEvent.id,updatedAt:"2026-10-24T12:00:00.000Z"};
+  const h=harness(t,{events:[f.master,f.active,f.standalone,duplicateEvent],tasks:[f.annual,f.displaced,duplicateTask],mappings:[f.mapping,duplicateMapping],recurrence:f.recurrence});
+  const original=StateRepository.prototype.deleteMappingIfUnchanged;let attempts=0;
+  StateRepository.prototype.deleteMappingIfUnchanged=async function(mapping) { if(mapping.taskId===duplicateTask.id&&attempts++===0)return false;return original.call(this,mapping); };
+  t.after(()=>{StateRepository.prototype.deleteMappingIfUnchanged=original;});
+  const preview=await h.engine.preview(actor,transferIntent(f,{
+    "home:todoist:old-oneoff":"retain-unlinked","home:calendar:birthday-standalone":"unchanged",
+    "home:calendar:duplicate-event":"delete","home:todoist:duplicate-task":"unchanged",
+  }));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const first=await h.engine.execute("repair");
+  assert.notEqual(first.status,"succeeded");
+  assert.equal(h.eventMap.has(duplicateEvent.id),false,"the exact event deletion crossed its durable step boundary");
+  assert.equal(h.mappingMap.has(duplicateTask.id),true,"stale mapping remains until its conditional cleanup succeeds");
+  const second=await h.engine.execute("repair");
+  assert.equal(second.status,"succeeded",JSON.stringify(second));
+  assert.equal(h.mappingMap.has(duplicateTask.id),false);
+  assert.equal(h.writes.filter(row=>row[0]==="delete-event"&&row[1]===duplicateEvent.id).length,1,"retry does not issue a second provider deletion");
+});
+
+test("lost Todoist delete acknowledgement resumes from exact task absence",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const preview=await h.engine.preview(actor,transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"}));
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  h.clients.todoist.deleteTask=async id=>{h.taskMap.delete(id);h.writes.push(["delete-task",id]);throw new Error("lost delete acknowledgement");};
+  const first=await h.engine.execute("repair");
+  assert.notEqual(first.status,"succeeded");
+  assert.equal(h.taskMap.has(f.displaced.id),false);
+  h.clients.todoist.deleteTask=async()=>assert.fail("resume must not issue a second deletion");
+  const second=await h.engine.execute("repair");
+  assert.equal(second.status,"succeeded",JSON.stringify(second));
+  assert.equal(h.writes.filter(row=>row[0]==="delete-task"&&row[1]===f.displaced.id).length,1);
+});
+
+test("deletion preview rejects retained history, recurring objects and provider edits after preview",async t=>{
+  const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});
+  const input=transferIntent(f,{"home:todoist:old-oneoff":"delete","home:calendar:birthday-standalone":"unchanged"});
+  h.engine.state.listCompletedCalendarProjectionsByTaskAnyProfile=async id=>id===f.displaced.id?[{profile:"home",taskId:id,eventId:"old-history",completedAt:"2025-01-01T00:00:00Z"}]:[];
+  await assert.rejects(h.engine.preview(actor,input),/retained completion history/);
+  h.engine.state.listCompletedCalendarProjectionsByTaskAnyProfile=async()=>[];
+  const preview=await h.engine.preview(actor,input);
+  h.eventMap.get(f.standalone.id).summary="Externally changed";
+  h.operations.set("repair",{id:"repair",status:"queued",steps:{},preview});
+  const result=await h.engine.execute("repair");
+  assert.notEqual(result.status,"succeeded");
+  assert.equal(h.eventMap.get(f.standalone.id).summary,"Externally changed");
+  assert.ok(!h.writes.some(row=>row[0]==="delete-event"&&row[1]===f.standalone.id));
+});
+
+test("transfer deletion cannot target a recurring Calendar master or occurrence",async t=>{
+  const f=birthdayTransferFixture();
+  f.annual={...f.annual,due:{date:"2027-11-01",is_recurring:true,string:"every November 1"}};
+  f.master={...f.master,start:{date:"2023-11-01"},end:{date:"2023-11-02"},recurrence:["RRULE:FREQ=YEARLY"]};
+  f.active={...f.active,start:{date:"2027-11-01"},end:{date:"2027-11-02"},originalStartTime:{date:"2027-11-01"}};
+  const old=mappedTodoistOwnedSource(f);
+  const h=harness(t,{events:[f.master,f.active,f.standalone,old.sourceMaster,old.sourceOccurrence],tasks:[f.annual],mappings:[old.sourceMapping],recurrence:old.sourceLink});
+  await assert.rejects(h.engine.preview(actor,transferIntent(f,{
+    "home:calendar:birthday-master":"delete",
+    "home:calendar:old-todoist-master":"exclude","home:calendar:old-todoist-occurrence":"exclude",
+  })),/missing or overlaps the selected annual series/);
+});
 
 test("Calendar-owned series transfer preserves the recurring birthday task and atomically reassigns all mapping indexes",async t=>{
   const f=birthdayTransferFixture(),h=harness(t,{events:[f.master,f.active,f.standalone],tasks:[f.annual,f.displaced],mappings:[f.mapping],recurrence:f.recurrence});

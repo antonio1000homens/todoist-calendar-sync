@@ -1729,6 +1729,36 @@ export class StateRepository {
     }
   }
 
+  /** Delete an exact standalone mapping only when every primary index still has its previewed version. */
+  async deleteMappingIfUnchanged(mapping: Mapping): Promise<boolean> {
+    if (!mapping.updatedAt || mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
+    const table=this.ensureTable();
+    const conditions=(taskOwner=false)=>({
+      ConditionExpression: taskOwner
+        ? "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId)"
+        : "profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId)",
+      ...(taskOwner?{ExpressionAttributeNames:{"#profile":"profile"}}:{}),
+      ExpressionAttributeValues:{":profile":mapping.profile,":task":mapping.taskId,":event":mapping.eventId,":updated":mapping.updatedAt},
+    });
+    try {
+      await client.send(new TransactWriteCommand({TransactItems:[
+        {Delete:{TableName:table,Key:key(`EVENT#${mapping.profile}#${mapping.eventId}`,"MAP"),...conditions()}},
+        {Delete:{TableName:table,Key:key(`TASK#${mapping.profile}#${mapping.taskId}`,"MAP"),...conditions()}},
+        {Delete:{TableName:table,Key:key(`TASKOWNER#${mapping.taskId}`,"MAP"),...conditions(true)}},
+      ] as never}));
+      return true;
+    } catch(error) {
+      if((error as {name?:string}).name!=="TransactionCanceledException") throw error;
+      const [event,task,owner]=await Promise.all([
+        client.send(new GetCommand({TableName:table,Key:key(`EVENT#${mapping.profile}#${mapping.eventId}`,"MAP"),ConsistentRead:true})),
+        client.send(new GetCommand({TableName:table,Key:key(`TASK#${mapping.profile}#${mapping.taskId}`,"MAP"),ConsistentRead:true})),
+        client.send(new GetCommand({TableName:table,Key:key(`TASKOWNER#${mapping.taskId}`,"MAP"),ConsistentRead:true})),
+      ]);
+      if(!event.Item&&!task.Item&&!owner.Item) return true;
+      return false;
+    }
+  }
+
   /**
    * Remove only an elapsed Calendar event's EVENT row. The task-side indexes
    * are removed only when they still point to that exact event; if they point

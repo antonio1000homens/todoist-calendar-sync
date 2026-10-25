@@ -1,5 +1,6 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
+import { reviewHash } from "./review-store.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -267,6 +268,23 @@ export class DynamoReconciliationStore implements ReconciliationStore {
       TableName: this.ensureTable(),
       Key: key(`BASELINE#${profile}#TASK#${taskId}`, "RECONCILE"),
     }));
+  }
+
+  async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined):Promise<boolean> {
+    if(!tableName) throw new Error("STATE_TABLE_NAME is not configured");
+    const key= {pk:`BASELINE#${profile}#TASK#${taskId}`,sk:"RECONCILE"};
+    const current=await documentClient.send(new GetCommand({TableName:tableName,Key:key,ConsistentRead:true}));
+    if(!expected) return !current.Item;
+    if(!current.Item || reviewHash(current.Item.baseline)!==reviewHash(expected) || current.Item.updatedAt!==expected.updatedAt) return false;
+    try {
+      await documentClient.send(new DeleteCommand({TableName:tableName,Key:key,
+        ConditionExpression:"updatedAt = :updated AND baseline = :baseline",
+        ExpressionAttributeValues:{":updated":expected.updatedAt,":baseline":expected}}));
+      return true;
+    } catch(error) {
+      if((error as {name?:string}).name!=="ConditionalCheckFailedException") throw error;
+      return false;
+    }
   }
 }
 

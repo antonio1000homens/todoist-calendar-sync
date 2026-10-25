@@ -97,6 +97,16 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
                 await save();
                 return;
               }
+              const displacedDeleteStatus = operation.steps[`transfer-delete-displaced-task:${id}`]?.status;
+              if (side === "todoist" && object === null
+                && (displacedDeleteStatus === "running" || displacedDeleteStatus === "done")) {
+                // A Todoist delete may succeed while its acknowledgement is
+                // lost. Persist the exact ID's absence so subsequent reads and
+                // retries can finish cleanup without issuing another delete.
+                expected[key] = null;
+                await save();
+                return;
+              }
               if (approvedRecovery) { expected[key] = object; await save(); return; }
               throw new Error(`Provider item ${key} changed after preview or the last recorded repair write; review live state before continuing`);
             }
