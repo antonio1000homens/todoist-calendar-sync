@@ -1328,7 +1328,9 @@ export class ManualInterventionService {
         ? { mode: "auto" as const, defaultAction: type === "calendar_owned_recurrence_task_deleted"
           ? "delete_whole_series" : "delete_calendar_series" }
         : {}),
-      defaultAction: resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
+      defaultAction: routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
+        ? type === "calendar_owned_recurrence_task_deleted" ? "delete_whole_series" : "delete_calendar_series"
+        : resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
     };
     if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
 
