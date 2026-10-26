@@ -228,6 +228,14 @@ test("recovery eligibility is phase-specific and never resumes already begun pro
   for(const [phase,allowed] of phases){
     const f=fixture();
     f.operation.lifecycle.phase=phase;
+    if(["drain_after_timeout","ready_for_delete"].includes(phase))
+      f.operation.lifecycle.evidence.workerTimeoutElapsed={
+        operationId:"op-recovery",phase:"workerTimeoutElapsed",
+        receiptId:"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",completedAt:2000};
+    if(phase==="ready_for_delete")
+      f.operation.lifecycle.evidence.postTimeoutDrain={
+        operationId:"op-recovery",phase:"postTimeoutDrain",
+        receiptId:"ffffffff-ffff-4fff-8fff-ffffffffffff",completedAt:3000};
     if(["delete","verify_deletion","restore_mappings","confirm_restored","release_fence"].includes(phase))
       f.operation.lifecycle.evidence.deletionStarted={
         operationId:"op-recovery",phase:"deletionStarted",
@@ -251,4 +259,25 @@ test("transport read failures, stale confirmations and missing operation never t
   stale.confirmation.expiresAtMs=Date.now()-1000;
   await assert.rejects(stale.service.apply("op-recovery",issued.confirmationId,"operator"),/expired/);
   assert.equal(stale.operation.recovery,undefined);
+});
+
+
+test("recovery cannot restore mappings until the original worker timeout has elapsed",async()=>{
+  const f=fixture();
+  f.operation.lifecycle.evidence.fenceInstalled.completedAt=Date.now()-5_000;
+  const inspection=await f.service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,false);
+  assert.match(inspection.preview.blockers.join(" "),/worker timeout/i);
+  assert.equal(f.external.writes.length,0);
+});
+
+test("phase escalation cannot bypass durable timeout and lease-drain receipts",async()=>{
+  for(const phase of ["drain_after_timeout","ready_for_delete"]){
+    const f=fixture();
+    f.operation.lifecycle.phase=phase;
+    const inspected=await f.service.inspect("op-recovery");
+    assert.equal(inspected.preview.allowed,false);
+    assert.match(inspected.preview.blockers.join(" "),/durable receipt/i);
+    assert.equal(f.external.writes.length,0);
+  }
 });
