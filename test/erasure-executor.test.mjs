@@ -96,6 +96,46 @@ test("revoked readiness stops active lifecycle work and retains its fence for br
   assert.match(item.lifecycle.lastError,/break-glass recovery is required/);
 });
 
+test("deployment revocation freezes a provider-ready lifecycle using the real store and CAS",async()=>{
+  const previous={enabled:process.env.ERASURE_EXECUTION_ENABLED,version:process.env.ERASURE_PROTOCOL_VERSION,
+    table:process.env.STATE_TABLE_NAME};
+  process.env.ERASURE_EXECUTION_ENABLED="false";process.env.ERASURE_PROTOCOL_VERSION="1";
+  process.env.STATE_TABLE_NAME="test-state";
+  const item={...storedQueuedOperation(),providerDeletionReady:true,status:"deleting",
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{}}};
+  const commands=[];
+  const db={async send(command){
+    commands.push(command);
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const input=command.input,values=input.ExpressionAttributeValues;
+      assert.match(input.ConditionExpression,/providerDeletionReady=:observedReady/);
+      assert.equal(values[":observedReady"],true);
+      assert.equal(values[":status"],"deleting");
+      assert.equal(values[":phase"],"delete");
+      assert.equal(values[":fingerprint"],item.previewFingerprint);
+      item.status=values[":reviewRequired"];
+      item.lifecycle.lastError=values[":error"];
+      return {};
+    }
+    throw new Error("Unexpected database command");
+  }};
+  try {
+    const store=new ErasureOperationStore(db);
+    await store.markExecutionDisabledReviewRequired("op");
+    assert.equal(item.status,"review_required");
+    assert.equal(item.lifecycle.phase,"delete");
+    assert.match(item.lifecycle.lastError,/break-glass recovery is required/);
+    assert.equal(commands.filter(x=>x.constructor.name.includes("Update")).length,1);
+    await assert.rejects(store.markExecutionDisabledReviewRequired("op"),/not an active execution/);
+  }finally{
+    for(const [key,value] of Object.entries({ERASURE_EXECUTION_ENABLED:previous.enabled,
+      ERASURE_PROTOCOL_VERSION:previous.version,STATE_TABLE_NAME:previous.table}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }
+});
+
 test("gate drift during release-fence verification persists review-required without clearing the fence",async()=>{
   const item={...storedQueuedOperation(),providerDeletionReady:true,status:"verifying",
     lifecycle:{phase:"release_fence",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
