@@ -8,6 +8,7 @@ import { enqueueErasureOperation } from "./erasure-queue.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
 import { executeErasureDeletionStep, verifyErasurePostflight } from "./erasure-deletion.js";
+import { erasureExecutionEnabled } from "./erasure-readiness.js";
 
 const lambda=new LambdaClient({});
 function targetWorkerFunction(): string {
@@ -105,7 +106,9 @@ export async function processErasureOperation(operationId: string): Promise<{
   if(!operation) return {status:"succeeded",scheduled:false};
   if(operation.status==="succeeded"||operation.status==="review_required")
     return {status:operation.status,phase:operation.lifecycle?.phase,scheduled:false};
-  if(operation.providerDeletionReady!==true) {
+  // Independent execution switch: a persisted approval cannot bypass a
+  // revoked deployment-level gate via a queued or delayed SQS delivery.
+  if(!erasureExecutionEnabled()||operation.providerDeletionReady!==true) {
     if(operation.lifecycle&&["fencing","deleting","verifying"].includes(operation.status)) {
       await store.markExecutionDisabledReviewRequired(operationId);
       return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
