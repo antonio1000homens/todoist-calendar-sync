@@ -22,7 +22,7 @@
     "check:public": "bash scripts/check-public-source.sh"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1152.0",
+    "@aws-sdk/client-dynamodb": "^3.1156.0",
     "@aws-sdk/client-lambda": "^3.1156.0",
     "@aws-sdk/client-sqs": "^3.1152.0",
     "@aws-sdk/client-ssm": "^3.1152.0",
