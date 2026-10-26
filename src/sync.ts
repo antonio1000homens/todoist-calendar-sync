@@ -891,6 +891,17 @@ export class Synchronizer {
       // If Todoist itself has already moved to this Calendar occurrence,
       // reconciliation must only advance durable state, not move it twice.
       const providerAlreadyAdvanced = Boolean(task?.due?.is_recurring && startsMatch(active, task));
+      if (providerAlreadyAdvanced && progressAware) {
+        // Due-date readback alone cannot prove that the previous occurrence
+        // was completed: this might be a user reschedule or a late completion
+        // webhook. Only the completion handler can commit its monotonic
+        // watermark and successor mapping in one CAS transaction.
+        await this.state.audit(profile, "calendar_owned_completion_advance_deferred", {
+          seriesId: link.seriesId, taskId: link.taskId, activeEventId: link.eventId,
+          nextEventId: active.id, reason: "completion_evidence_required",
+        });
+        continue;
+      }
       const nextTask = providerAlreadyAdvanced && task
         ? task
         : task?.due?.is_recurring
