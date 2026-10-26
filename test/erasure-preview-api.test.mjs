@@ -53,6 +53,23 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
   assert.equal(JSON.parse(createdResponse.body).operation.queueReady,false);
   assert.equal(JSON.parse(createdResponse.body).operation.providerDeletionReady,false);
   assert.equal(created.providerDeletionReady,false);
+
+  // A preview issued while disabled must stay preview-only after a flag change.
+  process.env.ERASURE_EXECUTION_ENABLED="true";
+  const legacy=await handler(event("/review/api/erasure-operations","POST",headers,
+    {operationId:"legacy-operation",confirmationId:"single-use"}),deps);
+  assert.equal(legacy.statusCode,201);
+  assert.equal(created.providerDeletionReady,false);
+
+  // An approval issued after opt-in can be queued through the authenticated API.
+  issued={...issued,executionReadyAtIssue:true};
+  const executable=await handler(event("/review/api/erasure-operations","POST",headers,
+    {operationId:"executable-operation",confirmationId:"single-use"}),deps);
+  assert.equal(executable.statusCode,201);
+  assert.equal(created.providerDeletionReady,true);
+  assert.equal(JSON.parse(executable.body).operation.queueReady,true);
+  assert.equal(JSON.parse(executable.body).operation.providerDeletionReady,true);
+  assert.equal(calls,4);
 });
 
 test("operation creation refuses a changed exact inventory and leaves confirmation unconsumed",async t=>{
