@@ -34,12 +34,9 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
         if(!uuid.test(id))throw new Error("Invalid recovery event-source mapping UUID");
         const item=await lambda.send(new GetEventSourceMappingCommand({UUID:id}));
         // The mapping must still belong to the exact configured worker and an SQS source.
-        if(item.FunctionArn?.split(":").slice(0,7).join(":")!==undefined) {
-          const functionName=target();
-          if(!item.FunctionArn?.endsWith(":function:"+functionName)
-            &&!item.FunctionArn?.includes(":function:"+functionName+":"))
-            throw new Error("Recovery mapping belongs to another Lambda function");
-        }
+        const functionName=target();
+        if(!item.FunctionArn?.endsWith(":function:"+functionName))
+          throw new Error("Recovery mapping belongs to another Lambda function");
         if(!item.EventSourceArn?.includes(":sqs:"))throw new Error("Recovery mapping is not an SQS event source");
         return {id,state:item.State||"Unknown"};
       }));
