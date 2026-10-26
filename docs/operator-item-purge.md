@@ -176,13 +176,13 @@ protections that remain, inspect the fence and mapping state, and escalate if
 either differs. A fresh preview is unsafe until controlled recovery restores
 service admission.
 
-There is no automated operator recovery endpoint or command in this release. The
-safe response is to preserve any remaining protections and escalate for a
-separately reviewed recovery action; do not requeue the operation, delete or
-edit fence / epoch rows, or enable event-source mappings by hand. Escalate
-immediately if the fence or a mapping is missing, changed, or cannot be
-verified. A recovery implementation must, at minimum, do all of the following
-under operator change control:
+Issue #239 introduces a narrowly guarded recovery path for a proven pre-write
+failure with an intact matching fence and an unchanged exact inventory.
+For all other states, preserve protections and escalate; do not requeue the
+original erasure, edit fence / epoch rows, or enable event-source mappings by
+hand. Escalate immediately if the fence or a mapping is missing, changed,
+or cannot be verified. Any extended recovery implementation must also
+satisfy the following controls under operator change control:
 
 1. Read the durable operation and its original `mappingIds`,
    `enabledMappingIds`, preview fingerprint, and lifecycle receipts. Read back
@@ -204,9 +204,10 @@ under operator change control:
    current provider and DynamoDB state and require a new single-use confirmation.
    Never reuse this operation's consumed confirmation or its inventory.
 
-The deployed code does not provide that recovery implementation, so these
-checks are requirements for the separate break-glass change, not permission to
-perform ad-hoc DynamoDB or Lambda edits.
+The constrained #239 path implements these checks for a verified pre-write
+recovery only. It deliberately refuses partially or fully deleted cases until
+their replay-safe disposition is independently implemented and reviewed.
+These requirements are not permission to perform ad-hoc DynamoDB or Lambda edits.
 
 ## Explicit break-glass recovery (issue #239)
 
