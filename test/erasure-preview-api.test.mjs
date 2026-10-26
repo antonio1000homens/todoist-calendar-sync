@@ -30,7 +30,8 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
   let calls=0,issued,created;
   const store={issueConfirmation:async()=>({confirmationId:"single-use",expiresAt:Date.now()+300_000}),
     getIssuedPreview:async()=>issued,create:async operation=>{created=operation;}};
-  const deps={createErasureOperationStore:()=>store,buildErasurePreview:async(input,options={})=>{
+  const deps={acquireWriteLease:async()=>async()=>{},createErasureOperationStore:()=>store,
+    buildErasurePreview:async(input,options={})=>{
     calls++;return {...exact,operationId:options.newOperationId?.()||"op-preview",profile:input.profile,target:{taskId:input.taskId,
       ...(input.eventId?{eventId:input.eventId}:{}),deleteCalendar:input.deleteCalendar},
       selectedActions:{deleteTodoist:true,deleteCalendar:input.deleteCalendar}};
