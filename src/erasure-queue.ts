@@ -21,3 +21,13 @@ export async function enqueueErasureOperation(operationId: string, nextRunAt?: n
     MessageBody:JSON.stringify({version:1,operationId}),
     DelaySeconds:erasureOperationDelaySeconds(nextRunAt)}));
 }
+
+
+/** Recovery is a disjoint queue command: it can never be parsed as a deletion step. */
+export async function enqueueErasureRecovery(operationId:string,delaySeconds=0):Promise<void> {
+  if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId))throw new Error("Invalid erasure recovery operation ID");
+  if(!Number.isInteger(delaySeconds)||delaySeconds<0||delaySeconds>900)
+    throw new Error("Invalid recovery retry delay");
+  await queue.send(new SendMessageCommand({QueueUrl:queueUrl(),
+    MessageBody:JSON.stringify({version:1,recoveryOperationId:operationId}),DelaySeconds:delaySeconds}));
+}
