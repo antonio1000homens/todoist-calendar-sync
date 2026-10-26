@@ -93,7 +93,7 @@ export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"
   try { payload=JSON.parse(record.body); } catch { throw new Error("Invalid erasure queue message JSON"); }
   if(!payload||typeof payload!=="object"||Array.isArray(payload)) throw new Error("Invalid erasure queue message");
   const value=payload as Record<string,unknown>;
-  if(value.version!==1)throw new Error("Invalid erasure queue protocol version");
+  if(value.version!==1)throw new Error("Invalid erasure queue message protocol version");
   const keys=Object.keys(value).sort().join(",");
   const kind=keys==="operationId,version"?"erasure":keys==="recoveryOperationId,version"?"recovery":undefined;
   if(!kind)throw new Error("Invalid erasure queue message schema");
