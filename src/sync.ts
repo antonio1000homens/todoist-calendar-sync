@@ -1764,13 +1764,33 @@ export class Synchronizer {
           reason: "missing_or_changed_recurring_rule",
         });
       }
-      const oldRule = payload.event_data_extra?.old_item?.due?.string;
-      if (payload.event_name === "item:updated" && oldRule
-        && oldRule !== task.due?.string) {
+      const previousDue = payload.event_data_extra?.old_item?.due;
+      if (payload.event_name === "item:updated" && previousDue?.is_recurring
+        && (previousDue.string && previousDue.string !== task.due?.string
+          || previousDue.timezone && previousDue.timezone !== task.due?.timezone)) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
           taskId: task.id, masterEventId: mapping.masterEventId,
           reason: "explicit_todoist_recurrence_change",
         });
+      }
+      if (nativeCalendarRecurrenceCandidate(master)) {
+        // Webhooks can omit old_item. Validate the native rule against the
+        // verified Calendar master instead of trusting an unchanged due date:
+        // cadence, weekday, month/day, start boundary and local time must
+        // still match. Do not expand an infinite Calendar series here.
+        let zone: string;
+        try { zone = await resolveCalendarTimeZone(master, calendar.getTimeZone?.bind(calendar)); }
+        catch {
+          return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+            taskId: task.id, masterEventId: mapping.masterEventId, reason: "calendar_timezone_unverified",
+          });
+        }
+        const expectedRule = calendarOwnedTodoistRecurrence(master, [], zone);
+        if (!expectedRule || !matchesCalendarOwnedRecurringRule(task, expectedRule, zone)) {
+          return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+            taskId: task.id, masterEventId: mapping.masterEventId, reason: "native_rule_changed_or_unsupported",
+          });
+        }
       }
       if (recurringDateEdit) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_date_edit_requires_review", {
