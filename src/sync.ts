@@ -709,9 +709,14 @@ export class Synchronizer {
       return { blocked: true, task, mapping };
     }
     if (resolution.calendarChanged) {
+      if (!await this.state.mutationAllowed(profile)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
+        return { blocked: true, task, mapping };
+      }
       const updated = await calendar.patchEventMetadataIfUnchanged(master.id, master.etag!, {
         summary: resolution.summary, description: resolution.description,
       });
+      await this.state.recordMutation(profile);
       if (updated.id !== master.id || updated.recurringEventId || updated.status === "cancelled"
         || JSON.stringify(updated.recurrence) !== JSON.stringify(master.recurrence)
         || normalizedText(updated.summary) !== resolution.summary
@@ -724,7 +729,12 @@ export class Synchronizer {
     }
     let nextTask = task;
     if (resolution.todoistChanged) {
+      if (!await this.state.mutationAllowed(profile)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
+        return { blocked: true, task, mapping };
+      }
       nextTask = await todoist.updateTaskMetadata(task.id, expected);
+      await this.state.recordMutation(profile);
       const dueBefore = task.due, dueAfter = nextTask.due;
       if (nextTask.id !== task.id
         || normalizedText(nextTask.content) !== expected.content
@@ -742,25 +752,22 @@ export class Synchronizer {
       ...mapping, syncedTitle: resolution.summary, syncedDescription: resolution.description,
       updatedAt: new Date().toISOString(),
     };
-    // Only persist baselines for the same mapped pair. Do not resurrect a
-    // link concurrently advanced by completion/recovery.
-    const current = await this.state.getMappingByTask(profile, task.id);
-    if (!current || current.eventId !== mapping.eventId || current.masterEventId !== master.id
-      || current.completedThroughOriginalStart !== mapping.completedThroughOriginalStart) {
-      await this.state.audit(profile, "calendar_owned_metadata_mapping_changed", {
-        seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
-      });
-      return { blocked: true, task: nextTask, mapping };
-    }
+    // Provider writes and metadata-baseline persistence are independent. The
+    // latter MUST CAS all mapping indices and the link together against the
+    // original versions. Re-reading then putMapping would resurrect old
+    // occurrence indices after a concurrent completion.
     if (resolution.calendarChanged || resolution.todoistChanged
       || mapping.syncedTitle !== resolution.summary || mapping.syncedDescription !== resolution.description) {
-      await this.state.putMapping(nextMapping);
       const link = mapping.seriesId ? await this.state.getRecurrenceLink(profile, mapping.seriesId) : undefined;
-      if (link && link.taskId === task.id && link.eventId === mapping.eventId && link.owner === "calendar") {
-        await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
+      if (!link || link.owner !== "calendar" || link.taskId !== task.id
+        || link.eventId !== mapping.eventId || link.masterEventId !== master.id
+        || !await this.state.updateCalendarOwnedMetadataIfUnchanged(mapping, link, nextMapping)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mapping_changed", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
+        });
+        return { blocked: true, task: nextTask, mapping };
       }
       if (resolution.calendarChanged || resolution.todoistChanged) {
-        await this.state.recordMutation(profile);
         await this.state.audit(profile, "calendar_owned_metadata_propagated", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
           toCalendar: resolution.calendarChanged, toTodoist: resolution.todoistChanged,
