@@ -62,6 +62,7 @@ export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreview
   const noWrites=!lifecycle.evidence.deletionStarted && !lifecycle.deletionProgress
     && recoverableBeforeWrite.has(lifecycle.phase);
   const identical=snapshot.blockers.length===0
+    && erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint
     && snapshot.previewFingerprint===operation.previewFingerprint
     && snapshot.providerSnapshotFingerprint===operation.providerSnapshotFingerprint;
   if(noWrites&&identical)return "pre_write";
@@ -332,6 +333,7 @@ export class ErasureRecoveryService {
     // Only pre-write recoveries are automated. Every worker step must still
     // observe the *original* provider and DynamoDB contents.
     const unchanged=snapshot.blockers.length===0
+      &&erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint
       &&recoveryMode(op,snapshot)==="pre_write"
       &&snapshot.previewFingerprint===op.previewFingerprint
       &&snapshot.providerSnapshotFingerprint===op.providerSnapshotFingerprint;
