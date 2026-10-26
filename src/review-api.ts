@@ -13,6 +13,7 @@ import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 import { randomUUID } from "node:crypto";
+import { erasureExecutionEnabled } from "./erasure-readiness.js";
 
 const REVIEW_ORIGIN = "https://calendar-sync.alf-broadcast.co.uk";
 type Claims = { email?: unknown; sub?: unknown; aud?: unknown };
@@ -201,6 +202,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if(method==="POST") requireAdmissionProfile(operation.profile);
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
         providerDeletionReady:operation.providerDeletionReady===true,
+        executionEnabled:erasureExecutionEnabled(),
+        queueReady:erasureExecutionEnabled()&&operation.providerDeletionReady===true,
         backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE,
         phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
         deletionProgress:operation.lifecycle?.deletionProgress?{
@@ -219,6 +222,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       // Readiness is a hard admission gate for every start/resume request. An
       // active persisted lifecycle must not be re-enqueued after readiness is
       // revoked; the worker's own guard is only a second line of defense.
+      if (!erasureExecutionEnabled())
+        fail(409,"Erasure execution is disabled by deployment configuration; this operation cannot be queued or resumed");
       if (operation.providerDeletionReady !== true)
         fail(409,"The provider deletion and postflight workflow is not available; this operation cannot be queued or resumed");
       if (operation.status === "previewed") {
@@ -254,10 +259,11 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           throw error;
         }
         const {actionPlan,...safePreview}=preview;
-        return response(200,{preview:{...safePreview,confirmation:{confirmationId:issued.confirmationId,expiresAt:issued.expiresAt}}});
+        return response(200,{preview:{...safePreview,executionEnabled:erasureExecutionEnabled(),
+          confirmation:{confirmationId:issued.confirmationId,expiresAt:issued.expiresAt}}});
       }
       const {actionPlan,...safePreview}=preview;
-      return response(200,{preview:safePreview});
+      return response(200,{preview:{...safePreview,executionEnabled:erasureExecutionEnabled()}});
     }
 
     if (method === "POST" && segments[0] === "erasure-operations" && segments.length === 1) {
@@ -275,17 +281,21 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (current.blockers.length || current.previewFingerprint !== issued.previewFingerprint)
         fail(409,"The exact provider/state inventory changed or became unsafe; request a fresh preview");
       const now=new Date().toISOString();
+      // A previously issued preview (or a previously persisted preview-only
+      // operation) is never silently upgraded by flipping the deployment flag.
+      const providerDeletionReady=erasureExecutionEnabled()&&issued.executionReadyAtIssue===true;
       const operation = {operationId:current.operationId,profile:current.profile,target:current.target,
         selectedActions:current.selectedActions,providerSnapshotFingerprint:current.providerSnapshotFingerprint,
         inventory:current.inventory,actionPlan:issued.actionPlan,previewFingerprint:current.previewFingerprint,
-        providerDeletionReady:false,
+        providerDeletionReady,
         confirmationId:body.confirmationId,confirmationFingerprint:current.previewFingerprint,
         status:"previewed" as const,createdAt:now,updatedAt:now};
       try { await operationStore.create(operation); }
       catch { fail(409,"The confirmation expired, was already used, or the operation changed; request a fresh preview"); }
       return response(201,{operation:{operationId:operation.operationId,status:operation.status,
         previewFingerprint:operation.previewFingerprint,inventoryCount:operation.inventory.length,
-        queueReady:false,providerDeletionReady:false,backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE}});
+        queueReady:providerDeletionReady,providerDeletionReady,
+        backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE}});
     }
 
     if (method === "GET" && segments[0] === "cases" && segments.length === 1) {

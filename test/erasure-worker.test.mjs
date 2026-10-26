@@ -6,6 +6,10 @@ import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore } from "../dist/erasure-executor.js";
 import { handler, parseErasureQueueRecord } from "../dist/erasure-worker.js";
 
+// The existing worker integration cases exercise an explicitly approved deployment.
+process.env.ERASURE_PROTOCOL_VERSION = "1";
+process.env.ERASURE_EXECUTION_ENABLED = "true";
+
 const record = (body, messageId = "message-1") => ({ body, messageId, receiptHandle: "receipt", attributes: {}, messageAttributes: {}, md5OfBody: "digest", eventSource: "aws:sqs", eventSourceARN: "arn:aws:sqs:eu-west-2:123:erasure", awsRegion: "eu-west-2" });
 
 test("erasure queue record parser accepts only the versioned operation identity", () => {
@@ -143,6 +147,34 @@ test("transient action-time gate read failures are retried instead of marked rev
   const result=await handler({Records:[record('{"version":1,"operationId":"op_read"}')],awsRequestId:"req"});
   assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:"message-1"}]});
   assert.equal(reviewMarks,0,"only a definite invariant mismatch is terminal");
+});
+
+test("disabled deployment cannot start a previously approved queued operation",async t=>{
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  t.after(()=>{process.env.ERASURE_EXECUTION_ENABLED="true";});
+  const starts=[],queues=[];
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({
+    operationId:"approved",status:"queued",providerDeletionReady:true
+  }));
+  t.mock.method(ErasureOperationStore.prototype,"startFencedLifecycle",async()=>starts.push(true));
+  t.mock.method(SQSClient.prototype,"send",async command=>{queues.push(command);return {};});
+  const result=await handler({Records:[record('{"version":1,"operationId":"approved"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:"message-1"}]});
+  assert.deepEqual(starts,[]);assert.deepEqual(queues,[]);
+});
+
+test("revoking deployment flag during execution enters review-required without additional writes",async t=>{
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  t.after(()=>{process.env.ERASURE_EXECUTION_ENABLED="true";});
+  let reviews=0,advances=0;
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({
+    operationId:"active",status:"deleting",providerDeletionReady:true,lifecycle:{phase:"delete"}
+  }));
+  t.mock.method(ErasureOperationStore.prototype,"markExecutionDisabledReviewRequired",async()=>{reviews++;});
+  t.mock.method(ErasureOperationStore.prototype,"advanceFencedLifecycle",async()=>{advances++;});
+  const result=await handler({Records:[record('{"version":1,"operationId":"active"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[]});
+  assert.equal(reviews,1);assert.equal(advances,0);
 });
 
 test("malformed and failed erasure messages are retried through partial batch failure", async t => {

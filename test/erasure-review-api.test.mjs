@@ -5,6 +5,10 @@ import { SQSClient } from "@aws-sdk/client-sqs";
 import { ErasureOperationStore } from "../dist/erasure-executor.js";
 import { handler } from "../dist/review-api.js";
 
+// This suite exercises the intentionally opted-in start/resume path.
+process.env.ERASURE_PROTOCOL_VERSION = "1";
+process.env.ERASURE_EXECUTION_ENABLED = "true";
+
 const issuer = "https://erasure-review.cloudflareaccess.com";
 const audience = "erasure-review-test";
 function event(path, method, headers = {}, body) {
@@ -21,6 +25,7 @@ test("authenticated review API starts only stored confirmed operations and retur
     ?new Response(JSON.stringify({keys:[jwk]}),{status:200,headers:{"content-type":"application/json"}}):new Response("unexpected",{status:500});
   Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test",
     ERASURE_OPERATION_QUEUE_URL:"https://sqs.example/erasure"});
+  const run=(request)=>handler(request,{acquireWriteLease:async()=>async()=>{}});
   const sent=[],transitions=[];
   const operation={operationId:"op-113",status:"previewed",providerDeletionReady:true,previewFingerprint:"secret-digest",confirmationId:"secret-confirmation",
     inventory:[{type:"TASK",key:{pk:"secret-key",sk:"META"},digest:"secret-row"}],createdAt:"2026-10-23T10:00:00.000Z",updatedAt:"2026-10-23T10:00:00.000Z"};
@@ -38,23 +43,30 @@ test("authenticated review API starts only stored confirmed operations and retur
     }
   });
 
-  const denied=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{confirmationId:"attacker"}));
+  const denied=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{confirmationId:"attacker"}));
   assert.equal(denied.statusCode,400);
-  const started=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  const started=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(started.statusCode,202);
   assert.deepEqual(transitions,[["op-113","previewed","queued"]]);
   assert.deepEqual(JSON.parse(sent[0].MessageBody),{version:1,operationId:"op-113"});
-  const retried=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  const retried=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(retried.statusCode,202);assert.equal(sent.length,2,"retries redispatch the same durable operation id");
 
-  const status=await handler(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  const disabled=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  assert.equal(disabled.statusCode,409);
+  assert.match(JSON.parse(disabled.body).error,/disabled by deployment configuration/);
+  assert.equal(sent.length,2,"revoking the flag cannot enqueue an already approved operation");
+  process.env.ERASURE_EXECUTION_ENABLED="true";
+
+  const status=await run(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
   const body=JSON.parse(status.body);
   assert.equal(status.statusCode,200);assert.equal(body.operation.status,"queued");
   assert.equal("inventory" in body.operation,false);assert.equal("confirmationId" in body.operation,false);
 
   operation.status="review_required";
   operation.lifecycle={phase:"ready_for_delete",nextRunAt:Date.now()};
-  const reviewStatus=await handler(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
+  const reviewStatus=await run(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
   const reviewBody=JSON.parse(reviewStatus.body);
   assert.equal(reviewStatus.statusCode,200);
   assert.equal(reviewBody.operation.status,"review_required");
@@ -65,7 +77,7 @@ test("authenticated review API starts only stored confirmed operations and retur
   assert.match(reviewBody.operation.message,/escalate if either is missing, changed, or cannot be verified/i);
   assert.doesNotMatch(reviewBody.operation.message,/keep the profile fence and worker mappings in place/i);
   assert.match(reviewBody.operation.message,/do not start a fresh preview until service admission is restored/i);
-  const resume=await handler(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  const resume=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(resume.statusCode,409);
   assert.match(JSON.parse(resume.body).error,/break-glass recovery is required/);
   assert.equal(sent.length,2,"review-required operations cannot requeue the stale confirmation");
