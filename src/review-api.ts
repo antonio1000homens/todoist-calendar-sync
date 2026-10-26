@@ -5,7 +5,9 @@ import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
-import { enqueueErasureOperation } from "./erasure-queue.js";
+import { enqueueErasureOperation, enqueueErasureRecovery } from "./erasure-queue.js";
+import { ErasureRecoveryService } from "./erasure-recovery.js";
+import { recoveryAdapters } from "./erasure-recovery-adapters.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import { buildErasurePreview } from "./erasure-preview.js";
 import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
@@ -133,6 +135,8 @@ async function enqueueRepair(operationId: string, selectedProfile: Profile, atte
 export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   buildErasurePreview?: typeof buildErasurePreview;
   createErasureOperationStore?: () => ErasureOperationStore;
+  createErasureRecoveryService?: () => ErasureRecoveryService;
+  enqueueErasureRecovery?: typeof enqueueErasureRecovery;
   acquireWriteLease?: (selectedProfile:Profile,owner:string)=>Promise<()=>Promise<void>>;
   createReviewStore?:()=>ReviewStore;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
@@ -143,6 +147,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
 } = {}): Promise<LambdaFunctionURLResult> {
   const previewBuilder = dependencies.buildErasurePreview || buildErasurePreview;
   const erasureStore = () => dependencies.createErasureOperationStore?.() || new ErasureOperationStore();
+  const recoveryService = () => dependencies.createErasureRecoveryService?.()
+    || new ErasureRecoveryService(undefined,recoveryAdapters(false));
   const manualWriteLeases:(()=>Promise<void>)[]=[];
   try {
     const path = event.rawPath || "/";
@@ -193,6 +199,56 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if(method==="POST"&&process.env.ERASURE_PROTOCOL_VERSION==="1"&&!writeProfiles.includes(selectedProfile))
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
+
+    // Break-glass recovery is intentionally disjoint from erasure submission:
+    // it cannot acquire a profile write lease while the erasure fence is active.
+    if(segments[0]==="erasure-recoveries"&&segments[1]&&[2,3].includes(segments.length)) {
+      const id=segments[1],action=segments[2];
+      const recovery=recoveryService();
+      if(method==="GET"&&segments.length===2) {
+        const inspected=await recovery.inspect(id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",event:"recovery_preview",
+          operationId:id,allowed:inspected.preview.allowed,classification:inspected.preview.classification,
+          blockers:inspected.preview.blockers.length}));
+        return response(200,{preview:inspected.preview});
+      }
+      if(method==="GET"&&action==="status") {
+        const current=await recovery.status(id);
+        if(!current)return response(404,{error:"recovery_not_started"});
+        return response(200,{recovery:{status:current.status,startedAt:current.startedAt,
+          ...(current.lastError?{lastError:current.lastError}:{} )}});
+      }
+      if(method==="POST"&&action==="confirm") {
+        if(Object.keys(body||{}).length)fail(400,"Recovery confirmation creation accepts no request fields");
+        const issued=await recovery.issueConfirmation(id,actor.subject);
+        return response(200,{...issued});
+      }
+      if(method==="POST"&&action==="apply") {
+        if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
+          ||typeof body?.confirmationId!=="string"||body.confirmationId.length>256
+          ||body.operationId!==id||body.phrase!=="RESTORE SYNC"
+          ||!REVIEW_PROFILES.includes(body.profile as Profile))
+          fail(400,"Recovery requires an exact operation ID, profile, and typed RESTORE SYNC confirmation");
+        const operation=await erasureStore().get(id);
+        if(!operation||operation.profile!==body.profile)fail(409,"Recovery profile or operation changed");
+        await recovery.apply(id,body.confirmationId,actor.subject);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",event:"recovery_accepted",
+          operationId:id,profile:operation.profile}));
+        try { await (dependencies.enqueueErasureRecovery||enqueueErasureRecovery)(id); }
+        catch {return response(503,{error:"recovery_enqueue_failed",
+          message:"Recovery was accepted durably but its queue send failed. Retry dispatch for the same recovery, never confirm erasure again."});}
+        return response(202,{recovery:{status:"queued",operationId:id}});
+      }
+      if(method==="POST"&&action==="dispatch") {
+        if(Object.keys(body||{}).length)fail(400,"Recovery dispatch accepts no request fields");
+        const state=await recovery.status(id);
+        if(!state||!["queued","restoring","verifying"].includes(state.status))
+          fail(409,"Only an accepted incomplete recovery may be dispatched");
+        await (dependencies.enqueueErasureRecovery||enqueueErasureRecovery)(id);
+        return response(202,{recovery:{status:state.status,operationId:id}});
+      }
+      return response(404,{error:"not_found"});
+    }
 
     if ((method === "GET" && segments[0] === "erasure-operations" && segments.length === 2)
       || (method === "POST" && segments[0] === "erasure-operations" && segments[2] === "start" && segments.length === 3)) {
