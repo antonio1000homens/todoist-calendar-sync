@@ -81,8 +81,8 @@ test("revoked readiness stops active lifecycle work and retains its fence for br
     if(command.constructor.name.includes("Get"))return {Item:item};
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
-      assert.equal(values[":disabled"],false);
-      assert.match(command.input.ConditionExpression,/providerDeletionReady=:disabled/);
+      assert.equal(values[":observedReady"],false);
+      assert.match(command.input.ConditionExpression,/providerDeletionReady=:observedReady/);
       item.status=values[":reviewRequired"];item.lifecycle.lastError=values[":error"];
       return {};
     }
