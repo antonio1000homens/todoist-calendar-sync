@@ -257,7 +257,11 @@ transient exception, use **Retry existing recovery dispatch** on the
 authenticated page; do not issue another confirmation or replay a purge.
 `recovery.status=blocked` or a drift/ownership error requires manual review.
 Never edit DynamoDB fence/epoch rows, modify mappings outside this protocol,
-or interpret a 404 as evidence of successful erasure.
+or interpret a 404 as evidence of successful erasure. Once the service is
+restored, run a *fresh*, authenticated profile reconciliation to detect source
+changes suppressed by the fence; the normal worker deliberately drops old
+SQS payloads carrying a pre-fence erasure epoch. Do not replay old DLQ
+deliveries to compensate. Verify fresh work is admitted and processed.
 
 Recovery is not erasure of backups. The 35-day DynamoDB PITR disclosure
 continues to apply. Production acceptance requires a disposable Work-profile
