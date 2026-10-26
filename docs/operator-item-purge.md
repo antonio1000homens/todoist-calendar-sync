@@ -114,12 +114,45 @@ bound to the canonical inventory and a digest of the provider snapshot, and
 creation repeats the reads before atomically storing the immutable operation
 and consuming the confirmation.
 
-This release deliberately keeps these operations in `previewed` with
-`providerDeletionReady: false`. The `/start` route and SQS worker reject them
-before queueing or installing a fence because provider deletion and postflight
-are not implemented. Do not change this field or enqueue these operation IDs.
-The durable record is prepared for a later, separately reviewed executor
-release; it is not an instruction to begin a purge.
+The async erasure executor is implemented, including conditional provider deletion,
+exact DynamoDB row deletion, provider readback, and postflight verification. It
+remains **off by default**. The CloudFormation parameter
+`ErasureExecutionEnabled` defaults to `"false"`; it is deployed as
+`ERASURE_EXECUTION_ENABLED` on **both** the authenticated review API and
+the erasure worker. Execution requires that value to be exactly `"true"`
+on both functions and `ERASURE_PROTOCOL_VERSION=1`. The API start and
+the worker check their own deployment switch before doing any work.
+
+To enable the reviewed execution path:
+1. Complete a deployment review of the preview, deletion, readback, profile
+   admission fence, SQS mappings, provider permissions, backup disclosure,
+   logs/alarms, and the break-glass `review_required` procedure.
+2. Deploy the same reviewed code revision and `ErasureExecutionEnabled="true"`
+   to both functions. Confirm both deployed versions expose protocol v1 and the
+   same execution flag. Restrict direct invocation of old Lambda versions.
+3. Use a **new** authenticated, exact inventory preview, confirm the requested
+   Todoist deletion and any separately selected exact Calendar deletion, then
+   create the immutable operation and request `POST
+   /review/api/erasure-operations/{operationId}/start`. The create response
+   reports `providerDeletionReady` and `queueReady`; both must be true.
+   Status can be polled at `GET /review/api/erasure-operations/{operationId}`.
+   Start accepts no selection or confirmation fields.
+4. Validate the full fenced execution and postflight on an expendable,
+   non-recurring test item before accepting a production item.
+
+Readiness is bound **at confirmation issuance**. Previews issued while
+disabled and old `providerDeletionReady=false` operations remain
+non-executable even if deployment configuration subsequently changes. Generate
+a new preview and confirmation after enabling; never edit DynamoDB readiness
+flags by hand. Recurrence-linked, ambiguous/shared, unattributable, or
+potentially replayable items continue to fail closed.
+
+Revoking the deployment flag stops new starts and worker steps. An already
+fenced operation then becomes `review_required`, retaining its protections;
+**do not flip the switch off mid-purge without a documented break-glass recovery
+plan**. A successful production rollout must include the review-page
+confirmation/progress experience and a tested operator recovery process.
+This flag alone is not full issue #113 acceptance.
 
 The API scan stops after its bounded 80-second preview window and returns no
 confirmation if it cannot finish. It uses the configured DynamoDB scan page
