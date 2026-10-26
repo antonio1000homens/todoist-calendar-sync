@@ -4,6 +4,7 @@ import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
+  verifiedCalendarOwnedRecurrence,
   nativeCalendarRecurrenceCandidate,
   matchesCalendarOwnedRecurringRule,
   matchesCalendarOwnedRecurringTask,
@@ -161,6 +162,35 @@ test("complex or finite non-weekly Calendar recurrences are never silently appro
   assert.equal(matchesCalendarOwnedRecurringTask({
     id: "task", due: { date: "2099-09-02", is_recurring: true, string: "every Wednesday ending 30 Sep" },
   }, event, weekly), false);
+});
+
+test("native recurrence requires a complete explicit exception inventory", async () => {
+  const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY");
+  const scoped = instances(["2026-11-04T14:00:00Z"]);
+  assert.equal(await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London"), undefined,
+    "missing provider method is not proof that there are no future exceptions");
+  assert.equal((await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [])).frequency, "weekly");
+  let queried;
+  const farFuture = { ...instances(["2028-11-01T14:00:00Z"])[0],
+    id: "far-future", status: "cancelled" };
+  const rejected = await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async (id) => {
+    queried = id; return [farFuture];
+  });
+  assert.equal(queried, master.id);
+  assert.equal(rejected, undefined, "a cancellation outside the bounded instance window blocks native conversion");
+  const moved = { ...farFuture, status: "confirmed", start: { dateTime: "2028-11-02T14:00:00Z" } };
+  assert.equal(await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [moved]), undefined);
+});
+
+test("native task payload uses verified timezone without a London default", () => {
+  const master = {
+    ...weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY"),
+    start: { dateTime: "2026-11-04T14:00:00Z" },
+  };
+  const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/Berlin");
+  const event = { ...master, recurrence: undefined };
+  assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence, "Europe/Berlin").due.timezone, "Europe/Berlin");
+  assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence).due.timezone, undefined);
 });
 
 test("native recurrence rejects moved Calendar exceptions but accepts cancellations", () => {
