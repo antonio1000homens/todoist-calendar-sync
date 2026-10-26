@@ -1022,6 +1022,8 @@ export class Synchronizer {
         if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
         const deletingMaster = !event.recurringEventId && event.id === existingRecurrence.masterEventId;
         let next: CalendarEvent | undefined;
+        let successorRule: ReturnType<typeof calendarOwnedTodoistRecurrence>;
+        let verifiedTimeZone: string | undefined;
         if (!deletingMaster) {
           let master: CalendarEvent;
           try { master = await calendar.getEvent(existingRecurrence.masterEventId); }
@@ -1040,21 +1042,57 @@ export class Synchronizer {
             seriesId: series, masterEventId: existingRecurrence.masterEventId, taskId: existingRecurrence.taskId,
           });
           if (!timeZone) return;
-          const instances = await calendar.listInstances(existingRecurrence.masterEventId);
+          verifiedTimeZone = timeZone;
+          const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
+          const native = nativeCalendarRecurrenceCandidate(master);
+          const anchor = existingRecurrence.activeEffectiveStart || existingRecurrence.originalStart;
+          const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
+          const fromMs = Number.isFinite(anchorMs) ? Math.min(anchorMs, Date.now()) : Date.now();
+          const instances = native && calendar.listInstancesInWindow
+            ? await calendar.listInstancesInWindow(master.id,
+              new Date(fromMs - 24 * 60 * 60_000).toISOString(),
+              new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString())
+            : await calendar.listInstances(master.id);
+          successorRule = finiteWeekly || native ? calendarOwnedTodoistRecurrence(master, instances, timeZone) : undefined;
           next = selectCalendarRecurrenceInstance(instances, existingRecurrence, Date.now(), timeZone);
         }
         const oldMapping = recurrenceMapping(existingRecurrence);
-        await this.state.deleteMapping(oldMapping);
-        await todoist.deleteTask(existingRecurrence.taskId).catch((error: unknown) => {
-          if (Number((error as { status?: number }).status) !== 404) throw error;
-        });
         if (deletingMaster) {
+          await todoist.deleteTask(existingRecurrence.taskId).catch((error: unknown) => {
+            if (Number((error as { status?: number }).status) !== 404) throw error;
+          });
+          await this.state.deleteMapping(oldMapping);
           await this.state.deleteRecurrenceLink(delivery.profile, series);
           await this.state.recordMutation(delivery.profile);
           return this.state.audit(delivery.profile, "calendar_recurrence_master_deleted", { seriesId: series });
         }
-        if (!next) return this.state.audit(delivery.profile, "calendar_recurrence_instance_deleted_no_next", { seriesId: series });
-        const nextTask = await todoist.upsertTask(toTodoistTask(next));
+        if (!next) {
+          // An empty lookahead is not proof that an open-ended series ended.
+          return this.state.audit(delivery.profile, "calendar_recurrence_instance_deleted_no_next", { seriesId: series });
+        }
+        let previousTask: TodoistTask | undefined;
+        try { previousTask = await todoist.getTask(existingRecurrence.taskId); }
+        catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
+        if (previousTask?.due?.is_recurring
+          && (!successorRule || !matchesCalendarOwnedRecurringRule(previousTask, successorRule, verifiedTimeZone))) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
+            seriesId: series, taskId: previousTask.id, reason: "cancelled_instance_existing_recurrence_unverified",
+          });
+        }
+        const nextTask = successorRule
+          ? previousTask?.due?.is_recurring
+            ? await todoist.updateRecurringOccurrence(previousTask, toTodoistTask(next))
+            : await todoist.upsertTask(calendarOwnedRecurringTaskPayload(next, successorRule), previousTask?.id)
+          : await (async () => {
+            if (previousTask) await todoist.deleteTask(previousTask.id);
+            return todoist.upsertTask(toTodoistTask(next));
+          })();
+        if (successorRule && !matchesCalendarOwnedRecurringTask(nextTask, next, successorRule, verifiedTimeZone)) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
+            seriesId: series, eventId: next.id, taskId: nextTask.id, reason: "cancelled_instance_reanchoring",
+          });
+        }
+        await this.state.deleteMapping(oldMapping);
         const nextMapping: Mapping = {
           profile: delivery.profile,
           eventId: next.id,
