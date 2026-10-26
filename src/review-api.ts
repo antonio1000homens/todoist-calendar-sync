@@ -148,7 +148,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   const previewBuilder = dependencies.buildErasurePreview || buildErasurePreview;
   const erasureStore = () => dependencies.createErasureOperationStore?.() || new ErasureOperationStore();
   const recoveryService = () => dependencies.createErasureRecoveryService?.()
-    || new ErasureRecoveryService(undefined,recoveryAdapters(false));
+    || new ErasureRecoveryService(recoveryAdapters(false));
   const manualWriteLeases:(()=>Promise<void>)[]=[];
   try {
     const path = event.rawPath || "/";
@@ -256,7 +256,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const operation = await operationStore.get(segments[1]);
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
       if(method==="POST") requireAdmissionProfile(operation.profile);
-      if (method === "GET") return response(200,{operation:{operationId:operation.operationId,status:operation.status,
+      if (method === "GET") return response(200,{operation:{operationId:operation.operationId,profile:operation.profile,status:operation.status,
         providerDeletionReady:operation.providerDeletionReady===true,
         executionEnabled:erasureExecutionEnabled(),
         queueReady:erasureExecutionEnabled()&&operation.providerDeletionReady===true,
@@ -348,7 +348,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         status:"previewed" as const,createdAt:now,updatedAt:now};
       try { await operationStore.create(operation); }
       catch { fail(409,"The confirmation expired, was already used, or the operation changed; request a fresh preview"); }
-      return response(201,{operation:{operationId:operation.operationId,status:operation.status,
+      return response(201,{operation:{operationId:operation.operationId,profile:operation.profile,status:operation.status,
         previewFingerprint:operation.previewFingerprint,inventoryCount:operation.inventory.length,
         queueReady:providerDeletionReady,providerDeletionReady,
         backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE}});
