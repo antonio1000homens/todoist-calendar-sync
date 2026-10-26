@@ -382,7 +382,7 @@ function parseOpenTodoistRule(value: string | undefined): {
   return undefined;
 }
 
-function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecurrence): {
+function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecurrence, verifiedTimeZone?: string): {
   matches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule>;
 } {
   const parsed = parseOpenTodoistRule(task.due?.string);
@@ -391,15 +391,33 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
   const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
     && anchor.month === expectedStart.month && (!anchor.year || anchor.year === expectedStart.year));
   const due = task.due?.date || task.due?.datetime;
-  const current = due?.match(/^(\d{4}-\d{2}-\d{2})/);
-  const expectedCadenceDate = !current || (() => {
-    const parsedDate = parseNaturalDate(current[1]);
+  // Todoist can return UTC/offset datetimes that fall on the previous local
+  // day. Use an independently verified Calendar/Todoist zone to check cadence.
+  let currentDay: string | undefined;
+  if (due && /^\d{4}-\d{2}-\d{2}$/.test(due)) currentDay = due;
+  else if (due && /^\d{4}-\d{2}-\d{2}T/.test(due)) {
+    if (/Z|[+-]\d{2}:?\d{2}$/i.test(due)) {
+      if (verifiedTimeZone) {
+        const instant = new Date(due);
+        if (Number.isFinite(instant.getTime())) {
+          try {
+            const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
+              timeZone: verifiedTimeZone, year: "numeric", month: "2-digit", day: "2-digit",
+            }).formatToParts(instant).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+            currentDay = `${parts.year}-${parts.month}-${parts.day}`;
+          } catch { /* Invalid zones cannot prove a recurrence. */ }
+        }
+      }
+    } else if (verifiedTimeZone) currentDay = due.slice(0, 10);
+  }
+  const expectedCadenceDate = !due || Boolean(currentDay && (() => {
+    const parsedDate = parseNaturalDate(currentDay);
     if (!parsedDate) return false;
     if (recurrence.frequency === "monthly") return parsedDate.day === recurrence.dayOfMonth;
     if (recurrence.frequency === "yearly") return parsedDate.day === recurrence.dayOfMonth && parsedDate.month === recurrence.month;
     const instant = new Date(current[1] + "T12:00:00Z");
     return weekdayNames[instant.getUTCDay()] === recurrence.weekday;
-  })();
+  })());
   return { parsed, matches: Boolean(task.due?.is_recurring && parsed && correctStart && expectedCadenceDate
     && parsed.frequency === recurrence.frequency
     && parsed.weekday === recurrence.weekday
@@ -498,7 +516,7 @@ export function matchesCalendarOwnedRecurringRule(
   recurrence: CalendarOwnedTodoistRecurrence,
   verifiedTimeZone?: string,
 ): boolean {
-  if (recurrence.frequency) return openRuleMatches(task, recurrence).matches;
+  if (recurrence.frequency) return openRuleMatches(task, recurrence, verifiedTimeZone).matches;
   const expected = parseWeeklySchedule(recurrence.dueString);
   const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date || task.due?.datetime, verifiedTimeZone);
   const observed = observedParse.schedule;
@@ -525,7 +543,7 @@ export function calendarOwnedRecurringTaskReadback(
   verifiedTimeZone?: string,
 ): CalendarOwnedRecurringTaskReadback {
   if (recurrence.frequency) {
-    const { parsed, matches } = openRuleMatches(task, recurrence);
+    const { parsed, matches } = openRuleMatches(task, recurrence, verifiedTimeZone);
     return {
       matches: matches && startsMatchCalendarEvent(event, task, verifiedTimeZone),
       expected: { frequency: recurrence.frequency, ...(recurrence.weekday ? { weekday: recurrence.weekday } : {}),
