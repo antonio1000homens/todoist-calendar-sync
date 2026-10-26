@@ -331,6 +331,28 @@ test("repeated reconciliation cannot walk through future occurrences", async () 
   assert.equal(state.links[0].activeInstanceId, "current");
 });
 
+test("scheduled reconciliation preserves one native recurring Todoist task and uses bounded inventory", async () => {
+  const current = instance("oct-21", "2026-10-21", "2026-10-22");
+  const successor = instance("oct-28", "2026-10-28", "2026-10-29");
+  const link = { ...linkFor(current), calendarProgressVersion: 1 };
+  const state = new FakeState(link);
+  const tasks = new Map([[link.taskId, { id: link.taskId, content: current.summary,
+    due: { date: "2026-10-21", string: "every Wednesday starting 21 Oct 2026", is_recurring: true },
+  }]]);
+  const clients = fakeClients(state, [current, successor], tasks);
+  clients.events.set(MASTER, { id: MASTER, status: "confirmed", summary: current.summary,
+    start: { date: "2026-10-21" }, recurrence: ["RRULE:FREQ=WEEKLY"] });
+  clients.calendar.listInstances = async () => { throw new Error("unbounded expansion forbidden"); };
+  await new Synchronizer(state, undefined, async () => clients).reconcile(PROFILE);
+  assert.equal(clients.todoistRecurringUpdates.length, 1);
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.links[0].taskId, link.taskId);
+  assert.equal(state.links[0].activeInstanceId, successor.id);
+  assert.equal(tasks.get(link.taskId).due.is_recurring, true);
+  assert.equal(tasks.get(link.taskId).due.date, successor.start.date);
+});
+
 test("expired occurrence rolls once and its generated deletion webhook cannot delete the master", async () => {
   const expired = instance("expired", "2000-01-01", "2000-01-02");
   const next = instance("next", "2099-01-01", "2099-01-02");
