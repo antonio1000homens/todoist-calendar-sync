@@ -1200,7 +1200,7 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
   const state = new FakeState(link);
   const task = { id: link.taskId, project_id: "home-project",
     content: "Renamed from Todoist", description: "",
-    due: { date: "2026-10-28", string: "every Wednesday", is_recurring: true } };
+    due: { date: "2026-11-04", string: "every Wednesday", is_recurring: true } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
   const clients = fakeClients(state, [current], tasks, undefined, [master]);
   await new Synchronizer(state, undefined, async () => clients).process({
@@ -1213,7 +1213,7 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
   assert.equal(clients.calendarUpserts[0].metadataOnly, true);
   assert.equal(clients.events.get(MASTER).summary, "Renamed from Todoist");
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;BYDAY=WE"]);
-  assert.equal(tasks.get(task.id).due.date, "2026-10-28");
+  assert.equal(tasks.get(task.id).due.date, "2026-11-04");
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
 });
 
