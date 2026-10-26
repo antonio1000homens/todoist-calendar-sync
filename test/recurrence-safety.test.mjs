@@ -1163,3 +1163,115 @@ for (const status of ["cancelled", "flattened", "gone", "excluded", "todoist-own
     assert.deepEqual(state.links,[]);
   });
 }
+
+
+test("Calendar-owned native task creation echo never PUTs the generated Calendar instance", async () => {
+  const current = instance("oct-28", "2026-10-28", "2026-10-29");
+  current.summary = "Weekly test";
+  const master = { id: MASTER, etag: '"v1"', iCalUID: SERIES, status: "confirmed",
+    summary: "Weekly test", description: "", start: { date: current.start.date },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=WE"] };
+  const link = { ...linkFor(current, "echo-task"), calendarProgressVersion: 1,
+    syncedTitle: "Weekly test", syncedDescription: "" };
+  const state = new FakeState(link);
+  const initial = { id: link.taskId, project_id: "home-project",
+    content: "Weekly test", description: "",
+    due: { date: "2026-10-28", string: "every Wednesday", is_recurring: true } };
+  const tasks = new Map([[initial.id, structuredClone(initial)]]);
+  const clients = fakeClients(state, [current], tasks, undefined, [master]);
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "echo", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-10-26T15:10:27Z", headers: {},
+    body: JSON.stringify({ event_name: "item:added", event_data: initial }),
+  });
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.equal(state.mappingsByTask.get(link.taskId).recurrenceOwner, "calendar");
+  assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
+});
+
+test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calendar master", async () => {
+  const current = instance("oct-28", "2026-10-28", "2026-10-29");
+  current.summary = "Weekly test";
+  const master = { id: MASTER, etag: '"v1"', iCalUID: SERIES, status: "confirmed",
+    summary: "Weekly test", description: "", start: { date: current.start.date },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=WE"] };
+  const link = { ...linkFor(current, "edited-task"), calendarProgressVersion: 1,
+    syncedTitle: "Weekly test", syncedDescription: "" };
+  const state = new FakeState(link);
+  const task = { id: link.taskId, project_id: "home-project",
+    content: "Renamed from Todoist", description: "",
+    due: { date: "2026-10-28", string: "every Wednesday", is_recurring: true } };
+  const tasks = new Map([[task.id, structuredClone(task)]]);
+  const clients = fakeClients(state, [current], tasks, undefined, [master]);
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "edit", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-10-26T15:10:27Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task,
+      event_data_extra: { old_item: { ...task, content: "Weekly test" } } }),
+  });
+  assert.equal(clients.calendarUpserts.length, 1);
+  assert.equal(clients.calendarUpserts[0].metadataOnly, true);
+  assert.equal(clients.events.get(MASTER).summary, "Renamed from Todoist");
+  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;BYDAY=WE"]);
+  assert.equal(tasks.get(task.id).due.date, "2026-10-28");
+  assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
+});
+
+test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async () => {
+  const current = instance("oct-28", "2026-10-28", "2026-10-29");
+  const next = instance("nov-04", "2026-11-04", "2026-11-05");
+  current.summary = "Renamed from Calendar";
+  next.summary = "Renamed from Calendar";
+  const master = { id: MASTER, etag: '"v2"', iCalUID: SERIES, status: "confirmed",
+    summary: "Renamed from Calendar", description: "",
+    start: { date: current.start.date }, end: { date: current.end.date },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=WE"] };
+  const link = { ...linkFor(current, "advanced-task"), calendarProgressVersion: 1,
+    syncedTitle: "Weekly test", syncedDescription: "" };
+  const state = new FakeState(link);
+  const task = { id: link.taskId, project_id: "home-project", content: "Weekly test",
+    description: "", due: { date: "2026-11-04", string: "every Wednesday", is_recurring: true } };
+  const tasks = new Map([[task.id, structuredClone(task)]]);
+  const clients = fakeClients(state, [current, next], tasks, master);
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "calendar-rename", kind: "calendar", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-10-26T15:11:59Z", headers: {}, body: "",
+  });
+  assert.equal(tasks.get(task.id).content, "Renamed from Calendar");
+  assert.equal(tasks.get(task.id).due.date, "2026-11-04");
+  assert.equal(clients.todoistRecurringUpdates.length, 0);
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.equal(state.mappingsByTask.get(task.id).eventId, "oct-28",
+    "progress should change only after a verified completion");
+  assert.ok(state.audits.some(e => e.action === "calendar_owned_completion_advance_deferred"));
+});
+
+test("native Todoist completion already at next Calendar occurrence updates mapping without second advance", async () => {
+  const current = instance("oct-28", "2026-10-28", "2026-10-29");
+  const next = instance("nov-04", "2026-11-04", "2026-11-05");
+  current.summary = "Weekly test";
+  next.summary = "Weekly test";
+  const master = { id: MASTER, etag: '"v1"', iCalUID: SERIES, status: "confirmed",
+    summary: "Weekly test", description: "", start: { date: current.start.date },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=WE"] };
+  const link = { ...linkFor(current, "advanced-task"), calendarProgressVersion: 1,
+    syncedTitle: "Weekly test", syncedDescription: "" };
+  const state = new FakeState(link);
+  const oldTask = { id: link.taskId, project_id: "home-project", content: "Weekly test",
+    description: "", due: { date: "2026-10-28", string: "every Wednesday", is_recurring: true } };
+  const tasks = new Map([[oldTask.id, { ...structuredClone(oldTask),
+    due: { ...oldTask.due, date: "2026-11-04" } }]]);
+  const clients = fakeClients(state, [current, next], tasks, undefined, [master]);
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "completed", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-10-26T15:11:12Z", headers: {},
+    body: JSON.stringify({ event_name: "item:completed",
+      event_data: { ...oldTask, is_completed: true }, event_data_extra: { old_item: oldTask } }),
+  });
+  assert.equal(clients.todoistRecurringUpdates.length, 0, "Todoist advanced itself; never advance twice");
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(tasks.get(oldTask.id).due.date, "2026-11-04");
+  assert.equal(state.mappingsByTask.get(oldTask.id).eventId, "nov-04");
+  assert.equal(state.mappingsByTask.get(oldTask.id).completedThroughOriginalStart, "2026-10-28");
+  assert.ok(state.audits.some(e => e.action === "calendar_owned_completion_provider_already_advanced"));
+});
