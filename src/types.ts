@@ -195,6 +195,8 @@ export interface Mapping {
   /** Last successfully mirrored metadata. Used to distinguish user edits from sync echoes. */
   syncedTitle?: string;
   syncedDescription?: string;
+  /** True when the Calendar-owned mirror is one native recurring Todoist task. */
+  calendarNativeRecurring?: boolean;
   updatedAt: string;
 }
 
@@ -226,6 +228,8 @@ export interface RecurrenceLink {
   /** Last successfully mirrored metadata. Used to distinguish user edits from sync echoes. */
   syncedTitle?: string;
   syncedDescription?: string;
+  /** True when the Calendar-owned mirror is one native recurring Todoist task. */
+  calendarNativeRecurring?: boolean;
   taskId: string;
   eventId: string;
   updatedAt: string;
