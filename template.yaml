@@ -753,7 +753,6 @@ Resources:
 
   ErasureReviewRequiredMetricFilter:
     Type: AWS::Logs::MetricFilter
-    DependsOn: ErasureWorkerLogGroup
     Properties:
       LogGroupName: !Ref ErasureWorkerLogGroup
       FilterPattern: '{ $.service = "todoist-calendar-sync-erasure-worker" && $.event = "operation_step" && $.status = "review_required" }'
