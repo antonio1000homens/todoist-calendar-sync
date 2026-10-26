@@ -192,6 +192,11 @@ export interface Mapping {
   calendarProgressVersion?: 1;
   /** Monotonic immutable `originalStart` of the latest logically completed Calendar-owned occurrence. */
   completedThroughOriginalStart?: string;
+  /** Last successfully mirrored metadata. Used to distinguish user edits from sync echoes. */
+  syncedTitle?: string;
+  syncedDescription?: string;
+  /** True when the Calendar-owned mirror is one native recurring Todoist task. */
+  calendarNativeRecurring?: boolean;
   updatedAt: string;
 }
 
@@ -220,6 +225,11 @@ export interface RecurrenceLink {
   calendarProgressVersion?: 1;
   /** Monotonic immutable `originalStart` of the latest logically completed Calendar-owned occurrence. */
   completedThroughOriginalStart?: string;
+  /** Last successfully mirrored metadata. Used to distinguish user edits from sync echoes. */
+  syncedTitle?: string;
+  syncedDescription?: string;
+  /** True when the Calendar-owned mirror is one native recurring Todoist task. */
+  calendarNativeRecurring?: boolean;
   taskId: string;
   eventId: string;
   updatedAt: string;

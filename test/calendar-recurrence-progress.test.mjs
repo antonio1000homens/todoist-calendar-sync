@@ -86,6 +86,18 @@ class FakeState {
     this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
     this.links.push(structuredClone(link));
   }
+  async updateCalendarOwnedMetadataIfUnchanged(previous, link, mapping) {
+    const current = this.mappingsByTask.get(previous.taskId);
+    const currentLink = this.links.find(item => item.profile === previous.profile && item.seriesId === previous.seriesId);
+    if (!current || !currentLink || current.updatedAt !== previous.updatedAt
+      || current.eventId !== previous.eventId || currentLink.updatedAt !== link.updatedAt
+      || currentLink.eventId !== previous.eventId) return false;
+    this.storeMapping(mapping);
+    this.links = this.links.filter(item => !(item.profile === link.profile && item.seriesId === link.seriesId));
+    this.links.push({ ...structuredClone(link), syncedTitle: mapping.syncedTitle,
+      syncedDescription: mapping.syncedDescription, updatedAt: mapping.updatedAt });
+    return true;
+  }
   async advanceCalendarSeriesMapping({ previous, mapping, link }) {
     this.operations.push({ action: "advance-mapping", previous: structuredClone(previous), mapping: structuredClone(mapping), link: structuredClone(link) });
     if (this.failAdvance) throw new Error("injected recurrence mapping transaction failure");

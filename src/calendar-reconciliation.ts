@@ -21,15 +21,17 @@ import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
   matchesCalendarOwnedRecurringTask,
+  matchesCalendarOwnedRecurringRule,
   calendarOwnedTodoistRecurrence,
   verifiedCalendarOwnedRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   nativeCalendarRecurrenceCandidate,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
+import { normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { calendarEventHasElapsed, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
+import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -74,6 +76,9 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
+    ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
@@ -522,14 +527,71 @@ export async function reconcileUnmappedCalendar(
         throw error;
       }
       if (currentTask.due?.is_recurring) {
-        // Existing native recurrence already belongs to this series; never
-        // replace a task merely to normalize Todoist's due-string spelling.
-        if (!matchesCalendarOwnedRecurringTask(currentTask, active, recurrence, seriesTimeZone)) {
+        // Native recurrence belongs to this exact link, including after
+        // Todoist itself advanced its due. Reconcile metadata and persist a
+        // durable baseline, not just the recurrence rule.
+        if (!matchesCalendarOwnedRecurringRule(currentTask, recurrence, seriesTimeZone)) {
           summary.conflicts += 1;
           await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
             seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [currentTask.id],
           });
-        } else summary.skipped += 1;
+          return;
+        }
+        const metadata = calendarOwnedMetadataResolution(existingMapping, master, currentTask);
+        if (metadata.conflicts.length || metadata.calendarChanged && !master.etag) {
+          summary.conflicts += 1;
+          await state.audit(profile, "calendar_owned_metadata_conflict", {
+            seriesId, taskId: currentTask.id, masterEventId: master.id,
+            fields: metadata.conflicts, reason: master.etag ? "concurrent_edits_or_missing_baseline" : "master_etag_missing",
+          });
+          return;
+        }
+        const requiresProviderWrite = metadata.calendarChanged || metadata.todoistChanged;
+        if (requiresProviderWrite) {
+          if (await controlsBlockRecovery([master.id, active.id], currentTask.id)) return;
+          if (!await canMutate(master.id, currentTask.id)) return;
+        }
+        if (metadata.calendarChanged) {
+          const result = await pair.calendar.patchEventMetadataIfUnchanged(master.id, master.etag!, {
+            summary: metadata.summary, description: metadata.description,
+          });
+          await state.recordMutation(profile);
+          if (result.id !== master.id || JSON.stringify(result.recurrence) !== JSON.stringify(master.recurrence)
+            || normalizedText(result.summary) !== metadata.summary
+            || normalizedText(result.description) !== metadata.description) {
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_owned_metadata_readback_mismatch", { seriesId, taskId: currentTask.id, provider: "calendar" });
+            return;
+          }
+        }
+        if (metadata.todoistChanged) {
+          if (!await canMutate(master.id,currentTask.id)) return;
+          const updated = await pair.todoist.updateTaskMetadata(currentTask.id, {
+            content: metadata.summary, description: metadata.description,
+          });
+          await state.recordMutation(profile);
+          if (updated.id !== currentTask.id || normalizedText(updated.content) !== metadata.summary
+            || normalizedText(updated.description) !== metadata.description
+            || JSON.stringify(updated.due) !== JSON.stringify(currentTask.due)) {
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_owned_metadata_readback_mismatch", { seriesId, taskId: currentTask.id, provider: "todoist" });
+            return;
+          }
+        }
+        const baseline: Mapping = {
+          ...existingMapping, syncedTitle: metadata.summary, syncedDescription: metadata.description,
+          calendarNativeRecurring: true, updatedAt: new Date().toISOString(),
+        };
+        if (existingMapping.syncedTitle !== baseline.syncedTitle
+          || existingMapping.syncedDescription !== baseline.syncedDescription
+          || !existingMapping.calendarNativeRecurring || requiresProviderWrite) {
+          if (!await state.updateCalendarOwnedMetadataIfUnchanged(existingMapping, existingLink, baseline)) {
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_owned_metadata_mapping_changed", { seriesId, taskId: currentTask.id });
+            return;
+          }
+        }
+        summary.skipped += 1;
         return;
       }
       const competing = recurringTaskIdentityCandidates(active, await pair.todoist.listTasks())
@@ -557,6 +619,14 @@ export async function reconcileUnmappedCalendar(
         });
         return;
       }
+      const migratedMapping: Mapping = {
+        ...existingMapping, calendarNativeRecurring: true,
+        syncedTitle: normalizedText(active.summary),
+        syncedDescription: normalizedText(active.description),
+        updatedAt: new Date().toISOString(),
+      };
+      await state.putMapping(migratedMapping);
+      await state.putRecurrenceLink(recurrenceLink(migratedMapping));
       summary.rebound += 1;
       await state.audit(profile, "calendar_snapshot_migrated_native_recurring_task", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: currentTask.id,
@@ -654,6 +724,9 @@ export async function reconcileUnmappedCalendar(
       originalStart: start,
       activeEffectiveStart: active.start?.dateTime || active.start?.date || start,
       calendarProgressVersion: 1,
+      syncedTitle: normalizedText(active.summary),
+      syncedDescription: normalizedText(active.description),
+      ...(recurrence ? { calendarNativeRecurring: true } : {}),
       updatedAt: new Date().toISOString(),
     };
     if (await controlsBlockRecovery([master.id,active.id],task.id)) {

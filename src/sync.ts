@@ -468,6 +468,37 @@ export function canRecreateCalendarProjection(lifecycle: TodoistCalendarLifecycl
   return isStrictlyNewer(taskUpdatedAt, tombstoneUpdatedAt) || (lifecycle.dueAdded && !taskUpdatedAt);
 }
 
+/**
+ * Resolve metadata per field against the last mirrored values. Recurrence
+ * ownership does not make title/description read-only on either side.
+ * Missing baselines or simultaneous divergent edits must fail closed.
+ */
+export function calendarOwnedMetadataResolution(
+  baseline: Pick<Mapping, "syncedTitle" | "syncedDescription">,
+  master: CalendarEvent,
+  task: TodoistTask,
+): {
+  summary: string; description: string;
+  calendarChanged: boolean; todoistChanged: boolean; conflicts: string[];
+} {
+  const conflicts: string[] = [];
+  let calendarChanged = false;
+  let todoistChanged = false;
+  function field(name: string, initial: string | undefined, calendarValue: string, todoistValue: string): string {
+    if (calendarValue === todoistValue) return calendarValue;
+    if (initial === undefined) { conflicts.push(name); return calendarValue; }
+    if (calendarValue === initial) { calendarChanged = true; return todoistValue; }
+    if (todoistValue === initial) { todoistChanged = true; return calendarValue; }
+    conflicts.push(name);
+    return calendarValue;
+  }
+  return {
+    summary: field("title", baseline.syncedTitle, normalizedText(master.summary), normalizedText(task.content)),
+    description: field("description", baseline.syncedDescription, normalizedText(master.description), normalizedText(task.description)),
+    calendarChanged, todoistChanged, conflicts,
+  };
+}
+
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
 }
@@ -486,6 +517,9 @@ function recurrenceLink(mapping: Mapping, owner: RecurrenceLink["owner"]): Recur
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
+    ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(owner === "calendar" && mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(owner === "calendar" && mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
@@ -505,6 +539,9 @@ function recurrenceMapping(link: RecurrenceLink): Mapping {
     activeInstanceId: link.activeInstanceId,
     originalStart: link.originalStart,
     activeEffectiveStart: link.activeEffectiveStart,
+    ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
+    ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
+    ...(link.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(link.owner === "calendar" && link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(link.owner === "calendar" && link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
@@ -642,6 +679,104 @@ export class Synchronizer {
     await this.completedState().deleteCompletedCalendarProjection?.(projection);
   }
 
+  /**
+   * Compare each editable metadata field with the last confirmed mirror.
+   * Apply only changed fields: Calendar PATCH targets the MASTER with If-Match,
+   * Todoist POST omits due to avoid a second native recurrence advance.
+   */
+  private async reconcileCalendarOwnedMetadata(
+    profile: Profile,
+    mapping: Mapping,
+    master: CalendarEvent,
+    task: TodoistTask,
+    calendar: GoogleCalendar,
+    todoist: Todoist,
+  ): Promise<{ blocked: boolean; task: TodoistTask; mapping: Mapping }> {
+    const resolution = calendarOwnedMetadataResolution(mapping, master, task);
+    if (resolution.conflicts.length) {
+      await this.state.audit(profile, "calendar_owned_metadata_conflict", {
+        seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
+        fields: resolution.conflicts, reason: "concurrent_edits_or_missing_baseline",
+      });
+      return { blocked: true, task, mapping };
+    }
+    const expected = { content: resolution.summary, description: resolution.description };
+    if (resolution.calendarChanged && !master.etag) {
+      await this.state.audit(profile, "calendar_owned_metadata_conflict", {
+        seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
+        reason: "calendar_master_etag_missing",
+      });
+      return { blocked: true, task, mapping };
+    }
+    if (resolution.calendarChanged) {
+      if (!await this.state.mutationAllowed(profile)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
+        return { blocked: true, task, mapping };
+      }
+      const updated = await calendar.patchEventMetadataIfUnchanged(master.id, master.etag!, {
+        summary: resolution.summary, description: resolution.description,
+      });
+      await this.state.recordMutation(profile);
+      if (updated.id !== master.id || updated.recurringEventId || updated.status === "cancelled"
+        || JSON.stringify(updated.recurrence) !== JSON.stringify(master.recurrence)
+        || normalizedText(updated.summary) !== resolution.summary
+        || normalizedText(updated.description) !== resolution.description) {
+        await this.state.audit(profile, "calendar_owned_metadata_readback_mismatch", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id, provider: "calendar",
+        });
+        return { blocked: true, task, mapping };
+      }
+    }
+    let nextTask = task;
+    if (resolution.todoistChanged) {
+      if (!await this.state.mutationAllowed(profile)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
+        return { blocked: true, task, mapping };
+      }
+      nextTask = await todoist.updateTaskMetadata(task.id, expected);
+      await this.state.recordMutation(profile);
+      const dueBefore = task.due, dueAfter = nextTask.due;
+      if (nextTask.id !== task.id
+        || normalizedText(nextTask.content) !== expected.content
+        || normalizedText(nextTask.description) !== expected.description
+        || Boolean(dueBefore?.is_recurring) !== Boolean(dueAfter?.is_recurring)
+        || (dueBefore?.date || dueBefore?.datetime) !== (dueAfter?.date || dueAfter?.datetime)
+        || dueBefore?.string !== dueAfter?.string) {
+        await this.state.audit(profile, "calendar_owned_metadata_readback_mismatch", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id, provider: "todoist",
+        });
+        return { blocked: true, task, mapping };
+      }
+    }
+    const nextMapping: Mapping = {
+      ...mapping, syncedTitle: resolution.summary, syncedDescription: resolution.description,
+      updatedAt: new Date().toISOString(),
+    };
+    // Provider writes and metadata-baseline persistence are independent. The
+    // latter MUST CAS all mapping indices and the link together against the
+    // original versions. Re-reading then putMapping would resurrect old
+    // occurrence indices after a concurrent completion.
+    if (resolution.calendarChanged || resolution.todoistChanged
+      || mapping.syncedTitle !== resolution.summary || mapping.syncedDescription !== resolution.description) {
+      const link = mapping.seriesId ? await this.state.getRecurrenceLink(profile, mapping.seriesId) : undefined;
+      if (!link || link.owner !== "calendar" || link.taskId !== task.id
+        || link.eventId !== mapping.eventId || link.masterEventId !== master.id
+        || !await this.state.updateCalendarOwnedMetadataIfUnchanged(mapping, link, nextMapping)) {
+        await this.state.audit(profile, "calendar_owned_metadata_mapping_changed", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
+        });
+        return { blocked: true, task: nextTask, mapping };
+      }
+      if (resolution.calendarChanged || resolution.todoistChanged) {
+        await this.state.audit(profile, "calendar_owned_metadata_propagated", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
+          toCalendar: resolution.calendarChanged, toTodoist: resolution.todoistChanged,
+        });
+      }
+    }
+    return { blocked: false, task: nextTask, mapping: nextMapping };
+  }
+
   private async bindTodoistOwnedOccurrence(
     profile: Profile,
     mapping: Mapping,
@@ -753,12 +888,31 @@ export class Synchronizer {
           if (Number((error as { status?: number }).status) !== 404) throw error;
         });
       }
-      const nextTask = task?.due?.is_recurring
-        ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
-        : await todoist.upsertTask(
-          recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
-          progressAware ? task?.id : undefined,
-        );
+      // If Todoist itself has already moved to this Calendar occurrence,
+      // reconciliation must only advance durable state, not move it twice.
+      const providerAlreadyAdvanced = Boolean(task?.due?.is_recurring && startsMatch(active, task));
+      if (providerAlreadyAdvanced && progressAware) {
+        // Due-date readback alone cannot prove that the previous occurrence
+        // was completed: this might be a user reschedule or a late completion
+        // webhook. Only the completion handler can commit its monotonic
+        // watermark and successor mapping in one CAS transaction.
+        await this.state.audit(profile, "calendar_owned_completion_advance_deferred", {
+          seriesId: link.seriesId, taskId: link.taskId, activeEventId: link.eventId,
+          nextEventId: active.id, reason: "completion_evidence_required",
+        });
+        continue;
+      }
+      const nextTask = providerAlreadyAdvanced && task
+        ? task
+        : task?.due?.is_recurring
+          ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
+          : await todoist.upsertTask(
+            recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
+            progressAware ? task?.id : undefined,
+          );
+      if (providerAlreadyAdvanced) await this.state.audit(profile, "calendar_owned_completion_provider_already_advanced", {
+        seriesId: link.seriesId, taskId: link.taskId, nextEventId: active.id, origin: "scheduled_reconcile",
+      });
       if (recurrence && !calendarOwnedRecurringTaskReadback(nextTask, active, recurrence, timeZone).matches) {
         await this.state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
           seriesId: link.seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,
@@ -779,6 +933,9 @@ export class Synchronizer {
         activeEffectiveStart: eventEffectiveStart(active),
         ...(link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
         ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
+        ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
+        ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
+        ...(link.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
         updatedAt: new Date().toISOString(),
       };
       await this.state.putMapping(next);
@@ -1387,8 +1544,12 @@ export class Synchronizer {
     // An exact provider identity must never silently become a different task,
     // even when it belongs to another project/profile or is now a one-off.
     const conflictingIds = [...new Set(candidates.filter((id) => id !== task?.id).concat(sharedTaskIds.filter((id) => id !== task?.id)))];
+    // A native recurring task may already have been advanced by Todoist before
+    // we process its completion webhook. Validate the RULE independently of
+    // the due date and metadata, otherwise a legitimate advance looks like an
+    // identity collision and a Calendar rename never propagates.
     const mappedRecurringMatches = Boolean(calendarRecurrence && task && task.id === existing?.taskId
-      && matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone));
+      && matchesCalendarOwnedRecurringRule(task, calendarRecurrence, calendarTimeZone));
     if ((task?.due?.is_recurring && !mappedRecurringMatches) || conflictingIds.length) {
       return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
         seriesId, masterEventId: master.id, eventId: active.id,
@@ -1403,8 +1564,35 @@ export class Synchronizer {
     if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id })) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
     }
+    if (task?.due?.is_recurring && calendarRecurrence) {
+      const mapped = await this.state.getMappingByTask(delivery.profile, task.id);
+      if (!mapped || mapped.recurrenceOwner !== "calendar" || mapped.masterEventId !== master.id
+        || mapped.seriesId !== seriesId || mapped.eventId !== existing?.eventId) {
+        return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "durable_mapping_missing_or_changed",
+        });
+      }
+      const metadata = await this.reconcileCalendarOwnedMetadata(delivery.profile, mapped, master, task, calendar, todoist);
+      if (metadata.blocked) return;
+      task = metadata.task;
+      if (!startsMatch(active, task)) {
+        // An in-flight Todoist completion may have advanced the provider's due
+        // date while DynamoDB still references the old Calendar occurrence.
+        // Metadata can still be synced safely; due/progress must await a
+        // verified completion, never rewind a native recurring task.
+        return this.state.audit(delivery.profile, "calendar_owned_completion_advance_deferred", {
+          seriesId, masterEventId: master.id, taskId: task.id,
+          mappedEventId: existing?.eventId, activeEventId: active.id,
+          providerDue: task.due?.date || task.due?.datetime,
+        });
+      }
+    }
     if (task && existing?.activeInstanceId === active.id
-      && (calendarRecurrence ? matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone) : hasCanonicalState(active, task))) {
+      && (calendarRecurrence ? matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone)
+        && normalizedText(active.summary) === normalizedText(task.content)
+        && normalizedText(active.description) === normalizedText(task.description)
+        : hasCanonicalState(active, task))) {
       return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
     }
     if (await this.calendarMutationBlockedByCompletion(delivery, active.id)) return;
@@ -1442,6 +1630,9 @@ export class Synchronizer {
       activeInstanceId: active.id,
       originalStart: eventStart(active),
       activeEffectiveStart: eventEffectiveStart(active),
+      syncedTitle: normalizedText(active.summary),
+      syncedDescription: normalizedText(active.description),
+      ...(calendarRecurrence ? { calendarNativeRecurring: true } : {}),
       ...(existing
         ? existing.calendarProgressVersion === 1
           ? {
@@ -1553,6 +1744,76 @@ export class Synchronizer {
 
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
+    if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId
+      && (task.due?.is_recurring || mapping.calendarNativeRecurring)) {
+      // A mapped Calendar-origin recurring Todoist task may legitimately have
+      // user-edited metadata. Its automatic date advance is not an instruction
+      // to rewrite a generated Calendar instance or transfer ownership.
+      let master: CalendarEvent;
+      try { master = await calendar.getEvent(mapping.masterEventId); }
+      catch (error) {
+        if (!calendarEventGoneOnDirectRead(error)) throw error;
+        return this.state.audit(delivery.profile, "calendar_owned_todoist_master_missing", {
+          taskId: task.id, masterEventId: mapping.masterEventId,
+        });
+      }
+      if (master.status === "cancelled" || !master.recurrence?.length || master.recurringEventId
+        || !task.due?.is_recurring) {
+        return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+          taskId: task.id, masterEventId: mapping.masterEventId,
+          reason: "missing_or_changed_recurring_rule",
+        });
+      }
+      const previousDue = payload.event_data_extra?.old_item?.due;
+      if (payload.event_name === "item:updated" && previousDue?.is_recurring
+        && (previousDue.string && previousDue.string !== task.due?.string
+          || previousDue.timezone && previousDue.timezone !== task.due?.timezone)) {
+        return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+          taskId: task.id, masterEventId: mapping.masterEventId,
+          reason: "explicit_todoist_recurrence_change",
+        });
+      }
+      if (nativeCalendarRecurrenceCandidate(master)) {
+        // Webhooks can omit old_item. Validate the native rule against the
+        // verified Calendar master instead of trusting an unchanged due date:
+        // cadence, weekday, month/day, start boundary and local time must
+        // still match. Do not expand an infinite Calendar series here.
+        let zone: string;
+        try { zone = await resolveCalendarTimeZone(master, calendar.getTimeZone?.bind(calendar)); }
+        catch {
+          return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+            taskId: task.id, masterEventId: mapping.masterEventId, reason: "calendar_timezone_unverified",
+          });
+        }
+        const expectedRule = calendarOwnedTodoistRecurrence(master, [], zone);
+        if (!expectedRule || !matchesCalendarOwnedRecurringRule(task, expectedRule, zone)) {
+          return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+            taskId: task.id, masterEventId: mapping.masterEventId, reason: "native_rule_changed_or_unsupported",
+          });
+        }
+      }
+      if (recurringDateEdit) {
+        return this.state.audit(delivery.profile, "calendar_owned_todoist_date_edit_requires_review", {
+          taskId: task.id, masterEventId: mapping.masterEventId,
+          reason: "explicit_todoist_date_change",
+        });
+      }
+      if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
+        return this.state.audit(delivery.profile, "todoist_mutation_suppressed", {
+          taskId: task.id, event: payload.event_name, mode: delivery.mode,
+        });
+      }
+      const metadata = await this.reconcileCalendarOwnedMetadata(delivery.profile, mapping, master, task, calendar, todoist);
+      if (metadata.blocked) return;
+      // An item:added echo or native post-completion due change is not a
+      // request to PUT the Calendar instance. Completion alone may move the
+      // mapping, after the corresponding completion delivery is validated.
+      return this.state.audit(delivery.profile, "calendar_owned_todoist_echo_ignored", {
+        taskId: task.id, seriesId: mapping.seriesId,
+        due: task.due?.datetime || task.due?.date,
+        mappedOccurrence: mapping.eventId, event: payload.event_name,
+      });
+    }
     if (lifecycle.reason === "completed" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId) {
       const completedDueStart = task.due?.datetime || task.due?.date;
       if (mapping.calendarProgressVersion === 1 && mapping.completedThroughOriginalStart && completedDueStart
@@ -1707,9 +1968,21 @@ export class Synchronizer {
           seriesId: mapping.seriesId, taskId: task.id, terminality: "unverified",
         });
       }
-      const nextTask = currentCalendarRecurrence && currentRecurringTask
-        ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
-        : await todoist.upsertTask(toTodoistTask(next));
+      // Todoist automatically advances native recurrence on completion.
+      // When that readback already points to the exact next Calendar instance,
+      // do not send a second item_update (which could skip an occurrence).
+      const alreadyAdvanced = Boolean(currentCalendarRecurrence && currentRecurringTask
+        && startsMatch(next, currentRecurringTask));
+      const nextTask = alreadyAdvanced && currentRecurringTask
+        ? currentRecurringTask
+        : currentCalendarRecurrence && currentRecurringTask
+          ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
+          : await todoist.upsertTask(toTodoistTask(next));
+      if (alreadyAdvanced) {
+        await this.state.audit(delivery.profile, "calendar_owned_completion_provider_already_advanced", {
+          seriesId: mapping.seriesId, taskId: task.id, nextEventId: next.id,
+        });
+      }
       const readback = currentCalendarRecurrence
         ? calendarOwnedRecurringTaskReadback(nextTask, next, currentCalendarRecurrence, verifiedCalendarTimeZone)
         : undefined;
@@ -1734,6 +2007,9 @@ export class Synchronizer {
         activeEffectiveStart: eventEffectiveStart(next),
         ...(progressMapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
         ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+        ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
+        ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+        ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
         updatedAt: new Date().toISOString(),
       };
       const expectedLink = mapping.seriesId

@@ -779,6 +779,77 @@ export class StateRepository {
   }
 
   /**
+   * Persist metadata baselines without ever resurrecting an occurrence that a
+   * completion/recovery worker has already advanced. All three mapping views
+   * and the recurrence link must still match the exact versions read earlier.
+   */
+  async updateCalendarOwnedMetadataIfUnchanged(
+    previous: Mapping,
+    expectedLink: RecurrenceLink,
+    next: Mapping,
+  ): Promise<boolean> {
+    if (previous.recurrenceOwner !== "calendar" || expectedLink.owner !== "calendar"
+      || next.recurrenceOwner !== "calendar" || !previous.updatedAt || !expectedLink.updatedAt
+      || previous.profile !== next.profile || previous.taskId !== next.taskId
+      || previous.eventId !== next.eventId || previous.seriesId !== next.seriesId
+      || previous.masterEventId !== next.masterEventId || previous.activeInstanceId !== next.activeInstanceId
+      || previous.completedThroughOriginalStart !== next.completedThroughOriginalStart
+      || previous.calendarProgressVersion !== next.calendarProgressVersion
+      || expectedLink.profile !== previous.profile || expectedLink.seriesId !== previous.seriesId
+      || expectedLink.taskId !== previous.taskId || expectedLink.eventId !== previous.eventId
+      || expectedLink.masterEventId !== previous.masterEventId) {
+      throw new Error("Calendar metadata baseline update requires an unchanged exact series mapping");
+    }
+    const table = this.ensureTable();
+    const condition = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master";
+    const attrNames = { "#profile": "profile" };
+    const attrValues = {
+      ":profile": previous.profile, ":task": previous.taskId, ":event": previous.eventId,
+      ":updated": previous.updatedAt, ":owner": "calendar", ":series": previous.seriesId,
+      ":master": previous.masterEventId,
+    };
+    const row = (rowKey: {pk: string; sk: string}, index: Record<string, unknown>) => ({
+      Put: { TableName: table, Item: { ...next, ...rowKey, ...index },
+        ConditionExpression: condition, ExpressionAttributeNames: attrNames,
+        ExpressionAttributeValues: attrValues },
+    });
+    const link = {
+      ...expectedLink,
+      ...(next.syncedTitle !== undefined ? { syncedTitle: next.syncedTitle } : {}),
+      ...(next.syncedDescription !== undefined ? { syncedDescription: next.syncedDescription } : {}),
+      ...(next.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
+      updatedAt: next.updatedAt,
+    };
+    const tx: Array<Record<string, unknown>> = [
+      row(key(`EVENT#${next.profile}#${next.eventId}`, "MAP"), mappingEventLookupAttributes(next)),
+      row(key(`TASK#${next.profile}#${next.taskId}`, "MAP"), mappingLookupAttributes(next)),
+      row(key(`TASKOWNER#${next.taskId}`, "MAP"), mappingOwnerLookupAttributes(next)),
+      { Put: {
+        TableName: table,
+        Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
+        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :version AND #owner = :owner",
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: {
+          ":profile": expectedLink.profile, ":task": expectedLink.taskId,
+          ":event": expectedLink.eventId, ":version": expectedLink.updatedAt, ":owner": "calendar",
+        },
+      } },
+    ];
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{Code?: string}> };
+      if (conditionalFailure(error) || cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some(reason=>reason.Code==="ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every(reason=>reason.Code==="None" || reason.Code==="ConditionalCheckFailed")) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Atomically bind a Calendar-owned recurring task to its next occurrence,
    * commit completion progress, and remove the previous occurrence index.
    * Provider advancement must already have been read back and verified.
