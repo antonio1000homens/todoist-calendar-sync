@@ -1482,7 +1482,20 @@ export class Synchronizer {
         eventId: retained.eventId,
         completedThroughOriginalStart,
       });
-      const instances = await calendar.listInstances(mapping.masterEventId);
+      // Never exhaustively expand an indefinitely recurring Calendar master.
+      // Keep the mapped occurrence (which may be overdue) in the bounded range.
+      let completionMaster: CalendarEvent | undefined;
+      try { completionMaster = await calendar.getEvent(mapping.masterEventId); }
+      catch (error) { if (!calendarEventGoneOnDirectRead(error)) throw error; }
+      const nativeCompletion = Boolean(completionMaster && nativeCalendarRecurrenceCandidate(completionMaster));
+      const mappedStart = mapping.activeEffectiveStart || mapping.originalStart;
+      const mappedMs = mappedStart ? Date.parse(mappedStart) : Number.NaN;
+      const startMs = Number.isFinite(mappedMs) ? Math.min(mappedMs, Date.now()) : Date.now();
+      const instances = nativeCompletion && calendar.listInstancesInWindow
+        ? await calendar.listInstancesInWindow(mapping.masterEventId,
+          new Date(startMs - 24 * 60 * 60_000).toISOString(),
+          new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString())
+        : await calendar.listInstances(mapping.masterEventId);
       let currentRecurringTask: TodoistTask | undefined;
       let currentCalendarRecurrence: ReturnType<typeof calendarOwnedTodoistRecurrence>;
       const recurrenceHint = Boolean(task.due?.is_recurring || payload.event_data_extra?.old_item?.due?.is_recurring);
