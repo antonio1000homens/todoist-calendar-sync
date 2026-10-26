@@ -57,6 +57,10 @@ function mappingFromLink(link) {
     activeInstanceId: link.activeInstanceId,
     originalStart: link.originalStart,
     activeEffectiveStart: link.activeEffectiveStart,
+    ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
+    ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
+    ...(link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 } : {}),
+    ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
   };
 }
@@ -207,6 +211,14 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
       calendarDeletes.push(id);
       events.delete(id);
     },
+    async patchEventMetadataIfUnchanged(id, etag, metadata) {
+      const master = events.get(id);
+      if (!master || master.etag !== etag) throw Object.assign(new Error("stale master"), { status: 412 });
+      const next = { ...master, ...structuredClone(metadata), etag: `etag-${calendarUpserts.length + 1}` };
+      events.set(id, next);
+      calendarUpserts.push({ id, metadataOnly: true, metadata: structuredClone(metadata) });
+      return structuredClone(next);
+    },
     async upsertEvent(payload, existingId) {
       const id = existingId || payload.id || `calendar-created-${calendarUpserts.length + 1}`;
       const stored = { ...structuredClone(payload), id, status: "confirmed" };
@@ -241,6 +253,14 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
       todoistUpserts.push({ id, payload: structuredClone(payload), existingId });
       tasks.set(id, stored);
       return stored;
+    },
+    async updateTaskMetadata(id, metadata) {
+      const current = tasks.get(id);
+      if (!current) throw Object.assign(new Error("missing"), { status: 404 });
+      const stored = { ...structuredClone(current), ...structuredClone(metadata) };
+      tasks.set(id, stored);
+      state.operations.push(`update-task-metadata:${id}`);
+      return structuredClone(stored);
     },
     async updateRecurringOccurrence(task, occurrence) {
       const concrete = occurrence.due?.datetime || occurrence.due?.date;
@@ -906,7 +926,7 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   assert.equal(state.mappingsByTask.get(initialTask.id).activeEffectiveStart, dates[0]);
   assert.equal(state.links[0].owner, "calendar");
   assert.equal(state.links[0].masterEventId, MASTER);
-  assert.equal(state.audits.some((entry) => entry.action === "todoist_noop_canonical_state"), true);
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_owned_todoist_echo_ignored"), true);
 
   // Todoist advances its current due date to the next recurrence before the
   // completion webhook is handled. Here that due date is the canceled slot.
