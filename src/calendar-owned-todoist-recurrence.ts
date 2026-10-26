@@ -299,7 +299,8 @@ function openCalendarRecurrence(master: CalendarEvent, timeZone: string): Calend
   let parts: Record<string, string>;
   try { parts = localParts(start, timeZone); } catch { return undefined; }
   const weekday = weekdayNames.find((name) => name.toLowerCase().startsWith(parts.weekday.toLowerCase()));
-  const month = monthLookup.get(parts.month.toLowerCase());
+  // en-GB abbreviates September as "Sept"; normalize to the three-letter key.
+  const month = monthLookup.get(parts.month.toLowerCase().slice(0, 3));
   const day = Number(parts.day);
   if (!weekday || !month || !Number.isInteger(day) || day < 1 || day > 31) return undefined;
   // Enforce a single calendar date. Complex BYDAY and positional/31st patterns
