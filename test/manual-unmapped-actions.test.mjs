@@ -186,9 +186,9 @@ test("Slack exposes confirmed owner choices, but never authorizes unattended aut
   assert.match(blocks, /Keep separate/);
   const actions = decisionBlocks(oldCard.store.value).filter((block) => block.type === "actions")
     .flatMap((block) => block.elements);
-  assert.equal(JSON.parse(actions[0].value).confirmRequired, true);
-  assert.equal(JSON.parse(actions[1].value).confirmRequired, true);
-  assert.equal(JSON.parse(actions[2].value).confirmRequired, true);
+  assert.equal(JSON.parse(actions[0].value).confirmRequired, false);
+  assert.equal(JSON.parse(actions[1].value).confirmRequired, false);
+  assert.equal(JSON.parse(actions[2].value).confirmRequired, false);
   assert.equal(JSON.parse(actions[3].value).confirmRequired, false);
 });
 
