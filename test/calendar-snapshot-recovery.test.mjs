@@ -32,6 +32,12 @@ function fakeState() {
     async getCompletedCalendarProjectionByEvent(profile, eventId) { return completedProjections.find((item) => item.profile === profile && item.eventId === eventId); },
     async getRecurrenceLink() { return undefined; },
     async putMapping(mapping) { mappings.push(mapping); },
+    async updateCalendarOwnedMetadataIfUnchanged(previous, _link, next) {
+      const current = mappings.find(m => m.profile === previous.profile && m.taskId === previous.taskId && m.eventId === previous.eventId);
+      if (!current || current.updatedAt !== previous.updatedAt) return false;
+      mappings[mappings.indexOf(current)] = structuredClone(next);
+      return true;
+    },
     async putRecurrenceLink() {},
     async recordMutation() { mutations += 1; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
