@@ -2394,9 +2394,8 @@ export class ManualInterventionService {
       if (slackUserId === "AUTO_POLICY") {
         // Auto deletion must never fall through to a series or to an event
         // reassigned after the original Todoist deletion was observed.
-        if (mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId
-          || (mapping.activeInstanceId && mapping.activeInstanceId !== mapping.eventId)
-          || mapping.updatedAt !== decision.mappingSnapshot?.updatedAt) {
+        if (mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
+          || mapping.activeInstanceId || mapping.updatedAt !== decision.mappingSnapshot?.updatedAt) {
           return this.markStale(decision, "The standalone mapping changed or belongs to a recurrence; no automatic Calendar deletion was applied.", slackUserId);
         }
         const eventOwner = await state.getMappingByEvent(decision.profile, mapping.eventId);
@@ -2406,13 +2405,20 @@ export class ManualInterventionService {
         let event: CalendarEvent | undefined;
         try { event = await pair.calendar.getEvent(mapping.eventId); }
         catch (error) { if (!providerNotFound(error)) throw error; }
+        const shared = event?.extendedProperties?.shared;
         if (event && (event.recurringEventId || event.recurrence?.length
-          || (event.extendedProperties?.shared?.taskId && event.extendedProperties.shared.taskId !== mapping.taskId))) {
-          return this.markStale(decision, "The Calendar event is recurring or now belongs to another Todoist task.", slackUserId);
+          || shared?.syncRecurrenceOwner || shared?.todoistRecurrence || shared?.syncHistoryOnly === "true"
+          || shared?.taskId !== mapping.taskId)) {
+          return this.markStale(decision, "The Calendar event is recurring, historical or does not verify the mapped Todoist owner.", slackUserId);
         }
       }
       await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-      await state.deleteMapping(mapping);
+      // The Calendar API and DynamoDB are not one transaction. Never remove a
+      // mapping another writer has updated while this provider call was pending.
+      const mappingRemoved = await state.deleteMappingIfUnchanged(mapping);
+      if (!mappingRemoved) {
+        return this.markStale(decision, "Calendar deletion finished but mapping ownership changed; the newer mapping was preserved for review.", slackUserId);
+      }
       return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
     }
 
