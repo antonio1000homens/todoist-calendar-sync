@@ -456,20 +456,26 @@ export class ErasureOperationStore {
         ":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
   }
 
-  /** Freeze a previously enabled execution if its durable readiness bit is revoked mid-flight. */
+  /** Freeze an active execution when the deployment switch or durable readiness is revoked. */
   async markExecutionDisabledReviewRequired(id:string):Promise<void> {
     const operation=await this.get(id);
     const lifecycle=operation?.lifecycle;
-    if(!operation||!lifecycle||operation.providerDeletionReady===true
-      ||!["fencing","deleting","verifying"].includes(operation.status))
+    if(!operation||!lifecycle||!["fencing","deleting","verifying"].includes(operation.status)
+      ||(erasureExecutionEnabled()&&operation.providerDeletionReady===true))
       throw new Error("Operation is not an active execution with a revoked readiness gate");
     const message=ERASURE_REVIEW_REQUIRED_MESSAGE;
     const now=new Date().toISOString();
+    // Preserve the exact readiness state observed before the CAS. In particular,
+    // deployment revocation must also freeze operations that remain provider-ready.
+    const readinessCondition=operation.providerDeletionReady===undefined
+      ?"attribute_not_exists(providerDeletionReady)"
+      :"providerDeletionReady=:observedReady";
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
       UpdateExpression:"SET #status=:reviewRequired, #error=:error, updatedAt=:updatedAt, lifecycle.#lastError=:error",
-      ConditionExpression:"#status=:status AND lifecycle.#phase=:phase AND (providerDeletionReady=:disabled OR attribute_not_exists(providerDeletionReady)) AND previewFingerprint=:fingerprint",
+      ConditionExpression:`#status=:status AND lifecycle.#phase=:phase AND ${readinessCondition} AND previewFingerprint=:fingerprint`,
       ExpressionAttributeNames:{"#status":"status","#phase":"phase","#lastError":"lastError","#error":"error"},
-      ExpressionAttributeValues:{":status":operation.status,":phase":lifecycle.phase,":disabled":false,
+      ExpressionAttributeValues:{":status":operation.status,":phase":lifecycle.phase,
+        ...(operation.providerDeletionReady===undefined?{}:{":observedReady":operation.providerDeletionReady}),
         ":reviewRequired":"review_required",":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
   }
 
