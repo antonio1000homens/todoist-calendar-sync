@@ -37,10 +37,15 @@ function deletion(profile) {
     }),
   };
 }
-function setup(profile, { taskExists = false, mappingChanged = false, differentOwner = false, recurringEvent = false } = {}) {
+function setup(profile, { taskExists = false, differentOwner = false, recurringEvent = false,
+  mappingRecurrenceId = false, mappingActiveInstanceId = false,
+  syncRecurrenceOwner = false, todoistRecurrence = false, missingTaskId = false,
+  historicalEvent = false, raceAfterProviderDelete = false } = {}) {
   const operations = [], decisions = new Decisions(), notifier = new Notifier();
   const original = {
     profile, taskId: "task-1", eventId: "event-1", updatedAt: "2026-10-26T09:00:00.000Z",
+    ...(mappingRecurrenceId ? { recurrenceId: "legacy-weekly" } : {}),
+    ...(mappingActiveInstanceId ? { activeInstanceId: "event-1" } : {}),
   };
   let current = original;
   const state = {
@@ -49,7 +54,14 @@ function setup(profile, { taskExists = false, mappingChanged = false, differentO
     async syncBlocked() { return false; },
     async mutationAllowed() { return true; },
     async recordMutation(p) { operations.push(`mutation ${p}`); },
-    async deleteMapping(m) { operations.push(`mapping ${m.eventId} removed`); current = undefined; },
+    async deleteMapping() { throw new Error("Unsafe unconditional mapping deletion"); },
+    async deleteMappingIfUnchanged(m) {
+      if (!current || current.updatedAt !== m.updatedAt
+        || current.eventId !== m.eventId || current.taskId !== m.taskId) return false;
+      operations.push(`mapping ${m.eventId} removed`);
+      current = undefined;
+      return true;
+    },
     async audit() {},
   };
   const clients = async () => ({
@@ -64,10 +76,20 @@ function setup(profile, { taskExists = false, mappingChanged = false, differentO
         return {
           id, summary: "Standalone appointment",
           ...(recurringEvent ? { recurrence: ["RRULE:FREQ=WEEKLY"] } : {}),
-          extendedProperties: { shared: { taskId: "task-1" } },
+          extendedProperties: { shared: {
+            ...(missingTaskId ? {} : { taskId: "task-1" }),
+            ...(syncRecurrenceOwner ? { syncRecurrenceOwner: "todoist" } : {}),
+            ...(todoistRecurrence ? { todoistRecurrence: "every week" } : {}),
+            ...(historicalEvent ? { syncHistoryOnly: "true" } : {}),
+          } },
         };
       },
-      async deleteEvent(id) { operations.push(`calendar ${id} deleted`); },
+      async deleteEvent(id) {
+        operations.push(`calendar ${id} deleted`);
+        if (raceAfterProviderDelete) {
+          current = { ...current, eventId: "new-owner-event", updatedAt: "2026-10-26T10:30:00.000Z" };
+        }
+      },
     },
   });
   const policies = { async resolve(_profile, _type, _seriesId, mode) { return { mode, source: "catalog" }; } };
@@ -127,13 +149,17 @@ test("replayed Todoist deletion does not enqueue a deletion after the task has r
   }
 });
 
-test("automatic standalone action fails closed on updated mapping, different owner or recurrence", async () => {
+test("automatic standalone action fails closed on changed owner, legacy recurrence and provider metadata", async () => {
   const oldEnabled = process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = "true";
   try {
-    for (const caseName of ["mappingChanged", "differentOwner", "recurringEvent"]) {
+    for (const caseName of [
+      "mappingChanged", "differentOwner", "recurringEvent", "mappingRecurrenceId",
+      "mappingActiveInstanceId", "syncRecurrenceOwner", "todoistRecurrence",
+      "missingTaskId", "historicalEvent",
+    ]) {
       const h = setup("work", { [caseName]: true });
-      const m = { profile: "work", taskId: "task-1", eventId: "event-1", updatedAt: "2026-10-26T09:00:00.000Z" };
+      const m = { ...await h.state.getMappingByTask() };
       const decision = {
         decisionId: caseName, profile: "work", type: "standalone_todoist_task_deleted",
         taskId: "task-1", eventId: "event-1", mappingSnapshot: m,
@@ -151,6 +177,33 @@ test("automatic standalone action fails closed on updated mapping, different own
       assert.deepEqual(h.operations, [], caseName);
       assert.equal(h.notifier.posted.length, 0, caseName);
     }
+  } finally {
+    if (oldEnabled === undefined) delete process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
+    else process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = oldEnabled;
+  }
+});
+
+test("a concurrent mapping update after Calendar deletion is never removed by the auto action", async () => {
+  const oldEnabled = process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = "true";
+  try {
+    const h = setup("work", { raceAfterProviderDelete: true });
+    const m = { ...await h.state.getMappingByTask() };
+    h.decisions.rows.set("race", {
+      decisionId: "race", profile: "work", type: "standalone_todoist_task_deleted",
+      taskId: m.taskId, eventId: m.eventId, mappingSnapshot: m,
+      status: "pending", createdAt: "2026-10-26T09:00:00.000Z",
+      decisionDeadline: "2099-10-26T09:00:00.000Z", context: {},
+      permittedActions: MANUAL_DECISION_CATALOG.standalone_todoist_task_deleted.actions,
+    });
+    await h.service.processManualDelivery({
+      ...deletion("work"), kind: "manual", body: "",
+      manual: { decisionId: "race", action: "delete_calendar_event", slackUserId: "AUTO_POLICY" },
+    }, h.state);
+    assert.equal(h.decisions.rows.get("race").status, "stale");
+    assert.equal((await h.state.getMappingByTask()).eventId, "new-owner-event");
+    assert.deepEqual(h.operations, ["calendar event-1 deleted", "mutation work"]);
+    assert.equal(h.notifier.posted.length, 0);
   } finally {
     if (oldEnabled === undefined) delete process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
     else process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = oldEnabled;
