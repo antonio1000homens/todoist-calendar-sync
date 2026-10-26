@@ -1746,6 +1746,14 @@ export class Synchronizer {
           reason: "missing_or_changed_recurring_rule",
         });
       }
+      const oldRule = payload.event_data_extra?.old_item?.due?.string;
+      if (payload.event_name === "item:updated" && oldRule
+        && oldRule !== task.due?.string) {
+        return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
+          taskId: task.id, masterEventId: mapping.masterEventId,
+          reason: "explicit_todoist_recurrence_change",
+        });
+      }
       if (recurringDateEdit) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_date_edit_requires_review", {
           taskId: task.id, masterEventId: mapping.masterEventId,
