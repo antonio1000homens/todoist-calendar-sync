@@ -119,6 +119,23 @@ test("all-day native rules and Todoist's normalized no-start recurrence remain v
   }
 });
 
+
+test("native weekly recurrence checks the London-local day across UTC midnight", () => {
+  const master = weeklyMaster("2027-07-06T23:30:00Z", "RRULE:FREQ=WEEKLY;BYDAY=WE");
+  const scheduled = instances(["2027-07-06T23:30:00Z"]);
+  const recurrence = calendarOwnedTodoistRecurrence(master, scheduled, "Europe/London");
+  assert.equal(recurrence.weekday, "Wednesday");
+  assert.equal(recurrence.startDate, "2027-07-07");
+  const event = { ...scheduled[0], start: master.start };
+  const task = { id: "task", due: {
+    date: "2027-07-06T23:30:00Z", is_recurring: true, string: recurrence.dueString,
+  } };
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence), false,
+    "unverified timezone cannot prove an offset datetime's logical weekday");
+});
+
 test("complex or finite non-weekly Calendar recurrences are never silently approximated", () => {
   const invalid = [
     ["2026-11-30", "RRULE:FREQ=MONTHLY"],
