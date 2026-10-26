@@ -290,7 +290,7 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolea
     && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYMONTH", "BYMONTHDAY"].includes(key)));
 }
 
-function openCalendarRecurrence(master: CalendarEvent, timeZone: string): CalendarOwnedTodoistRecurrence | undefined {
+function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[], timeZone: string): CalendarOwnedTodoistRecurrence | undefined {
   if (!nativeCalendarRecurrenceCandidate(master)) return undefined;
   const rule = master.recurrence![0];
   const fields = ruleFields(rule)!;
@@ -308,6 +308,23 @@ function openCalendarRecurrence(master: CalendarEvent, timeZone: string): Calend
   const time = parts.hour ? parseTime(`${parts.hour}:${parts.minute}${(parts.dayPeriod || "").toLowerCase()}`) : undefined;
   if (parts.hour && !time) return undefined;
   const timePhrase = parts.hour ? ` at ${parts.hour}:${parts.minute}${(parts.dayPeriod || "").toLowerCase()}` : "";
+  // A provider instance's immutable originalStartTime must satisfy the master
+  // cadence; its mutable effective start can be a legitimate exception.
+  // Reject contradictory inventories rather than blessing the wrong pattern.
+  for (const instance of instances.filter((item) => item.recurringEventId === master.id)) {
+    const original = instance.originalStartTime?.dateTime || instance.originalStartTime?.date;
+    if (!original) return undefined;
+    let originalParts: Record<string, string>;
+    try { originalParts = localParts(original, timeZone); }
+    catch { return undefined; }
+    const originalMonth = monthLookup.get(originalParts.month.toLowerCase().slice(0, 3));
+    const originalDay = Number(originalParts.day);
+    const originalWeekday = weekdayNames.find((name) => name.toLowerCase().startsWith(originalParts.weekday.toLowerCase()));
+    if (!originalMonth || !originalWeekday || !Number.isInteger(originalDay)) return undefined;
+    if (fields.FREQ === "WEEKLY" && originalWeekday !== weekday) return undefined;
+    if (fields.FREQ === "MONTHLY" && originalDay !== day) return undefined;
+    if (fields.FREQ === "YEARLY" && (originalMonth !== month || originalDay !== day)) return undefined;
+  }
   const startPhrase = localDate(start, timeZone);
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
   const localIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -410,7 +427,7 @@ export function calendarOwnedTodoistRecurrence(
   timeZone: string,
 ): CalendarOwnedTodoistRecurrence | undefined {
   if (master.recurrence?.length !== 1) return undefined;
-  const open = openCalendarRecurrence(master, timeZone);
+  const open = openCalendarRecurrence(master, instances, timeZone);
   if (open) return open;
   const rule = master.recurrence[0];
   const fields = ruleFields(rule);
