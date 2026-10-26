@@ -137,14 +137,19 @@ function reconciliationState() {
   };
 }
 
-test('mapped recurring Todoist deletion has one deterministic auto-safe whole-series operation', () => {
-  const policy = MANUAL_DECISION_CATALOG.calendar_owned_recurrence_task_deleted;
-  assert.equal(policy.detection, 'pre_mutation');
-  assert.equal(policy.defaultMode, 'auto');
-  assert.equal(policy.defaultAction, 'delete_whole_series');
-  assert.deepEqual(policy.actions.map(action => action.id), ['delete_whole_series']);
-  assert.equal(policy.actions[0].destructive, true);
-  assert.equal(policy.actions[0].autoAllowed, true);
+test('native Todoist mirror deletion has one automatic whole-series action; rolling mirrors retain review choices', () => {
+  const native = MANUAL_DECISION_CATALOG.calendar_owned_native_recurrence_task_deleted;
+  assert.equal(native.detection, 'pre_mutation');
+  assert.equal(native.defaultMode, 'auto');
+  assert.equal(native.defaultAction, 'delete_whole_series');
+  assert.deepEqual(native.actions.map(action => action.id), ['delete_whole_series']);
+  assert.equal(native.actions[0].destructive, true);
+  assert.equal(native.actions[0].autoAllowed, true);
+  const rolling = MANUAL_DECISION_CATALOG.calendar_owned_recurrence_task_deleted;
+  assert.deepEqual(rolling.actions.map(action => action.id), [
+    'skip_occurrence', 'delete_this_and_future', 'delete_whole_series', 'restore_todoist_task',
+  ]);
+  assert.equal(rolling.defaultMode, undefined);
 });
 
 test('mapped recurring Todoist deletion queues whole-series removal without prompting, overriding old profile defaults', async () => {
@@ -153,7 +158,7 @@ test('mapped recurring Todoist deletion queues whole-series removal without prom
   const notifier = new FakeNotifier();
   const policies = new FakePolicyStore({ mode: 'prompt', source: 'profile', defaultAction: 'restore_todoist_task' });
   const queued = [];
-  const mapping = mappedCalendarRecurrence();
+  const mapping = { ...mappedCalendarRecurrence(), calendarNativeRecurring: true };
   const audits = [];
   const state = {
     async syncBlocked() { return false; },
@@ -216,7 +221,7 @@ test('terminal deterministic decision is not reopened by the same detector state
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
   const policies = new FakePolicyStore();
-  const mapping = mappedCalendarRecurrence();
+  const mapping = { ...mappedCalendarRecurrence(), calendarNativeRecurring: true };
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
@@ -318,7 +323,7 @@ test('the standard whole-series deletion is eligible for unattended execution', 
   assert.equal(policies.saved[0].defaultAction, 'delete_whole_series');
 });
 
-test('obsolete restore-task action cannot be saved as an auto policy', async () => {
+test('rolling mirror restore-task policy remains valid for explicit review', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const policies = new FakePolicyStore();
   const notifier = new FakeNotifier();
@@ -341,8 +346,8 @@ test('obsolete restore-task action cannot be saved as an auto policy', async () 
         defaultAction: 'restore_todoist_task',
       },
     },
-  }, {}).catch(error => { assert.match(error.message, /not a stable catalog action/); });
-  assert.equal(policies.saved.length, 0);
+  }, {});
+  assert.equal(policies.saved.length, 1);
 });
 
 test('expired decision is atomically closed before provider clients are read', async () => {
