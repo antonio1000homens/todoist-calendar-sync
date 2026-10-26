@@ -21,6 +21,17 @@ export function normalizedText(value: unknown): string {
   return String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\u200B/g, "").replace(/\s+/g, " ").trim();
 }
 
+/** Normalize description boundaries without destroying meaningful line breaks. */
+export function normalizedDescription(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\u200B/g, "")
+    .split("\n")
+    .map(line => line.replace(/[\t ]+$/g, ""))
+    .join("\n")
+    .trim();
+}
+
 export function normalizedStart(value: string | undefined, dateOnly: boolean): string {
   if (!value) return "";
   if (dateOnly) return `date:${value.slice(0, 10)}`;

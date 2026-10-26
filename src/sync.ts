@@ -4,7 +4,7 @@ import { attachProjectCommentReference, deleteMappingComments } from "./mapping-
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
-import { normalizedStart, normalizedText } from "./security.js";
+import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
 import {
   calendarRecurrenceMatchesTodoist,
   isTodoistOwnedCalendarRecurrence,
@@ -175,7 +175,7 @@ function recurrenceAnchorMatches(event: CalendarEvent): boolean {
 export function occurrenceStateMatches(event: CalendarEvent, task: TodoistTask): boolean {
   return event.status !== "cancelled"
     && normalizedText(event.summary) === normalizedText(task.content)
-    && normalizedText(event.description) === normalizedText(task.description)
+    && normalizedDescription(event.description) === normalizedDescription(task.description)
     && startsMatch(event, task);
 }
 
@@ -205,7 +205,7 @@ export function toTodoistTask(event: CalendarEvent): Omit<TodoistTask, "id"> {
     : start.date ? { date: start.date } : undefined;
   return {
     content: normalizedText(event.summary) || "Untitled calendar event",
-    description: normalizedText(event.description),
+    description: normalizedDescription(event.description),
     due,
   };
 }
@@ -264,7 +264,7 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
   return {
     id: "",
     summary: normalizedText(task.content) || "Untitled Todoist task",
-    description: normalizedText(task.description),
+    description: normalizedDescription(task.description),
     start,
     end,
     recurrence: rrule ? [rrule] : undefined,
@@ -288,7 +288,7 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
           todoistAnchorAllDay: start.date ? "true" : "false",
           todoistAnchorTimeZone: start.timeZone || "",
           todoistTemplateSummary: normalizedText(task.content),
-          todoistTemplateDescription: normalizedText(task.description),
+          todoistTemplateDescription: normalizedDescription(task.description),
         } : {}),
       },
     },
@@ -424,7 +424,7 @@ export function suppressedLegacyCalendarRecurrenceCandidate(
 export function hasCanonicalState(event: CalendarEvent, task: TodoistTask): boolean {
   const textMatches = event.status !== "cancelled"
     && normalizedText(event.summary) === normalizedText(task.content)
-    && normalizedText(event.description) === normalizedText(task.description);
+    && normalizedDescription(event.description) === normalizedDescription(task.description);
   if (!textMatches) return false;
   if (todoistRecurrenceToRrule(task)) {
     return calendarRecurrenceMatchesTodoist(event, task) && recurrenceAnchorMatches(event);
@@ -494,7 +494,7 @@ export function calendarOwnedMetadataResolution(
   }
   return {
     summary: field("title", baseline.syncedTitle, normalizedText(master.summary), normalizedText(task.content)),
-    description: field("description", baseline.syncedDescription, normalizedText(master.description), normalizedText(task.description)),
+    description: field("description", baseline.syncedDescription, normalizedDescription(master.description), normalizedDescription(task.description)),
     calendarChanged, todoistChanged, conflicts,
   };
 }
@@ -720,7 +720,7 @@ export class Synchronizer {
       if (updated.id !== master.id || updated.recurringEventId || updated.status === "cancelled"
         || JSON.stringify(updated.recurrence) !== JSON.stringify(master.recurrence)
         || normalizedText(updated.summary) !== resolution.summary
-        || normalizedText(updated.description) !== resolution.description) {
+        || normalizedDescription(updated.description) !== resolution.description) {
         await this.state.audit(profile, "calendar_owned_metadata_readback_mismatch", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id, provider: "calendar",
         });
@@ -738,7 +738,7 @@ export class Synchronizer {
       const dueBefore = task.due, dueAfter = nextTask.due;
       if (nextTask.id !== task.id
         || normalizedText(nextTask.content) !== expected.content
-        || normalizedText(nextTask.description) !== expected.description
+        || normalizedDescription(nextTask.description) !== expected.description
         || Boolean(dueBefore?.is_recurring) !== Boolean(dueAfter?.is_recurring)
         || (dueBefore?.date || dueBefore?.datetime) !== (dueAfter?.date || dueAfter?.datetime)
         || dueBefore?.string !== dueAfter?.string) {
@@ -1591,7 +1591,7 @@ export class Synchronizer {
     if (task && existing?.activeInstanceId === active.id
       && (calendarRecurrence ? matchesCalendarOwnedRecurringTask(task, active, calendarRecurrence, calendarTimeZone)
         && normalizedText(active.summary) === normalizedText(task.content)
-        && normalizedText(active.description) === normalizedText(task.description)
+        && normalizedDescription(active.description) === normalizedDescription(task.description)
         : hasCanonicalState(active, task))) {
       return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
     }
@@ -1631,7 +1631,7 @@ export class Synchronizer {
       originalStart: eventStart(active),
       activeEffectiveStart: eventEffectiveStart(active),
       syncedTitle: normalizedText(active.summary),
-      syncedDescription: normalizedText(active.description),
+      syncedDescription: normalizedDescription(active.description),
       ...(calendarRecurrence ? { calendarNativeRecurring: true } : {}),
       ...(existing
         ? existing.calendarProgressVersion === 1
