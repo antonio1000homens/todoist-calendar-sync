@@ -19,6 +19,8 @@ sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
 cloudflare_access_issuer="${CF_ACCESS_ISSUER:-}"
 cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
 review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
+# A destructive production feature; deployments must explicitly opt in.
+erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
 # SAM's key=value parameter parser consumes JSON quotes unless they are escaped.
 # Keep the value JSON for validation, but escape quotes only at the CLI boundary.
 sam_profile_config_json="${sync_profile_config_json//\"/\\\"}"
@@ -72,6 +74,10 @@ if [[ "$ssm_prefix" != /* ]]; then
 fi
 if [[ ! "$todoist_calendar_sync_slack_channel" =~ ^C[A-Z0-9]+$ ]]; then
   echo "TODOIST_CALENDAR_SYNC_SLACK_CHANNEL must be a Slack channel ID (C...)." >&2
+  exit 2
+fi
+if [[ "$erasure_execution_enabled" != "true" && "$erasure_execution_enabled" != "false" ]]; then
+  echo "ERASURE_EXECUTION_ENABLED must be exactly true or false." >&2
   exit 2
 fi
 
@@ -134,6 +140,7 @@ sam deploy \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
     "ResourceNamePrefix=$resource_name_prefix" \
+    "ErasureExecutionEnabled=$erasure_execution_enabled" \
     "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
     "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \
     "ProxySharedSecretParameter=$proxy_shared_secret_parameter" \
