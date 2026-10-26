@@ -94,9 +94,9 @@ This covers:
 - Todoist-owned recurring projections;
 - standalone mapped tasks.
 
-For mapped standalone tasks and Todoist-owned recurrences, the built-in policy is `auto`: no approval card is posted and a guarded deletion is queued in the same profile FIFO lane. Standalone automatic deletion rechecks that Todoist is absent, the mapping still has its original standalone identity (including legacy recurrence metadata), and the Calendar event has the exact task owner with no recurrence or archived-history markers. After deleting the provider event, the worker conditionally removes only the original mapping version; concurrent mapping updates remain intact for review. A recreated task or changed mapping causes no automatic Calendar delete. This default applies to `home`, `antonio` and `work` without configuring profile policies. Explicit saved policy overrides still take precedence.
+For mapped standalone tasks, Todoist-owned recurrences, and verified Calendar-owned **native recurring** Todoist mirrors, the built-in policy is `auto`: no approval card is posted and a guarded deletion is queued in the same profile FIFO lane. Standalone automatic deletion rechecks that Todoist is absent, the mapping still has its original standalone identity (including legacy recurrence metadata), and the Calendar event has the exact task owner with no recurrence or archived-history markers. After deleting the provider event, the worker conditionally removes only the original mapping version; concurrent mapping updates remain intact for review. A recreated task or changed mapping causes no automatic Calendar delete. This default applies to `home`, `antonio` and `work` without configuring profile policies. Explicit saved policy overrides still take precedence except old prompt defaults cannot override automatic deletion of a verified native Calendar-owned recurring mirror (explicit off/observe controls remain).
 
-Calendar-to-Todoist standalone deletions and supported one-sided title/date/time edits already flow through the normal synchronizer and baseline-aware snapshot reconciliation without a manual decision. Both-sides-changed conflicts, stale ownership, unsupported recurrence edits and Calendar-owned recurrence deletion with unclear scope still require review. Completion of a Todoist task is not treated as deletion: completed Calendar history remains protected.
+Calendar-to-Todoist standalone deletions and supported one-sided title/date/time edits already flow through the normal synchronizer and baseline-aware snapshot reconciliation without a manual decision. Both-sides-changed conflicts, stale ownership, unsupported recurrence edits and Calendar-owned **rolling one-off** recurrence deletion with unclear scope still requires review; native recurring Todoist task deletion is deterministically whole-series deletion. Completion of a Todoist task is not treated as deletion: completed Calendar history remains protected.
 
 Internal mirror replacement does not prompt because those flows remove mapping ownership before deleting the old Todoist task.
 
@@ -114,9 +114,9 @@ Provider authentication failures and deliveries about to be quarantined can also
 
 The typed catalog in `src/manual-intervention.ts` includes the wider use-case map from issue #49 so new detectors can be connected without adding Slack-specific conditionals. Each action can separately declare whether it is eligible for unattended auto policy.
 
-## Calendar-owned recurrence deletion choices
+## Calendar-owned rolling recurrence deletion choices
 
-When the current Todoist mirror is explicitly deleted, Slack offers:
+When the current Todoist mirror is a **rolling one-off projection** (not a native recurring Todoist task) and explicitly deleted, Slack offers:
 
 - **Skip this occurrence** — deletes the mapped Calendar instance, advances to the next active instance and creates the next Todoist mirror.
 - **Delete this and future** — removes mapping ownership first, then cancels active/future instances, bounded to ten mutations.
@@ -124,6 +124,8 @@ When the current Todoist mirror is explicitly deleted, Slack offers:
 - **Restore Todoist task** — recreates the Todoist mirror from the current Calendar occurrence and rewrites mapping ownership.
 
 Every action requests the normal durable reconciliation path after resolution.
+
+**Native recurring task exception:** when the mapped Todoist task itself is a native recurrence (`calendarNativeRecurring=true`), deleting it automatically removes the whole Calendar master series and active mapping/link. No deletion choice is presented, and historical Calendar occurrences are removed with the series. Old native-mirror choice cards are retired as stale when a corresponding deletion is observed; the worker refuses to execute their legacy partial-deletion actions. This does not change how completing a recurring task advances the next occurrence.
 
 ## Ambiguous snapshot matches
 
@@ -178,10 +180,10 @@ Examples:
 # Remember restore as the suggested response, but keep asking
 /sync policy antonio calendar_owned_recurrence_task_deleted prompt restore_todoist_task
 
-# Auto-restore only for this profile
-/sync policy antonio calendar_owned_recurrence_task_deleted auto restore_todoist_task
+# Restore is a prompted preference for rolling projections, not an unattended operation
+/sync policy antonio calendar_owned_recurrence_task_deleted prompt restore_todoist_task
 
-# Auto-skip a specific recurring series
+# Auto-skip a specific rolling projection series (does not apply to native recurring tasks)
 /sync policy series antonio series-123 calendar_owned_recurrence_task_deleted auto skip_occurrence
 
 # Keep detecting but never mutate or prompt
