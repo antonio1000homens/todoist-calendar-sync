@@ -319,6 +319,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${ResourceNamePrefix}-review-api-${Stage}
+      Description: Authenticated review API with the explicit erasure opt-in release from 2026-10-26.
       Handler: review-api.handler
       ReservedConcurrentExecutions: 2
       Timeout: 90
@@ -358,6 +359,7 @@ Resources:
         AuthType: NONE
         InvokeMode: BUFFERED
       AutoPublishAlias: live
+      AutoPublishAliasAllProperties: true
       DeploymentPreference:
         Type: AllAtOnce
     Metadata:
