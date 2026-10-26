@@ -879,12 +879,20 @@ export class Synchronizer {
           if (Number((error as { status?: number }).status) !== 404) throw error;
         });
       }
-      const nextTask = task?.due?.is_recurring
-        ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
-        : await todoist.upsertTask(
-          recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
-          progressAware ? task?.id : undefined,
-        );
+      // If Todoist itself has already moved to this Calendar occurrence,
+      // reconciliation must only advance durable state, not move it twice.
+      const providerAlreadyAdvanced = Boolean(task?.due?.is_recurring && startsMatch(active, task));
+      const nextTask = providerAlreadyAdvanced && task
+        ? task
+        : task?.due?.is_recurring
+          ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
+          : await todoist.upsertTask(
+            recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
+            progressAware ? task?.id : undefined,
+          );
+      if (providerAlreadyAdvanced) await this.state.audit(profile, "calendar_owned_completion_provider_already_advanced", {
+        seriesId: link.seriesId, taskId: link.taskId, nextEventId: active.id, origin: "scheduled_reconcile",
+      });
       if (recurrence && !calendarOwnedRecurringTaskReadback(nextTask, active, recurrence, timeZone).matches) {
         await this.state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
           seriesId: link.seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,
