@@ -16,10 +16,12 @@ const event=(path,method,headers={},body)=>({rawPath:path,headers,body:body===un
 
 test("preview issues one-use confirmation; create rechecks inventory and persists only an exact fresh operation",async t=>{
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
-    operators:process.env.REVIEW_OPERATOR_EMAILS};
+    operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION,
+    enabled:process.env.ERASURE_EXECUTION_ENABLED};
   globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
     ?new Response(JSON.stringify({keys:[jwk]}),{status:200,headers:{"content-type":"application/json"}}):new Response("unexpected",{status:500});
-  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test"});
+  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test",
+    ERASURE_PROTOCOL_VERSION:"1",ERASURE_EXECUTION_ENABLED:"false"});
   const headers=await signedHeaders();
   const exact={operationId:"op-preview",profile:"home",target:{taskId:"task-123",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},previewFingerprint:"canonical-preview-digest",
@@ -28,13 +30,15 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
   let calls=0,issued,created;
   const store={issueConfirmation:async()=>({confirmationId:"single-use",expiresAt:Date.now()+300_000}),
     getIssuedPreview:async()=>issued,create:async operation=>{created=operation;}};
-  const deps={createErasureOperationStore:()=>store,buildErasurePreview:async(input,options={})=>{
+  const deps={acquireWriteLease:async()=>async()=>{},createErasureOperationStore:()=>store,
+    buildErasurePreview:async(input,options={})=>{
     calls++;return {...exact,operationId:options.newOperationId?.()||"op-preview",profile:input.profile,target:{taskId:input.taskId,
       ...(input.eventId?{eventId:input.eventId}:{}),deleteCalendar:input.deleteCalendar},
       selectedActions:{deleteTodoist:true,deleteCalendar:input.deleteCalendar}};
   }};
   t.after(()=>{globalThis.fetch=old.fetch;
-    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,REVIEW_OPERATOR_EMAILS:old.operators}))
+    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,
+      REVIEW_OPERATOR_EMAILS:old.operators,ERASURE_PROTOCOL_VERSION:old.protocol,ERASURE_EXECUTION_ENABLED:old.enabled}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
   });
   const preview=await handler(event("/review/api/erasure-previews","POST",headers,
@@ -50,6 +54,23 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
   assert.equal(JSON.parse(createdResponse.body).operation.queueReady,false);
   assert.equal(JSON.parse(createdResponse.body).operation.providerDeletionReady,false);
   assert.equal(created.providerDeletionReady,false);
+
+  // A preview issued while disabled must stay preview-only after a flag change.
+  process.env.ERASURE_EXECUTION_ENABLED="true";
+  const legacy=await handler(event("/review/api/erasure-operations","POST",headers,
+    {operationId:"legacy-operation",confirmationId:"single-use"}),deps);
+  assert.equal(legacy.statusCode,201);
+  assert.equal(created.providerDeletionReady,false);
+
+  // An approval issued after opt-in can be queued through the authenticated API.
+  issued={...issued,executionReadyAtIssue:true};
+  const executable=await handler(event("/review/api/erasure-operations","POST",headers,
+    {operationId:"executable-operation",confirmationId:"single-use"}),deps);
+  assert.equal(executable.statusCode,201);
+  assert.equal(created.providerDeletionReady,true);
+  assert.equal(JSON.parse(executable.body).operation.queueReady,true);
+  assert.equal(JSON.parse(executable.body).operation.providerDeletionReady,true);
+  assert.equal(calls,4);
 });
 
 test("operation creation refuses a changed exact inventory and leaves confirmation unconsumed",async t=>{
@@ -62,7 +83,8 @@ test("operation creation refuses a changed exact inventory and leaves confirmati
   const calls=[];
   const store={getIssuedPreview:async()=>({profile:"home",target:{taskId:"task-123",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},previewFingerprint:"old-digest"}),create:async()=>calls.push("create")};
-  const deps={createErasureOperationStore:()=>store,buildErasurePreview:async()=>({blockers:[],previewFingerprint:"new-digest"})};
+  const deps={acquireWriteLease:async()=>async()=>{},createErasureOperationStore:()=>store,
+    buildErasurePreview:async()=>({blockers:[],previewFingerprint:"new-digest"})};
   t.after(()=>{globalThis.fetch=old.fetch;
     for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,REVIEW_OPERATOR_EMAILS:old.operators}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
@@ -71,20 +93,23 @@ test("operation creation refuses a changed exact inventory and leaves confirmati
   assert.equal(result.statusCode,409);assert.deepEqual(calls,[]);
 });
 
-test("preview-only operation cannot be started before provider deletion is implemented",async t=>{
+test("legacy preview-only operation cannot be started after deployment enables execution",async t=>{
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
-    operators:process.env.REVIEW_OPERATOR_EMAILS};
+    operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION,
+    enabled:process.env.ERASURE_EXECUTION_ENABLED};
   globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
     ?new Response(JSON.stringify({keys:[jwk]}),{status:200}):new Response("unexpected",{status:500});
-  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test"});
+  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test",
+    ERASURE_PROTOCOL_VERSION:"1",ERASURE_EXECUTION_ENABLED:"true"});
   const headers=await signedHeaders();
-  const store={get:async()=>({operationId:"op-preview",status:"previewed",providerDeletionReady:false})};
+  const store={get:async()=>({operationId:"op-preview",profile:"home",status:"previewed",providerDeletionReady:false})};
   t.after(()=>{globalThis.fetch=old.fetch;
-    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,REVIEW_OPERATOR_EMAILS:old.operators}))
+    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,
+      REVIEW_OPERATOR_EMAILS:old.operators,ERASURE_PROTOCOL_VERSION:old.protocol,ERASURE_EXECUTION_ENABLED:old.enabled}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
   });
   const result=await handler(event("/review/api/erasure-operations/op-preview/start","POST",headers,{}),
-    {createErasureOperationStore:()=>store});
+    {createErasureOperationStore:()=>store,acquireWriteLease:async()=>async()=>{}});
   assert.equal(result.statusCode,409);
   assert.match(JSON.parse(result.body).error,/provider deletion and postflight workflow is not available/);
 });

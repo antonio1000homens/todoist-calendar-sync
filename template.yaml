@@ -58,6 +58,11 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
+  ErasureExecutionEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Explicit two-Lambda opt-in for confirmed item erasure; keep false until guarded acceptance and recovery are approved.
   CompletedHistoryCleanupApply:
     Type: String
     Default: "false"
@@ -325,6 +330,7 @@ Resources:
           REVIEW_OPERATOR_EMAILS: !Ref ReviewOperatorEmails
           DLQ_URL: !Ref SyncDlq
           ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
+          ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
@@ -470,6 +476,7 @@ Resources:
         Variables:
           ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
           ERASURE_TARGET_WORKER_FUNCTION_NAME: !Ref WorkerFunction
+          ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
