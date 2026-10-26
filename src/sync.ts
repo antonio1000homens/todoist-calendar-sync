@@ -1097,12 +1097,20 @@ export class Synchronizer {
           const anchor = existingRecurrence.activeEffectiveStart || existingRecurrence.originalStart;
           const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
           const fromMs = Number.isFinite(anchorMs) ? Math.min(anchorMs, Date.now()) : Date.now();
-          const instances = native && calendar.listInstancesInWindow
-            ? await calendar.listInstancesInWindow(master.id,
+          if (native && !calendar.listInstancesInWindow) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+              seriesId: series, masterEventId: master.id,
+            });
+          }
+          const instances = native
+            ? await calendar.listInstancesInWindow!(master.id,
               new Date(fromMs - 24 * 60 * 60_000).toISOString(),
               new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString())
             : await calendar.listInstances(master.id);
-          successorRule = finiteWeekly || native ? calendarOwnedTodoistRecurrence(master, instances, timeZone) : undefined;
+          successorRule = finiteWeekly || native
+            ? await verifiedCalendarOwnedRecurrence(master, instances, timeZone,
+              calendar.listExplicitSeriesExceptions?.bind(calendar))
+            : undefined;
           next = selectCalendarRecurrenceInstance(instances, existingRecurrence, Date.now(), timeZone);
         }
         const oldMapping = recurrenceMapping(existingRecurrence);
@@ -1131,7 +1139,7 @@ export class Synchronizer {
         const nextTask = successorRule
           ? previousTask?.due?.is_recurring
             ? await todoist.updateRecurringOccurrence(previousTask, toTodoistTask(next))
-            : await todoist.upsertTask(calendarOwnedRecurringTaskPayload(next, successorRule), previousTask?.id)
+            : await todoist.upsertTask(calendarOwnedRecurringTaskPayload(next, successorRule, verifiedTimeZone), previousTask?.id)
           : await (async () => {
             if (previousTask) await todoist.deleteTask(previousTask.id);
             return todoist.upsertTask(toTodoistTask(next));
