@@ -1281,7 +1281,9 @@ export class ManualInterventionService {
         if (!mutatingMethods.has(operation)) return value.bind(current);
         return async (...args: unknown[]) => {
           const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
-            ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
+            ? { eventId: operation === "patchEventMetadataIfUnchanged"
+              ? String(args[0])
+              : typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
             : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" || operation === "updateTaskMetadata" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
           await recheckProtectedItems(profile);
           if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
