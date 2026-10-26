@@ -45,6 +45,7 @@ export interface ErasureOperation {
   actionPlan: ErasureActionPlan;
   status: ErasureOperationStatus;
   lifecycle?: FencedLifecycle;
+  recovery?: import("./erasure-recovery.js").RecoveryState;
   createdAt: string;
   updatedAt: string;
   requestId?: string;

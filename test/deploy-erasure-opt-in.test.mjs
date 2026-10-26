@@ -27,6 +27,6 @@ test("review API publishes a new live-alias version on reviewed function-propert
   assert.ok(review,"ReviewApiFunction SAM resource is defined");
   assert.match(review,/AutoPublishAlias: live/);
   assert.match(review,/AutoPublishAliasAllProperties: true/);
-  assert.match(review,/Description: Authenticated review API with the explicit erasure opt-in release/);
+  assert.match(review,/Description: (Authenticated review API with the explicit erasure opt-in release|Recovery-aware authenticated review API)/);
   assert.match(review,/ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled/);
 });

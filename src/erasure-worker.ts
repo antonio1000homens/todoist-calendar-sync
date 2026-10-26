@@ -4,7 +4,9 @@ import { GetEventSourceMappingCommand, GetFunctionConfigurationCommand, LambdaCl
 import { documentClient } from "./dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
-import { enqueueErasureOperation } from "./erasure-queue.js";
+import { enqueueErasureOperation, enqueueErasureRecovery } from "./erasure-queue.js";
+import { ErasureRecoveryService } from "./erasure-recovery.js";
+import { recoveryAdapters } from "./erasure-recovery-adapters.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
 import { executeErasureDeletionStep, verifyErasurePostflight } from "./erasure-deletion.js";
@@ -84,16 +86,26 @@ const adapters: ErasureWorkerAdapters={
   },
 };
 const store=new ErasureOperationStore(documentClient,undefined,adapters);
+const recoveryService=new ErasureRecoveryService(recoveryAdapters(true),documentClient,store);
 
-export function parseErasureQueueRecord(record: Pick<SQSRecord,"body">): string {
+export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery";id:string} {
   let payload:unknown;
   try { payload=JSON.parse(record.body); } catch { throw new Error("Invalid erasure queue message JSON"); }
   if(!payload||typeof payload!=="object"||Array.isArray(payload)) throw new Error("Invalid erasure queue message");
   const value=payload as Record<string,unknown>;
-  if(Object.keys(value).sort().join(",")!=="operationId,version"||value.version!==1
-    ||typeof value.operationId!=="string"||!/^[A-Za-z0-9_-]{1,128}$/.test(value.operationId))
-    throw new Error("Invalid erasure queue message schema");
-  return value.operationId;
+  if(value.version!==1)throw new Error("Invalid erasure queue message protocol version");
+  const keys=Object.keys(value).sort().join(",");
+  const kind=keys==="operationId,version"?"erasure":keys==="recoveryOperationId,version"?"recovery":undefined;
+  if(!kind)throw new Error("Invalid erasure queue message schema");
+  const id=kind==="erasure"?value.operationId:value.recoveryOperationId;
+  if(typeof id!=="string"||!/^[A-Za-z0-9_-]{1,128}$/.test(id))throw new Error("Invalid queue operation ID");
+  return {kind,id};
+}
+/** Legacy parser is deletion-only; recovery payloads must never become deletion commands. */
+export function parseErasureQueueRecord(record:Pick<SQSRecord,"body">):string {
+  const command=parseErasureQueueCommand(record);
+  if(command.kind!=="erasure")throw new Error("Recovery queue command is not an erasure deletion");
+  return command.id;
 }
 
 /** Process one durable step. The Lambda entrypoint owns all trusted adapters and queue dispatch. */
@@ -164,9 +176,17 @@ export const handler:SQSHandler=async event=>{
   const batchItemFailures=[];
   for(const record of event.Records){
     try {
-      const operationId=parseErasureQueueRecord(record);
-      const result=await processErasureOperation(operationId);
-      console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"operation_step",operationId,...result}));
+      const command=parseErasureQueueCommand(record);
+      if(command.kind==="recovery") {
+        const result=await recoveryService.process(command.id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"recovery_step",
+          operationId:command.id,status:result.status}));
+        if(result.retry)await enqueueErasureRecovery(command.id,10);
+      } else {
+        const result=await processErasureOperation(command.id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"operation_step",
+          operationId:command.id,...result}));
+      }
     } catch(error) {
       console.error(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"operation_step_failed",
         messageId:record.messageId,error:error instanceof Error?error.message:String(error)}));

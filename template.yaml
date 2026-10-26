@@ -319,7 +319,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${ResourceNamePrefix}-review-api-${Stage}
-      Description: Authenticated review API with the explicit erasure opt-in release from 2026-10-26.
+      Description: Recovery-aware authenticated review API with explicit guarded break-glass workflow.
       Handler: review-api.handler
       ReservedConcurrentExecutions: 2
       Timeout: 90
@@ -332,6 +332,7 @@ Resources:
           DLQ_URL: !Ref SyncDlq
           ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
           ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled
+          ERASURE_TARGET_WORKER_FUNCTION_NAME: !Ref WorkerFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
@@ -350,6 +351,12 @@ Resources:
               Action:
                 - dynamodb:TransactWriteItems
               Resource: !GetAtt SyncState.Arn
+            - Effect: Allow
+              Action: lambda:ListEventSourceMappings
+              Resource: "*"
+            - Effect: Allow
+              Action: lambda:GetEventSourceMapping
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
             - Effect: Allow
               Action: ssm:GetParameter
               Resource:
@@ -472,7 +479,7 @@ Resources:
       Handler: erasure-worker.handler
       ReservedConcurrentExecutions: 1
       RecursiveLoop: Allow
-      Timeout: 50
+      Timeout: 135
       CodeUri: .
       Environment:
         Variables:
@@ -763,6 +770,32 @@ Resources:
           MetricName: ReviewRequired
           MetricValue: "1"
           DefaultValue: 0
+
+  ErasureRecoveryBlockedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ErasureWorkerLogGroup
+      FilterPattern: '{ $.service = "todoist-calendar-sync-erasure-worker" && $.event = "recovery_step" && $.status = "blocked" }'
+      MetricTransformations:
+        - MetricNamespace: TodoistCalendarSync/Erasure
+          MetricName: RecoveryBlocked
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ErasureRecoveryBlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-erasure-recovery-blocked-${Stage}
+      AlarmDescription: Guarded erasure recovery stopped on drift; preserve the profile fence and inspect the durable operation.
+      Namespace: TodoistCalendarSync/Erasure
+      MetricName: RecoveryBlocked
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
 
   ErasureReviewRequiredAlarm:
     Type: AWS::CloudWatch::Alarm
