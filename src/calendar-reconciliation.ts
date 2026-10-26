@@ -78,6 +78,7 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
     activeEffectiveStart: mapping.activeEffectiveStart,
     ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
     ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
@@ -660,6 +661,7 @@ export async function reconcileUnmappedCalendar(
       calendarProgressVersion: 1,
       syncedTitle: normalizedText(active.summary),
       syncedDescription: normalizedText(active.description),
+      ...(recurrence ? { calendarNativeRecurring: true } : {}),
       updatedAt: new Date().toISOString(),
     };
     if (await controlsBlockRecovery([master.id,active.id],task.id)) {
