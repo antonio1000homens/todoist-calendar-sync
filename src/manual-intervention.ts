@@ -1321,8 +1321,7 @@ export class ManualInterventionService {
     const resolvedPolicy = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
     // An obsolete profile/series prompt preference must not override routine
     // whole-series deletion. Explicit OFF/OBSERVE safety controls remain.
-    const routineSeriesDelete = type === "calendar_owned_recurrence_task_deleted"
-      || type === "todoist_owned_recurrence_task_deleted";
+    const routineSeriesDelete = type === "calendar_owned_recurrence_task_deleted";
     const effective = {
       ...resolvedPolicy,
       ...(routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
