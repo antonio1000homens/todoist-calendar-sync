@@ -410,6 +410,7 @@ test('manual provider mutation is deferred while normal mutation circuit is open
       async getTask() { const error = new Error('not found'); error.status = 404; throw error; },
     },
     calendar: {
+      async getEvent() { return { id: 'master-1', recurrence: ['RRULE:FREQ=WEEKLY'] }; },
       async deleteEvent() { calendarWrites += 1; },
     },
   });
