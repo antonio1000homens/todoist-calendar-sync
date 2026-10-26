@@ -100,7 +100,7 @@ test("standalone Todoist deletion is auto-applied without an approval in all pro
       assert.equal(auto.manual.action, "delete_calendar_event");
       assert.equal(auto.manual.slackUserId, "AUTO_POLICY");
       await h.service.processManualDelivery(auto, h.state);
-      assert.deepEqual(h.operations, ["calendar event-1 deleted", "mapping event-1 removed", `mutation ${profile}`]);
+      assert.deepEqual(h.operations, ["calendar event-1 deleted", `mutation ${profile}`, "mapping event-1 removed"]);
       assert.equal(h.decisions.rows.get(auto.manual.decisionId).status, "resolved");
     }
   } finally {
