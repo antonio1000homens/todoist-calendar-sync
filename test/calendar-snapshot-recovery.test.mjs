@@ -294,9 +294,15 @@ test("existing Calendar-owned one-off mirror is upgraded in place only with exac
     assert.equal(calls, changed ? 0 : 1);
     assert.equal(result.conflicts, changed ? 1 : 0);
     assert.equal(existing.due.is_recurring, !changed);
-    assert.equal(state.mappings.length, 1);
-    assert.equal(state.mappings[0].taskId, "existing-task");
-    assert.equal(state.mappings[0].calendarProgressVersion, 1);
+    // The fake records every putMapping; DynamoDB replaces the same keys.
+    // Successful migration now persists the native-mirror classification.
+    assert.equal(state.mappings.length, changed ? 1 : 2);
+    assert.equal(state.mappings.at(-1).taskId, "existing-task");
+    assert.equal(state.mappings.at(-1).calendarProgressVersion, 1);
+    if (!changed) {
+      assert.equal(state.mappings.at(-1).calendarNativeRecurring, true);
+      assert.equal(state.mappings.at(-1).syncedTitle, "Appointment");
+    }
   }
 });
 
