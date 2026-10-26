@@ -2413,7 +2413,6 @@ export class ManualInterventionService {
       }
       await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
       await state.deleteMapping(mapping);
-      await state.recordMutation(decision.profile);
       return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
     }
 
