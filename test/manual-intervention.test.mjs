@@ -341,7 +341,7 @@ test('obsolete restore-task action cannot be saved as an auto policy', async () 
         defaultAction: 'restore_todoist_task',
       },
     },
-  }, {});
+  }, {}).catch(error => { assert.match(error.message, /not a stable catalog action/); });
   assert.equal(policies.saved.length, 0);
 });
 
@@ -400,6 +400,7 @@ test('manual provider mutation is deferred while normal mutation circuit is open
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
+    async getRecurrenceLink() { return { owner: 'calendar', taskId: mapping.taskId, masterEventId: mapping.masterEventId, eventId: mapping.eventId }; },
     async mutationAllowed() { return false; },
     async recordMutation() { throw new Error('recordMutation must not run when circuit is open'); },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
@@ -512,6 +513,8 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
+    async getRecurrenceLink() { return { owner: 'calendar', taskId: mapping.taskId, masterEventId: mapping.masterEventId, eventId: mapping.eventId }; },
+    async deleteMappingIfUnchanged() { operations.push('state:deleteMapping'); return true; },
     async mutationAllowed() { return true; },
     async deleteMapping() { operations.push('state:deleteMapping'); },
     async deleteRecurrenceLink() { operations.push('state:deleteRecurrenceLink'); },
@@ -524,6 +527,7 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
       async getTask() { const error = new Error('not found'); error.status = 404; throw error; },
     },
     calendar: {
+      async getEvent() { return { id: 'master-1', recurrence: ['RRULE:FREQ=WEEKLY'] }; },
       async deleteEvent(id) { operations.push(`calendar:delete:${id}`); },
     },
   });
