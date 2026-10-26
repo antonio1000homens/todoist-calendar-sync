@@ -562,6 +562,14 @@ export async function reconcileUnmappedCalendar(
         });
         return;
       }
+      const migratedMapping: Mapping = {
+        ...existingMapping, calendarNativeRecurring: true,
+        syncedTitle: normalizedText(active.summary),
+        syncedDescription: normalizedText(active.description),
+        updatedAt: new Date().toISOString(),
+      };
+      await state.putMapping(migratedMapping);
+      await state.putRecurrenceLink(recurrenceLink(migratedMapping));
       summary.rebound += 1;
       await state.audit(profile, "calendar_snapshot_migrated_native_recurring_task", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: currentTask.id,
