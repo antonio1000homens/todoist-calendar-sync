@@ -20,6 +20,7 @@ import { StateRepository } from "./repository.js";
 import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
+  matchesCalendarOwnedRecurringTask,
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   nativeCalendarRecurrenceCandidate,
