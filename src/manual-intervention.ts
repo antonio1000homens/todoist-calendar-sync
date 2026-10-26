@@ -930,7 +930,9 @@ function actionValue(decision: ManualDecision, action: ManualActionDefinition, e
     profile: decision.profile,
     decisionId: decision.decisionId,
     action: action.id,
-    confirmRequired: Boolean(action.destructive),
+    // The Slack decision button is already an explicit user instruction.
+    // Let the existing worker validation/circuit checks govern execution.
+    confirmRequired: false,
     ...extra,
   });
 }
@@ -1020,7 +1022,7 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
     : decision.permittedActions;
   const allActions = [...effectiveActions, ...dynamicActions];
   if (allActions.length) {
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: actionGuidance(decision) || "*What should happen next?* Choose the proposed action. Destructive choices require confirmation." } });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: actionGuidance(decision) || "*What should happen next?* Choose the proposed action. The selected action runs without a second confirmation." } });
   }
   for (let index = 0; index < allActions.length; index += 5) {
     blocks.push({
