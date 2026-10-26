@@ -21,6 +21,7 @@ import {
   calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
+  nativeCalendarRecurrenceCandidate,
   matchesCalendarOwnedRecurringRule,
   matchesCalendarOwnedRecurringTask,
   resolveCalendarTimeZone,
@@ -1230,17 +1231,26 @@ export class Synchronizer {
     }
     const seriesId = master.iCalUID || master.id;
     const existing = await this.state.getRecurrenceLink(delivery.profile, seriesId);
-    const instances = await calendar.listInstances(master.id);
     const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
+    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master);
+    // Native unbounded recurrences must not expand forever. Preserve the
+    // current mapped occurrence (which can be overdue) within a bounded lookahead.
+    const from = existing?.activeEffectiveStart || existing?.originalStart;
+    const startMs = from ? Math.min(Date.parse(from) || Date.now(), Date.now()) : Date.now();
+    const windowStart = new Date(startMs - 24 * 60 * 60_000).toISOString();
+    const windowEnd = new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString();
+    const instances = nativeRecurrence && calendar.listInstancesInWindow
+      ? await calendar.listInstancesInWindow(master.id, windowStart, windowEnd)
+      : await calendar.listInstances(master.id);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let calendarTimeZone = master.start?.timeZone;
-    if (finiteWeekly || hasAllDayInstances) {
+    if (finiteWeekly || nativeRecurrence || hasAllDayInstances) {
       calendarTimeZone = await this.verifiedCalendarRecurrenceTimeZone(delivery.profile, calendar, todoist, master, {
         seriesId, masterEventId: master.id,
       });
       if (!calendarTimeZone) return;
     }
-    const calendarRecurrence = finiteWeekly && calendarTimeZone
+    const calendarRecurrence = (finiteWeekly || nativeRecurrence) && calendarTimeZone
       ? calendarOwnedTodoistRecurrence(master, instances, calendarTimeZone)
       : undefined;
     if (!calendarRecurrence) {
