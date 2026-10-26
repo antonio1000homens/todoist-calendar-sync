@@ -771,6 +771,32 @@ Resources:
           MetricValue: "1"
           DefaultValue: 0
 
+  ErasureRecoveryBlockedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ErasureWorkerLogGroup
+      FilterPattern: '{ $.service = "todoist-calendar-sync-erasure-worker" && $.event = "recovery_step" && $.status = "blocked" }'
+      MetricTransformations:
+        - MetricNamespace: TodoistCalendarSync/Erasure
+          MetricName: RecoveryBlocked
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ErasureRecoveryBlockedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-erasure-recovery-blocked-${Stage}
+      AlarmDescription: Guarded erasure recovery stopped on drift; preserve the profile fence and inspect the durable operation.
+      Namespace: TodoistCalendarSync/Erasure
+      MetricName: RecoveryBlocked
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
   ErasureReviewRequiredAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
