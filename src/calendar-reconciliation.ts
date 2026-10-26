@@ -22,6 +22,7 @@ import {
   calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
   finiteWeeklyCalendarRuleCandidate,
+  nativeCalendarRecurrenceCandidate,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
@@ -418,13 +419,18 @@ export async function reconcileUnmappedCalendar(
       return;
     }
     const boundedFiniteWeekly = finiteWeeklyCalendarRuleCandidate(master);
+    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master);
+    const windowStart = new Date(now - 24 * 60 * 60_000).toISOString();
+    const windowEnd = new Date(now + 3 * 366 * 24 * 60 * 60_000).toISOString();
     const instances = boundedFiniteWeekly
       ? await pair.calendar.listInstances(master.id)
-      : await pair.calendar.listInstances(master.id, new Date(now - 24 * 60 * 60_000).toISOString());
+      : nativeRecurrence && pair.calendar.listInstancesInWindow
+        ? await pair.calendar.listInstancesInWindow(master.id, windowStart, windowEnd)
+        : await pair.calendar.listInstances(master.id, windowStart);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let seriesTimeZone = master.start?.timeZone || calendarTimeZone;
     let calendarTimeZoneError: string | undefined;
-    if (boundedFiniteWeekly || hasAllDayInstances) {
+    if (boundedFiniteWeekly || nativeRecurrence || hasAllDayInstances) {
       try { seriesTimeZone = await resolveCalendarTimeZone(master, pair.calendar.getTimeZone?.bind(pair.calendar)); }
       catch (error) {
         seriesTimeZone = undefined;
@@ -450,7 +456,7 @@ export async function reconcileUnmappedCalendar(
     }
     if (await completionBlocksRecovery(active.id)) return;
 
-    const recurrence = boundedFiniteWeekly && seriesTimeZone
+    const recurrence = (boundedFiniteWeekly || nativeRecurrence) && seriesTimeZone
       ? calendarOwnedTodoistRecurrence(master, instances, seriesTimeZone)
       : undefined;
     if (!recurrence) {
@@ -459,7 +465,7 @@ export async function reconcileUnmappedCalendar(
           ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
       });
     }
-    if (boundedFiniteWeekly || hasAllDayInstances) {
+    if (boundedFiniteWeekly || nativeRecurrence || hasAllDayInstances) {
       let todoistTimeZone: string;
       try { todoistTimeZone = await pair.todoist.getTimeZone(); }
       catch (error) {
