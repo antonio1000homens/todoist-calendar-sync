@@ -17,7 +17,7 @@ type Preview = {
 type Operation = {
   operationId:string;status:string;profile?:string;providerDeletionReady?:boolean;queueReady?:boolean;
   executionEnabled?:boolean;phase?:string;deletionProgress?:{stage:string;commentsCompleted:number;stateRowsCompleted:number};
-  operatorRecoveryRequired?:boolean;message?:string;backupRetentionNotice?:string;
+  operatorRecoveryRequired?:boolean;message?:string;backupRetentionNotice?:string;recoveryStatus?:string;
 };
 type ErasureApi=(route:string, options?:RequestInit)=>Promise<any>;
 const startSelection:Selection={profile:"work",taskId:"",eventId:"",deleteCalendar:false};
@@ -52,7 +52,7 @@ export function ErasurePanel({api}:{api:ErasureApi}) {
     setBusy(true);setNotice("");setRecoveryPreview(undefined);setRecoveryConfirmation(undefined);
     try{
       const result=await api("erasure-operations/"+encodeURIComponent(findOperationId));
-      setOperation(result.operation);setRecoveryStatus(undefined);setStarted(true);
+      setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);setStarted(true);
       if(result.operation?.status==="review_required")setNotice("Recovery requires an independent inspection; the original purge cannot be resumed.");
     }catch(error:any){setNotice(error.message||"Operation lookup failed.");}
     finally{setBusy(false);}
