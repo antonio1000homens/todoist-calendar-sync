@@ -1588,12 +1588,22 @@ export class Synchronizer {
       let completionMaster: CalendarEvent | undefined;
       try { completionMaster = await calendar.getEvent(mapping.masterEventId); }
       catch (error) { if (!calendarEventGoneOnDirectRead(error)) throw error; }
-      const nativeCompletion = Boolean(completionMaster && nativeCalendarRecurrenceCandidate(completionMaster));
+      if (!completionMaster || completionMaster.status === "cancelled" || !completionMaster.recurrence?.length) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_completed_master_unavailable", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: mapping.masterEventId,
+        });
+      }
+      const nativeCompletion = nativeCalendarRecurrenceCandidate(completionMaster);
+      if (nativeCompletion && !calendar.listInstancesInWindow) {
+        return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+          seriesId: mapping.seriesId, taskId: task.id, masterEventId: mapping.masterEventId,
+        });
+      }
       const mappedStart = mapping.activeEffectiveStart || mapping.originalStart;
       const mappedMs = mappedStart ? Date.parse(mappedStart) : Number.NaN;
       const startMs = Number.isFinite(mappedMs) ? Math.min(mappedMs, Date.now()) : Date.now();
-      const instances = nativeCompletion && calendar.listInstancesInWindow
-        ? await calendar.listInstancesInWindow(mapping.masterEventId,
+      const instances = nativeCompletion
+        ? await calendar.listInstancesInWindow!(mapping.masterEventId,
           new Date(startMs - 24 * 60 * 60_000).toISOString(),
           new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString())
         : await calendar.listInstances(mapping.masterEventId);
@@ -1601,9 +1611,21 @@ export class Synchronizer {
       let currentCalendarRecurrence: ReturnType<typeof calendarOwnedTodoistRecurrence>;
       const recurrenceHint = Boolean(task.due?.is_recurring || payload.event_data_extra?.old_item?.due?.is_recurring);
       let verifiedCalendarTimeZone: string | undefined;
-      if (recurrenceHint) {
+      if (recurrenceHint || nativeCompletion) {
         try { currentRecurringTask = await todoist.getTask(task.id); }
         catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
+        if (recurrenceHint && !currentRecurringTask?.due?.is_recurring) {
+          // Completed native items can disappear from Todoist's active task API.
+          // Creating a fresh one-off here would silently flatten the series.
+          return this.state.audit(delivery.profile, "calendar_recurrence_completed_recurring_readback_missing", {
+            seriesId: mapping.seriesId, masterEventId: mapping.masterEventId, taskId: task.id,
+          });
+        }
+        if (nativeCompletion && !currentRecurringTask) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_completed_recurring_readback_missing", {
+            seriesId: mapping.seriesId, masterEventId: mapping.masterEventId, taskId: task.id,
+          });
+        }
         if (currentRecurringTask?.due?.is_recurring) {
           let master: CalendarEvent | undefined;
           try { master = await calendar.getEvent?.(mapping.masterEventId); }
@@ -1618,7 +1640,8 @@ export class Synchronizer {
               });
             }
           }
-          if (master && timeZone) currentCalendarRecurrence = calendarOwnedTodoistRecurrence(master, instances, timeZone);
+          if (master && timeZone) currentCalendarRecurrence = await verifiedCalendarOwnedRecurrence(
+            master, instances, timeZone, calendar.listExplicitSeriesExceptions?.bind(calendar));
           verifiedCalendarTimeZone = timeZone;
           if (!master || !timeZone || !currentCalendarRecurrence
             || !matchesCalendarOwnedRecurringRule(currentRecurringTask, currentCalendarRecurrence, timeZone)) {
