@@ -519,6 +519,7 @@ function recurrenceLink(mapping: Mapping, owner: RecurrenceLink["owner"]): Recur
     activeEffectiveStart: mapping.activeEffectiveStart,
     ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
     ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(owner === "calendar" && mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(owner === "calendar" && mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
@@ -540,6 +541,7 @@ function recurrenceMapping(link: RecurrenceLink): Mapping {
     activeEffectiveStart: link.activeEffectiveStart,
     ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
     ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
+    ...(link.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
     ...(link.owner === "calendar" && link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(link.owner === "calendar" && link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
@@ -915,6 +917,7 @@ export class Synchronizer {
         ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
         ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
         ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
+        ...(link.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
         updatedAt: new Date().toISOString(),
       };
       await this.state.putMapping(next);
@@ -1611,6 +1614,7 @@ export class Synchronizer {
       activeEffectiveStart: eventEffectiveStart(active),
       syncedTitle: normalizedText(active.summary),
       syncedDescription: normalizedText(active.description),
+      ...(calendarRecurrence ? { calendarNativeRecurring: true } : {}),
       ...(existing
         ? existing.calendarProgressVersion === 1
           ? {
@@ -1722,7 +1726,8 @@ export class Synchronizer {
 
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
-    if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId) {
+    if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId
+      && (task.due?.is_recurring || mapping.calendarNativeRecurring)) {
       // A mapped Calendar-origin recurring Todoist task may legitimately have
       // user-edited metadata. Its automatic date advance is not an instruction
       // to rewrite a generated Calendar instance or transfer ownership.
@@ -1958,6 +1963,7 @@ export class Synchronizer {
         ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
         ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
         ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+        ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true } : {}),
         updatedAt: new Date().toISOString(),
       };
       const expectedLink = mapping.seriesId
