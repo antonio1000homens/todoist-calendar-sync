@@ -265,6 +265,8 @@ export class ErasureRecoveryService {
           await this.adapters.restoreMappings([disabled.id]);
           return {status:"restoring",retry:true};
         }
+        if(observed.mappings.some(x=>x.originallyEnabled&&x.state==="Enabling"))
+          return {status:"restoring",retry:true};
         await this.advance(op,"restoring","verifying");
         return {status:"verifying",retry:true};
       }
@@ -321,7 +323,9 @@ export class ErasureRecoveryService {
       this.adapters.listWorkerMappings(),this.adapters.mappingStates(original),this.adapters.readSnapshot(op)]);
     if(live.length!==original.length||new Set(live.map(x=>x.id)).size!==original.length
       ||live.some(x=>!original.includes(x.id)||!x.eventSourceArn.includes(":sqs:"))
-      ||states.length!==original.length||states.some(x=>!original.includes(x.id)||!["Enabled","Disabled"].includes(x.state)))
+      ||states.length!==original.length||new Set(states.map(x=>x.id)).size!==original.length
+      ||states.some(x=>!original.includes(x.id)
+        ||!["Enabled","Disabled","Enabling"].includes(x.state)))
       return {safe:false,mappings:[]};
     const mapped=expectedMappingStates(op,states);
     if(mapped.some(x=>!x.originallyEnabled&&x.state!=="Disabled"))return {safe:false,mappings:mapped};
