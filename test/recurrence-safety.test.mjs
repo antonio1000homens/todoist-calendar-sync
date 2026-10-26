@@ -194,6 +194,13 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
   const calendar = {
     async getTimeZone() { return "Europe/London"; },
     async listInstances() { return instances.map((event) => structuredClone(event)); },
+    async listInstancesInWindow(_id, start, end) {
+      return instances.filter((event) => {
+        const when = event.start?.dateTime || event.start?.date;
+        return Boolean(when && when >= start.slice(0, 10) && when <= end.slice(0, 10));
+      }).map((event) => structuredClone(event));
+    },
+    async listExplicitSeriesExceptions() { return []; },
     async listDelta() {
       return { items: deltaEvent ? [structuredClone(deltaEvent)] : [], nextSyncToken: "sync-next" };
     },
