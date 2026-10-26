@@ -149,6 +149,34 @@ test("transient action-time gate read failures are retried instead of marked rev
   assert.equal(reviewMarks,0,"only a definite invariant mismatch is terminal");
 });
 
+test("disabled deployment cannot start a previously approved queued operation",async t=>{
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  t.after(()=>{process.env.ERASURE_EXECUTION_ENABLED="true";});
+  const starts=[],queues=[];
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({
+    operationId:"approved",status:"queued",providerDeletionReady:true
+  }));
+  t.mock.method(ErasureOperationStore.prototype,"startFencedLifecycle",async()=>starts.push(true));
+  t.mock.method(SQSClient.prototype,"send",async command=>{queues.push(command);return {};});
+  const result=await handler({Records:[record('{"version":1,"operationId":"approved"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:"message-1"}]});
+  assert.deepEqual(starts,[]);assert.deepEqual(queues,[]);
+});
+
+test("revoking deployment flag during execution enters review-required without additional writes",async t=>{
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  t.after(()=>{process.env.ERASURE_EXECUTION_ENABLED="true";});
+  let reviews=0,advances=0;
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({
+    operationId:"active",status:"deleting",providerDeletionReady:true,lifecycle:{phase:"delete"}
+  }));
+  t.mock.method(ErasureOperationStore.prototype,"markExecutionDisabledReviewRequired",async()=>{reviews++;});
+  t.mock.method(ErasureOperationStore.prototype,"advanceFencedLifecycle",async()=>{advances++;});
+  const result=await handler({Records:[record('{"version":1,"operationId":"active"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[]});
+  assert.equal(reviews,1);assert.equal(advances,0);
+});
+
 test("malformed and failed erasure messages are retried through partial batch failure", async t => {
   t.mock.method(ErasureOperationStore.prototype, "get", async () => { throw new Error("temporary read failure"); });
   const result = await handler({ Records: [record("bad", "bad-message"), record('{"version":1,"operationId":"op"}', "retry-message")], awsRequestId: "req" });
