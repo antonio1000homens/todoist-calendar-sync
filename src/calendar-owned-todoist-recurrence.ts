@@ -425,7 +425,7 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
     if (!parsedDate) return false;
     if (recurrence.frequency === "monthly") return parsedDate.day === recurrence.dayOfMonth;
     if (recurrence.frequency === "yearly") return parsedDate.day === recurrence.dayOfMonth && parsedDate.month === recurrence.month;
-    const instant = new Date(current[1] + "T12:00:00Z");
+    const instant = new Date(currentDay + "T12:00:00Z");
     return weekdayNames[instant.getUTCDay()] === recurrence.weekday;
   })());
   return { parsed, matches: Boolean(task.due?.is_recurring && parsed && correctStart && expectedCadenceDate
