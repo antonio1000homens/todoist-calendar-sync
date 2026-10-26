@@ -137,26 +137,22 @@ function reconciliationState() {
   };
 }
 
-test('decision catalog exposes bounded recurrence choices and explicit auto-safe actions', () => {
+test('mapped recurring Todoist deletion has one deterministic auto-safe whole-series operation', () => {
   const policy = MANUAL_DECISION_CATALOG.calendar_owned_recurrence_task_deleted;
   assert.equal(policy.detection, 'pre_mutation');
-  assert.deepEqual(policy.actions.map((action) => action.id), [
-    'skip_occurrence',
-    'delete_this_and_future',
-    'delete_whole_series',
-    'restore_todoist_task',
-  ]);
-  assert.equal(policy.actions.find((action) => action.id === 'delete_whole_series').destructive, true);
-  assert.equal(policy.actions.find((action) => action.id === 'delete_whole_series').autoAllowed, undefined);
-  assert.equal(policy.actions.find((action) => action.id === 'restore_todoist_task').autoAllowed, true);
-  assert.equal(policy.actions.find((action) => action.id === 'skip_occurrence').autoAllowed, true);
+  assert.equal(policy.defaultMode, 'auto');
+  assert.equal(policy.defaultAction, 'delete_whole_series');
+  assert.deepEqual(policy.actions.map(action => action.id), ['delete_whole_series']);
+  assert.equal(policy.actions[0].destructive, true);
+  assert.equal(policy.actions[0].autoAllowed, true);
 });
 
-test('mapped explicit Todoist deletion is intercepted before provider mutation in prompt mode', async () => {
+test('mapped recurring Todoist deletion queues whole-series removal without prompting, overriding old profile defaults', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
   const policies = new FakePolicyStore({ mode: 'prompt', source: 'profile', defaultAction: 'restore_todoist_task' });
+  const queued = [];
   const mapping = mappedCalendarRecurrence();
   const audits = [];
   const state = {
@@ -181,16 +177,16 @@ test('mapped explicit Todoist deletion is intercepted before provider mutation i
         return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
       },
     },
-  }), policies);
+  }), policies, async delivery => { queued.push(delivery); });
 
   assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), true);
-  assert.equal(notifier.posted.length, 1);
-  assert.equal(notifier.posted[0].type, 'calendar_owned_recurrence_task_deleted');
-  assert.equal(notifier.posted[0].masterEventId, 'master-1');
-  assert.equal(notifier.posted[0].defaultAction, 'restore_todoist_task');
-  assert.equal(notifier.posted[0].policyScope, 'profile');
+  assert.equal(notifier.posted.length, 0);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].kind, 'manual');
+  assert.equal(queued[0].manual.action, 'delete_whole_series');
+  assert.equal(queued[0].manual.slackUserId, 'AUTO_POLICY');
   assert.equal(audits.at(-1).action, 'manual_decision_requested');
-  assert.equal(audits.at(-1).detail.handlingMode, 'prompt');
+  assert.equal(audits.at(-1).detail.handlingMode, 'auto');
 });
 
 test('stale Todoist deletion webhook does not create a prompt when the task already exists', async () => {
@@ -239,7 +235,7 @@ test('terminal deterministic decision is not reopened by the same detector state
         return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
       },
     },
-  }), policies);
+  }), policies, async () => {});
 
   await service.interceptTodoistDeletion(todoistDeleteDelivery(), state);
   const original = [...decisions.decisions.values()][0];
@@ -249,7 +245,7 @@ test('terminal deterministic decision is not reopened by the same detector state
 
   assert.equal(decisions.decisions.size, 1);
   assert.equal([...decisions.decisions.values()][0].status, 'resolved');
-  assert.equal(notifier.posted.length, 1);
+  assert.equal(notifier.posted.length, 0);
 });
 
 test('observe mode detects and blocks a pre-mutation ambiguity without posting Slack', async () => {
@@ -294,7 +290,7 @@ test('off mode disconnects the detector and allows the legacy synchronizer path'
   assert.equal(audits.at(-1).action, 'manual_detector_disabled');
 });
 
-test('unsafe destructive action cannot be configured for unattended auto execution', async () => {
+test('the standard whole-series deletion is eligible for unattended execution', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const policies = new FakePolicyStore();
   const notifier = new FakeNotifier();
@@ -318,11 +314,11 @@ test('unsafe destructive action cannot be configured for unattended auto executi
       },
     },
   }, {});
-  assert.equal(policies.saved.length, 0);
-  assert.match(notifier.text.at(-1), /not marked auto-safe/);
+  assert.equal(policies.saved.length, 1);
+  assert.equal(policies.saved[0].defaultAction, 'delete_whole_series');
 });
 
-test('safe action can be saved as an auto policy', async () => {
+test('obsolete restore-task action cannot be saved as an auto policy', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const policies = new FakePolicyStore();
   const notifier = new FakeNotifier();
@@ -346,9 +342,7 @@ test('safe action can be saved as an auto policy', async () => {
       },
     },
   }, {});
-  assert.equal(policies.saved.length, 1);
-  assert.equal(policies.saved[0].mode, 'auto');
-  assert.equal(policies.saved[0].defaultAction, 'restore_todoist_task');
+  assert.equal(policies.saved.length, 0);
 });
 
 test('expired decision is atomically closed before provider clients are read', async () => {
