@@ -345,3 +345,23 @@ test("durable operation store digests immutable preview content and atomically c
     assert.equal(calls.at(-1).input.ConditionExpression,"#status=:expected AND previewFingerprint=:fingerprint");
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
+
+test("confirmation persists the readiness at issuance, not the later deployment state",async t=>{
+  const before={table:process.env.STATE_TABLE_NAME,enabled:process.env.ERASURE_EXECUTION_ENABLED,
+    protocol:process.env.ERASURE_PROTOCOL_VERSION};
+  t.after(()=>{for(const [key,value] of Object.entries({STATE_TABLE_NAME:before.table,
+    ERASURE_EXECUTION_ENABLED:before.enabled,ERASURE_PROTOCOL_VERSION:before.protocol})) {
+    if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }});
+  process.env.STATE_TABLE_NAME="test-state";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
+  const writes=[];
+  const db={send:async cmd=>{writes.push(cmd.input);return {};}};
+  const store=new ErasureOperationStore(db,()=> "one-time-token");
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  await store.issueConfirmation({...preview,operationId:"issued-disabled"});
+  assert.equal(writes[0].TransactItems[0].Put.Item.executionReadyAtIssue,false);
+  process.env.ERASURE_EXECUTION_ENABLED="true";
+  await store.issueConfirmation({...preview,operationId:"issued-enabled"});
+  assert.equal(writes[1].TransactItems[0].Put.Item.executionReadyAtIssue,true);
+});
