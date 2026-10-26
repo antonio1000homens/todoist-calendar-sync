@@ -116,6 +116,13 @@ function validateLifecycle(op:ErasureOperation):string[] {
       ||!Number.isFinite(receipt.completedAt))blockers.push("Lifecycle evidence is malformed or owned by another operation");
   }
   if(!lc.evidence?.fenceInstalled)blockers.push("No validated durable fence installation receipt");
+  if(lc.evidence?.fenceInstalled && Date.now() < lc.evidence.fenceInstalled.completedAt
+    +lc.timeoutSeconds*1000+2000)
+    blockers.push("Original worker timeout after fence installation has not elapsed");
+  if(["drain_after_timeout","ready_for_delete"].includes(lc.phase) && !lc.evidence?.workerTimeoutElapsed)
+    blockers.push("No durable receipt proving worker timeout completed");
+  if(lc.phase==="ready_for_delete" && !lc.evidence?.postTimeoutDrain)
+    blockers.push("No durable receipt proving the original writer lease drain");
   if(!Number.isFinite(lc.timeoutSeconds)||lc.timeoutSeconds<=0)blockers.push("Invalid original worker timeout");
   return blockers;
 }
@@ -218,10 +225,10 @@ export class ErasureRecoveryService {
     await this.db.send(new TransactWriteCommand({TransactItems:[
       {Update:{TableName:table(),Key:operationKey(id),
         UpdateExpression:"SET recovery=:recovery, updatedAt=:now",
-        ConditionExpression:"#status=:review AND attribute_not_exists(recovery) AND previewFingerprint=:fingerprint AND lifecycle.#phase=:phase",
+        ConditionExpression:"#status=:review AND attribute_not_exists(recovery) AND previewFingerprint=:fingerprint AND lifecycle.#phase=:phase AND updatedAt=:observedUpdatedAt",
         ExpressionAttributeNames:{"#status":"status","#phase":"phase"},
         ExpressionAttributeValues:{":review":"review_required",":recovery":recovery,":fingerprint":current.operation.previewFingerprint,
-          ":phase":current.operation.lifecycle!.phase,":now":new Date(now).toISOString()}}},
+          ":phase":current.operation.lifecycle!.phase,":observedUpdatedAt":current.operation.updatedAt,":now":new Date(now).toISOString()}}},
       {Update:{TableName:table(),Key:confirmationKey(id),
         UpdateExpression:"SET #status=:consumed, consumedAt=:now",
         ConditionExpression:"#status=:issued AND operator=:operator AND confirmationId=:token AND inspectedFingerprint=:digest AND expiresAtMs>:time",
