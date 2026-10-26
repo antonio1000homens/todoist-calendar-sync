@@ -314,6 +314,16 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   for (const instance of instances.filter((item) => item.recurringEventId === master.id)) {
     const original = instance.originalStartTime?.dateTime || instance.originalStartTime?.date;
     if (!original) return undefined;
+    if (instance.status !== "cancelled") {
+      const effective = instance.start?.dateTime || instance.start?.date;
+      if (!effective || (original.length === 10 || effective.length === 10
+        ? original !== effective
+        : Date.parse(original) !== Date.parse(effective))) {
+        // Native recurring Todoist cannot model per-occurrence Calendar moves.
+        // Keep the authoritative Calendar exception on the rolling mirror path.
+        return undefined;
+      }
+    }
     let originalParts: Record<string, string>;
     try { originalParts = localParts(original, timeZone); }
     catch { return undefined; }
