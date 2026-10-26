@@ -124,7 +124,7 @@ function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;stat
 export class ErasureRecoveryService {
   constructor(private readonly adapters:RecoveryAdapters,
     private readonly db:Db=documentClient,
-    private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db),
+    private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db as typeof documentClient),
     private readonly newToken:()=>string=randomUUID) {}
 
   async inspect(id:string):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean}> {
