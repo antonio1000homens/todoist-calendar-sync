@@ -5,6 +5,10 @@ import { SQSClient } from "@aws-sdk/client-sqs";
 import { ErasureOperationStore } from "../dist/erasure-executor.js";
 import { handler } from "../dist/review-api.js";
 
+// This suite exercises the intentionally opted-in start/resume path.
+process.env.ERASURE_PROTOCOL_VERSION = "1";
+process.env.ERASURE_EXECUTION_ENABLED = "true";
+
 const issuer = "https://erasure-review.cloudflareaccess.com";
 const audience = "erasure-review-test";
 function event(path, method, headers = {}, body) {
