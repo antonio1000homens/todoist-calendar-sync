@@ -274,6 +274,19 @@ export class GoogleCalendar {
   }
 
   /** Retry creation only for a deterministic event ID owned by this repair. */
+  /** Mutate only a recurring master's metadata; never replace its recurrence or occurrences. */
+  async patchEventMetadataIfUnchanged(
+    masterId: string,
+    etag: string,
+    metadata: { summary: string; description: string },
+  ): Promise<CalendarEvent> {
+    if (!masterId || !etag) throw new Error("Recurring Calendar metadata update requires an ETag");
+    return this.request(
+      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(masterId)}`,
+      { method: "PATCH", headers: { "If-Match": etag }, body: JSON.stringify(metadata) },
+    );
+  }
+
   async createRepairEventOnce(event: CalendarEvent, operationId: string): Promise<CalendarEvent> {
     if (!event.id || !operationId) throw new Error("Repair creation requires a deterministic event ID and operation ID");
     const desired = { ...event, extendedProperties: { ...event.extendedProperties, shared: { ...event.extendedProperties?.shared, syncRepairId: operationId } } };
@@ -419,6 +432,14 @@ export class Todoist {
     const payload = todoistTaskPayload(existingId ? task : { ...task, ...(task.project_id || !projectId ? {} : { project_id: projectId }) });
     if (existingId) delete payload.project_id;
     return this.request<TodoistTask>(path, { method: "POST", body: JSON.stringify(payload) });
+  }
+
+  /** Modify only metadata; including due here could restart Todoist's native recurrence. */
+  async updateTaskMetadata(taskId: string, metadata: { content: string; description: string }): Promise<TodoistTask> {
+    await this.request(`/tasks/${encodeURIComponent(taskId)}`, {
+      method: "POST", body: JSON.stringify(metadata),
+    });
+    return this.getTask(taskId);
   }
 
   async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string): Promise<TodoistTask> {
