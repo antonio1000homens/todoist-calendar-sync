@@ -163,6 +163,18 @@ test("complex or finite non-weekly Calendar recurrences are never silently appro
   }, event, weekly), false);
 });
 
+test("native recurrence rejects moved Calendar exceptions but accepts cancellations", () => {
+  const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY");
+  const series = instances(["2026-11-04T14:00:00Z", "2026-11-11T14:00:00Z"]);
+  const moved = structuredClone(series);
+  moved[1].start.dateTime = "2026-11-12T14:00:00Z";
+  assert.equal(calendarOwnedTodoistRecurrence(master, moved, "Europe/London"), undefined,
+    "a moved single Calendar event cannot be represented by one native Todoist rule");
+  const cancelled = structuredClone(series);
+  cancelled[1].status = "cancelled";
+  assert.equal(calendarOwnedTodoistRecurrence(master, cancelled, "Europe/London").frequency, "weekly");
+});
+
 test("recurring task readback accepts Todoist date-text normalization but rejects changed schedule fields", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z");
   const schedule = instances([
