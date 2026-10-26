@@ -6,6 +6,10 @@ import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore } from "../dist/erasure-executor.js";
 import { handler, parseErasureQueueRecord } from "../dist/erasure-worker.js";
 
+// The existing worker integration cases exercise an explicitly approved deployment.
+process.env.ERASURE_PROTOCOL_VERSION = "1";
+process.env.ERASURE_EXECUTION_ENABLED = "true";
+
 const record = (body, messageId = "message-1") => ({ body, messageId, receiptHandle: "receipt", attributes: {}, messageAttributes: {}, md5OfBody: "digest", eventSource: "aws:sqs", eventSourceARN: "arn:aws:sqs:eu-west-2:123:erasure", awsRegion: "eu-west-2" });
 
 test("erasure queue record parser accepts only the versioned operation identity", () => {
