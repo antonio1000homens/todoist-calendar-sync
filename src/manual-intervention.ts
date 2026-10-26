@@ -1139,6 +1139,7 @@ export class ManualInterventionService {
     private readonly notifier = new SlackManualNotifier(store),
     private readonly clients: ProviderClientFactory = defaultProviderClientFactory,
     private readonly policies = new InterventionPolicyStore(),
+    private readonly enqueue = enqueueDelivery,
   ) {}
 
   private executionClientFactory?: ProviderClientFactory;
@@ -1381,7 +1382,7 @@ export class ManualInterventionService {
       await this.notifier.postDecision(result.decision);
     }
     if (mode === "auto" && defaultAction && result.decision.status === "pending") {
-      await enqueueDelivery({
+      await this.enqueue({
         id: `manual:${profile}:${result.decision.decisionId}:${defaultAction}:auto:${Date.now()}`,
         kind: "manual",
         profile,
