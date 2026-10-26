@@ -137,27 +137,28 @@ function reconciliationState() {
   };
 }
 
-test('decision catalog exposes bounded recurrence choices and explicit auto-safe actions', () => {
-  const policy = MANUAL_DECISION_CATALOG.calendar_owned_recurrence_task_deleted;
-  assert.equal(policy.detection, 'pre_mutation');
-  assert.deepEqual(policy.actions.map((action) => action.id), [
-    'skip_occurrence',
-    'delete_this_and_future',
-    'delete_whole_series',
-    'restore_todoist_task',
+test('native Todoist mirror deletion has one automatic whole-series action; rolling mirrors retain review choices', () => {
+  const native = MANUAL_DECISION_CATALOG.calendar_owned_native_recurrence_task_deleted;
+  assert.equal(native.detection, 'pre_mutation');
+  assert.equal(native.defaultMode, 'auto');
+  assert.equal(native.defaultAction, 'delete_whole_series');
+  assert.deepEqual(native.actions.map(action => action.id), ['delete_whole_series']);
+  assert.equal(native.actions[0].destructive, true);
+  assert.equal(native.actions[0].autoAllowed, true);
+  const rolling = MANUAL_DECISION_CATALOG.calendar_owned_recurrence_task_deleted;
+  assert.deepEqual(rolling.actions.map(action => action.id), [
+    'skip_occurrence', 'delete_this_and_future', 'delete_whole_series', 'restore_todoist_task',
   ]);
-  assert.equal(policy.actions.find((action) => action.id === 'delete_whole_series').destructive, true);
-  assert.equal(policy.actions.find((action) => action.id === 'delete_whole_series').autoAllowed, undefined);
-  assert.equal(policy.actions.find((action) => action.id === 'restore_todoist_task').autoAllowed, true);
-  assert.equal(policy.actions.find((action) => action.id === 'skip_occurrence').autoAllowed, true);
+  assert.equal(rolling.defaultMode, undefined);
 });
 
-test('mapped explicit Todoist deletion is intercepted before provider mutation in prompt mode', async () => {
+test('mapped recurring Todoist deletion queues whole-series removal without prompting, overriding old profile defaults', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
   const policies = new FakePolicyStore({ mode: 'prompt', source: 'profile', defaultAction: 'restore_todoist_task' });
-  const mapping = mappedCalendarRecurrence();
+  const queued = [];
+  const mapping = { ...mappedCalendarRecurrence(), calendarNativeRecurring: true };
   const audits = [];
   const state = {
     async syncBlocked() { return false; },
@@ -181,16 +182,16 @@ test('mapped explicit Todoist deletion is intercepted before provider mutation i
         return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
       },
     },
-  }), policies);
+  }), policies, async delivery => { queued.push(delivery); });
 
   assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), true);
-  assert.equal(notifier.posted.length, 1);
-  assert.equal(notifier.posted[0].type, 'calendar_owned_recurrence_task_deleted');
-  assert.equal(notifier.posted[0].masterEventId, 'master-1');
-  assert.equal(notifier.posted[0].defaultAction, 'restore_todoist_task');
-  assert.equal(notifier.posted[0].policyScope, 'profile');
+  assert.equal(notifier.posted.length, 0);
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].kind, 'manual');
+  assert.equal(queued[0].manual.action, 'delete_whole_series');
+  assert.equal(queued[0].manual.slackUserId, 'AUTO_POLICY');
   assert.equal(audits.at(-1).action, 'manual_decision_requested');
-  assert.equal(audits.at(-1).detail.handlingMode, 'prompt');
+  assert.equal(audits.at(-1).detail.handlingMode, 'auto');
 });
 
 test('stale Todoist deletion webhook does not create a prompt when the task already exists', async () => {
@@ -220,7 +221,7 @@ test('terminal deterministic decision is not reopened by the same detector state
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
   const policies = new FakePolicyStore();
-  const mapping = mappedCalendarRecurrence();
+  const mapping = { ...mappedCalendarRecurrence(), calendarNativeRecurring: true };
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
@@ -239,7 +240,7 @@ test('terminal deterministic decision is not reopened by the same detector state
         return { id: 'instance-1', summary: 'test recurring', start: { dateTime: '2026-09-15T00:00:00Z' } };
       },
     },
-  }), policies);
+  }), policies, async () => {});
 
   await service.interceptTodoistDeletion(todoistDeleteDelivery(), state);
   const original = [...decisions.decisions.values()][0];
@@ -249,7 +250,7 @@ test('terminal deterministic decision is not reopened by the same detector state
 
   assert.equal(decisions.decisions.size, 1);
   assert.equal([...decisions.decisions.values()][0].status, 'resolved');
-  assert.equal(notifier.posted.length, 1);
+  assert.equal(notifier.posted.length, 0);
 });
 
 test('observe mode detects and blocks a pre-mutation ambiguity without posting Slack', async () => {
@@ -294,7 +295,7 @@ test('off mode disconnects the detector and allows the legacy synchronizer path'
   assert.equal(audits.at(-1).action, 'manual_detector_disabled');
 });
 
-test('unsafe destructive action cannot be configured for unattended auto execution', async () => {
+test('the standard whole-series deletion is eligible for unattended execution', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const policies = new FakePolicyStore();
   const notifier = new FakeNotifier();
@@ -311,18 +312,18 @@ test('unsafe destructive action cannot be configured for unattended auto executi
       command: 'set_policy',
       slackUserId: 'U123',
       policy: {
-        decisionType: 'calendar_owned_recurrence_task_deleted',
+        decisionType: 'calendar_owned_native_recurrence_task_deleted',
         scope: 'profile',
         mode: 'auto',
         defaultAction: 'delete_whole_series',
       },
     },
   }, {});
-  assert.equal(policies.saved.length, 0);
-  assert.match(notifier.text.at(-1), /not marked auto-safe/);
+  assert.equal(policies.saved.length, 1);
+  assert.equal(policies.saved[0].defaultAction, 'delete_whole_series');
 });
 
-test('safe action can be saved as an auto policy', async () => {
+test('rolling mirror restore-task policy remains valid for explicit review', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const policies = new FakePolicyStore();
   const notifier = new FakeNotifier();
@@ -347,8 +348,6 @@ test('safe action can be saved as an auto policy', async () => {
     },
   }, {});
   assert.equal(policies.saved.length, 1);
-  assert.equal(policies.saved[0].mode, 'auto');
-  assert.equal(policies.saved[0].defaultAction, 'restore_todoist_task');
 });
 
 test('expired decision is atomically closed before provider clients are read', async () => {
@@ -406,6 +405,7 @@ test('manual provider mutation is deferred while normal mutation circuit is open
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
+    async getRecurrenceLink() { return { owner: 'calendar', taskId: mapping.taskId, masterEventId: mapping.masterEventId, eventId: mapping.eventId }; },
     async mutationAllowed() { return false; },
     async recordMutation() { throw new Error('recordMutation must not run when circuit is open'); },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
@@ -415,6 +415,7 @@ test('manual provider mutation is deferred while normal mutation circuit is open
       async getTask() { const error = new Error('not found'); error.status = 404; throw error; },
     },
     calendar: {
+      async getEvent() { return { id: 'master-1', recurrence: ['RRULE:FREQ=WEEKLY'] }; },
       async deleteEvent() { calendarWrites += 1; },
     },
   });
@@ -518,6 +519,8 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
   const state = {
     async syncBlocked() { return false; },
     async getMappingByTask() { return mapping; },
+    async getRecurrenceLink() { return { owner: 'calendar', taskId: mapping.taskId, masterEventId: mapping.masterEventId, eventId: mapping.eventId }; },
+    async deleteMappingIfUnchanged() { operations.push('state:deleteMapping'); return true; },
     async mutationAllowed() { return true; },
     async deleteMapping() { operations.push('state:deleteMapping'); },
     async deleteRecurrenceLink() { operations.push('state:deleteRecurrenceLink'); },
@@ -530,6 +533,7 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
       async getTask() { const error = new Error('not found'); error.status = 404; throw error; },
     },
     calendar: {
+      async getEvent() { return { id: 'master-1', recurrence: ['RRULE:FREQ=WEEKLY'] }; },
       async deleteEvent(id) { operations.push(`calendar:delete:${id}`); },
     },
   });
