@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
+import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
@@ -328,6 +329,7 @@ function App() {
       </ul>}
       {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more unresolved items</button>}
     </section>}
+    <ErasurePanel api={api} />
     <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>

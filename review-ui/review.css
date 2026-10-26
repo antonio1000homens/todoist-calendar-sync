@@ -5,3 +5,14 @@
 @media(max-width:650px){.leftover{grid-template-columns:1fr}.reconcile-button{margin:8px 0 0}}
 .detail-load{margin:18px 0;padding:16px}.detail-load p{margin-bottom:8px}.detail-load p:last-child{margin-bottom:0}
 .field-error{color:#b42318;font-weight:600}input[aria-invalid="true"],select[aria-invalid="true"]{border-color:#b42318}label>small{line-height:1.35}
+
+.erasure-panel{margin-top:20px;border-color:#ad6d32}
+.erasure-panel fieldset{margin:12px 0 16px;border:1px solid #dce1e6;border-radius:8px;padding:12px}
+.erasure-panel .erasure-checkbox{display:flex;flex-direction:row;align-items:center;gap:10px}
+.erasure-panel .erasure-checkbox input{width:auto}
+.erasure-results{margin-top:18px;padding:15px 0;border-top:1px solid #dce1e6}
+.erasure-scroll{overflow:auto;max-height:240px;margin:10px 0}
+.erasure-scroll table{width:100%;border-collapse:collapse;text-align:left}
+.erasure-scroll th,.erasure-scroll td{padding:8px;border-bottom:1px solid #e5e8eb;font-size:13px;vertical-align:top}
+.erasure-scroll code{overflow-wrap:anywhere}
+.erasure-results>button+button{margin-left:8px}
