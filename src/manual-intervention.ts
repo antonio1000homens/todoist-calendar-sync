@@ -65,6 +65,7 @@ export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled
 export type ManualDecisionSeverity = "info" | "warning" | "destructive";
 export type ManualDecisionType =
   | "calendar_owned_recurrence_task_deleted"
+  | "calendar_owned_native_recurrence_task_deleted"
   | "todoist_owned_recurrence_task_deleted"
   | "standalone_todoist_task_deleted"
   | "calendar_snapshot_unmapped_ambiguous"
@@ -120,16 +121,25 @@ const actions = (...items: Array<[string, string, boolean?, boolean?]>): ManualA
  */
 export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionPolicy> = {
   calendar_owned_recurrence_task_deleted: {
-    title: "Todoist mirror deleted — Calendar recurrence still exists",
+    title: "Todoist rolling mirror deleted — Calendar recurrence still exists",
     severity: "destructive",
     detection: "pre_mutation",
-    // Deleting a native recurring Todoist task removes the ENTIRE task,
-    // not one occurrence. A matching Calendar-owned series has one meaning.
+    // Legacy/rolling mirrors are not a single native repeating Todoist task:
+    // deleting one projection does NOT prove whole-series deletion intent.
+    actions: actions(
+      ["skip_occurrence", "Skip this occurrence", true, true],
+      ["delete_this_and_future", "Delete this and future", true],
+      ["delete_whole_series", "Delete whole Calendar series", true],
+      ["restore_todoist_task", "Restore Todoist task", false, true],
+    ),
+  },
+  calendar_owned_native_recurrence_task_deleted: {
+    title: "Native Todoist recurrence deleted — delete matching Calendar series",
+    severity: "destructive",
+    detection: "pre_mutation",
     defaultMode: "auto",
     defaultAction: "delete_whole_series",
-    actions: actions(
-      ["delete_whole_series", "Delete whole Calendar series", true, true],
-    ),
+    actions: actions(["delete_whole_series", "Delete whole Calendar series", true, true]),
   },
   todoist_owned_recurrence_task_deleted: {
     title: "Todoist recurrence deleted — Calendar projection still exists",
@@ -1321,15 +1331,15 @@ export class ManualInterventionService {
     const resolvedPolicy = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
     // An obsolete profile/series prompt preference must not override routine
     // whole-series deletion. Explicit OFF/OBSERVE safety controls remain.
-    const routineSeriesDelete = type === "calendar_owned_recurrence_task_deleted";
+    const routineSeriesDelete = type === "calendar_owned_native_recurrence_task_deleted";
     const effective = {
       ...resolvedPolicy,
       ...(routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
-        ? { mode: "auto" as const, defaultAction: type === "calendar_owned_recurrence_task_deleted"
+        ? { mode: "auto" as const, defaultAction: type === "calendar_owned_native_recurrence_task_deleted"
           ? "delete_whole_series" : "delete_calendar_series" }
         : {}),
       defaultAction: routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
-        ? type === "calendar_owned_recurrence_task_deleted" ? "delete_whole_series" : "delete_calendar_series"
+        ? type === "calendar_owned_native_recurrence_task_deleted" ? "delete_whole_series" : "delete_calendar_series"
         : resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
     };
     if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
@@ -1421,7 +1431,7 @@ export class ManualInterventionService {
     if (!mapping) return false;
 
     const type: ManualDecisionType = mapping.recurrenceOwner === "calendar" && mapping.masterEventId
-      ? "calendar_owned_recurrence_task_deleted"
+      ? mapping.calendarNativeRecurring ? "calendar_owned_native_recurrence_task_deleted" : "calendar_owned_recurrence_task_deleted"
       : mapping.recurrenceOwner === "todoist"
         ? "todoist_owned_recurrence_task_deleted"
         : "standalone_todoist_task_deleted";
@@ -2451,8 +2461,9 @@ export class ManualInterventionService {
       }
     }
 
-    if (decision.type === "calendar_owned_recurrence_task_deleted" && mapping.masterEventId) {
-      if (action === "delete_whole_series") {
+    if (["calendar_owned_recurrence_task_deleted", "calendar_owned_native_recurrence_task_deleted"].includes(decision.type) && mapping.masterEventId) {
+      if (action === "delete_whole_series" && decision.type === "calendar_owned_native_recurrence_task_deleted") {
+        if (!mapping.calendarNativeRecurring) return this.markStale(decision, "This is not a native recurring Todoist mirror.", slackUserId);
         // Never auto-delete a master from a stale or reassigned mapping. A
         // one-off Calendar occurrence must not masquerade as a series.
         if (mapping.updatedAt !== decision.mappingSnapshot?.updatedAt
@@ -2478,6 +2489,13 @@ export class ManualInterventionService {
         const removed = await state.deleteMappingIfUnchanged(mapping);
         if (!removed) return this.markStale(decision, "Calendar deletion completed but the mapping advanced concurrently; investigate the remaining mapping.", slackUserId);
         await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
+      }
+
+      if (action === "delete_whole_series" && decision.type === "calendar_owned_recurrence_task_deleted") {
+        await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
+        await state.deleteMapping(mapping);
+        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
@@ -2939,7 +2957,7 @@ export class ManualInterventionService {
         await this.notifier.updateResolution(decision, "Acknowledged. Todoist and Calendar remain unchanged.");
         return;
       }
-      if (["calendar_owned_recurrence_task_deleted", "todoist_owned_recurrence_task_deleted", "standalone_todoist_task_deleted"].includes(decision.type)) {
+      if (["calendar_owned_recurrence_task_deleted", "calendar_owned_native_recurrence_task_deleted", "todoist_owned_recurrence_task_deleted", "standalone_todoist_task_deleted"].includes(decision.type)) {
         await this.resolveMappedDeletion(decision, manual.action, state, manual.slackUserId);
         return;
       }
