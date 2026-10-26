@@ -1442,6 +1442,14 @@ export class ManualInterventionService {
       activeInstanceId: mapping.activeInstanceId,
       mappingUpdatedAt: mapping.updatedAt,
     };
+    if (type === "calendar_owned_native_recurrence_task_deleted") {
+      // An existing choice card created under the older rolling-mirror catalog
+      // must not survive alongside this native whole-series auto action.
+      const legacy = await this.store.get(
+        decisionKey(delivery.profile, "calendar_owned_recurrence_task_deleted", identity).decisionId);
+      if (legacy?.status === "pending") await this.markStale(legacy,
+        "Native recurring Todoist deletion now means whole-series deletion; this obsolete choice card was superseded.");
+    }
     const effective = await this.policies.resolve(delivery.profile, type, mapping.seriesId, MANUAL_DECISION_CATALOG[type].defaultMode || "prompt");
     if (effective.mode === "prompt" || effective.mode === "auto") {
       const existing = await this.store.get(decisionKey(delivery.profile, type, identity).decisionId);
@@ -2897,6 +2905,14 @@ export class ManualInterventionService {
       return;
     }
     if (decision.profile !== delivery.profile) throw new Error("Manual decision profile does not match delivery profile");
+    if (decision.type === "calendar_owned_recurrence_task_deleted"
+      && decision.mappingSnapshot?.calendarNativeRecurring) {
+      // Old pending cards must never offer rolling-projection dispositions for
+      // a deleted native recurring task, even after a fresh auto decision exists.
+      return this.markStale(decision,
+        "Obsolete native recurring deletion choices were superseded by automatic whole-series deletion.",
+        manual.slackUserId);
+    }
 
     const decisionActions = decision.type === "todoist_unmapped_conflict"
       ? MANUAL_DECISION_CATALOG.todoist_unmapped_conflict.actions
