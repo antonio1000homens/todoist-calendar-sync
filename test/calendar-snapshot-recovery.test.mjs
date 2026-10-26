@@ -257,6 +257,46 @@ test("snapshot import creates one native recurring Todoist task for indefinite w
   }
 });
 
+
+test("existing Calendar-owned one-off mirror is upgraded in place only with exact canonical ownership", async () => {
+  for (const changed of [false, true]) {
+    const master = { ...futureEvent("monthly-master", 15, "Appointment"),
+      iCalUID: "monthly-series", recurrence: ["RRULE:FREQ=MONTHLY"] };
+    const active = { ...futureEvent("monthly-active", 15, master.summary),
+      recurringEventId: master.id, iCalUID: master.iCalUID,
+      originalStartTime: { date: master.start.date } };
+    const state = fakeState();
+    const mapping = { profile: "home", eventId: active.id, taskId: "existing-task",
+      recurrenceOwner: "calendar", seriesId: master.iCalUID, masterEventId: master.id,
+      activeInstanceId: active.id, originalStart: active.start.date,
+      calendarProgressVersion: 1, updatedAt: "2099-01-01T00:00:00Z" };
+    state.mappings.push(mapping);
+    state.getRecurrenceLink = async () => ({ ...mapping, owner: "calendar" });
+    const existing = { id: "existing-task", content: changed ? "Edited independently" : master.summary,
+      description: "", due: { date: active.start.date, is_recurring: false } };
+    const clients = fakeClients([master], [existing]);
+    clients.pair.calendar.listInstances = async () => [active];
+    clients.pair.todoist.getTask = async (id) => {
+      assert.equal(id, existing.id);
+      return structuredClone(existing);
+    };
+    let calls = 0;
+    clients.pair.todoist.upsertTask = async (payload, id) => {
+      calls++;
+      assert.equal(id, existing.id);
+      existing.due = structuredClone(payload.due);
+      return structuredClone(existing);
+    };
+    const result = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+    assert.equal(calls, changed ? 0 : 1);
+    assert.equal(result.conflicts, changed ? 1 : 0);
+    assert.equal(existing.due.is_recurring, !changed);
+    assert.equal(state.mappings.length, 1);
+    assert.equal(state.mappings[0].taskId, "existing-task");
+    assert.equal(state.mappings[0].calendarProgressVersion, 1);
+  }
+});
+
 test("snapshot recovery retains an ending-only recurrence returned with a zone-less local due datetime", async () => {
   const master = {
     id: "verified-zone-master", iCalUID: "verified-zone-series", status: "confirmed", summary: "Task", description: "",
