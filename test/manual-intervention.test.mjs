@@ -312,7 +312,7 @@ test('the standard whole-series deletion is eligible for unattended execution', 
       command: 'set_policy',
       slackUserId: 'U123',
       policy: {
-        decisionType: 'calendar_owned_recurrence_task_deleted',
+        decisionType: 'calendar_owned_native_recurrence_task_deleted',
         scope: 'profile',
         mode: 'auto',
         defaultAction: 'delete_whole_series',
