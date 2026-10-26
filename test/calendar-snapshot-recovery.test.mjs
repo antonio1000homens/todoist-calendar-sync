@@ -49,6 +49,7 @@ function fakeClients(events, initialTasks = []) {
       calendar: {
         async listDelta() { return { items: events, nextSyncToken: "snapshot-token-must-be-ignored" }; },
         async listInstances() { listInstancesCalls += 1; return []; },
+        async listExplicitSeriesExceptions() { return []; },
         async getTimeZone() { return "Europe/London"; },
       },
       todoist: {
@@ -233,6 +234,7 @@ test("snapshot import creates one native recurring Todoist task for indefinite w
         async listDelta() { return { items: [master] }; },
         async listInstances() { return [instance]; },
         async listInstancesInWindow() { return [instance]; },
+        async listExplicitSeriesExceptions() { return []; },
         async getTimeZone() { return "Europe/London"; },
       },
       todoist: {
