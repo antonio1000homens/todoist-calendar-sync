@@ -436,6 +436,32 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
     && parsed.time === recurrence.time) };
 }
 
+/**
+ * A bounded instances expansion cannot prove that an open-ended series has no
+ * exceptions elsewhere. Require Google's complete explicit exception inventory
+ * before creating or maintaining a native indefinite Todoist recurrence.
+ * Any explicit cancellation or modified instance would produce a Todoist
+ * occurrence absent from Calendar, so fail closed to the guarded mirror path.
+ */
+export async function verifiedCalendarOwnedRecurrence(
+  master: CalendarEvent,
+  instances: CalendarEvent[],
+  timeZone: string,
+  listExplicitSeriesExceptions?: (masterId: string) => Promise<CalendarEvent[]>,
+): Promise<CalendarOwnedTodoistRecurrence | undefined> {
+  if (!nativeCalendarRecurrenceCandidate(master)) {
+    return calendarOwnedTodoistRecurrence(master, instances, timeZone);
+  }
+  if (!listExplicitSeriesExceptions) return undefined;
+  const exceptions = await listExplicitSeriesExceptions(master.id);
+  if (exceptions.some((item) => item.recurringEventId !== master.id
+    || item.status === "cancelled" || item.status !== "confirmed")) return undefined;
+  // Even an unmodified explicit override may hide distinct recurrence
+  // semantics (e.g. changed description/location). Never silently adopt it.
+  if (exceptions.length) return undefined;
+  return calendarOwnedTodoistRecurrence(master, instances, timeZone);
+}
+
 export function finiteWeeklyCalendarRuleCandidate(master: CalendarEvent): boolean {
   if (master.recurrence?.length !== 1) return false;
   const fields = ruleFields(master.recurrence[0]);
@@ -497,13 +523,14 @@ export function calendarOwnedTodoistRecurrence(
 export function calendarOwnedRecurringTaskPayload(
   event: CalendarEvent,
   recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
 ): Omit<TodoistTask, "id"> {
   const start = event.start || {};
   return {
     content: event.summary || "Untitled calendar event",
     description: event.description || "",
     due: {
-      ...(start.dateTime ? { datetime: start.dateTime, timezone: start.timeZone || "Europe/London" } : {}),
+      ...(start.dateTime ? { datetime: start.dateTime, ...(verifiedTimeZone || start.timeZone ? { timezone: verifiedTimeZone || start.timeZone } : {}) } : {}),
       ...(start.date ? { date: start.date } : {}),
       string: recurrence.dueString,
       lang: "en",
