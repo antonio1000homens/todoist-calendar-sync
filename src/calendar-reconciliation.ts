@@ -429,10 +429,17 @@ export async function reconcileUnmappedCalendar(
     const fromMs = Number.isFinite(mappedMs) ? Math.min(mappedMs, now) : now;
     const windowStart = new Date(fromMs - 24 * 60 * 60_000).toISOString();
     const windowEnd = new Date(now + 3 * 366 * 24 * 60 * 60_000).toISOString();
+    if (nativeRecurrence && !pair.calendar.listInstancesInWindow) {
+      summary.conflicts += 1;
+      await state.audit(profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+        seriesId, masterEventId: master.id,
+      });
+      return;
+    }
     const instances = boundedFiniteWeekly
       ? await pair.calendar.listInstances(master.id)
-      : nativeRecurrence && pair.calendar.listInstancesInWindow
-        ? await pair.calendar.listInstancesInWindow(master.id, windowStart, windowEnd)
+      : nativeRecurrence
+        ? await pair.calendar.listInstancesInWindow!(master.id, windowStart, windowEnd)
         : await pair.calendar.listInstances(master.id, windowStart);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let seriesTimeZone = master.start?.timeZone || calendarTimeZone;
