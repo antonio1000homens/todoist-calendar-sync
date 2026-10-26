@@ -216,3 +216,39 @@ test("mapping enablement can remain transitional without prematurely releasing t
   assert.equal((await f.service.process("op-recovery")).status,"verifying");
   assert.equal((await f.service.process("op-recovery")).status,"completed");
 });
+
+
+test("recovery eligibility is phase-specific and never resumes already begun provider deletion",async()=>{
+  const phases=[
+    ["disable_mappings",false],["confirm_disabled",false],["drain_before_fence",false],
+    ["install_fence",false],["wait_worker_timeout",true],["drain_after_timeout",true],
+    ["ready_for_delete",true],["delete",false],["verify_deletion",false],
+    ["restore_mappings",false],["confirm_restored",false],["release_fence",false],
+  ];
+  for(const [phase,allowed] of phases){
+    const f=fixture();
+    f.operation.lifecycle.phase=phase;
+    if(["delete","verify_deletion","restore_mappings","confirm_restored","release_fence"].includes(phase))
+      f.operation.lifecycle.evidence.deletionStarted={
+        operationId:"op-recovery",phase:"deletionStarted",
+        receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:2000};
+    const inspection=await f.service.inspect("op-recovery");
+    assert.equal(inspection.preview.allowed,allowed,"phase "+phase);
+    assert.equal(f.external.writes.length,0,"read-only for phase "+phase);
+  }
+});
+
+test("transport read failures, stale confirmations and missing operation never turn into permission to unlock",async()=>{
+  const f=fixture();
+  f.external.snapshot.blockers=["Calendar ETag mismatch"];
+  const preview=await f.service.inspect("op-recovery");
+  assert.equal(preview.preview.allowed,false);
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  const missing=fixture();
+  await assert.rejects(missing.service.inspect("not-our-operation"),/not found/);
+  const stale=fixture();
+  const issued=await stale.service.issueConfirmation("op-recovery","operator");
+  stale.confirmation.expiresAtMs=Date.now()-1000;
+  await assert.rejects(stale.service.apply("op-recovery",issued.confirmationId,"operator"),/expired/);
+  assert.equal(stale.operation.recovery,undefined);
+});
