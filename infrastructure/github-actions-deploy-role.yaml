@@ -250,6 +250,9 @@ Resources:
               - logs:DeleteLogGroup
               - logs:PutRetentionPolicy
               - logs:DeleteRetentionPolicy
+              - logs:DescribeMetricFilters
+              - logs:PutMetricFilter
+              - logs:DeleteMetricFilter
               - logs:TagResource
               - logs:UntagResource
               - logs:ListTagsForResource
