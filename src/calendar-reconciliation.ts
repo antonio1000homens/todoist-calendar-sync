@@ -21,12 +21,14 @@ import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
   matchesCalendarOwnedRecurringTask,
+  matchesCalendarOwnedRecurringRule,
   calendarOwnedTodoistRecurrence,
   verifiedCalendarOwnedRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   nativeCalendarRecurrenceCandidate,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
+import { normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
