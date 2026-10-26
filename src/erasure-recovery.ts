@@ -188,12 +188,14 @@ export class ErasureRecoveryService {
     const inspected=await this.inspect(id);
     if(!inspected.preview.allowed)throw Object.assign(new Error("Recovery is blocked; inspect safety evidence"),{status:409});
     const confirmationId=this.newToken(),expiresAt=Date.now()+5*60_000;
+    // DynamoDB TTL requires epoch *seconds*; the UI/action-time clock uses milliseconds.
     await this.db.send(new PutCommand({TableName:table(),Item:{
       ...confirmationKey(id),operationId:id,profile:inspected.operation.profile,operator,
-      confirmationId,inspectedFingerprint:inspected.fingerprint,expiresAt,status:"issued",
+      confirmationId,inspectedFingerprint:inspected.fingerprint,
+      expiresAt:Math.ceil(expiresAt/1000),expiresAtMs:expiresAt,status:"issued",
       createdAt:new Date().toISOString(),
     },ConditionExpression:"attribute_not_exists(pk) OR expiresAt < :now",
-      ExpressionAttributeValues:{":now":Date.now()}}));
+      ExpressionAttributeValues:{":now":Math.floor(Date.now()/1000)}}));
     return {preview:inspected.preview,confirmationId,expiresAt};
   }
 
@@ -202,7 +204,7 @@ export class ErasureRecoveryService {
       throw Object.assign(new Error("Invalid recovery confirmation"),{status:400});
     const issued=(await this.db.send(new GetCommand({TableName:table(),Key:confirmationKey(id),ConsistentRead:true}))).Item;
     if(!issued||issued.status!=="issued"||issued.operationId!==id||issued.operator!==operator
-      ||issued.confirmationId!==confirmationId||typeof issued.expiresAt!=="number"||issued.expiresAt<=Date.now())
+      ||issued.confirmationId!==confirmationId||typeof issued.expiresAtMs!=="number"||issued.expiresAtMs<=Date.now())
       throw Object.assign(new Error("Recovery confirmation is expired, changed, or consumed"),{status:409});
     const current=await this.inspect(id);
     if(!current.preview.allowed||current.fingerprint!==issued.inspectedFingerprint||!current.preview.epoch)
@@ -220,7 +222,7 @@ export class ErasureRecoveryService {
           ":phase":current.operation.lifecycle!.phase,":now":new Date(now).toISOString()}}},
       {Update:{TableName:table(),Key:confirmationKey(id),
         UpdateExpression:"SET #status=:consumed, consumedAt=:now",
-        ConditionExpression:"#status=:issued AND operator=:operator AND confirmationId=:token AND inspectedFingerprint=:digest AND expiresAt>:time",
+        ConditionExpression:"#status=:issued AND operator=:operator AND confirmationId=:token AND inspectedFingerprint=:digest AND expiresAtMs>:time",
         ExpressionAttributeNames:{"#status":"status"},
         ExpressionAttributeValues:{":issued":"issued",":consumed":"consumed",":operator":operator,":token":confirmationId,
           ":digest":current.fingerprint,":time":now,":now":new Date(now).toISOString()}}},
@@ -297,6 +299,10 @@ export class ErasureRecoveryService {
       ];
       if(recovery.hasJournal)items.push({Delete:{TableName:table(),Key:profileKey(op.profile,"JOURNAL"),
         ConditionExpression:"operationId=:id",ExpressionAttributeValues:{":id":id}}});
+      items.push({Delete:{TableName:table(),Key:confirmationKey(id),
+        ConditionExpression:"#status=:consumed AND operationId=:id AND inspectedFingerprint=:digest",
+        ExpressionAttributeNames:{"#status":"status"},
+        ExpressionAttributeValues:{":consumed":"consumed",":id":id,":digest":recovery.fingerprint}}});
       await this.db.send(new TransactWriteCommand({TransactItems:items}));
       return {status:"completed",retry:false};
     } catch(error) {
