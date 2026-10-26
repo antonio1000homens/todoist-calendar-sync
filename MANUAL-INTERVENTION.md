@@ -9,7 +9,7 @@ Issue #49 adds a human-in-the-loop control plane for sync decisions that are uns
 - Manual deliveries use `sync:<profile>`, the same FIFO message group as webhooks and reconciliation.
 - Provider changes are executed only by the normal todoist-calendar-sync worker.
 - The worker re-reads mapping/provider state before applying a decision. A stale decision is closed without mutation.
-- Destructive Slack buttons require confirmation.
+- Choosing a Slack decision button is the single explicit approval. There is no secondary destructive-action confirmation; worker-side checks, current provider readback and mutation circuits remain in force.
 - A remembered default is not the same thing as unattended execution; routine, unambiguous standalone Todoist deletions use a catalog-level auto policy.
 - Only catalog actions explicitly marked `autoAllowed` can be configured in `auto` mode.
 - A Todoist-owned recurrence deletion and a mapped standalone Todoist deletion are approved catalog-level BAU exceptions: both auto-delete their exact Calendar counterpart after identity and task-absence checks. Ambiguous Calendar-owned recurrence scope and bulk this-and-future deletion still require review.
@@ -75,7 +75,7 @@ After resolving a prompted decision, Slack offers policy buttons such as:
 - **Auto for series** when applicable;
 - **Always ask**.
 
-A saved default stores `mode=prompt` plus `defaultAction`. The next matching card highlights the preference and offers **Apply saved default**. Destructive defaults still use the normal second confirmation.
+A saved default stores `mode=prompt` plus `defaultAction`. The next matching card highlights the preference and offers **Apply saved default**. Applying a saved default is also a direct explicit choice; destructive defaults are not unattended auto-execution.
 
 An auto preference stores `mode=auto` plus `defaultAction`. The matching detector creates a durable decision and queues that action through the normal FIFO lane. The worker reports the automatic resolution to Slack after it completes.
 
