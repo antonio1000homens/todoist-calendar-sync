@@ -715,6 +715,69 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
+  ErasureDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-erasure-dlq-not-empty-${Stage}
+      AlarmDescription: A guarded item-erasure operation failed repeatedly; preserve the fence and operation journal for recovery.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ErasureOperationDlq.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ErasureWorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-erasure-worker-errors-${Stage}
+      AlarmDescription: Guarded item-erasure executor failed a Lambda invocation; inspect logs and durable fence state before retrying.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ErasureWorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ErasureReviewRequiredMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: ErasureWorkerLogGroup
+    Properties:
+      LogGroupName: !Ref ErasureWorkerLogGroup
+      FilterPattern: '{ $.service = "todoist-calendar-sync-erasure-worker" && $.event = "operation_step" && $.status = "review_required" }'
+      MetricTransformations:
+        - MetricNamespace: TodoistCalendarSync/Erasure
+          MetricName: ReviewRequired
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ErasureReviewRequiredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ResourceNamePrefix}-erasure-review-required-${Stage}
+      AlarmDescription: An item-erasure operation entered review_required; do not manually release a profile fence or mapping.
+      Namespace: TodoistCalendarSync/Erasure
+      MetricName: ReviewRequired
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
   SourceQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
