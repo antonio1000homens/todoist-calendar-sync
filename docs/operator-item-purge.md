@@ -208,6 +208,61 @@ The deployed code does not provide that recovery implementation, so these
 checks are requirements for the separate break-glass change, not permission to
 perform ad-hoc DynamoDB or Lambda edits.
 
+## Explicit break-glass recovery (issue #239)
+
+This is a separate, operator-confirmed admission restoration. It **never**
+resumes an earlier deletion, reuses the erasure confirmation, modifies the
+target provider items, or creates replacements.
+
+The authenticated review page can load an existing erasure operation ID and
+show **Inspect independent recovery evidence** when the original operation is
+`review_required`. The read-only inspection scans every page of profile
+fence/epoch/lease/journal controls, reads back the original worker SQS mappings,
+and refreshes the exact provider/comments/DynamoDB inventory. An incomplete
+scan, missing operation/fence/epoch, changed ownership, active lease, abnormal
+mapping, or ambiguous provider state **blocks recovery without writes**.
+
+**Automatic recovery eligibility is intentionally narrow:** only an erasure
+halted *before the first deletion step* (`wait_worker_timeout`,
+`drain_after_timeout`, or `ready_for_delete`) with an installed operation-owned
+fence and a provably unchanged provider/DynamoDB inventory may be restored.
+A partial erasure, a deletion that completed, a missing fence, or an
+already-recovered operation stays blocked. Even when all provider objects are
+absent, late webhook/SQS replay has not been proved impossible; an apparently
+completed purge therefore requires separate controlled replay-proof
+reconciliation before restoring admission. No `force unlock` exists.
+
+After inspecting all mapping UUIDs and blockers, select **Request single-use
+recovery confirmation**. A new, five-minute confirmation is bound to the
+current operator's identity, full inspection fingerprint, profile, operation,
+fence owner, epoch, mapping states, and immutable original evidence. Type
+`RESTORE SYNC`, repeat the exact operation ID and profile, then confirm.
+The server independently rereads all evidence before atomically consuming the
+confirmation and claiming the recovery. A stale token is never applied.
+
+The recovery worker takes a **distinct SQS payload** that cannot be parsed
+as an ordinary deletion request. It enables only the originally enabled
+worker event-source mappings, one at a time, and readbacks their exact states.
+Originally disabled mappings remain disabled. It waits for eventual AWS
+`Enabling` states without removing the fence. Once all original mapping
+states, unchanged provider inventory, fence ownership, monotonic epoch and
+empty lease set are verified again, a DynamoDB transaction conditionally
+removes *only this operation's* temporary fence and matching journal. The
+monotonic epoch and original `review_required` operation record are retained,
+with separate durable `recovery.status=completed` audit evidence.
+
+If an accepted recovery stops because an SQS send failed or the worker hit a
+transient exception, use **Retry existing recovery dispatch** on the
+authenticated page; do not issue another confirmation or replay a purge.
+`recovery.status=blocked` or a drift/ownership error requires manual review.
+Never edit DynamoDB fence/epoch rows, modify mappings outside this protocol,
+or interpret a 404 as evidence of successful erasure.
+
+Recovery is not erasure of backups. The 35-day DynamoDB PITR disclosure
+continues to apply. Production acceptance requires a disposable Work-profile
+fence/recovery fault-injection rehearsal and independent IAM/invocation review
+before closing issue #239.
+
 ## Limits
 
 The fence covers repository ingress and worker paths after the protocol
