@@ -16,7 +16,8 @@ const event=(path,method,headers={},body)=>({rawPath:path,headers,body:body===un
 
 test("preview issues one-use confirmation; create rechecks inventory and persists only an exact fresh operation",async t=>{
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
-    operators:process.env.REVIEW_OPERATOR_EMAILS};
+    operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION,
+    enabled:process.env.ERASURE_EXECUTION_ENABLED};
   globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
     ?new Response(JSON.stringify({keys:[jwk]}),{status:200,headers:{"content-type":"application/json"}}):new Response("unexpected",{status:500});
   Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test"});
