@@ -268,6 +268,9 @@ export class ErasureRecoveryService {
         const disabled=observed.mappings.find(x=>x.originallyEnabled&&x.state==="Disabled");
         if(disabled) {
           await this.adapters.restoreMappings([disabled.id]);
+          console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+            event:"recovery_mapping_restoration_requested",operationId:id,profile:op.profile,
+            originalMappingCount:op.lifecycle!.mappingIds.length}));
           return {status:"restoring",retry:true};
         }
         if(observed.mappings.some(x=>x.originallyEnabled&&x.state==="Enabling"))
@@ -307,6 +310,8 @@ export class ErasureRecoveryService {
         ExpressionAttributeNames:{"#status":"status"},
         ExpressionAttributeValues:{":consumed":"consumed",":id":id,":digest":recovery.fingerprint}}});
       await this.db.send(new TransactWriteCommand({TransactItems:items}));
+      console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+        event:"recovery_fence_released",operationId:id,profile:op.profile,epoch:recovery.epoch}));
       return {status:"completed",retry:false};
     } catch(error) {
       // Fail closed: transport errors are retryable by SQS with no fence
