@@ -74,6 +74,8 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
     activeInstanceId: mapping.activeInstanceId,
     originalStart: mapping.originalStart,
     activeEffectiveStart: mapping.activeEffectiveStart,
+    ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
+    ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
     ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
     taskId: mapping.taskId,
@@ -524,7 +526,7 @@ export async function reconcileUnmappedCalendar(
       if (currentTask.due?.is_recurring) {
         // Existing native recurrence already belongs to this series; never
         // replace a task merely to normalize Todoist's due-string spelling.
-        if (!matchesCalendarOwnedRecurringTask(currentTask, active, recurrence, seriesTimeZone)) {
+        if (!matchesCalendarOwnedRecurringRule(currentTask, recurrence, seriesTimeZone)) {
           summary.conflicts += 1;
           await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
             seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [currentTask.id],
@@ -654,6 +656,8 @@ export async function reconcileUnmappedCalendar(
       originalStart: start,
       activeEffectiveStart: active.start?.dateTime || active.start?.date || start,
       calendarProgressVersion: 1,
+      syncedTitle: normalizedText(active.summary),
+      syncedDescription: normalizedText(active.description),
       updatedAt: new Date().toISOString(),
     };
     if (await controlsBlockRecovery([master.id,active.id],task.id)) {
