@@ -86,7 +86,7 @@ const adapters: ErasureWorkerAdapters={
   },
 };
 const store=new ErasureOperationStore(documentClient,undefined,adapters);
-const recoveryService=new ErasureRecoveryService(documentClient,recoveryAdapters(true),store);
+const recoveryService=new ErasureRecoveryService(recoveryAdapters(true),documentClient,store);
 
 export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery";id:string} {
   let payload:unknown;
