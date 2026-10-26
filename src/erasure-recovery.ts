@@ -122,8 +122,8 @@ function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;stat
   return actual.map(x=>({id:x.id,state:x.state,originallyEnabled:enabled.has(x.id)}));
 }
 export class ErasureRecoveryService {
-  constructor(private readonly db:Db=documentClient,
-    private readonly adapters:RecoveryAdapters,
+  constructor(private readonly adapters:RecoveryAdapters,
+    private readonly db:Db=documentClient,
     private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db),
     private readonly newToken:()=>string=randomUUID) {}
 
@@ -131,6 +131,8 @@ export class ErasureRecoveryService {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const op=await this.erasures.get(id);
     if(!op)throw Object.assign(new Error("Erasure operation not found; absence cannot prove success"),{status:404});
+    if(op.status!=="review_required"||!op.lifecycle)
+      throw Object.assign(new Error("Only a persisted review_required erasure can be inspected for recovery"),{status:409});
     const blockers=validateLifecycle(op);
     // Read each source even if another is blocked; never issue confirmation on a partial read or exception.
     const [control,mappings,snapshot]=await Promise.all([
