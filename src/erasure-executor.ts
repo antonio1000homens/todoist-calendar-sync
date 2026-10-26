@@ -1,5 +1,6 @@
 /** Reusable lifecycle and durable async contract for per-item erasure jobs. */
 import { createHash, randomUUID } from "node:crypto";
+import { erasureExecutionEnabled } from "./erasure-readiness.js";
 import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
@@ -196,6 +197,9 @@ export class ErasureOperationStore {
       ...confirmationKey(preview.operationId),operationId:preview.operationId,confirmationId,previewFingerprint,
       preview:{profile:preview.profile,target:preview.target,selectedActions:preview.selectedActions,
         providerSnapshotFingerprint:preview.providerSnapshotFingerprint,inventory:preview.inventory,actionPlan:preview.actionPlan},
+      // Bind readiness to the exact confirmation issuance. A preview minted while
+      // disabled must never become executable after a deployment flag flip.
+      executionReadyAtIssue:erasureExecutionEnabled(),
       status:"issued",expiresAt,createdAt:new Date(now).toISOString(),
     },ConditionExpression:"attribute_not_exists(pk)"}}]}));
     return {confirmationId,previewFingerprint,expiresAt};
@@ -204,6 +208,7 @@ export class ErasureOperationStore {
   async getIssuedPreview(operationId: string, confirmationId: string): Promise<{
     profile: Profile; target: ErasureOperation["target"]; selectedActions: ErasureOperation["selectedActions"];
     providerSnapshotFingerprint: string; inventory: ErasureOperation["inventory"]; actionPlan: ErasureActionPlan; previewFingerprint: string;
+    executionReadyAtIssue: boolean;
   } | undefined> {
     const result=await this.db.send(new GetCommand({TableName:stateTable(),Key:confirmationKey(operationId),ConsistentRead:true}));
     const item=result.Item;
@@ -213,7 +218,8 @@ export class ErasureOperationStore {
       selectedActions:ErasureOperation["selectedActions"];providerSnapshotFingerprint:string;inventory:ErasureOperation["inventory"];actionPlan:ErasureActionPlan};
     if(!validActionPlan(preview.actionPlan,preview)
       ||erasurePreviewFingerprint(preview)!==item.previewFingerprint) return undefined;
-    return {...preview,previewFingerprint:item.previewFingerprint as string};
+    return {...preview,previewFingerprint:item.previewFingerprint as string,
+      executionReadyAtIssue:item.executionReadyAtIssue===true};
   }
 
   async create(operation: ErasureOperation): Promise<void> {
