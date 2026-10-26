@@ -308,7 +308,9 @@ function openCalendarRecurrence(master: CalendarEvent, timeZone: string): Calend
   if (parts.hour && !time) return undefined;
   const timePhrase = parts.hour ? ` at ${parts.hour}:${parts.minute}${(parts.dayPeriod || "").toLowerCase()}` : "";
   const startPhrase = localDate(start, timeZone);
-  const base = { rule, startDate: start.slice(0, 10), ...(time ? { time } : {}) };
+  // The UTC date of an offset timestamp can differ from its Calendar-local day.
+  const localIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const base = { rule, startDate: localIsoDate, ...(time ? { time } : {}) };
   if (fields.FREQ === "WEEKLY") {
     if (fields.BYMONTH || fields.BYMONTHDAY
       || (fields.BYDAY && fields.BYDAY !== Object.keys(weekdayCodes).find((code) => weekdayCodes[code] === weekday))) return undefined;
