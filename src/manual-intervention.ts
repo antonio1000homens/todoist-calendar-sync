@@ -2453,9 +2453,31 @@ export class ManualInterventionService {
 
     if (decision.type === "calendar_owned_recurrence_task_deleted" && mapping.masterEventId) {
       if (action === "delete_whole_series") {
+        // Never auto-delete a master from a stale or reassigned mapping. A
+        // one-off Calendar occurrence must not masquerade as a series.
+        if (mapping.updatedAt !== decision.mappingSnapshot?.updatedAt
+          || !mapping.seriesId || !mapping.masterEventId
+          || mapping.recurrenceOwner !== "calendar") {
+          return this.markStale(decision, "The Calendar recurrence mapping changed; automatic deletion was refused.", slackUserId);
+        }
+        const link = await state.getRecurrenceLink(decision.profile, mapping.seriesId);
+        if (!link || link.owner !== "calendar" || link.taskId !== mapping.taskId
+          || link.masterEventId !== mapping.masterEventId || link.eventId !== mapping.eventId) {
+          return this.markStale(decision, "The recurrence link no longer identifies the same series and task.", slackUserId);
+        }
+        let master: CalendarEvent | undefined;
+        try { master = await pair.calendar.getEvent(mapping.masterEventId); }
+        catch (error) { if (!providerNotFound(error)) throw error; }
+        if (master && (master.id !== mapping.masterEventId || master.recurringEventId
+          || !master.recurrence?.length)) {
+          return this.markStale(decision, "The Calendar master is no longer a verified recurring series.", slackUserId);
+        }
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-        await state.deleteMapping(mapping);
-        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
+        // A failed post-delete cleanup is retried through the existing
+        // quarantined manual delivery, never by creating a new series.
+        const removed = await state.deleteMappingIfUnchanged(mapping);
+        if (!removed) return this.markStale(decision, "Calendar deletion completed but the mapping advanced concurrently; investigate the remaining mapping.", slackUserId);
+        await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
