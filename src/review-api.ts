@@ -257,6 +257,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (!operation) return response(404,{error:"erasure_operation_not_found"});
       if(method==="POST") requireAdmissionProfile(operation.profile);
       if (method === "GET") return response(200,{operation:{operationId:operation.operationId,profile:operation.profile,status:operation.status,
+        recoveryStatus:operation.recovery?.status,
         providerDeletionReady:operation.providerDeletionReady===true,
         executionEnabled:erasureExecutionEnabled(),
         queueReady:erasureExecutionEnabled()&&operation.providerDeletionReady===true,
@@ -268,8 +269,11 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           stateRowsCompleted:operation.lifecycle.deletionProgress.stateIndex,
         }:undefined,
         ...(operation.lifecycle?.lastError?{lastError:operation.lifecycle.lastError}:{}),
-        ...(operation.status==="review_required"?{operatorRecoveryRequired:true,
-          message:ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
+        ...(operation.status==="review_required"?{
+          operatorRecoveryRequired:operation.recovery?.status!=="completed",
+          message:operation.recovery?.status==="completed"
+            ?"This original erasure was stopped. Profile admission has been safely restored; the previous deletion is never resumed."
+            :ERASURE_REVIEW_REQUIRED_MESSAGE}:{}),
         createdAt:operation.createdAt,updatedAt:operation.updatedAt}});
       if (Object.keys(body || {}).length) fail(400,"Erasure start accepts no request fields");
       if (operation.status === "review_required") fail(409,"Operator break-glass recovery is required before service admission or a fresh preview can resume");
