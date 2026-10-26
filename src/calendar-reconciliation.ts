@@ -28,7 +28,7 @@ import {
   nativeCalendarRecurrenceCandidate,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
-import { normalizedText } from "./security.js";
+import { normalizedDescription, normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
@@ -558,7 +558,7 @@ export async function reconcileUnmappedCalendar(
           await state.recordMutation(profile);
           if (result.id !== master.id || JSON.stringify(result.recurrence) !== JSON.stringify(master.recurrence)
             || normalizedText(result.summary) !== metadata.summary
-            || normalizedText(result.description) !== metadata.description) {
+            || normalizedDescription(result.description) !== metadata.description) {
             summary.conflicts += 1;
             await state.audit(profile, "calendar_owned_metadata_readback_mismatch", { seriesId, taskId: currentTask.id, provider: "calendar" });
             return;
@@ -571,7 +571,7 @@ export async function reconcileUnmappedCalendar(
           });
           await state.recordMutation(profile);
           if (updated.id !== currentTask.id || normalizedText(updated.content) !== metadata.summary
-            || normalizedText(updated.description) !== metadata.description
+            || normalizedDescription(updated.description) !== metadata.description
             || JSON.stringify(updated.due) !== JSON.stringify(currentTask.due)) {
             summary.conflicts += 1;
             await state.audit(profile, "calendar_owned_metadata_readback_mismatch", { seriesId, taskId: currentTask.id, provider: "todoist" });
@@ -622,7 +622,7 @@ export async function reconcileUnmappedCalendar(
       const migratedMapping: Mapping = {
         ...existingMapping, calendarNativeRecurring: true,
         syncedTitle: normalizedText(active.summary),
-        syncedDescription: normalizedText(active.description),
+        syncedDescription: normalizedDescription(active.description),
         updatedAt: new Date().toISOString(),
       };
       await state.putMapping(migratedMapping);
@@ -725,7 +725,7 @@ export async function reconcileUnmappedCalendar(
       activeEffectiveStart: active.start?.dateTime || active.start?.date || start,
       calendarProgressVersion: 1,
       syncedTitle: normalizedText(active.summary),
-      syncedDescription: normalizedText(active.description),
+      syncedDescription: normalizedDescription(active.description),
       ...(recurrence ? { calendarNativeRecurring: true } : {}),
       updatedAt: new Date().toISOString(),
     };
