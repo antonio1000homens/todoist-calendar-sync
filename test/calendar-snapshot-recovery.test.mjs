@@ -49,7 +49,7 @@ function fakeClients(events, initialTasks = []) {
       calendar: {
         async listDelta() { return { items: events, nextSyncToken: "snapshot-token-must-be-ignored" }; },
         async listInstances() { listInstancesCalls += 1; return []; },
-        async listInstancesInWindow() { return this.listInstances(); },
+        async listInstancesInWindow(masterId) { return this.listInstances(masterId); },
         async listExplicitSeriesExceptions() { return []; },
         async getTimeZone() { return "Europe/London"; },
       },
