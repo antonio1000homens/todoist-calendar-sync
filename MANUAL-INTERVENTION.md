@@ -10,9 +10,9 @@ Issue #49 adds a human-in-the-loop control plane for sync decisions that are uns
 - Provider changes are executed only by the normal todoist-calendar-sync worker.
 - The worker re-reads mapping/provider state before applying a decision. A stale decision is closed without mutation.
 - Destructive Slack buttons require confirmation.
-- A remembered default is not the same thing as unattended execution.
+- A remembered default is not the same thing as unattended execution; routine, unambiguous standalone Todoist deletions use a catalog-level auto policy.
 - Only catalog actions explicitly marked `autoAllowed` can be configured in `auto` mode.
-- Highly destructive actions such as deleting a whole recurrence or deleting this-and-future may be remembered as defaults but cannot be auto-applied.
+- A Todoist-owned recurrence deletion and a mapped standalone Todoist deletion are approved catalog-level BAU exceptions: both auto-delete their exact Calendar counterpart after identity and task-absence checks. Ambiguous Calendar-owned recurrence scope and bulk this-and-future deletion still require review.
 - Bulk "this and future" recurrence deletion is capped at ten Calendar instance mutations. Larger scopes are refused and require the series-level delete option or a narrower recurrence.
 - Normal `maxReceiveCount: 1`, worker concurrency `1`, circuit breaker and reconciliation coalescing remain unchanged.
 
@@ -79,7 +79,7 @@ A saved default stores `mode=prompt` plus `defaultAction`. The next matching car
 
 An auto preference stores `mode=auto` plus `defaultAction`. The matching detector creates a durable decision and queues that action through the normal FIFO lane. The worker reports the automatic resolution to Slack after it completes.
 
-Current auto-safe examples include restoring a deleted Todoist mirror, skipping a single Calendar-owned occurrence, keeping a Todoist-owned Calendar series while unlinking it, and requesting another reconciliation. Whole-series deletion and this-and-future deletion are intentionally not auto-safe.
+Auto-safe examples include deleting the exact mapped Calendar event after a standalone Todoist deletion, deleting a Todoist-owned Calendar series after its owning Todoist task is deleted, restoring a deleted Todoist mirror and skipping a Calendar-owned occurrence. Arbitrary Calendar-owned whole-series deletion and this-and-future deletion remain explicit review actions.
 
 ## Actively connected decision detectors
 
@@ -93,7 +93,7 @@ This covers:
 - Todoist-owned recurring projections;
 - standalone mapped tasks.
 
-Internal mirror replacement does not prompt because those flows remove mapping ownership before deleting the old Todoist task.
+For mapped standalone tasks and Todoist-owned recurrences, the built-in policy is `auto`: no approval card is posted and a guarded deletion is queued in the same profile FIFO lane. Standalone automatic deletion rechecks that Todoist is absent, the mapping has not changed, the Calendar event is still owned by that Todoist task and it has not become a recurring event. A recreated task or changed mapping causes no automatic Calendar delete. This default applies to `home`, `antonio` and `work` without configuring profile policies. Explicit saved policy overrides still take precedence.\n\nCalendar-to-Todoist standalone deletions and supported one-sided title/date/time edits already flow through the normal synchronizer and baseline-aware snapshot reconciliation without a manual decision. Both-sides-changed conflicts, stale ownership, unsupported recurrence edits and Calendar-owned recurrence deletion with unclear scope still require review. Completion of a Todoist task is not treated as deletion: completed Calendar history remains protected.\n\nInternal mirror replacement does not prompt because those flows remove mapping ownership before deleting the old Todoist task.
 
 ### Conflict audits
 
