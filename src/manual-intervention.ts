@@ -123,11 +123,12 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Todoist mirror deleted — Calendar recurrence still exists",
     severity: "destructive",
     detection: "pre_mutation",
+    // Deleting a native recurring Todoist task removes the ENTIRE task,
+    // not one occurrence. A matching Calendar-owned series has one meaning.
+    defaultMode: "auto",
+    defaultAction: "delete_whole_series",
     actions: actions(
-      ["skip_occurrence", "Skip this occurrence", true, true],
-      ["delete_this_and_future", "Delete this and future", true],
-      ["delete_whole_series", "Delete whole Calendar series", true],
-      ["restore_todoist_task", "Restore Todoist task", false, true],
+      ["delete_whole_series", "Delete whole Calendar series", true, true],
     ),
   },
   todoist_owned_recurrence_task_deleted: {
@@ -1317,8 +1318,16 @@ export class ManualInterventionService {
     const catalog = MANUAL_DECISION_CATALOG[type];
     const seriesId = typeof fields.seriesId === "string" ? fields.seriesId : undefined;
     const resolvedPolicy = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
+    // An obsolete profile/series prompt preference must not override routine
+    // whole-series deletion. Explicit OFF/OBSERVE safety controls remain.
+    const routineSeriesDelete = type === "calendar_owned_recurrence_task_deleted"
+      || type === "todoist_owned_recurrence_task_deleted";
     const effective = {
       ...resolvedPolicy,
+      ...(routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
+        ? { mode: "auto" as const, defaultAction: type === "calendar_owned_recurrence_task_deleted"
+          ? "delete_whole_series" : "delete_calendar_series" }
+        : {}),
       defaultAction: resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
     };
     if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
