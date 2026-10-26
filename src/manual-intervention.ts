@@ -47,9 +47,9 @@ const PENDING_DECISION_QUERY_PAGE_LIMIT = 25;
 const PENDING_DECISION_QUERY_MAX_PAGES = 12;
 const MAX_MANUAL_BULK_MUTATIONS = 10;
 const MANUAL_CALENDAR_MUTATIONS = new Set([
-  "upsertEvent", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "deleteEvent",
+  "upsertEvent", "patchEventMetadataIfUnchanged", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "deleteEvent",
 ]);
-const MANUAL_TODOIST_MUTATIONS = new Set(["upsertTask", "updateRecurringOccurrence", "deleteTask", "upsertComment", "deleteComment"]);
+const MANUAL_TODOIST_MUTATIONS = new Set(["upsertTask", "updateTaskMetadata", "updateRecurringOccurrence", "deleteTask", "upsertComment", "deleteComment"]);
 
 class ManualCircuitOpenError extends Error {
   constructor(readonly profile: Profile, readonly operation: string) {
@@ -1282,7 +1282,7 @@ export class ManualInterventionService {
         return async (...args: unknown[]) => {
           const ids = mutatingMethods === MANUAL_CALENDAR_MUTATIONS
             ? { eventId: typeof args[1] === "string" ? args[1] : typeof args[0] === "string" ? args[0] : (args[0] as CalendarEvent)?.id }
-            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
+            : { taskId: operation === "updateRecurringOccurrence" ? (args[0] as TodoistTask)?.id : operation === "deleteTask" || operation === "updateTaskMetadata" ? String(args[0]) : operation === "upsertTask" ? args[1] as string|undefined : undefined };
           await recheckProtectedItems(profile);
           if (await state.syncBlocked(profile, ids)) throw new ManualSyncBlockedError();
           if (!await state.mutationAllowed(profile)) throw new ManualCircuitOpenError(profile, operation);
