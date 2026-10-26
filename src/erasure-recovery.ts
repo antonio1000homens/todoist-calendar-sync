@@ -9,6 +9,7 @@ export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" 
 export interface RecoveryState {
   status:RecoveryStatus;
   fingerprint:string;
+  lifecycleFingerprint:string;
   epoch:number;
   hasJournal:boolean;
   startedAt:string;
@@ -211,6 +212,7 @@ export class ErasureRecoveryService {
       throw Object.assign(new Error("Safety evidence drifted; obtain a new recovery preview"),{status:409});
     const now=Date.now();
     const recovery:RecoveryState={status:"queued",fingerprint:current.fingerprint,
+      lifecycleFingerprint:digest(current.operation.lifecycle),
       epoch:current.preview.epoch,hasJournal:current.hasJournal,startedAt:new Date(now).toISOString()};
     // Lock the durable operation before SQS dispatch. No pre-existing fence/epoch may be changed.
     await this.db.send(new TransactWriteCommand({TransactItems:[
@@ -287,10 +289,11 @@ export class ErasureRecoveryService {
       const items:any[]=[
         {Update:{TableName:table(),Key:operationKey(id),
           UpdateExpression:"SET recovery.#status=:done, recovery.completedAt=:now, updatedAt=:now",
-          ConditionExpression:"#status=:review AND recovery.#status=:verify AND recovery.fingerprint=:digest AND recovery.epoch=:epoch",
-          ExpressionAttributeNames:{"#status":"status"},
+          ConditionExpression:"#status=:review AND recovery.#status=:verify AND recovery.fingerprint=:digest AND recovery.epoch=:epoch AND previewFingerprint=:preview AND lifecycle.#phase=:phase",
+          ExpressionAttributeNames:{"#status":"status","#phase":"phase"},
           ExpressionAttributeValues:{":review":"review_required",":verify":"verifying",":done":"completed",
-            ":digest":recovery.fingerprint,":epoch":recovery.epoch,":now":new Date().toISOString()}}},
+            ":digest":recovery.fingerprint,":epoch":recovery.epoch,":preview":op.previewFingerprint,
+            ":phase":op.lifecycle!.phase,":now":new Date().toISOString()}}},
         {Delete:{TableName:table(),Key:profileKey(op.profile,"FENCE"),
           ConditionExpression:"operationId=:id AND #state=:active",
           ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
@@ -320,6 +323,8 @@ export class ErasureRecoveryService {
     safe:boolean;mappings:RecoveryPreview["mappingStates"];
   }> {
     const recovery=op.recovery!;
+    if(validateLifecycle(op).length || digest(op.lifecycle)!==recovery.lifecycleFingerprint)
+      return {safe:false,mappings:[]};
     const control=await readControl(this.db,op.profile);
     if(control.fence?.operationId!==op.operationId||control.fence.state!=="active"
       ||control.epoch!==recovery.epoch||control.leases.length>0
