@@ -1326,8 +1326,13 @@ export class Synchronizer {
     const startMs = from ? Math.min(Date.parse(from) || Date.now(), Date.now()) : Date.now();
     const windowStart = new Date(startMs - 24 * 60 * 60_000).toISOString();
     const windowEnd = new Date(Date.now() + 3 * 366 * 24 * 60 * 60_000).toISOString();
-    const instances = nativeRecurrence && calendar.listInstancesInWindow
-      ? await calendar.listInstancesInWindow(master.id, windowStart, windowEnd)
+    if (nativeRecurrence && !calendar.listInstancesInWindow) {
+      return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+        seriesId, masterEventId: master.id,
+      });
+    }
+    const instances = nativeRecurrence
+      ? await calendar.listInstancesInWindow!(master.id, windowStart, windowEnd)
       : await calendar.listInstances(master.id);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let calendarTimeZone = master.start?.timeZone;
@@ -1338,12 +1343,13 @@ export class Synchronizer {
       if (!calendarTimeZone) return;
     }
     const calendarRecurrence = (finiteWeekly || nativeRecurrence) && calendarTimeZone
-      ? calendarOwnedTodoistRecurrence(master, instances, calendarTimeZone)
+      ? await verifiedCalendarOwnedRecurrence(master, instances, calendarTimeZone,
+        calendar.listExplicitSeriesExceptions?.bind(calendar))
       : undefined;
     if (!calendarRecurrence) {
       await this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
         seriesId, masterEventId: master.id, reason: finiteWeekly
-          ? "finite_weekly_rule_or_instance_inventory_not_representable" : "rrule_outside_supported_finite_weekly_subset",
+          ? "finite_weekly_rule_or_instance_inventory_not_representable" : nativeRecurrence ? "native_rule_or_complete_exception_inventory_not_representable" : "rrule_outside_supported_native_subset",
       });
     }
     const suppressed = suppressedLegacyCalendarRecurrenceCandidate(instances, existing, Date.now(), calendarTimeZone);
@@ -1401,7 +1407,7 @@ export class Synchronizer {
       }
     }
     const nextTask = await todoist.upsertTask(
-      calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence) : toTodoistTask(active), task?.id,
+      calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence, calendarTimeZone) : toTodoistTask(active), task?.id,
     );
     const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence, calendarTimeZone) : undefined;
     if (readback && !readback.matches) {
