@@ -20,7 +20,8 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
     enabled:process.env.ERASURE_EXECUTION_ENABLED};
   globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
     ?new Response(JSON.stringify({keys:[jwk]}),{status:200,headers:{"content-type":"application/json"}}):new Response("unexpected",{status:500});
-  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test"});
+  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,REVIEW_OPERATOR_EMAILS:"operator@example.test",
+    ERASURE_PROTOCOL_VERSION:"1",ERASURE_EXECUTION_ENABLED:"false"});
   const headers=await signedHeaders();
   const exact={operationId:"op-preview",profile:"home",target:{taskId:"task-123",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},previewFingerprint:"canonical-preview-digest",
@@ -35,7 +36,8 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
       selectedActions:{deleteTodoist:true,deleteCalendar:input.deleteCalendar}};
   }};
   t.after(()=>{globalThis.fetch=old.fetch;
-    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,REVIEW_OPERATOR_EMAILS:old.operators}))
+    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:old.issuer,CF_ACCESS_AUDIENCE:old.audience,
+      REVIEW_OPERATOR_EMAILS:old.operators,ERASURE_PROTOCOL_VERSION:old.protocol,ERASURE_EXECUTION_ENABLED:old.enabled}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
   });
   const preview=await handler(event("/review/api/erasure-previews","POST",headers,
