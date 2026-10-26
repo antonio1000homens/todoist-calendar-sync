@@ -66,7 +66,7 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
         allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId,
         // Bounded by the caller's Lambda timeout; any partial scan throws,
         // leaving the fence and mappings untouched.
-        scanDeadlineMs:95_000});
+        scanDeadlineMs:canRestore?95_000:68_000});
     },
   };
 }
