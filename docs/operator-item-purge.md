@@ -166,7 +166,8 @@ and the eventual action-time worker gate must both compare the exact inventory.
 The async review endpoint can report `status: "review_required"` with
 `operatorRecoveryRequired: true` if the final read-only deletion gate detects a
 changed preview, mapping inventory/state, fence owner, active lease, or lifecycle
-receipt. This worker does not delete provider objects. After detecting drift,
+receipt. Under an enabled deployment this worker can perform destructive steps, but
+it performs no further deletion after detecting drift.
 it makes no further changes to the fence or mappings. It acknowledges the queue
 message only after recording the terminal status and refuses to resume the same
 operation. The mismatch means the worker has not proved that all protections
