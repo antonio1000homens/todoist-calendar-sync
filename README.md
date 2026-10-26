@@ -31,6 +31,11 @@ The service includes:
 - FIFO ordering and durable completion markers;
 - Calendar incremental sync-token recovery;
 - Todoist and Calendar recurrence handling;
+  - Calendar-owned finite weekly COUNT rules create one recurring Todoist task when provider readback verifies the inclusive end. Simple indefinite weekly (one weekday), monthly (day 1–28) and yearly (fixed date except 29 February) rules also create one recurring Todoist task. Calendar remains the recurrence authority.
+  - Unsupported Calendar RRULEs (complex BYDAY, unsupported intervals/termination, or invalid/ambiguous provider data) use the guarded single-active-occurrence mirror rather than a misleading recurrence. Matching Calendar/Todoist timezones are required before native conversion.
+  - On task completion, the current Calendar occurrence is retained for history; the mapping advances to the next live Calendar occurrence. Cancelled occurrences are skipped. The native task ID is preserved when readback and ownership verification permit.
+  - Already-mapped Calendar-owned one-off mirrors can be upgraded in place by snapshot reconciliation only when exact current Calendar/task identity is proven. Ambiguous ownership is not silently adopted.
+
 - conservative reconciliation mutation budgets;
 - circuit breakers for mutation storms;
 - DynamoDB deletion protection and point-in-time recovery;

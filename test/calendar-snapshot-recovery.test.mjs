@@ -49,6 +49,8 @@ function fakeClients(events, initialTasks = []) {
       calendar: {
         async listDelta() { return { items: events, nextSyncToken: "snapshot-token-must-be-ignored" }; },
         async listInstances() { listInstancesCalls += 1; return []; },
+        async listInstancesInWindow(masterId) { return this.listInstances(masterId); },
+        async listExplicitSeriesExceptions() { return []; },
         async getTimeZone() { return "Europe/London"; },
       },
       todoist: {
@@ -208,6 +210,94 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(state.mappings.length, 1);
   assert.equal(state.mappings[0].taskId, "one-task");
   assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+});
+
+
+test("snapshot import creates one native recurring Todoist task for indefinite weekly, monthly and yearly series", async () => {
+  const cases = [
+    { date: "2099-09-02", rule: "RRULE:FREQ=WEEKLY", fragment: "Wednesday" },
+    { date: "2099-09-15", rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=15", fragment: "15th" },
+    { date: "2099-10-10", rule: "RRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=10", fragment: "10 Oct" },
+  ];
+  for (const { date, rule, fragment } of cases) {
+    const master = {
+      id: "series-" + date, iCalUID: "uid-" + date, status: "confirmed", summary: "Task",
+      start: { date }, end: { date: date }, recurrence: [rule],
+    };
+    const instance = {
+      id: "active-" + date, iCalUID: master.iCalUID, status: "confirmed", summary: "Task",
+      recurringEventId: master.id, originalStartTime: { date }, start: { date }, end: { date },
+    };
+    const state = fakeState();
+    const tasks = [];
+    const clients = {
+      calendar: {
+        async listDelta() { return { items: [master] }; },
+        async listInstances() { return [instance]; },
+        async listInstancesInWindow() { return [instance]; },
+        async listExplicitSeriesExceptions() { return []; },
+        async getTimeZone() { return "Europe/London"; },
+      },
+      todoist: {
+        async listTasks() { return tasks.map((task) => structuredClone(task)); },
+        async getTimeZone() { return "Europe/London"; },
+        async upsertTask(payload) {
+          const task = { id: "one-" + date, project_id: "home-project", ...structuredClone(payload) };
+          tasks.push(task);
+          return structuredClone(task);
+        },
+        async findComment() { return undefined; },
+        async upsertComment() { return { id: "comment" }; },
+      },
+    };
+    const result = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(result.imported, 1, rule);
+    assert.equal(result.conflicts, 0, rule);
+    assert.equal(tasks.length, 1, rule);
+    assert.equal(tasks[0].due.is_recurring, true, rule);
+    assert.ok(tasks[0].due.string.includes(fragment), rule);
+    assert.equal(state.mappings[0].recurrenceOwner, "calendar", rule);
+  }
+});
+
+
+test("existing Calendar-owned one-off mirror is upgraded in place only with exact canonical ownership", async () => {
+  for (const changed of [false, true]) {
+    const master = { ...futureEvent("monthly-master", 15, "Appointment"),
+      iCalUID: "monthly-series", recurrence: ["RRULE:FREQ=MONTHLY"] };
+    const active = { ...futureEvent("monthly-active", 15, master.summary),
+      recurringEventId: master.id, iCalUID: master.iCalUID,
+      originalStartTime: { date: master.start.date } };
+    const state = fakeState();
+    const mapping = { profile: "home", eventId: active.id, taskId: "existing-task",
+      recurrenceOwner: "calendar", seriesId: master.iCalUID, masterEventId: master.id,
+      activeInstanceId: active.id, originalStart: active.start.date,
+      calendarProgressVersion: 1, updatedAt: "2099-01-01T00:00:00Z" };
+    state.mappings.push(mapping);
+    state.getRecurrenceLink = async () => ({ ...mapping, owner: "calendar" });
+    const existing = { id: "existing-task", content: changed ? "Edited independently" : master.summary,
+      description: "", due: { date: active.start.date, is_recurring: false } };
+    const clients = fakeClients([master], [existing]);
+    clients.pair.calendar.listInstances = async () => [active];
+    clients.pair.todoist.getTask = async (id) => {
+      assert.equal(id, existing.id);
+      return structuredClone(existing);
+    };
+    let calls = 0;
+    clients.pair.todoist.upsertTask = async (payload, id) => {
+      calls++;
+      assert.equal(id, existing.id);
+      existing.due = structuredClone(payload.due);
+      return structuredClone(existing);
+    };
+    const result = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+    assert.equal(calls, changed ? 0 : 1);
+    assert.equal(result.conflicts, changed ? 1 : 0);
+    assert.equal(existing.due.is_recurring, !changed);
+    assert.equal(state.mappings.length, 1);
+    assert.equal(state.mappings[0].taskId, "existing-task");
+    assert.equal(state.mappings[0].calendarProgressVersion, 1);
+  }
 });
 
 test("snapshot recovery retains an ending-only recurrence returned with a zone-less local due datetime", async () => {

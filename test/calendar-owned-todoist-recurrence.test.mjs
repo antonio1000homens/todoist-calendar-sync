@@ -4,6 +4,8 @@ import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
   calendarOwnedTodoistRecurrence,
+  verifiedCalendarOwnedRecurrence,
+  nativeCalendarRecurrenceCandidate,
   matchesCalendarOwnedRecurringRule,
   matchesCalendarOwnedRecurringTask,
 } from "../dist/calendar-owned-todoist-recurrence.js";
@@ -68,12 +70,139 @@ test("all-day finite weekly recurrence preserves date-only Todoist due values", 
   }, schedule[0], recurrence), true);
 });
 
-test("unsupported, unbounded, or incomplete weekly recurrence inventories fail closed", () => {
+test("unsupported or incomplete finite weekly recurrence inventories fail closed", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=DAILY;COUNT=4");
   const schedule = instances(["2026-11-04T14:00:00Z"]);
   assert.equal(calendarOwnedTodoistRecurrence(master, schedule, "Europe/London"), undefined);
-  assert.equal(calendarOwnedTodoistRecurrence(weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY"), schedule, "Europe/London"), undefined);
-  assert.equal(calendarOwnedTodoistRecurrence(weeklyMaster("2026-11-04T14:00:00Z"), schedule, "Europe/London"), undefined);
+   assert.equal(calendarOwnedTodoistRecurrence(weeklyMaster("2026-11-04T14:00:00Z"), schedule, "Europe/London"), undefined);
+});
+
+
+test("indefinite weekly, monthly and annual Calendar patterns produce real Todoist recurrences", () => {
+  const examples = [
+    { start: "2026-11-04T14:00:00Z", rule: "RRULE:FREQ=WEEKLY;BYDAY=WE",
+      text: "every Wednesday at 2:00pm starting 4 Nov 2026", frequency: "weekly" },
+    { start: "2026-11-15T14:00:00Z", rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=15",
+      text: "every 15th at 2:00pm starting 15 Nov 2026", frequency: "monthly" },
+    { start: "2026-10-10T14:00:00Z", rule: "RRULE:FREQ=YEARLY;BYMONTH=10;BYMONTHDAY=10",
+      text: "every 10 Oct at 3:00pm starting 10 Oct 2026", frequency: "yearly" },
+  ];
+  for (const { start, rule, text, frequency } of examples) {
+    const master = weeklyMaster(start, rule);
+    assert.equal(nativeCalendarRecurrenceCandidate(master), true);
+    const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+    assert.equal(recurrence.frequency, frequency);
+    assert.equal(recurrence.dueString, text);
+    const event = { id: "active", start: master.start, summary: "Appointment" };
+    const due = { date: start, datetime: start, is_recurring: true, string: text };
+    const task = { id: "task", content: "Appointment", due };
+    assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence).due.is_recurring, true);
+    assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringTask({ ...task, due: { ...due, string: "every day" } },
+      event, recurrence, "Europe/London"), false);
+  }
+});
+
+test("all-day native rules and Todoist's normalized no-start recurrence remain valid", () => {
+  const shapes = [
+    { date: "2099-09-02", rule: "RRULE:FREQ=WEEKLY", normalized: "every Wednesday" },
+    { date: "2099-09-15", rule: "RRULE:FREQ=MONTHLY", normalized: "every 15th" },
+    { date: "2099-10-10", rule: "RRULE:FREQ=YEARLY", normalized: "every October 10" },
+  ];
+  for (const { date, rule, normalized } of shapes) {
+    const event = { id: "master", start: { date }, recurrence: [rule] };
+    const recurrence = calendarOwnedTodoistRecurrence(event, [], "Europe/London");
+    const task = { id: "task", due: { date, string: normalized, is_recurring: true } };
+    assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, is_recurring: false } }, recurrence), false);
+  }
+});
+
+
+test("native weekly recurrence checks the London-local day across UTC midnight", () => {
+  const master = weeklyMaster("2027-07-06T23:30:00Z", "RRULE:FREQ=WEEKLY;BYDAY=WE");
+  const scheduled = instances(["2027-07-06T23:30:00Z"]);
+  const recurrence = calendarOwnedTodoistRecurrence(master, scheduled, "Europe/London");
+  assert.equal(recurrence.weekday, "Wednesday");
+  assert.equal(recurrence.startDate, "2027-07-07");
+  const event = { ...scheduled[0], start: master.start };
+  const task = { id: "task", due: {
+    date: "2027-07-06T23:30:00Z", is_recurring: true, string: recurrence.dueString,
+  } };
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence), false,
+    "unverified timezone cannot prove an offset datetime's logical weekday");
+});
+
+test("complex or finite non-weekly Calendar recurrences are never silently approximated", () => {
+  const invalid = [
+    ["2026-11-30", "RRULE:FREQ=MONTHLY"],
+    ["2026-11-15", "RRULE:FREQ=MONTHLY;COUNT=5"],
+    ["2026-11-15", "RRULE:FREQ=MONTHLY;UNTIL=20271231"],
+    ["2028-02-29", "RRULE:FREQ=YEARLY"],
+    ["2026-11-04", "RRULE:FREQ=WEEKLY;BYDAY=WE,FR"],
+    ["2026-11-04", "RRULE:FREQ=WEEKLY;INTERVAL=2"],
+    ["2026-11-04", "RRULE:FREQ=WEEKLY;BYSETPOS=1"],
+    ["2026-11-15", "RRULE:FREQ=MONTHLY;BYDAY=3SU"],
+  ];
+  for (const [date, rule] of invalid) {
+    const master = { id: "master", start: { date }, recurrence: [rule] };
+    assert.equal(calendarOwnedTodoistRecurrence(master, [], "Europe/London"), undefined, rule);
+  }
+  const weekly = calendarOwnedTodoistRecurrence({
+    id: "master", start: { date: "2099-09-02" }, recurrence: ["RRULE:FREQ=WEEKLY"],
+  }, [], "Europe/London");
+  const event = { start: { date: "2099-09-02" } };
+  assert.equal(matchesCalendarOwnedRecurringTask({
+    id: "task", due: { date: "2099-09-02", is_recurring: true, string: "every Tuesday" },
+  }, event, weekly), false);
+  assert.equal(matchesCalendarOwnedRecurringTask({
+    id: "task", due: { date: "2099-09-02", is_recurring: true, string: "every Wednesday ending 30 Sep" },
+  }, event, weekly), false);
+});
+
+test("native recurrence requires a complete explicit exception inventory", async () => {
+  const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY");
+  const scoped = instances(["2026-11-04T14:00:00Z"]);
+  assert.equal(await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London"), undefined,
+    "missing provider method is not proof that there are no future exceptions");
+  assert.equal((await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [])).frequency, "weekly");
+  let queried;
+  const farFuture = { ...instances(["2028-11-01T14:00:00Z"])[0],
+    id: "far-future", status: "cancelled" };
+  const rejected = await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async (id) => {
+    queried = id; return [farFuture];
+  });
+  assert.equal(queried, master.id);
+  assert.equal(rejected, undefined, "a cancellation outside the bounded instance window blocks native conversion");
+  const moved = { ...farFuture, status: "confirmed", start: { dateTime: "2028-11-02T14:00:00Z" } };
+  assert.equal(await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [moved]), undefined);
+});
+
+test("native task payload uses verified timezone without a London default", () => {
+  const master = {
+    ...weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY"),
+    start: { dateTime: "2026-11-04T14:00:00Z" },
+  };
+  const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/Berlin");
+  const event = { ...master, recurrence: undefined };
+  assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence, "Europe/Berlin").due.timezone, "Europe/Berlin");
+  assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence).due.timezone, undefined);
+});
+
+test("native recurrence rejects moved Calendar exceptions but accepts cancellations", () => {
+  const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY");
+  const series = instances(["2026-11-04T14:00:00Z", "2026-11-11T14:00:00Z"]);
+  const moved = structuredClone(series);
+  moved[1].start.dateTime = "2026-11-12T14:00:00Z";
+  assert.equal(calendarOwnedTodoistRecurrence(master, moved, "Europe/London"), undefined,
+    "a moved single Calendar event cannot be represented by one native Todoist rule");
+  const cancelled = structuredClone(series);
+  cancelled[1].status = "cancelled";
+  assert.equal(calendarOwnedTodoistRecurrence(master, cancelled, "Europe/London").frequency, "weekly");
 });
 
 test("recurring task readback accepts Todoist date-text normalization but rejects changed schedule fields", () => {

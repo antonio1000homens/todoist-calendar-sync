@@ -168,6 +168,8 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
         if (failures.listInstances) throw new Error("injected Calendar instance read failure");
         return instances.map((item) => structuredClone(item));
       },
+      async listInstancesInWindow() { return this.listInstances(); },
+      async listExplicitSeriesExceptions() { return []; },
       async getTimeZone() {
         if (failures.calendarTimezone) throw new Error("injected Calendar timezone read failure");
         return failures.calendarTimeZone || "Europe/London";
@@ -622,6 +624,43 @@ test("Calendar-owned finite weekly completion skips a canceled occurrence and ad
   assert.equal(clients.tasks.get(link.taskId).due.datetime, "2026-11-18T14:00:00Z");
   assert.equal(clients.recurringUpdates.length, 1, "replay must not advance the same task twice");
   assert.equal(clients.calendarUpserts.length, 0, "Calendar series remains untouched on replay");
+});
+
+test("native completion never creates a flattened task when Todoist readback has 404", async () => {
+  const scheduled = [
+    instance("native-current", "2026-11-04", "2026-11-05"),
+    instance("native-next", "2026-11-11", "2026-11-12"),
+  ];
+  const master = { id: MASTER, status: "confirmed", iCalUID: SERIES,
+    start: { date: "2026-11-04" }, recurrence: ["RRULE:FREQ=WEEKLY"] };
+  const link = linkFor(scheduled[0], { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, scheduled, link, master, "every Wednesday starting 4 Nov 2026");
+  clients.todoist.getTask = async () => { throw Object.assign(new Error("no active item"), { status: 404 }); };
+  const delivery = completedDelivery("native-readback-404", link.taskId, scheduled[0], "2026-11-04T15:00:00Z");
+  const body = JSON.parse(delivery.body);
+  body.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
+  delivery.body = JSON.stringify(body);
+  await new Synchronizer(state, undefined, async () => clients).process(delivery);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.equal(state.links[0].activeInstanceId, scheduled[0].id);
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_completed_recurring_readback_missing"), true);
+});
+
+test("completion with missing Calendar master never invokes unbounded instance expansion", async () => {
+  const scheduled = [instance("missing-master-current", "2026-11-04", "2026-11-05"),
+    instance("missing-master-next", "2026-11-11", "2026-11-12")];
+  const link = linkFor(scheduled[0], { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, scheduled, link);
+  clients.calendar.getEvent = async () => { throw Object.assign(new Error("master gone"), { status: 404 }); };
+  clients.calendar.listInstances = async () => { throw new Error("unbounded read must not run"); };
+  const delivery = completedDelivery("missing-calendar-master", link.taskId, scheduled[0], "2026-11-04T15:00:00Z");
+  await new Synchronizer(state, undefined, async () => clients).process(delivery);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.links[0].activeInstanceId, scheduled[0].id);
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_completed_master_unavailable"), true);
 });
 
 test("Calendar-owned all-day weekly completion skips canceled dates and preserves the same Todoist task", async () => {
