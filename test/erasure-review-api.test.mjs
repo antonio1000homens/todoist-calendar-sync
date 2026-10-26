@@ -52,6 +52,13 @@ test("authenticated review API starts only stored confirmed operations and retur
   const retried=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
   assert.equal(retried.statusCode,202);assert.equal(sent.length,2,"retries redispatch the same durable operation id");
 
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  const disabled=await run(event("/review/api/erasure-operations/op-113/start","POST",headers,{}));
+  assert.equal(disabled.statusCode,409);
+  assert.match(JSON.parse(disabled.body).error,/disabled by deployment configuration/);
+  assert.equal(sent.length,2,"revoking the flag cannot enqueue an already approved operation");
+  process.env.ERASURE_EXECUTION_ENABLED="true";
+
   const status=await run(event("/review/api/erasure-operations/op-113","GET",{"cf-access-jwt-assertion":jwt}));
   const body=JSON.parse(status.body);
   assert.equal(status.statusCode,200);assert.equal(body.operation.status,"queued");
