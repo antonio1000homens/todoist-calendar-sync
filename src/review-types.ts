@@ -29,6 +29,8 @@ export interface RepairIntent {
 export interface ReviewSnapshot {
   ref: EntityRef; object: TodoistTask | CalendarEvent | null;
   checkedAt?: string;
+  /** Recorded path by which this provider identity entered the affected-item set. */
+  includedBy?: string[];
   mapping?: Mapping; control?: Record<string, unknown>;
   recurrence?: RecurrenceLink; calendarProjectionId?: string;
   destination?: { profile:Profile; eventId?:string };

@@ -4,8 +4,9 @@ import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, re
 import { createRoot } from "react-dom/client";
 import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
+import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
-type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
+type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
@@ -23,12 +24,25 @@ function IdentityDetails({value,scope}:{value:any;scope?:string}) {
     {!identity.identified&&<span className="warning">Identity not verified. Refresh affected items before assigning a disposition.</span>}
   </div>;
 }
+function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,updateLeftover,choiceKey,requiredDispositionRef}:{item:any;action:string;taskId:string;eventId:string;scope:string;snapshots:any[];leftovers:Record<string,string>;updateLeftover:(key:string,value:string)=>void;choiceKey:(item:any)=>string;requiredDispositionRef?:string}) {
+  const key=choiceKey(item);
+  const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);
+  if(action==="calendar-history-only")return <div className="leftover" key={key}><div><IdentityDetails value={item} scope={scope}/><small className="relationship-reasons">Included because: {snapshotRelationship(item).join("; ")}</small></div><p>This item will be retained or detached only as described in the exact repair preview.</p></div>;
+  if(selectedItem&&action==="todoist-only"&&item.ref.side==="calendar")return <div className="leftover" key={key}><div><IdentityDetails value={item} scope={scope}/><small className="relationship-reasons">Included because: {snapshotRelationship(item).join("; ")}</small></div><p>Selected as historical Calendar context; this repair will preserve it byte-for-byte and exclude it from future syncing.</p></div>;
+  if(selectedItem&&action!=="separate"&&!(action==="todoist-only"&&item.ref.side==="calendar"))return null;
+  if(action==="flatten"&&item.ref.side==="calendar"&&(snapshots.find((s:any)=>s.ref.side==="calendar"&&s.ref.id===eventId)?.object?.recurringEventId===item.ref.id||item.mapping&&item.object?.status==="cancelled"))return <div className="leftover" key={key}><div><IdentityDetails value={item} scope={scope}/><small className="relationship-reasons">Included because: {snapshotRelationship(item).join("; ")}</small></div><p>Included in the flatten plan. Preview shows the exact history and association changes.</p></div>;
+  const options=dispositionOptions(item,action);
+  return <div className="leftover" key={key}><div><IdentityDetails value={item} scope={scope}/><small className="relationship-reasons">Included because: {snapshotRelationship(item).join("; ")}</small></div>
+    {!item.object?<p>No live provider object; no disposition is available.</p>:<div><label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}{options.includes("unchanged")&&<option value="unchanged">Leave unchanged</option>}{options.includes("retain-unlinked")&&<option value="retain-unlinked">Retain item; detach obsolete mapping</option>}{options.includes("delete")&&<option value="delete">Delete exact one-off and purge its state</option>}</select></label>
+      <small>{requiredDispositionRef===key?"Required by repair preview validation.":"Whether a choice is required will be confirmed by the repair preview."}</small>{leftovers[key]&&<small>{dispositionGuidance(leftovers[key])}</small>}{item.object.status==="cancelled"&&<p className="warning">No generic cleanup action is safe for a cancelled recurrence. Leave unchanged preserves it; Exclude guards only this exact ID. Do not treat either choice as deleting the Calendar object or suppressing the whole series.</p>}</div>}
+  </div>;
+}
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
   const [action,setAction] = useState("link"), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
-  const [leftovers,setLeftovers] = useState<Record<string,string>>({});
+  const [leftovers,setLeftovers] = useState<Record<string,string>>({}), [requiredDispositionRef,setRequiredDispositionRef] = useState<string>();
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
@@ -67,12 +81,14 @@ function App() {
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
   const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");setValidationError(undefined);};
-  const selectCase=(item?:Case)=>{
+  const selectCase=(item?:Case,options:{syncUrl?:boolean}={})=>{
     invalidatePreview();
+    if(item)setProfile(item.profile);
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
-    setLeftovers({});setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
+    setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+    if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
     invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified,searchedItem));
@@ -103,9 +119,20 @@ function App() {
     if (!caseId) return;
     const controller=new AbortController();
     api(`cases/${encodeURIComponent(caseId)}`,{signal:controller.signal})
-      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item);}})
+      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});}})
       .catch(e=>{if(!isAbortError(e))setMessage(e.message);});
     return ()=>controller.abort();
+  },[]);
+  useEffect(()=>{
+    const onPopState=()=>{
+      const caseId=new URLSearchParams(location.search).get("case");
+      if(!caseId){selectionVersion.current++;selectCase(undefined,{syncUrl:false});return;}
+      api(`cases/${encodeURIComponent(caseId)}`).then(data=>{
+        selectionVersion.current++;setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});
+      }).catch((error:any)=>setMessage(error.message));
+    };
+    window.addEventListener("popstate",onPopState);
+    return()=>window.removeEventListener("popstate",onPopState);
   },[]);
   useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
   useEffect(() => {
@@ -180,7 +207,7 @@ function App() {
     const requestedId=sideName==="todoist"?taskId:eventId;
     const current=matches.find((s:any)=>s.ref.id===requestedId)||(!requestedId&&matches.length===1?matches[0]:undefined);
     const item=current?.object as ProviderObject|undefined;
-    if (!item) return <p>{current?`The provider could not find ${sideName} item ${current.ref.id}.`:`No ${sideName} item ID is attached to this alert. Search for the item below to continue.`}</p>;
+    if (!item) return <p>{current?`The provider could not find ${sideName} item ${current.ref.id}.`:requestedId?`No live provider snapshot is available for recorded ${sideName} ID ${requestedId}.`:`No ${sideName} item ID is attached to this alert. Search for the item below to continue.`}</p>;
     const start=sideName==="todoist"?(item.due?.datetime||item.due?.date):(item.start?.dateTime||item.start?.date);
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
     const recurrence=sideName==="todoist"?(item.due?.is_recurring?item.due.string||"Recurring":"None"):(item.recurrence?.join(" · ")||(item.recurringEventId?"Part of a recurring series":"None"));
@@ -188,7 +215,7 @@ function App() {
     const seriesAssociation=current.recurrence
       ? `Todoist ${current.recurrence.taskId} ↔ Calendar occurrence ${current.recurrence.activeInstanceId||current.recurrence.eventId} · series master ${current.recurrence.masterEventId} (${current.recurrence.owner}-owned)`
       : undefined;
-    return <><IdentityDetails value={current} />{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
+    return <><IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
@@ -199,7 +226,9 @@ function App() {
   const currentMappedEventId=liveMapping?.activeInstanceId||liveMapping?.eventId||liveMapping?.masterEventId;
   const mappingChanges=originalMapping&&liveMapping?["taskId","eventId","masterEventId","activeInstanceId","seriesId","recurrenceOwner"].filter(key=>originalMapping[key]!==liveMapping[key]):[];
   const alertContext=details?.item?.decision?.context||{};
-  const hasProviderIds=Boolean(selected?.taskId||selected?.eventId||alertContext.providerTaskId||alertContext.providerEventId);
+  const hasProviderIds=Boolean(selected?.taskId||selected?.eventId||selected?.decision?.taskId||selected?.decision?.eventId
+    ||selected?.decision?.masterEventId||selected?.decision?.activeInstanceId||alertContext.providerTaskId||alertContext.providerEventId
+    ||alertContext.masterEventId||alertContext.activeInstanceId||alertContext.candidateTaskIds?.length||alertContext.candidateEventIds?.length);
   const emptyOperationalExplanation=selected?.decision?.type==="operational_dlq"&&!hasProviderIds
     ? alertContext.kind==="reconcile"
       ? "This was a profile-wide reconciliation delivery, so it has no single Todoist task or Calendar event attached. The empty panels are expected; inspect the failure details and request a fresh reconciliation after addressing the cause."
@@ -214,7 +243,7 @@ function App() {
     alertContext.calendarStart&&liveEvent?.start&&(alertContext.calendarStart!==(liveEvent.start.dateTime||liveEvent.start.date))?`Calendar date changed from ${alertContext.calendarStart}`:undefined,
   ].filter(Boolean) as string[];
   const itemTitle=(snapshot:any) => snapshot?.object?.content||snapshot?.object?.summary||snapshot?.ref?.id;
-  const updateLeftover=(key:string,value:string) => {invalidatePreview();setLeftovers(current=>({...current,[key]:value}));};
+  const updateLeftover=(key:string,value:string) => {invalidatePreview();setLeftovers(current=>({...current,[key]:value}));if(value&&requiredDispositionRef===key)setRequiredDispositionRef(undefined);};
   const search=async () => {
     if (!selected) return;
     setBusy(true);setMessage("");setSearchResults([]);
@@ -249,10 +278,12 @@ function App() {
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner:action==="transfer"?"none":winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
     try { const result=await api(`cases/${encodeURIComponent(selected.id)}/previews`,{method:"POST",body:JSON.stringify(intent)});
-      if(requestVersion===selectionVersion.current)setPreview(result.preview);
+      if(requestVersion===selectionVersion.current){setRequiredDispositionRef(undefined);setPreview(result.preview);}
     }
     catch(e:any){
-      if (missingDispositionReference(e.message)) {
+      const missingDisposition=missingDispositionReference(e.message);
+      if (missingDisposition) {
+        if(requestVersion===selectionVersion.current)setRequiredDispositionRef(missingDisposition);
         // The selected pair can displace an item absent from the initial case detail.
         try {
           const refreshed=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:'POST',body:JSON.stringify(intent)});
@@ -299,40 +330,80 @@ function App() {
     if(!selected||selected.status!=="open")return;
     if(!window.confirm("Dismiss this alert without changing Todoist, Calendar, or their mapping?"))return;
     setBusy(true);setMessage("");
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item);await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
+    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item,{syncUrl:false});await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
   const snapshots=details?.snapshots||[];
+  const affectedGroups=groupAffectedSnapshots(snapshots);
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
+  const identityEvidence=selected?caseIdentityState(selected,snapshots):undefined;
+  const hasLiveIdentity=snapshots.some((snapshot:any)=>snapshot.ref?.profile===selected?.profile&&providerIdentity(snapshot).identified);
+  const hasPrimaryProviderIds=Boolean(selected?.taskId||selected?.eventId||selected?.decision?.taskId||selected?.decision?.eventId
+    ||alertContext.providerTaskId||alertContext.providerEventId);
+  const showProviderPanels=Boolean(hasPrimaryProviderIds||hasLiveIdentity);
+  const openCaseCount=cases.filter(item=>item.status==="open"||item.status==="repairing").length;
+  const latestRun=reconciliation?.reconciliation;
+  const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
       <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);selectCase(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
     {message && <p className="notice" role="status">{message}</p>}
-    {reconciliation?.summary&&<p className="notice" role="status">Run: {reconciliation.summary.runStatus}; unresolved in this run: {reconciliation.summary.runUnresolved}. Actionable review cases remaining: {reconciliation.summary.actionableCaseCount}.</p>}
-    {reconciliation?.reconciliation?.generation&&<section className="preview reconciliation-items"><h2>Unresolved items for this run</h2>
-      <p>Generation {reconciliation.reconciliation.generation}. Provider objects are not changed by this report.</p>
+    {reconciliation?.summary&&<section className="preview reconciliation-overview" aria-label="Latest reconciliation">
+      <h2>Latest reconciliation · {reconcileProfile}</h2>
+      <dl className="overview-grid"><dt>Run status</dt><dd>{reconciliation.summary.runStatus.replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
+        <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
+        <dt>Last run activity</dt><dd>{latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</dd>
+        <dt>Unresolved diagnostic counter</dt><dd>{reconciliation.summary.runUnresolved}</dd>
+        <dt>Items counted as blocked</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
+        <dt>Open review alerts</dt><dd>{openCaseCount} in this inbox · {reconciliation.summary.actionableCaseCount} actionable across the profile</dd></dl>
+      <p>Run diagnostics describe work deferred, blocked or in conflict during this generation. Open review alerts are persistent decisions in the review inbox; these counts measure different things. An intentional exclusion can still be counted as blocked, and an unchanged item can reappear if its inconsistency remains. Case status and a diagnostic's “review case” status show whether an alert is open, historic, or newly created.</p>
+    </section>}
+    {reconciliation?.reconciliation?.generation&&<section className="preview reconciliation-items"><h2>Items deferred or blocked during this run</h2>
+      <p>Generation {reconciliation.reconciliation.generation} · {latestRunAt?`run activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These are run diagnostics, not a count of open alerts. Provider objects are not changed by this report.</p>
       {reconciliationDiagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
         {reconciliationDiagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
-          <strong>{item.outcome.replaceAll("_"," ")}</strong> · {item.reason.replaceAll("_"," ")}<br/>
+          <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
           <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
           {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
           {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
           {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
           {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
           {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
-          <span>Recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
+          <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
         </li>)}
       </ul>}
-      {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more unresolved items</button>}
+      {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more run diagnostics</button>}
     </section>}
     <ErasurePanel api={api} />
-    <div className="layout"><nav aria-label="Conflicts"><h2>Conflicts</h2><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>setHistory(e.target.checked)} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open conflicts."}</p>}</nav>
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{openCaseCount} open/actionable case(s) shown in this inbox.</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
+        <section className="preview alert-evidence"><h3>Why this alert is open</h3>
+          <p><strong>Recorded reason:</strong> {selected.reason.replaceAll("_"," ")}. {/(unmapped|identity_conflict|ambiguous)/i.test(`${selected.reason} ${selected.decision?.type||""}`)&&"Here, ‘unmapped’ means the sync identity or durable mapping is missing or ambiguous; it does not prove that the Calendar event is missing."}</p>
+          <dl><dt>First seen / opened</dt><dd>{selected.createdAt?new Date(selected.createdAt).toLocaleString():"Not recorded"}</dd>
+            <dt>Last recorded observation</dt><dd>{selected.decision?.context?.lastObservedAt||selected.decision?.context?.lastSeenAt||selected.decision?.context?.observedAt?new Date(selected.decision.context.lastObservedAt||selected.decision.context.lastSeenAt||selected.decision.context.observedAt).toLocaleString():"Not recorded; case update time is not treated as a provider observation"}</dd>
+            <dt>Case state</dt><dd>{selected.status}{selected.updatedAt?` · case record updated ${new Date(selected.updatedAt).toLocaleString()}`:""}</dd>
+            <dt>Earlier dismissal / reopen history</dt><dd>{selected.decision?.context?.reopenedAt||selected.decision?.context?.dismissedAt?`${selected.decision.context.dismissedAt?`dismissed ${new Date(selected.decision.context.dismissedAt).toLocaleString()}`:""}${selected.decision.context.reopenedAt?` · reopened ${new Date(selected.decision.context.reopenedAt).toLocaleString()}`:""}`:"Not recorded on this case"}</dd>
+            <dt>Reconciliation generation</dt><dd>{selected.reconciliationGeneration||selected.decision?.context?.reconciliationGeneration||"Not recorded"}</dd>
+            <dt>Detection evidence</dt><dd>{selected.decision?.sourceAuditAction||selected.decision?.context?.action||"No source audit action recorded"}{selected.decision?.context?.reason?` · ${String(selected.decision.context.reason).replaceAll("_"," ")}`:""}</dd>
+          </dl>
+          <p>Historical cause is not inferred from the current live items. The live provider panels below show what could be verified at this check.</p>
+          {identityEvidence?.hasAnyRecordedIdentity?<div><strong>Recorded provider identities</strong>
+            <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedTaskIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
+            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedEventIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
+            {identityEvidence.seriesIds.length>0&&<p>Series identity (not a provider event ID): {identityEvidence.seriesIds.join(", ")}</p>}
+          </div>:<p className="warning">Unable to identify a provider item from the recorded alert. Search or refresh to establish a live identity; repair stays unavailable until a current item is verified.</p>}
+          {(selected.decision?.context?.candidateTaskIds?.length||selected.decision?.context?.candidateEventIds?.length||selected.decision?.context?.candidates?.length)&&<div className="candidate-search">
+            <p>Recorded candidate identities are not selected automatically. Search by a recorded title, then inspect the live provider identity before choosing one.</p>
+            <button className="secondary" onClick={()=>{setSearchSide("todoist");setSearchText(selected.decision?.context?.candidates?.[0]?.content||selected.decision?.context?.taskTitle||selected.title);}}>Search Todoist candidates</button>
+            <button className="secondary" onClick={()=>{setSearchSide("calendar");setSearchText(selected.decision?.context?.calendarTitle||selected.title);}}>Search Calendar candidates</button>
+          </div>}
+          <details><summary>Recorded alert evidence</summary><pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre></details>
+        </section>
         {selected.decision?.type==="operational_reconciliation_stuck"&&<section className="preview"><h3>Reconciliation diagnostics</h3>
           <dl>
             <dt>Generation</dt><dd>{selected.reconciliationGeneration||selected.decision.context?.reconciliationGeneration||"Not recorded"}</dd>
@@ -388,14 +459,14 @@ function App() {
         {!details?<div className="notice detail-load" role="status">
           {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
             <p>{currentDetailState?.status==="retrying"?"Review API is busy (HTTP 429). Retrying case details…":"Loading live Todoist and Calendar details…"}</p>}
-        </div>:<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>}
+        </div>:showProviderPanels?<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>:<p className="notice">No live Todoist or Calendar object could be verified from the identities attached to this case. Recorded candidate or series IDs above are evidence only; search and verify an exact live item before repairing.</p>}
         {["resolved","excluded"].includes(selected.status)&&<p className="notice">To change a previous decision, select the exact current provider IDs and create a fresh preview. Exclude the Todoist task to keep it Todoist-only; Leave unchanged permits normal syncing.</p>}
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
-        {selected.status==="open"&&<button className="secondary" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
         <div className="preview">
           <h3>Repair this conflict</h3>
+          <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
             <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
               ["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
@@ -423,13 +494,15 @@ function App() {
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
           <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
-          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object. Check its date, recurrence, status and ID before assigning a disposition.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{snapshots.map((item:any)=>{const key=choiceKey(item);const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);if(action==="calendar-history-only")return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope}/><p>This item will be retained or detached only as described in the exact repair preview.</p></div>;if(selectedItem&&action==="todoist-only"&&item.ref.side==="calendar")return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope}/><p>Selected as historical Calendar context; this repair will preserve it byte-for-byte and exclude it from future syncing.</p></div>;if(selectedItem&&action!=="separate"&&!(action==="todoist-only"&&item.ref.side==="calendar"))return null;if(action==="flatten"&&item.ref.side==="calendar"&&(snapshots.find((s:any)=>s.ref.side==="calendar"&&s.ref.id===eventId)?.object?.recurringEventId===item.ref.id||item.mapping&&item.object?.status==="cancelled"))return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope}/><p>Included in the flatten plan. Preview shows the exact history and association changes.</p></div>;const options=dispositionOptions(item,action);return <div className="leftover" key={key}><IdentityDetails value={item} scope={scope} />{!item.object?<p>No live provider object; no disposition is available.</p>:<label>Disposition<select aria-label={`Disposition for ${key}`} disabled={options.length===0} value={options.includes(leftovers[key])?leftovers[key]:""} onChange={e=>updateLeftover(key,e.target.value)}><option value="">Choose one</option>{options.includes("create")&&<option value="create">Create a new counterpart</option>}{options.includes("exclude")&&<option value="exclude">Exclude from syncing</option>}{options.includes("unchanged")&&<option value="unchanged">Leave unchanged</option>}{options.includes("retain-unlinked")&&<option value="retain-unlinked">Retain item; detach obsolete mapping</option>}{options.includes("delete")&&<option value="delete">Delete exact one-off and purge its state</option>}</select></label>}</div>;})}</div>}
+          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object, the recorded relationship that included it, and whether a disposition is required for this repair.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{affectedGroups.map((group:any)=><section className="affected-group" key={group.key}>{group.seriesId||group.masterId?<h5>Recurring series group · {group.seriesId?`series ${group.seriesId}`:`master ${group.masterId}`}{group.masterId?` · Calendar master ${group.masterId}`:""}</h5>:null}{group.items.map((item:any)=><AffectedItem key={choiceKey(item)} item={item} action={action} taskId={taskId} eventId={eventId} scope={scope} snapshots={snapshots} leftovers={leftovers} updateLeftover={updateLeftover} choiceKey={choiceKey} requiredDispositionRef={requiredDispositionRef}/>)}</section>)}</div>}
           {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
           <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>{selected.decision?.type==="operational_reconciliation_stuck"?`Request fresh reconciliation for ${selected.profile}`:`Run reconciliation for ${selected.profile}`}</button>
+          <p className="action-explanation">Run reconciliation scans the whole profile; it does not apply this one-case repair. Dismissing an alert hides the notification only and does not fix provider data or mappings.</p>
+          {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
           {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
         </div>
-        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} /><div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
+        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} />{item.includedBy?.length>0&&<p className="relationship-reasons">Included because: {item.includedBy.join("; ")}</p>}<div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{operationResumeEligibility(operation)==="fresh-preview"?<><p>This failed operation has no recorded provider write. Refresh affected items and create a new preview; the old operation will remain available for audit.</p><button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh and create new preview</button></>:operationResumeEligibility(operation)==="resume"&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>

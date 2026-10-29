@@ -291,6 +291,21 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   return { engine, execute, clients, eventMap, taskMap, mappingMap, eventMappingMap, ownerMappingMap, recurrences, controls, controlsMap, versions, operations, writes, calls, baselines };
 }
 
+test("affected snapshots carry exact recorded mapping and recurring-series inclusion paths",async t=>{
+  const occurrence=event("occurrence",{recurringEventId:"series-master",originalStartTime:{date:"2099-12-18"}});
+  const master=event("series-master",{recurrence:["RRULE:FREQ=YEARLY"]});
+  const mapping={profile:"home",taskId:"task",eventId:"occurrence",masterEventId:"series-master",activeInstanceId:"occurrence",seriesId:"series-1",recurrenceOwner:"calendar",updatedAt:"mapping-v1"};
+  const h=harness(t,{events:[master,occurrence],mappings:[mapping]});
+  const snapshots=await h.engine.collect(intent());
+  const taskSnapshot=snapshots.find(snapshot=>snapshot.ref.side==="todoist"&&snapshot.ref.id==="task");
+  const occurrenceSnapshot=snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id==="occurrence");
+  const masterSnapshot=snapshots.find(snapshot=>snapshot.ref.side==="calendar"&&snapshot.ref.id==="series-master");
+  assert.ok(taskSnapshot.includedBy.includes("Selected Todoist item for this repair"));
+  assert.ok(occurrenceSnapshot.includedBy.some(reason=>reason.includes("saved mapping from todoist item task")));
+  assert.ok(masterSnapshot.includedBy.some(reason=>reason.includes("Series master in saved mapping")));
+  assert.ok(masterSnapshot.includedBy.some(reason=>reason.includes("Recurring-series master of Calendar occurrence occurrence")));
+});
+
 function moveHarness(t,{existing=true}={}) {
   const h=harness(t,{events:[event("event",{extendedProperties:{shared:{taskId:"task"}}})],mappings:[{profile:"home",taskId:"task",eventId:"event"}]});
   const destinationEvents=new Map(existing?[["destination",event("destination",{summary:"Old destination",extendedProperties:{shared:{taskId:"task"}}})]]:[]);
