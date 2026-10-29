@@ -2,9 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 
-const deploy=readFileSync(new URL("../deploy.sh",import.meta.url),"utf8");
-const workflow=readFileSync(new URL("../.github/workflows/deploy.yml",import.meta.url),"utf8");
-const template=readFileSync(new URL("../template.yaml",import.meta.url),"utf8");
+const readText=(path)=>readFileSync(new URL(path,import.meta.url),"utf8").replace(/\r\n/g,"\n");
+const deploy=readText("../deploy.sh");
+const workflow=readText("../.github/workflows/deploy.yml");
+const template=readText("../template.yaml");
 
 test("operator opt-in is an explicit GitHub production decision, not a default template change",()=>{
   assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'true'/);

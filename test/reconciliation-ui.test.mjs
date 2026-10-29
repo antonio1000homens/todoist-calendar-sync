@@ -19,7 +19,7 @@ test('open review case count paginates and excludes terminal cases', async () =>
 
 test('active run polling refreshes the inbox and announces terminal status without implying inbox clearance', async () => {
   const source = await readFile(new URL('../review-ui/main.tsx', import.meta.url), 'utf8');
-  const polling = source.match(/useEffect\(\(\) => \{\n    const currentRunStatus=[\s\S]*?\n  \},\[reconcileProfile,[^\]]+\]\);/)?.[0] || '';
+  const polling = source.match(/useEffect\(\(\) => \{\r?\n    const currentRunStatus=[\s\S]*?\r?\n  \},\[reconcileProfile,[^\]]+\]\);/)?.[0] || '';
   assert.match(polling, /refreshReconciliation\(reconcileProfile\)/);
   assert.match(polling, /setTerminalInboxRefreshPending\(true\)/);
   assert.match(polling, /!data\.reconciliation\?\.pending/);
@@ -28,7 +28,11 @@ test('active run polling refreshes the inbox and announces terminal status witho
   assert.match(polling, /if\(terminal\|\|!data\.reconciliation\?\.pending\)/);
   assert.match(polling, /actionableCaseCount/);
   assert.match(source, /createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
-  assert.match(source, /Run: \{reconciliation\.summary\.runStatus\}; unresolved in this run: \{reconciliation\.summary\.runUnresolved\}\. Actionable review cases remaining: \{reconciliation\.summary\.actionableCaseCount\}\./);
+  assert.match(source, /Latest reconciliation · \{reconcileProfile\}/);
+  assert.match(source, /Items deferred or blocked during this run/);
+  assert.match(source, /Open review alerts/);
+  assert.match(source, /these counts measure different things/);
+  assert.doesNotMatch(source, /Unresolved items for this run/);
   assert.ok(source.includes('Candidate tasks: {item.detail.candidateTaskIds.join(", ")}'));
   assert.ok(source.includes('Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}'));
   assert.ok(source.includes('Discarded task: {item.detail.discardedTaskId}'));

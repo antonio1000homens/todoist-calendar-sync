@@ -224,26 +224,36 @@ export class ReviewEngine {
   }
   async collect(intent: RepairIntent, decision?: ManualDecision): Promise<ReviewSnapshot[]> {
     const refs = new Map<string, EntityRef>();
-    const add = (ref: EntityRef) => {
+    const inclusionReasons = new Map<string, Set<string>>();
+    const add = (ref: EntityRef, reason: string) => {
       if (intent.action === "move" && ref.side === "todoist" && ref.profile === intent.targetProfile && ref.id === intent.taskId) return;
-      if (ref.id) refs.set(entityKey(ref), ref);
+      if (ref.id) {
+        const key=entityKey(ref);
+        refs.set(key, ref);
+        const reasons=inclusionReasons.get(key)||new Set<string>();
+        reasons.add(reason);
+        inclusionReasons.set(key,reasons);
+      }
     };
-    if (intent.taskId) add({ profile: intent.profile, side: "todoist", id: intent.taskId });
-    if (intent.eventId) add({ profile: intent.profile, side: "calendar", id: intent.eventId });
+    if (intent.taskId) add({ profile: intent.profile, side: "todoist", id: intent.taskId }, "Selected Todoist item for this repair");
+    if (intent.eventId) add({ profile: intent.profile, side: "calendar", id: intent.eventId }, "Selected Calendar item for this repair");
     let destination: ReviewSnapshot["destination"];
     if (intent.action === "move" && intent.targetProfile && intent.taskId) {
       const target = await (await this.clients(intent.targetProfile)).calendar.findByTodoistTaskId(intent.taskId);
       destination = { profile:intent.targetProfile, eventId:target?.id };
-      if (target) add({profile:intent.targetProfile,side:"calendar",id:target.id});
+      if (target) add({profile:intent.targetProfile,side:"calendar",id:target.id}, "Current destination projection found by Todoist task ID");
     }
     if (intent.action === "decision" && decision) {
       const mapping = decision.mappingSnapshot;
       const contextTaskId = typeof decision.context?.providerTaskId === "string" ? decision.context.providerTaskId : undefined;
       const contextEventId = typeof decision.context?.providerEventId === "string" ? decision.context.providerEventId : undefined;
-      for (const taskId of [decision.taskId, mapping?.taskId, contextTaskId]) if (taskId) add({ profile:intent.profile, side:"todoist", id:taskId });
-      for (const eventId of [decision.eventId, decision.masterEventId, decision.activeInstanceId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId, contextEventId]) {
-        if (eventId) add({ profile:intent.profile, side:"calendar", id:eventId });
+      for (const taskId of [decision.taskId, contextTaskId]) if (taskId) add({ profile:intent.profile, side:"todoist", id:taskId }, "Identity recorded on the review alert");
+      if (mapping?.taskId) add({profile:intent.profile,side:"todoist",id:mapping.taskId}, "Task identity in the alert's saved mapping");
+      for (const eventId of [decision.eventId, decision.masterEventId, decision.activeInstanceId, contextEventId]) {
+        if (eventId) add({ profile:intent.profile, side:"calendar", id:eventId }, "Calendar identity recorded on the review alert");
       }
+      for (const eventId of [mapping?.eventId,mapping?.masterEventId,mapping?.activeInstanceId]) if(eventId)
+        add({profile:intent.profile,side:"calendar",id:eventId}, "Calendar identity in the alert's saved mapping");
     }
     const snapshots: ReviewSnapshot[] = [];
     for (const ref of refs.values()) {
@@ -252,32 +262,32 @@ export class ReviewEngine {
       if (destination && ref.profile === intent.profile && ref.side === "todoist" && ref.id === intent.taskId) snapshot.destination = destination;
       if (destination && ref.profile === destination.profile && snapshot.mapping && snapshot.mapping.taskId !== intent.taskId) invalidRepairIntent("Destination projection belongs to another task; repair its link before moving");
       if (snapshot.mapping) {
-        add({ profile: snapshot.mapping.profile, side: "todoist", id: snapshot.mapping.taskId });
-        add({ profile: snapshot.mapping.profile, side: "calendar", id: snapshot.mapping.eventId });
-        if (snapshot.mapping.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.mapping.masterEventId });
+        add({ profile: snapshot.mapping.profile, side: "todoist", id: snapshot.mapping.taskId }, `Linked by saved mapping from ${ref.side} item ${ref.id}`);
+        add({ profile: snapshot.mapping.profile, side: "calendar", id: snapshot.mapping.eventId }, `Linked by saved mapping from ${ref.side} item ${ref.id}`);
+        if (snapshot.mapping.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.mapping.masterEventId }, `Series master in saved mapping for ${ref.side} item ${ref.id}`);
       }
       if (ref.side === "todoist" && snapshot.recurrence) {
-        if (snapshot.recurrence.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId });
-        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.activeInstanceId || snapshot.recurrence.eventId });
+        if (snapshot.recurrence.masterEventId) add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.masterEventId }, `Series master in recurrence link ${snapshot.recurrence.seriesId}`);
+        add({ profile: ref.profile, side: "calendar", id: snapshot.recurrence.activeInstanceId || snapshot.recurrence.eventId }, `Active occurrence in recurrence link ${snapshot.recurrence.seriesId}`);
       }
       if (ref.side === "calendar" && snapshot.object) {
         const event = snapshot.object as CalendarEvent;
-        if (event.extendedProperties?.shared?.taskId) add({ profile: ref.profile, side: "todoist", id: event.extendedProperties.shared.taskId });
-        if (event.recurringEventId) add({ profile: ref.profile, side: "calendar", id: event.recurringEventId });
+        if (event.extendedProperties?.shared?.taskId) add({ profile: ref.profile, side: "todoist", id: event.extendedProperties.shared.taskId }, `Todoist task ID in Calendar event ${ref.id}`);
+        if (event.recurringEventId) add({ profile: ref.profile, side: "calendar", id: event.recurringEventId }, `Recurring-series master of Calendar occurrence ${ref.id}`);
         if (event.recurrence?.length) {
           const recurrence = snapshot.recurrence;
           if (recurrence) {
-            add({ profile:ref.profile, side:"todoist", id:recurrence.taskId });
-            add({ profile:ref.profile, side:"calendar", id:recurrence.activeInstanceId || recurrence.eventId });
+            add({ profile:ref.profile, side:"todoist", id:recurrence.taskId }, `Task in recurrence link ${recurrence.seriesId}`);
+            add({ profile:ref.profile, side:"calendar", id:recurrence.activeInstanceId || recurrence.eventId }, `Active occurrence in recurrence link ${recurrence.seriesId}`);
           }
-          if (snapshot.calendarProjectionId) add({ profile:ref.profile, side:"calendar", id:snapshot.calendarProjectionId });
+          if (snapshot.calendarProjectionId) add({ profile:ref.profile, side:"calendar", id:snapshot.calendarProjectionId }, `Current projection of recurring Calendar series ${ref.id}`);
         }
       }
       if (ref.side === "todoist" && snapshot.object) {
         // Full provider metadata lookup includes ambiguous claims rather than picking one.
         const pair = await this.clients(ref.profile);
         for (const event of (await pair.calendar.listDelta()).items) {
-          if (event.status !== "cancelled" && event.extendedProperties?.shared?.taskId === ref.id) add({ profile: ref.profile, side: "calendar", id: event.id });
+          if (event.status !== "cancelled" && event.extendedProperties?.shared?.taskId === ref.id) add({ profile: ref.profile, side: "calendar", id: event.id }, `Calendar event metadata names Todoist task ${ref.id}`);
         }
       }
     }
@@ -302,13 +312,16 @@ export class ReviewEngine {
           if (snapshots.some(s => s.ref.side === "calendar" && s.ref.id === candidate.id)) continue;
           if (snapshots.length >= 20) invalidRepairIntent("Too many affected items for one transfer; narrow the selection");
           const snapshot = await this.snapshot({profile:intent.profile,side:"calendar",id:candidate.id});
+          snapshot.includedBy=["Candidate surfaced by exact title/date matching for this transfer; it is not selected automatically"];
           snapshots.push(snapshot);
           // Surface the exact mapped task too; matching only discovers a
           // candidate and never chooses its disposition or transfers its link.
           const surfacedTaskId=snapshot.mapping?.taskId||(snapshot.object as CalendarEvent|null)?.extendedProperties?.shared?.taskId;
           if (surfacedTaskId && !snapshots.some(s => s.ref.side === "todoist" && s.ref.id === surfacedTaskId)) {
             if (snapshots.length >= 20) invalidRepairIntent("Too many affected items for one transfer; narrow the selection");
-            snapshots.push(await this.snapshot({profile:intent.profile,side:"todoist",id:surfacedTaskId}));
+            const surfaced=await this.snapshot({profile:intent.profile,side:"todoist",id:surfacedTaskId});
+            surfaced.includedBy=[`Existing mapping or Calendar task ID on candidate event ${candidate.id}`];
+            snapshots.push(surfaced);
           }
         }
       }
@@ -318,10 +331,15 @@ export class ReviewEngine {
       const master = snapshots.find(s=>s.ref.side==="calendar" && s.ref.id===occurrence?.recurringEventId)?.object as CalendarEvent|undefined;
       if (occurrence && master && occurrence.start?.date !== master.start?.date) {
         const id = flattenStandaloneId(intent.profile,intent.taskId,master.id,occurrence.id);
-        if (!snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===id)) snapshots.push(await this.snapshot({profile:intent.profile,side:"calendar",id}));
+        if (!snapshots.some(s=>s.ref.side==="calendar" && s.ref.id===id)) {
+          const historical=await this.snapshot({profile:intent.profile,side:"calendar",id});
+          historical.includedBy=[`Deterministic historical event referenced by flattening plan for master ${master.id}`];
+          snapshots.push(historical);
+        }
       }
     }
     for (const snapshot of snapshots) {
+      snapshot.includedBy=[...new Set([...(snapshot.includedBy||[]),...(inclusionReasons.get(entityKey(snapshot.ref))||[])])];
       const recurrence = snapshot.recurrence;
       if (!recurrence) continue;
       for (const refId of [recurrence.masterEventId, recurrence.activeInstanceId || recurrence.eventId]) {

@@ -363,7 +363,8 @@ test("repeated reconciliation cannot walk through future occurrences", async () 
   assert.equal(state.links[0].activeInstanceId, "current");
 });
 
-test("scheduled reconciliation preserves one native recurring Todoist task and uses bounded inventory", async () => {
+test("scheduled reconciliation preserves one native recurring Todoist task and uses bounded inventory", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-26T12:00:00Z") });
   const current = instance("oct-21", "2026-10-21", "2026-10-22");
   const successor = instance("oct-28", "2026-10-28", "2026-10-29");
   const link = { ...linkFor(current), calendarProgressVersion: 1 };
@@ -1229,7 +1230,8 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
 });
 
-test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async () => {
+test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-26T12:00:00Z") });
   const current = instance("oct-28", "2026-10-28", "2026-10-29");
   const next = instance("nov-04", "2026-11-04", "2026-11-05");
   current.summary = "Renamed from Calendar";

@@ -3,17 +3,18 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { syncMessageGroupId } from "../dist/types.js";
 
-const template = await readFile(new URL("../template.yaml", import.meta.url), "utf8");
-const workerSource = await readFile(new URL("../src/worker.ts", import.meta.url), "utf8");
-const handlerSource = await readFile(new URL("../src/handler.ts", import.meta.url), "utf8");
-const erasureProtocolSource = await readFile(new URL("../src/erasure-protocol.ts", import.meta.url), "utf8");
-const repositorySource = await readFile(new URL("../src/repository.ts", import.meta.url), "utf8");
-const reconciliationSource = await readFile(new URL("../src/reconciliation.ts", import.meta.url), "utf8");
-const queueSource = await readFile(new URL("../src/queue.ts", import.meta.url), "utf8");
-const healthSource = await readFile(new URL("../src/reconcile.ts", import.meta.url), "utf8");
-const typesSource = await readFile(new URL("../src/types.ts", import.meta.url), "utf8");
-const backfillSource = await readFile(new URL("../scripts/backfill-profile-lookup-index.mjs", import.meta.url), "utf8");
-const deployPolicy = await readFile(new URL("../infrastructure/github-actions-deploy-role.yaml", import.meta.url), "utf8");
+const readText = async (path) => (await readFile(new URL(path, import.meta.url), "utf8")).replace(/\r\n/g, "\n");
+const template = await readText("../template.yaml");
+const workerSource = await readText("../src/worker.ts");
+const handlerSource = await readText("../src/handler.ts");
+const erasureProtocolSource = await readText("../src/erasure-protocol.ts");
+const repositorySource = await readText("../src/repository.ts");
+const reconciliationSource = await readText("../src/reconciliation.ts");
+const queueSource = await readText("../src/queue.ts");
+const healthSource = await readText("../src/reconcile.ts");
+const typesSource = await readText("../src/types.ts");
+const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
+const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
 
 test("FIFO ordering is isolated by profile", () => {
   assert.equal(syncMessageGroupId("home"), "sync:home");
