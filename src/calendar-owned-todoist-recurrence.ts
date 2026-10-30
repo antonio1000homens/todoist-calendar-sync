@@ -399,7 +399,7 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
  * Only a single cadence is accepted; unrecognized modifiers fail closed. */
 function parseOpenTodoistRule(value: string | undefined): {
   frequency: "weekly" | "monthly" | "yearly"; weekday?: string;
-  dayOfMonth?: number; month?: number; time?: string; start?: ParsedDate;
+  dayOfMonth?: number; monthlyOrdinal?: number; month?: number; time?: string; start?: ParsedDate;
 } | undefined {
   if (!value) return undefined;
   const match = value.trim().replace(/\s+/g, " ").match(/^every\s+(.+?)(?:\s+starting(?:\s+on)?\s+(.+))?$/i);
