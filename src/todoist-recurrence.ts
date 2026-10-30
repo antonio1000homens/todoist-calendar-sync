@@ -129,10 +129,14 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
         : ["first", "second", "third", "fourth", "fifth"].indexOf(ordinal[1]) + 1;
     const weekday = weekdays[ordinal[2]];
     if (!weekday || !["MO", "TU", "WE", "TH", "FR"].includes(weekday)) return undefined;
-    const date = task.due?.date?.slice(0, 10)
-      || (task.due?.datetime
-        ? task.due.timezone ? localDateTime(task.due.datetime, task.due.timezone).slice(0, 10)
-          : task.due.datetime.slice(0, 10) : undefined);
+    const dueValue = task.due?.date || task.due?.datetime;
+    // Offset timestamps must be resolved to the provider's verified local day.
+    // A UTC date can differ from the ordinal weekday in the user's timezone.
+    const date = dueValue
+      ? hasOffset(dueValue) ? task.due?.timezone
+        ? localDateTime(dueValue, task.due.timezone).slice(0, 10) : undefined
+        : dueValue.slice(0, 10)
+      : undefined;
     const match = date?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (!match) return undefined;
     const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
