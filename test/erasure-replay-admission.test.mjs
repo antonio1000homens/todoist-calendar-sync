@@ -59,6 +59,14 @@ test("mapping, flatten, recurrence and metadata entrypoints share a fail-closed 
       {...mapping,recurrenceOwner:"calendar",seriesId:"series-203"},
       {...link,owner:"calendar",seriesId:"series-203"},
       {...mapping,recurrenceOwner:"calendar",seriesId:"series-203"}),
+    ()=>store.advanceCalendarSeriesMapping({previous:mapping,mapping,expectedLink:link,link}),
+    ()=>store.transferCalendarSeriesMapping({mapping,link}),
+    ()=>store.beginFutureSeriesSplit("work",mapping.taskId,"master-old","master-new"),
+    ()=>store.putConsolidationGuard("work","task-discarded",mapping.taskId,"decision-1","event-203",mapping),
+    ()=>store.commitRecurrenceConsolidation({mapping,link,previousMapping:mapping,previousLink:link,discardedTaskId:"task-discarded",decisionId:"decision-1"}),
+    ()=>store.restoreMappingIndexesIfOwned(mapping,link),
+    ()=>store.putCompletedCalendarProjection({profile:"work",taskId:mapping.taskId,eventId:mapping.eventId,completedAt:"2026-10-01T00:00:00Z"}),
+    ()=>store.recordRecurrence("work",mapping.eventId,["RRULE:FREQ=DAILY"]),
   ];
   for(const invoke of invocations)await assert.rejects(invoke(),ErasureReplayBlockedError);
   assert.equal(reads,invocations.length);
