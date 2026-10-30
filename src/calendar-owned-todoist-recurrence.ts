@@ -519,6 +519,9 @@ export async function verifiedCalendarOwnedRecurrence(
     return calendarOwnedTodoistRecurrence(master, instances, timeZone);
   }
   if (!listExplicitSeriesExceptions) return undefined;
+  // Even if the explicit provider inventory is inconsistent, a cancellation
+  // already visible in the bounded expansion must never be silently erased.
+  if (instances.some((item) => item.recurringEventId === master.id && item.status === "cancelled")) return undefined;
   const exceptions = await listExplicitSeriesExceptions(master.id);
   if (exceptions.some((item) => item.recurringEventId !== master.id
     || item.status === "cancelled" || item.status !== "confirmed")) return undefined;
