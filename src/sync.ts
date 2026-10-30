@@ -1,3 +1,5 @@
+import {defaultProviderClientFactory} from "./mutation-budget.js";
+import {guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
@@ -594,11 +596,8 @@ export class Synchronizer {
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return {
-      calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
-      todoist: new Todoist(await todoistToken(profile)),
-    };
+    if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
+    return defaultProviderClientFactory(profile);
   }
 
   private completedState(): Partial<Pick<StateRepository,
