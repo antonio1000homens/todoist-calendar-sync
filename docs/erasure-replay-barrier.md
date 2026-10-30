@@ -11,9 +11,9 @@ that a delayed ingress event cannot recreate the identity.
 - `src/erasure-replay-barrier.ts` defines deterministic HMAC-SHA256 marker keys
   and strongly consistent, fail-closed individual admission reads.
 - A prospective **single DynamoDB transaction** would install markers,
-  conditionally consume a distinct post-write authorization, update the
-  recovery record, and remove the owner-matched FENCE/JOURNAL under the expected
-  epoch. This is **only a transaction constructor**, not a callable recovery
+  conditionally consume and remove a distinct post-write authorization, delete
+  the original identity-bearing operation record after final verification,
+  and remove the owner-matched FENCE/JOURNAL under the expected epoch. This is **only a transaction constructor**, not a callable recovery
   endpoint: unimplemented operator-approval and postflight attributes make it
   deliberately unusable by the existing pre-write flow.
 - Markers store only `pk`, `sk`, `markerVersion`. They store **no plaintext**
