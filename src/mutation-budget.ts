@@ -1,5 +1,6 @@
 import { googleCredentials, profiles, todoistToken } from "./config.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
+import {guardReplayProviderClients} from "./erasure-replay-providers.js";
 import type { Profile } from "./types.js";
 
 export const DEFAULT_RECONCILIATION_MUTATION_LIMIT = 10;
@@ -111,7 +112,7 @@ function budgetedProvider<T extends object>(
   });
 }
 
-export const defaultProviderClientFactory: ProviderClientFactory = async (profile) => ({
+export const defaultProviderClientFactory: ProviderClientFactory = async (profile) => guardReplayProviderClients(profile,{
   calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
   todoist: new Todoist(await todoistToken(profile)),
 });
@@ -121,7 +122,7 @@ export function createBudgetedClientFactory(
   baseFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): ProviderClientFactory {
   return async (profile) => {
-    const clients = await baseFactory(profile);
+    const clients = guardReplayProviderClients(profile,await baseFactory(profile));
     return {
       calendar: budgetedProvider(clients.calendar, "calendar", profile, budget, CALENDAR_MUTATIONS),
       todoist: budgetedProvider(clients.todoist, "todoist", profile, budget, TODOIST_MUTATIONS),
