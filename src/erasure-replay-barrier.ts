@@ -138,21 +138,23 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     pairs.push(marker(profile,"TASK",proof.identity.taskId,ring.current,secret));
   for(const eventId of proof.identity.eventIds||[])
     pairs.push(marker(proof.identity.profile,"EVENT",eventId,ring.current,secret));
-  const table=tableName(),now=new Date().toISOString();
+  const table=tableName();
   const profileKey=(sk:string)=>({pk:`ERASURE#${proof.identity.profile}`,sk});
   const values={":id":proof.operationId,":epoch":proof.epoch,":review":"review_required",
-    ":verifying":"verifying",":completed":"completed",":mode":"post_write",
+    ":verifying":"verifying",":mode":"post_write",
     ":confirmationId":proof.confirmationId,":fingerprint":proof.recoveryFingerprint,
-    ":postflight":proof.postflightFingerprint,":now":now};
+    ":postflight":proof.postflightFingerprint};
   const tx:any[]=[
     ...pairs.map(key=>({Put:{TableName:table,Item:{...key,markerVersion:1},
       ConditionExpression:"attribute_not_exists(pk)"}})),
-    {Update:{TableName:table,Key:{pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"},
-      UpdateExpression:"SET recovery.#status=:completed, recovery.completedAt=:now, updatedAt=:now",
+    // Preserve immutable review_required evidence until the independently verified
+    // postflight. Then remove the identity-bearing operation and consumed token
+    // in the SAME transaction that installs markers and drops the fence.
+    {Delete:{TableName:table,Key:{pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"},
       ConditionExpression:"#status=:review AND recovery.#status=:verifying AND recovery.mode=:mode AND recovery.epoch=:epoch AND recovery.confirmationId=:confirmationId AND recovery.fingerprint=:fingerprint AND recovery.postflightFingerprint=:postflight",
       ExpressionAttributeNames:{"#status":"status"},
       ExpressionAttributeValues:values}},
-    {ConditionCheck:{TableName:table,Key:{pk:`ERASURE_POSTWRITE_CONFIRMATION#${proof.operationId}`,sk:"STATE"},
+    {Delete:{TableName:table,Key:{pk:`ERASURE_POSTWRITE_CONFIRMATION#${proof.operationId}`,sk:"STATE"},
       ConditionExpression:"#status=:consumed AND operationId=:id AND confirmationId=:confirmationId AND inspectedFingerprint=:fingerprint AND postflightFingerprint=:postflight",
       ExpressionAttributeNames:{"#status":"status"},
       ExpressionAttributeValues:{...values,":consumed":"consumed"}}},
