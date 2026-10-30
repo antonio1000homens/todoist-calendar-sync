@@ -25,6 +25,49 @@ that a delayed ingress event cannot recreate the identity.
   unavailable DB/keys, malformed aliases, profile scoping, and atomic
   transaction shape. They do **not** simulate the entire production replay path.
 
+## Staged provider and mapping admission (not enabled)
+
+This draft now includes an additional integration tranche:
+
+- `src/erasure-replay-providers.ts` wraps Calendar and Todoist mutations
+  for the default, budgeted and injected client factories. Synchronizer,
+  project-move and snapshot-reconciliation clients now use these factories.
+  Mutations without a verifiable task/event identity **fail closed** when the
+  barrier is enabled, rather than inventing an identity from a title, date,
+  request token or project ID. This deliberately blocks some legitimate
+  unmapped Calendar-to-Todoist creation and comment deletion paths until their
+  parent event/task identity is propagated explicitly.
+- `src/handler.ts` rejects delayed, newly signed Todoist webhooks carrying
+  erased task IDs **before** durable SQS admission; `src/worker.ts` also
+  checks newly delivered or retried Todoist messages under the writer lease
+  before any identity-bearing audit, receipt or provider writes.
+- `src/repository.ts` checks ordinary mappings, recurrence links, flatten
+  repairs, recurrence advance/transfer/consolidation, index restoration,
+  future series split, completed projections and durable consolidation guards
+  before creating/recreating state.
+- Tests exercise the real repository writers, wrapped provider methods and
+  signed webhook ingress under injected DynamoDB marker/failure conditions.
+  The existing profile fence/epoch and writer lease remain independent.
+
+**Rollout gate:** `ERASURE_REPLAY_BARRIER_VERSION` is **unset/off** in this
+draft. `0` or absent preserves current production behaviour; `1` requires
+valid HMAC configuration and fail-closes missing/unavailable marker reads.
+Unexpected values fail closed. This flag is *not* an operational bypass:
+after the first durable post-write marker exists it must never be disabled
+and every live/qualified writer must run the enabled implementation. Do not
+turn on the gate yet: the remaining identity propagation, old Lambda-version
+retirement and fully verified post-write recovery are unfinished.
+
+**Known remaining gaps:** direct provider clients outside the guarded
+factories, unknown-ID creation and comment deletions, recurrence aliases not
+contained in the currently available mapping, some noncanonical DynamoDB
+writers (including repair/review history), coordinated source/destination
+leases for cross-profile moves, complete Calendar delta ingestion, and old
+qualified Lambda versions. A strongly consistent lookup is not a substitute
+for an atomic provider/API mutation plus marker condition under concurrent
+cross-profile erasure; deployment must prove the serialized lease protocol
+covers these races. There has been **no** production rollout or fault injection.
+
 ## Marker and key lifecycle
 
 Dedicated environment variables (NOT configured by this draft):
@@ -68,10 +111,11 @@ the following entrypoints **before** post-write recovery is allowed:
 | `src/erasure-deletion.ts`, `src/erasure-recovery.ts`, `src/erasure-worker.ts` | deletion steps, independent readback, mapping restore and final fence release | independent strongly consistent postflight and atomic release |
 | `src/erasure-preview.ts`, `src/erasure-recovery-adapters.ts` | full DynamoDB inventory plus direct provider/comments reads | verify every scan page; fail closed on unknown aliases and recurrence |
 
-This is a **safety checklist**, not a claim that those paths already invoke
-`assertReplayAdmission`. The shared primitive must not be activated or relied
-on for post-write recovery until *all* of them are covered, including direct
-`new Todoist`/`new GoogleCalendar` sites and historical Lambda versions.
+This is a **remaining safety checklist**, not a claim of comprehensive coverage.
+Several normal provider/mapping entrypoints now check the staged barrier, but
+not every route in this table has complete identity propagation. The shared
+primitive must not be activated or relied on for post-write recovery until
+*all* routes, versions, project moves, and aliases are verified.
 
 ## Remaining recovery implementation
 
