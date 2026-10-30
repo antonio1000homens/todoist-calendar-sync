@@ -20,6 +20,7 @@ import { Synchronizer } from "./sync.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
+import {assertReplayAdmission, ErasureReplayBlockedError, ErasureReplayUnavailableError, replayAdmissionEnabled} from "./erasure-replay-barrier.js";
 import { logEvent } from "./observability.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
@@ -378,6 +379,26 @@ export const handler: SQSHandler = async (event, context: Context) => {
           }
         }
         if (!releaseWriterLease) {
+          continue;
+        }
+      }
+      // Drop keyed erased-task webhooks before any delivery receipt, log with
+      // provider identity, audit, repair, or state write. The profile writer
+      // lease above remains held until the finally block releases it.
+      // An unknown identity is never treated as proof of admission.
+      if(delivery.kind==="todoist"&&replayAdmissionEnabled()) {
+        let taskId:string|undefined;
+        try {
+          const parsed=JSON.parse(delivery.body) as TodoistWebhookPayload;
+          taskId=parsed.event_data?.id;
+        } catch { throw new ErasureReplayUnavailableError("Malformed Todoist webhook under replay admission"); }
+        if(typeof taskId!=="string"||!taskId.length)
+          throw new ErasureReplayUnavailableError("Todoist webhook missing its task identity");
+        try {
+          await assertReplayAdmission({profile:delivery.profile,taskId});
+        } catch(error) {
+          if(!(error instanceof ErasureReplayBlockedError))throw error;
+          logEvent("erased_identity_delivery_suppressed",{profile:delivery.profile,kind:"todoist"});
           continue;
         }
       }
