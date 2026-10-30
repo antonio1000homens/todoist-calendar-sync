@@ -83,6 +83,34 @@ function checkKeys(identity:ReplayIdentity,ring:KeyRing):ReplayKey[] {
   }
   return keys;
 }
+/** Deployment gate is intentionally OFF until all producer/worker versions
+ * participate. Enabling with absent keys never degrades to allow. This gate
+ * MUST become permanently ON before any markers/fence releases go live.
+ */
+export function replayAdmissionEnabled():boolean {
+  const version=process.env.ERASURE_REPLAY_BARRIER_VERSION;
+  if(version===undefined||version===""||version==="0")return false;
+  if(version==="1")return true;
+  throw new ErasureReplayUnavailableError("Unrecognised erasure replay barrier version");
+}
+/**
+ * Staged integration hook. With protocol v1 enabled, every indicated identity
+ * is checked, including existing-state mutations (not only object creation).
+ * Never swallow a marker or a missing-key error as a nonmatching identity.
+ */
+export async function assertReplayAdmissionIfEnabled(identity:ReplayIdentity,db:Db=documentClient):Promise<void> {
+  if(!replayAdmissionEnabled())return;
+  await assertReplayAdmission(identity,db);
+}
+/** Resolved recurrence aliases are protected alongside primary event IDs. */
+export function mappingReplayIdentity(mapping:{
+  profile:Profile;taskId:string;eventId:string;masterEventId?:string;activeInstanceId?:string;
+}):ReplayIdentity {
+  return {profile:mapping.profile,taskId:mapping.taskId,
+    eventIds:[...new Set([mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
+      .filter((id):id is string=>typeof id==="string"&&id.length>0))]};
+}
+
 /**
  * Strongly consistent admission check for a known task/event/series alias.
  * Every provider mutation, durable mapping write and fresh ingress path must
