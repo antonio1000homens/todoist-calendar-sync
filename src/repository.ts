@@ -9,6 +9,7 @@ import {
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
+import {assertReplayAdmissionIfEnabled, mappingReplayIdentity} from "./erasure-replay-barrier.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
@@ -722,6 +723,12 @@ export class StateRepository {
   /** Replace approved recurrence indexes with a standalone pair in one conditional transaction. */
   async commitFlattenMapping(input: { operationId:string; mapping:Mapping; previous:Mapping[]; links:RecurrenceLink[] }): Promise<boolean> {
     const {mapping,previous,links,operationId} = input;
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
+    for (const old of previous) await assertReplayAdmissionIfEnabled(mappingReplayIdentity(old));
+    for (const link of links) await assertReplayAdmissionIfEnabled({
+      profile:link.profile,taskId:link.taskId,
+      eventIds:[...new Set([link.eventId,link.masterEventId].filter((id):id is string=>typeof id==="string"&&id.length>0))],
+    });
     if (mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId || !mapping.updatedAt
       || previous.some(m=>m.profile!==mapping.profile || !m.updatedAt)
       || links.some(l=>l.profile!==mapping.profile || !l.updatedAt)) throw new Error("Flatten mapping identities or versions are incomplete");
@@ -768,6 +775,7 @@ export class StateRepository {
   }
 
   async putMapping(mapping: Mapping): Promise<void> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     const item = { ...mapping, updatedAt: now() };
     await client.send(new TransactWriteCommand({
       TransactItems: [
@@ -788,6 +796,8 @@ export class StateRepository {
     expectedLink: RecurrenceLink,
     next: Mapping,
   ): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(previous));
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(next));
     if (previous.recurrenceOwner !== "calendar" || expectedLink.owner !== "calendar"
       || next.recurrenceOwner !== "calendar" || !previous.updatedAt || !expectedLink.updatedAt
       || previous.profile !== next.profile || previous.taskId !== next.taskId
@@ -1287,6 +1297,9 @@ export class StateRepository {
    * resurrection of archived / completed projections is permitted.
    */
   async putNewRecurrenceMappingIfUnowned(mapping: Mapping, link: RecurrenceLink): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
+    await assertReplayAdmissionIfEnabled({profile:link.profile,taskId:link.taskId,
+      eventIds:[...new Set([link.eventId,link.masterEventId].filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     if (mapping.recurrenceOwner !== "todoist" || mapping.seriesId !== mapping.taskId
       || mapping.masterEventId !== mapping.eventId || link.owner !== "todoist"
       || link.seriesId !== mapping.seriesId || link.masterEventId !== mapping.masterEventId
@@ -1919,6 +1932,8 @@ export class StateRepository {
   }
 
   async putRecurrenceLink(link: RecurrenceLink): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile:link.profile,taskId:link.taskId,
+      eventIds:[...new Set([link.eventId,link.masterEventId].filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     for (let attempt = 0; attempt < 5; attempt += 1) {
       let next = link;
       let conditionExpression: string | undefined;
