@@ -3,6 +3,7 @@ import { calendarWatchToken, profileForChannel, profileForTodoistRoute, proxySha
 import { enqueueDelivery } from "./queue.js";
 import { StateRepository } from "./repository.js";
 import { equalSecret, sha256, validTodoistSignature } from "./security.js";
+import {assertReplayAdmission,ErasureReplayBlockedError,replayAdmissionEnabled} from "./erasure-replay-barrier.js";
 import type { Delivery, Profile } from "./types.js";
 
 const RETIRED_ROUTES = new Set(["/oauth", "/github", "/todoist-lambda", "/slackevents", "/gmail-webhook", "/mail-webhooks", "/slackmodals"]);
@@ -82,6 +83,29 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     if (!validTodoistSignature(body, headers["x-todoist-hmac-sha256"], await todoistWebhookSecret())) {
       log("webhook_rejected", { path, kind, profile, reason: "invalid_todoist_signature" });
       return response(401, { error: "invalid_todoist_signature" });
+    }
+  }
+
+  // Reject erased identities before they can be re-admitted into durable SQS,
+  // even if this is a newly signed webhook arriving long after fence release.
+  // The admission lease/epoch in enqueueDelivery still serialises races with
+  // a concurrent fence installation after this read.
+  if(kind==="todoist"&&replayAdmissionEnabled()) {
+    let taskId:string|undefined;
+    try {
+      const payload=JSON.parse(body) as {event_data?:{id?:unknown}};
+      if(typeof payload.event_data?.id==="string"&&payload.event_data.id)taskId=payload.event_data.id;
+    } catch {/* An unparseable webhook is not proof of a non-erased identity. */}
+    if(!taskId)return response(503,{error:"replay_identity_unavailable",accepted:false});
+    try {
+      await assertReplayAdmission({profile,taskId});
+    } catch(error) {
+      if(error instanceof ErasureReplayBlockedError) {
+        log("erased_webhook_suppressed",{kind,profile});
+        return response(202,{accepted:true,suppressed:true});
+      }
+      logError("erasure_replay_admission_failed",error,{kind,profile});
+      return response(503,{error:"replay_admission_unavailable",accepted:false});
     }
   }
 
