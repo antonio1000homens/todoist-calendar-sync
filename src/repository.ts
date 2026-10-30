@@ -871,6 +871,8 @@ export class StateRepository {
     link: RecurrenceLink;
   }): Promise<boolean> {
     const { previous, mapping, expectedLink, link } = input;
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(previous));
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     if (previous.profile !== mapping.profile || previous.taskId !== mapping.taskId
       || previous.eventId === mapping.eventId || previous.recurrenceOwner !== "calendar"
       || mapping.recurrenceOwner !== "calendar" || !previous.seriesId
@@ -973,6 +975,9 @@ export class StateRepository {
     link: RecurrenceLink;
   }): Promise<boolean> {
     const { previous, replaced, expectedLink, replacedLink, mapping, link } = input;
+    for (const candidate of [mapping,previous,replaced]) {
+      if(candidate)await assertReplayAdmissionIfEnabled(mappingReplayIdentity(candidate));
+    }
     if (mapping.recurrenceOwner !== "calendar" || link.owner !== "calendar"
       || mapping.profile !== link.profile || mapping.taskId !== link.taskId
       || mapping.eventId !== link.eventId || mapping.masterEventId !== link.masterEventId
@@ -1247,6 +1252,9 @@ export class StateRepository {
   }
 
   async beginFutureSeriesSplit(profile: Profile, taskId: string, oldMasterId: string, newMasterId: string, previousOccurrence?: string): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[
+      ...new Set([oldMasterId,newMasterId,previousOccurrence].filter((id):id is string=>typeof id==="string"&&id.length>0)),
+    ]});
     const previous = await this.getFutureSeriesSplitAnyProfile(taskId);
     if (previous) {
       if (previous.profile !== profile || previous.taskId !== taskId
@@ -1386,6 +1394,10 @@ export class StateRepository {
     profile: Profile, discardedTaskId: string, retainedTaskId: string, decisionId: string,
     cancelledEventId?: string, previousMapping?: Mapping,
   ): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId:discardedTaskId,
+      ...(cancelledEventId?{eventIds:[cancelledEventId]}:{})});
+    await assertReplayAdmissionIfEnabled({profile,taskId:retainedTaskId});
+    if(previousMapping)await assertReplayAdmissionIfEnabled(mappingReplayIdentity(previousMapping));
     const item = {
       ...key(`CONSOLIDATED_TASK#${profile}#${discardedTaskId}`),
       profile, discardedTaskId, retainedTaskId, decisionId, status: "pending", updatedAt: now(),
@@ -1420,6 +1432,10 @@ export class StateRepository {
     cancelledEventId?: string;
   }): Promise<boolean> {
     const { mapping, link, previousMapping, previousLink, discardedTaskId, decisionId, expectedTombstone } = input;
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(previousMapping));
+    await assertReplayAdmissionIfEnabled({profile:mapping.profile,taskId:discardedTaskId,
+      ...(input.cancelledEventId?{eventIds:[input.cancelledEventId]}:{})});
     if (mapping.recurrenceOwner !== "todoist" || mapping.taskId === discardedTaskId
       || mapping.seriesId !== mapping.taskId || link.owner !== "todoist"
       || link.seriesId !== mapping.seriesId || link.taskId !== mapping.taskId
@@ -1504,6 +1520,7 @@ export class StateRepository {
    * changes between the reads and the repair.
    */
   async restoreMappingIndexesIfOwned(mapping: Mapping, expectedLink?: RecurrenceLink): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     const current = await this.getMappingByEvent(mapping.profile, mapping.eventId);
     if (!current || current.taskId !== mapping.taskId || current.updatedAt !== mapping.updatedAt
       || current.profile !== mapping.profile) return false;
@@ -2104,6 +2121,8 @@ export class StateRepository {
   }
 
   async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile:projection.profile,
+      taskId:projection.taskId,eventIds:[projection.eventId]});
     // Once the event-side marker exists it is immutable. A retry must neither
     // reset the seven-day clock nor recreate a task-side index retired by
     // maintenance. Atomic creation avoids half-written history pairs.
@@ -2236,6 +2255,7 @@ export class StateRepository {
 
   async recordRecurrence(profile: Profile, eventId: string, recurrence: string[] | undefined): Promise<void> {
     if (!recurrence?.length) return;
+    await assertReplayAdmissionIfEnabled({profile,eventIds:[eventId]});
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
       Item: { ...key(`RECURRENCE#${profile}#${eventId}`), recurrence, updatedAt: now() },
