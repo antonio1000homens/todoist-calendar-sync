@@ -83,10 +83,11 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   assert.ok(tx.some(x=>x.Delete?.Key.sk==="FENCE"&&x.Delete.ConditionExpression.includes("operationId=:id")));
   assert.ok(tx.some(x=>x.Delete?.Key.sk==="JOURNAL"));
   assert.ok(tx.some(x=>x.ConditionCheck?.Key.sk==="EPOCH"));
-  assert.ok(tx.some(x=>x.ConditionCheck?.Key.pk.startsWith("ERASURE_POSTWRITE_CONFIRMATION#")));
-  assert.ok(tx.some(x=>x.Update?.Key.pk.startsWith("ERASURE_OPERATION#")
-    &&x.Update.ConditionExpression.includes("recovery.mode=:mode")
-    &&x.Update.ConditionExpression.includes("recovery.postflightFingerprint=:postflight")));
+  assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_POSTWRITE_CONFIRMATION#")
+    &&x.Delete.ConditionExpression.includes("#status=:consumed")));
+  assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_OPERATION#")
+    &&x.Delete.ConditionExpression.includes("recovery.mode=:mode")
+    &&x.Delete.ConditionExpression.includes("recovery.postflightFingerprint=:postflight")));
   const serialized=JSON.stringify(markers);
   assert.ok(!serialized.includes("deleted-task")&&!serialized.includes("deleted-event")
     &&!serialized.includes("deleted-alias")&&!serialized.includes("operator-operation-id"));
