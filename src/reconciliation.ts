@@ -1,3 +1,5 @@
+import {defaultProviderClientFactory} from "./mutation-budget.js";
+import {guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { reviewHash } from "./review-store.js";
@@ -299,11 +301,8 @@ export class SnapshotReconciler {
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return {
-      calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
-      todoist: new Todoist(await todoistToken(profile)),
-    };
+    if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
+    return defaultProviderClientFactory(profile);
   }
 
   private async completedProjection(profile: Profile, eventId: string) {
