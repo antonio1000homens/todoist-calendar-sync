@@ -305,7 +305,7 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolea
   const fields = ruleFields(master.recurrence[0]);
   return Boolean(fields && ["WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
     && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || fields.INTERVAL === "1")
-    && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYMONTH", "BYMONTHDAY"].includes(key)));
+    && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY"].includes(key)));
 }
 
 function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[], timeZone: string): CalendarOwnedTodoistRecurrence | undefined {
@@ -331,6 +331,7 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
       : fields.BYSETPOS && /^(?:[1-5]|-1)$/.test(fields.BYSETPOS) ? Number(fields.BYSETPOS) : undefined
     : undefined;
   if (fields.FREQ === "MONTHLY" && fields.BYDAY && (position === undefined
+    || (position !== -1 && (position < 1 || position > 5))
     || !monthlyDay || weekdayCodes[monthlyDay[2]] !== weekday || fields.BYMONTHDAY || fields.BYMONTH
     || (fields.BYSETPOS && monthlyDay[1]) || (fields.BYSETPOS && !/^(?:[1-5]|-1)$/.test(fields.BYSETPOS)))) return undefined;
   if (fields.BYSETPOS && position === undefined) return undefined;
