@@ -100,6 +100,8 @@ test("rejects ambiguous, unsupported and contradictory positional rules and move
   assert.equal(calendarOwnedTodoistRecurrence(cal, [moved], "Europe/London"), undefined);
   assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [moved]), undefined);
   assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [{ ...occurrence(date), status: "cancelled" }]), undefined);
+  assert.equal(await verifiedCalendarOwnedRecurrence(cal, [{ ...occurrence(date), status: "cancelled" }], "Europe/London", async () => []), undefined,
+    "a cancellation visible in bounded expansion cannot be ignored when explicit exception inventory is inconsistent");
   assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London"), undefined);
   assert.equal((await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [])).monthlyOrdinal, 5);
   assert.equal(nativeCalendarRecurrenceCandidate(cal), true);
