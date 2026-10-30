@@ -106,6 +106,17 @@ test("rejects ambiguous, unsupported and contradictory positional rules and move
   assert.equal(todoistRecurrenceToRrule(task(date, "every last Saturday")), undefined);
 });
 
+test("fourth-Friday recurrence can start on the fifth Friday before its first matching occurrence", () => {
+  // Regression: P&S series master on 30 October 2026, first recurring projection on 27 November.
+  const cal = master("2026-10-30", "RRULE:FREQ=MONTHLY;BYDAY=4FR");
+  const active = occurrence("2026-11-27");
+  const rec = calendarOwnedTodoistRecurrence(cal, [active], "Europe/London");
+  assert.equal(rec?.monthlyOrdinal, 4);
+  assert.equal(matchesCalendarOwnedRecurringTask(task("2026-11-27", "every 4th Friday"), active, rec, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask(task("2026-11-27", "every last Friday"), active, rec, "Europe/London"), false,
+    "even when due dates coincide, different recurrence semantics must be rejected");
+});
+
 test("native last-Friday timed recurrence preserves 9 AM London wall time across DST and checks date/time/zone", () => {
   const cal = {
     id: "master", start: { dateTime: "2027-03-26T09:00:00Z", timeZone: "Europe/London" },
