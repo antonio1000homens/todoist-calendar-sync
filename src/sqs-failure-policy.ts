@@ -58,7 +58,7 @@ export function isTransientDynamoDbFailure(error: unknown): boolean {
       // If AWS omitted cancellation reasons, the transaction's reason is
       // ambiguous. Any conditional or validation reason makes it nonretryable.
       return reasons.length > 0 && reasons.some(r => THROTTLED_CANCELLATION_CODES.has(r.Code || ""))
-        && reasons.every(r => !r.Code || r.Code === "None" || THROTTLED_CANCELLATION_CODES.has(r.Code));
+        && reasons.every(r => r.Code === "None" || (typeof r.Code === "string" && THROTTLED_CANCELLATION_CODES.has(r.Code)));
     }
     if (e.name && TRANSIENT_DYNAMODB_ERRORS.has(e.name)) return true;
     // SDK $retryable hints alone are insufficient to identify DynamoDB.
