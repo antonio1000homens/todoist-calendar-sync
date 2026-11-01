@@ -15,9 +15,8 @@ function resourceBlock(name) {
 }
 
 const retainedAlarms = [
-  "WatchRenewalFailureAlarm", "WatchMissingAlarm", "WatchLambdaErrorsAlarm",
+  "WatchLambdaErrorsAlarm",
   "DlqAlarm", "ErasureDlqAlarm", "ErasureWorkerErrorsAlarm",
-  "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
   "SourceQueueAgeAlarm", "SourceQueueDepthAlarm", "WorkerErrorsAlarm",
   "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
   "ProfileLookupIndexReadThrottleAlarm", "ProfileLookupIndexWriteThrottleAlarm",
@@ -26,9 +25,12 @@ const retainedAlarms = [
 const removedAlarms = [
   "DynamoDbReadUtilizationAlarm", "DynamoDbWriteUtilizationAlarm",
   "ProfileLookupIndexReadUtilizationAlarm", "ProfileLookupIndexWriteUtilizationAlarm",
+  // Explicitly authorised removals; log-derived metrics must continue to exist.
+  "WatchRenewalFailureAlarm", "WatchMissingAlarm",
+  "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
 ];
 
-test("retains all 15 critical, erasure, watch, throttle, and backpressure alarms on AlertTopic", () => {
+test("retains 11 independent DLQ, worker, watch-Lambda, throttle, and backpressure alarms on AlertTopic", () => {
   const alarms = [...template.matchAll(/^  ([A-Za-z][A-Za-z0-9]*):\n    Type: AWS::CloudWatch::Alarm$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(alarms.sort(), [...retainedAlarms].sort());
@@ -38,7 +40,7 @@ test("retains all 15 critical, erasure, watch, throttle, and backpressure alarms
   }
 });
 
-test("removes only the four early-warning utilization alarms and preserves their actual throttle signals", () => {
+test("removes the four previously retired utilization and four requested custom-metric alarms, preserving throttles", () => {
   for (const name of removedAlarms) assert.equal(resourceBlock(name), "", `${name} should be absent`);
   for (const name of [
     "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
@@ -46,7 +48,7 @@ test("removes only the four early-warning utilization alarms and preserves their
   ]) assert.notEqual(resourceBlock(name), "", `${name} must remain`);
 });
 
-test("keeps log-derived safety metrics and documents the actual alert route and coverage tradeoff", () => {
+test("keeps all four log-derived custom metric filters and documents the coverage tradeoff", () => {
   for (const name of ["ErasureReviewRequiredMetricFilter", "ErasureRecoveryBlockedMetricFilter",
     "WatchRenewalFailureMetricFilter", "WatchMissingMetricFilter"]) {
     assert.match(resourceBlock(name), /Type: AWS::Logs::MetricFilter/);
@@ -54,6 +56,8 @@ test("keeps log-derived safety metrics and documents the actual alert route and 
   assert.match(inventory, /zero SNS subscriptions/);
   assert.match(inventory, /eight alarm-metric units/);
   assert.match(inventory, /Capacity nears its provisioned limit before throttling/);
+  assert.match(inventory, /custom metric charges can continue/i);
+  assert.match(inventory, /no direct CloudWatch alarm/i);
 });
 
 test("documents every retained and removed alarm in the review matrix", () => {
