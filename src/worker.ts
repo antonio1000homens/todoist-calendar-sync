@@ -3,6 +3,7 @@ import { reconcileUnmappedCalendar } from "./calendar-reconciliation.js";
 import { ManualInterventionService } from "./manual-intervention.js";
 import {
   createBudgetedClientFactory,
+  createObservedProviderClientFactory,
   defaultProviderClientFactory,
   isMutationBudgetExhausted,
   ReconciliationMutationBudget,
@@ -415,10 +416,9 @@ export const handler: SQSHandler = async (event, context: Context) => {
         seriesIds: [...identityRefs.seriesIds], generation: identityRefs.generation,
       });
 
-      // Synchronizers already call recordMutation only after an actual provider
-      // write. Intercept that signal at the shared repository boundary so the
-      // worker can distinguish meaningful changes from stale/echo/no-op webhook
-      // deliveries without duplicating synchronizer logic.
+      // Retain post-write mutation accounting for logging. Retry safety
+      // additionally observes the provider boundary before a write is
+      // attempted, since mapping writes may precede recordMutation.
       const recordMutation = state.recordMutation.bind(state);
       state.recordMutation = async (profile) => {
         // A provider write already succeeded before recordMutation was
@@ -610,7 +610,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // An ambiguous linked Calendar identity is not resolved by this delivery.
       // Let the existing failure/retry/quarantine flow retain the original
       // payload (including deletes), rather than acknowledging lost work.
-      await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
+      // Track *attempted* provider writes before entering the provider method.
+      // Project/orphan/sync paths may persist mappings or recurrence state
+      // before calling recordMutation, so that signal alone is too late to
+      // decide that SQS replay is safe after a DynamoDB throttle.
+      const observedClientFactory = createObservedProviderClientFactory(() => {
+        meaningfulMutation = true;
+      });
+      await new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery);
 
       if (delivery.kind === "calendar" && delivery.headers["x-calendar-sync-cursor-expired"] === "true") {
         await state.audit(delivery.profile, "calendar_sync_cursor_expired_reconciliation_needed", { deliveryId: delivery.id });
