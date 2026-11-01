@@ -54,7 +54,7 @@ test("keeps all four log-derived custom metric filters and documents the coverag
     assert.match(resourceBlock(name), /Type: AWS::Logs::MetricFilter/);
   }
   assert.match(inventory, /zero SNS subscriptions/);
-  assert.match(inventory, /eight alarm-metric units/);
+  assert.match(inventory, /eight alarm-metric\s+units/);
   assert.match(inventory, /Capacity nears its provisioned limit before throttling/);
   assert.match(inventory, /custom metric charges can continue/i);
   assert.match(inventory, /no direct CloudWatch alarm/i);
