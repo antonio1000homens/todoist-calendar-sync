@@ -15,7 +15,7 @@ Issue #49 adds a human-in-the-loop control plane for sync decisions that are uns
 - Only catalog actions explicitly marked `autoAllowed` can be configured in `auto` mode.
 - A Todoist-owned recurrence deletion and a mapped standalone Todoist deletion are approved catalog-level BAU exceptions: both auto-delete their exact Calendar counterpart after identity and task-absence checks. Ambiguous Calendar-owned recurrence scope and bulk this-and-future deletion still require review.
 - Bulk "this and future" recurrence deletion is capped at ten Calendar instance mutations. Larger scopes are refused and require the series-level delete option or a narrower recurrence.
-- Normal `maxReceiveCount: 1`, worker concurrency `1`, circuit breaker and reconciliation coalescing remain unchanged.
+- Worker concurrency `1`, circuit breaker and reconciliation coalescing remain unchanged. **Sync FIFO** now permits up to `maxReceiveCount: 5` only as a last-resort redrive ceiling; the worker explicitly quarantines permanent and potentially partially applied failures immediately, after a successful SQS DLQ handoff. Eligible transient DynamoDB failures retry the **original** FIFO message in place with 30/60/120/240-second visibility backoff. The sync DLQ retains messages for 14 days. See [Throttling recovery runbook](docs/dynamodb-throttling-recovery.md).
 
 ## Durable decisions
 
