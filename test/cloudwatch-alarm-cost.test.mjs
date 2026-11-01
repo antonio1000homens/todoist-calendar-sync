@@ -52,7 +52,11 @@ test("keeps log-derived safety metrics and documents the actual alert route and 
     assert.match(resourceBlock(name), /Type: AWS::Logs::MetricFilter/);
   }
   assert.match(inventory, /zero SNS subscriptions/);
-  assert.match(inventory, /eight alarm-metric units/);
+  assert.match(inventory, /maximum gross saving is \*\*\$0\.80 for a full month\*\*/);
+  assert.match(inventory, /current template and deployed production stack\s+retain 15 alarms/);
+  assert.match(inventory, /Before\s+PR #261, the template declared 19 alarms/);
+  assert.match(inventory, /first ten eligible standard alarm-metric units are free account-wide/);
+  assert.doesNotMatch(inventory, /\*\*\$0\.40 per full month\*\*/);
   assert.match(inventory, /Capacity nears its provisioned limit before throttling/);
 });
 

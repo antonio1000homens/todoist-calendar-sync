@@ -1,11 +1,10 @@
 # CloudWatch alarm cost and coverage
 
-This inventory covers the production alarms declared by `template.yaml`. The
-current CloudFormation template declares 19 alarms. Four two-metric DynamoDB
-utilization alarms are removed by this change. The 15 remaining alarms retain
-the actionable failure, erasure, watch, throttle, and queue signals. No alarm
-resource is disabled or removed from the deployed stack until this template is
-deployed.
+This inventory covers the production alarms declared by `template.yaml`. Before
+PR #261, the template declared 19 alarms. That PR removed four two-metric
+DynamoDB utilization alarms; the current template and deployed production stack
+retain 15 alarms covering actionable failure, erasure, watch, throttle, and
+queue signals. No further alarm removal is proposed here.
 
 ## Alarm inventory
 
@@ -48,22 +47,21 @@ cheaper substitute at this size.
 
 ## Cost estimate
 
-The Windsor account's October 2026 Cost Explorer readback in `eu-west-2` showed
-`EUW2-CW:AlarmMonitorUsage` at **$0.98808217** and **19.8808217544 usage
-quantity**. The observed effective rate is about **$0.0497 per usage unit**.
-Removing the eight utilization-alarm metric units therefore projects about
-**$0.40 per full month** in savings at that observed rate. This is an estimate:
-alarm charges are prorated by active hours, current Free Tier eligibility and
-other account alarms affect the bill, and the actual next full billing cycle
-must be compared. AWS's pricing page confirms that metric-math alarm costs
-scale with the number of listed metrics and that rates shown there are US East
-prices; the estimate above uses the live EUW2 billing readback instead.
+AWS's verified EU (London) price is **$0.10 per standard alarm metric-month**.
+The four removed utilization alarms each contained two standard-resolution
+metrics, so the maximum gross saving is **$0.80 for a full month** if all eight
+units would otherwise have been billed. This is not a promised net saving: the
+first ten eligible standard alarm-metric units are free account-wide, other
+account alarms consume that shared allowance, and charges are prorated by
+active hours. The actual net saving may therefore be **$0**. The October
+Cost Explorer total divided by usage quantity is an average across the account
+and Free Tier allocation; it is not a valid marginal price for these alarms.
 
-The alarm count falls from 19 to 15. Retaining 15 alarms is intentional: going
-below the 10 standard alarm-metric Free Tier allowance is not a safety target,
-and removing any of the remaining alerts would reduce distinct failure or
-backpressure coverage. The exact billable total is not inferred from alarm
-count alone.
+The current inventory is 15 alarms after PR #261. Alarm count is not the same
+as billable metric-unit count: metric-math expressions can contain multiple
+units, custom-metric charges are separate, and the Free Tier is shared across
+the account. Retaining the distinct failure and backpressure alerts remains
+intentional; the exact billable total is not inferred from alarm count alone.
 
 ## Failure coverage after the change
 
