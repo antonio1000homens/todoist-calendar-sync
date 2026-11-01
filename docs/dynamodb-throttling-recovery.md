@@ -36,23 +36,30 @@ tail of the group nor rewrites the delivery ID or erasure epoch.
    main sync DLQ. Only after that send succeeds does the worker acknowledge
    the source. If the send fails, the original source record is returned
    as failed for bounded native retry/redrive.
-6. If a provider mutation has already occurred before
-   `recordMutation` (which is called after the write), the worker sets
-   the mutation-observed flag *before* attempting to record it in
-   DynamoDB. A throttle of that accounting write cannot trigger automatic
-   replay of an already-applied provider mutation.
+6. The worker supplies `createObservedProviderClientFactory` to the
+   entire incremental orphan/project/synchronizer path. Its proxy tracks
+   every mutating provider method *before the provider method is entered*,
+   including a create/update/delete which is followed by
+   `putMapping`, `putRecurrenceLink` or `recordMutation`.
+   A throttle from any subsequent DynamoDB state operation therefore
+   cannot trigger automatic replay of an already-applied provider
+   mutation. A write *attempt* that fails before reaching the provider
+   is conservatively quarantined, not automatically replayed.
 7. No path marks the delivery `DELIVERY#` receipt completed while an
    operation is retrying or quarantined. The recovery operator must
    re-read current provider state before replaying, especially for
    Calendar master/instance changes and Todoist recurring advancement.
 
-**Limits:** observation of `recordMutation` is not proof that an
-external mutation did *not* happen elsewhere before an exception. An
-unobservable timeout after a provider write remains a risk in distributed
-systems. The safest correctness guarantee is existing deterministic
+**Limits:** the provider-boundary observer is deliberately more
+conservative than `recordMutation`: an attempted write is enough to
+quarantine after any later DynamoDB throttle, even when the write had
+no side effect. This covers post-provider `putMapping` and recurrence
+writes, not only accounting. Direct low-level provider mutations that
+bypass the observed client factory must not be added to incremental
+sync paths. The safest correctness guarantee remains deterministic
 provider IDs, conditional state writes, provider readback and durable
-repair barriers. Treat any uncertain provider side effect as a manual
-review case rather than broadening the auto-retry allowlist.
+repair barriers. Treat uncertain provider side effects as review cases
+rather than broadening the auto-retry allowlist.
 
 ## Classification
 
@@ -65,7 +72,9 @@ is explicitly a DynamoDB:
 `ReplicatedWriteConflictException`. A
 `TransactionCanceledException` is retryable **only when**
 `CancellationReasons` is present, includes a throughput/throttling
-reason, and has **no** condition/validation/unknown reason.
+reason, and **every** entry has the explicit code `None` or a
+recognized throughput/throttling reason. An absent, blank or unknown
+`Code` is always quarantined.
 
 Conditional check failures, ambiguous transaction cancellations,
 Google/Todoist provider HTTP errors, erasure epochs and fences,
