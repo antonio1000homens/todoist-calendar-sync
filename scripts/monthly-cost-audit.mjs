@@ -139,7 +139,7 @@ export function runAudit({
     const q=aws("sqs","get-queue-attributes",[
       "--queue-url",url,"--attribute-names",
       "ApproximateNumberOfMessages","ApproximateNumberOfMessagesNotVisible",
-      "ApproximateAgeOfOldestMessage","MessageRetentionPeriod","RedrivePolicy",
+      "MessageRetentionPeriod","RedrivePolicy",
     ]);
     const a=q.Attributes||{};
     queueReports.push({name,
