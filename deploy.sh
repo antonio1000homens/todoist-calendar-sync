@@ -21,6 +21,12 @@ cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
 review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
 # A destructive production feature; deployments must explicitly opt in.
 erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
+# Explicitly pass every provisioned table/index capacity. Otherwise a new
+# template default can silently override the existing 5/5 GSI stack parameter.
+state_table_read_capacity="${STATE_TABLE_READ_CAPACITY:-20}"
+state_table_write_capacity="${STATE_TABLE_WRITE_CAPACITY:-20}"
+profile_lookup_index_read_capacity="${PROFILE_LOOKUP_INDEX_READ_CAPACITY:-5}"
+profile_lookup_index_write_capacity="${PROFILE_LOOKUP_INDEX_WRITE_CAPACITY:-5}"
 # SAM's key=value parameter parser consumes JSON quotes unless they are escaped.
 # Keep the value JSON for validation, but escape quotes only at the CLI boundary.
 sam_profile_config_json="${sync_profile_config_json//\"/\\\"}"
@@ -95,6 +101,14 @@ for (const profile of ['home', 'antonio', 'work']) {
 NODE
 
 cd "$script_dir"
+# Fail closed on accidental paid provisioned-capacity changes, even when the
+# deploy job reuses a previously validated SAM build.
+STATE_TABLE_READ_CAPACITY="$state_table_read_capacity" \
+STATE_TABLE_WRITE_CAPACITY="$state_table_write_capacity" \
+PROFILE_LOOKUP_INDEX_READ_CAPACITY="$profile_lookup_index_read_capacity" \
+PROFILE_LOOKUP_INDEX_WRITE_CAPACITY="$profile_lookup_index_write_capacity" \
+  node scripts/check-dynamodb-capacity.mjs
+
 if [ "$skip_source_validation" = "true" ]; then
   if [ ! -f .aws-sam/build/template.yaml ]; then
     echo "SKIP_SOURCE_VALIDATION=true but .aws-sam/build/template.yaml does not exist." >&2
@@ -140,6 +154,10 @@ sam deploy \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
     "ResourceNamePrefix=$resource_name_prefix" \
+    "StateTableReadCapacity=$state_table_read_capacity" \
+    "StateTableWriteCapacity=$state_table_write_capacity" \
+    "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity" \
+    "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity" \
     "ErasureExecutionEnabled=$erasure_execution_enabled" \
     "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
     "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \
