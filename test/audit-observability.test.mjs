@@ -13,6 +13,10 @@ test("new audit expiry is seven days and does not alter the other TTL policies",
 test("routine and significant audit classifications are deterministic", () => {
   assert.equal(classifyAuditAction("todoist_snapshot_reconcile_converged"), "routine");
   assert.equal(classifyAuditAction("calendar_delta_processed"), "routine");
+  assert.equal(classifyAuditAction("calendar_elapsed_standalone_event_ignored"), "routine");
+  assert.equal(classifyAuditAction("calendar_archived_series_delta_ignored"), "routine");
+  assert.equal(classifyAuditAction("calendar_completed_projection_ignored"), "significant",
+    "completion-guard diagnostics remain durable");
   assert.equal(classifyAuditAction("todoist_snapshot_reconcile_conflict_both_sides_changed"), "significant");
   assert.equal(classifyAuditAction("calendar_snapshot_unmapped_ambiguous"), "significant");
   assert.equal(classifyAuditAction("future_unreviewed_action"), "significant");
