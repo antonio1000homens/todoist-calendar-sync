@@ -35,7 +35,7 @@ The readiness marker remains outside reconciliation mapping/recurrence runtime f
 
 `ProfileLookupIndex` is independently provisioned. The default is 10 RCU / 10 WCU rather than 5 / 5 because a mapping write projects three mapping rows into the index. The values remain explicit CloudFormation parameters so they can be tuned from measured production traffic.
 
-The shared DynamoDB client bounds `ProfileLookupIndex` query pages to the configured 25-item page limit and paces multi-page reads to 5 RCU/second by default. Standard AWS SDK retries remain enabled. CloudWatch alarms monitor GSI-specific read/write throttles and read/write utilization using both the `TableName` and `GlobalSecondaryIndexName` dimensions; table-only alarms do not cover index throttles.
+The shared DynamoDB client bounds `ProfileLookupIndex` query pages to the configured 25-item page limit and paces multi-page reads to 5 RCU/second by default. Standard AWS SDK retries remain enabled. CloudWatch alarms monitor GSI-specific read/write throttles using both the `TableName` and `GlobalSecondaryIndexName` dimensions; table-only alarms do not cover index throttles. Early utilization alarms were removed under issue #257; review consumed versus provisioned capacity during the daily operator check. See [CloudWatch alarm cost and coverage](cloudwatch-alarm-cost-and-coverage.md).
 
 ## Legacy routine audit mitigation
 

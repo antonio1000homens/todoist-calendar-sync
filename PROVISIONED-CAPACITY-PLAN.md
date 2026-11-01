@@ -48,7 +48,7 @@ The implementation on `plan/gcp-sync-provisioned-capacity` now contains all thre
 - [x] CloudFormation switches the table to `PROVISIONED` with explicit 25/25 defaults;
 - [x] no Application Auto Scaling resources are configured;
 - [x] dedicated read/write throttle alarms are configured;
-- [x] two-minute >=80% read/write utilisation alarms are configured;
+- [ ] review DynamoDB capacity from CloudWatch metrics during the daily operator check; paging is based on actual table/GSI throttles and sustained source queue age/depth, not early utilization thresholds;
 - [x] sustained SQS queue-depth alarm is configured in addition to the existing queue-age alarm;
 - [ ] merge/deploy to production;
 - [ ] verify production table mode/capacity and alarms;
@@ -262,13 +262,15 @@ Configured capacity/backpressure signals:
 
 - DynamoDB `ReadThrottleEvents > 0`;
 - DynamoDB `WriteThrottleEvents > 0`;
-- read utilisation >=80% for two consecutive one-minute periods;
-- write utilisation >=80% for two consecutive one-minute periods;
+- table and `ProfileLookupIndex` read/write throttles;
 - SQS oldest-message age >5 minutes;
 - SQS visible queue depth >100 for two consecutive five-minute periods;
 - existing worker-error and DLQ alarms.
 
-These alarms inform an operator; they do not scale the table.
+These alarms inform an operator; they do not scale the table. Early utilization
+threshold alarms were removed under issue #257. Review consumed and provisioned
+capacity during the daily operator check; see
+[`docs/cloudwatch-alarm-cost-and-coverage.md`](docs/cloudwatch-alarm-cost-and-coverage.md).
 
 ## CloudFormation implementation
 
@@ -299,7 +301,7 @@ After deployment:
 2. confirm billing mode is `PROVISIONED`;
 3. confirm provisioned read/write are 25/25;
 4. confirm no Application Auto Scaling target exists for this table;
-5. confirm read/write throttle and utilisation alarms exist;
+5. confirm table and index read/write throttle alarms exist;
 6. run the Home/Antonio/Work post-deploy smoke;
 7. exercise a normal Todoist and Calendar change;
 8. observe a scheduled/manual reconciliation and verify chunk/scan telemetry;
@@ -346,7 +348,8 @@ The capacity safeguards are independent and also protect the mapping migration/b
 - [x] Continuations retain reconciliation generation and profile ordering.
 - [x] Continuation enqueue failure remains recoverable through durable pending state.
 - [x] Item-size anomalies are observable without logging state contents.
-- [x] Read/write throttle and sustained utilisation alarms are defined.
+- [x] Read/write throttle alarms are defined for the table and profile lookup index.
+- [ ] Review consumed-versus-provisioned capacity during the daily operator check; early utilization thresholds are not paging alarms.
 - [x] Queue age and sustained queue depth expose backpressure.
 - [ ] Production deployment confirms 25/25 and no throttles under normal use.
 - [ ] Home/Antonio/Work smoke passes after cutover.
