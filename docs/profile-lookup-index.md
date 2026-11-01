@@ -33,7 +33,9 @@ The readiness marker remains outside reconciliation mapping/recurrence runtime f
 
 ## GSI capacity and alarms
 
-`ProfileLookupIndex` is independently provisioned. The default is 10 RCU / 10 WCU rather than 5 / 5 because a mapping write projects three mapping rows into the index. The values remain explicit CloudFormation parameters so they can be tuned from measured production traffic.
+`ProfileLookupIndex` has independent provisioned throughput, **but its capacity counts against the same shared Free Tier allowance as the main table**. Issue #255 aligns the IaC defaults with the actual production GSI setting at **5 RCU / 5 WCU**, and reduces main-table capacity to **20 RCU / 20 WCU**. The combined total is **25/25**. The original 10/10 GSI default was not applied to the deployed index and would have silently exceeded the account budget. All four values now have explicit deployment overrides and a combined CI/deploy guard.
+
+A mapping transaction may project multiple rows to this index, so the 5 WCU budget must be validated against short bursts, not only hourly or five-minute averages. Before deploying the reduction, confirm the merged #256 throttle/retry protection is **actually deployed** and has passed post-deploy validation. See [Provisioned capacity plan](../PROVISIONED-CAPACITY-PLAN.md) for the explicit deployment gate, backup checks, paid-capacity escape hatch, rollout and rollback.
 
 The shared DynamoDB client bounds `ProfileLookupIndex` query pages to the configured 25-item page limit and paces multi-page reads to 5 RCU/second by default. Standard AWS SDK retries remain enabled. CloudWatch alarms monitor GSI-specific read/write throttles using both the `TableName` and `GlobalSecondaryIndexName` dimensions; table-only alarms do not cover index throttles. Early utilization alarms were removed under issue #257; review consumed versus provisioned capacity during the daily operator check. See [CloudWatch alarm cost and coverage](cloudwatch-alarm-cost-and-coverage.md).
 

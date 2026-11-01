@@ -36,6 +36,12 @@ jobs:
       REVIEW_OPERATOR_EMAILS: ${{ vars.REVIEW_OPERATOR_EMAILS }}
       # Explicit production operator opt-in. Recovery implementation tracked by #239.
       ERASURE_EXECUTION_ENABLED: 'true'
+      # A merge triggers automatic production deployment; lowering live RCU/WCU
+      # requires a separate operator approval in the production environment.
+      DYNAMODB_CAPACITY_REDUCTION_APPROVED: ${{ vars.DYNAMODB_CAPACITY_REDUCTION_APPROVED }}
+      # Unset by default; explicit acknowledgement required for temporary
+      # above-Free-Tier rollback during an incident.
+      DYNAMODB_ALLOW_PAID_CAPACITY: ${{ vars.DYNAMODB_ALLOW_PAID_CAPACITY }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.TODOIST_CALENDAR_SYNC_CLOUDFLARE_API_TOKEN }}
     steps:
       - name: Validate non-secret deployment configuration

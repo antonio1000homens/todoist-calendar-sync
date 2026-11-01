@@ -70,14 +70,14 @@ Parameters:
     Description: Enable transactional seven-day COMPLETED_TASK retirement only after an operator-reviewed dry run.
   StateTableReadCapacity:
     Type: Number
-    Default: 25
+    Default: 20
     MinValue: 1
-    Description: Fixed DynamoDB read capacity. This stack does not configure Application Auto Scaling.
+    Description: Fixed main-table read capacity; total with all provisioned GSIs must stay within the shared 25 RCU budget by default.
   StateTableWriteCapacity:
     Type: Number
-    Default: 25
+    Default: 20
     MinValue: 1
-    Description: Fixed DynamoDB write capacity. This stack does not configure Application Auto Scaling.
+    Description: Fixed main-table write capacity; total with all provisioned GSIs must stay within the shared 25 WCU budget by default.
   DynamoDbScanRcuBudgetPerSecond:
     Type: Number
     Default: 10
@@ -95,14 +95,14 @@ Parameters:
     Description: Maximum mapped/unmapped Todoist candidates processed by one reconciliation chunk.
   ProfileLookupIndexReadCapacity:
     Type: Number
-    Default: 10
+    Default: 5
     MinValue: 1
-    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups; a GSI-specific throttle alarm detects exhausted capacity.
+    Description: Provisioned profile-lookup read capacity; combined main-table and index RCU must stay within the shared 25 RCU budget by default.
   ProfileLookupIndexWriteCapacity:
     Type: Number
-    Default: 10
+    Default: 5
     MinValue: 1
-    Description: Provisioned write capacity for profile-scoped lookup rows; one mapping write projects three records into this GSI. A GSI-specific throttle alarm detects exhausted capacity.
+    Description: Provisioned profile-lookup write capacity; mapping transactions project multiple index rows, so monitor GSI write throttles.
   BillingAlarmEmail:
     Type: String
     Default: ""

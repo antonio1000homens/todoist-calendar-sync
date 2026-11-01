@@ -134,8 +134,8 @@ test("administrative migration paths retry throttling and document their full-ta
 });
 
 test("ProfileLookupIndex has independent capacity headroom and GSI-dimensioned throttle alarms", () => {
-  assert.match(template, /ProfileLookupIndexReadCapacity:[\s\S]*?Default:\s*10/);
-  assert.match(template, /ProfileLookupIndexWriteCapacity:[\s\S]*?Default:\s*10/);
+  assert.match(template, /ProfileLookupIndexReadCapacity:[\s\S]*?Default:\s*5/);
+  assert.match(template, /ProfileLookupIndexWriteCapacity:[\s\S]*?Default:\s*5/);
   assert.match(template, /ProfileLookupIndexReadThrottleAlarm:/);
   assert.match(template, /ProfileLookupIndexWriteThrottleAlarm:/);
   assert.doesNotMatch(template, /ProfileLookupIndex(?:Read|Write)UtilizationAlarm:/);

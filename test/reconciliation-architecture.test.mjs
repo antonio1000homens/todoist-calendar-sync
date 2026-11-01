@@ -155,10 +155,10 @@ test("failed webhook admission returns a retryable non-2xx response without clai
   assert.doesNotMatch(enqueueCatch, /response\(202/);
 });
 
-test("state table uses fixed 25/25 provisioned capacity, remains protected and worker can transact mappings", () => {
+test("state table uses budgeted 20/20 provisioned capacity, remains protected and worker can transact mappings", () => {
   assert.match(template, /BillingMode:\s*PROVISIONED/);
-  assert.match(template, /StateTableReadCapacity:[\s\S]*?Default:\s*25/);
-  assert.match(template, /StateTableWriteCapacity:[\s\S]*?Default:\s*25/);
+  assert.match(template, /StateTableReadCapacity:[\s\S]*?Default:\s*20/);
+  assert.match(template, /StateTableWriteCapacity:[\s\S]*?Default:\s*20/);
   assert.match(template, /ReadCapacityUnits:\s*!Ref StateTableReadCapacity/);
   assert.match(template, /WriteCapacityUnits:\s*!Ref StateTableWriteCapacity/);
   assert.doesNotMatch(template, /AWS::ApplicationAutoScaling::/);
