@@ -341,6 +341,17 @@ export function calendarEventHasElapsed(event: CalendarEvent, now = Date.now(), 
   return Number.isFinite(endTime) && endTime <= now;
 }
 
+/** Only confirmed, non-recurring events may bypass historical ownership reads.
+ * A cancelled event, master or instance must still run the normal recovery path. */
+export function ignorableElapsedStandaloneCalendarEvent(
+  event: CalendarEvent, now = Date.now(), timeZone?: string,
+): boolean {
+  return event.status === "confirmed"
+    && !event.recurringEventId
+    && !event.recurrence?.length
+    && calendarEventHasElapsed(event, now, timeZone);
+}
+
 export function calendarOccurrenceHasEnded(event: CalendarEvent, now = Date.now(), timeZone?: string): boolean {
   if (event.status === "cancelled") return true;
   if (event.end?.date && !event.end.dateTime) {
@@ -983,6 +994,19 @@ export class Synchronizer {
         eventId: event.id, masterEventId: event.recurringEventId || event.id,
       });
     }
+    // Most historical one-offs are irrelevant. Check the supplied Calendar
+    // shape before any event-specific DynamoDB lookup (including a completion
+    // marker). The existing elapsed-event policy already ignores these edits.
+    if (event.status === "confirmed" && !event.recurringEventId && !event.recurrence?.length) {
+      const timeZone = event.end?.date && !event.end.dateTime && calendar.getTimeZone
+        ? await calendar.getTimeZone() : undefined;
+      if (ignorableElapsedStandaloneCalendarEvent(event, Date.now(), timeZone)) {
+        return this.state.audit(delivery.profile, "calendar_elapsed_standalone_event_ignored", {
+          eventId: event.id, end: event.end?.dateTime || event.end?.date,
+          ...(timeZone ? { timeZone } : {}),
+        });
+      }
+    }
     let ownershipEvent = event;
     let mapping = event.status === "cancelled" && !event.recurringEventId
       ? await this.state.getMappingByEvent(delivery.profile, event.id)
@@ -1019,18 +1043,6 @@ export class Synchronizer {
       });
     }
     mapping ||= await this.state.getMappingByEvent(delivery.profile, event.id);
-    if (!event.recurringEventId && !event.recurrence?.length && event.status !== "cancelled") {
-      const endIsAllDay = Boolean(event.end?.date && !event.end.dateTime);
-      const calendar = endIsAllDay ? (await this.clients(delivery.profile)).calendar : undefined;
-      const timeZone = calendar?.getTimeZone ? await calendar.getTimeZone() : undefined;
-      if (calendarEventHasElapsed(event, Date.now(), timeZone)) {
-        return this.state.audit(delivery.profile, "calendar_elapsed_standalone_event_ignored", {
-          eventId: event.id,
-          end: event.end?.dateTime || event.end?.date,
-          ...(timeZone ? { timeZone } : {}),
-        });
-      }
-    }
     const completedProjection = await this.getCompletedProjection(delivery.profile, event.id);
     if (completedProjection) {
       return this.state.audit(delivery.profile, "calendar_completed_projection_ignored", {
