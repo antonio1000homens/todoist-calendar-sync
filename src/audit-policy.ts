@@ -24,6 +24,10 @@ const SIGNIFICANT_EXACT_ACTIONS = new Set([
 
 const ROUTINE_EXACT_ACTIONS = new Set([
   "todoist_snapshot_reconcile_baseline_established",
+  // These are expected no-op Calendar changes, not actionable incidents.
+  // Keep their structured CloudWatch telemetry without writing AUDIT# rows.
+  "calendar_elapsed_standalone_event_ignored",
+  "calendar_archived_series_delta_ignored",
 ]);
 
 const REVIEWED_ROUTINE_ACTION_RE = /(?:^|_)(?:started|completed|queued|requested|coalesced|processed|reconciled|baselined|converged|created|updated|moved|written_back|rejoined|noop)(?:$|_)/;
