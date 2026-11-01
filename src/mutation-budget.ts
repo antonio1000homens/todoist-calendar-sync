@@ -76,6 +76,8 @@ const TODOIST_MUTATIONS = new Set([
   "upsertComment",
   "upsertProjectComment",
   "deleteComment",
+  "createProjectComment",
+  "updateComment",
 ]);
 
 function mutationReservation(provider: "calendar" | "todoist", operation: string, args: unknown[]): number {
@@ -109,6 +111,42 @@ function budgetedProvider<T extends object>(
       };
     },
   });
+}
+
+/**
+ * Fail-closed tracking for incremental sync. The callback runs BEFORE a
+ * potentially mutating provider method is entered, so state-write throttling
+ * between provider success and StateRepository.recordMutation cannot cause an
+ * unsafe automatic replay. False-positive attempts are quarantined rather
+ * than replayed: a method can fail before reaching the provider.
+ *
+ * Reuse the reviewed budget mutation allowlists; do not wrap read methods.
+ */
+export function createObservedProviderClientFactory(
+  onAttempt: (profile: Profile, provider: "calendar" | "todoist", operation: string) => void,
+  baseFactory: ProviderClientFactory = defaultProviderClientFactory,
+): ProviderClientFactory {
+  const observe = <T extends object>(
+    target: T, profile: Profile, provider: "calendar" | "todoist", operations: Set<string>,
+  ): T => new Proxy(target, {
+    get(current, property, receiver) {
+      const value = Reflect.get(current, property, receiver);
+      if (typeof value !== "function") return value;
+      const operation = String(property);
+      if (!operations.has(operation)) return value.bind(current);
+      return (...args: unknown[]) => {
+        onAttempt(profile, provider, operation);
+        return Reflect.apply(value, current, args);
+      };
+    },
+  });
+  return async profile => {
+    const clients = await baseFactory(profile);
+    return {
+      calendar: observe(clients.calendar, profile, "calendar", new Set([...CALENDAR_MUTATIONS, "watch", "stopWatch"])),
+      todoist: observe(clients.todoist, profile, "todoist", TODOIST_MUTATIONS),
+    };
+  };
 }
 
 export const defaultProviderClientFactory: ProviderClientFactory = async (profile) => ({

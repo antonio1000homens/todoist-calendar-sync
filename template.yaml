@@ -191,7 +191,8 @@ Resources:
       QueueName: !Sub ${ResourceNamePrefix}-dlq-${Stage}.fifo
       FifoQueue: true
       ContentBasedDeduplication: false
-      MessageRetentionPeriod: 86400
+      # The operator has two weeks to diagnose/replay a quarantined message.
+      MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
   SyncQueue:
@@ -203,13 +204,18 @@ Resources:
       # Reconciliation can scan the durable state table under the configured
       # RCU budget. Keep the queue lease comfortably above the worker timeout
       # so a slow scan cannot become a duplicate delivery.
+      # Transient DynamoDB failures shorten visibility with bounded backoff
+      # and are retried IN PLACE, preserving their per-profile FIFO sequence.
       VisibilityTimeout: 900
       MessageRetentionPeriod: 345600
       ReceiveMessageWaitTimeSeconds: 20
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDlq.Arn
-        maxReceiveCount: 1
+        # SDK attempts (5) are inside each Lambda receive; the worker permits
+        # native retries only for eligible transient DynamoDB failures.
+        # Other failures are handed directly to SyncDlq after a confirmed send.
+        maxReceiveCount: 5
 
   ErasureOperationDlq:
     Type: AWS::SQS::Queue
@@ -432,9 +438,16 @@ Resources:
           TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: !Ref TodoistCalendarSyncSlackChannel
           SLACK_BOT_TOKEN_PARAMETER: !Ref SlackBotTokenParameter
           DLQ_URL: !Ref SyncDlq
+          SYNC_QUEUE_URL: !Ref SyncQueue
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt SyncQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SyncDlq.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: sqs:ChangeMessageVisibility
+              Resource: !GetAtt SyncQueue.Arn
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
         - Statement:

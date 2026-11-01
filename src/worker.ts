@@ -3,6 +3,7 @@ import { reconcileUnmappedCalendar } from "./calendar-reconciliation.js";
 import { ManualInterventionService } from "./manual-intervention.js";
 import {
   createBudgetedClientFactory,
+  createObservedProviderClientFactory,
   defaultProviderClientFactory,
   isMutationBudgetExhausted,
   ReconciliationMutationBudget,
@@ -21,6 +22,10 @@ import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
 import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import { logEvent } from "./observability.js";
+import {
+  MAX_SYNC_RECEIVES, failedDeliveryDisposition,
+  quarantineFailedRecord, shortenTransientRetryVisibility, transientRetryVisibilitySeconds,
+} from "./sqs-failure-policy.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 
@@ -93,7 +98,7 @@ function sqsSummary(record: SQSRecord): Record<string, unknown> {
     sentTimestamp: Number.isFinite(sentTimestamp) ? new Date(sentTimestamp).toISOString() : record.attributes.SentTimestamp,
     approximateAgeMs: Number.isFinite(sentTimestamp) ? Math.max(0, Date.now() - sentTimestamp) : undefined,
     bodyBytes: Buffer.byteLength(record.body || ""),
-    expectedDlqAfterFailure: receiveCount >= 1,
+    expectedDlqAfterFailure: receiveCount >= MAX_SYNC_RECEIVES,
   };
 }
 
@@ -411,14 +416,16 @@ export const handler: SQSHandler = async (event, context: Context) => {
         seriesIds: [...identityRefs.seriesIds], generation: identityRefs.generation,
       });
 
-      // Synchronizers already call recordMutation only after an actual provider
-      // write. Intercept that signal at the shared repository boundary so the
-      // worker can distinguish meaningful changes from stale/echo/no-op webhook
-      // deliveries without duplicating synchronizer logic.
+      // Retain post-write mutation accounting for logging. Retry safety
+      // additionally observes the provider boundary before a write is
+      // attempted, since mapping writes may precede recordMutation.
       const recordMutation = state.recordMutation.bind(state);
       state.recordMutation = async (profile) => {
-        await recordMutation(profile);
+        // A provider write already succeeded before recordMutation was
+        // invoked. If this DynamoDB accounting write throttles, the result is
+        // ambiguous and must NOT be automatically replayed.
         meaningfulMutation = true;
+        await recordMutation(profile);
       };
 
       // Keep the normal audit record as the source of truth, then let the
@@ -603,7 +610,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // An ambiguous linked Calendar identity is not resolved by this delivery.
       // Let the existing failure/retry/quarantine flow retain the original
       // payload (including deletes), rather than acknowledging lost work.
-      await new OrphanRecoveringSynchronizer(state, scheduleOrphan).process(delivery);
+      // Track *attempted* provider writes before entering the provider method.
+      // Project/orphan/sync paths may persist mappings or recurrence state
+      // before calling recordMutation, so that signal alone is too late to
+      // decide that SQS replay is safe after a DynamoDB throttle.
+      const observedClientFactory = createObservedProviderClientFactory(() => {
+        meaningfulMutation = true;
+      });
+      await new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery);
 
       if (delivery.kind === "calendar" && delivery.headers["x-calendar-sync-cursor-expired"] === "true") {
         await state.audit(delivery.profile, "calendar_sync_cursor_expired_reconciliation_needed", { deliveryId: delivery.id });
@@ -650,6 +664,32 @@ export const handler: SQSHandler = async (event, context: Context) => {
         failures.push({ itemIdentifier: record.messageId });
         continue;
       }
+      const receiveCount = Math.max(1, Number(record.attributes?.ApproximateReceiveCount || "1") || 1);
+      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount);
+      if (disposition.kind === "retry_fifo") {
+        // SQS retains the same payload at the head of the original profile
+        // group; no new message is enqueued and no completion receipt is
+        // written. A short visibility backoff is optional: an API outage
+        // leaves the original, longer queue visibility timeout in force.
+        try {
+          await shortenTransientRetryVisibility(record, receiveCount);
+        } catch (visibilityError) {
+          log("transient_dynamodb_retry_visibility_fallback", {
+            delivery: deliverySummary(delivery),
+            error: serializeError(visibilityError),
+          });
+        }
+        log("delivery_transient_dynamodb_retry_scheduled", {
+          delivery: deliverySummary(delivery),
+          sqs: sqsSummary(record),
+          receiveCount,
+          maxReceiveCount: MAX_SYNC_RECEIVES,
+          targetVisibilitySeconds: transientRetryVisibilitySeconds(receiveCount),
+          error: serializeError(error),
+        });
+        failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
       if (delivery?.kind === "reconcile" && delivery.reconcile?.generation && state) {
         await state.recordReconciliationFailure(
           delivery.profile,
@@ -683,6 +723,24 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }));
       });
 
+      // Once the bounded source attempts are exhausted, SQS's native redrive
+      // handles the original message. For nonretryable/ambiguous failures,
+      // explicitly copy the ORIGINAL payload to the DLQ and return success
+      // only after the durable handoff is confirmed. If handoff fails,
+      // return batchItemFailures: SQS retains the source for another attempt.
+      let quarantined = false;
+      if (disposition.reason !== "retries_exhausted" && delivery) {
+        try {
+          await quarantineFailedRecord(record, delivery.profile);
+          quarantined = true;
+        } catch (handoffError) {
+          log("delivery_dlq_handoff_failed_source_retained", {
+            delivery: deliverySummary(delivery),
+            sqs: sqsSummary(record),
+            error: serializeError(handoffError),
+          });
+        }
+      }
       console.error(JSON.stringify({
         service: "todoist-calendar-sync-worker",
         event: "delivery_failed_for_dlq",
@@ -691,9 +749,15 @@ export const handler: SQSHandler = async (event, context: Context) => {
         sqs: sqsSummary(record),
         delivery: deliverySummary(delivery),
         error: serializeError(error),
-        dlqPolicy: { maxReceiveCount: 1, action: "quarantine_after_this_failed_receive" },
+        dlqPolicy: {
+          maxReceiveCount: MAX_SYNC_RECEIVES,
+          disposition: disposition.reason,
+          action: quarantined ? "durable_handoff_acknowledge_source"
+            : disposition.reason === "retries_exhausted" ? "native_sqs_redrive"
+              : "retain_source_until_handoff_or_redrive",
+        },
       }));
-      failures.push({ itemIdentifier: record.messageId });
+      if (!quarantined) failures.push({ itemIdentifier: record.messageId });
     } finally {
       if (releaseWriterLease) {
         try {

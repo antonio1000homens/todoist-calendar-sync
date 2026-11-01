@@ -35,11 +35,15 @@ test("worker remains single-concurrency while project moves lack cross-profile c
   assert.match(workerBlock, /ReservedConcurrentExecutions:\s*1/);
 });
 
-test("DLQ quarantines after one receive and retains messages for 24 hours", () => {
+test("DLQ retains originals for 14 days and source FIFO retries transient DynamoDB failures at most five times", () => {
   const dlqBlock = template.match(/SyncDlq:[\s\S]*?SyncQueue:/)?.[0] || "";
   const queueBlock = template.match(/SyncQueue:[\s\S]*?AlertTopic:/)?.[0] || "";
-  assert.match(dlqBlock, /MessageRetentionPeriod:\s*86400/);
-  assert.match(queueBlock, /maxReceiveCount:\s*1/);
+  assert.match(dlqBlock, /MessageRetentionPeriod:\s*1209600/);
+  assert.match(queueBlock, /maxReceiveCount:\s*5/);
+  const workerBlock = template.match(/WorkerFunction:[\s\S]*?ErasureWorkerLogGroup:/)?.[0] || "";
+  assert.match(workerBlock, /SYNC_QUEUE_URL: !Ref SyncQueue/);
+  assert.match(workerBlock, /QueueName: !GetAtt SyncDlq.QueueName/);
+  assert.match(workerBlock, /Action: sqs:ChangeMessageVisibility/);
 });
 
 test("worker emits a searchable structured log before returning a DLQ failure", () => {
@@ -48,6 +52,8 @@ test("worker emits a searchable structured log before returning a DLQ failure", 
   assert.match(workerSource, /receiveCount/);
   assert.match(workerSource, /providerBody/);
   assert.match(workerSource, /deliverySummary/);
+  assert.match(workerSource, /createObservedProviderClientFactory/);
+  assert.match(workerSource, /new OrphanRecoveringSynchronizer\(state, scheduleOrphan, observedClientFactory\)/);
 });
 
 test("capped or circuit-blocked reconciliation keeps its durable generation pending", () => {
