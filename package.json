@@ -20,7 +20,8 @@
     "state:cleanup-completed-comment": "npm run build --silent && node scripts/cleanup-completed-project-comment.mjs",
     "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
     "check:public": "bash scripts/check-public-source.sh",
-    "check:capacity": "node scripts/check-dynamodb-capacity.mjs"
+    "check:capacity": "node scripts/check-dynamodb-capacity.mjs",
+    "cost:audit": "node scripts/monthly-cost-audit.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1156.0",

@@ -231,6 +231,8 @@ For project-comment migration behavior see [`PROJECT-COMMENT-MIGRATION.md`](PROJ
 
 For DynamoDB capacity decisions see [`PROVISIONED-CAPACITY-PLAN.md`](PROVISIONED-CAPACITY-PLAN.md).
 
+For a read-only account cost/budget check, run `npm run cost:audit` (no Cost Explorer requests by default). An explicit `--include-cost-explorer` option makes two potentially billable account-wide queries. The [monthly cost audit guide](docs/monthly-cost-audit.md) describes budget enablement, S3 attribution limits, and the safe post-release checklist.
+
 A worker failure emits a structured `delivery_failed_for_dlq` record before the failed SQS message is quarantined. Search CloudWatch by SQS message ID or delivery ID when diagnosing DLQ items.
 
 ## Public-source policy
