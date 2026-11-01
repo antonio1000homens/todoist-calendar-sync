@@ -7,6 +7,8 @@ import {
 } from "../scripts/check-dynamodb-capacity.mjs";
 
 const template = readFileSync(new URL("../template.yaml", import.meta.url), "utf8");
+const deployScript = readFileSync(new URL("../deploy.sh", import.meta.url), "utf8");
+const deployWorkflow = readFileSync(new URL("../.github/workflows/deploy.yml", import.meta.url), "utf8");
 
 test("all provisioned DynamoDB table and GSI defaults sum to 25/25 or less", () => {
   const actual = assertSharedFreeTierCapacity(template);
@@ -48,6 +50,22 @@ test("increasing IaC defaults past shared allowance fails even with an operator 
   );
   assert.notEqual(changed, template);
   assert.throws(() => assertSharedFreeTierCapacity(changed, {}, true), /IaC default throughput.*exceeds/);
+});
+
+test("deployment keeps all four capacity overrides and rejects unapproved production reductions", () => {
+  for(const key of [
+    "StateTableReadCapacity", "StateTableWriteCapacity",
+    "ProfileLookupIndexReadCapacity", "ProfileLookupIndexWriteCapacity",
+  ]) {
+    assert.match(deployScript, new RegExp(`"${key}=\\$[a-z_]+"`),
+      `${key} must be passed to sam deploy explicitly`);
+  }
+  assert.match(deployWorkflow, /DYNAMODB_CAPACITY_REDUCTION_APPROVED:.*vars\.DYNAMODB_CAPACITY_REDUCTION_APPROVED/);
+  assert.match(deployScript, /if \[ "\$capacity_reduction_approved" != "true" \]; then/);
+  assert.match(deployScript, /aws cloudformation describe-stacks/);
+  assert.match(deployScript, /current_table_read/);
+  assert.match(deployScript, /profile_lookup_index_write_capacity < current_index_write/);
+  assert.match(deployScript, /DYNAMODB_CAPACITY_REDUCTION_APPROVED=true/);
 });
 
 test("new provisioned GSI or table cannot evade the budget guard", () => {
