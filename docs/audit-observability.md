@@ -20,9 +20,16 @@ Routine telemetry is logs-only. The reviewed routine groups are:
 | Action shape | Destination | Examples |
 | --- | --- | --- |
 | normal progress and successful summaries | CloudWatch only | `*_queued`, `*_requested`, `*_completed`, `*_processed`, `*_created`, `*_updated`, `*_reconciled`, `*_baselined`, `*_converged`, `*_noop*` |
+| proven irrelevant historical Calendar delta | CloudWatch only | `calendar_elapsed_standalone_event_ignored`, `calendar_archived_series_delta_ignored` |
 | safety, conflict, ambiguity or failed/deferred work | CloudWatch + DynamoDB | `*_conflict*`, `*_ambiguous*`, `*_blocked*`, `*_suppressed*`, `*_stale*`, `*_failed*`, `*_deferred*`, `*_circuit_open`, `*_mutation_budget_exhausted` |
 | mapping recovery, orphan handling and deletion outcomes | CloudWatch + DynamoDB | snapshot import/rebind, `*_orphan*`, `*_missing*`, `*_unbound*`, `*_tombstone*`, `*_deleted*`, `*_removed*`, `*_due_removed*` |
 | manual intervention | CloudWatch + DynamoDB | `manual_decision_requested`, `manual_detector_*`, `manual_action_deferred_safety` |
+
+Do **not** generalise this to all `*_ignored` actions: an ignored conflict,
+stale owner, cancellation or completion guard may warrant durable diagnostics.
+The two explicitly reviewed historical skip actions are expected high-volume
+no-ops and no longer produce `AUDIT#` writes. The seven-day significant
+audit window and active-conflict/review-seeding dependencies are unchanged.
 
 The implementation is conservative: an action that does not match a reviewed
 routine shape defaults to significant and is retained until explicitly

@@ -174,6 +174,40 @@ function fixture({ events = [], tasks = [] } = {}) {
   return { state, identities, eventMap, taskMap, calendar, todoist, calendarUpserts, todoistUpserts, sync };
 }
 
+test("historical standalone Calendar deltas bypass orphan ownership reads and preserve the sync cursor", async () => {
+  const old = {
+    id: "old-one-off", status: "confirmed", summary: "An old appointment", description: "",
+    start: { dateTime: "2020-01-01T10:00:00Z" },
+    end: { dateTime: "2020-01-01T11:00:00Z" },
+  };
+  const f = fixture({ events: [old] });
+  let mappingReads = 0, syncControlReads = 0;
+  const originalMapping = f.state.getMappingByEvent.bind(f.state);
+  f.state.getMappingByEvent = async (...args) => { mappingReads++; return originalMapping(...args); };
+  f.state.syncBlocked = async () => { syncControlReads++; return false; };
+
+  await f.sync.process(delivery("calendar"));
+
+  assert.equal(mappingReads, 0, "no orphan or delegated sync EVENT# reads for historical one-offs");
+  assert.equal(syncControlReads, 0, "no per-event DynamoDB control checks for historical one-offs");
+  assert.equal(f.state.token, "sync-token-next", "the whole Calendar delta must still be acknowledged");
+  assert.equal(f.todoistUpserts.length, 0);
+  assert.equal(f.calendarUpserts.length, 0);
+  assert.equal(f.state.mappings.length, 0);
+  assert.ok(f.state.audits.some((item) => item.action === "calendar_elapsed_standalone_event_ignored"));
+});
+
+test("old recurring instance stays on the ownership path even when its end is historical", async () => {
+  // The helper must never treat a historical instance as a standalone event:
+  // a past exception may belong to an active series with future occurrences.
+  const { ignorableElapsedStandaloneCalendarEvent } = await import("../dist/sync.js");
+  const oldInstance = {
+    id: "master_20200101", recurringEventId: "master", status: "confirmed",
+    start: { dateTime: "2020-01-01T10:00:00Z" }, end: { dateTime: "2020-01-01T11:00:00Z" },
+  };
+  assert.equal(ignorableElapsedStandaloneCalendarEvent(oldInstance), false);
+});
+
 test("canonical identity treats Calendar offset time and Todoist floating wall-clock time as the same logical start", () => {
   const event = {
     id: "event",

@@ -31,7 +31,7 @@ import {
 import { normalizedDescription, normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
+import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -746,10 +746,14 @@ export async function reconcileUnmappedCalendar(
   };
 
   const afterEventId = continuation?.afterEventId;
+  // Do not let known historical standalone events consume the bounded
+  // reconciliation candidate window or trigger per-event DynamoDB work.
+  // Keep cancelled events, recurrence masters/instances and unknown dates.
   const candidates = snapshot.items
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id))
-    .filter((event) => !afterEventId || event.id > afterEventId);
+    .filter((event) => (!afterEventId || event.id > afterEventId)
+      && !ignorableElapsedStandaloneCalendarEvent(event, now, calendarTimeZone));
 
   for (let index = 0; index < candidates.length; index += 1) {
     const event = candidates[index];

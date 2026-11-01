@@ -16,6 +16,13 @@ const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
 
+test("completed-history schedule stays disabled while operator apply is false", () => {
+  assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
+  assert.match(template, /RunCompletedHistoryCleanup:\s*!Equals \[!Ref CompletedHistoryCleanupApply, "true"\]/);
+  const cleanup = template.match(/CompletedHistoryCleanupFunction:[\s\S]*?WatchFunction:/)?.[0] || "";
+  assert.match(cleanup, /Enabled:\s*!If \[RunCompletedHistoryCleanup, true, false\]/);
+});
+
 test("FIFO ordering is isolated by profile", () => {
   assert.equal(syncMessageGroupId("home"), "sync:home");
   assert.equal(syncMessageGroupId("antonio"), "sync:antonio");

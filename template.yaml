@@ -112,6 +112,9 @@ Parameters:
 
 Conditions:
   HasBillingAlarmEmail: !Not [!Equals [!Ref BillingAlarmEmail, ""]]
+  # The disabled cleanup apply flag must not drive an endless daily scan.
+  # Operators can still invoke the separate dry-run CLI on demand.
+  RunCompletedHistoryCleanup: !Equals [!Ref CompletedHistoryCleanupApply, "true"]
 
 Globals:
   Function:
@@ -593,8 +596,8 @@ Resources:
           Properties:
             Schedule: rate(1 day)
             Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
-            Description: Bounded cursor-based completed-task history maintenance; read-only until explicitly enabled.
-            Enabled: true
+            Description: Guarded completed-task retirement, scheduled only after an explicit apply opt-in.
+            Enabled: !If [RunCompletedHistoryCleanup, true, false]
     Metadata:
       BuildMethod: esbuild
       BuildProperties:

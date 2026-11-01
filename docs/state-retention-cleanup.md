@@ -99,14 +99,18 @@ webhook, snapshot and orphan recovery from creating a duplicate Todoist task.
 Its initial `completedAt` is immutable: a replay must never reset the grace
 period or recreate a retired `COMPLETED_TASK` row.
 
-The new scheduled `CompletedHistoryCleanupFunction` inspects at most ten pages
-of 25 evaluated items every day, paced at five read units/second and using a
-durable cursor in apply mode. While apply is disabled, the schedule also stores
-its cursor in a separate `DRY_RUN_STATE` checkpoint so successive daily runs
-continue through bounded windows instead of repeating the first page. This
-checkpoint stores only continuation metadata and aggregate counts; it never
-changes completion rows. Apply and dry-run cursors are independent. Its stack parameter
-`CompletedHistoryCleanupApply` defaults to **false** (dry-run only). It scans
+The `CompletedHistoryCleanupFunction` processes at most ten scan pages of
+25 evaluated items per invocation, paced at five read units/second. Its
+EventBridge **daily schedule is now disabled when
+`CompletedHistoryCleanupApply=false`** (the default). This prevents a
+read-only schedule from consuming DynamoDB RCUs every day without deleting
+anything. Operators retain the explicit `state:cleanup-completed` CLI for
+manual dry-run inspection. The function itself also supports a manually
+invoked, non-destructive dry run that persists a separate `DRY_RUN_STATE`
+continuation checkpoint; the apply and dry-run cursors stay independent.
+An operator-approved deployment setting `CompletedHistoryCleanupApply=true`
+enables the schedule **and** transactional retirement. The flag never
+implicitly changes production as part of an application PR. It scans
 only candidate `COMPLETED_TASK` rows, groups the task's strongly consistent
 completion references, and retires all eligible task-side completion lookup
 rows in **one guarded transaction**, retaining `COMPLETED_EVENT`. It can also
@@ -186,11 +190,13 @@ project comments have been retired.
 
 ### Verification and staged activation
 
-1. Deploy with `CompletedHistoryCleanupApply=false` and examine the daily
-   CloudWatch `terminal_completed_history_cleanup_report` counts. The dry-run
-   cursor advances across bounded daily windows and restarts after a complete
-   table pass. No completed rows are written by this default schedule; only
-   the separate continuation checkpoint is updated.
+1. Deploy with `CompletedHistoryCleanupApply=false` and verify the
+   `DailyCompletedHistoryReview` EventBridge schedule is **disabled**. The
+   default no longer produces daily scan reports or checkpoint writes.
+   Instead run the documented manual dry-run CLI as needed; if an operator
+   explicitly invokes the Lambda in dry-run mode, its checkpoint may advance
+   without modifying completion records. Inspect
+   `terminal_completed_history_cleanup_report` for manual invocations.
 2. Use an authorized read-only session to run `npm ci` then
    `npm run state:cleanup-completed -- --max-pages=40`. The output is a
    dry-run report with `eligible`, `retired`, `skipped_active`,

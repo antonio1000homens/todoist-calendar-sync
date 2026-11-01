@@ -10,7 +10,7 @@ import {
 import { defaultProviderClientFactory, type ProviderClientFactory, type ProviderClients } from "./mutation-budget.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { StateRepository } from "./repository.js";
-import { todoistCalendarLifecycle } from "./sync.js";
+import { ignorableElapsedStandaloneCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => Promise<void>;
@@ -158,8 +158,26 @@ export class OrphanRecoveringSynchronizer {
 
     let tasks: TodoistTask[] | undefined;
     const blockedEventIds = new Set<string>();
+    const ignoredHistoryEventIds = new Set<string>();
+    const now = Date.now();
+    let calendarTimeZone: string | undefined;
 
     for (const event of delta.items) {
+      // The delegated synchronizer will still receive this delta and advance
+      // its sync cursor; only skip orphan/identity lookups for proven history.
+      if (event.extendedProperties?.shared?.syncHistoryOnly === "true") {
+        ignoredHistoryEventIds.add(event.id);
+        continue;
+      }
+      if (event.status === "confirmed" && !event.recurringEventId && !event.recurrence?.length
+          && event.end?.date && !event.end.dateTime && !calendarTimeZone && clients.calendar.getTimeZone) {
+        try { calendarTimeZone = await clients.calendar.getTimeZone(); }
+        catch { /* Missing timezone must fail open into ordinary ownership checks. */ }
+      }
+      if (ignorableElapsedStandaloneCalendarEvent(event, now, calendarTimeZone)) {
+        ignoredHistoryEventIds.add(event.id);
+        continue;
+      }
       const currentMapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (await this.state.syncBlocked(delivery.profile, { eventId: event.id, taskId: currentMapping?.taskId || event.extendedProperties?.shared?.taskId })) {
         blockedEventIds.add(event.id);
@@ -248,7 +266,7 @@ export class OrphanRecoveringSynchronizer {
     await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, filteredClients).process(delivery);
 
     for (const event of delta.items) {
-      if (blockedEventIds.has(event.id)) continue;
+      if (blockedEventIds.has(event.id) || ignoredHistoryEventIds.has(event.id)) continue;
       await this.rememberCalendarResult(delivery.profile, event, clients);
     }
   }
