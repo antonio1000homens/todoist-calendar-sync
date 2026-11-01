@@ -52,6 +52,8 @@ test("worker emits a searchable structured log before returning a DLQ failure", 
   assert.match(workerSource, /receiveCount/);
   assert.match(workerSource, /providerBody/);
   assert.match(workerSource, /deliverySummary/);
+  assert.match(workerSource, /createObservedProviderClientFactory/);
+  assert.match(workerSource, /new OrphanRecoveringSynchronizer\(state, scheduleOrphan, observedClientFactory\)/);
 });
 
 test("capped or circuit-blocked reconciliation keeps its durable generation pending", () => {
