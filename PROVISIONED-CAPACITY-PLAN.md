@@ -1,355 +1,214 @@
-# todoist-calendar-sync DynamoDB provisioned-capacity plan
+# DynamoDB fixed provisioned capacity — shared Free Tier plan (#255)
 
-## Decision
+## Current recommendation (1 November 2026)
 
-Move `todoist-calendar-sync-state-production` from `PAY_PER_REQUEST` to **fixed provisioned capacity**.
+Keep `todoist-calendar-sync-state-production` and the existing
+`ProfileLookupIndex` in **PROVISIONED** mode, with **no Application Auto Scaling**.
+Provision **20 read / 20 write units on the main table and 5 read / 5 write
+units on the GSI**:
 
-Initial target:
+| Resource | Before (live) | After (proposed) |
+| --- | --- | --- |
+| Main table | 25 RCU / 25 WCU | **20 RCU / 20 WCU** |
+| `ProfileLookupIndex` | 5 RCU / 5 WCU | **5 RCU / 5 WCU** |
+| **Total** | **30 RCU / 30 WCU** | **25 RCU / 25 WCU** |
 
-- read capacity: **25 RCU**
-- write capacity: **25 WCU**
-- DynamoDB Application Auto Scaling: **disabled / not configured**
+DynamoDB's provisioned-capacity Free Tier allowance is **shared across
+provisioned tables and their GSIs**, not a per-table 25/25 budget.
+Other tables/GSIs and billing eligibility within the account and region
+must also be considered. A 1 November read-only inspection in
+`eu-west-2` found three other DynamoDB tables in `PAY_PER_REQUEST`
+mode and no additional provisioned table there. This makes 25/25
+a reasonable local target, but it is **not** a guarantee of a zero
+AWS bill (alarms, storage, other regions, and other AWS services still cost).
 
-The system should absorb bursts by **delaying work**, not by increasing DynamoDB capacity.
+This decision supersedes the original September 2026 **table-only**
+25/25 plan and its pre-GSI throughput assumptions.
 
-The primary control model is:
+## Evidence and current production deployment
 
-```text
-provider/webhook burst
-        |
-        v
-      SQS FIFO
-        |
-        v
-Lambda worker (reserved concurrency = 1, batch size = 1)
-        |
-        v
-bounded DynamoDB work
-        |
-        v
-fixed 25 RCU / 25 WCU table
-```
+Read-only AWS observations, 1 November 2026:
 
-For reconciliation, one Lambda invocation must also be prevented from consuming the whole table capacity in a short interval. Full-table/background work therefore needs explicit page limits, consumed-capacity measurement, pacing, and bounded reconciliation continuations.
+- CloudFormation stack `todoist-calendar-sync`: `UPDATE_COMPLETE`;
+  persisted parameters `StateTableReadCapacity=25`,
+  `StateTableWriteCapacity=25`, `ProfileLookupIndexReadCapacity=5`,
+  `ProfileLookupIndexWriteCapacity=5`.
+- `template.yaml` had main defaults **25/25** but GSI defaults
+  **10/10**. The prior `deploy.sh` omitted all four capacity parameter
+  overrides, allowing drift between defaults and persisted stack values.
+  The original operator/deployment that set 5/5 is not established from
+  the available update history; do not assume it was automatic.
+- Main table and GSI were `ACTIVE`; table deletion protection was
+  **enabled** and point-in-time recovery was **enabled** with a 35-day
+  recovery period, verified using `DescribeContinuousBackups`.
+- Last 7-day 5-minute-window maxima (all 2016 windows):
+  table reads **5.63 RCU/s**, writes **3.46 WCU/s**;
+  GSI reads **0.083 RCU/s**, writes **0.21 WCU/s**.
+- Separate 7-day 1-minute observations showed table peak
+  **8.28 consumed RCU/s**, **3.60 consumed WCU/s**, and GSI
+  **0.108 read / 0.80 write units per second** *averaged across
+  observed minutes*. CloudWatch pagination left a small part of
+  that seven-day 1-minute sample incomplete; do not interpret those
+  maxima as exhaustive or as sub-second burst rates.
+- No throttling datapoints were returned for
+  `ReadThrottleEvents`, `WriteThrottleEvents` or
+  `ThrottledRequests` in the observed windows. **Missing metrics
+  are not evidence of zero throttle incidents.** Validate both main
+  table and GSI at one-minute resolution, and check worker retries,
+  queue age, and DLQ after rollout.
 
-## Implementation status
+The index remains provisioned at 5/5 because normal profile queries
+are paginated/paced and observed GSI usage is low. One mapping
+transaction projects multiple rows into the GSI, so conditional
+and transactional bursts still require headroom and monitoring.
 
-The implementation on `plan/gcp-sync-provisioned-capacity` now contains all three planned safety/cutover slices:
-
-- [x] shared DynamoDB client with deliberate standard retry behaviour;
-- [x] all todoist-calendar-sync full-table scans use bounded pages and `ReturnConsumedCapacity` pacing;
-- [x] default scan page limit is 25 evaluated items;
-- [x] default background scan budget is 10 RCU/s;
-- [x] item-size warning telemetry at >=16 KiB and critical telemetry at >=64 KiB;
-- [x] snapshot reconciliation is bounded to 20 candidates per invocation by default;
-- [x] reconciliation continuation messages remain in the same profile FIFO lane and generation;
-- [x] continuation enqueue failure leaves the durable reconciliation generation recoverable;
-- [x] recurrence reconciliation is not repeated for every continuation chunk;
-- [x] CloudFormation switches the table to `PROVISIONED` with explicit 25/25 defaults;
-- [x] no Application Auto Scaling resources are configured;
-- [x] dedicated read/write throttle alarms are configured;
-- [ ] review DynamoDB capacity from CloudWatch metrics during the daily operator check; paging is based on actual table/GSI throttles and sustained source queue age/depth, not early utilization thresholds;
-- [x] sustained SQS queue-depth alarm is configured in addition to the existing queue-age alarm;
-- [ ] merge/deploy to production;
-- [ ] verify production table mode/capacity and alarms;
-- [ ] exercise Home/Antonio/Work post-deploy smoke and controlled backlog/reconciliation behaviour.
-
-Nothing in this branch changes production until the PR is merged and the deployment workflow runs.
-
-## Why fixed provisioned mode is now reasonable
-
-The previous retry/amplification incident made on-demand capacity safer while workload behaviour was uncertain. The system is now materially more bounded:
-
-- `WorkerFunction.ReservedConcurrentExecutions: 1`;
-- SQS event source `BatchSize: 1`;
-- FIFO message ordering;
-- `ReconcilerFunction.ReservedConcurrentExecutions: 1`;
-- ingress writes to SQS rather than directly to DynamoDB;
-- failed worker deliveries are quarantined instead of repeatedly replayed;
-- reconciliation requests are deduplicated/generation-based;
-- mutation circuits and mutation budgets constrain runaway provider activity;
-- the state table has no GSIs requiring independent capacity planning.
-
-These controls make normal webhook traffic predictable enough for fixed 25/25 capacity, subject to verification from recent CloudWatch consumption.
-
-## Why Lambda concurrency is necessary but not sufficient
-
-Lambda concurrency controls **how many invocations run at once**. It does not rate-limit the DynamoDB calls made by a single invocation.
-
-The worker is already at the minimum useful concurrency:
+## System backpressure retained
 
 ```text
-Reserved concurrency = 1
-SQS batch size       = 1
+webhook --> SQS FIFO group sync:<profile> --> Lambda worker (concurrency 1)
+                        |                    |
+                        |                    +--> DynamoDB state table (20/20)
+                        |                         +--> ProfileLookupIndex (5/5)
+                        |
+                        +--> retry-safe original FIFO message / 14-day DLQ
 ```
 
-This means a webhook burst naturally becomes queue depth:
+- Worker `ReservedConcurrentExecutions: 1`, batch size 1.
+- Shared DynamoDB SDK `maxAttempts: 5`, standard retries.
+- #256 merged: only eligible pre-provider-mutation transient DynamoDB
+  failures use bounded native FIFO retry; ambiguous or potentially
+  partially applied operations are quarantined. **Verify #256 is
+  actually deployed, not merely merged, before reducing capacity.**
+- Full-table admin/cleanup scan pages bounded to 25 evaluated items,
+  default 10 RCU/s pacing; normal `ProfileLookupIndex` queries
+  paced to 5 RCU/s with bounded pages. Reconciliation also limits
+  candidate chunks and provider mutations.
+- #259 disables scheduled completed-history dry-run-only scans when
+  cleanup apply is false.
+- Guarded transactional reads/writes, provider receipt/identity
+  checks, erasure fencing, Calendar cursor and recap/continuation
+  state must not be weakened by this capacity change.
+
+## IaC controls and guardrails
+
+`template.yaml` has these **explicit defaults**:
 
 ```text
-50 incoming changes
-      |
-      v
-SQS: 50, 49, 48, ...
-      |
-      v
-one worker invocation at a time
+StateTableReadCapacity          20
+StateTableWriteCapacity         20
+ProfileLookupIndexReadCapacity   5
+ProfileLookupIndexWriteCapacity  5
 ```
 
-That is the desired behaviour.
-
-However, one reconciliation invocation can still do this:
+`deploy.sh` explicitly passes **all four** as SAM parameter
+overrides. Operators may override via:
 
 ```text
-Scan page
-Get
-Get
-TransactWrite
-Put baseline
-Put audit
-...
+STATE_TABLE_READ_CAPACITY
+STATE_TABLE_WRITE_CAPACITY
+PROFILE_LOOKUP_INDEX_READ_CAPACITY
+PROFILE_LOOKUP_INDEX_WRITE_CAPACITY
 ```
 
-Concurrency = 1 does not slow those calls down. Therefore the design uses two levels of backpressure:
+`npm run check:capacity` validates the combined defaults and
+current override values across **every PROVISIONED DynamoDB table
+and every declared GSI** in the SAM template. Invalid, unsupported,
+unexpectedly unprovisioned indexes and any inadvertent
+over-25/25 configuration fail CI/deploy. The CI test exercises
+an added table, added GSI, excessive defaults, invalid overrides
+and the explicit paid-capacity path.
 
-1. **invocation-level**: SQS FIFO + Lambda reserved concurrency 1;
-2. **inside an invocation**: bounded/paced DynamoDB reads and bounded reconciliation chunks.
+If an incident justifies **paid** capacity, a separate operator
+can set `DYNAMODB_ALLOW_PAID_CAPACITY=I_ACKNOWLEDGE_PAID_CAPACITY`
+for that deployment. This only bypasses the *override*
+limit; template defaults must remain safe. This variable is
+**not automatically set** in GitHub Actions and the operator
+must explicitly document the temporary overage and reversion.
 
-## Important capacity characteristics of the current data model
+### Automatic production deployment safety gate
 
-### Mapping writes are transactional
+A successful `master` CI automatically launches the production
+deploy workflow. Merely merging this PR **must not lower RCU/WCU
+without separate approval**.
 
-`StateRepository.putMapping()` writes three table items in one `TransactWriteItems` request:
+Before deploying, `deploy.sh` reads the **four actual
+CloudFormation stack parameters**; any requested reduction
+without `DYNAMODB_CAPACITY_REDUCTION_APPROVED=true` exits before
+`sam deploy`. The production GitHub environment variable
+`DYNAMODB_CAPACITY_REDUCTION_APPROVED` is intentionally **unset
+by default**. This means an unapproved merged PR cannot silently
+decrease table/index capacity. A failed gate blocks the deploy;
+the application is not partially updated by that deployment.
 
-- `EVENT#<profile>#<eventId>`
-- `TASK#<profile>#<taskId>`
-- `TASKOWNER#<taskId>`
+**Operator rollout sequence:**
 
-Transactional writes are more expensive than ordinary single-item writes. The worker's concurrency of one prevents parallel mapping updates, while bounded reconciliation prevents one invocation from processing an arbitrarily large number of candidates.
+1. Confirm #256 was successfully deployed and observe working
+   FIFO retries/quarantine, current source age/depth, DLQ contents,
+   and no active profile/erasure/reconciliation incident.
+2. Review the #255 CI and SAM validation. Inspect the generated
+   CloudFormation **change set** (a live change set is not created
+   by this code PR); confirm the existing table/index are
+   **Modify, replacement=False**, never `Add`, `Remove`
+   or `Replace`. DeletionProtectionEnabled, PITR, primary keys,
+   index key schema and `DeletionPolicy/UpdateReplacePolicy`
+   must remain unchanged.
+3. Set `DYNAMODB_CAPACITY_REDUCTION_APPROVED=true` in the
+   GitHub **production environment** and execute an authorised
+   controlled deployment. After this deployment, clear that
+   variable so future unexpected reductions fail closed.
+4. Confirm live table 20/20 and GSI 5/5,
+   `ACTIVE`, deletion protection enabled, PITR enabled and
+   no unexpectedly replaced/retained duplicate table.
+5. Validate `home`, `antonio`, `work`: standalone and
+   recurring Todoist/Calendar updates, duplicate delivery
+   suppression, one-item reconcile, and a successful queued
+   continuation with no new unintended provider mutations.
+6. Compare a **7–14 day** normalised post-rollout window
+   with the read-only baseline: main and GSI
+   `ConsumedReadCapacityUnits`, `ConsumedWriteCapacityUnits`,
+   `ReadThrottleEvents`, `WriteThrottleEvents`,
+   `ThrottledRequests`, worker retries/errors, SQS
+   `ApproximateAgeOfOldestMessage`, queue depth, DLQ count
+   and Calendar cursor/reconciliation progress. Do not infer
+   availability from averages alone.
 
-### Some reads are strongly consistent
+### Read-only verification commands
 
-Delivery-completion, reconciliation-state and mapping-owner safety reads use `ConsistentRead: true`. These should retain capacity headroom ahead of lower-priority background scans.
-
-### The largest read burst risk is `Scan`
-
-The table has full-table scans for:
-
-- reconciliation mappings;
-- recurrence links;
-- pending manual decisions;
-- intervention policies.
-
-A DynamoDB `FilterExpression` is applied after items are read, so filtering does not remove the capacity cost of evaluated items.
-
-All of these paths therefore use the shared paced scan helper.
-
-## Burst mitigation strategy
-
-### Layer 1 — retain queue backpressure
-
-Keep:
-
-```yaml
-WorkerFunction:
-  ReservedConcurrentExecutions: 1
-
-SyncQueue event source:
-  BatchSize: 1
+```bash
+aws cloudformation describe-stacks --region eu-west-2 \
+  --stack-name todoist-calendar-sync \
+  --query "Stacks[0].Parameters[?contains(ParameterKey,'Capacity')].[ParameterKey,ParameterValue]"
+aws dynamodb describe-table --region eu-west-2 \
+  --table-name todoist-calendar-sync-state-production \
+  --query "Table.{Status:TableStatus,Table:ProvisionedThroughput,Index:GlobalSecondaryIndexes[*].{Name:IndexName,Status:IndexStatus,Throughput:ProvisionedThroughput},DeletionProtection:DeletionProtectionEnabled}"
+aws dynamodb describe-continuous-backups --region eu-west-2 \
+  --table-name todoist-calendar-sync-state-production \
+  --query "ContinuousBackupsDescription.PointInTimeRecoveryDescription"
+npm run check:capacity
+npm test
+sam validate --template template.yaml --lint
 ```
 
-Do not increase worker concurrency as part of this migration.
+## Rollback / incident budget exception
 
-Webhook bursts accumulate in SQS instead of creating parallel DynamoDB write pressure.
+If queue age rises, retries exhaust, throttles occur, or a
+transactional/read-consistency path regresses, **stop the
+reduction** and inspect whether the cause is a GSI hotspot,
+a brief burst, a repeated webhook, a reconciliation scan,
+or genuine steady-state demand. Do not redrive the entire
+DLQ or remove alarms to hide the symptom.
 
-The existing oldest-message alarm and the added sustained queue-depth alarm make this backpressure visible.
+A deliberate temporary rollback to main table **25/25** with
+index **5/5** totals **30/30**, i.e. paid throughput.
+It requires an explicit `DYNAMODB_ALLOW_PAID_CAPACITY`
+acknowledgment above. Only use the minimum required increase;
+restore the 20/20+5/5 configuration after the problem is
+diagnosed. Remain PROVISIONED by default; switching to
+`PAY_PER_REQUEST` is a separate, reviewed incident
+decision. Do not repeatedly toggle billing mode during testing.
 
-### Layer 2 — capacity-aware scan pagination
-
-All full-table scans use a shared helper with initial defaults:
-
-```text
-page evaluated-item limit: 25
-background scan budget:     10 RCU/s
-```
-
-Each page requests:
-
-```text
-ReturnConsumedCapacity = TOTAL
-```
-
-The helper:
-
-- limits evaluated items per request;
-- measures actual consumed capacity;
-- preserves `LastEvaluatedKey` pagination;
-- delays before the next page when actual consumption is above the background budget;
-- adds small jitter when a delay is required;
-- emits structured page and completion telemetry;
-- never adds an unnecessary delay after the final page.
-
-This deliberately leaves capacity headroom for webhook state reads/writes and strongly consistent safety checks.
-
-### Layer 3 — bounded reconciliation continuations
-
-Snapshot reconciliation processes at most 20 mapped/unmapped Todoist candidates per invocation by default.
-
-Candidate lists are sorted by Todoist task ID and continuation state records:
-
-```text
-sequence
-phase = mapped | unmapped
-afterTaskId
-```
-
-When more candidates remain:
-
-```text
-current reconciliation chunk
-        |
-        v
-process <=20 candidates
-        |
-        v
-enqueue next continuation
-same generation + same sync:<profile> FIFO group
-        |
-        v
-mark current delivery complete
-```
-
-If the continuation cannot be queued, the current delivery is not marked complete and the existing durable pending-generation recovery path remains available to a later webhook/scheduled reconciliation request.
-
-This changes a large reconciliation from a single burst into queue-mediated sequential work.
-
-### Layer 4 — provider mutation budget remains independent
-
-The existing reconciliation provider mutation budget remains in force. Candidate chunking limits how much reconciliation state is assessed per invocation; the mutation budget independently limits Calendar/Todoist provider writes.
-
-The stricter control wins when either limit is reached.
-
-### Layer 5 — item-size observability
-
-The shared DynamoDB document client observes Put and transactional-Put payload sizes without logging item contents.
-
-Current thresholds:
-
-```text
->= 16 KiB  warning
->= 64 KiB  critical log
-```
-
-This is intentionally observational rather than a hard rejection. Large canonical state remains valid, but it becomes visible as a possible capacity outlier.
-
-### Layer 6 — fixed DynamoDB capacity
-
-CloudFormation configures:
-
-```yaml
-BillingMode: PROVISIONED
-ProvisionedThroughput:
-  ReadCapacityUnits: 25
-  WriteCapacityUnits: 25
-```
-
-The values are CloudFormation parameters with defaults of 25 so a future explicit stack change can raise/lower capacity without introducing runtime auto scaling.
-
-There are **no** `AWS::ApplicationAutoScaling::*` resources.
-
-### Layer 7 — alarms
-
-Configured capacity/backpressure signals:
-
-- DynamoDB `ReadThrottleEvents > 0`;
-- DynamoDB `WriteThrottleEvents > 0`;
-- table and `ProfileLookupIndex` read/write throttles;
-- SQS oldest-message age >5 minutes;
-- SQS visible queue depth >100 for two consecutive five-minute periods;
-- existing worker-error and DLQ alarms.
-
-These alarms inform an operator; they do not scale the table. Early utilization
-threshold alarms were removed under issue #257. Review consumed and provisioned
-capacity during the daily operator check; see
-[`docs/cloudwatch-alarm-cost-and-coverage.md`](docs/cloudwatch-alarm-cost-and-coverage.md).
-
-## CloudFormation implementation
-
-Capacity/pacing parameters:
-
-```text
-StateTableReadCapacity              default 25
-StateTableWriteCapacity             default 25
-DynamoDbScanRcuBudgetPerSecond      default 10
-DynamoDbScanPageItemLimit           default 25
-ReconciliationCandidateLimit        default 20
-```
-
-The template remains the only source of truth for table capacity. Avoid console-only changes except emergency mitigation followed immediately by an equivalent IaC update.
-
-## Deployment / validation plan
-
-Before merge/deploy:
-
-- all unit/build/SAM validation must pass;
-- inspect current source queue and DLQ state;
-- ensure no known reconciliation incident is active;
-- inspect recent DynamoDB consumed capacity if available.
-
-After deployment:
-
-1. confirm the existing table was updated in place and remains deletion-protected/PITR-enabled;
-2. confirm billing mode is `PROVISIONED`;
-3. confirm provisioned read/write are 25/25;
-4. confirm no Application Auto Scaling target exists for this table;
-5. confirm table and index read/write throttle alarms exist;
-6. run the Home/Antonio/Work post-deploy smoke;
-7. exercise a normal Todoist and Calendar change;
-8. observe a scheduled/manual reconciliation and verify chunk/scan telemetry;
-9. confirm queue age/depth remains healthy and no DynamoDB throttles occur.
-
-The cutover must not be merged if the source queue/DLQ indicates an active incident or if CI/SAM validation is not green. Because the CloudFormation change updates the existing retained table in place, review the generated change set/deployment output for replacement before accepting any deploy; table replacement is not an acceptable cutover path.
-
-## Controlled burst validation
-
-Do not generate a provider mutation storm purely to test DynamoDB.
-
-Prefer:
-
-- a read-oriented repository/test-table workload for scan pacing;
-- a reconciliation with enough no-op candidates to demonstrate continuation chunking;
-- normal webhook events allowed to queue naturally.
-
-Success means excess work becomes **queue depth / continuation messages**, not DynamoDB scaling or uncontrolled request bursts.
-
-## Rollback
-
-If fixed 25/25 produces unexpected throttling:
-
-1. determine whether the cause is an unbounded path, unexpectedly large item, abnormal one-off burst, or genuinely higher steady-state demand;
-2. for genuinely higher steady state, explicitly raise `StateTableReadCapacity` and/or `StateTableWriteCapacity` in CloudFormation;
-3. if behaviour is not understood or requires immediate safety, revert the template to `PAY_PER_REQUEST` and redeploy;
-4. retain scan pacing, continuation chunking and observability—they are useful in either billing mode.
-
-Do not repeatedly toggle billing modes during testing.
-
-## Interaction with issue #64 (project-comment mapping index)
-
-The project-comment mapping work may reduce Todoist API reads but does not materially remove DynamoDB reconciliation state. It may add small mapping metadata fields.
-
-The capacity safeguards are independent and also protect the mapping migration/backfill from producing large unbounded reconciliation runs.
-
-## Acceptance criteria
-
-- [x] DynamoDB capacity is defined as fixed provisioned 25/25 defaults in IaC.
-- [x] No DynamoDB Application Auto Scaling resources are configured.
-- [x] Worker reserved concurrency remains 1 and SQS batch size remains 1.
-- [x] All known full-table state scans use bounded, capacity-aware pacing.
-- [x] Large snapshot reconciliations are split into resumable FIFO continuation chunks.
-- [x] Continuations retain reconciliation generation and profile ordering.
-- [x] Continuation enqueue failure remains recoverable through durable pending state.
-- [x] Item-size anomalies are observable without logging state contents.
-- [x] Read/write throttle alarms are defined for the table and profile lookup index.
-- [ ] Review consumed-versus-provisioned capacity during the daily operator check; early utilization thresholds are not paging alarms.
-- [x] Queue age and sustained queue depth expose backpressure.
-- [ ] Production deployment confirms 25/25 and no throttles under normal use.
-- [ ] Home/Antonio/Work smoke passes after cutover.
+Related: [#254](https://github.com/antonio1000homens/todoist-calendar-sync/issues/254),
+[#255](https://github.com/antonio1000homens/todoist-calendar-sync/issues/255),
+[#256](https://github.com/antonio1000homens/todoist-calendar-sync/issues/256),
+[profile index guide](docs/profile-lookup-index.md),
+[alarm-cost and safety coverage](docs/cloudwatch-alarm-cost-and-coverage.md).
