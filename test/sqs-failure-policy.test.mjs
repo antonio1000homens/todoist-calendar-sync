@@ -11,6 +11,7 @@ import { StateRepository } from "../dist/repository.js";
 import { ManualInterventionService } from "../dist/manual-intervention.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { syncMessageGroupId } from "../dist/types.js";
+import { createObservedProviderClientFactory } from "../dist/mutation-budget.js";
 
 function namedError(name, fields = {}) {
   const e = new Error(name);
@@ -41,11 +42,72 @@ test("transient DynamoDB classification is strict across wrapped errors and tran
     namedError("TransactionCanceledException"), // unknown cancellation == unsafe
     namedError("TransactionCanceledException",{CancellationReasons:[{Code:"ConditionalCheckFailed"},{Code:"ThrottlingError"}]}),
     namedError("TransactionCanceledException",{CancellationReasons:[{Code:"TransactionConflict"}]}),
+    namedError("TransactionCanceledException",{CancellationReasons:[{Code:undefined},{Code:"ProvisionedThroughputExceeded"}]}),
+    namedError("TransactionCanceledException",{CancellationReasons:[{}, {Code:"ThrottlingError"}]}),
+    namedError("TransactionCanceledException",{CancellationReasons:[{Code:"Unknown"},{Code:"ThrottlingError"}]}),
     namedError("ConditionalCheckFailedException"),
     namedError("ErasureEpochChangedError"),
     namedError("ProviderError",{status:429,$retryable:{throttling:true}}),
     namedError("ProviderError",{status:400}),
   ]) assert.equal(isTransientDynamoDbFailure(error), false, error.name);
+});
+
+test("the earliest provider write boundary prevents retry of a later DynamoDB mapping throttle", async () => {
+  const sequence = [];
+  const events = [];
+  const source = async () => ({
+    calendar: {
+      listDelta: async () => ({ items: [] }),
+      upsertEvent: async () => {
+        sequence.push("provider-write");
+        events.push("created");
+        return { id: "new-event" };
+      },
+      deleteEvent: async () => { sequence.push("provider-delete"); },
+    },
+    todoist: {
+      getTask: async () => ({ id: "task-1" }),
+      upsertTask: async () => {
+        sequence.push("todoist-write");
+        return { id: "task-1" };
+      },
+    },
+  });
+  let providerAttemptObserved = false;
+  const factory = createObservedProviderClientFactory((profile, provider, operation) => {
+    assert.equal(profile, "home");
+    sequence.push(`attempt:${provider}.${operation}`);
+    providerAttemptObserved = true;
+  }, source);
+  const { calendar, todoist } = await factory("home");
+  await calendar.listDelta("token");
+  await todoist.getTask("task-1");
+  assert.deepEqual(sequence, [], "read-only methods never trip the provider-write fence");
+  const created = await calendar.upsertEvent({ id: "" });
+  assert.equal(created.id, "new-event");
+  assert.deepEqual(sequence, ["attempt:calendar.upsertEvent", "provider-write"]);
+  assert.equal(providerAttemptObserved, true);
+  const stateThrottle = throttle(); // e.g. StateRepository.putMapping fails after Google success
+  assert.equal(failedDeliveryDisposition(stateThrottle, {kind:"todoist"}, providerAttemptObserved, 1).reason,
+    "partial_provider_mutation", "a state write after provider success cannot replay the provider call");
+  assert.deepEqual(events, ["created"]);
+  await todoist.upsertTask({});
+  assert.deepEqual(sequence.slice(-2), ["attempt:todoist.upsertTask", "todoist-write"]);
+});
+
+test("unknown result of a provider attempt still fails closed before state can commit", async () => {
+  let attempted = false;
+  const factory = createObservedProviderClientFactory(() => { attempted = true; }, async () => ({
+    calendar: { deleteEvent: async () => { throw new Error("lost Google acknowledgement"); } },
+    todoist: { updateComment: async () => { throw new Error("lost Todoist acknowledgement"); } },
+  }));
+  const clients = await factory("work");
+  await assert.rejects(clients.calendar.deleteEvent("old-event"), /lost Google acknowledgement/);
+  assert.equal(attempted, true);
+  assert.equal(failedDeliveryDisposition(throttle(), {kind:"calendar"}, attempted, 1).kind,"quarantine");
+  attempted = false;
+  await assert.rejects(clients.todoist.updateComment("comment-1",""), /lost Todoist acknowledgement/);
+  assert.equal(attempted, true, "direct comment updates must also count as provider writes");
 });
 
 test("only safe incremental types can retry; the fifth receive is terminal", () => {
