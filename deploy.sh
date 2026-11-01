@@ -21,6 +21,7 @@ cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
 review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
 # A destructive production feature; deployments must explicitly opt in.
 erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
+capacity_reduction_approved="${DYNAMODB_CAPACITY_REDUCTION_APPROVED:-false}"
 # Explicitly pass every provisioned table/index capacity. Otherwise a new
 # template default can silently override the existing 5/5 GSI stack parameter.
 state_table_read_capacity="${STATE_TABLE_READ_CAPACITY:-20}"
@@ -126,6 +127,42 @@ else
 fi
 
 aws sts get-caller-identity --region "$region" >/dev/null
+
+# This stack deploys automatically on successful master CI. Do not lower
+# live provisioned throughput merely because a new default was merged.
+# Compare all four live stack parameters; if CloudFormation cannot verify
+# them, fail closed before any SAM deployment / infrastructure mutation.
+if [ "$capacity_reduction_approved" != "true" ]; then
+  current_capacity="$(aws cloudformation describe-stacks \
+    --region "$region" --stack-name "$stack_name" \
+    --query "Stacks[0].Parameters[?ParameterKey=='StateTableReadCapacity' || ParameterKey=='StateTableWriteCapacity' || ParameterKey=='ProfileLookupIndexReadCapacity' || ParameterKey=='ProfileLookupIndexWriteCapacity'].[ParameterKey,ParameterValue]" \
+    --output text)"
+  current_table_read=""
+  current_table_write=""
+  current_index_read=""
+  current_index_write=""
+  while read -r capacity_key capacity_value; do
+    case "$capacity_key" in
+      StateTableReadCapacity) current_table_read="$capacity_value" ;;
+      StateTableWriteCapacity) current_table_write="$capacity_value" ;;
+      ProfileLookupIndexReadCapacity) current_index_read="$capacity_value" ;;
+      ProfileLookupIndexWriteCapacity) current_index_write="$capacity_value" ;;
+    esac
+  done <<< "$current_capacity"
+  for current in "$current_table_read" "$current_table_write" "$current_index_read" "$current_index_write"; do
+    if [[ ! "$current" =~ ^[1-9][0-9]*$ ]]; then
+      echo "Cannot verify all current DynamoDB capacity parameters. Refusing an unapproved deployment." >&2
+      exit 1
+    fi
+  done
+  if (( state_table_read_capacity < current_table_read ||
+        state_table_write_capacity < current_table_write ||
+        profile_lookup_index_read_capacity < current_index_read ||
+        profile_lookup_index_write_capacity < current_index_write )); then
+    echo "Production DynamoDB capacity reduction is not approved. Confirm #256 retry rollout, current throttles/queue health and set DYNAMODB_CAPACITY_REDUCTION_APPROVED=true in the production environment for the controlled deployment." >&2
+    exit 1
+  fi
+fi
 
 for parameter_name in \
   "$calendar_watch_token_parameter" \
