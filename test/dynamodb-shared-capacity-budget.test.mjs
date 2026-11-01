@@ -61,6 +61,7 @@ test("deployment keeps all four capacity overrides and rejects unapproved produc
       `${key} must be passed to sam deploy explicitly`);
   }
   assert.match(deployWorkflow, /DYNAMODB_CAPACITY_REDUCTION_APPROVED:.*vars\.DYNAMODB_CAPACITY_REDUCTION_APPROVED/);
+  assert.match(deployWorkflow, /DYNAMODB_ALLOW_PAID_CAPACITY:.*vars\.DYNAMODB_ALLOW_PAID_CAPACITY/);
   assert.match(deployScript, /if \[ "\$capacity_reduction_approved" != "true" \]; then/);
   assert.match(deployScript, /aws cloudformation describe-stacks/);
   assert.match(deployScript, /current_table_read/);
@@ -87,5 +88,5 @@ test("new provisioned GSI or table cannot evade the budget guard", () => {
   SyncDlq:
     Type: AWS::SQS::Queue`,
   );
-  assert.throws(() => assertSharedFreeTierCapacity(secondTable), /exceeds shared free-tier allowance/);
+  assert.throws(() => assertSharedFreeTierCapacity(secondTable), /exceeds shared .*free-tier allowance/);
 });
