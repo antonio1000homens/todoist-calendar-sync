@@ -575,6 +575,12 @@ export class SnapshotReconciler {
     // state. Real StateRepository reconciliation always performs this sweep.
     if (!(this.state instanceof StateRepository)) return;
     const review = new ReviewStore();
+    // A deleted event cannot be retired while a different recurrence link
+    // still uses its master or active occurrence, even with mapping indexes
+    // missing. Inspect all profile links once, not for every case.
+    const linkSets = await Promise.all((["home", "antonio", "work"] as const)
+      .map(candidate => this.state.listRecurrenceLinks(candidate)));
+    const links = linkSets.flat();
     let cursor: Record<string, unknown> | undefined;
     let examined = 0;
     do {
@@ -606,13 +612,19 @@ export class SnapshotReconciler {
         if (!absent) continue;
         for (const eventId of eventIds) {
           const event = await this.currentEvent(clients.calendar, eventId);
-          if (event && event.status !== "cancelled"
-            || await this.state.getMappingByEvent(profile, eventId)
+          if ((event && event.status !== "cancelled")
+            || links.some(link => [link.eventId, link.masterEventId, link.activeInstanceId].includes(eventId))
+            || (await Promise.all((["home", "antonio", "work"] as const)
+              .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
             || await this.state.syncBlocked(profile, { eventId })
             || await this.completedProjection(profile, eventId)) { absent = false; break; }
         }
         if (!absent) continue;
-        await review.resolveVerifiedDeletedCase(item.id, { profile, taskIds, eventIds });
+        const closed = await review.resolveVerifiedDeletedCase(item.id, { profile, taskIds, eventIds });
+        if (!closed) await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
+          taskId: taskIds[0], eventId: eventIds[0],
+          reason: "case_state_or_repair_changed_during_verified_deletion",
+        });
       }
       cursor = page.cursor as Record<string, unknown> | undefined;
     } while (cursor && examined < 40);
