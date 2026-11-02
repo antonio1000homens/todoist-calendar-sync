@@ -457,10 +457,7 @@ export function todoistCalendarLifecycle(payload: TodoistWebhookPayload): Todois
   const eventName = payload.event_name || "";
   const oldTask = payload.event_data_extra?.old_item;
   const explicitlyDeleted = /deleted/i.test(eventName) || Boolean(task.is_deleted);
-  // "item:uncompleted" contains the substring "completed" but means an
-  // active task. Provider-side reactivation still requires a separate guarded
-  // transition out of COMPLETED_EVENT history; do not misclassify the webhook.
-  const completed = (!/uncompleted/i.test(eventName) && /completed/i.test(eventName)) || Boolean(task.is_completed);
+  const completed = /completed/i.test(eventName) || Boolean(task.is_completed);
   const hadDue = taskHasDue(oldTask);
   const hasDue = taskHasDue(task);
   const dueRemoved = hadDue && !oldTask?.due?.is_recurring && !hasDue;
