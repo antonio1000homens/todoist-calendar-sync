@@ -223,6 +223,14 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async getMappingByEvent(_profile, eventId) { return activeMapping?.eventId === eventId ? structuredClone(activeMapping) : undefined; },
     async deleteMapping(value) { if (activeMapping?.taskId === value.taskId && activeMapping?.eventId === value.eventId) activeMapping = undefined; },
     async mutationAllowed() { return true; },
+    async acceptTaskVersion() { return true; },
+    async reopenRetainedStandaloneMapping(m, taskUpdatedAt) {
+      const index = completed.findIndex((c) => c.eventId === m.eventId && c.taskId === m.taskId
+        && Date.parse(taskUpdatedAt) > Date.parse(c.completedAt));
+      if (index < 0 || activeMapping?.taskId !== m.taskId) return false;
+      completed.splice(index, 1);
+      return true;
+    },
     async recordMutation() {},
     async getCalendarProjectionTombstone() { return undefined; },
     async deleteCalendarProjectionTombstone() {},
@@ -256,7 +264,7 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     body: JSON.stringify({ event_name: "item:completed", event_data: { ...task, is_completed: true } }),
   });
 
-  assert.equal(activeMapping, undefined);
+  assert.equal(activeMapping?.taskId, mapping.taskId, "completion must retain the mapping for seven days");
   assert.deepEqual(calendarDeletes, []);
   assert.equal(completed.length, 1);
   assert.equal(completed[0].eventId, event.id);
@@ -271,9 +279,22 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     id: "delete-history", kind: "todoist", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:02:00Z", headers: {},
     body: JSON.stringify({ event_name: "item:deleted", event_data: { ...task, is_deleted: true } }),
   });
-  assert.deepEqual(calendarDeletes, [event.id]);
-  assert.equal(completed.length, 0);
-  assert.equal(audits.at(-1).action, "todoist_deleted_completed_calendar_history");
+  assert.deepEqual(calendarDeletes, [], "late task deletion must not delete completed Calendar history");
+  assert.equal(completed.length, 1);
+  assert.equal(activeMapping?.eventId, event.id);
+  assert.equal(audits.at(-1).action, "todoist_completed_mapping_deletion_ignored");
+
+  await sync.process({
+    id: "reopen-history", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2026-09-29T13:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:uncompleted", event_data: {
+      ...task, is_completed: false, updated_at: "2026-09-29T13:00:00Z",
+    } }),
+  });
+  assert.equal(activeMapping?.eventId, event.id, "uncompletion retains the original mapping");
+  assert.equal(completed.length, 0, "uncompletion withdraws the pending retirement marker");
+  assert.deepEqual(calendarDeletes, [], "completion and uncompletion never modify Calendar");
+  assert.equal(audits.at(-1).action, "todoist_uncompleted_mapping_retained");
 });
 
 test("rechecks completion immediately before Calendar-to-Todoist mutation", async () => {
