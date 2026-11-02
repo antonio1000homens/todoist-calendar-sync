@@ -100,17 +100,40 @@ Its initial `completedAt` is immutable: a replay must never reset the grace
 period or recreate a retired `COMPLETED_TASK` row.
 
 The `CompletedHistoryCleanupFunction` processes at most ten scan pages of
-25 evaluated items per invocation, paced at five read units/second. Its
-EventBridge **daily schedule is now disabled when
-`CompletedHistoryCleanupApply=false`** (the default). This prevents a
-read-only schedule from consuming DynamoDB RCUs every day without deleting
-anything. Operators retain the explicit `state:cleanup-completed` CLI for
-manual dry-run inspection. The function itself also supports a manually
-invoked, non-destructive dry run that persists a separate `DRY_RUN_STATE`
-continuation checkpoint; the apply and dry-run cursors stay independent.
-An operator-approved deployment setting `CompletedHistoryCleanupApply=true`
-enables the schedule **and** transactional retirement. The flag never
-implicitly changes production as part of an application PR. It scans
+25 evaluated items per invocation, paced at five read units/second. Since
+the owner-approved November 2026 activation, the **production deployment
+workflow explicitly passes `CompletedHistoryCleanupApply=true`**, enabling
+guarded daily retirement. For manual/ad-hoc deployments and new stacks, the
+parameter still defaults to `false`; this prevents an accidental destructive
+rollout. The operator-only `npm run state:cleanup-completed` CLI remains
+dry-run by default.
+
+The EventBridge schedule is now an explicit `AWS::Events::Rule` whose
+`State: !If [RunCompletedHistoryCleanup, ENABLED, DISABLED]` survives SAM
+transformation. It preserves the former generated rule/permission logical
+IDs, so updates should be in place. The production GitHub workflow verifies
+the deployed stack parameter, Lambda environment and actual EventBridge rule
+state. Apply mode uses an independent durable cursor and guarded transactions;
+manually invoked dry-run mode may persist a distinct `DRY_RUN_STATE`
+checkpoint. The schedule **never** turns on merely because a user runs
+the CLI.
+
+**Recovery boundary:** Completing a standalone task already deletes its active
+`EVENT#`, `TASK#` and `TASKOWNER#` mapping immediately; the seven-day
+cleanup removes only its guarded `COMPLETED_TASK#` lookup. It deliberately
+**keeps the permanent `COMPLETED_EVENT#` marker**, even when Todoist project
+mapping comments and Google Calendar `extendedProperties.shared.taskId`
+survive. Those provider breadcrumbs support identity recovery, but today's
+synchronizer explicitly ignores historical completed projections on normal
+Todoist updates. Therefore, **uncompleting a task or changing its date is
+not yet guaranteed to reactivate that Calendar event automatically**.
+A future change must verify the live reopened Todoist task, exact provider
+identity, newer version, no competing profile/recurrence/tombstone/erasure,
+and atomically transition the event guard into an active mapping. Do not
+remove completion markers or automatically reimport completed Calendar
+history as a shortcut.
+
+It scans
 only candidate `COMPLETED_TASK` rows, groups the task's strongly consistent
 completion references, and retires all eligible task-side completion lookup
 rows in **one guarded transaction**, retaining `COMPLETED_EVENT`. It can also
@@ -190,9 +213,11 @@ project comments have been retired.
 
 ### Verification and staged activation
 
-1. Deploy with `CompletedHistoryCleanupApply=false` and verify the
-   `DailyCompletedHistoryReview` EventBridge schedule is **disabled**. The
-   default no longer produces daily scan reports or checkpoint writes.
+1. Deploy production with explicit `CompletedHistoryCleanupApply=true`, then verify
+   the EventBridge rule is **ENABLED**, the Lambda environment also says
+   `true`, and the apply cursor advances while the dry-run cursor is unused.
+   For a rollback, deploy `false` and verify the rule is **DISABLED**. The
+   default for unapproved stacks produces no daily scan reports or checkpoint writes.
    Instead run the documented manual dry-run CLI as needed; if an operator
    explicitly invokes the Lambda in dry-run mode, its checkpoint may advance
    without modifying completion records. Inspect
