@@ -372,7 +372,10 @@ export class OrphanRecoveringSynchronizer {
           taskId: task.id,
           eventId: exact.id,
         });
-      } else if (!exact) {
+      } else if (!exact && payload.event_name !== "item:added") {
+        // An explicitly newly created Todoist task gets a new Calendar event.
+        // Canonical title/date recovery is only a repair for an existing task;
+        // it cannot substitute an unrelated old event for this new task ID.
         const snapshot = await clients.calendar.listDelta();
         const currentIdentity = todoistCanonicalIdentity(task)!;
         const currentMatches = await this.eligibleCalendarMatches(targetProfile, snapshot.items, currentIdentity);
