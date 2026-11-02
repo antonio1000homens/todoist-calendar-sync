@@ -3,6 +3,7 @@ import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
+import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
 import {
@@ -811,7 +812,19 @@ export class Synchronizer {
 
   async process(delivery: Delivery): Promise<void> {
     if (delivery.kind === "calendar") return this.processCalendar(delivery);
-    if (delivery.kind === "todoist") return this.processTodoist(delivery);
+    if (delivery.kind === "todoist") {
+      await this.processTodoist(delivery);
+      // Run only after the original provider delivery completed successfully.
+      // A stale payload alone is never sufficient for retirement; the queued
+      // reconciliation performs fresh reads and version-fenced cleanup.
+      if (this.state instanceof StateRepository) {
+        const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
+        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
+          await requestDeletedConflictReview(this.state, delivery.profile, { taskIds: [payload.event_data.id] });
+        }
+      }
+      return;
+    }
     if (delivery.kind === "reconcile") return this.reconcile(delivery.profile);
     return this.processOrphan(delivery);
   }
@@ -986,6 +999,12 @@ export class Synchronizer {
     for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist);
     if (delta.nextSyncToken) await this.state.putSyncToken(delivery.profile, delta.nextSyncToken);
     await this.state.audit(delivery.profile, "calendar_delta_processed", { deliveryId: delivery.id, count: delta.items.length, mode: delivery.mode });
+    if (this.state instanceof StateRepository) {
+      const deleted = delta.items.filter(event => event.status === "cancelled");
+      if (deleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
+        eventIds: [...new Set(deleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
+      });
+    }
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
