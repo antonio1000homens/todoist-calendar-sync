@@ -183,3 +183,38 @@ test("action-specific fields never expose recurrence options on ordinary one-off
   assert.equal(actionFormFields("decision").decision,true);
   assert.equal(actionFormFields("create").sourceChoice,false);
 });
+
+test("case summary preserves observed deleted, completed and cancelled statuses without enabling repairs",()=>{
+  const missingTask={ref:{profile,side:"todoist",id:"task"},object:null};
+  const cancelledEvent=eventSnap({status:"cancelled"});
+  const absent=assess([missingTask,cancelledEvent]);
+  assert.equal(absent.summary.task,"missing (404/410)");
+  assert.equal(absent.summary.event,"cancelled / deleted");
+  assert.equal(absent.summary.recurrence,"Unknown / unverifiable");
+  assert.equal(absent.actions.length,0);
+  const done=assess([taskSnap({is_completed:true}),eventSnap({status:"cancelled"})]);
+  assert.equal(done.summary.task,"completed in Todoist");
+  assert.equal(done.summary.event,"cancelled / deleted");
+  assert.equal(done.actions.length,0);
+});
+
+test("all twelve repair operations fail closed for unverified or cross-profile evidence",()=>{
+  const foreignTask=taskSnap();foreignTask.ref.profile="work";
+  const foreignEvent=eventSnap();foreignEvent.ref.profile="work";
+  for(const scenario of [[],[foreignTask,foreignEvent],
+    [{ref:{side:"todoist",profile,id:"task"},object:null},
+      {ref:{side:"calendar",profile,id:"event"},object:null}]]){
+    const result=assess(scenario);
+    for(const id of REPAIR_ACTION_IDS)
+      assert.equal(allowed(result,id),false,`${id} should not appear for unverified evidence`);
+  }
+});
+
+test("one-sided creation requires a verifiable due date and is revoked by later discoveries",()=>{
+  no(assess([taskSnap({due:null})],select("task","")),"create");
+  yes(assess([taskSnap()],select("task","")),"create");
+  const before=assess([taskSnap()],select("task",""));
+  const after=assess([taskSnap({},{mapping})],select("task",""));
+  assert.equal(revalidateRepairAction("create",before).revoked,false);
+  assert.equal(revalidateRepairAction("create",after).revoked,true);
+});
