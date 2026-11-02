@@ -88,7 +88,7 @@ test("an in-flight Calendar write prevents completion from committing a guard", 
     if (command instanceof TransactWriteCommand) {
       const [check, ...puts] = input.TransactItems;
       assert.equal(check.ConditionCheck.Key.pk, "CALENDAR_WRITE#fence-task");
-      assert.ok(check.ConditionCheck.ConditionExpression.includes("expiresAt < :now"));
+      assert.ok(check.ConditionCheck.ConditionExpression.includes("leaseUntilMs < :now"));
       if (lease) {
         const error = Object.assign(new Error("Calendar write in flight"), {
           name: "TransactionCanceledException", CancellationReasons: [{ Code: "ConditionalCheckFailed" }],
