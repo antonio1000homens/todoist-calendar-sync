@@ -376,7 +376,10 @@ function App() {
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         <section className="preview alert-evidence">
-          <details><summary>Recorded alert evidence</summary><pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre></details>
+          <details><summary>Recorded alert evidence</summary>
+            <pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre>
+            {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p>}
+          </details>
         </section>
         {selected.decision?.type==="operational_reconciliation_stuck"&&<section className="preview"><h3>Reconciliation diagnostics</h3>
           <dl>
@@ -419,16 +422,6 @@ function App() {
           {details?.reconciliation?.run?.nextContinuation&&<p>Current expected continuation: {details.reconciliation.run.nextContinuation.deliveryId} · {details.reconciliation.run.nextContinuation.phase} sequence {details.reconciliation.run.nextContinuation.sequence}</p>}
           <p>These fields are diagnostics from persisted state. A monitor stall does not establish why progress stopped. A queue acceptance record does not confirm current queue or DLQ state.</p>
         </section>}
-        {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<details className="preview"><summary>Delivery failure details</summary><dl>
-          {selected.decision.context?.kind&&<><dt>Delivery type</dt><dd>{selected.decision.context.kind}</dd></>}
-          {selected.decision.context?.status&&<><dt>Provider response</dt><dd>HTTP {selected.decision.context.status}</dd></>}
-          {selected.decision.context?.failure&&<><dt>Failure</dt><dd>{selected.decision.context.failure}</dd></>}
-          {selected.decision.context?.deliveryId&&<><dt>Delivery ID</dt><dd>{selected.decision.context.deliveryId}</dd></>}
-          {selected.decision.context?.providerErrorTag&&<><dt>Provider error</dt><dd>{selected.decision.context.providerErrorTag}</dd></>}
-          {selected.decision.context?.reconcileStage&&<><dt>Reconciliation stage</dt><dd>{selected.decision.context.reconcileStage}</dd></>}
-          {selected.decision.context?.providerTaskId&&<><dt>Failing task ID</dt><dd>{selected.decision.context.providerTaskId}</dd></>}
-          {selected.decision.context?.providerEventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.providerEventId}</dd></>}
-        </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
         {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
         {!details?<div className="notice detail-load" role="status">
           {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
