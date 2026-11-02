@@ -12,6 +12,7 @@ import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
+  retainedAuditProviderIds,
   retainedConflictEntity,
   retainedConflictIdentity,
   retainedConflictIncidentId,
@@ -2529,6 +2530,33 @@ export class StateRepository {
       // Every observation is logged. An already-retained incident row is the
       // only write failure that can be safely treated as a duplicate.
       if (!(conflictHash && conditionalFailure(error))) throw error;
+    }
+    // Audit references are only emitted for conflict-class observations.
+    // They permit later exact-ID cleanup without a table-wide Scan. Historical
+    // unindexed audit rows still expire under their original seven-day TTL.
+    if (/(?:conflict|ambiguous|blocked)/.test(action) && !/(?:operational|dlq)/.test(action)) {
+      const related = retainedAuditProviderIds(detail);
+      const refs = [
+        ...related.taskIds.map(id => ({ side: "todoist", id })),
+        ...related.eventIds.map(id => ({ side: "calendar", id })),
+      ];
+      if (refs.length <= 20) {
+        for (const ref of refs) {
+          try {
+            await client.send(new PutCommand({ TableName: this.ensureTable(),
+              Item: { pk: `AUDIT_REF#${profile}#${ref.side}#${ref.id}`,
+                sk: `AUDIT#${createHash("sha256").update(auditId).digest("hex")}`,
+                auditKey: auditId, profile, expiresAt: auditRecord.expiresAt },
+              ConditionExpression: "attribute_not_exists(pk)",
+            }));
+          } catch (error) {
+            if (!conditionalFailure(error)) console.warn(JSON.stringify({
+              event: "conflict_audit_reverse_index_deferred", profile, action,
+              reason: error instanceof Error ? error.name : "unknown",
+            }));
+          }
+        }
+      }
     }
     if (fingerprint && incidentId) {
       try {
