@@ -104,7 +104,11 @@ export class OrphanRecoveringSynchronizer {
     for (const event of matching) {
       if (await this.state.syncBlocked(profile, { eventId: event.id })) continue;
       const existing = await this.state.getMappingByEvent(profile, event.id);
-      if (!existing) eligible.push(event);
+      // Completed events have no active mapping by design. An orphan identity
+      // match must never turn one into a mapping for a newly created task,
+      // including after the COMPLETED_TASK lookup has been retired.
+      const completed = await this.state.getCompletedCalendarProjectionByEvent?.(profile, event.id);
+      if (!existing && !completed) eligible.push(event);
     }
     return eligible;
   }
@@ -184,6 +188,10 @@ export class OrphanRecoveringSynchronizer {
         continue;
       }
       if (!standaloneCalendarSource(event)) continue;
+      // No amount of title/date similarity can reassign a completed event.
+      // The permanent event-keyed completion guard survives cleanup of its
+      // task-keyed lookup after seven days.
+      if (await this.state.getCompletedCalendarProjectionByEvent?.(delivery.profile, event.id)) continue;
       const mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (mapping) {
         await this.seedCalendarIdentityFromMappedTask(delivery.profile, event, mapping, clients);
@@ -342,6 +350,15 @@ export class OrphanRecoveringSynchronizer {
     } else if (standaloneTodoistCandidate(task)) {
       const exact = await clients.calendar.findByTodoistTaskId(task.id);
       if (exact?.status !== "cancelled" && exact) {
+        // Provider breadcrumbs remain after a completion, but they do not
+        // authorise restoring its retired active mapping. Completion and
+        // uncompletion do not mutate Calendar, even for the same task ID.
+        if (await this.state.getCompletedCalendarProjectionByEvent?.(targetProfile, exact.id)) {
+          await this.state.audit(targetProfile, "todoist_completed_calendar_identity_not_rebound", {
+            taskId: task.id, eventId: exact.id,
+          });
+          return;
+        }
         if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: exact.id })) return;
         mapping = {
           profile: targetProfile,
