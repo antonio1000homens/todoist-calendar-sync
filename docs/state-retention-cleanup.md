@@ -91,76 +91,58 @@ Run npm run state:inspect again, verify table and GSI activity, watch worker/Dyn
 Do **not** automatically delete SYSTEM#PROFILE_LOOKUP_INDEX or unindexed RECURRENCE rows: the former is retained migration evidence; a legacy recurrence row can still be written by recordRecurrence and may be needed for compatibility.
 
 
-## Terminal completed-task history (issue #114; new independent maintenance operation)
+## Terminal completed-task history (issue #114; retained-mapping lifecycle in #277)
 
-Completion already drops the active EVENT/TASK/TASKOWNER mapping. An immutable
-`COMPLETED_EVENT#profile#eventId` marker remains **indefinitely** to block Calendar
-webhook, snapshot and orphan recovery from creating a duplicate Todoist task.
-Its initial `completedAt` is immutable: a replay must never reset the grace
-period or recreate a retired `COMPLETED_TASK` row.
+After the **#277 code change is deployed**, completion of a standalone
+Todoist task retains its active `EVENT#`, `TASK#`, and `TASKOWNER#` mapping
+**for seven full days**, and leaves the linked Google Calendar event
+untouched. `COMPLETED_TASK#profile#taskId` records the task-side pending
+retirement and `COMPLETED_EVENT#profile#eventId` remains as the permanent
+historical guard. The initial `completedAt` is immutable; a stale
+`item:completed` webhook cannot reset the grace period or recreate a
+previously retired `COMPLETED_TASK` row.
+
+An explicit *uncompletion within the grace* keeps the same mapping and
+Calendar event unchanged, and may withdraw the completion markers only after
+fresh Todoist active-state and mapping-version verification. It is not a
+Calendar update. When seven full days have elapsed without uncompletion, the
+guarded cleanup can **atomically retire the unchanged standalone mapping
+triplet together with its `COMPLETED_TASK#` lookup**, while retaining
+`COMPLETED_EVENT#` and the Calendar event. Uncompletion after expiry
+does not recover a retired mapping; a newly created Todoist task must use
+its **new task ID** and create a **new Calendar event**, even when the title
+and date are identical to old history.
 
 The `CompletedHistoryCleanupFunction` processes at most ten scan pages of
-25 evaluated items per invocation, paced at five read units/second. Since
-the owner-approved November 2026 activation, the **production deployment
-workflow explicitly passes `CompletedHistoryCleanupApply=true`**, enabling
-guarded daily retirement. For manual/ad-hoc deployments and new stacks, the
-parameter still defaults to `false`; this prevents an accidental destructive
-rollout. The operator-only `npm run state:cleanup-completed` CLI remains
-dry-run by default.
+25 evaluated items per invocation, paced at five read units/second. A
+post-read scan filter identifies `COMPLETED_TASK#` records, and the worker
+strongly reads the exact completion guards and all mapping ownership views.
+It handles a retained complete standalone mapping and the legacy
+already-retired triplet, without treating an unrelated live/competing mapping
+as a cleanup candidate. Missing/partial/mismatched indexes are safety skips.
 
-The EventBridge schedule is now an explicit `AWS::Events::Rule` whose
-`State: !If [RunCompletedHistoryCleanup, ENABLED, DISABLED]` survives SAM
-transformation. It preserves the former generated rule/permission logical
-IDs, so updates should be in place. The production GitHub workflow verifies
-the deployed stack parameter, Lambda environment and actual EventBridge rule
-state. Apply mode uses an independent durable cursor and guarded transactions;
-manually invoked dry-run mode may persist a distinct `DRY_RUN_STATE`
-checkpoint. The schedule **never** turns on merely because a user runs
-the CLI.
+The EventBridge schedule is controlled by an explicit
+`AWS::Events::Rule.State` conditional; the original SAM
+`Schedule.Enabled` condition was flattened in the live transformed stack.
+Its rule and Lambda permission retain their prior CloudFormation logical IDs.
+Production GitHub Actions reads externally controlled
+`vars.COMPLETED_HISTORY_CLEANUP_APPLY` with a **disabled `false` default**.
+It also refuses enabled cleanup unless the #277 implementation exists
+in the exact deployed source revision. The workflow verifies the deployed
+CloudFormation parameter, Lambda environment flag and actual EventBridge
+rule state. Operators can manually run the dry-run
+`npm run state:cleanup-completed` CLI while the schedule is disabled;
+manual dry-run checkpoint state is separate from the apply cursor.
 
-**Recovery boundary:** Completing a standalone task already deletes its active
-`EVENT#`, `TASK#` and `TASKOWNER#` mapping immediately; the seven-day
-cleanup removes only its guarded `COMPLETED_TASK#` lookup. It deliberately
-**keeps the permanent `COMPLETED_EVENT#` marker**, even when Todoist project
-mapping comments and Google Calendar `extendedProperties.shared.taskId`
-survive. Those provider breadcrumbs support identity recovery, but today's
-synchronizer explicitly ignores historical completed projections on normal
-Todoist updates. Therefore, **uncompleting a task or changing its date is
-not yet guaranteed to reactivate that Calendar event automatically**.
-A future change must verify the live reopened Todoist task, exact provider
-identity, newer version, no competing profile/recurrence/tombstone/erasure,
-and atomically transition the event guard into an active mapping. Do not
-remove completion markers or automatically reimport completed Calendar
-history as a shortcut.
-
-It scans the table in bounded pages and uses a post-read filter to
-select `COMPLETED_TASK` rows; it then groups the task's strongly consistent
-completion references, and retires all eligible task-side completion lookup
-rows in **one guarded transaction**, retaining `COMPLETED_EVENT`. It can also
-remove a strictly older baseline with a timestamp condition. It checks all
-three profiles' task mapping indexes, the global TASKOWNER, event mapping
-indexes, and recurrence ownership before writing. A missing/changed guard,
-unverified recurrence, more than 12 history rows, or an active owner is a
-*safety skip*, never permission to delete. A verified exhausted recurrence
-uses an immutable `COMPLETED_SERIES#profile#seriesId` certificate (no Todoist
-task reference) to retire older occurrences in safe transactional batches of
-at most 12 event references; without the certificate a truncated multi-row
-history query is always skipped. Version, canonical, tombstone,
-audit, delivery and other state are untouched.
-
-Eligibility starts at **seven full 24-hour periods** since the latest
-persisted completion. A missing Todoist task, old due date, cancelled instance,
-or lack of an available next occurrence does **not** establish terminality.
-Calendar-owned finite COUNT/UNTIL series can be marked terminal only after
-confirming the current master and absence of a successor and atomically
-retiring its unchanged recurrence link. Todoist-owned rolling series require
-a freshly returned completed provider task with no recurring due. Finality
-is recorded as a permanent series certificate, which allows cleanup of older
-occurrences only after the latest terminal completion's seven-day grace.
-All other recurring histories deliberately remain in `skipped_ambiguous`
-for human review. The **scheduled worker never modifies live providers**.
-Project mapping comments require a separate provider-aware, human-reviewed
-operation; they are never removed merely because a task lookup row vanished.
+A verified exhausted recurrence uses the existing immutable
+`COMPLETED_SERIES#profile#seriesId` terminal certificate (no Todoist
+task reference) for bounded terminal task-side cleanup; active recurrence
+ownership or ambiguous completion remains in `skipped_ambiguous`.
+The standalone seven-day rule does **not** imply that a rolling recurrence
+has ended. The worker never modifies either provider and cannot purge
+permanent Calendar event-side completion history. No Todoist project
+comment is deleted by this automatic maintenance task; the separately
+guarded manual comment procedure below remains available.
 
 ### Operator-only project-comment retirement
 
@@ -213,15 +195,18 @@ project comments have been retired.
 
 ### Verification and staged activation
 
-1. Deploy production with explicit `CompletedHistoryCleanupApply=true`, then verify
-   the EventBridge rule is **ENABLED**, the Lambda environment also says
-   `true`, and the apply cursor advances while the dry-run cursor is unused.
-   For a rollback, deploy `false` and verify the rule is **DISABLED**. The
-   default for unapproved stacks produces no daily scan reports or checkpoint writes.
-   Instead run the documented manual dry-run CLI as needed; if an operator
-   explicitly invokes the Lambda in dry-run mode, its checkpoint may advance
-   without modifying completion records. Inspect
-   `terminal_completed_history_cleanup_report` for manual invocations.
+1. Merge and deploy **#277 first** with cleanup off. Confirm the mapping
+   remains during the seven-day grace; Calendar never changes on completion
+   or uncompletion. Keep the production environment variable
+   `COMPLETED_HISTORY_CLEANUP_APPLY` absent or `false` and verify the
+   rule is `DISABLED` after deploying #275. Once #277 and #275 have both
+   been deployed and tested, a production operator can set that variable to
+   `true` and re-run the deployment. The workflow checks the #277 source
+   prerequisite, Lambda apply flag and live rule state before reporting
+   success. To disable further retirement, change the variable back to
+   `false`, redeploy and verify `DISABLED`; already retired indexes are
+   not recreated. Manual dry-run may persist an independent `DRY_RUN_STATE`
+   checkpoint without modifying completion records.
 2. Use an authorized read-only session to run `npm ci` then
    `npm run state:cleanup-completed -- --max-pages=40`. The output is a
    dry-run report with `eligible`, `retired`, `skipped_active`,
