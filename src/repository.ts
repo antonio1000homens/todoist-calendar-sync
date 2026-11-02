@@ -2210,6 +2210,54 @@ export class StateRepository {
     }
   }
 
+  /**
+   * An explicit uncompletion re-enables a still-retained standalone mapping
+   * without touching Google Calendar. A task whose indexes have been retired
+   * is deliberately NOT restored, even if provider comments still exist.
+   */
+  async reopenRetainedStandaloneMapping(mapping: Mapping, taskUpdatedAt: string | undefined): Promise<boolean> {
+    if (mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId
+      || mapping.activeInstanceId || !taskUpdatedAt || !Number.isFinite(Date.parse(taskUpdatedAt))) return false;
+    const table = this.ensureTable();
+    const history = await this.getCompletedCalendarProjectionByEvent(mapping.profile, mapping.eventId);
+    if (!history || history.taskId !== mapping.taskId || history.recurrenceOwner
+      || history.seriesId || history.masterEventId || history.terminalVerified
+      || !Number.isFinite(Date.parse(history.completedAt))
+      || Date.parse(taskUpdatedAt) <= Date.parse(history.completedAt)) return false;
+    const values = { ":profile": mapping.profile, ":task": mapping.taskId,
+      ":event": mapping.eventId, ":completed": history.completedAt };
+    const identity = "#profile = :profile AND taskId = :task AND eventId = :event AND completedAt = :completed";
+    const matchingMap = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :mappingUpdated";
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: identity + " AND attribute_not_exists(recurrenceOwner)",
+        ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
+      { Delete: { TableName: table, Key: key(`COMPLETED_TASK#${mapping.profile}#${mapping.taskId}`, `EVENT#${mapping.eventId}`),
+        ConditionExpression: identity + " AND attribute_not_exists(recurrenceOwner)",
+        ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
+      ...[
+        key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+        key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
+        key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+      ].map((rowKey) => ({ ConditionCheck: { TableName: table, Key: rowKey,
+        ConditionExpression: matchingMap + " AND attribute_not_exists(recurrenceOwner)",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: { ...values, ":mappingUpdated": mapping.updatedAt } } })),
+      { ConditionCheck: { TableName: table, Key: key(`ERASURE#${mapping.profile}`, "FENCE"),
+        ConditionExpression: "attribute_not_exists(pk)" } },
+    ];
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{Code?: string}> };
+      if (conditionalFailure(error) || cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
+      throw error;
+    }
+  }
+
   async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
     await client.send(new TransactWriteCommand({
       TransactItems: [
