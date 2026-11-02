@@ -4,7 +4,7 @@ import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, re
 import { createRoot } from "react-dom/client";
 import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
-import { caseUrl, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
+import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -87,7 +87,7 @@ function App() {
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
-    setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+    setAction(item?.decision?.type?.startsWith("operational_")?"":"link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
@@ -328,6 +328,10 @@ function App() {
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
+  const recordedIds=recordedPrimaryProviderIds(selected);
+  const recordedTaskId=recordedIds.taskId, recordedEventId=recordedIds.eventId;
+  const verifiedRepairTarget=Boolean((taskId&&repairSelection.verifiedTaskId===taskId)
+    ||(eventId&&repairSelection.verifiedEventId===eventId));
   const snapshots=details?.snapshots||[];
   const affectedGroups=groupAffectedSnapshots(snapshots);
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
@@ -435,11 +439,20 @@ function App() {
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
-            <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
-              ["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
-            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-            <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
-            <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
+            {recordedTaskId&&<label>Todoist ID recorded on alert
+              <input value={recordedTaskId} readOnly aria-label="Recorded Todoist task ID" />
+              <small>Provider status: {recordedProviderState("todoist",recordedTaskId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            {recordedEventId&&<label>Calendar ID recorded on alert
+              <input value={recordedEventId} readOnly aria-label="Recorded Calendar event ID" />
+              <small>Provider status: {recordedProviderState("calendar",recordedEventId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            {!verifiedRepairTarget&&<p className="notice">No live item selected for repair. Use Find counterpart below or refresh affected items to verify a current item; the recorded IDs above may refer to deleted items.</p>}
+            {verifiedRepairTarget&&<label>Repair action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
+              ["","Choose a repair action"],["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
+            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>}
+            {(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a live task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for a live event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
             {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
               invalidatePreview();
