@@ -60,3 +60,17 @@ export function previewEffect(snapshot, intent, plan) {
   if (disposition === "delete") return { operation:"Delete exact one-off and purge attributable state", result:"Apply only after the preview verifies this exact object has no recurrence or retained completion history" };
   return { operation:"Selected repair / contextual item", result:"See planned changes below" };
 }
+
+/** A retained Google htmlLink is not proof that an event still exists. */
+export function providerLink(item, side) {
+  if (!item || (side === "calendar" && item.status !== "confirmed")
+    || (side === "todoist" && item.is_deleted)) return undefined;
+  const href = item.url || item.htmlLink;
+  if (typeof href !== "string" || !href) return undefined;
+  try {
+    const parsed = new URL(href);
+    return ["https:", "http:"].includes(parsed.protocol) ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+}

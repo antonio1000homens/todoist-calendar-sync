@@ -3,8 +3,8 @@ import { createReviewApiClient, createRetryingTask, isAbortError, reconciliation
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { ErasurePanel } from "./erasure-panel";
-import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
-import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "./case-url.mjs";
+import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
+import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -197,7 +197,6 @@ function App() {
     refreshTask.start();
     return ()=>refreshTask.stop();
   },[terminalInboxRefreshPending,profile,history]);
-  const providerLink=(item:ProviderObject|undefined, side:"todoist"|"calendar") => providerSnapshotLink(item,side);
   const displaySnapshot=(sideName:"todoist"|"calendar") => {
     const matches=details?.snapshots?.filter((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName)||[];
     const requestedId=sideName==="todoist"?taskId:eventId;
@@ -211,7 +210,7 @@ function App() {
     const seriesAssociation=current.recurrence
       ? `Todoist ${current.recurrence.taskId} ↔ Calendar occurrence ${current.recurrence.activeInstanceId||current.recurrence.eventId} · series master ${current.recurrence.masterEventId} (${current.recurrence.owner}-owned)`
       : undefined;
-    return <>{sideName==="calendar"&&item.status==="cancelled"&&<p className="warning">Cancelled / deleted in Google Calendar. This is a retained tombstone, not a verified live event.</p>}<IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
+    return <><IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{sideName==="calendar"&&item.status==="cancelled"&&<p className="warning">Cancelled / deleted in Google Calendar. Its retained URL is not an active event link.</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
@@ -331,6 +330,9 @@ function App() {
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
   const snapshots=details?.snapshots||[];
+  const calendarEvidenceLink=(id:string)=>providerLink(snapshots.find((snapshot:any)=>
+    snapshot?.ref?.profile===selected?.profile && snapshot.ref.side==="calendar"
+    && snapshot.ref.id===id && snapshot.object?.id===id)?.object,"calendar");
   const affectedGroups=groupAffectedSnapshots(snapshots);
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
@@ -391,8 +393,8 @@ function App() {
           </dl>
           <p>Historical cause is not inferred from the current live items. The live provider panels below show what could be verified at this check.</p>
           {identityEvidence?.hasAnyRecordedIdentity?<div><strong>Recorded provider identities</strong>
-            <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedTaskIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
-            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedEventIds.includes(id)?" · verified live":" · cancelled, deleted or unverified"}</span>):"none"}</p>
+            <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id} · {recordedProviderState("todoist",id,snapshots,selected?.profile)}</span>):"none"}</p>
+            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id} · {recordedProviderState("calendar",id,snapshots,selected?.profile)}{calendarEvidenceLink(id)&&<> · <a href={calendarEvidenceLink(id)} target="_blank" rel="noreferrer">Open in Google Calendar</a></>}</span>):"none"}</p>
             {identityEvidence.seriesIds.length>0&&<p>Series identity (not a provider event ID): {identityEvidence.seriesIds.join(", ")}</p>}
           </div>:<p className="warning">Unable to identify a provider item from the recorded alert. Search or refresh to establish a live identity; repair stays unavailable until a current item is verified.</p>}
           {(selected.decision?.context?.candidateTaskIds?.length||selected.decision?.context?.candidateEventIds?.length||selected.decision?.context?.candidates?.length)&&<div className="candidate-search">

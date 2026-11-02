@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "../review-ui/case-url.mjs";
+import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "../review-ui/case-url.mjs";
 
 test("case URL follows case selection and removes stale case parameters",()=>{
   assert.equal(caseUrl("https://example.test/review/?case=old&tab=history","new").href,
@@ -66,6 +66,21 @@ test("cancelled recurrence master and occurrence are grouped without losing exac
   assert.equal(groups.length,2);
 });
 
+test("cancelled Calendar tombstones are verified as deleted, not mislabelled live",()=>{
+  const item={eventId:"4qqousburkrnq07abcq9chu8dg"};
+  const cancelled={ref:{profile:"home",side:"calendar",id:item.eventId},object:{
+    id:item.eventId,status:"cancelled",htmlLink:"https://www.google.com/calendar/event?eid=stale",
+  }};
+  const identity=caseIdentityState(item,[cancelled]);
+  assert.deepEqual(identity.verifiedEventIds,[]);
+  assert.equal(recordedProviderState("calendar",item.eventId,[cancelled],"home"),"cancelled / deleted in Google Calendar");
+  assert.equal(recordedProviderState("calendar",item.eventId,[{...cancelled,object:null}],"home"),"missing (404/410)");
+  assert.equal(recordedProviderState("calendar",item.eventId,[],"home"),"candidate / unverified");
+  const confirmed={...cancelled,object:{...cancelled.object,status:"confirmed"}};
+  assert.deepEqual(caseIdentityState(item,[confirmed]).verifiedEventIds,[item.eventId]);
+  assert.equal(recordedProviderState("calendar",item.eventId,[confirmed],"home"),"verified live");
+});
+
 test("cancelled Calendar identities are never presented as verified live or linked to stale htmlLinks",async()=>{
   const caseItem={eventId:"annual-master",taskId:"missing-task",decision:{context:{}}};
   const snapshots=[
@@ -81,5 +96,5 @@ test("cancelled Calendar identities are never presented as verified live or link
   assert.equal(providerSnapshotLink({id:"occ",status:"confirmed",htmlLink:"javascript:alert(1)"},"calendar"),undefined);
   const source=await readFile(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
   assert.match(source,/Cancelled \/ deleted in Google Calendar/);
-  assert.match(source,/providerSnapshotLink\(item,side\)/);
+  assert.match(source,/providerLink\(item,sideName\)/);
 });

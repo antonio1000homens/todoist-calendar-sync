@@ -20,7 +20,8 @@ export function caseIdsFromEvidence(item) {
 export function caseIdentityState(item, snapshots=[]) {
   const ids=caseIdsFromEvidence(item);
   const verified=new Set(snapshots.filter((snapshot)=>snapshot?.object?.id===snapshot?.ref?.id
-    && snapshot.object.status!=="cancelled" && !snapshot.object.is_deleted)
+    && (snapshot.ref.side !== "calendar" || snapshot.object.status === "confirmed")
+    && (snapshot.ref.side !== "todoist" || !snapshot.object.is_deleted))
     .map((snapshot)=>`${snapshot.ref.side}:${snapshot.ref.id}`));
   return {
     taskIds:[...new Set(ids.taskIds)], eventIds:[...new Set(ids.eventIds)],
@@ -29,6 +30,22 @@ export function caseIdentityState(item, snapshots=[]) {
     verifiedEventIds:[...new Set(ids.eventIds.filter((id)=>verified.has(`calendar:${id}`)))],
     hasAnyRecordedIdentity:ids.taskIds.length+ids.eventIds.length>0,
   };
+}
+
+/** Status of this exact provider identity, not the historical alert's claim. */
+export function recordedProviderState(side, id, snapshots=[], profile) {
+  const snapshot=snapshots.find(entry=>entry?.ref?.side===side && entry.ref.id===id
+    && (!profile || entry.ref.profile===profile));
+  if (!snapshot) return "candidate / unverified";
+  if (!snapshot.object) return "missing (404/410)";
+  if (snapshot.object.id!==id) return "identity mismatch / unverified";
+  if (side==="calendar") {
+    if (snapshot.object.status==="cancelled") return "cancelled / deleted in Google Calendar";
+    return snapshot.object.status==="confirmed" ? "verified live" : "status unverified";
+  }
+  if (snapshot.object.is_deleted) return "deleted in Todoist";
+  if (snapshot.object.is_completed) return "completed in Todoist";
+  return "verified live";
 }
 
 export function dispositionGuidance(disposition) {
@@ -61,15 +78,6 @@ export function groupAffectedSnapshots(snapshots=[]) {
   })}));
 }
 
-/** Links are accepted only from a verified active provider object. A cancelled
- * Calendar tombstone may retain an old htmlLink but is not a live event. */
-export function providerSnapshotLink(item, side) {
-  if (!item || item.status === "cancelled" || item.is_deleted
-    || (side === "calendar" && item.status !== "confirmed")) return undefined;
-  const value = item.url || item.htmlLink;
-  if (typeof value !== "string" || !value) return undefined;
-  try {
-    const parsed = new URL(value);
-    return ["https:", "http:"].includes(parsed.protocol) ? parsed.href : undefined;
-  } catch { return undefined; }
-}
+/** Compatibility alias for the deleted-conflict review regression tests.
+ * Reuse the shared, active-provider-only URL policy. */
+export { providerLink as providerSnapshotLink } from "./item-identity.mjs";
