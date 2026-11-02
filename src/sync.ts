@@ -457,7 +457,7 @@ export function todoistCalendarLifecycle(payload: TodoistWebhookPayload): Todois
   const eventName = payload.event_name || "";
   const oldTask = payload.event_data_extra?.old_item;
   const explicitlyDeleted = /deleted/i.test(eventName) || Boolean(task.is_deleted);
-  const uncompleted = /uncompleted/i.test(eventName) && task.is_completed !== true;
+  const uncompleted = /uncompleted/i.test(eventName);
   const completed = !uncompleted && (/completed/i.test(eventName) || Boolean(task.is_completed));
   const hadDue = taskHasDue(oldTask);
   const hasDue = taskHasDue(task);
@@ -1747,8 +1747,22 @@ export class Synchronizer {
       // its completion guard, but DO NOT PATCH or recreate the Calendar event.
       // After retirement, no mapping can be reactivated from title/date.
       const mapped = existingMapping?.profile === delivery.profile ? existingMapping : undefined;
-      const restored = mapped && !mapped.recurrenceOwner
-        ? await this.state.reopenRetainedStandaloneMapping?.(mapped, task.updated_at)
+      let verifiedVersion: string | undefined;
+      if (mapped && !mapped.recurrenceOwner) {
+        // The webhook can be delayed. Never trust its uncompleted label or
+        // timestamp as proof the current task is active.
+        let current: TodoistTask | undefined;
+        try { current = await (await this.clients(delivery.profile)).todoist.getTask(task.id); }
+        catch (error) {
+          if (Number((error as { status?: number }).status) !== 404) throw error;
+        }
+        if (current?.id === task.id && current.is_completed === false
+          && !current.is_deleted && current.project_id === profiles[delivery.profile].todoistProjectId) {
+          verifiedVersion = current.updated_at;
+        }
+      }
+      const restored = mapped && verifiedVersion
+        ? await this.state.reopenRetainedStandaloneMapping?.(mapped, verifiedVersion)
         : false;
       return this.state.audit(delivery.profile, restored ? "todoist_uncompleted_mapping_retained" : "todoist_uncompleted_no_active_mapping", {
         taskId: task.id, eventId: mapped?.eventId,
