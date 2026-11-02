@@ -1695,6 +1695,12 @@ export class Synchronizer {
     let task = payload.event_data;
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
+    // Every Todoist-origin Calendar update/delete holds this task's durable
+    // write fence until provider and mapping writes finish. Completion retries
+    // rather than committing its immutable marker mid-mutation.
+    const writeFence = lifecycle.action === "upsert" || lifecycle.action === "delete_projection"
+      ? await this.state.beginTodoistCalendarWrite?.(task.id) : undefined;
+    try {
     // Epochs reject messages already admitted before an erasure fence. An old
     // Todoist webhook can also arrive after that fence and receive the new
     // epoch, so upserts must be checked against current provider state too.
@@ -2353,6 +2359,9 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "todoist_pair_sync_control_blocked", { taskId: task.id, eventId: existingEvent?.id || mapping?.eventId });
     }
 
+    // Revalidate after all remote lookups. The write fence prevents a new
+    // completion from racing this check until the provider write is finished.
+    if (existingEvent && await this.calendarMutationBlockedByCompletion(delivery, existingEvent.id)) return;
     const desiredRrule = todoistRecurrenceToRrule(task);
     const previousSeriesId = mapping?.recurrenceOwner === "todoist" ? mapping.seriesId : undefined;
     if (mapping?.recurrenceOwner === "todoist" && existingEvent?.recurrence?.length && !desiredRrule) {
@@ -2421,8 +2430,7 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       if (todoistRecurring && !preservedCalendarMapping) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
-      const completedProjection = await this.getCompletedProjection(delivery.profile, existingEvent.id);
-      if (completedProjection?.taskId === task.id) await this.deleteCompletedProjection(completedProjection);
+      // Only the verified uncompletion path can withdraw completion markers.
       return this.state.audit(delivery.profile, "todoist_noop_canonical_state", { taskId: task.id, eventId: existingEvent.id });
     }
     const event = toCalendarEvent(task, existingEvent, !recurringDateEdit);
@@ -2460,8 +2468,7 @@ export class Synchronizer {
     await this.state.putMapping(nextMapping);
     if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
     else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
-    const completedProjection = await this.getCompletedProjection(delivery.profile, stored.id);
-    if (completedProjection?.taskId === task.id) await this.deleteCompletedProjection(completedProjection);
+    // Ordinary updates must never clear a completion guard, even on retries.
     if (projectionTombstone) await this.state.deleteCalendarProjectionTombstone(delivery.profile, task.id);
     await this.state.recordRecurrence(delivery.profile, stored.id, stored.recurrence);
     await this.state.recordMutation(delivery.profile);
@@ -2472,6 +2479,9 @@ export class Synchronizer {
       activeInstanceId: active?.id,
       recurrenceReanchored: recurringDateEdit && todoistRrule,
     });
+    } finally {
+      if (writeFence) await this.state.endTodoistCalendarWrite?.(task.id, writeFence);
+    }
   }
 
   private async processOrphan(delivery: Delivery): Promise<void> {
