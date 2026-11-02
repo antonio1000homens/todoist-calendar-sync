@@ -392,3 +392,14 @@ test("a stale completed task update cannot rebind a lifecycle-retired mapping", 
   assert.equal(f.calendarUpserts.length, 0);
   assert.deepEqual(f.eventMap.get(old.id), old);
 });
+
+test("an explicitly added task never reuses an unrelated Calendar orphan on matching title and date", async () => {
+  const existing = timedEvent("unrelated-calendar-event", "School run", 8);
+  const fresh = timedTask("brand-new-task", "School run", 8);
+  const f = fixture({ events: [existing], tasks: [fresh] });
+  await f.sync.process(delivery("todoist", JSON.stringify({ event_name: "item:added", event_data: fresh })));
+  assert.equal(f.calendarUpserts.length, 1);
+  assert.equal(f.calendarUpserts[0].existingId, undefined);
+  assert.notEqual(f.calendarUpserts[0].id, existing.id);
+  assert.deepEqual(f.eventMap.get(existing.id), existing);
+});
