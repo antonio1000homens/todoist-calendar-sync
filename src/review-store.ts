@@ -4,6 +4,7 @@ import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
 import { retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
@@ -145,6 +146,51 @@ export class ReviewStore {
       } catch (error) { if (!conditional(error)) throw error; }
     }
   }
+  /**
+   * Active deletion conflict guards are bounded pointers, not a permanent
+   * per-provider tombstone. They are created only after a deletion notification
+   * matched an existing actionable case and expire after seven days. The
+   * pointed-to case must still be open/repairing and mention this exact ID.
+   */
+  async indexDeletedConflictCase(item: ReviewCase): Promise<void> {
+    if (item.status !== "open" || !item.id || !item.profile) return;
+    const evidence = reviewCaseEvidenceIds(item);
+    if (!evidence.taskIds.length || !evidence.eventIds.length
+      || evidence.taskIds.length + evidence.eventIds.length > 20) return;
+    const expiry = Math.floor(Date.now() / 1000) + 7 * 86400;
+    const refs = [
+      ...evidence.taskIds.map(id => ({ side: "todoist", id })),
+      ...evidence.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of refs) {
+      await this.db.send(new PutCommand({ TableName: reviewTable(),
+        Item: { pk: `DELETION_REVIEW#${item.profile}#${ref.side}#${ref.id}`,
+          sk: `CASE#${item.id}`, caseId: item.id, profile: item.profile,
+          expiresAt: expiry },
+      }));
+    }
+  }
+
+  /** True means an open case still claims this exact provider identity and
+   * sync must not create a new counterpart until it is re-evaluated.
+   */
+  async hasActiveDeletionGuard(profile: Profile, side: "todoist" | "calendar", id: string): Promise<boolean> {
+    if (!id) return false;
+    const page = await this.db.send(new QueryCommand({ TableName: reviewTable(),
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": `DELETION_REVIEW#${profile}#${side}#${id}`,
+        ":prefix": "CASE#" }, ConsistentRead: true, Limit: 40 }));
+    if (page.LastEvaluatedKey) return true; // fail closed on suspiciously crowded identity
+    for (const row of page.Items || []) {
+      if (!row.caseId || Number(row.expiresAt || 0) <= Date.now() / 1000) continue;
+      const item = await this.getCase(String(row.caseId));
+      if (!item || item.profile !== profile || !["open", "repairing"].includes(item.status)) continue;
+      const ids = reviewCaseEvidenceIds(item);
+      if ((side === "todoist" ? ids.taskIds : ids.eventIds).includes(id)) return true;
+    }
+    return false;
+  }
+
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
   async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {
     const result = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
@@ -225,18 +271,9 @@ export class ReviewStore {
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || current.status !== "open"
       || current.operationId) return false;
-    const context = current.decision?.context || {};
+    const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     const strings = (value: unknown): string[] => Array.isArray(value)
       ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
-    const candidateItems = Array.isArray(context.candidates)
-      ? context.candidates.map((candidate: unknown) => (candidate as { id?: unknown } | null)?.id) : [];
-    const taskIds = [current.taskId, current.decision?.taskId, context.providerTaskId,
-      context.taskId, context.masterTaskId, ...strings(context.candidateTaskIds), ...candidateItems]
-      .filter((v): v is string => typeof v === "string" && Boolean(v));
-    const eventIds = [current.eventId, current.decision?.eventId, current.decision?.masterEventId,
-      current.decision?.activeInstanceId, context.providerEventId, context.eventId,
-      context.masterEventId, context.activeInstanceId, ...strings(context.candidateEventIds)]
-      .filter((v): v is string => typeof v === "string" && Boolean(v));
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
       || eventIds.some(id => !expected.eventIds.includes(id))) return false;
