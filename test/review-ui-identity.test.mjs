@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "../review-ui/item-identity.mjs";
+import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "../review-ui/item-identity.mjs";
 
 const calendar = (id, start, extra={})=>({
   ref:{profile:"home",side:"calendar",id},
@@ -85,4 +85,14 @@ test("cancelled Calendar and deleted Todoist objects can be excluded but not use
   assert.deepEqual(dispositionOptions({ref:{profile:"home",side:"todoist",id:"old"},object:{id:"old"},mapping:{recurrenceOwner:"calendar"}},"transfer"),["create","exclude","retain-unlinked","delete"]);
   assert.deepEqual(dispositionOptions(calendar("confirmed","2027-03-01"),"transfer"),["create","exclude","unchanged","delete"]);
   assert.deepEqual(dispositionOptions({ref:{profile:"home",side:"calendar",id:"missing"},object:null}),[]);
+});
+
+test("cancelled Calendar event with stale Google htmlLink cannot be opened as live",()=>{
+  const url="https://www.google.com/calendar/event?eid=abc123";
+  assert.equal(providerLink({id:"event",status:"confirmed",htmlLink:url},"calendar"),url);
+  assert.equal(providerLink({id:"event",status:"cancelled",htmlLink:url},"calendar"),undefined);
+  assert.equal(providerLink({id:"event",htmlLink:url},"calendar"),undefined);
+  assert.equal(providerLink({id:"event",status:"confirmed",htmlLink:"javascript:alert(1)"},"calendar"),undefined);
+  assert.equal(providerLink({url:"https://app.todoist.com/app/task/active"},"todoist"),"https://app.todoist.com/app/task/active");
+  assert.equal(providerLink({url:"https://app.todoist.com/app/task/deleted",is_deleted:true},"todoist"),undefined);
 });
