@@ -15,10 +15,8 @@ function resourceBlock(name) {
 }
 
 const retainedAlarms = [
-  "WatchRenewalFailureAlarm", "WatchMissingAlarm", "WatchLambdaErrorsAlarm",
-  "ErasureWorkerErrorsAlarm",
-  "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
-  "WorkerErrorsAlarm",
+  "WatchLambdaErrorsAlarm",
+  "ErasureWorkerErrorsAlarm", "WorkerErrorsAlarm",
   "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
   "ProfileLookupIndexReadThrottleAlarm", "ProfileLookupIndexWriteThrottleAlarm",
 ];
@@ -26,10 +24,13 @@ const retainedAlarms = [
 const removedAlarms = [
   "DynamoDbReadUtilizationAlarm", "DynamoDbWriteUtilizationAlarm",
   "ProfileLookupIndexReadUtilizationAlarm", "ProfileLookupIndexWriteUtilizationAlarm",
+  // Explicitly authorised removals; log-derived metrics must continue to exist.
+  "WatchRenewalFailureAlarm", "WatchMissingAlarm",
+  "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
   "DlqAlarm", "ErasureDlqAlarm", "SourceQueueAgeAlarm", "SourceQueueDepthAlarm",
 ];
 
-test("retains all 11 worker, erasure-state, watch, and throttle alarms on AlertTopic", () => {
+test("retains 7 worker, watch-Lambda, and throttle alarms on AlertTopic", () => {
   const alarms = [...template.matchAll(/^  ([A-Za-z][A-Za-z0-9]*):\n    Type: AWS::CloudWatch::Alarm$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(alarms.sort(), [...retainedAlarms].sort());
@@ -39,7 +40,7 @@ test("retains all 11 worker, erasure-state, watch, and throttle alarms on AlertT
   }
 });
 
-test("removes the utilization and SQS alarms while preserving distinct throttle and erasure-state signals", () => {
+test("removes utilization, custom-metric, and SQS alarms while preserving throttles", () => {
   for (const name of removedAlarms) assert.equal(resourceBlock(name), "", `${name} should be absent`);
   for (const name of [
     "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
@@ -47,14 +48,18 @@ test("removes the utilization and SQS alarms while preserving distinct throttle 
   ]) assert.notEqual(resourceBlock(name), "", `${name} must remain`);
 });
 
-test("keeps log-derived safety metrics and documents the actual alert route and coverage tradeoff", () => {
+test("keeps all four log-derived custom metric filters and documents the coverage tradeoff", () => {
   for (const name of ["ErasureReviewRequiredMetricFilter", "ErasureRecoveryBlockedMetricFilter",
     "WatchRenewalFailureMetricFilter", "WatchMissingMetricFilter"]) {
     assert.match(resourceBlock(name), /Type: AWS::Logs::MetricFilter/);
   }
   assert.match(inventory, /zero SNS subscriptions/);
-  assert.match(inventory, /eight alarm-metric units/);
+  assert.match(inventory, /eight alarm-metric\s+units/);
   assert.match(inventory, /Capacity nears its provisioned limit before throttling/);
+  assert.match(inventory, /custom metric charges can continue/i);
+  assert.match(inventory, /no direct CloudWatch alarm/i);
+  assert.match(inventory, /10 minutes plus up to five minutes of scrape wait/);
+  assert.match(inventory, /Grafana/);
 });
 
 test("documents every retained and removed alarm in the review matrix", () => {
@@ -67,10 +72,4 @@ test("documents every retained and removed alarm in the review matrix", () => {
     "profile-lookup-read-utilization", "profile-lookup-write-utilization",
   ];
   for (const suffix of suffixes) assert.ok(inventory.includes(`\`${suffix}\``), `${suffix} needs an inventory row`);
-});
-
-test("documents Grafana coverage and the delayed source queue alert tradeoff", () => {
-  assert.match(inventory, /Dead-letter queues.*Grafana/s);
-  assert.match(inventory, /10-minute.*delay/s);
-  assert.match(inventory, /tech debt/i);
 });
