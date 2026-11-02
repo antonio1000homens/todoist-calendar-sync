@@ -71,8 +71,8 @@ conditions as automatically paged after this change.
   ratio as the **marginal price** would be wrong because of Free Tier
   credits/allowances. Review full-month post-deployment cost and usage type.
 - PR #257 removed four utilization alarms, each containing two underlying
-  standard-resolution metrics in metric math. That change removed **eight
-  alarm-metric units**, a maximum **$0.80 gross per full month** under the same
+  standard-resolution metrics in metric math. That change removed **eight alarm-metric units**,
+  a maximum **$0.80 gross per full month** under the same
   assumptions. The earlier $0.40 estimate did not account for both metrics in
   each math alarm.
 - This PR removes four single-metric SQS alarms, a maximum **$0.40 gross per
