@@ -927,6 +927,23 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
+    if (!continuation && tableName && this.state instanceof StateRepository) {
+      // A missed deletion webhook must not let recurring recovery re-create
+      // a surviving side before the terminal review pass. Prime exact-ID
+      // guards from already-open cases before any recurrence/provider writes.
+      const reviews = new ReviewStore();
+      let reviewCursor: Record<string, unknown> | undefined;
+      let indexed = 0;
+      do {
+        const page = await reviews.listCases(profile, reviewCursor, false);
+        for (const item of page.items) {
+          if (item.status !== "open") continue;
+          if (++indexed > 100) throw new Error("Too many active conflict identities to fence safely; reconciliation deferred");
+          await reviews.indexDeletedConflictCase(item);
+        }
+        reviewCursor = page.cursor as Record<string, unknown> | undefined;
+      } while (reviewCursor);
+    }
     if (!continuation) await this.reconcileExistingRecurrence(profile);
 
     const clients = await this.clients(profile);
