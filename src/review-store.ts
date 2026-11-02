@@ -476,6 +476,49 @@ export class ReviewStore {
         ExpressionAttributeValues: { ":auditKey": pointer.auditKey },
       } });
     }
+    // The earlier provider/state reads are only a preflight. Fence the shared
+    // DynamoDB ownership and repair/completion indexes in the SAME atomic
+    // transaction as the terminal case update. A concurrent sync or repair
+    // that claims any verified identity must cancel the entire retirement.
+    const profiles: Profile[] = ["home", "antonio", "work"];
+    const absence = new Map<string, { pk: string; sk: string }>();
+    const checkAbsent = (pk: string, sk = "MAP"): void => {
+      absence.set(`${pk}|${sk}`, { pk, sk });
+    };
+    for (const taskId of expected.taskIds) {
+      checkAbsent(`TASKOWNER#${taskId}`);
+      for (const candidateProfile of profiles) {
+        checkAbsent(`TASK#${candidateProfile}#${taskId}`);
+        // Todoist-owned recurrence key uses task ID as its series identity.
+        checkAbsent(`RECURRENCE#${candidateProfile}#${taskId}`, "STATE");
+      }
+    }
+    for (const eventId of expected.eventIds) {
+      for (const candidateProfile of profiles) {
+        checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
+        checkAbsent(`COMPLETED_EVENT#${candidateProfile}#${eventId}`, "STATE");
+        for (const taskId of expected.taskIds) {
+          checkAbsent(`COMPLETED_TASK#${candidateProfile}#${taskId}`, `EVENT#${eventId}`);
+        }
+      }
+    }
+    // Never ConditionCheck a key that is also deleted in this transaction.
+    // Such a duplicate would invalidate all DynamoDB transactions.
+    const modified = new Set(items.flatMap(x =>
+      [x.Update?.Key, x.Delete?.Key, x.Put?.Item].filter(Boolean)
+        .map(key => `${key!.pk}|${key!.sk}`)));
+    for (const [k, Key] of absence) {
+      if (modified.has(k)) continue;
+      items.push({ ConditionCheck: { TableName: reviewTable(), Key,
+        ConditionExpression: "attribute_not_exists(pk)" } });
+    }
+    for (const ref of refs) {
+      items.push({ ConditionCheck: { TableName: reviewTable(),
+        Key: key(`SYNC_CONTROL#${ref.profile}:${ref.side}:${ref.id}`),
+        ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
+        ExpressionAttributeValues: { ":no": false },
+      } });
+    }
     if (items.length > 95) return false; // leave open for safe bounded retry
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
