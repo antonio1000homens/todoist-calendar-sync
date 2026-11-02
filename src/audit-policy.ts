@@ -28,6 +28,9 @@ const ROUTINE_EXACT_ACTIONS = new Set([
   // Keep their structured CloudWatch telemetry without writing AUDIT# rows.
   "calendar_elapsed_standalone_event_ignored",
   "calendar_archived_series_delta_ignored",
+  // Verified deletion is a resolved lifecycle outcome, never a new retained
+  // conflict that can be re-seeded into the review inbox.
+  "todoist_snapshot_reconcile_verified_deletion_retired",
 ]);
 
 const REVIEWED_ROUTINE_ACTION_RE = /(?:^|_)(?:started|completed|queued|requested|coalesced|processed|reconciled|baselined|converged|created|updated|moved|written_back|rejoined|noop)(?:$|_)/;
@@ -51,6 +54,24 @@ const DEDUPED_CONFLICT_ACTIONS = new Set([
   "todoist_snapshot_reconcile_unmapped_conflict",
   "todoist_snapshot_reconcile_cancelled_projection_blocked",
 ]);
+
+/**
+ * Reverse-index only explicitly recorded provider IDs in significant conflict
+ * audits. Matching titles and dates must never become deletion evidence.
+ */
+export function retainedAuditProviderIds(detail: Record<string, unknown>): {
+  taskIds: string[]; eventIds: string[];
+} {
+  const ids = (values: unknown[]): string[] => [...new Set(values.filter(
+    (id): id is string => typeof id === "string" && /^[A-Za-z0-9_.-]{1,256}$/.test(id)))];
+  const list = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
+  return {
+    taskIds: ids([detail.taskId, detail.providerTaskId, detail.masterTaskId,
+      ...list(detail.candidateTaskIds)]),
+    eventIds: ids([detail.eventId, detail.providerEventId, detail.masterEventId,
+      detail.activeInstanceId, ...list(detail.candidateEventIds)]),
+  };
+}
 
 export function retainedConflictEntity(detail: Record<string, unknown>): string | undefined {
   for (const field of ["taskId", "eventId", "seriesId"] as const) {

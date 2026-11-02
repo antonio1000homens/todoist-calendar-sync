@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "../review-ui/case-url.mjs";
+import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "../review-ui/case-url.mjs";
 
 test("case URL follows case selection and removes stale case parameters",()=>{
   assert.equal(caseUrl("https://example.test/review/?case=old&tab=history","new").href,
@@ -79,4 +79,22 @@ test("cancelled Calendar tombstones are verified as deleted, not mislabelled liv
   const confirmed={...cancelled,object:{...cancelled.object,status:"confirmed"}};
   assert.deepEqual(caseIdentityState(item,[confirmed]).verifiedEventIds,[item.eventId]);
   assert.equal(recordedProviderState("calendar",item.eventId,[confirmed],"home"),"verified live");
+});
+
+test("cancelled Calendar identities are never presented as verified live or linked to stale htmlLinks",async()=>{
+  const caseItem={eventId:"annual-master",taskId:"missing-task",decision:{context:{}}};
+  const snapshots=[
+    {ref:{profile:"home",side:"calendar",id:"annual-master"},object:{
+      id:"annual-master",status:"cancelled",htmlLink:"https://calendar.google.com/calendar/event?eid=obsolete"}},
+    {ref:{profile:"home",side:"todoist",id:"missing-task"},object:null},
+  ];
+  const identity=caseIdentityState(caseItem,snapshots);
+  assert.deepEqual(identity.verifiedEventIds,[]);
+  assert.equal(providerSnapshotLink(snapshots[0].object,"calendar"),undefined);
+  assert.equal(providerSnapshotLink({...snapshots[0].object,status:"confirmed"},"calendar"),
+    "https://calendar.google.com/calendar/event?eid=obsolete");
+  assert.equal(providerSnapshotLink({id:"occ",status:"confirmed",htmlLink:"javascript:alert(1)"},"calendar"),undefined);
+  const source=await readFile(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  assert.match(source,/Cancelled \/ deleted in Google Calendar/);
+  assert.match(source,/providerLink\(item,sideName\)/);
 });
