@@ -218,3 +218,15 @@ test("one-sided creation requires a verifiable due date and is revoked by later 
   assert.equal(revalidateRepairAction("create",before).revoked,false);
   assert.equal(revalidateRepairAction("create",after).revoked,true);
 });
+
+test("Calendar search result with incomplete series metadata is not treated as standalone",()=>{
+  const selection={...select("","searched"),verifiedEventId:"searched",
+    searchedEvent:{id:"searched",caseId:"case-284",profile,status:"confirmed",
+      start:{date:"2026-01-01"},end:{date:"2026-01-02"},etag:"etag"}};
+  const r=assess([],selection);
+  assert.equal(r.summary.eventRole,"unknown");
+  no(r,"create","calendar-history-only","todoist-only-delete-calendar","transfer");
+  const identity=providerIdentity({_profile:profile,_side:"calendar",id:"searched",_caseId:"case-284",
+    status:"confirmed",start:{date:"2026-01-01"},end:{date:"2026-01-02"}});
+  assert.match(identity.recurrence,/unknown/i);
+});
