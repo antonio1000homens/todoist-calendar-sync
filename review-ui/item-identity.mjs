@@ -12,8 +12,22 @@ export function providerIdentity(value) {
   const end = side === "calendar" ? object?.end?.dateTime || object?.end?.date : undefined;
   const date = start ? end && end !== start ? `${start} → ${end}` : start
     : side === "todoist" ? "No due date" : "Start unavailable";
-  let recurrence = "One-off / not recurring";
-  if (side === "todoist" && object?.due?.is_recurring) {
+  // Missing providers and incomplete Calendar recurrence metadata must never
+  // be presented as proof that a historical item was standalone.
+  let recurrence = !object || object.id !== id || side === "calendar" && object.status !== "confirmed"
+    ? "Recurrence unknown — item unavailable / not verified"
+    : side === "calendar" && !object.recurringEventId && !Array.isArray(object.recurrence)
+      && (value?._side==="calendar" || !object.start || !object.end)
+      ? "Recurrence unknown — Calendar search/series metadata incomplete"
+      : object?.due?.is_recurring===undefined && side==="todoist" && object?.due
+        ? "Recurrence unknown — Todoist due rule unverified"
+        : "One-off / not recurring";
+  const current = Boolean(object?.id===id
+    && (side==="calendar" ? object.status==="confirmed"
+      : side==="todoist" ? !object.is_deleted&&!object.is_completed : false));
+  if (!current) {
+    recurrence = "Recurrence unknown — item unavailable / not verified";
+  } else if (side === "todoist" && object?.due?.is_recurring) {
     recurrence = `Recurring Todoist task (${object.due.string || "rule unavailable"})`;
   } else if (side === "calendar" && object?.recurringEventId) {
     const original = object.originalStartTime?.dateTime || object.originalStartTime?.date;

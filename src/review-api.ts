@@ -430,6 +430,27 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const preview = await reviewEngine.preview(actor,intent);
       return response(200,{preview});
     }
+    // Read-only recheck for an unselected repair action. Do not manufacture
+    // a mutating intent or call the preview/apply pipeline.
+    if (method === "GET" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
+      const item = await store.getCase(segments[1]);
+      if (!item) return response(404,{error:"conflict_not_found"});
+      const query = event.queryStringParameters || {};
+      if (Object.keys(query).some(key => !["taskId","eventId"].includes(key)))
+        fail(400,"Unsupported recheck parameters");
+      const checkedId = (value: string | undefined): string | undefined => {
+        if (!value) return undefined;
+        if (value.length > 1024 || [...value].some(char => char.charCodeAt(0) < 32))
+          fail(400,"Invalid provider item ID");
+        return value;
+      };
+      const selectedTaskId = checkedId(query.taskId) || undefined;
+      const selectedEventId = checkedId(query.eventId) || undefined;
+      const intent: RepairIntent = {caseId:item.id,profile:item.profile,action:"link",
+        taskId:selectedTaskId,eventId:selectedEventId,winner:"none",scope:"occurrence",leftovers:{}};
+      const snapshots = await reviewEngine.collect(intent,item.decision);
+      return response(200,{item,snapshots});
+    }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});

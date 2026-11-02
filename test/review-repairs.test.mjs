@@ -2782,3 +2782,21 @@ test("completed Calendar deletion resumes after later mapping cleanup failure",a
   assert.equal(h.mappingMap.size,0);
   assert.deepEqual(h.writes,[["delete-event",projection.id]],"resume trusts the recorded exact deletion and does not repeat it");
 });
+
+test("forged contextual repair intents cannot preview two missing provider objects",async t=>{
+  const h=harness(t,{tasks:[],events:[]});
+  for(const action of ["link","verify","create","move","transfer","flatten"]){
+    await assert.rejects(()=>h.engine.preview(actor,intent({action})),
+      /Select|live|requires|confirmed|not found|missing|current|source|Calendar/i,action);
+  }
+  assert.deepEqual(h.writes,[],"read-only preview rejects forged intent without writes");
+});
+
+test("forged cross-profile context and unavailable Slack decision remain backend-rejected",async t=>{
+  const h=harness(t);
+  await assert.rejects(()=>h.engine.preview(actor,intent({profile:"work"})),
+    /Conflict not found in this profile/);
+  await assert.rejects(()=>h.engine.preview(actor,intent({action:"decision",decisionAction:"delete"})),
+    /permitted repair action|Select a permitted/);
+  assert.deepEqual(h.writes,[]);
+});

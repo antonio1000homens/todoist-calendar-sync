@@ -224,6 +224,24 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   assert.equal(inbox.status,200);
   assert.deepEqual(inbox.body.items.map(item=>item.id),["case-1"]);
 
+  // A no-action recheck uses GET with the selected exact provider IDs. It
+  // must never synthesize a mutation or require a repair action.
+  const readOnly=await jsonResponse(await handler(event("/review/api/cases/case-1/affected?taskId=task-1&eventId=occurrence","GET",headers)));
+  assert.equal(readOnly.status,200,JSON.stringify(readOnly.body));
+  assert.equal(readOnly.body.item.id,"case-1");
+  assert.deepEqual(readOnly.body.snapshots.map(snapshot=>snapshot.ref.id),["task-1","occurrence","series-master"]);
+  assert.equal(persistedPreviews.length,0);
+  assert.equal(caseUpdates.length,0);
+  assert.equal(queueCalls.length,0);
+  for(const query of ["taskId=invalid%0Atask","taskId=task-1&unexpected=1"]){
+    const rejected=await jsonResponse(await handler(event(`/review/api/cases/case-1/affected?${query}`,"GET",headers)));
+    assert.equal(rejected.status,400,"read-only route must validate IDs and parameters");
+  }
+  const noActionWrite=await jsonResponse(await handler(event("/review/api/cases/case-1/affected","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk",
+  },{action:"",winner:"none",scope:"occurrence",leftovers:{}})));
+  assert.equal(noActionWrite.status,400,"legacy mutation route must not accept empty actions");
+
   t.mock.method(StateRepository.prototype,"getReconciliationState",async profile=>({profile,generation:"generation-1"}));
   t.mock.method(StateRepository.prototype,"listReconciliationDiagnostics",async(profile,generation,limit,after)=>({
     items:[{profile,generation,action:"todoist_snapshot_reconcile_unmapped_conflict",outcome:"conflict",
