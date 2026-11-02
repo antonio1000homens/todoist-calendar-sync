@@ -662,21 +662,6 @@ Resources:
           MetricValue: "1"
           DefaultValue: 0
 
-  WatchRenewalFailureAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-watch-renewal-failures-${Stage}
-      AlarmDescription: A Google Calendar watch replacement failed; inspect the watch Lambda logs and verify the previous watch.
-      Namespace: TodoistCalendarSync/Watch
-      MetricName: RenewalFailures
-      Statistic: Sum
-      Period: 900
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
   WatchMissingMetricFilter:
     Type: AWS::Logs::MetricFilter
     DependsOn: WatchLogGroup
@@ -688,21 +673,6 @@ Resources:
           MetricName: MissingWatches
           MetricValue: "1"
           DefaultValue: 0
-
-  WatchMissingAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-watch-missing-${Stage}
-      AlarmDescription: The watch lifecycle check found a profile without persisted Calendar watch state.
-      Namespace: TodoistCalendarSync/Watch
-      MetricName: MissingWatches
-      Statistic: Sum
-      Period: 900
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
 
   WatchLambdaErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -797,36 +767,6 @@ Resources:
           MetricName: RecoveryBlocked
           MetricValue: "1"
           DefaultValue: 0
-
-  ErasureRecoveryBlockedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-recovery-blocked-${Stage}
-      AlarmDescription: Guarded erasure recovery stopped on drift; preserve the profile fence and inspect the durable operation.
-      Namespace: TodoistCalendarSync/Erasure
-      MetricName: RecoveryBlocked
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ErasureReviewRequiredAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-review-required-${Stage}
-      AlarmDescription: An item-erasure operation entered review_required; do not manually release a profile fence or mapping.
-      Namespace: TodoistCalendarSync/Erasure
-      MetricName: ReviewRequired
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
 
   SourceQueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
