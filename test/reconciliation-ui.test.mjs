@@ -39,3 +39,15 @@ test('active run polling refreshes the inbox and announces terminal status witho
   assert.ok(source.includes('Retained task: {item.detail.retainedTaskId}'));
   assert.ok(source.includes('Decision: {item.detail.decisionId}'));
 });
+
+test('dismissing an open review alert is single-click without changing the dismiss-only action', async () => {
+  const source = await readFile(new URL('../review-ui/main.tsx', import.meta.url), 'utf8');
+  const dismiss = source.match(/const dismissAlert=async \(\) => \{([\s\S]*?)\n  \};/)?.[1];
+  assert.ok(dismiss, 'dismiss handler must remain available');
+  assert.doesNotMatch(dismiss, /(?:window\.)?confirm\s*\(/);
+  assert.match(dismiss, /if\(!selected\|\|selected\.status!=="open"\)return;/);
+  assert.ok(dismiss.includes('api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"})'));
+  assert.match(dismiss, /setBusy\(true\)/);
+  assert.match(dismiss, /Alert dismissed\. Its history remains available/);
+  assert.match(source, /onClick=\{dismissAlert\} disabled=\{busy\}>Dismiss alert only/);
+});
