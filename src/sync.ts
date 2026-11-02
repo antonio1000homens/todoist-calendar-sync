@@ -1399,8 +1399,11 @@ export class Synchronizer {
         return this.state.audit(delivery.profile,"calendar_task_link_ambiguous_conflict",{eventId:event.id,taskId:task.id,ownerProfile:owner.profile,mappedEventId:owner.eventId});
       }
     }
-    if (task && await this.state.syncBlocked(delivery.profile, { taskId:task.id, eventId:event.id })) {
+    if (task && await this.state.syncBlocked(delivery.profile, { taskId:task.id, eventId:event.id }, !mapping)) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:event.id, taskId:task.id });
+    }
+    if (!mapping && await this.state.syncBlocked(delivery.profile, { eventId:event.id }, true)) {
+      return this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { eventId:event.id });
     }
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "calendar_mutation_suppressed", { eventId: event.id, taskId: task?.id, mode: delivery.mode });
@@ -1758,7 +1761,8 @@ export class Synchronizer {
       }
     }
     const controlProfile = existingMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
-    if (await this.state.syncBlocked(controlProfile, { taskId: task.id, eventId: existingMapping?.eventId })) {
+    if (await this.state.syncBlocked(controlProfile, { taskId: task.id, eventId: existingMapping?.eventId },
+      lifecycle.action === "upsert" && !existingMapping)) {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });
     }
     const recurringDateEdit = todoistRecurringDateEdited(payload);
