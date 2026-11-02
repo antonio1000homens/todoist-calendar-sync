@@ -272,8 +272,6 @@ export class ReviewStore {
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
       || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
-    const strings = (value: unknown): string[] => Array.isArray(value)
-      ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
       || eventIds.some(id => !expected.eventIds.includes(id))) return false;
@@ -285,11 +283,10 @@ export class ReviewStore {
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
     const detail = source?.detail && typeof source.detail === "object"
       ? source.detail as Record<string, unknown> : undefined;
-    const attributedIds = detail ? [detail.taskId, detail.eventId,
-      ...strings(detail.candidateTaskIds), ...strings(detail.candidateEventIds)]
-      .filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
-    const attributable = Boolean(source && detail && attributedIds.length > 0
-      && attributedIds.every(id => expected.taskIds.includes(id) || expected.eventIds.includes(id)));
+    const attribution = detail ? retainedAuditProviderIds(detail) : { taskIds: [], eventIds: [] };
+    const attributable = Boolean(source && detail && attribution.taskIds.length + attribution.eventIds.length > 0
+      && attribution.taskIds.every(id => expected.taskIds.includes(id))
+      && attribution.eventIds.every(id => expected.eventIds.includes(id)));
     const pointerKey = current.conflictKey && current.id.startsWith("incident-")
       ? { pk: `REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`, sk: `INCIDENT#${caseId}` }
       : undefined;
