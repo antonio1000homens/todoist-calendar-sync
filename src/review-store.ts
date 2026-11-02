@@ -3,7 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
-import { retainedConflictIdentity } from "./audit-policy.js";
+import { retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
