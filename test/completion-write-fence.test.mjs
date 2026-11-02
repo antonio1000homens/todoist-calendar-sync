@@ -110,3 +110,39 @@ test("an in-flight Calendar write prevents completion from committing a guard", 
     assert.equal(guard.eventId, "fence-event");
   } finally { documentClient.send = original; }
 });
+
+test("Calendar write lease release aliases the reserved DynamoDB token field", async () => {
+  const original = documentClient.send;
+  let attempted = 0;
+  documentClient.send = async (command) => {
+    assert.ok(command instanceof DeleteCommand);
+    attempted++;
+    assert.equal(command.input.Key.pk, "CALENDAR_WRITE#fence-task");
+    assert.equal(command.input.ConditionExpression, "#token = :token");
+    assert.deepEqual(command.input.ExpressionAttributeNames, { "#token": "token" });
+    assert.deepEqual(command.input.ExpressionAttributeValues, { ":token": "lease-owner-token" });
+    return {};
+  };
+  try {
+    await state.endTodoistCalendarWrite("fence-task", "lease-owner-token");
+    assert.equal(attempted, 1);
+  } finally {
+    documentClient.send = original;
+  }
+});
+
+test("Calendar write lease release still ignores a replaced lease but propagates other errors", async () => {
+  const original = documentClient.send;
+  let error = Object.assign(new Error("Lease owned by another worker"), { name: "ConditionalCheckFailedException" });
+  documentClient.send = async (command) => {
+    assert.ok(command instanceof DeleteCommand);
+    throw error;
+  };
+  try {
+    await state.endTodoistCalendarWrite("fence-task", "old-token");
+    error = Object.assign(new Error("DynamoDB unavailable"), { name: "ValidationException" });
+    await assert.rejects(state.endTodoistCalendarWrite("fence-task", "old-token"), /DynamoDB unavailable/);
+  } finally {
+    documentClient.send = original;
+  }
+});
