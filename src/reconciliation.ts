@@ -738,7 +738,7 @@ export class SnapshotReconciler {
   }
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
-    if (await this.state.syncBlocked(profile, { taskId: task.id })) {
+    if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: task.id, reason: "active_review_control",
       });
