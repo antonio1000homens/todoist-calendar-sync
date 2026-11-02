@@ -268,8 +268,9 @@ test("an operational DLQ case shows its missing task as read-only evidence, not 
   assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link"),false);
   const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
   assert.match(source,/value=\{recordedTaskId\} readOnly aria-label="Recorded Todoist task ID"/);
-  assert.match(source,/!verifiedRepairTarget&&<p className="notice">No live item selected for repair/);
-  assert.match(source,/setAction\(item\?\.decision\?\.type\?\.startsWith\("operational_"\)\?"":"link"\)/);
+  assert.match(source,/!capabilities\.actions\.length&&<p className="notice" role="status">No currently eligible repair action/);
+  assert.match(source,/setAction\(""\)/);
+  assert.match(source,/availableRepairActions\(/);
 });
 
 test("a verified recorded task can populate repair selection without making the evidence editable", () => {
