@@ -450,6 +450,23 @@ export class ReviewStore {
     }
   }
 
+  async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string): Promise<void> {
+    try {
+      await this.db.send(new UpdateCommand({ TableName: reviewTable(),
+        Key: key(`REVIEW_CASE#${caseId}`),
+        UpdateExpression: "SET #result = :message, updatedAt = :now",
+        ConditionExpression: "#status = :open AND updatedAt = :version AND attribute_not_exists(operationId)",
+        ExpressionAttributeNames: { "#status": "status", "#result": "result" },
+        ExpressionAttributeValues: { ":open": "open", ":version": expectedUpdatedAt,
+          ":message": "deletion_cleanup_deferred: current provider, mapping or audit state changed; retry is required",
+          ":now": new Date().toISOString() },
+      }));
+    } catch (error) {
+      // A changed case is not ours to update; preserve newer review/repair state.
+      if (!conditional(error)) throw error;
+    }
+  }
+
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
