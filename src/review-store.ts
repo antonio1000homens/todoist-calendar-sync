@@ -358,7 +358,7 @@ export class ReviewStore {
     // Every candidate audit is re-read and deleted only when *all* its
     // recorded provider IDs are within this verified-deleted fixture.
     const auditDeletes = new Set(items.filter(x => x.Delete)
-      .map(x => x.Delete?.Key.pk).filter((value): value is string => typeof value === "string"));
+      .map(x => x.Delete?.Key?.pk).filter((value): value is string => typeof value === "string"));
     const referenceKeys = [
       ...expected.taskIds.map(id => `AUDIT_REF#${expected.profile}#todoist#${id}`),
       ...expected.eventIds.map(id => `AUDIT_REF#${expected.profile}#calendar#${id}`),
