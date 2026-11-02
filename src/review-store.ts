@@ -149,7 +149,7 @@ export class ReviewStore {
   /**
    * Active deletion conflict guards are bounded pointers, not a permanent
    * per-provider tombstone. They are created only after a deletion notification
-   * matched an existing actionable case and expire after seven days. The
+   * matched an existing actionable case, with a bounded expiry. The
    * pointed-to case must still be open/repairing and mention this exact ID.
    */
   async indexDeletedConflictCase(item: ReviewCase): Promise<void> {
@@ -157,7 +157,7 @@ export class ReviewStore {
     const evidence = reviewCaseEvidenceIds(item);
     if (!evidence.taskIds.length || !evidence.eventIds.length
       || evidence.taskIds.length + evidence.eventIds.length > 20) return;
-    const expiry = Math.floor(Date.now() / 1000) + 7 * 86400;
+    const expiry = Math.floor(Date.now() / 1000) + 90 * 86400;
     const refs = [
       ...evidence.taskIds.map(id => ({ side: "todoist", id })),
       ...evidence.eventIds.map(id => ({ side: "calendar", id })),
@@ -269,8 +269,8 @@ export class ReviewStore {
     expected: { profile: Profile; taskIds: string[]; eventIds: string[] },
   ): Promise<boolean> {
     const current = await this.getCase(caseId);
-    if (!current || current.profile !== expected.profile || current.status !== "open"
-      || current.operationId) return false;
+    if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
+      || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     const strings = (value: unknown): string[] => Array.isArray(value)
       ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
@@ -279,7 +279,7 @@ export class ReviewStore {
       || eventIds.some(id => !expected.eventIds.includes(id))) return false;
 
     const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
-    if (manual && (manual.status !== "pending" || manual.profile !== expected.profile
+    if (manual && (!["pending", "resolved"].includes(manual.status) || manual.profile !== expected.profile
       || manual.decisionId !== caseId)) return false;
     const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
@@ -300,21 +300,30 @@ export class ReviewStore {
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
       { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
-        UpdateExpression: "SET #status = :resolved, #result = :result, updatedAt = :now, lookupSk = :lookup, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey",
-        ConditionExpression: "#status = :open AND updatedAt = :version AND attribute_not_exists(operationId)",
+        UpdateExpression: "SET #status = :resolved, #result = :result, updatedAt = :now, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, title, reason, reconciliationGeneration, progressCheckpoint, coalescedInto",
+        ConditionExpression: "#status = :old AND updatedAt = :version AND attribute_not_exists(operationId)",
         ExpressionAttributeNames: { "#status": "status", "#result": "result" },
         ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution,
-          ":now": now, ":open": "open", ":version": current.updatedAt,
-          ":lookup": `REVIEW#CLOSED#${current.createdAt}#${caseId}`,
+          ":now": now, ":old": current.status, ":version": current.updatedAt,
           ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
       } },
     ];
     if (manual) items.push({ Update: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
-      UpdateExpression: "SET #status = :resolved, resolution = :result, resolvedAt = :now REMOVE lookupPk, lookupSk, #context",
-      ConditionExpression: "#status = :pending AND profile = :profile AND decisionId = :id AND createdAt = :createdAt",
+      UpdateExpression: "SET #status = :resolved, resolution = :result, resolvedAt = :now REMOVE lookupPk, lookupSk, #context, taskId, eventId, masterEventId, activeInstanceId, seriesId, mappingSnapshot",
+      ConditionExpression: "#status = :old AND profile = :profile AND decisionId = :id AND createdAt = :createdAt",
       ExpressionAttributeNames: { "#status": "status", "#context": "context" },
-      ExpressionAttributeValues: { ":pending": "pending", ":resolved": "resolved", ":profile": expected.profile,
+      ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
         ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
+    } });
+    // Remove exact case-scoped deletion-review guards. Their unique case sort
+    // key means this cannot remove guards owned by other unresolved cases.
+    const refs = [
+      ...expected.taskIds.map(id => ({ side: "todoist", id })),
+      ...expected.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of refs) items.push({ Delete: { TableName: reviewTable(),
+      Key: { pk: `DELETION_REVIEW#${expected.profile}#${ref.side}#${ref.id}`,
+        sk: `CASE#${caseId}` },
     } });
     if (pointer?.incidentId === caseId && pointerKey) items.push({ Delete: {
       TableName: reviewTable(), Key: pointerKey,
