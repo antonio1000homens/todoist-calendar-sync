@@ -215,12 +215,25 @@ export class ReviewStore {
   }
 
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
-  async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {
+  async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false, limit = 50) {
     const result = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
       KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)",
-      ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": history ? "REVIEW#" : "REVIEW#OPEN#" }, Limit: 50,
+      ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": history ? "REVIEW#" : "REVIEW#OPEN#" }, Limit: Math.min(50, Math.max(1, limit)),
       ExclusiveStartKey: cursor }));
     return { items: (result.Items || []) as ReviewCase[], cursor: result.LastEvaluatedKey };
+  }
+  /** Round-robin pagination across reconciliation generations; a hot first
+   * page cannot starve newer deleted cases indefinitely. */
+  async deletionSweepCursor(profile: Profile, history: boolean): Promise<Record<string, unknown> | undefined> {
+    const marker = await this.get<{ cursor?: Record<string, unknown> }>(`DELETION_SWEEP#${profile}#${history ? "history" : "open"}`);
+    return marker?.cursor;
+  }
+  async saveDeletionSweepCursor(profile: Profile, history: boolean, cursor?: Record<string, unknown>): Promise<void> {
+    const pk = `DELETION_SWEEP#${profile}#${history ? "history" : "open"}`;
+    // A null cursor restarts from the first page after a complete sweep.
+    await this.db.send(new PutCommand({ TableName: reviewTable(),
+      Item: { ...key(pk), ...(cursor ? { cursor } : {}), expiresAt: Math.floor(Date.now() / 1000) + 7 * 86400 },
+    }));
   }
   async countActionableCases(profile: Profile): Promise<number> {
     let count = 0;
