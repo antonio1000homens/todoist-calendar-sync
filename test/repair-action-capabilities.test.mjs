@@ -53,7 +53,7 @@ test("exact mapped one-off pair exposes verify and guarded standalone deletion, 
 
 test("recurring Todoist task and current Calendar occurrence can expose flatten with master evidence",()=>{
   const t=taskSnap({due:{date:"2027-02-01",is_recurring:true,string:"every year"}});
-  const master=eventSnap({id:"master",recurrence:["RRULE:FREQ=YEARLY"]});
+  const master=eventSnap({id:"master",recurrence:["RRULE:FREQ=YEARLY"]},{calendarProjectionId:"event"});
   master.ref.id="master";
   const current=eventSnap({recurringEventId:"master"});
   const r=assess([t,master,current]);
@@ -66,7 +66,7 @@ test("recurring Todoist task and current Calendar occurrence can expose flatten 
 
 test("recurring Todoist and Calendar master with selected current occurrence may offer guarded transfer",()=>{
   const t=taskSnap({due:{date:"2027-02-01",is_recurring:true,string:"every year"}});
-  const m=eventSnap({recurrence:["RRULE:FREQ=YEARLY"]},{calendarProjectionId:"occ"});
+  const m=eventSnap({recurrence:["RRULE:FREQ=YEARLY"],extendedProperties:{shared:{syncRecurrenceOwner:"calendar"}}},{calendarProjectionId:"occ"});
   const occ=eventSnap({id:"occ",recurringEventId:"event"});
   occ.ref.id="occ";
   const r=assess([t,m,occ]);
@@ -78,7 +78,7 @@ test("recurring Todoist and Calendar master with selected current occurrence may
 
 test("one-off Todoist plus recurring Calendar occurrence can show flatten (not Todoist-only)",()=>{
   const t=taskSnap();
-  const master=eventSnap({id:"master",recurrence:["RRULE:FREQ=YEARLY"]});
+  const master=eventSnap({id:"master",recurrence:["RRULE:FREQ=YEARLY"]},{calendarProjectionId:"event"});
   master.ref.id="master";
   const current=eventSnap({recurringEventId:"master"});
   const r=assess([t,master,current]);
@@ -98,7 +98,7 @@ test("elapsed standalone Calendar item with verified Todoist identity can detach
   const e=eventSnap({start:{date:"2024-02-01"},end:{date:"2024-02-02"},
     extendedProperties:{shared:{taskId:"historical-task"}}});
   const r=assess([e],select("","event"));
-  yes(r,"calendar-history-only","create","exclude");
+  yes(r,"calendar-history-only","exclude");
   assert.equal(actionFormFields("calendar-history-only").scope,false);
   no(assess([eventSnap({start:{date:"2028-02-01"},end:{date:"2028-02-02"},
     extendedProperties:{shared:{taskId:"historical-task"}}})],select("","event")),"calendar-history-only");
@@ -246,4 +246,55 @@ test("historical mapping evidence is stale when its provider item is missing",()
   const answer=assess([absent,eventSnap()]);
   assert.equal(answer.summary.mapping,"stale / unverified mapping");
   no(answer,"verify","link","transfer");
+});
+
+test("recheck eligibility keeps only the recurrence scopes consumed by preview",()=>{
+  for(const action of ["create","separate","exclude","verify","decision","move","todoist-only","calendar-history-only"]){
+    assert.equal(actionFormFields(action,{hasRecurrence:true}).scope,false,action);
+  }
+  for(const action of ["flatten","transfer","link"])
+    assert.equal(actionFormFields(action,{hasRecurrence:true}).scope,true,action);
+});
+test("pending Slack decisions are limited to their exact verified targets and bind_task choice",()=>{
+  const context=item();
+  context.decision={status:"pending",permittedActions:[
+    {id:"bind_task:task",label:"Bind current"},{id:"bind_task:another",label:"Bind another"}],
+    context:{providerEventId:"event"}};
+  const match=assess([taskSnap(),eventSnap()],select(),context);
+  yes(match,"decision");
+  assert.deepEqual(match.summary.decisionActions.map(x=>x.id),["bind_task:task"]);
+  const other=assess([taskSnap(),eventSnap({id:"another-event"})],select("task","another-event"),context);
+  no(other,"decision");
+  const noTask=assess([eventSnap()],select("","event"),context);
+  no(noTask,"decision");
+  const noChoice=item();
+  noChoice.decision={status:"pending",permittedActions:[{id:"reconcile_now"}]};
+  no(assess([taskSnap(),eventSnap()],select(),noChoice),"decision");
+});
+test("flatten requires verified current projection and transfer requires Calendar ownership",()=>{
+  const taskRecurring=taskSnap({due:{date:"2027-02-01",is_recurring:true,string:"every year"}});
+  const occurrence=eventSnap({recurringEventId:"master"});
+  const wrongMaster=eventSnap({id:"master",recurrence:["RRULE:FREQ=YEARLY"]},{calendarProjectionId:"previous"});
+  no(assess([taskRecurring,occurrence,wrongMaster]),"flatten");
+  const rightMaster={...wrongMaster,calendarProjectionId:"event"};
+  yes(assess([taskRecurring,occurrence,rightMaster]),"flatten");
+  const master=eventSnap({recurrence:["RRULE:FREQ=YEARLY"]},{calendarProjectionId:"occ"});
+  const active=eventSnap({id:"occ",recurringEventId:"event"});
+  no(assess([taskRecurring,master,active]),"transfer");
+  const claimed=eventSnap({recurrence:["RRULE:FREQ=YEARLY"],extendedProperties:{shared:{syncRecurrenceOwner:"calendar"}}},{calendarProjectionId:"occ"});
+  yes(assess([taskRecurring,claimed,active]),"transfer");
+});
+test("specialist Todoist-only requires a precisely shaped elapsed all-day pair",()=>{
+  const yearly=taskSnap({due:{date:"2027-02-01",is_recurring:true,string:"every year"}});
+  const history=eventSnap({start:{date:"2025-01-01"},end:{date:"2025-01-02"}});
+  yes(assess([yearly,history]),"todoist-only");
+  no(assess([taskSnap({due:{date:"2027-02-01",datetime:"2027-02-01T12:00:00Z",is_recurring:true,string:"every year"}}),history]),"todoist-only");
+  no(assess([yearly,eventSnap({start:{dateTime:"2025-01-01T12:00:00Z"},end:{dateTime:"2025-01-01T13:00:00Z"}})]),"todoist-only");
+});
+test("non-live historical providers are never displayed as recurring",()=>{
+  for(const missing of [
+    {ref:{side:"todoist",profile,id:"task"},object:{id:"task",is_completed:true,due:{is_recurring:true,string:"every week"}}},
+    {ref:{side:"todoist",profile,id:"task"},object:{id:"task",is_deleted:true,due:{is_recurring:true,string:"every week"}}},
+    {ref:{side:"calendar",profile,id:"event"},object:{id:"event",status:"cancelled",recurringEventId:"master",start:{date:"2024-01-01"}}},
+  ]) assert.match(providerIdentity(missing).recurrence,/unknown/i);
 });
