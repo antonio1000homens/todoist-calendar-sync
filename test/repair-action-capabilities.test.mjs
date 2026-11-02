@@ -121,7 +121,8 @@ test("missing, cancelled and unverified identities are not inferred as one-off o
   assert.match(providerIdentity(missing).recurrence,/unknown/i);
   assert.match(providerIdentity(cancelled).recurrence,/unknown/i);
   assert.equal(allowed(assess([taskSnap(),cancelled]),"create"),true);
-  no(assess([taskSnap({is_completed:true}),eventSnap()]),"link","verify","exclude");
+  no(assess([taskSnap({is_completed:true}),eventSnap()]),"link","verify");
+  yes(assess([taskSnap({is_completed:true}),eventSnap()]),"exclude"); // Calendar remains live
 });
 
 test("multiple live candidates do not silently authorize counterpart creation or auto-select an identity",()=>{
