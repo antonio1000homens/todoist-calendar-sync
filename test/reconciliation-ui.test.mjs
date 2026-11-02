@@ -46,9 +46,15 @@ test('dismissing an open review alert is single-click without changing the dismi
   assert.ok(dismiss, 'dismiss handler must remain available');
   assert.doesNotMatch(dismiss, /(?:window\.)?confirm\s*\(/);
   assert.match(dismiss, /if\(!selected\|\|selected\.status!=="open"\)return;/);
-  assert.ok(dismiss.includes('api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"})'));
+  assert.ok(dismiss.includes('api(`cases/${encodeURIComponent(dismissedCaseId)}/dismiss`,{method:"POST",body:"{}"})'));
   assert.match(dismiss, /setBusy\(true\)/);
-  assert.match(dismiss, /Alert dismissed\. Its history remains available/);
+  assert.match(dismiss, /Alert dismissed\. Select another alert/);
+  const requestPosition=dismiss.indexOf("await api(`cases/");
+  const clearedPosition=dismiss.indexOf("selectCase(undefined)");
+  assert.ok(requestPosition>=0 && clearedPosition>requestPosition, "selection clears only after dismissal succeeds");
+  assert.ok(dismiss.includes("selectedVersion===selectionVersion.current)selectCase(undefined)"), "do not clear newly selected cases");
+  assert.doesNotMatch(dismiss, /selectCase\(result\.item/);
+  assert.ok(source.includes('else window.history.replaceState(null,"",next)'), "clearing selection also removes the case URL parameter");
   assert.match(source, /onClick=\{dismissAlert\} disabled=\{busy\}>Dismiss alert only/);
 });
 
