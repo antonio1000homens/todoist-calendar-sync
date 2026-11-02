@@ -5,6 +5,17 @@ export function caseUrl(currentHref, caseId) {
   return url;
 }
 
+
+/** Primary IDs recorded by this alert are historical evidence, not live repair targets. */
+export function recordedPrimaryProviderIds(item) {
+  const context=item?.decision?.context||{};
+  const first=(...values)=>values.find(value=>typeof value==="string"&&value.trim().length>0)||"";
+  return {
+    taskId:first(context.providerTaskId,item?.decision?.taskId,item?.taskId,context.taskId),
+    eventId:first(context.providerEventId,item?.decision?.eventId,item?.eventId,context.eventId),
+  };
+}
+
 export function caseIdsFromEvidence(item) {
   const context=item?.decision?.context||{};
   const strings=(value)=>Array.isArray(value)?value.filter((id)=>typeof id==="string"&&id.length>0):[];

@@ -4,7 +4,7 @@ import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, re
 import { createRoot } from "react-dom/client";
 import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
-import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
+import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -87,7 +87,7 @@ function App() {
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
-    setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+    setAction(item?.decision?.type?.startsWith("operational_")?"":"link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
@@ -323,20 +323,27 @@ function App() {
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
-    if(!window.confirm("Dismiss this alert without changing Todoist, Calendar, or their mapping?"))return;
+    const dismissedCaseId=selected.id;
+    const selectedVersion=selectionVersion.current;
     setBusy(true);setMessage("");
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item,{syncUrl:false});await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
+    try {
+      await api(`cases/${encodeURIComponent(dismissedCaseId)}/dismiss`,{method:"POST",body:"{}"});
+      // Do not discard another case that the operator selected while the request was pending.
+      if(selectedVersion===selectionVersion.current)selectCase(undefined);
+      await refresh();
+      setMessage("Alert dismissed. Select another alert, or show history to revisit it.");
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
+  const recordedIds=recordedPrimaryProviderIds(selected);
+  const recordedTaskId=recordedIds.taskId, recordedEventId=recordedIds.eventId;
+  const verifiedRepairTarget=Boolean((taskId&&repairSelection.verifiedTaskId===taskId)
+    ||(eventId&&repairSelection.verifiedEventId===eventId));
   const snapshots=details?.snapshots||[];
-  const calendarEvidenceLink=(id:string)=>providerLink(snapshots.find((snapshot:any)=>
-    snapshot?.ref?.profile===selected?.profile && snapshot.ref.side==="calendar"
-    && snapshot.ref.id===id && snapshot.object?.id===id)?.object,"calendar");
   const affectedGroups=groupAffectedSnapshots(snapshots);
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
-  const identityEvidence=selected?caseIdentityState(selected,snapshots):undefined;
   const hasLiveIdentity=snapshots.some((snapshot:any)=>snapshot.ref?.profile===selected?.profile&&providerIdentity(snapshot).identified);
   const hasPrimaryProviderIds=Boolean(selected?.taskId||selected?.eventId||selected?.decision?.taskId||selected?.decision?.eventId
     ||alertContext.providerTaskId||alertContext.providerEventId);
@@ -380,29 +387,11 @@ function App() {
     <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{openCaseCount} open/actionable case(s) shown in this inbox.</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
-        <section className="preview alert-evidence"><h3>Why this alert is open</h3>
-          <p><strong>Recorded reason:</strong> {selected.reason.replaceAll("_"," ")}. {/(unmapped|identity_conflict|ambiguous)/i.test(`${selected.reason} ${selected.decision?.type||""}`)&&"Here, ‘unmapped’ means the sync identity or durable mapping is missing or ambiguous; it does not prove that the Calendar event is missing."}</p>
-          {selected.status==="resolved"&&selected.result?.startsWith("resolved_deleted")&&<p className="notice">Resolved by verified deletion. The provider items were absent and the obsolete sync identity was retired automatically; no manual dismissal was required.</p>}
-          {selected.result?.startsWith("deletion_cleanup_deferred")&&<p className="warning">Deletion cleanup could not be completed safely. This alert remains actionable; retry reconciliation after checking provider state, pending repairs and conflicting mappings.</p>}
-          <dl><dt>First seen / opened</dt><dd>{selected.createdAt?new Date(selected.createdAt).toLocaleString():"Not recorded"}</dd>
-            <dt>Last recorded observation</dt><dd>{selected.decision?.context?.lastObservedAt||selected.decision?.context?.lastSeenAt||selected.decision?.context?.observedAt?new Date(selected.decision.context.lastObservedAt||selected.decision.context.lastSeenAt||selected.decision.context.observedAt).toLocaleString():"Not recorded; case update time is not treated as a provider observation"}</dd>
-            <dt>Case state</dt><dd>{selected.status}{selected.updatedAt?` · case record updated ${new Date(selected.updatedAt).toLocaleString()}`:""}</dd>
-            <dt>Earlier dismissal / reopen history</dt><dd>{selected.decision?.context?.reopenedAt||selected.decision?.context?.dismissedAt?`${selected.decision.context.dismissedAt?`dismissed ${new Date(selected.decision.context.dismissedAt).toLocaleString()}`:""}${selected.decision.context.reopenedAt?` · reopened ${new Date(selected.decision.context.reopenedAt).toLocaleString()}`:""}`:"Not recorded on this case"}</dd>
-            <dt>Reconciliation generation</dt><dd>{selected.reconciliationGeneration||selected.decision?.context?.reconciliationGeneration||"Not recorded"}</dd>
-            <dt>Detection evidence</dt><dd>{selected.decision?.sourceAuditAction||selected.decision?.context?.action||"No source audit action recorded"}{selected.decision?.context?.reason?` · ${String(selected.decision.context.reason).replaceAll("_"," ")}`:""}</dd>
-          </dl>
-          <p>Historical cause is not inferred from the current live items. The live provider panels below show what could be verified at this check.</p>
-          {identityEvidence?.hasAnyRecordedIdentity?<div><strong>Recorded provider identities</strong>
-            <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id} · {recordedProviderState("todoist",id,snapshots,selected?.profile)}</span>):"none"}</p>
-            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id} · {recordedProviderState("calendar",id,snapshots,selected?.profile)}{calendarEvidenceLink(id)&&<> · <a href={calendarEvidenceLink(id)} target="_blank" rel="noreferrer">Open in Google Calendar</a></>}</span>):"none"}</p>
-            {identityEvidence.seriesIds.length>0&&<p>Series identity (not a provider event ID): {identityEvidence.seriesIds.join(", ")}</p>}
-          </div>:<p className="warning">Unable to identify a provider item from the recorded alert. Search or refresh to establish a live identity; repair stays unavailable until a current item is verified.</p>}
-          {(selected.decision?.context?.candidateTaskIds?.length||selected.decision?.context?.candidateEventIds?.length||selected.decision?.context?.candidates?.length)&&<div className="candidate-search">
-            <p>Recorded candidate identities are not selected automatically. Search by a recorded title, then inspect the live provider identity before choosing one.</p>
-            <button className="secondary" onClick={()=>{setSearchSide("todoist");setSearchText(selected.decision?.context?.candidates?.[0]?.content||selected.decision?.context?.taskTitle||selected.title);}}>Search Todoist candidates</button>
-            <button className="secondary" onClick={()=>{setSearchSide("calendar");setSearchText(selected.decision?.context?.calendarTitle||selected.title);}}>Search Calendar candidates</button>
-          </div>}
-          <details><summary>Recorded alert evidence</summary><pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre></details>
+        <section className="preview alert-evidence">
+          <details><summary>Recorded alert evidence</summary>
+            <pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre>
+            {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p>}
+          </details>
         </section>
         {selected.decision?.type==="operational_reconciliation_stuck"&&<section className="preview"><h3>Reconciliation diagnostics</h3>
           <dl>
@@ -445,16 +434,6 @@ function App() {
           {details?.reconciliation?.run?.nextContinuation&&<p>Current expected continuation: {details.reconciliation.run.nextContinuation.deliveryId} · {details.reconciliation.run.nextContinuation.phase} sequence {details.reconciliation.run.nextContinuation.sequence}</p>}
           <p>These fields are diagnostics from persisted state. A monitor stall does not establish why progress stopped. A queue acceptance record does not confirm current queue or DLQ state.</p>
         </section>}
-        {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<details className="preview"><summary>Delivery failure details</summary><dl>
-          {selected.decision.context?.kind&&<><dt>Delivery type</dt><dd>{selected.decision.context.kind}</dd></>}
-          {selected.decision.context?.status&&<><dt>Provider response</dt><dd>HTTP {selected.decision.context.status}</dd></>}
-          {selected.decision.context?.failure&&<><dt>Failure</dt><dd>{selected.decision.context.failure}</dd></>}
-          {selected.decision.context?.deliveryId&&<><dt>Delivery ID</dt><dd>{selected.decision.context.deliveryId}</dd></>}
-          {selected.decision.context?.providerErrorTag&&<><dt>Provider error</dt><dd>{selected.decision.context.providerErrorTag}</dd></>}
-          {selected.decision.context?.reconcileStage&&<><dt>Reconciliation stage</dt><dd>{selected.decision.context.reconcileStage}</dd></>}
-          {selected.decision.context?.providerTaskId&&<><dt>Failing task ID</dt><dd>{selected.decision.context.providerTaskId}</dd></>}
-          {selected.decision.context?.providerEventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.providerEventId}</dd></>}
-        </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
         {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
         {!details?<div className="notice detail-load" role="status">
           {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
@@ -468,11 +447,20 @@ function App() {
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
-            <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
-              ["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
-            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-            <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
-            <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
+            {recordedTaskId&&<label>Todoist ID recorded on alert
+              <input value={recordedTaskId} readOnly aria-label="Recorded Todoist task ID" />
+              <small>Provider status: {recordedProviderState("todoist",recordedTaskId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            {recordedEventId&&<label>Calendar ID recorded on alert
+              <input value={recordedEventId} readOnly aria-label="Recorded Calendar event ID" />
+              <small>Provider status: {recordedProviderState("calendar",recordedEventId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            {!verifiedRepairTarget&&<p className="notice">No live item selected for repair. Use Find counterpart below or refresh affected items to verify a current item; the recorded IDs above may refer to deleted items.</p>}
+            {verifiedRepairTarget&&<label>Repair action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
+              ["","Choose a repair action"],["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
+            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>}
+            {(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a live task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for a live event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
             {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
               invalidatePreview();
