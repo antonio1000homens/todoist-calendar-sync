@@ -2216,24 +2216,29 @@ export class StateRepository {
    * is deliberately NOT restored, even if provider comments still exist.
    */
   async reopenRetainedStandaloneMapping(mapping: Mapping, taskUpdatedAt: string | undefined): Promise<boolean> {
-    if (mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId
-      || mapping.activeInstanceId || !taskUpdatedAt || !Number.isFinite(Date.parse(taskUpdatedAt))) return false;
+    if (mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
+      || mapping.activeInstanceId || mapping.originalStart || mapping.activeEffectiveStart
+      || !taskUpdatedAt || !Number.isFinite(Date.parse(taskUpdatedAt))) return false;
     const table = this.ensureTable();
     const history = await this.getCompletedCalendarProjectionByEvent(mapping.profile, mapping.eventId);
+    const legacyHistory = history as (CompletedCalendarProjection & { recurrenceId?: string; activeInstanceId?: string }) | undefined;
     if (!history || history.taskId !== mapping.taskId || history.recurrenceOwner
-      || history.seriesId || history.masterEventId || history.terminalVerified
+      || legacyHistory?.recurrenceId || history.seriesId || history.masterEventId
+      || legacyHistory?.activeInstanceId || history.originalStart || history.terminalVerified
       || !Number.isFinite(Date.parse(history.completedAt))
-      || Date.parse(taskUpdatedAt) <= Date.parse(history.completedAt)) return false;
+      || Date.parse(taskUpdatedAt) <= Date.parse(history.completedAt)
+      || Date.now() - Date.parse(history.completedAt) >= 7 * 24 * 60 * 60_000) return false;
     const values = { ":profile": mapping.profile, ":task": mapping.taskId,
       ":event": mapping.eventId, ":completed": history.completedAt };
     const identity = "#profile = :profile AND taskId = :task AND eventId = :event AND completedAt = :completed";
-    const matchingMap = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :mappingUpdated";
+    const standaloneGuard = " AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(recurrenceId) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId) AND attribute_not_exists(originalStart) AND attribute_not_exists(activeEffectiveStart)";
+    const matchingMap = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :mappingUpdated" + standaloneGuard;
     const tx: Array<Record<string, unknown>> = [
       { Delete: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
-        ConditionExpression: identity + " AND attribute_not_exists(recurrenceOwner)",
+        ConditionExpression: identity + standaloneGuard,
         ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
       { Delete: { TableName: table, Key: key(`COMPLETED_TASK#${mapping.profile}#${mapping.taskId}`, `EVENT#${mapping.eventId}`),
-        ConditionExpression: identity + " AND attribute_not_exists(recurrenceOwner)",
+        ConditionExpression: identity + standaloneGuard,
         ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
       ...[
         key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
@@ -2242,7 +2247,10 @@ export class StateRepository {
       ].map((rowKey) => ({ ConditionCheck: { TableName: table, Key: rowKey,
         ConditionExpression: matchingMap + " AND attribute_not_exists(recurrenceOwner)",
         ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: { ...values, ":mappingUpdated": mapping.updatedAt } } })),
+        ExpressionAttributeValues: {
+          ":profile": mapping.profile, ":task": mapping.taskId,
+          ":event": mapping.eventId, ":mappingUpdated": mapping.updatedAt,
+        } } })),
       { ConditionCheck: { TableName: table, Key: key(`ERASURE#${mapping.profile}`, "FENCE"),
         ConditionExpression: "attribute_not_exists(pk)" } },
     ];
