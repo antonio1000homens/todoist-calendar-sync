@@ -621,10 +621,13 @@ export class SnapshotReconciler {
         }
         if (!absent) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, { profile, taskIds, eventIds });
-        if (!closed) await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
-          taskId: taskIds[0], eventId: eventIds[0],
-          reason: "case_state_or_repair_changed_during_verified_deletion",
-        });
+        if (!closed) {
+          await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt);
+          await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            reason: "case_state_or_repair_changed_during_verified_deletion",
+          });
+        }
       }
       cursor = page.cursor as Record<string, unknown> | undefined;
     } while (cursor && examined < 40);
