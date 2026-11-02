@@ -2193,7 +2193,8 @@ export class StateRepository {
     try {
       await client.send(new DeleteCommand({
         TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${taskId}`),
-        ConditionExpression: "token = :token",
+        ConditionExpression: "#token = :token",
+        ExpressionAttributeNames: { "#token": "token" },
         ExpressionAttributeValues: { ":token": token },
       }));
     } catch (error) {
