@@ -5,6 +5,7 @@ import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
+import { profiles } from "../dist/config.js";
 
 test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
@@ -254,6 +255,11 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async deleteEvent(id) { calendarDeletes.push(id); },
   };
   const todoist = {
+    async getTask(taskId) {
+      return { id: taskId, content: event.summary, project_id: profiles.home.todoistProjectId,
+        due: { date: "2026-09-28" }, is_completed: false,
+        updated_at: "2026-09-29T13:00:00Z" };
+    },
     async upsertTask() { todoistUpserts += 1; return { id: "resurrected" }; },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
