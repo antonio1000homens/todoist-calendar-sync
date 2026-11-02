@@ -13,7 +13,10 @@ function liveIds(item, snapshots, side) {
   return [...new Set((snapshots || [])
     .filter(snapshot => snapshot?.ref?.profile === item.profile
       && snapshot.ref.side === side && snapshot.object?.id === snapshot.ref.id
-      && (side !== "calendar" || snapshot.object.status !== "cancelled"))
+      && (side === "calendar"
+        ? snapshot.object.status === "confirmed" && Boolean(snapshot.object.start?.date || snapshot.object.start?.dateTime)
+          && Boolean(snapshot.object.end?.date || snapshot.object.end?.dateTime)
+        : !snapshot.object.is_deleted && !snapshot.object.is_completed))
     .map(snapshot => snapshot.ref.id))];
 }
 
@@ -50,7 +53,10 @@ export function editRepairSelection(previous, side, id, verified = false, search
   const searched = verified && searchResult?.id === id ? {
     id, caseId:previous.caseId, profile:previous.profile,
     due:searchResult.due, recurrence:searchResult.recurrence,
-    recurringEventId:searchResult.recurringEventId, status:searchResult.status,
+    recurringEventId:searchResult.recurringEventId, originalStartTime:searchResult.originalStartTime,
+    start:searchResult.start, end:searchResult.end, etag:searchResult.etag,
+    is_deleted:searchResult.is_deleted, is_completed:searchResult.is_completed,
+    status:searchResult.status,
   } : undefined;
   if (side === "todoist") return {
     ...previous, taskId:id, verifiedTaskId:verified ? id : "", manualTask:true, searchedTask:searched,
@@ -155,4 +161,12 @@ export function repairPreviewAllowed(form, selected, details, action, decisionAc
 export function missingDispositionReference(message) {
   const match = /^Choose (?:Create counterpart or Exclude|Create counterpart, Exclude, or Leave unchanged|Create counterpart, Exclude, Leave unchanged, or Retain unlinked) for (home|antonio|work):(todoist|calendar):([^\s]+)$/.exec(message || '');
   return match ? `${match[1]}:${match[2]}:${match[3]}` : undefined;
+}
+
+/** Never silently swap an invalidated mutation to another repair operation.
+ * Caller must discard all preview/owner/scope/disposition state if revoked. */
+export function revalidateRepairAction(action, capabilities) {
+  if (!action) return { action:"", revoked:false };
+  if ((capabilities?.actions||[]).some(item=>item.id===action&&item.eligible)) return { action,revoked:false };
+  return { action:"", revoked:true };
 }
