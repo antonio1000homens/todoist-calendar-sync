@@ -1,5 +1,5 @@
 import { ReviewStore as SyncReviewStore, SyncControls, reviewHash } from "./review-store.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DeleteCommand,
   GetCommand,
@@ -2088,6 +2088,37 @@ export class StateRepository {
     return results;
   }
 
+  /**
+   * A short-lived cross-invocation fence serialises Todoist Calendar writes
+   * with completion guard creation. A lease outlives the AWS Lambda maximum
+   * invocation time (15 minutes); after a crashed invocation, the next worker
+   * can recover without permanently blocking the task.
+   */
+  async beginTodoistCalendarWrite(taskId: string): Promise<string> {
+    const nowMs = Date.now();
+    const token = randomUUID();
+    await client.send(new PutCommand({
+      TableName: this.ensureTable(),
+      Item: { ...key(`CALENDAR_WRITE#${taskId}`), token, expiresAt: nowMs + 16 * 60_000 },
+      ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+      ExpressionAttributeValues: { ":now": nowMs },
+    }));
+    return token;
+  }
+
+  async endTodoistCalendarWrite(taskId: string, token: string): Promise<void> {
+    try {
+      await client.send(new DeleteCommand({
+        TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${taskId}`),
+        ConditionExpression: "token = :token",
+        ExpressionAttributeValues: { ":token": token },
+      }));
+    } catch (error) {
+      // An expired lease may have been replaced by another invocation.
+      if (!conditionalFailure(error)) throw error;
+    }
+  }
+
   async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
     // Once the event-side marker exists it is immutable. A retry must neither
     // reset the seven-day clock nor recreate a task-side index retired by
@@ -2096,6 +2127,13 @@ export class StateRepository {
     try {
       await client.send(new TransactWriteCommand({
         TransactItems: [
+          // Completion cannot become durable during an in-flight Calendar write.
+          // A contended completion delivery fails and is retried, not acknowledged.
+          { ConditionCheck: {
+            TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${projection.taskId}`),
+            ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+            ExpressionAttributeValues: { ":now": Date.now() },
+          } },
           {
             Put: {
               TableName: this.ensureTable(),
