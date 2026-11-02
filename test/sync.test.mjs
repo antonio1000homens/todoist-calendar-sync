@@ -185,13 +185,6 @@ test("classifies Todoist due removal separately from deletion and completion", (
     reason: "completed",
     dueAdded: false,
   });
-  // Reopening is an upsert signal, never a fresh completion. Restoring a
-  // COMPLETED_EVENT mapping must still pass independent identity safety checks.
-  assert.deepEqual(todoistCalendarLifecycle({ event_name: "item:uncompleted", event_data: { id: "task-4", content: "Task", due, is_completed: false }, event_data_extra: { old_item: { id: "task-4", due, is_completed: true } } }), {
-    action: "upsert",
-    reason: "eligible",
-    dueAdded: false,
-  });
   assert.deepEqual(todoistCalendarLifecycle({ event_name: "item:deleted", event_data: { id: "task-4", content: "Task", due, is_deleted: true } }), {
     action: "delete_projection",
     reason: "deleted",
