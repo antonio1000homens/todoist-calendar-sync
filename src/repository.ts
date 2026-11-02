@@ -1805,6 +1805,74 @@ export class StateRepository {
     }
   }
 
+  /**
+   * Retire a Todoist-owned recurring projection only after its task and every
+   * currently referenced Calendar resource have been verified absent by the
+   * reconciliation worker. Provider verification happens before this call.
+   *
+   * The four index deletes are one transaction: a racing new series owner,
+   * active repair, or a completed-history guard prevents partial retirement.
+   */
+  async retireDeletedTodoistRecurrenceIfUnchanged(mapping: Mapping, expectedLink: RecurrenceLink): Promise<boolean> {
+    if (mapping.recurrenceOwner !== "todoist" || !mapping.seriesId || !mapping.updatedAt
+      || expectedLink.owner !== "todoist" || !expectedLink.updatedAt
+      || expectedLink.profile !== mapping.profile || expectedLink.seriesId !== mapping.seriesId
+      || expectedLink.taskId !== mapping.taskId || expectedLink.eventId !== mapping.eventId
+      || expectedLink.masterEventId !== mapping.masterEventId
+      || expectedLink.activeInstanceId !== mapping.activeInstanceId) return false;
+    const table = this.ensureTable();
+    const values: Record<string, unknown> = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt, ":owner": "todoist", ":series": mapping.seriesId,
+    };
+    const optional = (row: Mapping | RecurrenceLink, field: string, values: Record<string, unknown>): string => {
+      const value = (row as unknown as Record<string, unknown>)[field];
+      if (value === undefined || value === null) return `attribute_not_exists(${field})`;
+      const placeholder = `:${field}`;
+      values[placeholder] = value;
+      return `${field} = ${placeholder}`;
+    };
+    const mappingFields = ["recurrenceId", "masterEventId", "activeInstanceId",
+      "originalStart", "activeEffectiveStart"];
+    const mapCondition = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND seriesId = :series AND "
+      + mappingFields.map(field => optional(mapping, field, values)).join(" AND ");
+    const linkValues: Record<string, unknown> = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": expectedLink.updatedAt, ":owner": "todoist", ":series": mapping.seriesId,
+    };
+    const linkCondition = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND #owner = :owner AND seriesId = :series AND "
+      + ["masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart"]
+        .map(field => optional(expectedLink, field, linkValues)).join(" AND ");
+    const mappingKeys = [
+      key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+      key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
+      key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+    ];
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: [
+        ...mappingKeys.map(Key => ({ Delete: {
+          TableName: table, Key, ConditionExpression: mapCondition,
+          ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: values,
+        } })),
+        { Delete: { TableName: table, Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
+          ConditionExpression: linkCondition, ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+          ExpressionAttributeValues: linkValues } },
+        ...(["todoist", "calendar"] as const).map(side => ({ ConditionCheck: {
+          TableName: table, Key: key(`SYNC_CONTROL#${mapping.profile}:${side}:${side === "todoist" ? mapping.taskId : mapping.eventId}`),
+          ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
+          ExpressionAttributeValues: { ":no": false },
+        } })),
+        { ConditionCheck: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+          ConditionExpression: "attribute_not_exists(pk)" } },
+      ] }));
+      return true;
+    } catch (error) {
+      if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
+      return false;
+    }
+  }
+
   /** Delete an exact standalone mapping only when every primary index still has its previewed version. */
   async deleteMappingIfUnchanged(mapping: Mapping): Promise<boolean> {
     if (!mapping.updatedAt || mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
