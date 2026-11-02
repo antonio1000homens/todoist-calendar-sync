@@ -12,9 +12,16 @@ const eventKey = "COMPLETED_EVENT#home#event-1|STATE";
 const taskKey = "COMPLETED_TASK#home#one|EVENT#event-1";
 const k = ({ pk, sk }) => pk + "|" + sk;
 
-async function simulate({ active = false, partial = false, race = false, recurrence = false, certifiedSeries = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
+async function simulate({ active = false, retained = false, partial = false, race = false, recurrence = false, certifiedSeries = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
   const store = new Map([[taskKey, { ...history }], [eventKey, { ...history, pk: "COMPLETED_EVENT#home#event-1", sk: "STATE" }]]);
   if (active) store.set("TASKOWNER#one|MAP", { profile: "home", taskId: "one", eventId: "new-event" });
+  if (retained) {
+    const mapping = { profile: "home", taskId: "one", eventId: "event-1",
+      updatedAt: "2026-10-01T09:00:00Z" };
+    for (const pk of ["TASKOWNER#one", "TASK#home#one", "EVENT#home#event-1"]) {
+      store.set(`${pk}|MAP`, { ...mapping, pk, sk: "MAP" });
+    }
+  }
   if (partial) store.set("EVENT#home#event-1|MAP", { profile: "home", taskId: "one", eventId: "event-1" });
   if (certifiedSeries) {
     for (let n = 1; n <= 13; n++) {
@@ -216,4 +223,40 @@ test("scheduled handler enables only the separate checkpoint while apply is disa
   assert.equal(checkpoint.sk, "DRY_RUN_STATE");
   assert.equal(checkpoint.scanComplete, true);
   assert.equal(checkpoint.lastCounts.eligibleCandidates, undefined, "scheduled state stores aggregate counts, not candidate IDs");
+});
+
+test("completion preserves all three mapping indexes until seven full days", async () => {
+  const result = await simulate({ retained: true, apply: true, clock: "2026-10-08T11:59:59Z" });
+  assert.equal(result.counts.too_recent, 1);
+  for (const pk of ["TASKOWNER#one", "TASK#home#one", "EVENT#home#event-1"]) {
+    assert.equal(result.store.has(`${pk}|MAP`), true);
+  }
+  assert.equal(result.store.has(taskKey), true);
+});
+
+test("cleanup retires the exact unchanged standalone mapping triplet after seven days", async () => {
+  const result = await simulate({ retained: true, apply: true });
+  assert.equal(result.counts.retired, 1);
+  assert.equal(result.store.has(taskKey), false);
+  assert.equal(result.store.has(eventKey), true, "permanent event-side history guard must survive");
+  for (const pk of ["TASKOWNER#one", "TASK#home#one", "EVENT#home#event-1"]) {
+    assert.equal(result.store.has(`${pk}|MAP`), false);
+  }
+});
+
+test("dry run never retires retained mappings or their task-side history", async () => {
+  const result = await simulate({ retained: true });
+  assert.equal(result.counts.eligible, 1);
+  assert.equal(result.writes, 0);
+  assert.equal(result.store.has("TASKOWNER#one|MAP"), true);
+  assert.equal(result.store.has("TASK#home#one|MAP"), true);
+  assert.equal(result.store.has("EVENT#home#event-1|MAP"), true);
+  assert.equal(result.store.has(taskKey), true);
+});
+
+test("active different owner and partial mapped triplets are never retired", async () => {
+  const result = await simulate({ retained: true, active: true, apply: true });
+  assert.equal(result.counts.skipped_active, 1);
+  assert.equal(result.store.has(taskKey), true);
+  assert.equal(result.store.has("EVENT#home#event-1|MAP"), true);
 });
