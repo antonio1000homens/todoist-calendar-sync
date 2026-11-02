@@ -13,10 +13,7 @@ function liveIds(item, snapshots, side) {
   return [...new Set((snapshots || [])
     .filter(snapshot => snapshot?.ref?.profile === item.profile
       && snapshot.ref.side === side && snapshot.object?.id === snapshot.ref.id
-      && (side === "calendar"
-        ? snapshot.object.status === "confirmed" && Boolean(snapshot.object.start?.date || snapshot.object.start?.dateTime)
-          && Boolean(snapshot.object.end?.date || snapshot.object.end?.dateTime)
-        : !snapshot.object.is_deleted && !snapshot.object.is_completed))
+      && (side !== "calendar" || snapshot.object.status !== "cancelled"))
     .map(snapshot => snapshot.ref.id))];
 }
 
