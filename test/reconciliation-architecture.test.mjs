@@ -22,7 +22,7 @@ test("completed-history EventBridge rule is conditionally managed after SAM tran
   assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
   assert.match(template, /RunCompletedHistoryCleanup:\s*!Equals \[!Ref CompletedHistoryCleanupApply, "true"\]/);
   const functionBlock = template.match(/CompletedHistoryCleanupFunction:[\s\S]*?CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:/)?.[0] || "";
-  assert.doesNotMatch(functionBlock, /DailyCompletedHistoryReview:/, "do not rely on SAM Schedule.Enabled to preserve Fn::If");
+  assert.doesNotMatch(functionBlock, /^\s{8}DailyCompletedHistoryReview:/m, "do not rely on a nested SAM Schedule.Enabled event");
   const rule = template.match(/  CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:[\s\S]*?  WatchFunction:/)?.[0] || "";
   assert.match(rule, /Type:\s*AWS::Events::Rule/);
   assert.match(rule, /State:\s*!If \[RunCompletedHistoryCleanup, ENABLED, DISABLED\]/);
