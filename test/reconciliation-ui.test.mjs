@@ -59,4 +59,7 @@ test('review alert detail shows recorded evidence without redundant explanation 
   assert.match(evidence, /<details><summary>Recorded alert evidence<\/summary><pre>\{JSON\.stringify\(selected\.decision\?\.context\|\|\{\},null,2\)\}<\/pre><\/details>/);
   assert.doesNotMatch(evidence, /Why this alert is open|Recorded reason:|First seen \/ opened|Recorded provider identities|Search Todoist candidates|Search Calendar candidates/);
   assert.doesNotMatch(source, /<h3>Why this alert is open<\/h3>/);
+  assert.doesNotMatch(source, /<summary>Delivery failure details<\/summary>/);
+  assert.match(evidence, /selected\.decision\?\.type\?\.startsWith\("operational_"\)/);
+  assert.match(evidence, /A failed delivery is not replayed/);
 });
