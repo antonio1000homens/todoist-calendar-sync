@@ -104,6 +104,8 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const taskId=task?.ref.id,eventId=event?.ref.id;
   const mapT=task?.mapping,mapE=event?.mapping;
   const map=mapT||mapE;
+  const staleMappingEvidence=snapshots.some(snapshot=>snapshot.ref?.profile===item.profile
+    &&snapshot.mapping && !live(snapshot,snapshot.ref.side,item.profile,snapshot.ref.id));
   const taskRec=taskRole(taskObj,mapT,task?.recurrence);
   const calRec=eventRole(eventObj,mapE,event?.recurrence,event?.searchOnly);
   const recurrent=taskRec==="recurring"||["master","occurrence"].includes(calRec);
@@ -206,7 +208,8 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   return {actions:actions.filter(a=>a.eligible),unavailable:actions.filter(a=>!a.eligible),
     summary:{
       task:taskState,event:eventState,mapping:competing?"conflicting/unknown"
-        :mappedPair?"mapped":map?"mapped to another identity":"unmapped or unknown",
+        :mappedPair?"mapped":staleMappingEvidence?"stale / unverified mapping"
+          :map?"mapped to another identity":"unmapped or unknown",
       recurrence:taskRec==="recurring"?"Recurring Todoist task"
         :calRec==="master"?"Calendar master":calRec==="occurrence"?"Calendar occurrence"
         :taskRec==="standalone"||calRec==="standalone"?"Standalone":"Unknown / unverifiable",
