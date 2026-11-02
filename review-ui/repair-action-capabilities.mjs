@@ -113,14 +113,19 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const single=Boolean(taskId)!==Boolean(eventId);
   const validSource=task||event;
   const hasOtherSide=taskId?otherLiveEvents.length>0:otherLiveTasks.length>0;
+  // If a recorded/current candidate with the requested ID belongs to a
+  // different profile, never treat its absence from this profile as safe to
+  // create a new projection.
+  const foreignCandidate=snapshots.some(snapshot=>snapshot.ref?.profile!==item.profile
+    && [selection?.taskId,selection?.eventId].includes(snapshot.ref?.id));
   const unknownCounterpart=Boolean(validSource?.mapping||validSource?.recurrence||validSource?.destination
-    ||hasOtherSide||competing||otherLiveTasks.length>1||otherLiveEvents.length>1);
+    ||hasOtherSide||competing||foreignCandidate||otherLiveTasks.length>1||otherLiveEvents.length>1);
   const pending=decision||item.decision;
   const pendingActions=(pending?.permittedActions||[]).filter(a=>a?.id&&a.id!=="reconcile_now");
   const open=item.status==="open"&&!operation?.status?.match(/^(queued|running|needs_review)$/);
   const pair=Boolean(taskId&&eventId);
   const noRecurrence=taskRec==="standalone"&&calRec==="standalone";
-  const currentEventMapped=Boolean(event?.mapping?.eventId===eventId&&event.mapping.taskId===taskId);
+  const currentEventMapped=Boolean(event?.mapping&&event.mapping.eventId===eventId&&event.mapping.taskId===taskId);
   const taskDue=taskObj?.due?.date;
   const rule=taskObj?.due?.string||"";
   const history=Boolean(taskObj&&eventObj&&taskRec==="recurring"&&calRec==="standalone"
