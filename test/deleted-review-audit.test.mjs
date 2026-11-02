@@ -48,6 +48,19 @@ test("deleted fixture audits are retired only when every provider ID is attribut
   assert.ok(tx.some(x=>x.Delete?.Key.pk==="DELETION_REVIEW#home#calendar#event-a"));
   const receipt=tx.find(x=>x.Update?.Key.pk==="REVIEW_CASE#review-a").Update;
   assert.match(receipt.UpdateExpression,/REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk/);
+  assert.equal(receipt.ExpressionAttributeValues[":title"],"Verified deletion");
+  assert.equal(receipt.ExpressionAttributeValues[":reason"],"verified_deletion");
+  const checks=tx.filter(x=>x.ConditionCheck).map(x=>x.ConditionCheck);
+  const checked=(pk,sk)=>checks.some(x=>x.Key.pk===pk&&x.Key.sk===sk);
+  for(const profile of ["home","antonio","work"]){
+    assert.ok(checked(`TASK#${profile}#task-a`,"MAP"));
+    assert.ok(checked(`EVENT#${profile}#event-a`,"MAP"));
+    assert.ok(checked(`COMPLETED_EVENT#${profile}#event-a`,"STATE"));
+    assert.ok(checked(`COMPLETED_TASK#${profile}#task-a`,"EVENT#event-a"));
+  }
+  assert.ok(checked("TASKOWNER#task-a","MAP"));
+  assert.ok(checks.some(x=>x.Key.pk==="SYNC_CONTROL#home:todoist:task-a"
+    && x.ConditionExpression.includes("attribute_not_exists(activeRepair)")));
   assert.equal(f.getQueries(),2);
 });
 
