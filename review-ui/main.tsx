@@ -4,7 +4,7 @@ import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, re
 import { createRoot } from "react-dom/client";
 import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
-import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
+import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "./case-url.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -197,11 +197,7 @@ function App() {
     refreshTask.start();
     return ()=>refreshTask.stop();
   },[terminalInboxRefreshPending,profile,history]);
-  const providerLink=(item:ProviderObject|undefined) => {
-    const href=item?.url||item?.htmlLink;
-    if (!href) return undefined;
-    try { const parsed=new URL(href); return ["https:","http:"].includes(parsed.protocol)?parsed.href:undefined; } catch { return undefined; }
-  };
+  const providerLink=(item:ProviderObject|undefined, side:"todoist"|"calendar") => providerSnapshotLink(item,side);
   const displaySnapshot=(sideName:"todoist"|"calendar") => {
     const matches=details?.snapshots?.filter((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName)||[];
     const requestedId=sideName==="todoist"?taskId:eventId;
@@ -211,11 +207,11 @@ function App() {
     const start=sideName==="todoist"?(item.due?.datetime||item.due?.date):(item.start?.dateTime||item.start?.date);
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
     const recurrence=sideName==="todoist"?(item.due?.is_recurring?item.due.string||"Recurring":"None"):(item.recurrence?.join(" · ")||(item.recurringEventId?"Part of a recurring series":"None"));
-    const href=providerLink(item);
+    const href=providerLink(item,sideName);
     const seriesAssociation=current.recurrence
       ? `Todoist ${current.recurrence.taskId} ↔ Calendar occurrence ${current.recurrence.activeInstanceId||current.recurrence.eventId} · series master ${current.recurrence.masterEventId} (${current.recurrence.owner}-owned)`
       : undefined;
-    return <><IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
+    return <>{sideName==="calendar"&&item.status==="cancelled"&&<p className="warning">Cancelled / deleted in Google Calendar. This is a retained tombstone, not a verified live event.</p>}<IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
@@ -384,6 +380,7 @@ function App() {
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         <section className="preview alert-evidence"><h3>Why this alert is open</h3>
           <p><strong>Recorded reason:</strong> {selected.reason.replaceAll("_"," ")}. {/(unmapped|identity_conflict|ambiguous)/i.test(`${selected.reason} ${selected.decision?.type||""}`)&&"Here, ‘unmapped’ means the sync identity or durable mapping is missing or ambiguous; it does not prove that the Calendar event is missing."}</p>
+          {selected.status==="resolved"&&selected.result?.startsWith("resolved_deleted")&&<p className="notice">Resolved by verified deletion. The provider items were absent and the obsolete sync identity was retired automatically; no manual dismissal was required.</p>}
           <dl><dt>First seen / opened</dt><dd>{selected.createdAt?new Date(selected.createdAt).toLocaleString():"Not recorded"}</dd>
             <dt>Last recorded observation</dt><dd>{selected.decision?.context?.lastObservedAt||selected.decision?.context?.lastSeenAt||selected.decision?.context?.observedAt?new Date(selected.decision.context.lastObservedAt||selected.decision.context.lastSeenAt||selected.decision.context.observedAt).toLocaleString():"Not recorded; case update time is not treated as a provider observation"}</dd>
             <dt>Case state</dt><dd>{selected.status}{selected.updatedAt?` · case record updated ${new Date(selected.updatedAt).toLocaleString()}`:""}</dd>
@@ -394,7 +391,7 @@ function App() {
           <p>Historical cause is not inferred from the current live items. The live provider panels below show what could be verified at this check.</p>
           {identityEvidence?.hasAnyRecordedIdentity?<div><strong>Recorded provider identities</strong>
             <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedTaskIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
-            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedEventIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
+            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedEventIds.includes(id)?" · verified live":" · cancelled, deleted or unverified"}</span>):"none"}</p>
             {identityEvidence.seriesIds.length>0&&<p>Series identity (not a provider event ID): {identityEvidence.seriesIds.join(", ")}</p>}
           </div>:<p className="warning">Unable to identify a provider item from the recorded alert. Search or refresh to establish a live identity; repair stays unavailable until a current item is verified.</p>}
           {(selected.decision?.context?.candidateTaskIds?.length||selected.decision?.context?.candidateEventIds?.length||selected.decision?.context?.candidates?.length)&&<div className="candidate-search">
