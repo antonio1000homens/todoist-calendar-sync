@@ -833,7 +833,7 @@ export class Synchronizer {
     const { calendar, todoist } = await this.clients(profile);
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
-      if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: link.activeInstanceId || link.masterEventId })) continue;
+      if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: link.activeInstanceId || link.masterEventId }, true)) continue;
       let master: CalendarEvent;
       try { master = await calendar.getEvent(link.masterEventId); }
       catch (error) {
@@ -909,7 +909,7 @@ export class Synchronizer {
         });
         continue;
       }
-      if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: active.id })) continue;
+      if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: active.id }, true)) continue;
       if (!progressAware) {
         await this.state.deleteMapping(recurrenceMapping(link));
         await todoist.deleteTask(link.taskId).catch((error: unknown) => {
@@ -1599,7 +1599,7 @@ export class Synchronizer {
         seriesId, masterEventId: master.id, taskId: task.id, reason: "existing_native_recurrence_cannot_be_safely_flattened",
       });
     }
-    if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id })) {
+    if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id }, !existing)) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
     }
     if (task?.due?.is_recurring && calendarRecurrence) {
