@@ -111,6 +111,7 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const otherLiveTasks=unique(snapshots.filter(s=>live(s,"todoist",item.profile,s.ref?.id)).map(s=>s.ref.id));
   const otherLiveEvents=unique(snapshots.filter(s=>live(s,"calendar",item.profile,s.ref?.id)).map(s=>s.ref.id));
   const single=Boolean(taskId)!==Boolean(eventId);
+  const creatableTask=Boolean(taskObj&&(taskObj.due?.date||taskObj.due?.datetime));
   const validSource=task||event;
   const hasOtherSide=taskId?otherLiveEvents.length>0:otherLiveTasks.length>0;
   // If a recorded/current candidate with the requested ID belongs to a
@@ -135,7 +136,8 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const eligible={
     verify:pair&&mappedPair&&!competing&&!controlled,
     link:pair&&!competing&&!controlled,
-    create:single&&!unknownCounterpart&&!controlled&&(taskRec!=="unknown"||calRec!=="unknown"),
+    create:single&&!unknownCounterpart&&!controlled
+      &&(taskId?creatableTask&&taskRec!=="unknown":calRec!=="unknown"),
     exclude:Boolean(validSource)&&!controlled,
     separate:Boolean(validSource)&&(mappedPair||competing||Boolean(map))&&!controlled,
     flatten:pair&&calRec==="occurrence"&&Boolean(snapshots.find(s=>s.ref?.profile===item.profile&&s.ref.side==="calendar"
