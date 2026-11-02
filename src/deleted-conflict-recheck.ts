@@ -1,5 +1,6 @@
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { ReviewStore } from "./review-store.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import type { StateRepository } from "./repository.js";
 import type { Delivery, Profile } from "./types.js";
 
@@ -24,18 +25,10 @@ export async function requestDeletedConflictReview(
     for (const item of page.items) {
       if (++examined > 200) return false;
       if (item.status !== "open") continue;
-      const context = item.decision?.context || {};
-      const vals = (v: unknown): string[] => Array.isArray(v) ? v.filter((id): id is string =>
-        typeof id === "string" && Boolean(id)) : [];
-      const candidateItems = Array.isArray(context.candidates)
-        ? context.candidates.map((item: unknown) => (item as { id?: unknown } | null)?.id) : [];
-      const taskIds = [item.taskId, item.decision?.taskId, context.taskId, context.masterTaskId,
-        context.providerTaskId, ...vals(context.candidateTaskIds), ...candidateItems];
-      const eventIds = [item.eventId, item.decision?.eventId, item.decision?.masterEventId,
-        item.decision?.activeInstanceId, context.eventId, context.providerEventId,
-        context.masterEventId, context.activeInstanceId, ...vals(context.candidateEventIds)];
+      const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
       if (!taskIds.some(id => typeof id === "string" && tasks.has(id))
         && !eventIds.some(id => typeof id === "string" && events.has(id))) continue;
+      await review.indexDeletedConflictCase(item);
       const result = await requestReconciliation(state, profile, "manual", enqueue,
         { requester: "verified-deletion-recheck" });
       if (!result.queued && !result.coalesced) {
