@@ -323,7 +323,6 @@ function App() {
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
-    if(!window.confirm("Dismiss this alert without changing Todoist, Calendar, or their mapping?"))return;
     setBusy(true);setMessage("");
     try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item,{syncUrl:false});await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
