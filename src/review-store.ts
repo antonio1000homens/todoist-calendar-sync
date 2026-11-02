@@ -514,7 +514,7 @@ export class ReviewStore {
     }
     for (const ref of refs) {
       items.push({ ConditionCheck: { TableName: reviewTable(),
-        Key: key(`SYNC_CONTROL#${ref.profile}:${ref.side}:${ref.id}`),
+        Key: key(`SYNC_CONTROL#${expected.profile}:${ref.side}:${ref.id}`),
         ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
         ExpressionAttributeValues: { ":no": false },
       } });
