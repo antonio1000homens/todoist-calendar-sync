@@ -2099,8 +2099,12 @@ export class StateRepository {
     const token = randomUUID();
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
-      Item: { ...key(`CALENDAR_WRITE#${taskId}`), token, expiresAt: nowMs + 16 * 60_000 },
-      ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+      Item: {
+        ...key(`CALENDAR_WRITE#${taskId}`), token,
+        leaseUntilMs: nowMs + 16 * 60_000,
+        expiresAt: Math.floor((nowMs + 16 * 60_000) / 1000),
+      },
+      ConditionExpression: "attribute_not_exists(pk) OR leaseUntilMs < :now",
       ExpressionAttributeValues: { ":now": nowMs },
     }));
     return token;
@@ -2131,7 +2135,7 @@ export class StateRepository {
           // A contended completion delivery fails and is retried, not acknowledged.
           { ConditionCheck: {
             TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${projection.taskId}`),
-            ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+            ConditionExpression: "attribute_not_exists(pk) OR leaseUntilMs < :now",
             ExpressionAttributeValues: { ":now": Date.now() },
           } },
           {
