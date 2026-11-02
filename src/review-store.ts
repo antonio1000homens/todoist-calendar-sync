@@ -350,6 +350,40 @@ export class ReviewStore {
         }
       }
     }
+    // Retire only canonical identity and reconciliation baseline snapshots
+    // scoped to the fully absent provider IDs. Every delete is version-fenced:
+    // a concurrent new provider identity or repair aborts the whole transaction
+    // instead of stripping a newer baseline or live canonical pointer.
+    const canonicalRefs = [
+      ...expected.taskIds.map(id => ({ side: "todoist", id })),
+      ...expected.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of canonicalRefs) {
+      const pk = `CANONICAL#${expected.profile}#${ref.side}#${ref.id}`;
+      const currentIdentity = await this.get<Record<string, unknown>>(pk);
+      if (!currentIdentity) continue;
+      if (currentIdentity.profile !== expected.profile || currentIdentity.side !== ref.side
+        || currentIdentity.providerId !== ref.id
+        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return false;
+      items.push({ Delete: { TableName: reviewTable(), Key: key(pk),
+        ConditionExpression: "#profile = :profile AND #side = :side AND providerId = :id AND updatedAt = :updated AND #identity = :identity",
+        ExpressionAttributeNames: { "#profile": "profile", "#side": "side", "#identity": "identity" },
+        ExpressionAttributeValues: { ":profile": expected.profile, ":side": ref.side, ":id": ref.id,
+          ":updated": currentIdentity.updatedAt, ":identity": currentIdentity.identity },
+      } });
+    }
+    for (const taskId of expected.taskIds) {
+      const baselineKey = { pk: `BASELINE#${expected.profile}#TASK#${taskId}`, sk: "RECONCILE" };
+      const currentBaseline = (await this.db.send(new GetCommand({
+        TableName: reviewTable(), Key: baselineKey, ConsistentRead: true,
+      }))).Item;
+      if (!currentBaseline) continue;
+      if (typeof currentBaseline.updatedAt !== "string" || !currentBaseline.baseline) return false;
+      items.push({ Delete: { TableName: reviewTable(), Key: baselineKey,
+        ConditionExpression: "updatedAt = :updated AND baseline = :baseline",
+        ExpressionAttributeValues: { ":updated": currentBaseline.updatedAt, ":baseline": currentBaseline.baseline },
+      } });
+    }
     // Query only exact-provider reverse indexes. Do not scan the audit table:
     // older records without these pointers retain their original 7-day TTL.
     // Every candidate audit is re-read and deleted only when *all* its
