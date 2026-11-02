@@ -66,7 +66,7 @@ function App() {
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
-  const capabilities=availableRepairActions({caseItem:selected,snapshots:details?.snapshots||[],
+  const capabilities=availableRepairActions({caseItem:details?.item,snapshots:details?.snapshots||[],
     selection:repairSelection,decision:details?.item?.decision,operation,profiles});
   const ownerRequirement=repairRecurrenceOwnerRequirement(repairSelection,details,action);
   const formFields=actionFormFields(action,{hasRecurrence:capabilities.summary.hasRecurrence,ownerRequired:Boolean(ownerRequirement)});
@@ -275,12 +275,17 @@ function App() {
     const requestVersion=selectionVersion.current;
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner:action==="transfer"?"none":winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:"POST",body:JSON.stringify(intent)});
+    try {
+      // Rechecking provider objects never needs a chosen mutation. Read-only
+      // GET can hydrate searched IDs and links without a fabricated action.
+      const query=new URLSearchParams({taskId:taskId||"",eventId:eventId||""});
+      const result=await api(`cases/${encodeURIComponent(selected.id)}/affected?${query}`);
       if(requestVersion!==selectionVersion.current)return;
-      setDetails((current:any)=>current?.item?.id===selected.id?{...current,snapshots:result.snapshots}:current);
-      setRepairSelection(current=>reconcileRepairSelection(selected,result.snapshots,current));setLeftovers({});
+      if(result.item?.id!==selected.id||result.item?.profile!==selected.profile)throw new Error("Case changed during recheck");
+      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots}:current);
+      setRepairSelection(current=>reconcileRepairSelection(result.item,result.snapshots,current));setLeftovers({});
       if(operationResumeEligibility(operation)==="fresh-preview") {
-        const refreshedSelection=reconcileRepairSelection(selected,result.snapshots,emptyRepairSelection(selected));
+        const refreshedSelection=reconcileRepairSelection(result.item,result.snapshots,emptyRepairSelection(result.item));
         setRepairSelection(refreshedSelection);
         setMessage(`Current provider items refreshed. The failed operation ${operation?.id} remains unchanged. Review the current Todoist and Calendar IDs, then create a new preview.`);
       }
@@ -356,7 +361,7 @@ function App() {
     }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
-  const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
+  const decisionActions=capabilities.summary.decisionActions||[];
   const recordedIds=recordedPrimaryProviderIds(selected);
   const recordedTaskId=recordedIds.taskId, recordedEventId=recordedIds.eventId;
   const verifiedRepairTarget=Boolean((taskId&&repairSelection.verifiedTaskId===taskId)
