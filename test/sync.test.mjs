@@ -534,19 +534,38 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     updatedAt: "2026-10-05T17:00:00Z",
   };
   let saved;
+  let fenceHeld = false;
   const state = {
+    async beginTodoistCalendarWrite(id) {
+      assert.equal(id, task.id);
+      assert.equal(fenceHeld, false);
+      fenceHeld = true;
+      return "fence-token";
+    },
+    async endTodoistCalendarWrite(id, token) {
+      assert.equal(id, task.id);
+      assert.equal(token, "fence-token");
+      assert.equal(fenceHeld, true);
+      fenceHeld = false;
+    },
     async syncBlocked() { return false; },
     async getMappingByTaskAnyProfile() { return structuredClone(original); },
     async acceptTaskVersion() { return true; },
     async getCalendarProjectionTombstone() { return undefined; },
     async getMappingByTask() { return structuredClone(original); },
     async mutationAllowed() { return true; },
-    async putMapping(value) { saved = structuredClone(value); },
+    async putMapping(value) {
+      assert.equal(fenceHeld, true, "the fence remains held through the mapping write");
+      saved = structuredClone(value);
+    },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async audit() {},
   };
   const calendar = {
-    async getEvent() { return structuredClone(event); },
+    async getEvent() {
+      assert.equal(fenceHeld, true, "the fence precedes the provider lookup");
+      return structuredClone(event);
+    },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return structuredClone(task); } } }));
 
@@ -561,6 +580,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   });
 
   assert.ok(saved);
+  assert.equal(fenceHeld, false, "the fence is released after the complete no-op workflow");
   assert.equal(saved.projectId, "project-home");
   assert.equal(saved.projectCommentId, "project-comment-7");
   assert.equal(saved.taskCommentId, "legacy-task-comment-2");
