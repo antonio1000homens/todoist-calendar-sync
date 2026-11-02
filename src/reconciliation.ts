@@ -570,24 +570,22 @@ export class SnapshotReconciler {
    * This is intentionally bounded and never infers an ID from title/date.
    * A one-sided deletion remains actionable, including recurring masters.
    */
-  private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair): Promise<void> {
+  private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair, includeHistory = false): Promise<void> {
     // Fixture repositories used in unit tests do not have persistent review
     // state. Real StateRepository reconciliation always performs this sweep.
     if (!(this.state instanceof StateRepository)) return;
     const review = new ReviewStore();
-    // A deleted event cannot be retired while a different recurrence link
-    // still uses its master or active occurrence, even with mapping indexes
-    // missing. Inspect all profile links once, not for every case.
-    const linkSets = await Promise.all((["home", "antonio", "work"] as const)
-      .map(candidate => this.state.listRecurrenceLinks(candidate)));
-    const links = linkSets.flat();
+    // Load recurrence ownership lazily: ordinary reconciliation without any
+    // deleted conflicts should not spend three profile-wide GSI queries.
+    let links: Awaited<ReturnType<StateRepository["listRecurrenceLinks"]>> | undefined;
     let cursor: Record<string, unknown> | undefined;
     let examined = 0;
     do {
-      const page = await review.listCases(profile, cursor, false);
+      const page = await review.listCases(profile, cursor, includeHistory);
       for (const item of page.items) {
         if (examined++ >= 40) return;
-        if (item.status !== "open" || item.operationId || item.reason.startsWith("operational_")) continue;
+        if (item.status !== (includeHistory ? "dismissed" : "open") || item.operationId
+          || item.reason.startsWith("operational_")) continue;
         const context = item.decision?.context || {};
         const ids = (value: unknown): string[] => Array.isArray(value)
           ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
@@ -610,6 +608,8 @@ export class SnapshotReconciler {
             || await this.state.syncBlocked(profile, { taskId })) { absent = false; break; }
         }
         if (!absent) continue;
+        links ||= (await Promise.all((["home", "antonio", "work"] as const)
+          .map(candidate => this.state.listRecurrenceLinks(candidate)))).flat();
         for (const eventId of eventIds) {
           const event = await this.currentEvent(clients.calendar, eventId);
           if ((event && event.status !== "cancelled")
@@ -1000,6 +1000,7 @@ export class SnapshotReconciler {
       counts,
     });
     await this.retireVerifiedDeletedCases(profile, clients);
+    await this.retireVerifiedDeletedCases(profile, clients, true);
     return { processedCandidates, counts };
   }
 }
