@@ -68,9 +68,12 @@ const sameMapping=(mapping,profile,taskId,eventId)=>Boolean(mapping?.profile===p
 const elapsedEvent=event=>{
   const end=dateTime(event?.end);
   if(typeof end!=="string")return false;
-  const instant=/^\d{4}-\d{2}-\d{2}$/.test(end)?end+"T00:00:00Z":end;
+  // All-day dates are Calendar-local, not UTC. Fail closed near the current
+  // boundary until the backend can classify in the verified Calendar zone.
+  const allDay=/^\d{4}-\d{2}-\d{2}$/.test(end);
+  const instant=allDay?end+"T00:00:00Z":end;
   const timestamp=Date.parse(instant);
-  return Number.isFinite(timestamp)&&timestamp<Date.now();
+  return Number.isFinite(timestamp)&&timestamp+(allDay?48*60*60*1000:0)<Date.now();
 };
 // Only a hint, not a substitute for provider-local timezone checks in the backend.
 export function actionFormFields(action, {hasRecurrence=false, ownerRequired=false}={}) {
@@ -78,7 +81,7 @@ export function actionFormFields(action, {hasRecurrence=false, ownerRequired=fal
   return {
     winner:action==="link",
     owner:(["link","transfer","create"].includes(action))&&(hasRecurrence||ownerRequired),
-    scope:["flatten","transfer"].includes(action)||(hasRecurrence&&["link","create","separate","exclude"].includes(action)),
+    scope:["flatten","transfer"].includes(action)||(hasRecurrence&&action==="link"),
     destination:action==="move",
     decision:action==="decision",
     occurrence:action==="flatten",
@@ -135,6 +138,24 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
     ||hasOtherSide||competing||foreignCandidate||otherLiveTasks.length>1||otherLiveEvents.length>1);
   const pending=decision||item.decision;
   const pendingActions=(pending?.permittedActions||[]).filter(a=>a?.id&&a.id!=="reconcile_now");
+  // Match decisionRepairIntent() exactly, including bind_task:<id>. A pending
+  // decision is only offered when its own current targets are both selected
+  // and verified, not merely when an unrelated search result is live.
+  const decisionTarget=(choice)=>{
+    const contextTask=typeof pending?.context?.providerTaskId==="string"?pending.context.providerTaskId:undefined;
+    const contextEvent=typeof pending?.context?.providerEventId==="string"?pending.context.providerEventId:undefined;
+    const targetTask=choice.id.startsWith("bind_task:")?choice.id.slice("bind_task:".length)
+      :pending?.taskId||pending?.mappingSnapshot?.taskId||contextTask;
+    const targetEvent=pending?.eventId||pending?.mappingSnapshot?.eventId
+      ||pending?.activeInstanceId||pending?.masterEventId||contextEvent;
+    return {taskId:targetTask||"",eventId:targetEvent||""};
+  };
+  const matchedDecisionActions=pending?.status==="pending"?pendingActions.filter(choice=>{
+    const expected=decisionTarget(choice);
+    return Boolean((expected.taskId||expected.eventId)
+      && expected.taskId===(taskId||"")&&expected.eventId===(eventId||"")
+      &&(!expected.taskId||task)&&(!expected.eventId||event));
+  }):[];
   const noActiveRepair=!operation?.status?.match(/^(queued|running|needs_review)$/);
   const open=item.status==="open"&&noActiveRepair;
   // The existing backend explicitly permits a new exact preview of a
@@ -148,21 +169,32 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const rule=taskObj?.due?.string||"";
   const history=Boolean(taskObj&&eventObj&&taskRec==="recurring"&&calRec==="standalone"
     &&/^every year$|^every 1 year$/i.test(rule)&&/^\d{4}-\d{2}-\d{2}$/.test(taskDue||"")
-    &&dateTime(eventObj.start)<taskDue&&elapsedEvent(eventObj)
-    &&!mapT&&!mapE&&!task?.recurrence&&!event?.recurrence);
+    &&!taskObj.due?.datetime && !taskDue?.includes("T")
+    &&/^\d{4}-\d{2}-\d{2}$/.test(eventObj.start?.date||"")
+    &&/^\d{4}-\d{2}-\d{2}$/.test(eventObj.end?.date||"")
+    &&!eventObj.start?.dateTime&&!eventObj.end?.dateTime
+    &&eventObj.end.date>eventObj.start.date&&eventObj.start.date<taskDue
+    &&elapsedEvent(eventObj)&&!eventObj.extendedProperties?.shared?.taskId
+    &&!mapT&&!mapE&&!task?.recurrence&&!event?.recurrence
+    &&snapshots.length===2);
   const eligible={
     verify:pair&&mappedPair&&!competing&&!controlled,
     link:pair&&!competing&&!controlled,
     create:single&&!unknownCounterpart&&!controlled
-      &&(taskId?creatableTask&&taskRec!=="unknown":calRec!=="unknown"),
+      &&(taskId?creatableTask&&taskRec!=="unknown":calRec!=="unknown"&&!event?.searchOnly),
     exclude:Boolean(validSource)&&!controlled,
     separate:Boolean(validSource)&&(mappedPair||competing||Boolean(map))&&!controlled,
     flatten:pair&&calRec==="occurrence"&&Boolean(snapshots.find(s=>s.ref?.profile===item.profile&&s.ref.side==="calendar"
-      &&s.ref.id===eventObj?.recurringEventId&&live(s,"calendar",item.profile,s.ref.id)&&s.object?.recurrence?.length))
+      &&s.ref.id===eventObj?.recurringEventId&&live(s,"calendar",item.profile,s.ref.id)
+      &&s.object?.recurrence?.length&&s.calendarProjectionId===eventId))
       &&!controlled&&!competing,
     transfer:pair&&taskRec==="recurring"&&calRec==="master"&&Boolean(event?.calendarProjectionId)
       &&Boolean(snapshots.find(s=>s.ref?.id===event.calendarProjectionId&&s.ref?.side==="calendar"
         &&live(s,"calendar",item.profile,s.ref.id)&&s.object?.recurringEventId===eventId))
+      &&Boolean((event.recurrence?.owner==="calendar"
+        &&event.recurrence.seriesId===(eventObj.iCalUID||eventId))
+        ||eventObj.extendedProperties?.shared?.syncRecurrenceOwner==="calendar")
+      &&(!event.recurrence||event.recurrence.owner==="calendar")
       &&!competing&&!controlled,
     "todoist-only":pair&&history&&!controlled,
     "todoist-only-delete-calendar":pair&&noRecurrence&&Boolean(taskDue||taskObj?.due?.datetime)&&mappedPair
@@ -170,8 +202,7 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
     "calendar-history-only":Boolean(eventId)&&calRec==="standalone"&&elapsedEvent(eventObj)
       &&Boolean(eventObj?.etag)&&Boolean(eventObj?.extendedProperties?.shared?.taskId||event?.mapping?.taskId)
       &&!controlled,
-    decision:Boolean(validSource)&&pending?.status==="pending"&&pendingActions.length>0
-      &&!controlled,
+    decision:matchedDecisionActions.length>0&&!controlled,
     move:Boolean(taskId)&&profiles.some(p=>p!==item.profile&&p!=="all")&&!controlled,
   };
   const why={
@@ -219,6 +250,6 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
         :competing?"Competing mapping evidence requires investigation; no mutation is selected automatically."
         :unknownCounterpart?"Current mapping or additional candidates require explicit review.":"Current provider identities verified.",
       title:selectedFacts?.content||selectedFacts?.summary||item.title,
-      decisionActions:pendingActions.map(a=>({id:a.id,label:a.label})),
+      decisionActions:matchedDecisionActions.map(a=>({id:a.id,label:a.label})),
     }};
 }
