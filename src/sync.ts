@@ -2218,6 +2218,17 @@ export class Synchronizer {
         completedAt: retained.completedAt,
       });
     }
+    // A completed mapping is retained solely for the grace period. Even a
+    // delayed provider item:deleted / due-removed webhook must not interpret
+    // that retained index as permission to delete the Calendar event.
+    if (mapping && !mapping.recurrenceOwner && lifecycle.action === "delete_projection") {
+      const completed = await this.getCompletedProjection(delivery.profile, mapping.eventId);
+      if (completed?.taskId === task.id) {
+        return this.state.audit(delivery.profile, "todoist_completed_mapping_deletion_ignored", {
+          taskId: task.id, eventId: mapping.eventId,
+        });
+      }
+    }
     if (lifecycle.reason === "due_removed") {
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
         return this.state.audit(delivery.profile, "todoist_mutation_suppressed", { taskId: task.id, event: payload.event_name, mode: delivery.mode });
