@@ -4,6 +4,7 @@ import { requestDeletedConflictReview } from "../dist/deleted-conflict-recheck.j
 
 const reviewFor = (items) => ({
   async listCases() { return { items, cursor: undefined }; },
+  async indexDeletedConflictCase(item) { assert.equal(item.status, "open"); },
 });
 function harness() {
   const queued=[], marked=[];
