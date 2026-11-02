@@ -77,3 +77,7 @@ export function groupAffectedSnapshots(snapshots=[]) {
     return role(a)-role(b)||String(a.ref.id).localeCompare(String(b.ref.id));
   })}));
 }
+
+/** Compatibility alias for the deleted-conflict review regression tests.
+ * Reuse the shared, active-provider-only URL policy. */
+export { providerLink as providerSnapshotLink } from "./item-identity.mjs";

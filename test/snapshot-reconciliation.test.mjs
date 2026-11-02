@@ -778,3 +778,58 @@ test("pending future-only split prevents hourly reconciliation creating a compet
   assert.equal(store.putBaselineCalls, 0);
   assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_future_series_split_pending"));
 });
+
+test("Todoist-owned deleted recurrence retires exact indexes without provider recreation", async () => {
+  for (const calendarStatus of ["cancelled", "missing"]) {
+    const m={...mapping(),recurrenceOwner:"todoist",seriesId:"task-1",
+      masterEventId:"event-1",activeInstanceId:"instance-1"};
+    const link={profile:"home",owner:"todoist",seriesId:m.seriesId,taskId:m.taskId,
+      eventId:m.eventId,masterEventId:m.masterEventId,activeInstanceId:m.activeInstanceId,
+      updatedAt:m.updatedAt};
+    const state=new FakeState(m);
+    state.recurrenceLinks.set("home:task-1",link);
+    const store=new FakeStore(m,baseline(task(),event()));
+    const events=new Map(calendarStatus==="cancelled"
+      ? [["event-1",event({status:"cancelled"})],["instance-1",event({id:"instance-1",status:"cancelled",recurringEventId:"event-1"})]]
+      : []);
+    const clients=fakeClients({listedTasks:[],taskById:new Map(),calendarEvents:events});
+    let retired=0;
+    state.retireDeletedTodoistRecurrenceIfUnchanged=async(current,expected)=>{
+      assert.deepEqual(current,m); assert.deepEqual(expected,link);
+      retired++;
+      state.mapping=undefined;
+      state.recurrenceLinks.delete("home:task-1");
+      return true;
+    };
+    const result=await makeReconciler({state,store,clients}).reconcile("home");
+    assert.equal(result.counts.deleted_retired,1,calendarStatus);
+    assert.equal(retired,1,calendarStatus);
+    assert.equal(store.baselines.size,0);
+    assert.deepEqual(clients.metrics.todoistUpdates,[]);
+    assert.deepEqual(clients.metrics.calendarUpdates,[]);
+    assert.deepEqual(clients.metrics.calendarDeletes,[]);
+    assert.ok(state.audits.some(a=>a.action==="todoist_snapshot_reconcile_verified_deletion_retired"));
+  }
+});
+
+test("Todoist recurrence is never retired for a surviving side, changed link, or active repair", async () => {
+  for (const scenario of ["task-live","calendar-live","link-changed","repair-blocked"]) {
+    const m={...mapping(),recurrenceOwner:"todoist",seriesId:"task-1",masterEventId:"event-1"};
+    const state=new FakeState(m);
+    state.recurrenceLinks.set("home:task-1",{profile:"home",owner:"todoist",seriesId:"task-1",
+      taskId:scenario==="link-changed"?"different-task":"task-1",eventId:"event-1",
+      masterEventId:"event-1",updatedAt:m.updatedAt});
+    if (scenario==="repair-blocked") state.syncBlocked=async()=>true;
+    const t=task();
+    const tasks=scenario==="task-live"?[t]:[];
+    const events=new Map([["event-1",event({status:scenario==="calendar-live"?"confirmed":"cancelled"})]]);
+    const clients=fakeClients({listedTasks:tasks,taskById:new Map(tasks.map(x=>[x.id,x])),calendarEvents:events});
+    let retired=0;
+    state.retireDeletedTodoistRecurrenceIfUnchanged=async()=>{retired++;return true;};
+    const result=await makeReconciler({state,store:new FakeStore(m),clients}).reconcile("home");
+    assert.equal(retired,0,scenario);
+    assert.equal(result.counts.deleted_retired,0,scenario);
+    assert.deepEqual(clients.metrics.todoistUpdates,[]);
+    assert.deepEqual(clients.metrics.calendarUpdates,[]);
+  }
+});
