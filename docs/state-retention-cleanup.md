@@ -133,8 +133,8 @@ and atomically transition the event guard into an active mapping. Do not
 remove completion markers or automatically reimport completed Calendar
 history as a shortcut.
 
-It scans
-only candidate `COMPLETED_TASK` rows, groups the task's strongly consistent
+It scans the table in bounded pages and uses a post-read filter to
+select `COMPLETED_TASK` rows; it then groups the task's strongly consistent
 completion references, and retires all eligible task-side completion lookup
 rows in **one guarded transaction**, retaining `COMPLETED_EVENT`. It can also
 remove a strictly older baseline with a timestamp condition. It checks all
