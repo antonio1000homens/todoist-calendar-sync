@@ -26,10 +26,11 @@ const validId=(s)=>typeof s==="string"&&s.length>0;
 const unique=values=>[...new Set(values.filter(validId))];
 const dateTime=value=>value?.dateTime||value?.date;
 const recurringTask=task=>task?.due?.is_recurring===true&&validId(task?.due?.string);
-const eventRole=(event,mapping,recurrence)=>{
+const eventRole=(event,mapping,recurrence,searchOnly=false)=>{
   if(!event)return "unknown";
   if(event.recurringEventId)return "occurrence";
   if(Array.isArray(event.recurrence)&&event.recurrence.length)return "master";
+  if(searchOnly&&!Array.isArray(event.recurrence))return "unknown";
   if(mapping?.recurrenceOwner||mapping?.masterEventId||recurrence?.owner)return "unknown";
   return event.status==="confirmed"&&dateTime(event.start)&&dateTime(event.end)?"standalone":"unknown";
 };
@@ -54,7 +55,8 @@ function verifiedSelection({caseItem, snapshots=[], selection}) {
     if(inSnapshot)return inSnapshot;
     if(snapshot)return undefined; // an explicit 404/cancelled observation overrides search
     if(searched?.id!==id||searched.caseId!==caseItem.id||searched.profile!==caseItem.profile)return undefined;
-    return live({ref:{side,profile:caseItem.profile,id},object:searched},side,caseItem.profile,id);
+    const matched=live({ref:{side,profile:caseItem.profile,id},object:searched},side,caseItem.profile,id);
+    return matched?{...matched,searchOnly:true}:undefined;
   };
   return {
     task:pick("todoist",selection.taskId,selection.verifiedTaskId,selection.searchedTask),
@@ -103,7 +105,7 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const mapT=task?.mapping,mapE=event?.mapping;
   const map=mapT||mapE;
   const taskRec=taskRole(taskObj,mapT,task?.recurrence);
-  const calRec=eventRole(eventObj,mapE,event?.recurrence);
+  const calRec=eventRole(eventObj,mapE,event?.recurrence,event?.searchOnly);
   const recurrent=taskRec==="recurring"||["master","occurrence"].includes(calRec);
   const controlled=[task,event].some(s=>s?.control?.activeRepair||s?.control?.excluded);
   const mismatchedMapping=Boolean(mapT&&mapE&&(mapT.taskId!==mapE.taskId||mapT.eventId!==mapE.eventId
