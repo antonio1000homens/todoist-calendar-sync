@@ -16,9 +16,9 @@ function resourceBlock(name) {
 
 const retainedAlarms = [
   "WatchRenewalFailureAlarm", "WatchMissingAlarm", "WatchLambdaErrorsAlarm",
-  "DlqAlarm", "ErasureDlqAlarm", "ErasureWorkerErrorsAlarm",
+  "ErasureWorkerErrorsAlarm",
   "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
-  "SourceQueueAgeAlarm", "SourceQueueDepthAlarm", "WorkerErrorsAlarm",
+  "WorkerErrorsAlarm",
   "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
   "ProfileLookupIndexReadThrottleAlarm", "ProfileLookupIndexWriteThrottleAlarm",
 ];
@@ -26,9 +26,10 @@ const retainedAlarms = [
 const removedAlarms = [
   "DynamoDbReadUtilizationAlarm", "DynamoDbWriteUtilizationAlarm",
   "ProfileLookupIndexReadUtilizationAlarm", "ProfileLookupIndexWriteUtilizationAlarm",
+  "DlqAlarm", "ErasureDlqAlarm", "SourceQueueAgeAlarm", "SourceQueueDepthAlarm",
 ];
 
-test("retains all 15 critical, erasure, watch, throttle, and backpressure alarms on AlertTopic", () => {
+test("retains all 11 worker, erasure-state, watch, and throttle alarms on AlertTopic", () => {
   const alarms = [...template.matchAll(/^  ([A-Za-z][A-Za-z0-9]*):\n    Type: AWS::CloudWatch::Alarm$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(alarms.sort(), [...retainedAlarms].sort());
@@ -38,7 +39,7 @@ test("retains all 15 critical, erasure, watch, throttle, and backpressure alarms
   }
 });
 
-test("removes only the four early-warning utilization alarms and preserves their actual throttle signals", () => {
+test("removes the utilization and SQS alarms while preserving distinct throttle and erasure-state signals", () => {
   for (const name of removedAlarms) assert.equal(resourceBlock(name), "", `${name} should be absent`);
   for (const name of [
     "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
@@ -66,4 +67,10 @@ test("documents every retained and removed alarm in the review matrix", () => {
     "profile-lookup-read-utilization", "profile-lookup-write-utilization",
   ];
   for (const suffix of suffixes) assert.ok(inventory.includes(`\`${suffix}\``), `${suffix} needs an inventory row`);
+});
+
+test("documents Grafana coverage and the delayed source queue alert tradeoff", () => {
+  assert.match(inventory, /Dead-letter queues.*Grafana/s);
+  assert.match(inventory, /10-minute.*delay/s);
+  assert.match(inventory, /tech debt/i);
 });

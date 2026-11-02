@@ -43,7 +43,7 @@ The service includes:
 - conservative reconciliation mutation budgets;
 - circuit breakers for mutation storms;
 - DynamoDB deletion protection and point-in-time recovery;
-- a FIFO dead-letter queue with operational logging/alarms;
+- a FIFO dead-letter queue with operational logging and Grafana visibility; CloudWatch alarms remain for worker and erasure safety events;
 - optional Slack-backed manual intervention for decisions that are unsafe to guess.
 
 Provider credentials and webhook secrets are never stored in this repository.
