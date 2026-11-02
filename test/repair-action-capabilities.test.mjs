@@ -230,3 +230,13 @@ test("Calendar search result with incomplete series metadata is not treated as s
     status:"confirmed",start:{date:"2026-01-01"},end:{date:"2026-01-02"}});
   assert.match(identity.recurrence,/unknown/i);
 });
+
+test("terminal cases preserve only explicitly supported fresh exact-pair previews",()=>{
+  for(const status of ["dismissed","resolved","excluded"]){
+    const r=assess([taskSnap({},{mapping}),eventSnap({},{mapping})],select(),item(status));
+    yes(r,"verify","todoist-only-delete-calendar");
+    no(r,"link","create","move","flatten","transfer","exclude","separate","decision");
+  }
+  const withoutMapping=assess([taskSnap(),eventSnap()],select(),item("dismissed"));
+  assert.equal(withoutMapping.actions.length,0);
+});
