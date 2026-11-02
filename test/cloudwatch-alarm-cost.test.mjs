@@ -16,8 +16,7 @@ function resourceBlock(name) {
 
 const retainedAlarms = [
   "WatchLambdaErrorsAlarm",
-  "DlqAlarm", "ErasureDlqAlarm", "ErasureWorkerErrorsAlarm",
-  "SourceQueueAgeAlarm", "SourceQueueDepthAlarm", "WorkerErrorsAlarm",
+  "ErasureWorkerErrorsAlarm", "WorkerErrorsAlarm",
   "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
   "ProfileLookupIndexReadThrottleAlarm", "ProfileLookupIndexWriteThrottleAlarm",
 ];
@@ -28,9 +27,10 @@ const removedAlarms = [
   // Explicitly authorised removals; log-derived metrics must continue to exist.
   "WatchRenewalFailureAlarm", "WatchMissingAlarm",
   "ErasureRecoveryBlockedAlarm", "ErasureReviewRequiredAlarm",
+  "DlqAlarm", "ErasureDlqAlarm", "SourceQueueAgeAlarm", "SourceQueueDepthAlarm",
 ];
 
-test("retains 11 independent DLQ, worker, watch-Lambda, throttle, and backpressure alarms on AlertTopic", () => {
+test("retains 7 worker, watch-Lambda, and throttle alarms on AlertTopic", () => {
   const alarms = [...template.matchAll(/^  ([A-Za-z][A-Za-z0-9]*):\n    Type: AWS::CloudWatch::Alarm$/gm)]
     .map((match) => match[1]);
   assert.deepEqual(alarms.sort(), [...retainedAlarms].sort());
@@ -40,7 +40,7 @@ test("retains 11 independent DLQ, worker, watch-Lambda, throttle, and backpressu
   }
 });
 
-test("removes the four previously retired utilization and four requested custom-metric alarms, preserving throttles", () => {
+test("removes utilization, custom-metric, and SQS alarms while preserving throttles", () => {
   for (const name of removedAlarms) assert.equal(resourceBlock(name), "", `${name} should be absent`);
   for (const name of [
     "DynamoDbReadThrottleAlarm", "DynamoDbWriteThrottleAlarm",
@@ -58,6 +58,8 @@ test("keeps all four log-derived custom metric filters and documents the coverag
   assert.match(inventory, /Capacity nears its provisioned limit before throttling/);
   assert.match(inventory, /custom metric charges can continue/i);
   assert.match(inventory, /no direct CloudWatch alarm/i);
+  assert.match(inventory, /10 minutes plus up to\s+five minutes of scrape wait/);
+  assert.match(inventory, /Grafana/);
 });
 
 test("documents every retained and removed alarm in the review matrix", () => {

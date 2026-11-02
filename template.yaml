@@ -692,42 +692,6 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
-  DlqAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-dlq-not-empty-${Stage}
-      AlarmDescription: A todoist-calendar-sync delivery was quarantined; inspect worker delivery_failed_for_dlq log using the delivery/message id.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncDlq.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ErasureDlqAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-dlq-not-empty-${Stage}
-      AlarmDescription: A guarded item-erasure operation failed repeatedly; preserve the fence and operation journal for recovery.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt ErasureOperationDlq.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
   ErasureWorkerErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -767,43 +731,6 @@ Resources:
           MetricName: RecoveryBlocked
           MetricValue: "1"
           DefaultValue: 0
-
-  SourceQueueAgeAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-source-oldest-message-${Stage}
-      AlarmDescription: The source FIFO queue has a message older than five minutes.
-      Namespace: AWS/SQS
-      MetricName: ApproximateAgeOfOldestMessage
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncQueue.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 300
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  SourceQueueDepthAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-source-depth-${Stage}
-      AlarmDescription: More than 100 queued deliveries indicates sustained backpressure rather than a short absorbed burst.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncQueue.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 100
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
 
   WorkerErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
