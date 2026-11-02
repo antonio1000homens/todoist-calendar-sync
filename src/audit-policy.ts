@@ -28,6 +28,9 @@ const ROUTINE_EXACT_ACTIONS = new Set([
   // Keep their structured CloudWatch telemetry without writing AUDIT# rows.
   "calendar_elapsed_standalone_event_ignored",
   "calendar_archived_series_delta_ignored",
+  // Verified deletion is a resolved lifecycle outcome, never a new retained
+  // conflict that can be re-seeded into the review inbox.
+  "todoist_snapshot_reconcile_verified_deletion_retired",
 ]);
 
 const REVIEWED_ROUTINE_ACTION_RE = /(?:^|_)(?:started|completed|queued|requested|coalesced|processed|reconciled|baselined|converged|created|updated|moved|written_back|rejoined|noop)(?:$|_)/;
