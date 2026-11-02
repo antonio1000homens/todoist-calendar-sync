@@ -82,7 +82,7 @@ export function repairRecurrenceOwnerRequirement(form, details, action) {
   const task = current("todoist", form.taskId);
   if ((action === "link" || action === "transfer" || action === "create" && !form.taskId) && event?.recurringEventId) return "calendar-occurrence";
   if ((action === "link" || action === "transfer" || action === "create" && !form.taskId) && event?.recurrence?.length) return "calendar-series";
-  if (action === "link" && task?.due?.is_recurring) return "todoist-task";
+  if ((action === "link" || action === "create" && !form.eventId) && task?.due?.is_recurring) return "todoist-task";
   return undefined;
 }
 
