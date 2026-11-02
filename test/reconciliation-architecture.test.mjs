@@ -29,7 +29,10 @@ test("completed-history EventBridge rule is conditionally managed after SAM tran
   assert.match(rule, /CompletedHistoryCleanupFunctionDailyCompletedHistoryReviewPermission:/);
   assert.match(rule, /SourceArn:\s*!GetAtt CompletedHistoryCleanupFunctionDailyCompletedHistoryReview.Arn/);
   assert.match(deployScript, /CompletedHistoryCleanupApply=\$completed_history_cleanup_apply/);
-  assert.match(productionWorkflow, /COMPLETED_HISTORY_CLEANUP_APPLY: 'true'/);
+  assert.match(productionWorkflow, /COMPLETED_HISTORY_CLEANUP_APPLY:.*vars\.COMPLETED_HISTORY_CLEANUP_APPLY\s*\|\|\s*'false'/);
+  assert.match(productionWorkflow, /Gate cleanup activation on retained-mapping implementation/);
+  assert.match(productionWorkflow, /Refusing automatic cleanup: #277 seven-day retained-mapping lifecycle is absent/);
+  assert.doesNotMatch(productionWorkflow, /^\s*COMPLETED_HISTORY_CLEANUP_APPLY:\s*'true'\s*$/m);
   assert.match(productionWorkflow, /Verify completed-history retirement schedule and Lambda mode/);
 });
 
