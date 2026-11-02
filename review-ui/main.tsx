@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility, revalidateRepairAction } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
+import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
 import { ErasurePanel } from "./erasure-panel";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
@@ -40,7 +41,7 @@ function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,upda
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
-  const [action,setAction] = useState("link"), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
+  const [action,setAction] = useState(""), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
   const [leftovers,setLeftovers] = useState<Record<string,string>>({}), [requiredDispositionRef,setRequiredDispositionRef] = useState<string>();
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
@@ -65,7 +66,12 @@ function App() {
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
+  const capabilities=availableRepairActions({caseItem:selected,snapshots:details?.snapshots||[],
+    selection:repairSelection,decision:details?.item?.decision,operation,profiles});
   const ownerRequirement=repairRecurrenceOwnerRequirement(repairSelection,details,action);
+  const formFields=actionFormFields(action,{hasRecurrence:capabilities.summary.hasRecurrence,ownerRequired:Boolean(ownerRequirement)});
+  const currentAction=capabilities.actions.find((item:any)=>item.id===action);
+  const capabilitySignature=capabilities.actions.map((item:any)=>item.id).join("|");
   const ownerExplanation=ownerRequirement === "calendar-occurrence"
     ? "This occurrence belongs to a recurring Calendar series. Choose which provider owns the recurrence."
     : ownerRequirement === "calendar-series"
@@ -73,7 +79,7 @@ function App() {
       : ownerRequirement === "todoist-task"
         ? "This Todoist task repeats. Select Todoist as recurrence owner unless repairing a Calendar-owned series."
         : undefined;
-  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
+  const canPreview=Boolean(currentAction)&&repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
     && Object.entries(leftovers).every(([key,disposition]) => (details?.snapshots||[]).some((s:any)=>
       `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key
       && dispositionOptions(s,action).length>0 && (!disposition || dispositionOptions(s,action).includes(disposition))));
@@ -81,13 +87,28 @@ function App() {
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
   const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");setValidationError(undefined);};
+  // A newly missing, cancelled, completed, reassigned or unverified provider
+  // immediately revokes the chosen action. Never substitute another mutation.
+  useEffect(()=>{
+    if(!revalidateRepairAction(action,capabilities).revoked)return;
+    invalidatePreview();setAction("");setOwner("");setWinner("none");setScope("occurrence");
+    setLeftovers({});setRequiredDispositionRef(undefined);setDecisionAction("");setTargetProfile("");
+    setMessage("The selected repair action is no longer supported by current provider evidence. Recheck and choose an action again.");
+  },[action,capabilitySignature,selected?.id,selected?.profile,repairSelection.taskId,
+    repairSelection.eventId,repairSelection.verifiedTaskId,repairSelection.verifiedEventId,
+    details,operation?.status]);
+  const chooseRepairAction=(next:string)=>{
+    invalidatePreview();setAction(next);setOwner(next==="transfer"?"calendar":"");
+    setWinner("none");setScope(["flatten","transfer","todoist-only","todoist-only-delete-calendar","calendar-history-only"].includes(next)?"future":"occurrence");
+    setLeftovers({});setRequiredDispositionRef(undefined);setTargetProfile("");setDecisionAction("");
+  };
   const selectCase=(item?:Case,options:{syncUrl?:boolean}={})=>{
     invalidatePreview();
     if(item)setProfile(item.profile);
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
-    setAction(item?.decision?.type?.startsWith("operational_")?"":"link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+    setAction("");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
@@ -455,12 +476,38 @@ function App() {
               <input value={recordedEventId} readOnly aria-label="Recorded Calendar event ID" />
               <small>Provider status: {recordedProviderState("calendar",recordedEventId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
             </label>}
-            {!verifiedRepairTarget&&<p className="notice">No live item selected for repair. Use Find counterpart below or refresh affected items to verify a current item; the recorded IDs above may refer to deleted items.</p>}
-            {verifiedRepairTarget&&<label>Repair action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
-              ["","Choose a repair action"],["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
-            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>}
-            {(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a live task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
-            {(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for a live event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            <div className="item-identity" role="status" aria-live="polite">
+              <strong>Current repair context</strong>
+              <span>Todoist: {capabilities.summary.task}{capabilities.summary.verifiedTaskId&&` · ${capabilities.summary.verifiedTaskId}`}</span>
+              <span>Calendar: {capabilities.summary.event}{capabilities.summary.verifiedEventId&&` · ${capabilities.summary.verifiedEventId}`}</span>
+              <span>Association: {capabilities.summary.mapping} · recurrence: {capabilities.summary.recurrence}</span>
+              <small>{capabilities.summary.reason} Historical alert evidence is shown separately above.</small>
+            </div>
+            {!capabilities.actions.length&&<p className="notice" role="status">No currently eligible repair action. Recurrence cannot be inferred from a missing item. Recheck items (no changes), find an existing live item, run profile reconciliation, or dismiss the alert only.</p>}
+            {capabilities.actions.length>0&&<>
+              <label>What would you like to do?
+                <select aria-label="Recommended repair action" value={currentAction?.tier==="common"?action:""} onChange={e=>chooseRepairAction(e.target.value)}>
+                  <option value="">Choose an action (no changes)</option>
+                  {capabilities.actions.filter((item:any)=>item.tier==="common").map((item:any)=><option key={item.id} value={item.id}>{item.label}</option>)}
+                </select>
+              </label>
+              {currentAction&&<p className="action-explanation">{currentAction.explanation} A backend-validated preview and separate Apply step are still required.</p>}
+              {capabilities.actions.some((item:any)=>item.tier==="advanced")&&<details>
+                <summary>Advanced repairs — specialised operations</summary>
+                <label>Advanced repair action
+                  <select aria-label="Advanced repair action" value={currentAction?.tier==="advanced"?action:""} onChange={e=>chooseRepairAction(e.target.value)}>
+                    <option value="">Choose a specialised action</option>
+                    {capabilities.actions.filter((item:any)=>item.tier==="advanced").map((item:any)=><option key={item.id} value={item.id}>{item.label}</option>)}
+                  </select>
+                </label>
+              </details>}
+            </>}
+            <details><summary>Why aren't other actions shown?</summary>
+              <p>Only options with verified current provider evidence are selectable. Backend preview and apply checks still decide whether they are safe.</p>
+              <ul>{capabilities.unavailable.map((item:any)=><li key={item.id}><strong>{item.label}:</strong> {item.reason}</li>)}</ul>
+            </details>
+            {Boolean(action)&&(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} readOnly placeholder="Find a verified Todoist task" aria-invalid={validationError?.field==="taskId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {Boolean(action)&&(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} readOnly placeholder="Find a verified Calendar event" aria-invalid={validationError?.field==="eventId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
             {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
               invalidatePreview();
@@ -472,19 +519,21 @@ function App() {
             {action==="todoist-only"&&<p className="notice">Choose the exact recurring Todoist task and a confirmed standalone Calendar item that is historical to it. The task keeps its due date as a one-off and is excluded from projection. The Calendar item is preserved byte-for-byte and excluded from future syncing.</p>}
             {action==="todoist-only-delete-calendar"&&<p className="warning">Choose the exact active one-off Todoist task and its mapped Calendar projection. Applying this repair deletes only that Calendar projection, keeps the Todoist task unchanged, removes the stale mapping, and excludes both exact IDs from future syncing. Closed cases may use a fresh preview against current IDs.</p>}
             {action==="calendar-history-only"&&<p className="warning">Choose one confirmed, elapsed standalone Calendar event. Preview will show its exact date range and mapping rows, along with any current/future counterpart that will remain linked. Applying changes only the selected event metadata and its exact event mapping.</p>}
-            {action==="create"&&<div className="source-choice"><span>Choose which item should get a new counterpart:</span><div><button className="secondary" onClick={()=>setEventId("")}>Create Calendar event from this Todoist task</button><button className="secondary" onClick={()=>setTaskId("")}>Create Todoist task from this Calendar event</button></div></div>}
-            {["link","transfer"].includes(action)&&<label>Fields to use<select value={action==="transfer"?"none":winner} disabled={action==="transfer"} onChange={e=>{invalidatePreview();setWinner(e.target.value);}} aria-invalid={validationError?.field==="winner"}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select>{action==="transfer"&&<small>The transfer preserves the Todoist task's existing recurrence and fields.</small>}{validationError?.field==="winner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
-            {["link","transfer","create"].includes(action)&&<label>Recurrence owner {ownerRequirement&&<strong>(required)</strong>}<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}} required={Boolean(ownerRequirement)} aria-invalid={validationError?.field==="owner" || Boolean(ownerRequirement&&!owner)} aria-describedby={ownerRequirement?"recurrence-owner-help":undefined}><option value="">{ownerRequirement?"Choose a recurrence owner":"No recurrence / leave unchanged"}</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select>{ownerExplanation&&<small id="recurrence-owner-help">{ownerExplanation}</small>}{validationError?.field==="owner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
-            {["flatten","todoist-only","todoist-only-delete-calendar","link","transfer","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}} aria-invalid={validationError?.field==="scope"}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select>{validationError?.field==="scope"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {action==="create"&&<p className="notice">Verified source: {taskId?`Todoist task ${taskId}`:`Calendar event ${eventId}`}. The other side will be created only after an explicit preview and Apply repair.</p>}
+            {formFields.winner&&<label>Fields to use<select value={action==="transfer"?"none":winner} disabled={action==="transfer"} onChange={e=>{invalidatePreview();setWinner(e.target.value);}} aria-invalid={validationError?.field==="winner"}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select>{action==="transfer"&&<small>The transfer preserves the Todoist task's existing recurrence and fields.</small>}{validationError?.field==="winner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {formFields.owner&&<label>Recurrence owner {ownerRequirement&&<strong>(required)</strong>}<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}} required={Boolean(ownerRequirement)} aria-invalid={validationError?.field==="owner" || Boolean(ownerRequirement&&!owner)} aria-describedby={ownerRequirement?"recurrence-owner-help":undefined}><option value="">{ownerRequirement?"Choose a recurrence owner":"No recurrence / leave unchanged"}</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select>{ownerExplanation&&<small id="recurrence-owner-help">{ownerExplanation}</small>}{validationError?.field==="owner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {formFields.scope&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}} aria-invalid={validationError?.field==="scope"}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select>{validationError?.field==="scope"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {action==="move"&&<label>Destination account<select value={targetProfile} onChange={e=>{invalidatePreview();setTargetProfile(e.target.value);}}><option value="">Choose account</option>{profiles.filter(p=>p!=="all"&&p!==selected.profile).map(p=><option key={p}>{p}</option>)}</select></label>}
             {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
+          <details open={!verifiedRepairTarget}><summary>Find existing item / choose a different verified counterpart</summary>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
-          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
-          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object, the recorded relationship that included it, and whether a disposition is required for this repair.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{affectedGroups.map((group:any)=><section className="affected-group" key={group.key}>{group.seriesId||group.masterId?<h5>Recurring series group · {group.seriesId?`series ${group.seriesId}`:`master ${group.masterId}`}{group.masterId?` · Calendar master ${group.masterId}`:""}</h5>:null}{group.items.map((item:any)=><AffectedItem key={choiceKey(item)} item={item} action={action} taskId={taskId} eventId={eventId} scope={scope} snapshots={snapshots} leftovers={leftovers} updateLeftover={updateLeftover} choiceKey={choiceKey} requiredDispositionRef={requiredDispositionRef}/>)}</section>)}</div>}
-          {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
-          <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
+          </details>
+          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Recheck items (no changes)</button>
+          {formFields.dispositions&&snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object, the recorded relationship that included it, and whether a disposition is required for this repair.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{affectedGroups.map((group:any)=><section className="affected-group" key={group.key}>{group.seriesId||group.masterId?<h5>Recurring series group · {group.seriesId?`series ${group.seriesId}`:`master ${group.masterId}`}{group.masterId?` · Calendar master ${group.masterId}`:""}</h5>:null}{group.items.map((item:any)=><AffectedItem key={choiceKey(item)} item={item} action={action} taskId={taskId} eventId={eventId} scope={scope} snapshots={snapshots} leftovers={leftovers} updateLeftover={updateLeftover} choiceKey={choiceKey} requiredDispositionRef={requiredDispositionRef}/>)}</section>)}</div>}
+          {!canPreview&&Boolean(action)&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: the selected live identities no longer satisfy this action. Recheck provider state and choose again."}</p>}
+          {Boolean(currentAction)&&<button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair (no changes)"}</button>}
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>{selected.decision?.type==="operational_reconciliation_stuck"?`Request fresh reconciliation for ${selected.profile}`:`Run reconciliation for ${selected.profile}`}</button>
           <p className="action-explanation">Run reconciliation scans the whole profile; it does not apply this one-case repair. Dismissing an alert hides the notification only and does not fix provider data or mappings.</p>
           {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
