@@ -135,6 +135,7 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const foreignCandidate=snapshots.some(snapshot=>snapshot.ref?.profile!==item.profile
     && [selection?.taskId,selection?.eventId].includes(snapshot.ref?.id));
   const unknownCounterpart=Boolean(validSource?.mapping||validSource?.recurrence||validSource?.destination
+    ||eventObj?.extendedProperties?.shared?.taskId
     ||hasOtherSide||competing||foreignCandidate||otherLiveTasks.length>1||otherLiveEvents.length>1);
   const pending=decision||item.decision;
   const pendingActions=(pending?.permittedActions||[]).filter(a=>a?.id&&a.id!=="reconcile_now");
