@@ -299,10 +299,10 @@ export class ReviewStore {
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
       { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
-        UpdateExpression: "SET #status = :resolved, #result = :result, updatedAt = :now, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, title, reason, reconciliationGeneration, progressCheckpoint, coalescedInto",
+        UpdateExpression: "SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, reconciliationGeneration, progressCheckpoint, coalescedInto",
         ConditionExpression: "#status = :old AND updatedAt = :version AND attribute_not_exists(operationId)",
-        ExpressionAttributeNames: { "#status": "status", "#result": "result" },
-        ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution,
+        ExpressionAttributeNames: { "#status": "status", "#result": "result", "#title": "title", "#reason": "reason" },
+        ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution, ":title": "Verified deletion", ":reason": "verified_deletion",
           ":now": now, ":old": current.status, ":version": current.updatedAt,
           ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
       } },
