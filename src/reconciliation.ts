@@ -314,8 +314,9 @@ export class SnapshotReconciler {
   private async retainCompletedProjectionIfMarked(profile: Profile, mapping: Mapping): Promise<ReconcileOutcome | undefined> {
     const completedProjection = await this.completedProjection(profile, mapping.eventId);
     if (completedProjection?.taskId !== mapping.taskId) return undefined;
-    await this.state.deleteMapping(mapping);
-    await this.store.deleteBaseline(profile, mapping.taskId);
+    // The mapping is kept throughout the seven-day completion grace.
+    // The maintenance worker retires all three indexes transactionally.
+    // Reconciliation must not delete these rows early or mutate providers.
     await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
       taskId: mapping.taskId,
       eventId: mapping.eventId,
