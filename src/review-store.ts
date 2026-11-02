@@ -3,7 +3,7 @@ import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComma
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
 import type { Profile } from "./types.js";
-import { retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
+import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
@@ -353,6 +353,63 @@ export class ReviewStore {
         }
       }
     }
+    // Query only exact-provider reverse indexes. Do not scan the audit table:
+    // older records without these pointers retain their original 7-day TTL.
+    // Every candidate audit is re-read and deleted only when *all* its
+    // recorded provider IDs are within this verified-deleted fixture.
+    const auditDeletes = new Set(items.filter(x => x.Delete)
+      .map(x => x.Delete?.Key.pk).filter((value): value is string => typeof value === "string"));
+    const referenceKeys = [
+      ...expected.taskIds.map(id => `AUDIT_REF#${expected.profile}#todoist#${id}`),
+      ...expected.eventIds.map(id => `AUDIT_REF#${expected.profile}#calendar#${id}`),
+    ];
+    const referencedAudits = new Map<string, Record<string, unknown>>();
+    const auditPointers = new Map<string, { key: { pk: string; sk: string }; auditKey: string }>();
+    for (const pk of referenceKeys) {
+      const page = await this.db.send(new QueryCommand({ TableName: reviewTable(),
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+        ExpressionAttributeValues: { ":pk": pk, ":prefix": "AUDIT#" },
+        ConsistentRead: true, Limit: 50 }));
+      if (page.LastEvaluatedKey) return false; // no partially attributed cleanup
+      for (const row of page.Items || []) {
+        if (typeof row.auditKey !== "string" || !row.auditKey.startsWith(`AUDIT#${expected.profile}#`)
+          || typeof row.sk !== "string") continue;
+        const pointerKey = { pk, sk: row.sk };
+        auditPointers.set(`${pk}|${row.sk}`, { key: pointerKey, auditKey: row.auditKey });
+        if (!referencedAudits.has(row.auditKey)) {
+          const record = await this.get<Record<string, unknown>>(row.auditKey);
+          if (record) referencedAudits.set(row.auditKey, record);
+        }
+      }
+    }
+    const safeAudits = new Set<string>();
+    for (const [auditKey, record] of referencedAudits) {
+      const auditDetail = record.detail && typeof record.detail === "object"
+        ? record.detail as Record<string, unknown> : undefined;
+      if (!auditDetail || typeof record.action !== "string"
+        || /(?:operational|dlq)/.test(record.action)) continue;
+      const identities = retainedAuditProviderIds(auditDetail);
+      if (!identities.taskIds.length && !identities.eventIds.length) continue;
+      if (identities.taskIds.every(id => expected.taskIds.includes(id))
+        && identities.eventIds.every(id => expected.eventIds.includes(id))) safeAudits.add(auditKey);
+    }
+    for (const auditKey of safeAudits) {
+      if (auditDeletes.has(auditKey)) continue;
+      const record = referencedAudits.get(auditKey)!;
+      items.push({ Delete: { TableName: reviewTable(), Key: key(auditKey),
+        ConditionExpression: "createdAt = :createdAt AND #action = :action",
+        ExpressionAttributeNames: { "#action": "action" },
+        ExpressionAttributeValues: { ":createdAt": record.createdAt, ":action": record.action },
+      } });
+    }
+    for (const pointer of auditPointers.values()) {
+      if (!safeAudits.has(pointer.auditKey) && referencedAudits.has(pointer.auditKey)) continue;
+      items.push({ Delete: { TableName: reviewTable(), Key: pointer.key,
+        ConditionExpression: "auditKey = :auditKey",
+        ExpressionAttributeValues: { ":auditKey": pointer.auditKey },
+      } });
+    }
+    if (items.length > 95) return false; // leave open for safe bounded retry
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
       return true;
