@@ -22,6 +22,12 @@ review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
 # A destructive production feature; deployments must explicitly opt in.
 erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
 capacity_reduction_approved="${DYNAMODB_CAPACITY_REDUCTION_APPROVED:-false}"
+# Explicit production opt-in; do not turn on retention cleanup for new stacks.
+completed_history_cleanup_apply="${COMPLETED_HISTORY_CLEANUP_APPLY:-false}"
+if [[ "$completed_history_cleanup_apply" != "true" && "$completed_history_cleanup_apply" != "false" ]]; then
+  echo "COMPLETED_HISTORY_CLEANUP_APPLY must be true or false" >&2
+  exit 2
+fi
 # Explicitly pass every provisioned table/index capacity. Otherwise a new
 # template default can silently override the existing 5/5 GSI stack parameter.
 state_table_read_capacity="${STATE_TABLE_READ_CAPACITY:-20}"
@@ -195,6 +201,7 @@ sam deploy \
     "StateTableWriteCapacity=$state_table_write_capacity" \
     "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity" \
     "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity" \
+    "CompletedHistoryCleanupApply=$completed_history_cleanup_apply" \
     "ErasureExecutionEnabled=$erasure_execution_enabled" \
     "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
     "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \

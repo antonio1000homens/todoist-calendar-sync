@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, missingDispositionReference, repairRecurrenceOwnerRequirement, repairValidationField, operationResumeEligibility } from "../review-ui/repair-selection.mjs";
+import { recordedPrimaryProviderIds, recordedProviderState } from "../review-ui/case-url.mjs";
 
 const caseFor = (id, profile, taskId, eventId) =>
   ({ id, profile, taskId, eventId, decision:{context:{}}, status:"open" });
@@ -254,4 +255,32 @@ test("a recorded provider delta keeps a legacy failed operation resumable", () =
   assert.equal(operationResumeEligibility(operation),"resume");
   assert.equal(operationResumeEligibility({...operation,abandoned:true}),"none");
   assert.equal(operationResumeEligibility({...operation,expectedProviders:{"home:calendar:event":before}}),"fresh-preview");
+});
+
+test("an operational DLQ case shows its missing task as read-only evidence, not as repair selection", () => {
+  const item={id:"op-dlq",profile:"home",taskId:"deleted-task",decision:{
+    type:"operational_dlq",context:{providerTaskId:"deleted-task",deliveryId:"delivery-1"}}};
+  const snapshots=[{ref:{profile:"home",side:"todoist",id:"deleted-task"},object:null}];
+  assert.deepEqual(recordedPrimaryProviderIds(item),{taskId:"deleted-task",eventId:""});
+  assert.equal(recordedProviderState("todoist","deleted-task",snapshots,"home"),"missing (404/410)");
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.equal(form.taskId,"");
+  assert.equal(repairPreviewAllowed(form,item,detailsFor(item,snapshots),"link"),false);
+  const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  assert.match(source,/value=\{recordedTaskId\} readOnly aria-label="Recorded Todoist task ID"/);
+  assert.match(source,/!verifiedRepairTarget&&<p className="notice">No live item selected for repair/);
+  assert.match(source,/setAction\(item\?\.decision\?\.type\?\.startsWith\("operational_"\)\?"":"link"\)/);
+});
+
+test("a verified recorded task can populate repair selection without making the evidence editable", () => {
+  const item={id:"operational-2",profile:"home",taskId:"live-task",decision:{context:{providerTaskId:"live-task"}}};
+  const snapshots=[live("home","todoist","live-task")];
+  const form=reconcileRepairSelection(item,snapshots,emptyRepairSelection(item));
+  assert.equal(form.taskId,"live-task");
+  assert.equal(form.verifiedTaskId,"live-task");
+  assert.equal(recordedPrimaryProviderIds(item).taskId,"live-task");
+  assert.equal(recordedProviderState("todoist","live-task",snapshots,"home"),"verified live");
+  const alternate=editRepairSelection(form,"todoist","different-task",true,{id:"different-task"});
+  assert.equal(alternate.taskId,"different-task");
+  assert.equal(recordedPrimaryProviderIds(item).taskId,"live-task");
 });

@@ -39,3 +39,33 @@ test('active run polling refreshes the inbox and announces terminal status witho
   assert.ok(source.includes('Retained task: {item.detail.retainedTaskId}'));
   assert.ok(source.includes('Decision: {item.detail.decisionId}'));
 });
+
+test('dismissing an open review alert is single-click without changing the dismiss-only action', async () => {
+  const source = await readFile(new URL('../review-ui/main.tsx', import.meta.url), 'utf8');
+  const dismiss = source.match(/const dismissAlert=async \(\) => \{([\s\S]*?)\n  \};/)?.[1];
+  assert.ok(dismiss, 'dismiss handler must remain available');
+  assert.doesNotMatch(dismiss, /(?:window\.)?confirm\s*\(/);
+  assert.match(dismiss, /if\(!selected\|\|selected\.status!=="open"\)return;/);
+  assert.ok(dismiss.includes('api(`cases/${encodeURIComponent(dismissedCaseId)}/dismiss`,{method:"POST",body:"{}"})'));
+  assert.match(dismiss, /setBusy\(true\)/);
+  assert.match(dismiss, /Alert dismissed\. Select another alert/);
+  const requestPosition=dismiss.indexOf("await api(`cases/");
+  const clearedPosition=dismiss.indexOf("selectCase(undefined)");
+  assert.ok(requestPosition>=0 && clearedPosition>requestPosition, "selection clears only after dismissal succeeds");
+  assert.ok(dismiss.includes("selectedVersion===selectionVersion.current)selectCase(undefined)"), "do not clear newly selected cases");
+  assert.doesNotMatch(dismiss, /selectCase\(result\.item/);
+  assert.ok(source.includes('else window.history.replaceState(null,"",next)'), "clearing selection also removes the case URL parameter");
+  assert.match(source, /onClick=\{dismissAlert\} disabled=\{busy\}>Dismiss alert only/);
+});
+
+test('review alert detail shows recorded evidence without redundant explanation and identity metadata', async () => {
+  const source = await readFile(new URL('../review-ui/main.tsx', import.meta.url), 'utf8');
+  const evidence = source.match(/<section className="preview alert-evidence">([\s\S]*?)<\/section>/)?.[1];
+  assert.ok(evidence, 'recorded alert evidence section must be present');
+  assert.match(evidence, /<details><summary>Recorded alert evidence<\/summary>\s*<pre>\{JSON\.stringify\(selected\.decision\?\.context\|\|\{\},null,2\)\}<\/pre>/);
+  assert.doesNotMatch(evidence, /Why this alert is open|Recorded reason:|First seen \/ opened|Recorded provider identities|Search Todoist candidates|Search Calendar candidates/);
+  assert.doesNotMatch(source, /<h3>Why this alert is open<\/h3>/);
+  assert.doesNotMatch(source, /<summary>Delivery failure details<\/summary>/);
+  assert.match(evidence, /selected\.decision\?\.type\?\.startsWith\("operational_"\)/);
+  assert.match(evidence, /A failed delivery is not replayed/);
+});

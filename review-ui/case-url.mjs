@@ -5,6 +5,17 @@ export function caseUrl(currentHref, caseId) {
   return url;
 }
 
+
+/** Primary IDs recorded by this alert are historical evidence, not live repair targets. */
+export function recordedPrimaryProviderIds(item) {
+  const context=item?.decision?.context||{};
+  const first=(...values)=>values.find(value=>typeof value==="string"&&value.trim().length>0)||"";
+  return {
+    taskId:first(context.providerTaskId,item?.decision?.taskId,item?.taskId,context.taskId),
+    eventId:first(context.providerEventId,item?.decision?.eventId,item?.eventId,context.eventId),
+  };
+}
+
 export function caseIdsFromEvidence(item) {
   const context=item?.decision?.context||{};
   const strings=(value)=>Array.isArray(value)?value.filter((id)=>typeof id==="string"&&id.length>0):[];
@@ -19,7 +30,9 @@ export function caseIdsFromEvidence(item) {
 
 export function caseIdentityState(item, snapshots=[]) {
   const ids=caseIdsFromEvidence(item);
-  const verified=new Set(snapshots.filter((snapshot)=>snapshot?.object?.id===snapshot?.ref?.id)
+  const verified=new Set(snapshots.filter((snapshot)=>snapshot?.object?.id===snapshot?.ref?.id
+    && (snapshot.ref.side !== "calendar" || snapshot.object.status === "confirmed")
+    && (snapshot.ref.side !== "todoist" || !snapshot.object.is_deleted))
     .map((snapshot)=>`${snapshot.ref.side}:${snapshot.ref.id}`));
   return {
     taskIds:[...new Set(ids.taskIds)], eventIds:[...new Set(ids.eventIds)],
@@ -28,6 +41,22 @@ export function caseIdentityState(item, snapshots=[]) {
     verifiedEventIds:[...new Set(ids.eventIds.filter((id)=>verified.has(`calendar:${id}`)))],
     hasAnyRecordedIdentity:ids.taskIds.length+ids.eventIds.length>0,
   };
+}
+
+/** Status of this exact provider identity, not the historical alert's claim. */
+export function recordedProviderState(side, id, snapshots=[], profile) {
+  const snapshot=snapshots.find(entry=>entry?.ref?.side===side && entry.ref.id===id
+    && (!profile || entry.ref.profile===profile));
+  if (!snapshot) return "candidate / unverified";
+  if (!snapshot.object) return "missing (404/410)";
+  if (snapshot.object.id!==id) return "identity mismatch / unverified";
+  if (side==="calendar") {
+    if (snapshot.object.status==="cancelled") return "cancelled / deleted in Google Calendar";
+    return snapshot.object.status==="confirmed" ? "verified live" : "status unverified";
+  }
+  if (snapshot.object.is_deleted) return "deleted in Todoist";
+  if (snapshot.object.is_completed) return "completed in Todoist";
+  return "verified live";
 }
 
 export function dispositionGuidance(disposition) {
@@ -59,3 +88,7 @@ export function groupAffectedSnapshots(snapshots=[]) {
     return role(a)-role(b)||String(a.ref.id).localeCompare(String(b.ref.id));
   })}));
 }
+
+/** Compatibility alias for the deleted-conflict review regression tests.
+ * Reuse the shared, active-provider-only URL policy. */
+export { providerLink as providerSnapshotLink } from "./item-identity.mjs";

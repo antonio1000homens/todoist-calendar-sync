@@ -188,7 +188,7 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
   const controlsBlockRecovery = async (eventIds: string[], taskId?: string): Promise<boolean> => {
-    for (const eventId of eventIds) if (await state.syncBlocked(profile,{eventId,taskId})) {
+    for (const eventId of eventIds) if (await state.syncBlocked(profile,{eventId,taskId}, true)) {
       summary.blocked += 1;
       await state.audit(profile,"calendar_snapshot_sync_control_blocked",{eventId,taskId});
       return true;

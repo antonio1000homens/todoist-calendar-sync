@@ -1,5 +1,5 @@
 import { ReviewStore as SyncReviewStore, SyncControls, reviewHash } from "./review-store.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DeleteCommand,
   GetCommand,
@@ -12,6 +12,7 @@ import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
+  retainedAuditProviderIds,
   retainedConflictEntity,
   retainedConflictIdentity,
   retainedConflictIncidentId,
@@ -166,8 +167,13 @@ function latestOriginalStart(...values: Array<string | undefined>): string | und
 export class StateRepository {
   constructor(readonly repairOperationId?: string) {}
 
-  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
-    return new SyncControls().blocked(profile, ids, this.repairOperationId);
+  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, beforeProjection = false): Promise<boolean> {
+    if (await new SyncControls().blocked(profile, ids, this.repairOperationId)) return true;
+    if (!beforeProjection) return false;
+    const review = new SyncReviewStore();
+    if (ids.taskId && await review.hasActiveDeletionGuard(profile, "todoist", ids.taskId)) return true;
+    if (ids.eventId && await review.hasActiveDeletionGuard(profile, "calendar", ids.eventId)) return true;
+    return false;
   }
 
   async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {
@@ -1805,6 +1811,79 @@ export class StateRepository {
     }
   }
 
+  /**
+   * Retire a Todoist-owned recurring projection only after its task and every
+   * currently referenced Calendar resource have been verified absent by the
+   * reconciliation worker. Provider verification happens before this call.
+   *
+   * The four index deletes are one transaction: a racing new series owner,
+   * active repair, or a completed-history guard prevents partial retirement.
+   */
+  async retireDeletedTodoistRecurrenceIfUnchanged(mapping: Mapping, expectedLink: RecurrenceLink): Promise<boolean> {
+    if (mapping.recurrenceOwner !== "todoist" || !mapping.seriesId || !mapping.updatedAt
+      || expectedLink.owner !== "todoist" || !expectedLink.updatedAt
+      || expectedLink.profile !== mapping.profile || expectedLink.seriesId !== mapping.seriesId
+      || expectedLink.taskId !== mapping.taskId || expectedLink.eventId !== mapping.eventId
+      || expectedLink.masterEventId !== mapping.masterEventId
+      || expectedLink.activeInstanceId !== mapping.activeInstanceId) return false;
+    const table = this.ensureTable();
+    const values: Record<string, unknown> = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": mapping.updatedAt, ":owner": "todoist", ":series": mapping.seriesId,
+    };
+    const optional = (row: Mapping | RecurrenceLink, field: string, values: Record<string, unknown>): string => {
+      const value = (row as unknown as Record<string, unknown>)[field];
+      if (value === undefined || value === null) return `attribute_not_exists(${field})`;
+      const placeholder = `:${field}`;
+      values[placeholder] = value;
+      return `${field} = ${placeholder}`;
+    };
+    const mappingFields = ["recurrenceId", "masterEventId", "activeInstanceId",
+      "originalStart", "activeEffectiveStart"];
+    const mapCondition = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND seriesId = :series AND "
+      + mappingFields.map(field => optional(mapping, field, values)).join(" AND ");
+    const linkValues: Record<string, unknown> = {
+      ":profile": mapping.profile, ":task": mapping.taskId, ":event": mapping.eventId,
+      ":updated": expectedLink.updatedAt, ":owner": "todoist", ":series": mapping.seriesId,
+    };
+    const linkCondition = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND #owner = :owner AND seriesId = :series AND "
+      + ["masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart"]
+        .map(field => optional(expectedLink, field, linkValues)).join(" AND ");
+    const mappingKeys = [
+      key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+      key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
+      key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+    ];
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: [
+        ...mappingKeys.map(Key => ({ Delete: {
+          TableName: table, Key, ConditionExpression: mapCondition,
+          ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: values,
+        } })),
+        { Delete: { TableName: table, Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
+          ConditionExpression: linkCondition, ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+          ExpressionAttributeValues: linkValues } },
+        ...[
+          `SYNC_CONTROL#${mapping.profile}:todoist:${mapping.taskId}`,
+          ...[...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id)))]
+            .map(id => `SYNC_CONTROL#${mapping.profile}:calendar:${id}`),
+        ].map(controlKey => ({ ConditionCheck: {
+          TableName: table, Key: key(controlKey),
+          ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
+          ExpressionAttributeValues: { ":no": false },
+        } })),
+        ...[...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id)))]
+          .map(eventId => ({ ConditionCheck: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${eventId}`),
+            ConditionExpression: "attribute_not_exists(pk)" } })),
+      ] }));
+      return true;
+    } catch (error) {
+      if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
+      return false;
+    }
+  }
+
   /** Delete an exact standalone mapping only when every primary index still has its previewed version. */
   async deleteMappingIfUnchanged(mapping: Mapping): Promise<boolean> {
     if (!mapping.updatedAt || mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
@@ -2088,6 +2167,42 @@ export class StateRepository {
     return results;
   }
 
+  /**
+   * A short-lived cross-invocation fence serialises Todoist Calendar writes
+   * with completion guard creation. A lease outlives the AWS Lambda maximum
+   * invocation time (15 minutes); after a crashed invocation, the next worker
+   * can recover without permanently blocking the task.
+   */
+  async beginTodoistCalendarWrite(taskId: string): Promise<string> {
+    const nowMs = Date.now();
+    const token = randomUUID();
+    await client.send(new PutCommand({
+      TableName: this.ensureTable(),
+      Item: {
+        ...key(`CALENDAR_WRITE#${taskId}`), token,
+        leaseUntilMs: nowMs + 16 * 60_000,
+        expiresAt: Math.floor((nowMs + 16 * 60_000) / 1000),
+      },
+      ConditionExpression: "attribute_not_exists(pk) OR leaseUntilMs < :now",
+      ExpressionAttributeValues: { ":now": nowMs },
+    }));
+    return token;
+  }
+
+  async endTodoistCalendarWrite(taskId: string, token: string): Promise<void> {
+    try {
+      await client.send(new DeleteCommand({
+        TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${taskId}`),
+        ConditionExpression: "#token = :token",
+        ExpressionAttributeNames: { "#token": "token" },
+        ExpressionAttributeValues: { ":token": token },
+      }));
+    } catch (error) {
+      // An expired lease may have been replaced by another invocation.
+      if (!conditionalFailure(error)) throw error;
+    }
+  }
+
   async putCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
     // Once the event-side marker exists it is immutable. A retry must neither
     // reset the seven-day clock nor recreate a task-side index retired by
@@ -2096,6 +2211,13 @@ export class StateRepository {
     try {
       await client.send(new TransactWriteCommand({
         TransactItems: [
+          // Completion cannot become durable during an in-flight Calendar write.
+          // A contended completion delivery fails and is retried, not acknowledged.
+          { ConditionCheck: {
+            TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${projection.taskId}`),
+            ConditionExpression: "attribute_not_exists(pk) OR leaseUntilMs < :now",
+            ExpressionAttributeValues: { ":now": Date.now() },
+          } },
           {
             Put: {
               TableName: this.ensureTable(),
@@ -2204,6 +2326,62 @@ export class StateRepository {
     } catch (error) {
       const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
       if (cancelled.name === "TransactionCanceledException"
+        && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * An explicit uncompletion re-enables a still-retained standalone mapping
+   * without touching Google Calendar. A task whose indexes have been retired
+   * is deliberately NOT restored, even if provider comments still exist.
+   */
+  async reopenRetainedStandaloneMapping(mapping: Mapping, taskUpdatedAt: string | undefined): Promise<boolean> {
+    if (mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
+      || mapping.activeInstanceId || mapping.originalStart || mapping.activeEffectiveStart
+      || !taskUpdatedAt || !Number.isFinite(Date.parse(taskUpdatedAt))) return false;
+    const table = this.ensureTable();
+    const history = await this.getCompletedCalendarProjectionByEvent(mapping.profile, mapping.eventId);
+    const legacyHistory = history as (CompletedCalendarProjection & { recurrenceId?: string; activeInstanceId?: string }) | undefined;
+    if (!history || history.taskId !== mapping.taskId || history.recurrenceOwner
+      || legacyHistory?.recurrenceId || history.seriesId || history.masterEventId
+      || legacyHistory?.activeInstanceId || history.originalStart || history.terminalVerified
+      || !Number.isFinite(Date.parse(history.completedAt))
+      || Date.parse(taskUpdatedAt) <= Date.parse(history.completedAt)
+      || Date.now() - Date.parse(history.completedAt) >= 7 * 24 * 60 * 60_000) return false;
+    const values = { ":profile": mapping.profile, ":task": mapping.taskId,
+      ":event": mapping.eventId, ":completed": history.completedAt };
+    const identity = "#profile = :profile AND taskId = :task AND eventId = :event AND completedAt = :completed";
+    const standaloneGuard = " AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(recurrenceId) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId) AND attribute_not_exists(originalStart) AND attribute_not_exists(activeEffectiveStart)";
+    const matchingMap = "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :mappingUpdated" + standaloneGuard;
+    const tx: Array<Record<string, unknown>> = [
+      { Delete: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
+        ConditionExpression: identity + standaloneGuard,
+        ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
+      { Delete: { TableName: table, Key: key(`COMPLETED_TASK#${mapping.profile}#${mapping.taskId}`, `EVENT#${mapping.eventId}`),
+        ConditionExpression: identity + standaloneGuard,
+        ExpressionAttributeNames: { "#profile": "profile" }, ExpressionAttributeValues: values } },
+      ...[
+        key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
+        key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
+        key(`TASKOWNER#${mapping.taskId}`, "MAP"),
+      ].map((rowKey) => ({ ConditionCheck: { TableName: table, Key: rowKey,
+        ConditionExpression: matchingMap + " AND attribute_not_exists(recurrenceOwner)",
+        ExpressionAttributeNames: { "#profile": "profile" },
+        ExpressionAttributeValues: {
+          ":profile": mapping.profile, ":task": mapping.taskId,
+          ":event": mapping.eventId, ":mappingUpdated": mapping.updatedAt,
+        } } })),
+      { ConditionCheck: { TableName: table, Key: key(`ERASURE#${mapping.profile}`, "FENCE"),
+        ConditionExpression: "attribute_not_exists(pk)" } },
+    ];
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
+      return true;
+    } catch (error) {
+      const cancelled = error as { name?: string; CancellationReasons?: Array<{Code?: string}> };
+      if (conditionalFailure(error) || cancelled.name === "TransactionCanceledException"
         && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
         && cancelled.CancellationReasons.every((reason) => reason.Code === "None" || reason.Code === "ConditionalCheckFailed")) return false;
       throw error;
@@ -2353,6 +2531,33 @@ export class StateRepository {
       // Every observation is logged. An already-retained incident row is the
       // only write failure that can be safely treated as a duplicate.
       if (!(conflictHash && conditionalFailure(error))) throw error;
+    }
+    // Audit references are only emitted for conflict-class observations.
+    // They permit later exact-ID cleanup without a table-wide Scan. Historical
+    // unindexed audit rows still expire under their original seven-day TTL.
+    if (/(?:conflict|ambiguous|blocked)/.test(action) && !/(?:operational|dlq)/.test(action)) {
+      const related = retainedAuditProviderIds(detail);
+      const refs = [
+        ...related.taskIds.map(id => ({ side: "todoist", id })),
+        ...related.eventIds.map(id => ({ side: "calendar", id })),
+      ];
+      if (refs.length <= 20) {
+        for (const ref of refs) {
+          try {
+            await client.send(new PutCommand({ TableName: this.ensureTable(),
+              Item: { pk: `AUDIT_REF#${profile}#${ref.side}#${ref.id}`,
+                sk: `AUDIT#${createHash("sha256").update(auditId).digest("hex")}`,
+                auditKey: auditId, profile, expiresAt: auditRecord.expiresAt },
+              ConditionExpression: "attribute_not_exists(pk)",
+            }));
+          } catch (error) {
+            if (!conditionalFailure(error)) console.warn(JSON.stringify({
+              event: "conflict_audit_reverse_index_deferred", profile, action,
+              reason: error instanceof Error ? error.name : "unknown",
+            }));
+          }
+        }
+      }
     }
     if (fingerprint && incidentId) {
       try {
