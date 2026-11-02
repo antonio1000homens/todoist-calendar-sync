@@ -323,8 +323,16 @@ function App() {
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
+    const dismissedCaseId=selected.id;
+    const selectedVersion=selectionVersion.current;
     setBusy(true);setMessage("");
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item,{syncUrl:false});await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
+    try {
+      await api(`cases/${encodeURIComponent(dismissedCaseId)}/dismiss`,{method:"POST",body:"{}"});
+      // Do not discard another case that the operator selected while the request was pending.
+      if(selectedVersion===selectionVersion.current)selectCase(undefined);
+      await refresh();
+      setMessage("Alert dismissed. Select another alert, or show history to revisit it.");
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
   const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
