@@ -5,6 +5,7 @@ import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
+import { profiles } from "../dist/config.js";
 
 test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
@@ -223,6 +224,14 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async getMappingByEvent(_profile, eventId) { return activeMapping?.eventId === eventId ? structuredClone(activeMapping) : undefined; },
     async deleteMapping(value) { if (activeMapping?.taskId === value.taskId && activeMapping?.eventId === value.eventId) activeMapping = undefined; },
     async mutationAllowed() { return true; },
+    async acceptTaskVersion() { return true; },
+    async reopenRetainedStandaloneMapping(m, taskUpdatedAt) {
+      const index = completed.findIndex((c) => c.eventId === m.eventId && c.taskId === m.taskId
+        && Date.parse(taskUpdatedAt) > Date.parse(c.completedAt));
+      if (index < 0 || activeMapping?.taskId !== m.taskId) return false;
+      completed.splice(index, 1);
+      return true;
+    },
     async recordMutation() {},
     async getCalendarProjectionTombstone() { return undefined; },
     async deleteCalendarProjectionTombstone() {},
@@ -246,6 +255,11 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async deleteEvent(id) { calendarDeletes.push(id); },
   };
   const todoist = {
+    async getTask(taskId) {
+      return { id: taskId, content: event.summary, project_id: profiles.home.todoistProjectId,
+        due: { date: "2026-09-28" }, is_completed: false,
+        updated_at: "2026-09-29T13:00:00Z" };
+    },
     async upsertTask() { todoistUpserts += 1; return { id: "resurrected" }; },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
@@ -256,7 +270,7 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     body: JSON.stringify({ event_name: "item:completed", event_data: { ...task, is_completed: true } }),
   });
 
-  assert.equal(activeMapping, undefined);
+  assert.equal(activeMapping?.taskId, mapping.taskId, "completion must retain the mapping for seven days");
   assert.deepEqual(calendarDeletes, []);
   assert.equal(completed.length, 1);
   assert.equal(completed[0].eventId, event.id);
@@ -271,9 +285,22 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     id: "delete-history", kind: "todoist", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:02:00Z", headers: {},
     body: JSON.stringify({ event_name: "item:deleted", event_data: { ...task, is_deleted: true } }),
   });
-  assert.deepEqual(calendarDeletes, [event.id]);
-  assert.equal(completed.length, 0);
-  assert.equal(audits.at(-1).action, "todoist_deleted_completed_calendar_history");
+  assert.deepEqual(calendarDeletes, [], "late task deletion must not delete completed Calendar history");
+  assert.equal(completed.length, 1);
+  assert.equal(activeMapping?.eventId, event.id);
+  assert.equal(audits.at(-1).action, "todoist_completed_mapping_deletion_ignored");
+
+  await sync.process({
+    id: "reopen-history", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2026-09-29T13:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:uncompleted", event_data: {
+      ...task, is_completed: false, updated_at: "2026-09-29T13:00:00Z",
+    } }),
+  });
+  assert.equal(activeMapping?.eventId, event.id, "uncompletion retains the original mapping");
+  assert.equal(completed.length, 0, "uncompletion withdraws the pending retirement marker");
+  assert.deepEqual(calendarDeletes, [], "completion and uncompletion never modify Calendar");
+  assert.equal(audits.at(-1).action, "todoist_uncompleted_mapping_retained");
 });
 
 test("rechecks completion immediately before Calendar-to-Todoist mutation", async () => {
@@ -507,19 +534,38 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     updatedAt: "2026-10-05T17:00:00Z",
   };
   let saved;
+  let fenceHeld = false;
   const state = {
+    async beginTodoistCalendarWrite(id) {
+      assert.equal(id, task.id);
+      assert.equal(fenceHeld, false);
+      fenceHeld = true;
+      return "fence-token";
+    },
+    async endTodoistCalendarWrite(id, token) {
+      assert.equal(id, task.id);
+      assert.equal(token, "fence-token");
+      assert.equal(fenceHeld, true);
+      fenceHeld = false;
+    },
     async syncBlocked() { return false; },
     async getMappingByTaskAnyProfile() { return structuredClone(original); },
     async acceptTaskVersion() { return true; },
     async getCalendarProjectionTombstone() { return undefined; },
     async getMappingByTask() { return structuredClone(original); },
     async mutationAllowed() { return true; },
-    async putMapping(value) { saved = structuredClone(value); },
+    async putMapping(value) {
+      assert.equal(fenceHeld, true, "the fence remains held through the mapping write");
+      saved = structuredClone(value);
+    },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async audit() {},
   };
   const calendar = {
-    async getEvent() { return structuredClone(event); },
+    async getEvent() {
+      assert.equal(fenceHeld, true, "the fence precedes the provider lookup");
+      return structuredClone(event);
+    },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return structuredClone(task); } } }));
 
@@ -534,6 +580,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   });
 
   assert.ok(saved);
+  assert.equal(fenceHeld, false, "the fence is released after the complete no-op workflow");
   assert.equal(saved.projectId, "project-home");
   assert.equal(saved.projectCommentId, "project-comment-7");
   assert.equal(saved.taskCommentId, "legacy-task-comment-2");

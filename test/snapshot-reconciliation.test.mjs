@@ -267,8 +267,8 @@ test("retained completion wins over a missing Todoist task during snapshot recon
   const result = await makeReconciler({ state, store, clients }).reconcile("home");
 
   assert.equal(result.counts.completed_retained, 1);
-  assert.equal(state.mapping, undefined);
-  assert.equal(store.baselines.has(`home:${m.taskId}`), false);
+  assert.equal(state.mapping?.eventId, m.eventId, "completed mapping is retained for seven days");
+  assert.equal(store.baselines.has(`home:${m.taskId}`), true);
   assert.deepEqual(clients.metrics.calendarDeletes, []);
   assert.deepEqual(clients.metrics.todoistDeletes, []);
   assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_completed_projection_retained"), true);
@@ -299,8 +299,8 @@ test("rechecks completion before destructive snapshot reconciliation", async () 
   assert.equal(result.counts.completed_retained, 1);
   assert.deepEqual(clients.metrics.calendarDeletes, []);
   assert.deepEqual(clients.metrics.todoistDeletes, []);
-  assert.equal(state.mapping, undefined);
-  assert.equal(store.baselines.has(`home:${m.taskId}`), false);
+  assert.equal(state.mapping?.eventId, m.eventId, "completion cannot prematurely delete the mapping");
+  assert.equal(store.baselines.has(`home:${m.taskId}`), true);
 });
 
 test("ignores Calendar end-only drift because end is not a synchronized canonical field", async () => {

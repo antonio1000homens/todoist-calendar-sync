@@ -84,6 +84,10 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const taskRequests = new Map(), splits = new Map();
   const get = (map, id) => { if (!map.has(id)) throw Object.assign(new Error("Not found"), { status: 404 }); return clone(map.get(id)); };
   const stateMethods = {
+    // Provider tests use an in-memory repository; do not call DynamoDB for
+    // the production cross-invocation Calendar/completion write fence.
+    async beginTodoistCalendarWrite(id) { return "unit-fence:" + id; },
+    async endTodoistCalendarWrite(id, token) { assert.equal(token, "unit-fence:" + id); },
     async assertHistoricalSeriesUnowned() {},
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
