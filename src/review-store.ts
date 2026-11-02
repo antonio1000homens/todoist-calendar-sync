@@ -228,8 +228,11 @@ export class ReviewStore {
     const context = current.decision?.context || {};
     const strings = (value: unknown): string[] => Array.isArray(value)
       ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
+    const candidateItems = Array.isArray(context.candidates)
+      ? context.candidates.map((candidate: unknown) => (candidate as { id?: unknown } | null)?.id) : [];
     const taskIds = [current.taskId, current.decision?.taskId, context.providerTaskId,
-      context.taskId, ...strings(context.candidateTaskIds)].filter((v): v is string => typeof v === "string" && Boolean(v));
+      context.taskId, context.masterTaskId, ...strings(context.candidateTaskIds), ...candidateItems]
+      .filter((v): v is string => typeof v === "string" && Boolean(v));
     const eventIds = [current.eventId, current.decision?.eventId, current.decision?.masterEventId,
       current.decision?.activeInstanceId, context.providerEventId, context.eventId,
       context.masterEventId, context.activeInstanceId, ...strings(context.candidateEventIds)]
