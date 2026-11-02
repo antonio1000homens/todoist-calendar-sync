@@ -90,6 +90,14 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
   const empty={actions:[],unavailable:[],summary:{task:"unknown",event:"unknown",mapping:"unknown",recurrence:"unknown",verifiedTaskId:"",verifiedEventId:"",hasRecurrence:false,reason:"No current case selected"}};
   if(!item)return empty;
   const {task,event}=verifiedSelection({caseItem:item,snapshots,selection});
+  const observed=(side)=>{
+    const ids=unique([side==="todoist"?selection?.taskId:selection?.eventId,
+      side==="todoist"?item.taskId:item.eventId,
+      side==="todoist"?item.decision?.taskId:item.decision?.eventId]);
+    return ids.flatMap(id=>snapshots.filter(snapshot=>snapshot.ref?.profile===item.profile
+      &&snapshot.ref.side===side&&snapshot.ref.id===id)).find(Boolean);
+  };
+  const observedTask=observed("todoist"),observedEvent=observed("calendar");
   const taskObj=task?.object,eventObj=event?.object;
   const taskId=task?.ref.id,eventId=event?.ref.id;
   const mapT=task?.mapping,mapE=event?.mapping;
@@ -178,9 +186,15 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
         :allowed?"":!validSource?"No verified live provider target. Refresh or select an existing item.":why[id]};
   });
   const selectedFacts=taskObj||eventObj;
-  const taskState=taskObj?taskObj.is_completed?"completed":"active"
-    :selection?.taskId?"missing or unverified":"not selected";
-  const eventState=eventObj?"confirmed":selection?.eventId?"missing, cancelled or unverified":"not selected";
+  const taskState=taskObj?"active"
+    :observedTask?.object?.is_deleted?"deleted in Todoist"
+    :observedTask?.object?.is_completed?"completed in Todoist"
+    :observedTask&&!observedTask.object?"missing (404/410)"
+    :observedTask?.object?"unverified":"not selected / not verifiable";
+  const eventState=eventObj?"confirmed"
+    :observedEvent?.object?.status==="cancelled"?"cancelled / deleted"
+    :observedEvent&&!observedEvent.object?"missing (404/410)"
+    :observedEvent?.object?"status unverified":"not selected / not verifiable";
   return {actions:actions.filter(a=>a.eligible),unavailable:actions.filter(a=>!a.eligible),
     summary:{
       task:taskState,event:eventState,mapping:competing?"conflicting/unknown"
