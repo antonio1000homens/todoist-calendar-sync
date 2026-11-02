@@ -173,6 +173,27 @@ export class ReviewStore {
     }
   }
 
+  /**
+   * Versioned pending-refresh markers are already consumed by the worker's
+   * reconciliation follow-up protocol. A deletion arriving after a generation
+   * starts must have its own next pass, rather than coalescing silently.
+   */
+  async markDeletedReviewPendingRefresh(
+    refs: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string }>,
+  ): Promise<Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }>> {
+    const marked: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }> = [];
+    for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) {
+      const pendingRefreshAt = randomUUID();
+      await this.db.send(new UpdateCommand({ TableName: reviewTable(),
+        Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+        UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at",
+        ExpressionAttributeValues: { ":true": true, ":at": pendingRefreshAt },
+      }));
+      marked.push({ ...ref, pendingRefreshAt });
+    }
+    return marked;
+  }
+
   /** True means an open case still claims this exact provider identity and
    * sync must not create a new counterpart until it is re-evaluated.
    */
