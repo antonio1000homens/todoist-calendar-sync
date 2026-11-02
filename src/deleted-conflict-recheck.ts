@@ -4,9 +4,9 @@ import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import type { StateRepository } from "./repository.js";
 import type { Delivery, Profile } from "./types.js";
 
-/** Deletion webhooks trigger a current-state check only when an open review
- * case cites the exact provider ID, never by a title or scheduled date.
- * The queue coalesces multiple events into one per-profile generation.
+/** Index every affected case before scheduling one coalesced refresh.
+ * Pending-refresh markers force a second generation if the first is already
+ * processing; a failed enqueue is retried without losing those markers.
  */
 export async function requestDeletedConflictReview(
   state: StateRepository,
@@ -20,23 +20,30 @@ export async function requestDeletedConflictReview(
   if (!tasks.size && !events.size) return false;
   let cursor: Record<string, unknown> | undefined;
   let examined = 0;
+  const matching = [];
+  const references = new Map<string, { profile: Profile; side: "todoist" | "calendar"; id: string }>();
   do {
     const page = await review.listCases(profile, cursor, false);
     for (const item of page.items) {
-      if (++examined > 200) return false;
+      if (++examined > 200) throw new Error("Deleted-conflict case inventory exceeded its bounded limit");
       if (item.status !== "open") continue;
       const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
-      if (!taskIds.some(id => typeof id === "string" && tasks.has(id))
-        && !eventIds.some(id => typeof id === "string" && events.has(id))) continue;
-      await review.indexDeletedConflictCase(item);
-      const result = await requestReconciliation(state, profile, "manual", enqueue,
-        { requester: "verified-deletion-recheck" });
-      if (!result.queued && !result.coalesced) {
-        throw new Error("Verified-deletion conflict refresh could not enqueue: " + (result.enqueueError || "unknown queue failure"));
-      }
-      return true;
+      if (!taskIds.some(id => tasks.has(id)) && !eventIds.some(id => events.has(id))) continue;
+      matching.push(item);
+      for (const id of taskIds) references.set(`todoist:${id}`, { profile, side: "todoist", id });
+      for (const id of eventIds) references.set(`calendar:${id}`, { profile, side: "calendar", id });
     }
     cursor = page.cursor as Record<string, unknown> | undefined;
-  } while (cursor && examined < 200);
-  return false;
+  } while (cursor);
+  if (!matching.length) return false;
+
+  // The guard must be in place for EVERY case before a reconciliation can run.
+  for (const item of matching) await review.indexDeletedConflictCase(item);
+  const pendingRefreshRefs = await review.markDeletedReviewPendingRefresh([...references.values()]);
+  const result = await requestReconciliation(state, profile, "manual", enqueue,
+    { requester: "verified-deletion-recheck", pendingRefreshRefs });
+  if (!result.queued && !result.coalesced) {
+    throw new Error("Verified-deletion conflict refresh could not enqueue: " + (result.enqueueError || "unknown queue failure"));
+  }
+  return true;
 }
