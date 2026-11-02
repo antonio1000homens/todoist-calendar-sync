@@ -578,12 +578,13 @@ export class SnapshotReconciler {
     // Load recurrence ownership lazily: ordinary reconciliation without any
     // deleted conflicts should not spend three profile-wide GSI queries.
     let links: Awaited<ReturnType<StateRepository["listRecurrenceLinks"]>> | undefined;
-    let cursor: Record<string, unknown> | undefined;
+    let cursor = await review.deletionSweepCursor(profile, includeHistory);
     let examined = 0;
     do {
-      const page = await review.listCases(profile, cursor, includeHistory);
+      // Smaller pages avoid losing unexamined case identities at a limit.
+      const page = await review.listCases(profile, cursor, includeHistory, 10);
       for (const item of page.items) {
-        if (examined++ >= 40) return;
+        examined += 1;
         if (item.status !== (includeHistory ? "dismissed" : "open") || item.operationId
           || item.reason.startsWith("operational_")) continue;
         const context = item.decision?.context || {};
@@ -631,6 +632,7 @@ export class SnapshotReconciler {
       }
       cursor = page.cursor as Record<string, unknown> | undefined;
     } while (cursor && examined < 40);
+    await review.saveDeletionSweepCursor(profile, includeHistory, cursor);
   }
 
   private async reconcileMapping(
