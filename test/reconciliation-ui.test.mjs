@@ -51,3 +51,12 @@ test('dismissing an open review alert is single-click without changing the dismi
   assert.match(dismiss, /Alert dismissed\. Its history remains available/);
   assert.match(source, /onClick=\{dismissAlert\} disabled=\{busy\}>Dismiss alert only/);
 });
+
+test('review alert detail shows recorded evidence without redundant explanation and identity metadata', async () => {
+  const source = await readFile(new URL('../review-ui/main.tsx', import.meta.url), 'utf8');
+  const evidence = source.match(/<section className="preview alert-evidence">([\s\S]*?)<\/section>/)?.[1];
+  assert.ok(evidence, 'recorded alert evidence section must be present');
+  assert.match(evidence, /<details><summary>Recorded alert evidence<\/summary><pre>\{JSON\.stringify\(selected\.decision\?\.context\|\|\{\},null,2\)\}<\/pre><\/details>/);
+  assert.doesNotMatch(evidence, /Why this alert is open|Recorded reason:|First seen \/ opened|Recorded provider identities|Search Todoist candidates|Search Calendar candidates/);
+  assert.doesNotMatch(source, /<h3>Why this alert is open<\/h3>/);
+});
