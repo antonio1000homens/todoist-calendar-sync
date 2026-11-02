@@ -17,8 +17,8 @@ export function providerIdentity(value) {
   let recurrence = !object || object.id !== id || side === "calendar" && object.status !== "confirmed"
     ? "Recurrence unknown — item unavailable / not verified"
     : side === "calendar" && !object.recurringEventId && !Array.isArray(object.recurrence)
-      && !(object.start && object.end)
-      ? "Recurrence unknown — Calendar series metadata incomplete"
+      && (value?._side==="calendar" || !object.start || !object.end)
+      ? "Recurrence unknown — Calendar search/series metadata incomplete"
       : object?.due?.is_recurring===undefined && side==="todoist" && object?.due
         ? "Recurrence unknown — Todoist due rule unverified"
         : "One-off / not recurring";
