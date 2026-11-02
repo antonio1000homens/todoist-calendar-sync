@@ -22,7 +22,12 @@ export function providerIdentity(value) {
       : object?.due?.is_recurring===undefined && side==="todoist" && object?.due
         ? "Recurrence unknown — Todoist due rule unverified"
         : "One-off / not recurring";
-  if (side === "todoist" && object?.due?.is_recurring) {
+  const current = Boolean(object?.id===id
+    && (side==="calendar" ? object.status==="confirmed"
+      : side==="todoist" ? !object.is_deleted&&!object.is_completed : false));
+  if (!current) {
+    recurrence = "Recurrence unknown — item unavailable / not verified";
+  } else if (side === "todoist" && object?.due?.is_recurring) {
     recurrence = `Recurring Todoist task (${object.due.string || "rule unavailable"})`;
   } else if (side === "calendar" && object?.recurringEventId) {
     const original = object.originalStartTime?.dateTime || object.originalStartTime?.date;
