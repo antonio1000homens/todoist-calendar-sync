@@ -245,10 +245,11 @@ export class ReviewStore {
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
     const detail = source?.detail && typeof source.detail === "object"
       ? source.detail as Record<string, unknown> : undefined;
-    const attributable = Boolean(source && detail && [detail.taskId, detail.eventId,
+    const attributedIds = detail ? [detail.taskId, detail.eventId,
       ...strings(detail.candidateTaskIds), ...strings(detail.candidateEventIds)]
-      .filter((id): id is string => typeof id === "string" && Boolean(id))
-      .every(id => expected.taskIds.includes(id) || expected.eventIds.includes(id)));
+      .filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
+    const attributable = Boolean(source && detail && attributedIds.length > 0
+      && attributedIds.every(id => expected.taskIds.includes(id) || expected.eventIds.includes(id)));
     const pointerKey = current.conflictKey && current.id.startsWith("incident-")
       ? { pk: `REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`, sk: `INCIDENT#${caseId}` }
       : undefined;
@@ -279,12 +280,30 @@ export class ReviewStore {
       TableName: reviewTable(), Key: pointerKey,
       ConditionExpression: "incidentId = :id", ExpressionAttributeValues: { ":id": caseId },
     } });
-    if (attributable && source && current.sourceAuditKey) items.push({ Delete: {
-      TableName: reviewTable(), Key: key(current.sourceAuditKey),
-      ConditionExpression: "createdAt = :createdAt AND #action = :action",
-      ExpressionAttributeNames: { "#action": "action" },
-      ExpressionAttributeValues: { ":createdAt": source.createdAt, ":action": source.action },
-    } });
+    if (attributable && source && current.sourceAuditKey) {
+      items.push({ Delete: {
+        TableName: reviewTable(), Key: key(current.sourceAuditKey),
+        ConditionExpression: "createdAt = :createdAt AND #action = :action",
+        ExpressionAttributeNames: { "#action": "action" },
+        ExpressionAttributeValues: { ":createdAt": source.createdAt, ":action": source.action },
+      } });
+      const parsed = /^AUDIT#[^#]+#CONFLICT#([a-f0-9]{64})#(.+)$/.exec(current.sourceAuditKey);
+      const entity = detail && retainedConflictEntity(detail);
+      if (parsed && entity) {
+        const entityHash = createHash("sha256").update(entity).digest("hex");
+        const conflictStateKey = key(`CONFLICT_STATE#${expected.profile}#${entityHash}`);
+        const lifecycle = (await this.db.send(new GetCommand({
+          TableName: reviewTable(), Key: conflictStateKey, ConsistentRead: true,
+        }))).Item as { fingerprint?: string; incidentId?: string } | undefined;
+        if (lifecycle?.fingerprint === parsed[1] && lifecycle.incidentId === parsed[2]) {
+          items.push({ Delete: {
+            TableName: reviewTable(), Key: conflictStateKey,
+            ConditionExpression: "fingerprint = :fingerprint AND incidentId = :incident",
+            ExpressionAttributeValues: { ":fingerprint": parsed[1], ":incident": parsed[2] },
+          } });
+        }
+      }
+    }
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
       return true;
