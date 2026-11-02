@@ -31,6 +31,7 @@ class FakeState {
   constructor() {
     this.token = "sync-token";
     this.mappings = [];
+    this.completedEvents = new Map();
     this.audits = [];
     this.mutations = 0;
   }
@@ -45,6 +46,9 @@ class FakeState {
   }
   async getMappingByTaskAnyProfile(taskId) {
     return this.mappings.find((mapping) => mapping.taskId === taskId);
+  }
+  async getCompletedCalendarProjectionByEvent(profile, eventId) {
+    return this.completedEvents.get(`${profile}:${eventId}`);
   }
   async putMapping(mapping) {
     this.mappings = this.mappings.filter((existing) => !(
@@ -338,4 +342,53 @@ test("Todoist previous-identity ambiguity performs no Calendar mutation", async 
   const audit = f.state.audits.find((entry) => entry.action === "todoist_orphan_recovery_ambiguous");
   assert.deepEqual(audit?.detail.candidateEventIds, ["event-1", "event-2"]);
   assert.equal(audit?.detail.source, "webhook_old_item");
+});
+
+test("new task with the same title/due creates its own Calendar event, not the completed event", async () => {
+  const old = timedEvent("completed-event", "School run", 8, {
+    extendedProperties: { shared: { taskId: "completed-task", syncSource: "todoist-calendar-sync" } },
+  });
+  const fresh = timedTask("new-task", "School run", 8);
+  const f = fixture({ events: [old], tasks: [fresh] });
+  f.state.completedEvents.set("home:completed-event", {
+    profile: "home", taskId: "completed-task", eventId: "completed-event",
+    completedAt: "2026-09-01T09:00:00Z",
+  });
+  await f.sync.process(delivery("todoist", JSON.stringify({ event_name: "item:added", event_data: fresh })));
+  assert.equal(f.calendarUpserts.length, 1);
+  assert.equal(f.calendarUpserts[0].existingId, undefined);
+  assert.equal(f.state.mappings[0]?.taskId, fresh.id);
+  assert.notEqual(f.state.mappings[0]?.eventId, old.id);
+  assert.deepEqual(f.eventMap.get(old.id), old);
+});
+
+test("even if the completed Calendar event lost shared metadata, its permanent guard blocks canonical rebinding", async () => {
+  const old = timedEvent("completed-event", "School run", 8);
+  const fresh = timedTask("new-task", "School run", 8);
+  const f = fixture({ events: [old], tasks: [fresh] });
+  f.state.completedEvents.set("home:completed-event", {
+    profile: "home", taskId: "completed-task", eventId: "completed-event",
+    completedAt: "2026-09-01T09:00:00Z",
+  });
+  await f.sync.process(delivery("todoist", JSON.stringify({ event_name: "item:added", event_data: fresh })));
+  assert.equal(f.calendarUpserts.length, 1);
+  assert.equal(f.calendarUpserts[0].existingId, undefined);
+  assert.notEqual(f.state.mappings[0]?.eventId, old.id);
+  assert.deepEqual(f.eventMap.get(old.id), old);
+});
+
+test("a stale completed task update cannot rebind a lifecycle-retired mapping", async () => {
+  const old = timedEvent("completed-event", "School run", 8, {
+    extendedProperties: { shared: { taskId: "completed-task" } },
+  });
+  const sameId = timedTask("completed-task", "School run", 8);
+  const f = fixture({ events: [old], tasks: [sameId] });
+  f.state.completedEvents.set("home:completed-event", {
+    profile: "home", taskId: sameId.id, eventId: old.id,
+    completedAt: "2026-09-01T09:00:00Z",
+  });
+  await f.sync.process(delivery("todoist", JSON.stringify({ event_name: "item:updated", event_data: sameId })));
+  assert.equal(f.state.mappings.length, 0);
+  assert.equal(f.calendarUpserts.length, 0);
+  assert.deepEqual(f.eventMap.get(old.id), old);
 });
