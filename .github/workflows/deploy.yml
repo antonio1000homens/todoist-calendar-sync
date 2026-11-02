@@ -36,6 +36,8 @@ jobs:
       REVIEW_OPERATOR_EMAILS: ${{ vars.REVIEW_OPERATOR_EMAILS }}
       # Explicit production operator opt-in. Recovery implementation tracked by #239.
       ERASURE_EXECUTION_ENABLED: 'true'
+      # Owner-approved production activation of seven-day terminal COMPLETED_TASK retirement.
+      COMPLETED_HISTORY_CLEANUP_APPLY: 'true'
       # A merge triggers automatic production deployment; lowering live RCU/WCU
       # requires a separate operator approval in the production environment.
       DYNAMODB_CAPACITY_REDUCTION_APPROVED: ${{ vars.DYNAMODB_CAPACITY_REDUCTION_APPROVED }}
@@ -105,6 +107,28 @@ jobs:
           SKIP_SOURCE_VALIDATION: 'true'
           BILLING_ALARM_EMAIL: ${{ env.TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL }}
         run: bash ./deploy.sh
+
+      - name: Verify completed-history retirement schedule and Lambda mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${COMPLETED_HISTORY_CLEANUP_APPLY}"
+          actual="$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" --query "Stacks[0].Parameters[?ParameterKey=='CompletedHistoryCleanupApply'].ParameterValue | [0]" --output text)"
+          if [ "$actual" != "$expected" ]; then
+            echo "CompletedHistoryCleanupApply stack parameter mismatch." >&2
+            exit 1
+          fi
+          function_name="$(aws cloudformation describe-stack-resource --region "$AWS_REGION" --stack-name "$STACK_NAME" --logical-resource-id CompletedHistoryCleanupFunction --query 'StackResourceDetail.PhysicalResourceId' --output text)"
+          deployed_flag="$(aws lambda get-function-configuration --region "$AWS_REGION" --function-name "$function_name" --query 'Environment.Variables.TODOIST_CALENDAR_SYNC_COMPLETED_CLEANUP_APPLY' --output text)"
+          rule_name="$(aws cloudformation describe-stack-resource --region "$AWS_REGION" --stack-name "$STACK_NAME" --logical-resource-id CompletedHistoryCleanupFunctionDailyCompletedHistoryReview --query 'StackResourceDetail.PhysicalResourceId' --output text)"
+          rule_state="$(aws events describe-rule --region "$AWS_REGION" --name "$rule_name" --query State --output text)"
+          expected_state="DISABLED"
+          if [ "$expected" = "true" ]; then expected_state="ENABLED"; fi
+          if [ "$deployed_flag" != "$expected" ] || [ "$rule_state" != "$expected_state" ]; then
+            echo "Completed-history Lambda mode or EventBridge schedule does not match expected state." >&2
+            exit 1
+          fi
+          echo "Completed-history cleanup mode and schedule verified."
 
       - name: Verify erasure execution flag and protocol on both deployed Lambdas
         shell: bash
