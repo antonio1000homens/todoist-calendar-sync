@@ -1858,13 +1858,18 @@ export class StateRepository {
         { Delete: { TableName: table, Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
           ConditionExpression: linkCondition, ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
           ExpressionAttributeValues: linkValues } },
-        ...(["todoist", "calendar"] as const).map(side => ({ ConditionCheck: {
-          TableName: table, Key: key(`SYNC_CONTROL#${mapping.profile}:${side}:${side === "todoist" ? mapping.taskId : mapping.eventId}`),
+        ...[
+          `SYNC_CONTROL#${mapping.profile}:todoist:${mapping.taskId}`,
+          ...[...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id)))]
+            .map(id => `SYNC_CONTROL#${mapping.profile}:calendar:${id}`),
+        ].map(controlKey => ({ ConditionCheck: {
+          TableName: table, Key: key(controlKey),
           ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
           ExpressionAttributeValues: { ":no": false },
         } })),
-        { ConditionCheck: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${mapping.eventId}`),
-          ConditionExpression: "attribute_not_exists(pk)" } },
+        ...[...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id)))]
+          .map(eventId => ({ ConditionCheck: { TableName: table, Key: key(`COMPLETED_EVENT#${mapping.profile}#${eventId}`),
+            ConditionExpression: "attribute_not_exists(pk)" } })),
       ] }));
       return true;
     } catch (error) {
