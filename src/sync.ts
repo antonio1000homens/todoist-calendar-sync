@@ -447,7 +447,7 @@ type TodoistCalendarAction = "upsert" | "delete_projection" | "complete_projecti
 
 export interface TodoistCalendarLifecycle {
   action: TodoistCalendarAction;
-  reason: "deleted" | "completed" | "due_removed" | "undated" | "eligible";
+  reason: "deleted" | "completed" | "uncompleted" | "due_removed" | "undated" | "eligible";
   dueAdded: boolean;
 }
 
@@ -457,13 +457,17 @@ export function todoistCalendarLifecycle(payload: TodoistWebhookPayload): Todois
   const eventName = payload.event_name || "";
   const oldTask = payload.event_data_extra?.old_item;
   const explicitlyDeleted = /deleted/i.test(eventName) || Boolean(task.is_deleted);
-  const completed = /completed/i.test(eventName) || Boolean(task.is_completed);
+  const uncompleted = /uncompleted/i.test(eventName) && task.is_completed !== true;
+  const completed = !uncompleted && (/completed/i.test(eventName) || Boolean(task.is_completed));
   const hadDue = taskHasDue(oldTask);
   const hasDue = taskHasDue(task);
   const dueRemoved = hadDue && !oldTask?.due?.is_recurring && !hasDue;
   const dueAdded = !hadDue && hasDue;
   if (explicitlyDeleted) return { action: "delete_projection", reason: "deleted", dueAdded: false };
   if (completed) return { action: "complete_projection", reason: "completed", dueAdded: false };
+  // Completing/uncompleting changes only the mapping's lifecycle, never
+  // Calendar metadata or time. Subsequent edits can sync normally.
+  if (uncompleted) return { action: "skip", reason: "uncompleted", dueAdded: false };
   if (dueRemoved) return { action: "delete_projection", reason: "due_removed", dueAdded: false };
   if (!hasDue) return { action: "skip", reason: "undated", dueAdded: false };
   return { action: "upsert", reason: "eligible", dueAdded };
@@ -1733,9 +1737,22 @@ export class Synchronizer {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });
     }
     const recurringDateEdit = todoistRecurringDateEdited(payload);
-    const orderedLifecycle = lifecycle.action === "upsert" || lifecycle.reason === "due_removed" || lifecycle.reason === "undated";
+    const orderedLifecycle = lifecycle.action === "upsert" || lifecycle.reason === "completed"
+      || lifecycle.reason === "uncompleted" || lifecycle.reason === "due_removed" || lifecycle.reason === "undated";
     if (orderedLifecycle && !await this.state.acceptTaskVersion(delivery.profile, task.id, task.updated_at)) {
       return this.state.audit(delivery.profile, "todoist_stale_version_suppressed", { taskId: task.id, event: payload.event_name, taskUpdatedAt: task.updated_at });
+    }
+    if (lifecycle.reason === "uncompleted") {
+      // Within seven days this task still has its original mapping. Release
+      // its completion guard, but DO NOT PATCH or recreate the Calendar event.
+      // After retirement, no mapping can be reactivated from title/date.
+      const mapped = existingMapping?.profile === delivery.profile ? existingMapping : undefined;
+      const restored = mapped && !mapped.recurrenceOwner
+        ? await this.state.reopenRetainedStandaloneMapping?.(mapped, task.updated_at)
+        : false;
+      return this.state.audit(delivery.profile, restored ? "todoist_uncompleted_mapping_retained" : "todoist_uncompleted_no_active_mapping", {
+        taskId: task.id, eventId: mapped?.eventId,
+      });
     }
     if (lifecycle.action === "skip") {
       return this.state.audit(delivery.profile, "todoist_calendar_skipped_undated", { taskId: task.id, event: payload.event_name });
@@ -1756,6 +1773,14 @@ export class Synchronizer {
 
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
+    if (mapping && lifecycle.action === "upsert" && !mapping.recurrenceOwner) {
+      const completed = await this.getCompletedProjection(delivery.profile, mapping.eventId);
+      if (completed?.taskId === task.id) {
+        return this.state.audit(delivery.profile, "todoist_completed_mapping_update_ignored", {
+          taskId: task.id, eventId: mapping.eventId,
+        });
+      }
+    }
     if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "calendar" && mapping.masterEventId
       && (task.due?.is_recurring || mapping.calendarNativeRecurring)) {
       // A mapped Calendar-origin recurring Todoist task may legitimately have
@@ -2180,8 +2205,13 @@ export class Synchronizer {
       }
       const retained = completedCalendarProjection(mapping, delivery.receivedAt);
       await this.putCompletedProjection(retained);
-      await this.state.deleteMapping(mapping);
-      if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
+      // The active mapping remains addressable during the seven-day grace.
+      // The scheduled worker, not the completion webhook, retires it once
+      // terminality and unchanged ownership have been verified.
+      if (mapping.recurrenceOwner || mapping.seriesId) {
+        await this.state.deleteMapping(mapping);
+        if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
+      }
       return this.state.audit(delivery.profile, "todoist_completed_calendar_retained", {
         taskId: task.id,
         eventId: mapping.eventId,
