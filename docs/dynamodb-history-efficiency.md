@@ -58,10 +58,14 @@ are not a substitute for strongly consistent checks before history deletion.
    `calendar_elapsed_standalone_event_ignored` and
    `calendar_archived_series_delta_ignored`. Other unknown or concerning
    `*_ignored` actions still produce significant `AUDIT#` records.
-5. The daily completed-task cleanup schedule is disabled **when
-   `CompletedHistoryCleanupApply=false`**. Manual dry-run remains available
-   through `npm run state:cleanup-completed`; setting the deployment flag to
-   `true` intentionally enables guarded daily retirement.
+5. The completed-task maintenance schedule is controlled by an explicit
+   EventBridge rule whose State reflects `CompletedHistoryCleanupApply`.
+   The owner-approved production workflow sets this flag to `true` and verifies
+   the deployed Lambda and rule. Ad-hoc/new-stack deployments default to
+   `false`, and manual dry-run remains available via
+   `npm run state:cleanup-completed`. Only task-facing `COMPLETED_TASK#`
+   rows are eligible for guarded retirement after seven full days; the
+   `COMPLETED_EVENT#` duplicate-prevention markers remain permanent.
 
 **No production records are purged or reindexed by these changes.** In
 particular, active review cases/repairs and all completed Calendar history
@@ -160,3 +164,29 @@ sam validate --template-file template.yaml --lint
 Reduced reads/writes improve capacity headroom; with DynamoDB
 **provisioned billing**, charges fall only if provisioned RCU/WCU is
 subsequently reduced (#255). This patch alone is not a guaranteed bill saving.
+
+## Production activation (November 2026)
+
+Owner-approved deployment now explicitly supplies
+`COMPLETED_HISTORY_CLEANUP_APPLY=true` in `.github/workflows/deploy.yml`,
+which `deploy.sh` passes to `CompletedHistoryCleanupApply`. The deployed
+EventBridge rule is defined as `AWS::Events::Rule` with an `ENABLED`/`DISABLED`
+`Fn::If` on `State` because the former SAM `Schedule.Enabled` conditional
+was flattened to `ENABLED` in the processed CloudFormation template.
+Both the rule and invocation permission reuse their pre-existing generated
+logical IDs, keeping the CloudFormation update in place.
+
+Production's active schedule only retires task-side completion lookups after
+guarded terminality verification. It **does not restore** completed mappings
+when users uncomplete a Todoist task or move its date: the synchronizer still
+ignores a linked event with a `COMPLETED_EVENT#` guard. Todoist project
+comments and Calendar `shared.taskId` are valuable identity breadcrumbs
+but do not themselves implement verified reactivation. A separate
+conditionally atomic reactivation path is needed before claiming that
+behaviour; do not remove permanent event-side guards to fake it.
+
+Verify `CompletedHistoryCleanupApply=true` on the deployed stack, its
+Lambda environment variable, and `events describe-rule` State=ENABLED.
+For rollback, deploy `COMPLETED_HISTORY_CLEANUP_APPLY=false` and confirm
+State=DISABLED. No historic Calendar event or permanent completion guard
+deletion is authorised.
