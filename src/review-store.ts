@@ -167,7 +167,9 @@ export class ReviewStore {
         Item: { pk: `DELETION_REVIEW#${item.profile}#${ref.side}#${ref.id}`,
           sk: `CASE#${item.id}`, caseId: item.id, profile: item.profile,
           expiresAt: expiry },
-      }));
+        ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+        ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
+      })).catch(error => { if (!conditional(error)) throw error; });
     }
   }
 
