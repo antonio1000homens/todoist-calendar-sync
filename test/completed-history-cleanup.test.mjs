@@ -14,7 +14,6 @@ const k = ({ pk, sk }) => pk + "|" + sk;
 
 async function simulate({ active = false, retained = false, partial = false, race = false, recurrence = false, certifiedSeries = false, apply = false, clock = "2026-10-09T12:00:00Z" } = {}) {
   const store = new Map([[taskKey, { ...history }], [eventKey, { ...history, pk: "COMPLETED_EVENT#home#event-1", sk: "STATE" }]]);
-  if (active) store.set("TASKOWNER#one|MAP", { profile: "home", taskId: "one", eventId: "new-event" });
   if (retained) {
     const mapping = { profile: "home", taskId: "one", eventId: "event-1",
       updatedAt: "2026-10-01T09:00:00Z" };
@@ -22,6 +21,7 @@ async function simulate({ active = false, retained = false, partial = false, rac
       store.set(`${pk}|MAP`, { ...mapping, pk, sk: "MAP" });
     }
   }
+  if (active) store.set("TASKOWNER#one|MAP", { profile: "home", taskId: "one", eventId: "new-event" });
   if (partial) store.set("EVENT#home#event-1|MAP", { profile: "home", taskId: "one", eventId: "event-1" });
   if (certifiedSeries) {
     for (let n = 1; n <= 13; n++) {
