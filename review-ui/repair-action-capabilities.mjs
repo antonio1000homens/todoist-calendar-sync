@@ -63,8 +63,13 @@ function verifiedSelection({caseItem, snapshots=[], selection}) {
 }
 const sameMapping=(mapping,profile,taskId,eventId)=>Boolean(mapping?.profile===profile&&mapping.taskId===taskId
   && [mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].includes(eventId));
-const elapsedEvent=event=>Boolean(dateTime(event?.end)&&Date.parse(String(dateTime(event.end)).slice(0,10).length===10
-  && !String(dateTime(event.end)).includes("T") ? String(dateTime(event.end))+"T00:00:00Z":dateTime(event.end))<Date.now());
+const elapsedEvent=event=>{
+  const end=dateTime(event?.end);
+  if(typeof end!=="string")return false;
+  const instant=/^\d{4}-\d{2}-\d{2}$/.test(end)?end+"T00:00:00Z":end;
+  const timestamp=Date.parse(instant);
+  return Number.isFinite(timestamp)&&timestamp<Date.now();
+};
 // Only a hint, not a substitute for provider-local timezone checks in the backend.
 export function actionFormFields(action, {hasRecurrence=false, ownerRequired=false}={}) {
   const active=validId(action);
@@ -142,7 +147,7 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
       &&Boolean(eventObj?.etag)&&Boolean(eventObj?.extendedProperties?.shared?.taskId||event?.mapping?.taskId)
       &&!controlled,
     decision:Boolean(validSource)&&pending?.status==="pending"&&pendingActions.length>0
-      &&pendingActions.some(a=>a.id===pending?.choice||a.id===pending?.action||true)&&!controlled,
+      &&!controlled,
     move:Boolean(taskId)&&profiles.some(p=>p!==item.profile&&p!=="all")&&!controlled,
   };
   const why={
