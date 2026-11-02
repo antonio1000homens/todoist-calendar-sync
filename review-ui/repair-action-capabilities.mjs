@@ -133,7 +133,12 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
     ||hasOtherSide||competing||foreignCandidate||otherLiveTasks.length>1||otherLiveEvents.length>1);
   const pending=decision||item.decision;
   const pendingActions=(pending?.permittedActions||[]).filter(a=>a?.id&&a.id!=="reconcile_now");
-  const open=item.status==="open"&&!operation?.status?.match(/^(queued|running|needs_review)$/);
+  const noActiveRepair=!operation?.status?.match(/^(queued|running|needs_review)$/);
+  const open=item.status==="open"&&noActiveRepair;
+  // The existing backend explicitly permits a new exact preview of a
+  // standalone Calendar-only deletion on a terminal case, and read-only
+  // verification of a current mapped pair. Never reopen other mutations.
+  const freshTerminal=["resolved","dismissed","excluded"].includes(item.status)&&noActiveRepair;
   const pair=Boolean(taskId&&eventId);
   const noRecurrence=taskRec==="standalone"&&calRec==="standalone";
   const currentEventMapped=Boolean(event?.mapping&&event.mapping.eventId===eventId&&event.mapping.taskId===taskId);
@@ -182,9 +187,10 @@ export function availableRepairActions({caseItem,case:legacyCase,snapshots=[],se
     move:"Move needs a verified live Todoist task and a different configured profile.",
   };
   const actions=definitions.map(([id,label,tier,explanation])=>{
-    const allowed=Boolean(open&&eligible[id]);
+    const permitted=open||(freshTerminal&&["verify","todoist-only-delete-calendar"].includes(id));
+    const allowed=Boolean(permitted&&eligible[id]);
     return {id,label,tier,explanation,eligible:allowed,
-      reason:!open?"Open an actionable case and obtain a fresh preview before repairing."
+      reason:!permitted?"This case is not open. Only an explicitly supported fresh preview of the exact existing pair can be offered."
         :allowed?"":!validSource?"No verified live provider target. Refresh or select an existing item.":why[id]};
   });
   const selectedFacts=taskObj||eventObj;
