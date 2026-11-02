@@ -12,7 +12,7 @@ const profiles: Profile[] = ["home", "antonio", "work"];
 const cursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "STATE" };
 const dryRunCursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "DRY_RUN_STATE" };
 const MAX_HISTORY_ROWS = 12; // conservative: all guards and deletes fit in one DynamoDB transaction
-type Row = CompletedCalendarProjection & { pk: string; sk: string };
+type Row = CompletedCalendarProjection & { pk: string; sk: string; recurrenceId?: string; activeInstanceId?: string; activeEffectiveStart?: string };
 type ScanKey = Record<string, unknown>;
 export type CleanupCounts = {
   eligible: number; retired: number; skipped_active: number;
@@ -67,7 +67,8 @@ async function processTask(
   // never by the completion webhook. Old deployments may already have removed
   // them, so the legacy zero-index path also remains supported.
   const standalone = rows.length === 1 && !rows[0].recurrenceOwner
-    && !rows[0].seriesId && !rows[0].masterEventId && !rows[0].originalStart;
+    && !rows[0].recurrenceId && !rows[0].seriesId && !rows[0].masterEventId
+    && !rows[0].activeInstanceId && !rows[0].originalStart && !rows[0].activeEffectiveStart;
   const ownedKeys = [
     key(`TASKOWNER#${taskId}`, "MAP"),
     key(`TASK#${profile}#${taskId}`, "MAP"),
@@ -78,7 +79,8 @@ async function processTask(
   if (ownPresent && (!standalone || ownedRows.some((row) =>
     !row || row.profile !== profile || row.taskId !== taskId || row.eventId !== rows[0].eventId
     || !row.updatedAt || typeof row.updatedAt !== "string"
-    || row.recurrenceOwner || row.seriesId || row.masterEventId || row.activeInstanceId
+    || row.recurrenceOwner || row.recurrenceId || row.seriesId || row.masterEventId
+    || row.activeInstanceId || row.originalStart || row.activeEffectiveStart
     || row.updatedAt !== ownedRows[0]?.updatedAt))) return "skipped_active";
   // The preflight is a courtesy for diagnostics. Conditions in the transaction
   // below are authoritative if a new mapping/recurrence races the cleanup.
@@ -142,7 +144,7 @@ async function processTask(
       ":updated": ownedRows[0]!.updatedAt };
     for (const rowKey of ownedKeys) tx.push({ Delete: {
       TableName: table, Key: rowKey,
-      ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(seriesId)",
+      ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(recurrenceId) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId) AND attribute_not_exists(originalStart) AND attribute_not_exists(activeEffectiveStart)",
       ExpressionAttributeNames: { "#profile": "profile" },
       ExpressionAttributeValues: values,
     } });
