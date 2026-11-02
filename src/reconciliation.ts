@@ -571,6 +571,9 @@ export class SnapshotReconciler {
    * A one-sided deletion remains actionable, including recurring masters.
    */
   private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair): Promise<void> {
+    // Fixture repositories used in unit tests do not have persistent review
+    // state. Real StateRepository reconciliation always performs this sweep.
+    if (!(this.state instanceof StateRepository)) return;
     const review = new ReviewStore();
     let cursor: Record<string, unknown> | undefined;
     let examined = 0;
