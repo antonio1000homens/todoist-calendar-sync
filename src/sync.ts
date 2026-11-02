@@ -997,14 +997,16 @@ export class Synchronizer {
       return;
     }
     for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist);
-    if (delta.nextSyncToken) await this.state.putSyncToken(delivery.profile, delta.nextSyncToken);
-    await this.state.audit(delivery.profile, "calendar_delta_processed", { deliveryId: delivery.id, count: delta.items.length, mode: delivery.mode });
     if (this.state instanceof StateRepository) {
       const deleted = delta.items.filter(event => event.status === "cancelled");
       if (deleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
         eventIds: [...new Set(deleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
       });
     }
+    // Only advance after all deletion-review guards and follow-up scheduling
+    // succeed, otherwise a failed notification loses these Calendar deltas.
+    if (delta.nextSyncToken) await this.state.putSyncToken(delivery.profile, delta.nextSyncToken);
+    await this.state.audit(delivery.profile, "calendar_delta_processed", { deliveryId: delivery.id, count: delta.items.length, mode: delivery.mode });
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
@@ -1514,6 +1516,9 @@ export class Synchronizer {
     if (master.status === "cancelled" || !master.recurrence?.length || master.extendedProperties?.shared?.syncHistoryOnly === "true") {
       return this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
     }
+    if (await this.state.syncBlocked(delivery.profile, { eventId: master.id }, true)) {
+      return this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id });
+    }
     if (isTodoistOwnedCalendarRecurrence(master)) {
       return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
         masterEventId: master.id, candidateTaskIds: [master.extendedProperties?.shared?.taskId].filter(Boolean),
@@ -1566,6 +1571,9 @@ export class Synchronizer {
     }
     const active = selectCalendarRecurrenceInstance(instances, existing, Date.now(), calendarTimeZone);
     if (!active) return this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
+    if (await this.state.syncBlocked(delivery.profile, { eventId: active.id }, true)) {
+      return this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id, eventId: active.id });
+    }
     if (await this.state.syncBlocked(delivery.profile, { taskId:existing?.taskId, eventId:active.id })) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:active.id, taskId:existing?.taskId, masterEventId:master.id });
     }
