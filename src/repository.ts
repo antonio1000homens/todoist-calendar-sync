@@ -166,8 +166,13 @@ function latestOriginalStart(...values: Array<string | undefined>): string | und
 export class StateRepository {
   constructor(readonly repairOperationId?: string) {}
 
-  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
-    return new SyncControls().blocked(profile, ids, this.repairOperationId);
+  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, beforeProjection = false): Promise<boolean> {
+    if (await new SyncControls().blocked(profile, ids, this.repairOperationId)) return true;
+    if (!beforeProjection) return false;
+    const review = new SyncReviewStore();
+    if (ids.taskId && await review.hasActiveDeletionGuard(profile, "todoist", ids.taskId)) return true;
+    if (ids.eventId && await review.hasActiveDeletionGuard(profile, "calendar", ids.eventId)) return true;
+    return false;
   }
 
   async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {
