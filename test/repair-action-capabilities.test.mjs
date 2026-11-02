@@ -240,3 +240,10 @@ test("terminal cases preserve only explicitly supported fresh exact-pair preview
   const withoutMapping=assess([taskSnap(),eventSnap()],select(),item("dismissed"));
   assert.equal(withoutMapping.actions.length,0);
 });
+
+test("historical mapping evidence is stale when its provider item is missing",()=>{
+  const absent={ref:{profile,side:"todoist",id:"task"},object:null,mapping};
+  const answer=assess([absent,eventSnap()]);
+  assert.equal(answer.summary.mapping,"stale / unverified mapping");
+  no(answer,"verify","link","transfer");
+});
