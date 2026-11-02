@@ -603,14 +603,6 @@ Resources:
             - Effect: Allow
               Action: dynamodb:TransactWriteItems
               Resource: !GetAtt SyncState.Arn
-      Events:
-        DailyCompletedHistoryReview:
-          Type: Schedule
-          Properties:
-            Schedule: rate(1 day)
-            Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
-            Description: Guarded completed-task retirement, scheduled only after an explicit apply opt-in.
-            Enabled: !If [RunCompletedHistoryCleanup, true, false]
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -618,6 +610,28 @@ Resources:
         Format: cjs
         Target: es2022
         Minify: true
+
+  # Use the pre-existing SAM-generated logical IDs so CloudFormation updates
+  # the existing rule/permission in place. SAM's Schedule.Enabled does not
+  # reliably preserve the Fn::If expression in its transformed EventBridge rule.
+  CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
+      Description: Guarded completed-task retirement, active only while explicitly opted in.
+      ScheduleExpression: rate(1 day)
+      State: !If [RunCompletedHistoryCleanup, ENABLED, DISABLED]
+      Targets:
+        - Arn: !GetAtt CompletedHistoryCleanupFunction.Arn
+          Id: CompletedHistoryCleanupFunctionDailyCompletedHistoryLambdaTarget
+
+  CompletedHistoryCleanupFunctionDailyCompletedHistoryReviewPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CompletedHistoryCleanupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CompletedHistoryCleanupFunctionDailyCompletedHistoryReview.Arn
 
   WatchFunction:
     Type: AWS::Serverless::Function

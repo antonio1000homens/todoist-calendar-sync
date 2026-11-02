@@ -15,12 +15,25 @@ const healthSource = await readText("../src/reconcile.ts");
 const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
+const deployScript = await readText("../deploy.sh");
+const productionWorkflow = await readText("../.github/workflows/deploy.yml");
 
-test("completed-history schedule stays disabled while operator apply is false", () => {
+test("completed-history EventBridge rule is conditionally managed after SAM transform", () => {
   assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
   assert.match(template, /RunCompletedHistoryCleanup:\s*!Equals \[!Ref CompletedHistoryCleanupApply, "true"\]/);
-  const cleanup = template.match(/CompletedHistoryCleanupFunction:[\s\S]*?WatchFunction:/)?.[0] || "";
-  assert.match(cleanup, /Enabled:\s*!If \[RunCompletedHistoryCleanup, true, false\]/);
+  const functionBlock = template.match(/CompletedHistoryCleanupFunction:[\s\S]*?CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:/)?.[0] || "";
+  assert.doesNotMatch(functionBlock, /^\s{8}DailyCompletedHistoryReview:/m, "do not rely on a nested SAM Schedule.Enabled event");
+  const rule = template.match(/  CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:[\s\S]*?  WatchFunction:/)?.[0] || "";
+  assert.match(rule, /Type:\s*AWS::Events::Rule/);
+  assert.match(rule, /State:\s*!If \[RunCompletedHistoryCleanup, ENABLED, DISABLED\]/);
+  assert.match(rule, /CompletedHistoryCleanupFunctionDailyCompletedHistoryReviewPermission:/);
+  assert.match(rule, /SourceArn:\s*!GetAtt CompletedHistoryCleanupFunctionDailyCompletedHistoryReview.Arn/);
+  assert.match(deployScript, /CompletedHistoryCleanupApply=\$completed_history_cleanup_apply/);
+  assert.match(productionWorkflow, /COMPLETED_HISTORY_CLEANUP_APPLY:.*vars\.COMPLETED_HISTORY_CLEANUP_APPLY\s*\|\|\s*'false'/);
+  assert.match(productionWorkflow, /Gate cleanup activation on retained-mapping implementation/);
+  assert.match(productionWorkflow, /Refusing automatic cleanup: #277 seven-day retained-mapping lifecycle is absent/);
+  assert.doesNotMatch(productionWorkflow, /^\s*COMPLETED_HISTORY_CLEANUP_APPLY:\s*'true'\s*$/m);
+  assert.match(productionWorkflow, /Verify completed-history retirement schedule and Lambda mode/);
 });
 
 test("FIFO ordering is isolated by profile", () => {
