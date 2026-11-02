@@ -585,8 +585,11 @@ export class SnapshotReconciler {
         const context = item.decision?.context || {};
         const ids = (value: unknown): string[] => Array.isArray(value)
           ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
+        const candidateItems = Array.isArray(context.candidates)
+          ? context.candidates.map((candidate: unknown) => (candidate as { id?: unknown } | null)?.id) : [];
         const taskIds = [...new Set([item.taskId, item.decision?.taskId, context.providerTaskId, context.taskId,
-          ...ids(context.candidateTaskIds)].filter((id): id is string => typeof id === "string" && Boolean(id)))];
+          context.masterTaskId, ...ids(context.candidateTaskIds), ...candidateItems]
+          .filter((id): id is string => typeof id === "string" && Boolean(id)))];
         const eventIds = [...new Set([item.eventId, item.decision?.eventId, item.decision?.masterEventId,
           item.decision?.activeInstanceId, context.providerEventId, context.eventId, context.masterEventId,
           context.activeInstanceId, ...ids(context.candidateEventIds)]
