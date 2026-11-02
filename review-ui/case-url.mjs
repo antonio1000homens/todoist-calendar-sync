@@ -19,7 +19,8 @@ export function caseIdsFromEvidence(item) {
 
 export function caseIdentityState(item, snapshots=[]) {
   const ids=caseIdsFromEvidence(item);
-  const verified=new Set(snapshots.filter((snapshot)=>snapshot?.object?.id===snapshot?.ref?.id)
+  const verified=new Set(snapshots.filter((snapshot)=>snapshot?.object?.id===snapshot?.ref?.id
+    && snapshot.object.status!=="cancelled" && !snapshot.object.is_deleted)
     .map((snapshot)=>`${snapshot.ref.side}:${snapshot.ref.id}`));
   return {
     taskIds:[...new Set(ids.taskIds)], eventIds:[...new Set(ids.eventIds)],
@@ -58,4 +59,17 @@ export function groupAffectedSnapshots(snapshots=[]) {
     const role=(snapshot)=>snapshot?.object?.recurringEventId?1:snapshot?.object?.recurrence?.length?0:2;
     return role(a)-role(b)||String(a.ref.id).localeCompare(String(b.ref.id));
   })}));
+}
+
+/** Links are accepted only from a verified active provider object. A cancelled
+ * Calendar tombstone may retain an old htmlLink but is not a live event. */
+export function providerSnapshotLink(item, side) {
+  if (!item || item.status === "cancelled" || item.is_deleted
+    || (side === "calendar" && item.status !== "confirmed")) return undefined;
+  const value = item.url || item.htmlLink;
+  if (typeof value !== "string" || !value) return undefined;
+  try {
+    const parsed = new URL(value);
+    return ["https:", "http:"].includes(parsed.protocol) ? parsed.href : undefined;
+  } catch { return undefined; }
 }
