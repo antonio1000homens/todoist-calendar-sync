@@ -209,6 +209,91 @@ export class ReviewStore {
     }
     return {...current,status:"dismissed",result,updatedAt:now};
   }
+  /**
+   * Close an obsolete conflict only after the caller has freshly verified that
+   * every provider identity is deleted and no mapping, recurrence or repair
+   * still owns it. Keep a small terminal case/decision receipt so replayed
+   * audits and deterministic decision seeding cannot reopen the old case.
+   *
+   * Remove strictly attributable audit and incident pointers within the same
+   * transaction, never records belonging to a live counterpart.
+   */
+  async resolveVerifiedDeletedCase(
+    caseId: string,
+    expected: { profile: Profile; taskIds: string[]; eventIds: string[] },
+  ): Promise<boolean> {
+    const current = await this.getCase(caseId);
+    if (!current || current.profile !== expected.profile || current.status !== "open"
+      || current.operationId) return false;
+    const context = current.decision?.context || {};
+    const strings = (value: unknown): string[] => Array.isArray(value)
+      ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
+    const taskIds = [current.taskId, current.decision?.taskId, context.providerTaskId,
+      context.taskId, ...strings(context.candidateTaskIds)].filter((v): v is string => typeof v === "string" && Boolean(v));
+    const eventIds = [current.eventId, current.decision?.eventId, current.decision?.masterEventId,
+      current.decision?.activeInstanceId, context.providerEventId, context.eventId,
+      context.masterEventId, context.activeInstanceId, ...strings(context.candidateEventIds)]
+      .filter((v): v is string => typeof v === "string" && Boolean(v));
+    if (!taskIds.length || !eventIds.length
+      || taskIds.some(id => !expected.taskIds.includes(id))
+      || eventIds.some(id => !expected.eventIds.includes(id))) return false;
+
+    const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
+    if (manual && (manual.status !== "pending" || manual.profile !== expected.profile
+      || manual.decisionId !== caseId)) return false;
+    const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
+      ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
+    const detail = source?.detail && typeof source.detail === "object"
+      ? source.detail as Record<string, unknown> : undefined;
+    const attributable = Boolean(source && detail && [detail.taskId, detail.eventId,
+      ...strings(detail.candidateTaskIds), ...strings(detail.candidateEventIds)]
+      .filter((id): id is string => typeof id === "string" && Boolean(id))
+      .every(id => expected.taskIds.includes(id) || expected.eventIds.includes(id)));
+    const pointerKey = current.conflictKey && current.id.startsWith("incident-")
+      ? { pk: `REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`, sk: `INCIDENT#${caseId}` }
+      : undefined;
+    const pointer = pointerKey ? (await this.db.send(new GetCommand({
+      TableName: reviewTable(), Key: pointerKey, ConsistentRead: true,
+    }))).Item as { incidentId?: string } | undefined : undefined;
+    const now = new Date().toISOString();
+    const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
+    const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
+      { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
+        UpdateExpression: "SET #status = :resolved, #result = :result, updatedAt = :now, lookupSk = :lookup, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey",
+        ConditionExpression: "#status = :open AND updatedAt = :version AND attribute_not_exists(operationId)",
+        ExpressionAttributeNames: { "#status": "status", "#result": "result" },
+        ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution,
+          ":now": now, ":open": "open", ":version": current.updatedAt,
+          ":lookup": `REVIEW#CLOSED#${current.createdAt}#${caseId}`,
+          ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
+      } },
+    ];
+    if (manual) items.push({ Update: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
+      UpdateExpression: "SET #status = :resolved, resolution = :result, resolvedAt = :now REMOVE lookupPk, lookupSk, #context",
+      ConditionExpression: "#status = :pending AND profile = :profile AND decisionId = :id AND createdAt = :createdAt",
+      ExpressionAttributeNames: { "#status": "status", "#context": "context" },
+      ExpressionAttributeValues: { ":pending": "pending", ":resolved": "resolved", ":profile": expected.profile,
+        ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
+    } });
+    if (pointer?.incidentId === caseId && pointerKey) items.push({ Delete: {
+      TableName: reviewTable(), Key: pointerKey,
+      ConditionExpression: "incidentId = :id", ExpressionAttributeValues: { ":id": caseId },
+    } });
+    if (attributable && source && current.sourceAuditKey) items.push({ Delete: {
+      TableName: reviewTable(), Key: key(current.sourceAuditKey),
+      ConditionExpression: "createdAt = :createdAt AND #action = :action",
+      ExpressionAttributeNames: { "#action": "action" },
+      ExpressionAttributeValues: { ":createdAt": source.createdAt, ":action": source.action },
+    } });
+    try {
+      await this.db.send(new TransactWriteCommand({ TransactItems: items }));
+      return true;
+    } catch (error) {
+      if (conditional(error) || (error as { name?: string }).name === "TransactionCanceledException") return false;
+      throw error;
+    }
+  }
+
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
