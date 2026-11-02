@@ -440,7 +440,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         fail(400,"Unsupported recheck parameters");
       const checkedId = (value: string | undefined): string | undefined => {
         if (!value) return undefined;
-        if (value.length > 1024 || /[\\u0000-\\u001f]/.test(value))
+        if (value.length > 1024 || [...value].some(char => char.charCodeAt(0) < 32))
           fail(400,"Invalid provider item ID");
         return value;
       };
