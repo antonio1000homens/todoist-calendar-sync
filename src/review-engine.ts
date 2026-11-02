@@ -359,6 +359,9 @@ export class ReviewEngine {
     if (!intent.leftovers || Object.values(intent.leftovers).some(v => !["exclude","create","unchanged","retain-unlinked","delete"].includes(v))) invalidRepairIntent("Invalid leftover dispositions");
     if (Object.values(intent.leftovers).includes("delete") && intent.action !== "transfer") invalidRepairIntent("Exact deletion is available only for an explicitly selected one-off duplicate during a Calendar series transfer");
     if (intent.action !== "transfer" && Object.values(intent.leftovers).includes("retain-unlinked")) invalidRepairIntent("Retain unlinked is available only during an explicit Calendar series transfer");
+    if (intent.action === "decision" && (record.status !== "open" || record.decision?.status !== "pending")) {
+      invalidRepairIntent("Slack/manual repair requires a currently pending decision on an open case; refresh before choosing an action");
+    }
     intent = decisionRepairIntent(intent, record.decision);
     let snapshots = await this.collect(intent, record.decision);
     if (!snapshots.length) invalidRepairIntent("Select at least one provider item");
@@ -523,6 +526,33 @@ export class ReviewEngine {
     }
     const task = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId)?.object as TodoistTask | undefined;
     const event = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId)?.object as CalendarEvent | undefined;
+    // UI filtering is advisory. Forged/stale preview intents must be rejected
+    // by the same fresh provider snapshots used for the frozen repair preview.
+    const selectedTask = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "todoist" && s.ref.id === intent.taskId);
+    const selectedEvent = snapshots.find(s => s.ref.profile === intent.profile && s.ref.side === "calendar" && s.ref.id === intent.eventId);
+    const activeTask = Boolean(task && !task.is_deleted && !task.is_completed);
+    const activeEvent = Boolean(event && event.status === "confirmed" && (event.start?.date || event.start?.dateTime));
+    if (["link","verify"].includes(intent.action) && (!activeTask || !activeEvent)) {
+      invalidRepairIntent("This action requires both selected provider objects to be verified live; refresh affected items");
+    }
+    if (["move"].includes(intent.action) && !activeTask) {
+      invalidRepairIntent("Move requires a verified active Todoist task; refresh the provider item");
+    }
+    if (["exclude","separate","decision"].includes(intent.action) && !activeTask && !activeEvent) {
+      invalidRepairIntent("No verified live provider item is available for this repair; recheck or search instead");
+    }
+    if (intent.action === "create") {
+      if (activeTask === activeEvent) invalidRepairIntent("Create requires exactly one current verified source");
+      const source = activeTask ? selectedTask : selectedEvent;
+      if (source?.mapping || source?.recurrence || source?.destination
+        || snapshots.some(s => s.ref.profile === intent.profile
+          && s.ref.side !== (activeTask ? "todoist" : "calendar")
+          && s.object && s.object.id === s.ref.id
+          && (s.ref.side === "todoist" ? !(s.object as TodoistTask).is_deleted && !(s.object as TodoistTask).is_completed
+            : (s.object as CalendarEvent).status === "confirmed"))) {
+        invalidRepairIntent("Create source already has a mapping, recurrence owner, destination, or existing live counterpart; recheck the affected items");
+      }
+    }
     if (intent.action === "todoist-only") {
       const taskSnapshot = snapshots.find(s => s.ref.side === "todoist" && s.ref.id === intent.taskId);
       const eventSnapshot = snapshots.find(s => s.ref.side === "calendar" && s.ref.id === intent.eventId);
