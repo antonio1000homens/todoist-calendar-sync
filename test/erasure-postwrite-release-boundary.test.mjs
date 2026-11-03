@@ -27,8 +27,8 @@ test("the future post-write marker+fence transaction stays offline, not invoked 
     }
     assert.doesNotMatch(source,/\batomicReplayRelease\s*\(/,
       "No worker, API or recovery controller may execute the staged post-write fence release: "+relative);
-    assert.doesNotMatch(source,/\b(?:as|from)\s+["']\.\/erasure-replay-barrier\.js["']/,
-      "Unexpected direct replay transaction import in "+relative);
+    assert.doesNotMatch(source,/import\s*\{[^}]*\batomicReplayRelease\b[^}]*\}\s*from\s*["'][^"']*erasure-replay-barrier\.js/,
+      "Staged replay release must not be imported into live entrypoints: "+relative);
   }
   assert.equal(foundDeclaration,1);
 });
