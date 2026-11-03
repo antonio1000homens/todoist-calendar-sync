@@ -110,8 +110,8 @@ class FakeState {
 
 let currentTodoistTask;
 
-function fixture({ unlinked = false } = {}) {
-  const state = new FakeState(unlinked ? undefined : mapping());
+function fixture({ unlinked = false, unmapped = false } = {}) {
+  const state = new FakeState(unlinked || unmapped ? undefined : mapping());
   const events = new Map(unlinked ? [] : [[MASTER_ID, masterEvent()]]);
   const instances = [
     instance("instance-14", "2026-09-14"),
@@ -247,4 +247,16 @@ test("new unsupported Phase B schedules remain one-off rolling projections with 
     assert.equal(record.detail.phaseBCandidateRrule, rule, phrase);
     assert.equal(record.detail.phaseBReason, "anchor_not_verified", phrase);
   }
+});
+
+test("Phase B never overwrites a Todoist-owned Calendar master when DynamoDB mapping is absent", async () => {
+  const task = recurringTask("2026-09-14", "Water plants edited", "2026-09-14T10:10:00Z");
+  task.due.string = "every other Monday";
+  const { state, sync, upserts } = fixture({ unmapped: true });
+  await sync.process(delivery(task, undefined));
+  assert.equal(upserts.length, 0);
+  assert.equal(state.mapping, undefined);
+  const record = state.audits.at(-1);
+  assert.equal(record.action, "todoist_phase_b_existing_series_requires_review");
+  assert.equal(record.detail.eventId, MASTER_ID);
 });
