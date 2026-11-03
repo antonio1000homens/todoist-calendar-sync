@@ -12,11 +12,12 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [operation,setOperation]=useState<Operation>();
   const [busy,setBusy]=useState(false),[notice,setNotice]=useState("");
   const [preview,setPreview]=useState<any>(),[confirmation,setConfirmation]=useState<any>();
+  const [postWriteAssessment,setPostWriteAssessment]=useState<any>();
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
   const [recoveryStatus,setRecoveryStatus]=useState<string>();
   const lookup=async()=>{
     if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
-    setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
+    setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
     try{
       const result=await api("erasure-operations/"+encodeURIComponent(operationId));
       setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);
@@ -35,6 +36,15 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     setBusy(true);setPreview(undefined);setConfirmation(undefined);setNotice("");
     try{const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId));setPreview(result.preview);}
     catch(e:any){setNotice(e.message||"Recovery inspection failed");}
+    finally{setBusy(false);}
+  };
+  const inspectPostWrite=async()=>{
+    if(!operation||busy)return;
+    setBusy(true);setPostWriteAssessment(undefined);setNotice("");
+    try{
+      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId));
+      setPostWriteAssessment(result.assessment);
+    }catch(e:any){setNotice(e.message||"Post-write evidence inspection failed; fence remains protected");}
     finally{setBusy(false);}
   };
   const requestConfirmation=async()=>{
@@ -100,6 +110,16 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           {preview.blockers?.length>0&&<ul>{preview.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>}
           {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation()}>Request recovery confirmation</button>}
         </>}
+        <h4>Post-write evidence (read-only)</h4>
+        <p>Inspect evidence after an erasure may have deleted a provider item. This assessment cannot confirm, resume or finish deletion, restore worker mappings, or release a fence.</p>
+        <button className="secondary" disabled={busy} onClick={()=>void inspectPostWrite()}>Inspect post-write evidence</button>
+        {postWriteAssessment&&<div className="erasure-results" aria-label="Post-write recovery evidence">
+          <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile <strong>{postWriteAssessment.profile}</strong> · fence release: <strong>not authorised</strong></p>
+          <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · both original targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · matching fence: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"}</p>
+          <p>Provider items absent: {postWriteAssessment.evidence?.providersAbsent?"yes":"no"} · state rows absent: {postWriteAssessment.evidence?.stateRowsAbsent?"yes":"no"} · original worker mappings restored: {postWriteAssessment.evidence?.workerMappingsRestored?"yes":"no"}</p>
+          <p className="warning">Only safe action: preserve the existing fence for independently authorised follow-up. No post-write confirmation or apply action exists.</p>
+          {postWriteAssessment.blockers?.length>0&&<ul>{postWriteAssessment.blockers.map((message:string,i:number)=><li key={i} className="warning">{message}</li>)}</ul>}
+        </div>}
         {confirmation&&<>
           <p>Confirmation expires {new Date(confirmation.expiresAt).toLocaleString()}.</p>
           <label>Type RESTORE SYNC<input value={typed.phrase} autoComplete="off" onChange={e=>setTyped(v=>({...v,phrase:e.target.value}))}/></label>
