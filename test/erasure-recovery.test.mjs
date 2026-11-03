@@ -112,6 +112,29 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(external.writes.length,0);
 });
 
+test("independent post-write preview never issues a confirmation, writes state, or releases a fence",async()=>{
+  const {service,external}=fixture({paginated:true});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"not_post_write");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.onlyAvailableAction,"keep_fenced");
+  assert.equal(assessment.evidence.originalProviderWriteIndicated,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(external.providerCalls,1);
+  assert.equal(external.writes.length,0);
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("post-write inspection with an active lease exposes a blocker but never changes controls",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"ADMISSION#stale",owner:"stale"});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.evidence.leasesDrained,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(external.writes.length,0);
+});
+
 test("distinct single-use confirmation and CAS restore only the originally enabled mapping",async()=>{
   const {service,operation,external}=fixture();
   const issued=await service.issueConfirmation("op-recovery","operator-1");
