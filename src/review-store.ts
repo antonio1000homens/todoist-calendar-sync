@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { Profile } from "./types.js";
+import type { Profile, RecurrenceLink } from "./types.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
@@ -302,7 +302,7 @@ export class ReviewStore {
    */
   async resolveVerifiedDeletedCase(
     caseId: string,
-    expected: { profile: Profile; taskIds: string[]; eventIds: string[] },
+    expected: { profile: Profile; taskIds: string[]; eventIds: string[]; staleLinks?: RecurrenceLink[] },
   ): Promise<boolean> {
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
@@ -329,16 +329,29 @@ export class ReviewStore {
     const pointer = pointerKey ? (await this.db.send(new GetCommand({
       TableName: reviewTable(), Key: pointerKey, ConsistentRead: true,
     }))).Item as { incidentId?: string } | undefined : undefined;
+    // Caller has freshly checked the exact task, master, and active occurrence.
+    // Never grant this path permission to remove a foreign or calendar-owned link.
+    const staleLinks = expected.staleLinks || [];
+    const seenLinks = new Set<string>();
+    for (const link of staleLinks) {
+      const identity = `${link.profile}/${link.seriesId}`;
+      if (seenLinks.has(identity) || link.profile !== expected.profile || link.owner !== "todoist"
+        || link.seriesId !== link.taskId || !expected.taskIds.includes(link.taskId)
+        || !expected.eventIds.includes(link.eventId)
+        || (link.masterEventId && !expected.eventIds.includes(link.masterEventId))
+        || (link.activeInstanceId && !expected.eventIds.includes(link.activeInstanceId))
+        || !link.updatedAt) return false;
+      seenLinks.add(identity);
+    }
     const now = new Date().toISOString();
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
       { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
-        UpdateExpression: "SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, reconciliationGeneration, progressCheckpoint, coalescedInto",
+        UpdateExpression: "SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, reconciliationGeneration, progressCheckpoint, coalescedInto, expiresAt",
         ConditionExpression: "#status = :old AND updatedAt = :version AND attribute_not_exists(operationId)",
         ExpressionAttributeNames: { "#status": "status", "#result": "result", "#title": "title", "#reason": "reason" },
         ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution, ":title": "Verified deletion", ":reason": "verified_deletion",
-          ":now": now, ":old": current.status, ":version": current.updatedAt,
-          ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
+          ":now": now, ":old": current.status, ":version": current.updatedAt },
       } },
     ];
     if (manual) items.push({ Update: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
@@ -348,6 +361,29 @@ export class ReviewStore {
       ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
         ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
     } });
+    // Retire the stale active link inside the same transaction as the case and
+    // pending manual decision. All identity/ownership/version fields are CAS
+    // fenced; a revived or re-owned series cancels the entire operation.
+    for (const link of staleLinks) {
+      const values: Record<string, unknown> = {
+        ":profile": link.profile, ":owner": "todoist", ":series": link.seriesId,
+        ":task": link.taskId, ":event": link.eventId, ":updated": link.updatedAt,
+      };
+      const conditions = [
+        "#profile = :profile", "#owner = :owner", "seriesId = :series",
+        "taskId = :task", "eventId = :event", "updatedAt = :updated",
+      ];
+      for (const field of ["masterEventId", "activeInstanceId"] as const) {
+        if (link[field]) { conditions.push(`${field} = :${field}`); values[`:${field}`] = link[field]; }
+        else conditions.push(`attribute_not_exists(${field})`);
+      }
+      items.push({ Delete: { TableName: reviewTable(),
+        Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
+        ConditionExpression: conditions.join(" AND "),
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: values,
+      } });
+    }
     // Remove exact case-scoped deletion-review guards. Their unique case sort
     // key means this cannot remove guards owned by other unresolved cases.
     const refs = [
@@ -496,10 +532,9 @@ export class ReviewStore {
     for (const eventId of expected.eventIds) {
       for (const candidateProfile of profiles) {
         checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
-        checkAbsent(`COMPLETED_EVENT#${candidateProfile}#${eventId}`, "STATE");
-        for (const taskId of expected.taskIds) {
-          checkAbsent(`COMPLETED_TASK#${candidateProfile}#${taskId}`, `EVENT#${eventId}`);
-        }
+        // Completed projections are historical receipts, not live ownership.
+        // Do not delete or require their absence during an active-link cleanup.
+        checkAbsent(`RECURRENCE#${candidateProfile}#${eventId}`, "STATE");
       }
     }
     // Never ConditionCheck a key that is also deleted in this transaction.
