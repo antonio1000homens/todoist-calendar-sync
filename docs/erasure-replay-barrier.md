@@ -141,3 +141,35 @@ primitive must not be activated or relied on for post-write recovery until
 
 **Never:** manually delete a fence or epoch, clear/skip the DLQ, promote an old
 message to a new epoch, or restore synchronisation after ambiguous deletion.
+
+
+## Follow-on: source-bound Calendar → Todoist creation (staged, issue #243)
+
+- A Todoist `upsertTask` without `existingId`, or `createTaskOnce`, may create
+  a *new* task ID. Checking `task.id` or the idempotency request key cannot
+  protect against recreation of an erased task; those fields are not the
+  identity selected by a `POST /tasks` operation.
+- The mutation boundary now accepts an optional, trusted third argument of
+  Calendar source IDs. All regular synchronizer, Calendar snapshot import,
+  manual conflict repair and review-engine task creators supply the source
+  event and known recurrence master aliases using
+  `calendarReplaySourceIds(event, ...aliases)`.
+- With replay admission enabled, task creation *fails closed* without a
+  non-empty, unique, bounded Calendar source/alias inventory. Every supplied
+  source ID is checked under the profile's HMAC-derived immutable replay
+  markers before the provider call. Known existing-task updates still check
+  the Todoist task ID; when source aliases are supplied, both are checked.
+- A source ID is provenance, not proof of provider deletion or an authorisation
+  to create a replacement task. Callers must obtain it from the original
+  provider-read Calendar event; this change does not infer a source from user
+  text or a stale Todoist task ID. The provider never receives the third argument.
+- The delegated review idempotency wrapper preserves source IDs when converting
+  `upsertTask` into `createTaskOnce`. An AST-based test audits production
+  creator callsites for omissions and provider tests cover deleted aliases,
+  invalid/duplicate sources and safe existing-task updates.
+
+**Rollout remains prohibited.** `ERASURE_REPLAY_BARRIER_VERSION` stays off.
+This increment does not finish the source-inventory security review, unknown
+comment ownership, Calendar creation provenance, old qualified Lambda versions,
+atomic post-write postflight/confirmation, or Work-profile disposable staging.
+It does not unlock post-write recovery or justify closing #243, #239 or #113.
