@@ -67,8 +67,12 @@ function taskIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdenti
   }
   if(method==="updateRecurringOccurrence")return {profile,taskId:(args[0] as TodoistTask)?.id};
   if(method==="upsertTask") {
-    const task=args[0] as (TodoistTask|undefined);
-    return {profile,taskId:typeof args[1]==="string" ? args[1] : task?.id};
+    // Todoist POST /tasks creates a NEW ID and deliberately drops task.id from
+    // the payload. Only existingId selects a known provider identity for PATCH.
+    // Do not admit anonymous creation by validating an ignored task.id.
+    const existingId=args[1];
+    return {profile,...(typeof existingId==="string"&&existingId
+      ?{taskId:existingId}:{})};
   }
   if(method==="createTaskOnce") {
     // Request IDs and timestamps are not Todoist task IDs. The *source*
