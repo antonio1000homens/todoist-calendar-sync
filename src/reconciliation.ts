@@ -1,11 +1,13 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
+import { classifyDeletedRecurrenceLinks } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { isMutationBudgetExhausted } from "./mutation-budget.js";
 import { ReconciliationItemError, reconciliationFailureDetails, type ReconciliationFailureContext } from "./reconciliation-diagnostics.js";
 import { normalizedText } from "./security.js";
@@ -571,62 +573,82 @@ export class SnapshotReconciler {
    * A one-sided deletion remains actionable, including recurring masters.
    */
   private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair, includeHistory = false): Promise<void> {
-    // Fixture repositories used in unit tests do not have persistent review
-    // state. Real StateRepository reconciliation always performs this sweep.
     if (!(this.state instanceof StateRepository)) return;
     const review = new ReviewStore();
-    // Load recurrence ownership lazily: ordinary reconciliation without any
-    // deleted conflicts should not spend three profile-wide GSI queries.
+    // Do not scan the recurrence GSI until a candidate has independently
+    // verified provider deletions. Every actual removal uses a base-table CAS.
     let links: Awaited<ReturnType<StateRepository["listRecurrenceLinks"]>> | undefined;
     let cursor = await review.deletionSweepCursor(profile, includeHistory);
     let examined = 0;
     do {
-      // Smaller pages avoid losing unexamined case identities at a limit.
       const page = await review.listCases(profile, cursor, includeHistory, 10);
       for (const item of page.items) {
         examined += 1;
         if (item.status !== (includeHistory ? "dismissed" : "open") || item.operationId
           || item.reason.startsWith("operational_")) continue;
-        const context = item.decision?.context || {};
-        const ids = (value: unknown): string[] => Array.isArray(value)
-          ? value.filter((id): id is string => typeof id === "string" && Boolean(id)) : [];
-        const candidateItems = Array.isArray(context.candidates)
-          ? context.candidates.map((candidate: unknown) => (candidate as { id?: unknown } | null)?.id) : [];
-        const taskIds = [...new Set([item.taskId, item.decision?.taskId, context.providerTaskId, context.taskId,
-          context.masterTaskId, ...ids(context.candidateTaskIds), ...candidateItems]
-          .filter((id): id is string => typeof id === "string" && Boolean(id)))];
-        const eventIds = [...new Set([item.eventId, item.decision?.eventId, item.decision?.masterEventId,
-          item.decision?.activeInstanceId, context.providerEventId, context.eventId, context.masterEventId,
-          context.activeInstanceId, ...ids(context.candidateEventIds)]
-          .filter((id): id is string => typeof id === "string" && Boolean(id)))];
-        // One-sided evidence cannot justify retiring an unknown counterpart.
+        const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
         if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
+        const recurring = item.decision?.type?.includes("recurrence_task_deleted");
+        const masterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
+        // A cancelled active occurrence alone is never evidence of deleting
+        // the recurring master. Unidentified masters must remain in review.
+        if (recurring && (!masterId || !eventIds.includes(masterId))) continue;
         let absent = true;
         for (const taskId of taskIds) {
           if (await this.currentTask(clients.todoist, taskId)
             || await this.state.getMappingByTaskAnyProfile(taskId)
-            || await this.state.getRecurrenceLinkByTaskAnyProfile(taskId)
             || await this.state.syncBlocked(profile, { taskId })) { absent = false; break; }
+        }
+        if (!absent) continue;
+        for (const eventId of eventIds) {
+          const event = await this.currentEvent(clients.calendar, eventId);
+          if ((event && event.status !== "cancelled")
+            || (await Promise.all((["home", "antonio", "work"] as const)
+              .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
+            || await this.state.syncBlocked(profile, { eventId })) { absent = false; break; }
         }
         if (!absent) continue;
         links ||= (await Promise.all((["home", "antonio", "work"] as const)
           .map(candidate => this.state.listRecurrenceLinks(candidate)))).flat();
-        for (const eventId of eventIds) {
-          const event = await this.currentEvent(clients.calendar, eventId);
-          if ((event && event.status !== "cancelled")
-            || links.some(link => [link.eventId, link.masterEventId, link.activeInstanceId].includes(eventId))
-            || (await Promise.all((["home", "antonio", "work"] as const)
-              .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
-            || await this.state.syncBlocked(profile, { eventId })
-            || await this.completedProjection(profile, eventId)) { absent = false; break; }
+        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links);
+        if (classification.blocked.length) {
+          await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            reason: "live_or_ambiguous_recurrence_owner", blockers: classification.blocked.slice(0, 5),
+          });
+          continue;
+        }
+        // A GSI inventory can lag. Re-read all proposed stale links strongly,
+        // and refuse anything that changed before the conditional transaction.
+        for (const link of classification.stale) {
+          const current = await this.state.getRecurrenceLink(link.profile, link.seriesId);
+          if (!current || !same(current, link)) { absent = false; break; }
         }
         if (!absent) continue;
-        const closed = await review.resolveVerifiedDeletedCase(item.id, { profile, taskIds, eventIds });
-        if (!closed) {
+        // Tighten the provider read/write gap before committing. DynamoDB
+        // ownership/mapping/repair fences are rechecked within the transaction.
+        for (const taskId of taskIds) if (await this.currentTask(clients.todoist, taskId)) { absent = false; break; }
+        if (!absent) continue;
+        for (const eventId of eventIds) {
+          const event = await this.currentEvent(clients.calendar, eventId);
+          if (event && event.status !== "cancelled") { absent = false; break; }
+        }
+        if (!absent) continue;
+        const closed = await review.resolveVerifiedDeletedCase(item.id, {
+          profile, taskIds, eventIds, staleLinks: classification.stale,
+        });
+        if (closed) {
+          const retired = new Set(classification.stale.map(link => `${link.profile}/${link.seriesId}`));
+          links = links.filter(link => !retired.has(`${link.profile}/${link.seriesId}`));
+          await this.state.audit(profile, "verified_deletion_cleanup_completed", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            retiredRecurrenceLinks: classification.stale.map(link => link.seriesId),
+          });
+        } else {
           await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt);
           await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
             taskId: taskIds[0], eventId: eventIds[0],
-            reason: "case_state_or_repair_changed_during_verified_deletion",
+            reason: "case_state_mapping_repair_or_recurrence_changed_during_verified_deletion",
           });
         }
       }
