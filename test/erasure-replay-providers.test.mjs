@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {documentClient} from "../dist/dynamodb-capacity.js";
-import {guardReplayProviderClients} from "../dist/erasure-replay-providers.js";
+import {calendarReplaySourceIds,guardReplayProviderClients} from "../dist/erasure-replay-providers.js";
 import {ErasureReplayBlockedError,ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 
 const original={
@@ -102,4 +102,65 @@ test("missing HMAC configuration refuses writes rather than silently bypassing a
   const {clients,called}=fixture();
   await assert.rejects(clients.todoist.upsertTask({content:"safe"},"existing-task"),ErasureReplayUnavailableError);
   assert.equal(called.length,0);
+});
+
+test("Calendar-sourced Todoist creation checks the event and master aliases before the provider POST",async t=>{
+  const reads=[];
+  t.mock.method(documentClient,"send",async cmd=>{
+    assert.equal(cmd.constructor.name,"GetCommand");
+    assert.equal(cmd.input.ConsistentRead,true);
+    reads.push(cmd.input.Key);
+    return {};
+  });
+  const {clients,called}=fixture();
+  const source=calendarReplaySourceIds({id:"active-occurrence",recurringEventId:"series-master"},"series-master");
+  assert.deepEqual(source,["active-occurrence","series-master"]);
+  await clients.todoist.upsertTask({content:"new task"},undefined,source);
+  await clients.todoist.createTaskOnce({content:"idempotent new task"},"request-not-task-id",source);
+  assert.equal(called.length,2);
+  assert.equal(reads.length,4);
+  assert.ok(reads.every(item=>item.pk==="ERASURE_REPLAY#work"&&item.sk.startsWith("EVENT#")));
+  assert.deepEqual(called[0].slice(1),[{content:"new task"},undefined,source]);
+  assert.deepEqual(called[1].slice(1),[{content:"idempotent new task"},"request-not-task-id",source]);
+});
+
+test("erased Calendar recurrence alias prevents a new Todoist task even with fresh idempotency key",async t=>{
+  let reads=0;
+  t.mock.method(documentClient,"send",async cmd=>{
+    assert.equal(cmd.input.ConsistentRead,true);
+    reads++;
+    return reads===2?{Item:{markerVersion:1}}:{};
+  });
+  const {clients,called}=fixture();
+  await assert.rejects(clients.todoist.createTaskOnce(
+    {content:"never create"},"brand-new-request",calendarReplaySourceIds({id:"new-instance",recurringEventId:"erased-master"})
+  ),ErasureReplayBlockedError);
+  assert.equal(reads,2);
+  assert.equal(called.length,0);
+});
+
+test("missing, duplicate, malformed and excessive Calendar provenance always fail closed",async t=>{
+  let reads=0;
+  t.mock.method(documentClient,"send",async()=>{reads++;return {};});
+  const {clients,called}=fixture();
+  for(const invalid of [undefined,[],["same","same"],["valid",null],["bad/id"],
+    Array.from({length:33},(_,i)=>"event-"+i)]){
+    await assert.rejects(clients.todoist.upsertTask({id:"ignored-provider-id",content:"new"},undefined,invalid),
+      ErasureReplayUnavailableError);
+    await assert.rejects(clients.todoist.createTaskOnce({content:"new"},"a-request-key",invalid),
+      ErasureReplayUnavailableError);
+  }
+  assert.throws(()=>calendarReplaySourceIds({id:""}),ErasureReplayUnavailableError);
+  assert.equal(reads,0);
+  assert.equal(called.length,0);
+});
+
+test("updates verify both Todoist task and known Calendar source when both are provided",async t=>{
+  const reads=[];
+  t.mock.method(documentClient,"send",async cmd=>{reads.push(cmd.input.Key);return {};});
+  const {clients,called}=fixture();
+  await clients.todoist.upsertTask({content:"updated"},"existing-task",["calendar-source"]);
+  assert.equal(called.length,1);
+  assert.ok(reads.some(x=>x.sk.startsWith("TASK#")));
+  assert.ok(reads.some(x=>x.sk.startsWith("EVENT#")));
 });
