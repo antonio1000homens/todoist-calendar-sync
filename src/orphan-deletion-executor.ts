@@ -135,7 +135,7 @@ function assertIdentity(operation: OrphanDeletionOperation): void {
     || !Number.isInteger(operation.version) || operation.version < 0
     || !knownPhases.has(operation.phase)) throw new OrphanSafetyError("Incomplete immutable orphan operation identity");
 }
-function assertTrustedProof(operation: OrphanDeletionOperation, proof: VerifiedOrphanProof): void {
+export function assertTrustedProof(operation: OrphanDeletionOperation, proof: VerifiedOrphanProof): void {
   const age=Date.now()-Date.parse(proof.checkedAt);
   if (proof.caseId!==operation.caseId || proof.profile!==operation.profile
     || proof.caseUpdatedAt!==operation.caseUpdatedAt
