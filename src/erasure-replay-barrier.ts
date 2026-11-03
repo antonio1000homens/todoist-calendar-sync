@@ -168,10 +168,18 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     pairs.push(marker(proof.identity.profile,"EVENT",eventId,ring.current,secret));
   const table=tableName();
   const profileKey=(sk:string)=>({pk:`ERASURE#${proof.identity.profile}`,sk});
-  const values={":id":proof.operationId,":epoch":proof.epoch,":review":"review_required",
-    ":verifying":"verifying",":mode":"post_write",
-    ":confirmationId":proof.confirmationId,":fingerprint":proof.recoveryFingerprint,
-    ":postflight":proof.postflightFingerprint};
+  // DynamoDB rejects expression values unused by a *specific* transaction
+  // action. Keep independent, exact placeholder sets for each conditional delete.
+  const operationValues={
+    ":review":"review_required",":verifying":"verifying",":mode":"post_write",
+    ":epoch":proof.epoch,":confirmationId":proof.confirmationId,
+    ":fingerprint":proof.recoveryFingerprint,":postflight":proof.postflightFingerprint,
+  };
+  const confirmationValues={
+    ":consumed":"consumed",":id":proof.operationId,
+    ":confirmationId":proof.confirmationId,
+    ":fingerprint":proof.recoveryFingerprint,":postflight":proof.postflightFingerprint,
+  };
   const tx:any[]=[
     ...pairs.map(key=>({Put:{TableName:table,Item:{...key,markerVersion:1},
       ConditionExpression:"attribute_not_exists(pk)"}})),
@@ -181,11 +189,11 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     {Delete:{TableName:table,Key:{pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"},
       ConditionExpression:"#status=:review AND recovery.#status=:verifying AND recovery.mode=:mode AND recovery.epoch=:epoch AND recovery.confirmationId=:confirmationId AND recovery.fingerprint=:fingerprint AND recovery.postflightFingerprint=:postflight",
       ExpressionAttributeNames:{"#status":"status"},
-      ExpressionAttributeValues:values}},
+      ExpressionAttributeValues:operationValues}},
     {Delete:{TableName:table,Key:{pk:`ERASURE_POSTWRITE_CONFIRMATION#${proof.operationId}`,sk:"STATE"},
       ConditionExpression:"#status=:consumed AND operationId=:id AND confirmationId=:confirmationId AND inspectedFingerprint=:fingerprint AND postflightFingerprint=:postflight",
       ExpressionAttributeNames:{"#status":"status"},
-      ExpressionAttributeValues:{...values,":consumed":"consumed"}}},
+      ExpressionAttributeValues:confirmationValues}},
     {ConditionCheck:{TableName:table,Key:profileKey("EPOCH"),
       ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":proof.epoch}}},
     {Delete:{TableName:table,Key:profileKey("FENCE"),
