@@ -101,7 +101,7 @@ the following entrypoints **before** post-write recovery is allowed:
 | --- | --- | --- |
 | `src/worker.ts`, `src/handler.ts`, `src/queue.ts` | delivery admission, retries, old epochs, orphan and manual payloads | reject old epochs and new-epoch delayed admission; test old qualified Lambda versions |
 | `src/sync.ts` | `todoist.upsertTask`, `calendar.upsertEvent`, `upsertComment`, recurrence rebind | check full task/event/master/instance identity under writer lease |
-| `src/reconciliation.ts` | `upsertTask`, `upsertEvent`, comment/mapping save | check both snapshot and action-time identities |
+| `src/reconciliation.ts`, `src/canonical-identity.ts` | `upsertTask`, `upsertEvent`, comment/mapping/baseline/canonical identity save or cleanup | check both snapshot and action-time identities; DDB baseline/canonical rows check task/event replay markers at their write boundary |
 | `src/calendar-reconciliation.ts` | standalone and recurring Todoist creation/rebind, mapping creation | check event, series and linked task aliases |
 | `src/project-sync.ts` | source/destination projections, cross-profile moves, recurrence migration | check source AND destination before any provider or DynamoDB write |
 | `src/orphan-recovery.ts` | orphan reattachment and state re-mapping | check both sides before repair and putMapping |

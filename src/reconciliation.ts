@@ -1,5 +1,6 @@
 import {defaultProviderClientFactory} from "./mutation-budget.js";
 import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
@@ -253,6 +254,9 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async putBaseline(profile: Profile, taskId: string, task: TodoistTask, event: CalendarEvent): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[
+      event.id,event.recurringEventId,event.extendedProperties?.shared?.syncHistoryMasterId,
+    ].filter((value):value is string=>typeof value==="string"&&value.length>0)});
     const baseline: ReconciliationBaseline = {
       todoist: canonicalTodoist(task),
       calendar: canonicalCalendar(event),
@@ -270,6 +274,7 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaseline(profile: Profile, taskId: string): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     await documentClient.send(new DeleteCommand({
       TableName: this.ensureTable(),
       Key: key(`BASELINE#${profile}#TASK#${taskId}`, "RECONCILE"),
