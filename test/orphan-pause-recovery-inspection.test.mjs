@@ -168,7 +168,7 @@ test("current Lambda readback, cross-profile fence/lease and epoch drift are har
 test("AWS API failure remains retryable rather than reporting a safe state",async()=>{
   await gate(async()=>{
     const f=fixture();
-    f.db.send=async()=>{throw Error("DynamoDB 429");};
+    f.input.db.send=async()=>{throw Error("DynamoDB 429");};
     await assert.rejects(()=>inspectOrphanPauseRecovery(id,f.input),/DynamoDB 429/);
     const g=fixture();g.input.mappings=async()=>{throw Error("Lambda list mappings 503");};
     await assert.rejects(()=>inspectOrphanPauseRecovery(id,g.input),/503/);
