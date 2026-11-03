@@ -110,30 +110,52 @@ export class GoogleCalendar {
     } while (true);
   }
 
-  async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
-    // The first Google result is not necessarily the active projection. Its
-    // ordering is unspecified, and showDeleted can return old cancelled copies.
-    // Never silently pick a candidate that could delete or overwrite another.
+  /**
+   * Return every Calendar event tagged with an exact Todoist task ID, including
+   * cancelled records and explicit recurrence overrides. This is OBSERVATION,
+   * not a comprehensive proof of identity or deletion: legacy untagged events,
+   * recurrence master/instance relationships and cross-profile provenance
+   * still require independent reads.
+   */
+  async listLinkedEventsByTodoistTaskId(taskId: string): Promise<CalendarEvent[]> {
+    if (!/^[A-Za-z0-9_.-]{1,1024}$/.test(taskId))
+      throw new Error("Calendar alias inventory requires an exact Todoist task ID");
     const query = new URLSearchParams({
       showDeleted: "true",
+      singleEvents: "false",
       maxResults: "2500",
       sharedExtendedProperty: `taskId=${taskId}`,
     });
     const found = new Map<string, CalendarEvent>();
-    let pages = 0;
-    while (true) {
-      if (++pages > 20) throw new Error("Calendar task link lookup exceeded page limit");
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 20; page += 1) {
       const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
         `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
       );
+      if (response.items !== undefined && !Array.isArray(response.items))
+        throw new Error("Calendar linked-event inventory returned invalid items");
       for (const event of response.items || []) {
-        found.set(event.id, event);
+        if (!event || typeof event.id !== "string" || !event.id)
+          throw new Error("Calendar linked-event inventory returned unidentified event");
+        const previous = found.get(event.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(event))
+          throw new Error("Calendar linked-event inventory changed during pagination");
+        found.set(event.id,event);
         if (found.size > 10000) throw new Error("Calendar task link lookup exceeded candidate limit");
       }
-      if (!response.nextPageToken) break;
-      query.set("pageToken", response.nextPageToken);
+      const next = response.nextPageToken;
+      if (next === undefined) return [...found.values()];
+      if (typeof next !== "string" || !next || seenTokens.has(next))
+        throw new Error("Calendar linked-event inventory returned repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken", next);
     }
-    return selectLinkedCalendarEvent(taskId, [...found.values()]);
+    throw new Error("Calendar task link lookup exceeded page limit");
+  }
+
+  async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
+    // Existing sync uses an exact UNIQUE candidate, never the first result.
+    return selectLinkedCalendarEvent(taskId, await this.listLinkedEventsByTodoistTaskId(taskId));
   }
 
   /**
