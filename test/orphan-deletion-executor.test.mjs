@@ -222,7 +222,7 @@ test("DynamoDB journal enforces immutable identity and phase/version conditional
   assert.equal(after.version,1);
   assert.equal(after.phase,"fenced");
   assert.match(writes[1].input.ConditionExpression,/#version = :oldVersion/);
-  assert.match(writes[1].input.ConditionExpression,/targetId = :target/);
+  assert.match(writes[1].input.ConditionExpression,/#target = :target/);
   assert.equal(writes[1].input.ExpressionAttributeValues[":oldVersion"],0);
   await assert.rejects(journal.advance(operation,"succeeded","skipped"),/Invalid guarded orphan transition/);
   const review=await journal.requireReview(after,"state conflict");
