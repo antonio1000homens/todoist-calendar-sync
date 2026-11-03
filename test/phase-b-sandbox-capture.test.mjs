@@ -177,7 +177,7 @@ test("after requires an observed due-date advance and does not overwrite evidenc
   assert.equal(result.status, "captured");
   const manifest = f.getManifest();
   assert.equal(manifest.source.afterCompletion.due.date, dates[1]);
-  assert.deepEqual(f.calls.slice(-3), ["getTask", "getTask", "saveManifest"]);
+  assert.deepEqual(f.calls.slice(-3), ["readManifest", "getTask", "saveManifest"]);
   validateCaptureManifest(manifest, validateSandboxEnvironment(f.env), true);
   await assert.rejects(runCapture("after", args("after"), f.env, f.dependencies),
     /already exists/);
