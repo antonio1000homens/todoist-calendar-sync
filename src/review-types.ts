@@ -29,6 +29,8 @@ export interface RepairIntent {
 export interface ReviewSnapshot {
   ref: EntityRef; object: TodoistTask | CalendarEvent | null;
   checkedAt?: string;
+  /** Failed direct read or ownership check: never interpret as verified absence. */
+  lookupError?: string;
   /** Recorded path by which this provider identity entered the affected-item set. */
   includedBy?: string[];
   mapping?: Mapping; control?: Record<string, unknown>;
