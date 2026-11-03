@@ -52,6 +52,21 @@ function table():string {
 }
 const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
+const postwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
+const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
+function postwriteReviewEnabled():void {
+  if(process.env.ERASURE_POSTWRITE_REVIEW_VERSION!=="1")
+    throw Object.assign(new Error("Post-write review token feature is disabled; profile remains fenced"),{status:409});
+}
+function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
+  const {operation,preview,fingerprint}=inspection;
+  return digest({mode:"post_write",fingerprint,epoch:preview.epoch,profile:operation.profile,
+    originalUpdatedAt:operation.updatedAt,originalStatus:operation.status,
+    originalConfirmationId:operation.confirmationId,
+    originalPreviewFingerprint:operation.previewFingerprint,originalSelections:operation.selectedActions,
+    originalTargets:operation.target,originalActionPlan:operation.actionPlan,originalInventory:operation.inventory,
+    lifecycle:operation.lifecycle});
+}
 const profileKey=(profile:string,sk:string)=>({pk:"ERASURE#"+profile,sk});
 function digest(value:unknown):string {
   const canonical=(obj:unknown):unknown=>Array.isArray(obj)?obj.map(canonical)
@@ -196,11 +211,106 @@ export class ErasureRecoveryService {
     return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal)};
   }
 
-  /** Independent post-write inspection. Intentionally has no confirm/apply
-   * counterpart: release and partial deletion are not yet authorised. */
+  /** Post-write review is separate from the pre-write RESTORE SYNC executor.
+   * It can persist a fenced acknowledgement but NEVER queues or releases work. */
   async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
     const inspection=await this.inspect(id);
-    return assessPostWriteRecovery(inspection.operation,inspection.preview);
+    return {...assessPostWriteRecovery(inspection.operation,inspection.preview),
+      reviewEnabled:process.env.ERASURE_POSTWRITE_REVIEW_VERSION==="1",
+      ...(inspection.operation.postwriteReview?.status==="reviewed_fenced"
+        ?{reviewStatus:"reviewed_fenced" as const}:{})};
+  }
+
+  private async inspectPostWriteCandidate(id:string) {
+    const inspection=await this.inspect(id);
+    const assessment=assessPostWriteRecovery(inspection.operation,inspection.preview);
+    if(assessment.classification!=="fully_deleted_candidate"||!inspection.preview.epoch
+      ||inspection.operation.recovery||inspection.operation.postwriteReview)
+      throw Object.assign(new Error("Post-write review requires fresh, fully deleted candidate evidence; keep fence"),{status:409});
+    return {inspection,assessment,postflightFingerprint:postwriteEvidenceDigest(inspection)};
+  }
+
+  /** Create a NEW short-lived post-write token; an erasure or pre-write
+   * confirmation cannot be reused. This does not authorise provider writes. */
+  async issuePostWriteReviewToken(id:string,operator:string):Promise<{
+    confirmationId:string;expiresAt:number;operationId:string;profile:string;releaseAllowed:false;
+  }> {
+    postwriteReviewEnabled();
+    if(!operator||operator.length>256)throw Object.assign(new Error("Invalid operator identity"),{status:400});
+    const {inspection,postflightFingerprint}=await this.inspectPostWriteCandidate(id);
+    const confirmationId=this.newToken(),now=Date.now(),expiresAt=now+5*60_000;
+    await this.db.send(new PutCommand({TableName:table(),Item:{
+      ...postwriteReviewTokenKey(id),operationId:id,profile:inspection.operation.profile,
+      mode:"post_write",status:"issued",operator,confirmationId,
+      inspectedFingerprint:inspection.fingerprint,postflightFingerprint,
+      originalPreviewFingerprint:inspection.operation.previewFingerprint,epoch:inspection.preview.epoch,
+      expiresAt:Math.ceil(expiresAt/1000),expiresAtMs:expiresAt,createdAt:new Date(now).toISOString(),
+    },ConditionExpression:"attribute_not_exists(pk) OR (#status=:issued AND expiresAtMs<=:now)",
+      ExpressionAttributeNames:{"#status":"status"},
+      ExpressionAttributeValues:{":issued":"issued",":now":now}}));
+    return {confirmationId,expiresAt,operationId:id,profile:inspection.operation.profile,releaseAllowed:false};
+  }
+
+  /** Atomically consume one bound token and journal a *fenced-only* operator
+   * acknowledgement. No worker, provider, mapping, marker or profile changes. */
+  async acknowledgePostWriteReview(id:string,confirmationId:string,operator:string,
+    typed:{operationId:string;profile:string;phrase:string}):Promise<{status:"reviewed_fenced";releaseAllowed:false}> {
+    postwriteReviewEnabled();
+    if(!idPattern.test(id)||!uuid.test(confirmationId)||!operator||operator.length>256
+      ||typed?.operationId!==id||typed?.profile===undefined
+      ||typed.phrase!==postwriteReviewPhrase)
+      throw Object.assign(new Error("Exact typed REVIEW AND KEEP FENCED, operation and confirmation are required"),{status:400});
+    const issued=(await this.db.send(new GetCommand({
+      TableName:table(),Key:postwriteReviewTokenKey(id),ConsistentRead:true}))).Item;
+    if(!issued||issued.status!=="issued"||issued.mode!=="post_write"
+      ||issued.operator!==operator||issued.operationId!==id||issued.profile!==typed.profile
+      ||issued.confirmationId!==confirmationId||issued.expiresAtMs<=Date.now())
+      throw Object.assign(new Error("Post-write review token expired, consumed or changed"),{status:409});
+    const {inspection,postflightFingerprint}=await this.inspectPostWriteCandidate(id);
+    const {operation,preview,fingerprint,hasJournal}=inspection;
+    if(operation.profile!==typed.profile||fingerprint!==issued.inspectedFingerprint
+      ||postflightFingerprint!==issued.postflightFingerprint
+      ||issued.originalPreviewFingerprint!==operation.previewFingerprint
+      ||issued.epoch!==preview.epoch)
+      throw Object.assign(new Error("Post-write provider or fence evidence drifted; obtain a new preview"),{status:409});
+    const now=Date.now(),time=new Date(now).toISOString();
+    const reviewed={
+      mode:"post_write" as const,status:"reviewed_fenced" as const,epoch:preview.epoch!,
+      confirmationId,inspectedFingerprint:fingerprint,postflightFingerprint,reviewedAt:time,
+    };
+    const transactions:any[]=[
+      {Update:{TableName:table(),Key:operationKey(id),
+        UpdateExpression:"SET postwriteReview=:review, updatedAt=:now",
+        ConditionExpression:"#status=:required AND attribute_not_exists(postwriteReview) AND attribute_not_exists(recovery) AND previewFingerprint=:original AND updatedAt=:updated AND lifecycle.#phase=:phase",
+        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},
+        ExpressionAttributeValues:{":required":"review_required",":review":reviewed,":now":time,
+          ":original":operation.previewFingerprint,":updated":operation.updatedAt,":phase":operation.lifecycle!.phase}}},
+      {Update:{TableName:table(),Key:postwriteReviewTokenKey(id),
+        UpdateExpression:"SET #status=:consumed, consumedAt=:now REMOVE #ttl, expiresAtMs, #operator",
+        ConditionExpression:"#status=:issued AND mode=:mode AND #operator=:operator AND operationId=:id AND confirmationId=:token AND inspectedFingerprint=:fingerprint AND postflightFingerprint=:postflight AND originalPreviewFingerprint=:original AND epoch=:epoch AND expiresAtMs>:time",
+        ExpressionAttributeNames:{"#status":"status","#ttl":"expiresAt","#operator":"operator"},
+        ExpressionAttributeValues:{":issued":"issued",":consumed":"consumed",":mode":"post_write",
+          ":operator":operator,":id":id,":token":confirmationId,":fingerprint":fingerprint,
+          ":postflight":postflightFingerprint,":original":operation.previewFingerprint,
+          ":epoch":preview.epoch,":time":now,":now":time}}},
+      {ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"FENCE"),
+        ConditionExpression:"operationId=:id AND #state=:active",
+        ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
+      {ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"EPOCH"),
+        ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":preview.epoch}}},
+    ];
+    if(hasJournal)transactions.push({ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"JOURNAL"),
+      ConditionExpression:"operationId=:id",ExpressionAttributeValues:{":id":id}}});
+    else transactions.push({ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"JOURNAL"),
+      ConditionExpression:"attribute_not_exists(pk)"}});
+    try {await this.db.send(new TransactWriteCommand({TransactItems:transactions}));}
+    catch(error) {
+      if((error as {name?:string})?.name==="TransactionCanceledException"
+        ||(error as {name?:string})?.name==="ConditionalCheckFailedException")
+        throw Object.assign(new Error("Post-write review state changed; no recovery or fence release occurred"),{status:409});
+      throw error;
+    }
+    return {status:"reviewed_fenced",releaseAllowed:false};
   }
 
   async issueConfirmation(id:string,operator:string):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number}> {

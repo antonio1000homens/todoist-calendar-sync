@@ -174,3 +174,18 @@ test retries/restarts and require a future-only rollback/quarantine plan.
 
 **Deployment boundary:** the collector is not invoked by the production
 synchronizer. All unverified Phase B schedules continue rolling.
+
+## Phase B operator-only sandbox evidence capture
+
+The manual [Phase B sandbox capture guide](phase-b-sandbox-capture.md) and
+`scripts/phase-b-sandbox-capture.mjs` close the evidence-capture gap left by
+PR #300: an operator can record original Todoist due readback, manually
+complete a task in an isolated project, record the advanced due and then
+independently re-read Calendar master, instances and exceptions. All provider
+operations performed by the script are GETs; no production worker uses it.
+
+The manifest's original-anchor provenance note and manual-completion
+observation are operator attestations, *not* provider-authenticated proof.
+Even a reported `native_exact` is a read-only diagnostic and cannot be
+used to enable automatic native writes. Further live fixture results,
+per-family acceptance, idempotent native mutation and rollback still remain.
