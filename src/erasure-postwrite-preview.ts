@@ -13,6 +13,7 @@ export interface PostWriteRecoveryAssessment {
   profile:ErasureOperation["profile"];
   classification:PostWriteClassification;
   releaseAllowed:false;
+  reviewStatus?:"reviewed_fenced";
   onlyAvailableAction:"keep_fenced";
   potentialDisposition:"independent_full_deletion_verification"|"new_reviewed_deletion_authorization"|"use_pre_write_recovery";
   blockers:string[];
@@ -73,7 +74,7 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
     blockers.push("Partial or unverified deletion requires a NEW independently reviewed authorization and action-time version checks");
   // Even a perfect snapshot does not prove source/alias completeness, old
   // qualified consumer safety, or the immutable marker/fence transaction.
-  blockers.push("Complete replay-barrier rollout, alias and old-Lambda coverage, single-use post-write confirmation and verified atomic release are not yet accepted");
+  blockers.push("Complete replay-barrier rollout, alias and old-Lambda coverage, executable post-write authorisation and verified atomic release are not yet accepted");
   blockers.push("Disposable Work-profile staging and independent security/privacy review remain required");
   const potentialDisposition=classification==="not_post_write"?"use_pre_write_recovery":
     classification==="fully_deleted_candidate"?"independent_full_deletion_verification":
