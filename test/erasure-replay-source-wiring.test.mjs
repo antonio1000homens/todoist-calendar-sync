@@ -30,17 +30,17 @@ test("all production Todoist creation entrypoints carry explicit Calendar source
           if(method==="createTaskOnce"){
             assert.ok(args.length>=3,`Todoist idempotent creation lacks source identity: ${context}`);
             const sourceArg=args[2].getText(parsed);
-            assert.match(sourceArg,/calendarReplaySourceIds\\(|args\\[2\\]/,
+            assert.match(sourceArg,/calendarReplaySourceIds\(|args\[2\]/,
               `Todoist idempotent creation has unverified provenance: ${context}`);
             checked.push(context);
           } else {
             const target=args[1]?.getText(parsed);
             // Known task IDs are safe for updates. Missing/optional task IDs
             // might invoke POST /tasks and therefore MUST supply event aliases.
-            const canCreate=!target || /\\?\\.|\\bundefined\\b|\\bnull\\b/.test(target);
+            const canCreate=!target || /\?\.|\bundefined\b|\bnull\b/.test(target);
             if(canCreate){
               assert.ok(args.length>=3,`Todoist creation lacks source identity: ${context}`);
-              assert.match(args[2].getText(parsed),/calendarReplaySourceIds\\(/,
+              assert.match(args[2].getText(parsed),/calendarReplaySourceIds\(/,
                 `Todoist creation has unverified Calendar provenance: ${context}`);
               checked.push(context);
             }
