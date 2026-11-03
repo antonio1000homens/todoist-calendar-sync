@@ -88,8 +88,8 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
 
   // Reject erased identities before they can be re-admitted into durable SQS,
   // even if this is a newly signed webhook arriving long after fence release.
-  // The admission lease/epoch in enqueueDelivery still serialises races with
-  // a concurrent fence installation after this read.
+  // enqueueDelivery independently rechecks the marker under its admission
+  // lease, covering a fence/marker installed after this fast-path read.
   if(kind==="todoist"&&replayAdmissionEnabled()) {
     let taskId:string|undefined;
     try {
@@ -140,6 +140,12 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
   try {
     await enqueueDelivery(delivery);
   } catch (error) {
+    // The erased marker may have appeared between the initial ingress read
+    // and the lease-protected pre-send recheck. Acknowledge but never enqueue.
+    if (error instanceof ErasureReplayBlockedError) {
+      log("erased_webhook_suppressed", { kind, profile });
+      return response(202, { accepted: true, suppressed: true });
+    }
     logError("webhook_enqueue_failed", error, { deliveryId: id, kind, profile });
     // Provider webhooks retry non-2xx responses. Returning an explicit 503 also
     // avoids relying on Lambda URL's translation of an uncaught exception.
