@@ -251,6 +251,19 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
 
+    // Post-write assessment is strictly read-only. There is no POST route and
+    // no way to turn its candidate classification into a recovery token,
+    // mapping write, provider delete, or fence release.
+    if(segments[0]==="erasure-postwrite-recoveries") {
+      if(method!=="GET"||segments.length!==2||!segments[1])
+        return response(404,{error:"not_found"});
+      const assessment=await recoveryService().inspectPostWrite(segments[1]);
+      console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
+        event:"postwrite_recovery_evidence_inspected",operationId:segments[1],
+        classification:assessment.classification,blockerCount:assessment.blockers.length}));
+      return response(200,{assessment});
+    }
+
     // Break-glass recovery is intentionally disjoint from erasure submission:
     // it cannot acquire a profile write lease while the erasure fence is active.
     if(segments[0]==="erasure-recoveries"&&segments[1]&&[2,3].includes(segments.length)) {

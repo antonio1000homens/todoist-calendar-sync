@@ -112,6 +112,66 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(external.writes.length,0);
 });
 
+test("independent post-write preview never issues a confirmation, writes state, or releases a fence",async()=>{
+  const {service,external}=fixture({paginated:true});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"not_post_write");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.onlyAvailableAction,"keep_fenced");
+  assert.equal(assessment.evidence.originalProviderWriteIndicated,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(external.providerCalls,1);
+  assert.equal(external.writes.length,0);
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("strong exact postflight is a read-only candidate only with an original deletion receipt",async()=>{
+  const f=fixture();
+  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
+    comments:[],
+  };
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.lifecycle.phase="verify_deletion";
+  f.operation.lifecycle.evidence.deletionStarted={
+    operationId:"op-recovery",phase:"deletionStarted",
+    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
+  };
+  const snapshot={
+    operationId:"op-recovery",profile:"work",target:f.operation.target,
+    selectedActions:f.operation.selectedActions,inventory:[],
+    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+  };
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  const assessment=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"fully_deleted_candidate");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(f.external.writes.length,0);
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  // A stale or malformed fingerprint must not count as fully verified absence.
+  snapshot.previewFingerprint="0".repeat(64);
+  const unsafe=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(unsafe.classification,"partial_or_ambiguous");
+  assert.equal(unsafe.releaseAllowed,false);
+  assert.equal(f.external.writes.length,0);
+});
+
+test("post-write inspection with an active lease exposes a blocker but never changes controls",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"ADMISSION#stale",owner:"stale"});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.evidence.leasesDrained,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(external.writes.length,0);
+});
+
 test("distinct single-use confirmation and CAS restore only the originally enabled mapping",async()=>{
   const {service,operation,external}=fixture();
   const issued=await service.issueConfirmation("op-recovery","operator-1");
