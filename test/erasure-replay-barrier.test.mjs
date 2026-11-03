@@ -88,6 +88,17 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_OPERATION#")
     &&x.Delete.ConditionExpression.includes("recovery.mode=:mode")
     &&x.Delete.ConditionExpression.includes("recovery.postflightFingerprint=:postflight")));
+  // Every action's value map must match its own condition exactly. DynamoDB
+  // rejects unused values (even if used by a neighbouring transaction action).
+  for (const action of tx) {
+    const entry=action.Put||action.Delete||action.ConditionCheck||action.Update;
+    const expressions=[entry.ConditionExpression,entry.UpdateExpression,
+      entry.FilterExpression].filter(Boolean).join(" ");
+    const referenced=[...new Set(expressions.match(/:[A-Za-z][A-Za-z0-9_]*/g)||[])].sort();
+    const provided=Object.keys(entry.ExpressionAttributeValues||{}).sort();
+    assert.deepEqual(provided,referenced,
+      `Unused or missing DynamoDB placeholders for ${JSON.stringify(entry.Key||entry.Item)}`);
+  }
   const serialized=JSON.stringify(markers);
   assert.ok(!serialized.includes("deleted-task")&&!serialized.includes("deleted-event")
     &&!serialized.includes("deleted-alias")&&!serialized.includes("operator-operation-id"));
