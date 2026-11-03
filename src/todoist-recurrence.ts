@@ -119,6 +119,36 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
     return frequency ? `RRULE:FREQ=${frequency};INTERVAL=${count}` : undefined;
   }
 
+  // A monthly ordinal is a calendar position, never a 28-day interval.
+  // Fifth weekdays occur only in some months; the recurrence must skip the rest.
+  const ordinal = value.match(/^every\s+(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last)\s+([a-z]+)(?:\s+of\s+(?:the\s+)?month)?$/);
+  if (ordinal) {
+    const position = ordinal[1] === "last" ? -1
+      : ["1st", "2nd", "3rd", "4th", "5th"].indexOf(ordinal[1]) >= 0
+        ? ["1st", "2nd", "3rd", "4th", "5th"].indexOf(ordinal[1]) + 1
+        : ["first", "second", "third", "fourth", "fifth"].indexOf(ordinal[1]) + 1;
+    const weekday = weekdays[ordinal[2]];
+    if (!weekday || !["MO", "TU", "WE", "TH", "FR"].includes(weekday)) return undefined;
+    const dueValue = task.due?.date || task.due?.datetime;
+    // Offset timestamps must be resolved to the provider's verified local day.
+    // A UTC date can differ from the ordinal weekday in the user's timezone.
+    const date = dueValue
+      ? hasOffset(dueValue) ? task.due?.timezone
+        ? localDateTime(dueValue, task.due.timezone).slice(0, 10) : undefined
+        : dueValue.slice(0, 10)
+      : undefined;
+    const match = date?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return undefined;
+    const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+    const current = new Date(Date.UTC(year, month - 1, day));
+    const weekdayIndex = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].indexOf(weekday);
+    if (current.getUTCFullYear() !== year || current.getUTCMonth() !== month - 1
+      || current.getUTCDate() !== day || current.getUTCDay() !== weekdayIndex
+      || (position === -1 ? day + 7 <= new Date(Date.UTC(year, month, 0)).getUTCDate()
+        : Math.floor((day - 1) / 7) + 1 !== position)) return undefined;
+    return `RRULE:FREQ=MONTHLY;BYDAY=${position}${weekday}`;
+  }
+
   const dayExpression = value.match(/^every\s+(.+)$/)?.[1];
   if (dayExpression) {
     const tokens = dayExpression

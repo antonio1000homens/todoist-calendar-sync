@@ -31,7 +31,7 @@ The service includes:
 - FIFO ordering and durable completion markers;
 - Calendar incremental sync-token recovery;
 - Todoist and Calendar recurrence handling;
-  - Calendar-owned finite weekly COUNT rules create one recurring Todoist task when provider readback verifies the inclusive end. Simple indefinite weekly (one weekday), monthly (day 1–28) and yearly (fixed date except 29 February) rules also create one recurring Todoist task. Calendar remains the recurrence authority.
+  - Calendar-owned finite weekly COUNT rules create one recurring Todoist task when provider readback verifies the inclusive end. Simple indefinite weekly (one weekday), monthly (day 1–28, or first–fifth Monday–Friday / last weekday) and yearly (fixed date except 29 February) rules also create one recurring Todoist task. Monthly ordinal conversion distinguishes the fourth weekday from the last weekday; a fifth weekday skips months where it does not exist. Provider due-date, wall-time, timezone and recurrence semantics are verified before adopting a native mirror. Calendar remains the recurrence authority.
   - Unsupported Calendar RRULEs (complex BYDAY, unsupported intervals/termination, or invalid/ambiguous provider data) use the guarded single-active-occurrence mirror rather than a misleading recurrence. Matching Calendar/Todoist timezones are required before native conversion.
   - On task completion, the current Calendar occurrence is retained for history; the mapping advances to the next live Calendar occurrence. Cancelled occurrences are skipped. The native task ID is preserved when readback and ownership verification permit.
   - A Calendar-owned recurring task supports **title and description edits from either app**. The worker compares each field with the last mirrored metadata snapshot, then applies a metadata-only Todoist update or a conditional PATCH to the Calendar **master**. Recurrence ownership is retained; genuine user edits are not suppressed merely because a webhook originates in Todoist.
@@ -43,7 +43,7 @@ The service includes:
 - conservative reconciliation mutation budgets;
 - circuit breakers for mutation storms;
 - DynamoDB deletion protection and point-in-time recovery;
-- a FIFO dead-letter queue with operational logging/alarms;
+- a FIFO dead-letter queue with operational logging and Grafana visibility; CloudWatch alarms remain for worker errors, watch Lambda errors, and table/GSI throttles;
 - optional Slack-backed manual intervention for decisions that are unsafe to guess.
 
 Provider credentials and webhook secrets are never stored in this repository.
@@ -230,6 +230,8 @@ For manual intervention behavior see [`MANUAL-INTERVENTION.md`](MANUAL-INTERVENT
 For project-comment migration behavior see [`PROJECT-COMMENT-MIGRATION.md`](PROJECT-COMMENT-MIGRATION.md).
 
 For DynamoDB capacity decisions see [`PROVISIONED-CAPACITY-PLAN.md`](PROVISIONED-CAPACITY-PLAN.md).
+
+For a read-only account cost/budget check, run `npm run cost:audit` (no Cost Explorer requests by default). An explicit `--include-cost-explorer` option makes two potentially billable account-wide queries. The [monthly cost audit guide](docs/monthly-cost-audit.md) describes budget enablement, S3 attribution limits, and the safe post-release checklist.
 
 A worker failure emits a structured `delivery_failed_for_dlq` record before the failed SQS message is quarantined. Search CloudWatch by SQS message ID or delivery ID when diagnosing DLQ items.
 

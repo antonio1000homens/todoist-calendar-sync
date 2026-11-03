@@ -166,9 +166,11 @@ test("UI requests only the selected case and keeps failed detail panels out of r
 test("reconciliation status polling starts slowly and backs off under repeated 429s",()=>{
   assert.deepEqual([0,1,2,3,4,5,8].map(reconciliationPollDelayMs),[5000,10000,20000,40000,60000,60000,60000]);
   const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
-  assert.match(source,/if\(terminal\|\|!data\.reconciliation\?\.pending\)[\s\S]*?setTerminalInboxRefreshPending\(true\)/);
+  assert.match(source,/if\(\["succeeded","needs_review","failed"\]\.includes\(status\)\|\|!data\.reconciliation\?\.pending\)[\s\S]*?setTerminalInboxRefreshPending\(true\)/);
   assert.match(source,/createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
   assert.doesNotMatch(source,/else timer=window\.setTimeout\(poll,1500\)/);
+  assert.match(source,/if\(options\.quiet&&previous\?\.data\)/,
+    "transient polling errors must preserve the current run for backoff and retry");
 });
 
 test("terminal inbox refresh retries independently after a failed refresh", async () => {

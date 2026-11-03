@@ -133,13 +133,12 @@ test("administrative migration paths retry throttling and document their full-ta
   assert.match(rolloutDocs, /batches of 5/);
 });
 
-test("ProfileLookupIndex has independent capacity headroom and GSI-dimensioned alarms", () => {
-  assert.match(template, /ProfileLookupIndexReadCapacity:[\s\S]*?Default:\s*10/);
-  assert.match(template, /ProfileLookupIndexWriteCapacity:[\s\S]*?Default:\s*10/);
+test("ProfileLookupIndex has independent capacity headroom and GSI-dimensioned throttle alarms", () => {
+  assert.match(template, /ProfileLookupIndexReadCapacity:[\s\S]*?Default:\s*5/);
+  assert.match(template, /ProfileLookupIndexWriteCapacity:[\s\S]*?Default:\s*5/);
   assert.match(template, /ProfileLookupIndexReadThrottleAlarm:/);
   assert.match(template, /ProfileLookupIndexWriteThrottleAlarm:/);
-  assert.match(template, /ProfileLookupIndexReadUtilizationAlarm:/);
-  assert.match(template, /ProfileLookupIndexWriteUtilizationAlarm:/);
-  assert.equal((template.match(/Name:\s*GlobalSecondaryIndexName/g) || []).length >= 6, true);
+  assert.doesNotMatch(template, /ProfileLookupIndex(?:Read|Write)UtilizationAlarm:/);
+  assert.equal((template.match(/Name:\s*GlobalSecondaryIndexName/g) || []).length >= 2, true);
   assert.match(template, /Value:\s*ProfileLookupIndex/);
 });

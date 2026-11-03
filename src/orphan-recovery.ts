@@ -10,7 +10,7 @@ import {
 import { defaultProviderClientFactory, type ProviderClientFactory, type ProviderClients } from "./mutation-budget.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { StateRepository } from "./repository.js";
-import { todoistCalendarLifecycle } from "./sync.js";
+import { ignorableElapsedStandaloneCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => Promise<void>;
@@ -104,7 +104,11 @@ export class OrphanRecoveringSynchronizer {
     for (const event of matching) {
       if (await this.state.syncBlocked(profile, { eventId: event.id })) continue;
       const existing = await this.state.getMappingByEvent(profile, event.id);
-      if (!existing) eligible.push(event);
+      // Completed events have no active mapping by design. An orphan identity
+      // match must never turn one into a mapping for a newly created task,
+      // including after the COMPLETED_TASK lookup has been retired.
+      const completed = await this.state.getCompletedCalendarProjectionByEvent?.(profile, event.id);
+      if (!existing && !completed) eligible.push(event);
     }
     return eligible;
   }
@@ -158,14 +162,36 @@ export class OrphanRecoveringSynchronizer {
 
     let tasks: TodoistTask[] | undefined;
     const blockedEventIds = new Set<string>();
+    const ignoredHistoryEventIds = new Set<string>();
+    const now = Date.now();
+    let calendarTimeZone: string | undefined;
 
     for (const event of delta.items) {
+      // The delegated synchronizer will still receive this delta and advance
+      // its sync cursor; only skip orphan/identity lookups for proven history.
+      if (event.extendedProperties?.shared?.syncHistoryOnly === "true") {
+        ignoredHistoryEventIds.add(event.id);
+        continue;
+      }
+      if (event.status === "confirmed" && !event.recurringEventId && !event.recurrence?.length
+          && event.end?.date && !event.end.dateTime && !calendarTimeZone && clients.calendar.getTimeZone) {
+        try { calendarTimeZone = await clients.calendar.getTimeZone(); }
+        catch { /* Missing timezone must fail open into ordinary ownership checks. */ }
+      }
+      if (ignorableElapsedStandaloneCalendarEvent(event, now, calendarTimeZone)) {
+        ignoredHistoryEventIds.add(event.id);
+        continue;
+      }
       const currentMapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (await this.state.syncBlocked(delivery.profile, { eventId: event.id, taskId: currentMapping?.taskId || event.extendedProperties?.shared?.taskId })) {
         blockedEventIds.add(event.id);
         continue;
       }
       if (!standaloneCalendarSource(event)) continue;
+      // No amount of title/date similarity can reassign a completed event.
+      // The permanent event-keyed completion guard survives cleanup of its
+      // task-keyed lookup after seven days.
+      if (await this.state.getCompletedCalendarProjectionByEvent?.(delivery.profile, event.id)) continue;
       const mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (mapping) {
         await this.seedCalendarIdentityFromMappedTask(delivery.profile, event, mapping, clients);
@@ -248,7 +274,7 @@ export class OrphanRecoveringSynchronizer {
     await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, filteredClients).process(delivery);
 
     for (const event of delta.items) {
-      if (blockedEventIds.has(event.id)) continue;
+      if (blockedEventIds.has(event.id) || ignoredHistoryEventIds.has(event.id)) continue;
       await this.rememberCalendarResult(delivery.profile, event, clients);
     }
   }
@@ -324,6 +350,15 @@ export class OrphanRecoveringSynchronizer {
     } else if (standaloneTodoistCandidate(task)) {
       const exact = await clients.calendar.findByTodoistTaskId(task.id);
       if (exact?.status !== "cancelled" && exact) {
+        // Provider breadcrumbs remain after a completion, but they do not
+        // authorise restoring its retired active mapping. Completion and
+        // uncompletion do not mutate Calendar, even for the same task ID.
+        if (await this.state.getCompletedCalendarProjectionByEvent?.(targetProfile, exact.id)) {
+          await this.state.audit(targetProfile, "todoist_completed_calendar_identity_not_rebound", {
+            taskId: task.id, eventId: exact.id,
+          });
+          return;
+        }
         if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: exact.id })) return;
         mapping = {
           profile: targetProfile,
@@ -337,7 +372,10 @@ export class OrphanRecoveringSynchronizer {
           taskId: task.id,
           eventId: exact.id,
         });
-      } else if (!exact) {
+      } else if (!exact && payload.event_name !== "item:added") {
+        // An explicitly newly created Todoist task gets a new Calendar event.
+        // Canonical title/date recovery is only a repair for an existing task;
+        // it cannot substitute an unrelated old event for this new task ID.
         const snapshot = await clients.calendar.listDelta();
         const currentIdentity = todoistCanonicalIdentity(task)!;
         const currentMatches = await this.eligibleCalendarMatches(targetProfile, snapshot.items, currentIdentity);

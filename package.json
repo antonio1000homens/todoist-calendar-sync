@@ -16,18 +16,21 @@
     "seed:review-inbox": "npm run build --silent && node scripts/seed-review-inbox.mjs",
     "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",
     "state:inspect": "npm run build --silent && node scripts/audit-state-retention.mjs",
+    "state:audit-deleted-recurrences": "npm run build --silent && node scripts/audit-deleted-recurrences.mjs",
     "state:cleanup-completed": "npm run build --silent && node scripts/cleanup-terminal-completions.mjs",
     "state:cleanup-completed-comment": "npm run build --silent && node scripts/cleanup-completed-project-comment.mjs",
     "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
-    "check:public": "bash scripts/check-public-source.sh"
+    "check:public": "bash scripts/check-public-source.sh",
+    "check:capacity": "node scripts/check-dynamodb-capacity.mjs",
+    "cost:audit": "node scripts/monthly-cost-audit.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1156.0",
     "@aws-sdk/client-lambda": "^3.1156.0",
-    "@aws-sdk/client-sqs": "^3.1156.0",
+    "@aws-sdk/client-sqs": "^3.1160.0",
     "@aws-sdk/client-ssm": "^3.1156.0",
-    "@aws-sdk/lib-dynamodb": "^3.1156.0",
-    "jose": "^6.2.13",
+    "@aws-sdk/lib-dynamodb": "^3.1160.0",
+    "jose": "^6.2.14",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
@@ -38,6 +41,6 @@
     "@types/react-dom": "^19.3.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
-    "wrangler": "^4.152.0"
+    "wrangler": "^4.156.0"
   }
 }

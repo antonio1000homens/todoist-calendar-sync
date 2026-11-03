@@ -70,14 +70,14 @@ Parameters:
     Description: Enable transactional seven-day COMPLETED_TASK retirement only after an operator-reviewed dry run.
   StateTableReadCapacity:
     Type: Number
-    Default: 25
+    Default: 20
     MinValue: 1
-    Description: Fixed DynamoDB read capacity. This stack does not configure Application Auto Scaling.
+    Description: Fixed main-table read capacity; total with all provisioned GSIs must stay within the shared 25 RCU budget by default.
   StateTableWriteCapacity:
     Type: Number
-    Default: 25
+    Default: 20
     MinValue: 1
-    Description: Fixed DynamoDB write capacity. This stack does not configure Application Auto Scaling.
+    Description: Fixed main-table write capacity; total with all provisioned GSIs must stay within the shared 25 WCU budget by default.
   DynamoDbScanRcuBudgetPerSecond:
     Type: Number
     Default: 10
@@ -95,14 +95,14 @@ Parameters:
     Description: Maximum mapped/unmapped Todoist candidates processed by one reconciliation chunk.
   ProfileLookupIndexReadCapacity:
     Type: Number
-    Default: 10
+    Default: 5
     MinValue: 1
-    Description: Provisioned read capacity for profile-scoped mapping and recurrence lookups; GSI-specific alarms monitor throttling/utilization.
+    Description: Provisioned profile-lookup read capacity; combined main-table and index RCU must stay within the shared 25 RCU budget by default.
   ProfileLookupIndexWriteCapacity:
     Type: Number
-    Default: 10
+    Default: 5
     MinValue: 1
-    Description: Provisioned write capacity for profile-scoped lookup rows; one mapping write projects three records into this GSI.
+    Description: Provisioned profile-lookup write capacity; mapping transactions project multiple index rows, so monitor GSI write throttles.
   BillingAlarmEmail:
     Type: String
     Default: ""
@@ -112,6 +112,9 @@ Parameters:
 
 Conditions:
   HasBillingAlarmEmail: !Not [!Equals [!Ref BillingAlarmEmail, ""]]
+  # The disabled cleanup apply flag must not drive an endless daily scan.
+  # Operators can still invoke the separate dry-run CLI on demand.
+  RunCompletedHistoryCleanup: !Equals [!Ref CompletedHistoryCleanupApply, "true"]
 
 Globals:
   Function:
@@ -188,7 +191,8 @@ Resources:
       QueueName: !Sub ${ResourceNamePrefix}-dlq-${Stage}.fifo
       FifoQueue: true
       ContentBasedDeduplication: false
-      MessageRetentionPeriod: 86400
+      # The operator has two weeks to diagnose/replay a quarantined message.
+      MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
 
   SyncQueue:
@@ -200,13 +204,18 @@ Resources:
       # Reconciliation can scan the durable state table under the configured
       # RCU budget. Keep the queue lease comfortably above the worker timeout
       # so a slow scan cannot become a duplicate delivery.
+      # Transient DynamoDB failures shorten visibility with bounded backoff
+      # and are retried IN PLACE, preserving their per-profile FIFO sequence.
       VisibilityTimeout: 900
       MessageRetentionPeriod: 345600
       ReceiveMessageWaitTimeSeconds: 20
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDlq.Arn
-        maxReceiveCount: 1
+        # SDK attempts (5) are inside each Lambda receive; the worker permits
+        # native retries only for eligible transient DynamoDB failures.
+        # Other failures are handed directly to SyncDlq after a confirmed send.
+        maxReceiveCount: 5
 
   ErasureOperationDlq:
     Type: AWS::SQS::Queue
@@ -429,9 +438,16 @@ Resources:
           TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: !Ref TodoistCalendarSyncSlackChannel
           SLACK_BOT_TOKEN_PARAMETER: !Ref SlackBotTokenParameter
           DLQ_URL: !Ref SyncDlq
+          SYNC_QUEUE_URL: !Ref SyncQueue
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt SyncQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SyncDlq.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: sqs:ChangeMessageVisibility
+              Resource: !GetAtt SyncQueue.Arn
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
         - Statement:
@@ -587,14 +603,6 @@ Resources:
             - Effect: Allow
               Action: dynamodb:TransactWriteItems
               Resource: !GetAtt SyncState.Arn
-      Events:
-        DailyCompletedHistoryReview:
-          Type: Schedule
-          Properties:
-            Schedule: rate(1 day)
-            Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
-            Description: Bounded cursor-based completed-task history maintenance; read-only until explicitly enabled.
-            Enabled: true
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -602,6 +610,28 @@ Resources:
         Format: cjs
         Target: es2022
         Minify: true
+
+  # Use the pre-existing SAM-generated logical IDs so CloudFormation updates
+  # the existing rule/permission in place. SAM's Schedule.Enabled does not
+  # reliably preserve the Fn::If expression in its transformed EventBridge rule.
+  CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ResourceNamePrefix}-completed-cleanup-${Stage}
+      Description: Guarded completed-task retirement, active only while explicitly opted in.
+      ScheduleExpression: rate(1 day)
+      State: !If [RunCompletedHistoryCleanup, ENABLED, DISABLED]
+      Targets:
+        - Arn: !GetAtt CompletedHistoryCleanupFunction.Arn
+          Id: CompletedHistoryCleanupFunctionDailyCompletedHistoryLambdaTarget
+
+  CompletedHistoryCleanupFunctionDailyCompletedHistoryReviewPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CompletedHistoryCleanupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CompletedHistoryCleanupFunctionDailyCompletedHistoryReview.Arn
 
   WatchFunction:
     Type: AWS::Serverless::Function
@@ -646,21 +676,6 @@ Resources:
           MetricValue: "1"
           DefaultValue: 0
 
-  WatchRenewalFailureAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-watch-renewal-failures-${Stage}
-      AlarmDescription: A Google Calendar watch replacement failed; inspect the watch Lambda logs and verify the previous watch.
-      Namespace: TodoistCalendarSync/Watch
-      MetricName: RenewalFailures
-      Statistic: Sum
-      Period: 900
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
   WatchMissingMetricFilter:
     Type: AWS::Logs::MetricFilter
     DependsOn: WatchLogGroup
@@ -672,21 +687,6 @@ Resources:
           MetricName: MissingWatches
           MetricValue: "1"
           DefaultValue: 0
-
-  WatchMissingAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-watch-missing-${Stage}
-      AlarmDescription: The watch lifecycle check found a profile without persisted Calendar watch state.
-      Namespace: TodoistCalendarSync/Watch
-      MetricName: MissingWatches
-      Statistic: Sum
-      Period: 900
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
 
   WatchLambdaErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -700,42 +700,6 @@ Resources:
           Value: !Ref WatchFunction
       Statistic: Sum
       Period: 900
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  DlqAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-dlq-not-empty-${Stage}
-      AlarmDescription: A todoist-calendar-sync delivery was quarantined; inspect worker delivery_failed_for_dlq log using the delivery/message id.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncDlq.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ErasureDlqAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-dlq-not-empty-${Stage}
-      AlarmDescription: A guarded item-erasure operation failed repeatedly; preserve the fence and operation journal for recovery.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt ErasureOperationDlq.QueueName
-      Statistic: Maximum
-      Period: 300
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
@@ -781,73 +745,6 @@ Resources:
           MetricName: RecoveryBlocked
           MetricValue: "1"
           DefaultValue: 0
-
-  ErasureRecoveryBlockedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-recovery-blocked-${Stage}
-      AlarmDescription: Guarded erasure recovery stopped on drift; preserve the profile fence and inspect the durable operation.
-      Namespace: TodoistCalendarSync/Erasure
-      MetricName: RecoveryBlocked
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ErasureReviewRequiredAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-erasure-review-required-${Stage}
-      AlarmDescription: An item-erasure operation entered review_required; do not manually release a profile fence or mapping.
-      Namespace: TodoistCalendarSync/Erasure
-      MetricName: ReviewRequired
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  SourceQueueAgeAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-source-oldest-message-${Stage}
-      AlarmDescription: The source FIFO queue has a message older than five minutes.
-      Namespace: AWS/SQS
-      MetricName: ApproximateAgeOfOldestMessage
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncQueue.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 300
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  SourceQueueDepthAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-source-depth-${Stage}
-      AlarmDescription: More than 100 queued deliveries indicates sustained backpressure rather than a short absorbed burst.
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt SyncQueue.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 100
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
 
   WorkerErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -940,170 +837,6 @@ Resources:
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  DynamoDbReadUtilizationAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-dynamodb-read-utilization-${Stage}
-      AlarmDescription: Fixed provisioned read capacity has remained above 80 percent for two minutes; investigate backlog or raise the explicit capacity setting if this is steady-state demand.
-      Metrics:
-        - Id: consumed
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ConsumedReadCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-            Period: 60
-            Stat: Sum
-          ReturnData: false
-        - Id: provisioned
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ProvisionedReadCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-            Period: 60
-            Stat: Average
-          ReturnData: false
-        - Id: utilization
-          Expression: "100 * consumed / (provisioned * 60)"
-          Label: DynamoDB read capacity utilization
-          ReturnData: true
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 80
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  DynamoDbWriteUtilizationAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-dynamodb-write-utilization-${Stage}
-      AlarmDescription: Fixed provisioned write capacity has remained above 80 percent for two minutes; investigate backlog or raise the explicit capacity setting if this is steady-state demand.
-      Metrics:
-        - Id: consumed
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ConsumedWriteCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-            Period: 60
-            Stat: Sum
-          ReturnData: false
-        - Id: provisioned
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ProvisionedWriteCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-            Period: 60
-            Stat: Average
-          ReturnData: false
-        - Id: utilization
-          Expression: "100 * consumed / (provisioned * 60)"
-          Label: DynamoDB write capacity utilization
-          ReturnData: true
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 80
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ProfileLookupIndexReadUtilizationAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-read-utilization-${Stage}
-      AlarmDescription: ProfileLookupIndex read capacity has remained above 80 percent for two minutes.
-      Metrics:
-        - Id: consumed
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ConsumedReadCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-                - Name: GlobalSecondaryIndexName
-                  Value: ProfileLookupIndex
-            Period: 60
-            Stat: Sum
-          ReturnData: false
-        - Id: provisioned
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ProvisionedReadCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-                - Name: GlobalSecondaryIndexName
-                  Value: ProfileLookupIndex
-            Period: 60
-            Stat: Average
-          ReturnData: false
-        - Id: utilization
-          Expression: "100 * consumed / (provisioned * 60)"
-          Label: Profile lookup index read capacity utilization
-          ReturnData: true
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 80
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions: [!Ref AlertTopic]
-
-  ProfileLookupIndexWriteUtilizationAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub ${ResourceNamePrefix}-profile-lookup-write-utilization-${Stage}
-      AlarmDescription: ProfileLookupIndex write capacity has remained above 80 percent for two minutes.
-      Metrics:
-        - Id: consumed
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ConsumedWriteCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-                - Name: GlobalSecondaryIndexName
-                  Value: ProfileLookupIndex
-            Period: 60
-            Stat: Sum
-          ReturnData: false
-        - Id: provisioned
-          MetricStat:
-            Metric:
-              Namespace: AWS/DynamoDB
-              MetricName: ProvisionedWriteCapacityUnits
-              Dimensions:
-                - Name: TableName
-                  Value: !Ref SyncState
-                - Name: GlobalSecondaryIndexName
-                  Value: ProfileLookupIndex
-            Period: 60
-            Stat: Average
-          ReturnData: false
-        - Id: utilization
-          Expression: "100 * consumed / (provisioned * 60)"
-          Label: Profile lookup index write capacity utilization
-          ReturnData: true
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 80
-      ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 

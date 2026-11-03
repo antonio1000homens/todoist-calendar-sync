@@ -84,6 +84,10 @@ function harness(t, { events = [event()], tasks = [task()], mappings = [], recur
   const taskRequests = new Map(), splits = new Map();
   const get = (map, id) => { if (!map.has(id)) throw Object.assign(new Error("Not found"), { status: 404 }); return clone(map.get(id)); };
   const stateMethods = {
+    // Provider tests use an in-memory repository; do not call DynamoDB for
+    // the production cross-invocation Calendar/completion write fence.
+    async beginTodoistCalendarWrite(id) { return "unit-fence:" + id; },
+    async endTodoistCalendarWrite(id, token) { assert.equal(token, "unit-fence:" + id); },
     async assertHistoricalSeriesUnowned() {},
     async getSyncToken() { return "sync-token"; },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
@@ -2606,6 +2610,9 @@ test("an explicit Todoist-only disposition survives repeat snapshot and webhook 
   const controls=new SyncControls();
   controls.control=async ref=>h.controlsMap.get(refKey(ref));
   t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  // Deletion-hook reconciliation is externally queued only for an existing
+  // matching open review case. This harness has none.
+  t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(), reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
@@ -2639,6 +2646,9 @@ test("Todoist-only flatten keeps the selected due date, excludes projection, and
   const controls=new SyncControls();
   controls.control=async ref=>h.controlsMap.get(refKey(ref));
   t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  // Deletion-hook reconciliation is externally queued only for an existing
+  // matching open review case. This harness has none.
+  t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
@@ -2680,6 +2690,9 @@ test("explicit Calendar projection deletion retains the exact Todoist task and f
   const controls=new SyncControls();
   controls.control=async ref=>h.controlsMap.get(refKey(ref));
   t.mock.method(ReviewStore.prototype,"get",async()=>undefined);
+  // Deletion-hook reconciliation is externally queued only for an existing
+  // matching open review case. This harness has none.
+  t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
@@ -2768,4 +2781,22 @@ test("completed Calendar deletion resumes after later mapping cleanup failure",a
   assert.equal(resumed.status,"succeeded",resumed.error);
   assert.equal(h.mappingMap.size,0);
   assert.deepEqual(h.writes,[["delete-event",projection.id]],"resume trusts the recorded exact deletion and does not repeat it");
+});
+
+test("forged contextual repair intents cannot preview two missing provider objects",async t=>{
+  const h=harness(t,{tasks:[],events:[]});
+  for(const action of ["link","verify","create","move","transfer","flatten"]){
+    await assert.rejects(()=>h.engine.preview(actor,intent({action})),
+      /Select|live|requires|confirmed|not found|missing|current|source|Calendar/i,action);
+  }
+  assert.deepEqual(h.writes,[],"read-only preview rejects forged intent without writes");
+});
+
+test("forged cross-profile context and unavailable Slack decision remain backend-rejected",async t=>{
+  const h=harness(t);
+  await assert.rejects(()=>h.engine.preview(actor,intent({profile:"work"})),
+    /Conflict not found in this profile/);
+  await assert.rejects(()=>h.engine.preview(actor,intent({action:"decision",decisionAction:"delete"})),
+    /permitted repair action|Select a permitted/);
+  assert.deepEqual(h.writes,[]);
 });

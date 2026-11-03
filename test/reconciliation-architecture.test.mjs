@@ -15,6 +15,26 @@ const healthSource = await readText("../src/reconcile.ts");
 const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
+const deployScript = await readText("../deploy.sh");
+const productionWorkflow = await readText("../.github/workflows/deploy.yml");
+
+test("completed-history EventBridge rule is conditionally managed after SAM transform", () => {
+  assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
+  assert.match(template, /RunCompletedHistoryCleanup:\s*!Equals \[!Ref CompletedHistoryCleanupApply, "true"\]/);
+  const functionBlock = template.match(/CompletedHistoryCleanupFunction:[\s\S]*?CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:/)?.[0] || "";
+  assert.doesNotMatch(functionBlock, /^\s{8}DailyCompletedHistoryReview:/m, "do not rely on a nested SAM Schedule.Enabled event");
+  const rule = template.match(/  CompletedHistoryCleanupFunctionDailyCompletedHistoryReview:[\s\S]*?  WatchFunction:/)?.[0] || "";
+  assert.match(rule, /Type:\s*AWS::Events::Rule/);
+  assert.match(rule, /State:\s*!If \[RunCompletedHistoryCleanup, ENABLED, DISABLED\]/);
+  assert.match(rule, /CompletedHistoryCleanupFunctionDailyCompletedHistoryReviewPermission:/);
+  assert.match(rule, /SourceArn:\s*!GetAtt CompletedHistoryCleanupFunctionDailyCompletedHistoryReview.Arn/);
+  assert.match(deployScript, /CompletedHistoryCleanupApply=\$completed_history_cleanup_apply/);
+  assert.match(productionWorkflow, /COMPLETED_HISTORY_CLEANUP_APPLY:.*vars\.COMPLETED_HISTORY_CLEANUP_APPLY\s*\|\|\s*'false'/);
+  assert.match(productionWorkflow, /Gate cleanup activation on retained-mapping implementation/);
+  assert.match(productionWorkflow, /Refusing automatic cleanup: #277 seven-day retained-mapping lifecycle is absent/);
+  assert.doesNotMatch(productionWorkflow, /^\s*COMPLETED_HISTORY_CLEANUP_APPLY:\s*'true'\s*$/m);
+  assert.match(productionWorkflow, /Verify completed-history retirement schedule and Lambda mode/);
+});
 
 test("FIFO ordering is isolated by profile", () => {
   assert.equal(syncMessageGroupId("home"), "sync:home");
@@ -28,11 +48,15 @@ test("worker remains single-concurrency while project moves lack cross-profile c
   assert.match(workerBlock, /ReservedConcurrentExecutions:\s*1/);
 });
 
-test("DLQ quarantines after one receive and retains messages for 24 hours", () => {
+test("DLQ retains originals for 14 days and source FIFO retries transient DynamoDB failures at most five times", () => {
   const dlqBlock = template.match(/SyncDlq:[\s\S]*?SyncQueue:/)?.[0] || "";
   const queueBlock = template.match(/SyncQueue:[\s\S]*?AlertTopic:/)?.[0] || "";
-  assert.match(dlqBlock, /MessageRetentionPeriod:\s*86400/);
-  assert.match(queueBlock, /maxReceiveCount:\s*1/);
+  assert.match(dlqBlock, /MessageRetentionPeriod:\s*1209600/);
+  assert.match(queueBlock, /maxReceiveCount:\s*5/);
+  const workerBlock = template.match(/WorkerFunction:[\s\S]*?ErasureWorkerLogGroup:/)?.[0] || "";
+  assert.match(workerBlock, /SYNC_QUEUE_URL: !Ref SyncQueue/);
+  assert.match(workerBlock, /QueueName: !GetAtt SyncDlq.QueueName/);
+  assert.match(workerBlock, /Action: sqs:ChangeMessageVisibility/);
 });
 
 test("worker emits a searchable structured log before returning a DLQ failure", () => {
@@ -41,6 +65,8 @@ test("worker emits a searchable structured log before returning a DLQ failure", 
   assert.match(workerSource, /receiveCount/);
   assert.match(workerSource, /providerBody/);
   assert.match(workerSource, /deliverySummary/);
+  assert.match(workerSource, /createObservedProviderClientFactory/);
+  assert.match(workerSource, /new OrphanRecoveringSynchronizer\(state, scheduleOrphan, observedClientFactory\)/);
 });
 
 test("capped or circuit-blocked reconciliation keeps its durable generation pending", () => {
@@ -142,10 +168,10 @@ test("failed webhook admission returns a retryable non-2xx response without clai
   assert.doesNotMatch(enqueueCatch, /response\(202/);
 });
 
-test("state table uses fixed 25/25 provisioned capacity, remains protected and worker can transact mappings", () => {
+test("state table uses budgeted 20/20 provisioned capacity, remains protected and worker can transact mappings", () => {
   assert.match(template, /BillingMode:\s*PROVISIONED/);
-  assert.match(template, /StateTableReadCapacity:[\s\S]*?Default:\s*25/);
-  assert.match(template, /StateTableWriteCapacity:[\s\S]*?Default:\s*25/);
+  assert.match(template, /StateTableReadCapacity:[\s\S]*?Default:\s*20/);
+  assert.match(template, /StateTableWriteCapacity:[\s\S]*?Default:\s*20/);
   assert.match(template, /ReadCapacityUnits:\s*!Ref StateTableReadCapacity/);
   assert.match(template, /WriteCapacityUnits:\s*!Ref StateTableWriteCapacity/);
   assert.doesNotMatch(template, /AWS::ApplicationAutoScaling::/);

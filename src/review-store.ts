@@ -2,8 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { Profile } from "./types.js";
-import { retainedConflictIdentity } from "./audit-policy.js";
+import type { Profile, RecurrenceLink } from "./types.js";
+import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
@@ -145,13 +146,94 @@ export class ReviewStore {
       } catch (error) { if (!conditional(error)) throw error; }
     }
   }
+  /**
+   * Active deletion conflict guards are bounded pointers, not a permanent
+   * per-provider tombstone. They are created only after a deletion notification
+   * matched an existing actionable case, with a bounded expiry. The
+   * pointed-to case must still be open/repairing and mention this exact ID.
+   */
+  async indexDeletedConflictCase(item: ReviewCase): Promise<void> {
+    if (item.status !== "open" || !item.id || !item.profile) return;
+    const evidence = reviewCaseEvidenceIds(item);
+    if (!evidence.taskIds.length || !evidence.eventIds.length
+      || evidence.taskIds.length + evidence.eventIds.length > 20) return;
+    const expiry = Math.floor(Date.now() / 1000) + 90 * 86400;
+    const refs = [
+      ...evidence.taskIds.map(id => ({ side: "todoist", id })),
+      ...evidence.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of refs) {
+      await this.db.send(new PutCommand({ TableName: reviewTable(),
+        Item: { pk: `DELETION_REVIEW#${item.profile}#${ref.side}#${ref.id}`,
+          sk: `CASE#${item.id}`, caseId: item.id, profile: item.profile,
+          expiresAt: expiry },
+        ConditionExpression: "attribute_not_exists(pk) OR expiresAt < :now",
+        ExpressionAttributeValues: { ":now": Math.floor(Date.now() / 1000) },
+      })).catch(error => { if (!conditional(error)) throw error; });
+    }
+  }
+
+  /**
+   * Versioned pending-refresh markers are already consumed by the worker's
+   * reconciliation follow-up protocol. A deletion arriving after a generation
+   * starts must have its own next pass, rather than coalescing silently.
+   */
+  async markDeletedReviewPendingRefresh(
+    refs: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string }>,
+  ): Promise<Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }>> {
+    const marked: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }> = [];
+    for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) {
+      const pendingRefreshAt = randomUUID();
+      await this.db.send(new UpdateCommand({ TableName: reviewTable(),
+        Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+        UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at",
+        ExpressionAttributeValues: { ":true": true, ":at": pendingRefreshAt },
+      }));
+      marked.push({ ...ref, pendingRefreshAt });
+    }
+    return marked;
+  }
+
+  /** True means an open case still claims this exact provider identity and
+   * sync must not create a new counterpart until it is re-evaluated.
+   */
+  async hasActiveDeletionGuard(profile: Profile, side: "todoist" | "calendar", id: string): Promise<boolean> {
+    if (!id) return false;
+    const page = await this.db.send(new QueryCommand({ TableName: reviewTable(),
+      KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues: { ":pk": `DELETION_REVIEW#${profile}#${side}#${id}`,
+        ":prefix": "CASE#" }, ConsistentRead: true, Limit: 40 }));
+    if (page.LastEvaluatedKey) return true; // fail closed on suspiciously crowded identity
+    for (const row of page.Items || []) {
+      if (!row.caseId || Number(row.expiresAt || 0) <= Date.now() / 1000) continue;
+      const item = await this.getCase(String(row.caseId));
+      if (!item || item.profile !== profile || !["open", "repairing"].includes(item.status)) continue;
+      const ids = reviewCaseEvidenceIds(item);
+      if ((side === "todoist" ? ids.taskIds : ids.eventIds).includes(id)) return true;
+    }
+    return false;
+  }
+
   getCase(id: string): Promise<ReviewCase | undefined> { return this.get(`REVIEW_CASE#${id}`); }
-  async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false) {
+  async listCases(profile: Profile, cursor?: Record<string, unknown>, history = false, limit = 50) {
     const result = await this.db.send(new QueryCommand({ TableName: reviewTable(), IndexName: "ProfileLookupIndex",
       KeyConditionExpression: "lookupPk = :pk AND begins_with(lookupSk, :prefix)",
-      ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": history ? "REVIEW#" : "REVIEW#OPEN#" }, Limit: 50,
+      ExpressionAttributeValues: { ":pk": `PROFILE#${profile}`, ":prefix": history ? "REVIEW#" : "REVIEW#OPEN#" }, Limit: Math.min(50, Math.max(1, limit)),
       ExclusiveStartKey: cursor }));
     return { items: (result.Items || []) as ReviewCase[], cursor: result.LastEvaluatedKey };
+  }
+  /** Round-robin pagination across reconciliation generations; a hot first
+   * page cannot starve newer deleted cases indefinitely. */
+  async deletionSweepCursor(profile: Profile, history: boolean): Promise<Record<string, unknown> | undefined> {
+    const marker = await this.get<{ cursor?: Record<string, unknown> }>(`DELETION_SWEEP#${profile}#${history ? "history" : "open"}`);
+    return marker?.cursor;
+  }
+  async saveDeletionSweepCursor(profile: Profile, history: boolean, cursor?: Record<string, unknown>): Promise<void> {
+    const pk = `DELETION_SWEEP#${profile}#${history ? "history" : "open"}`;
+    // A null cursor restarts from the first page after a complete sweep.
+    await this.db.send(new PutCommand({ TableName: reviewTable(),
+      Item: { ...key(pk), ...(cursor ? { cursor } : {}), expiresAt: Math.floor(Date.now() / 1000) + 7 * 86400 },
+    }));
   }
   async countActionableCases(profile: Profile): Promise<number> {
     let count = 0;
@@ -209,6 +291,324 @@ export class ReviewStore {
     }
     return {...current,status:"dismissed",result,updatedAt:now};
   }
+  /**
+   * Close an obsolete conflict only after the caller has freshly verified that
+   * every provider identity is deleted and no mapping, recurrence or repair
+   * still owns it. Keep a small terminal case/decision receipt so replayed
+   * audits and deterministic decision seeding cannot reopen the old case.
+   *
+   * Remove strictly attributable audit and incident pointers within the same
+   * transaction, never records belonging to a live counterpart.
+   */
+  async resolveVerifiedDeletedCase(
+    caseId: string,
+    expected: {
+      profile: Profile; taskIds: string[]; eventIds: string[];
+      staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
+      masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
+    },
+  ): Promise<boolean> {
+    const current = await this.getCase(caseId);
+    if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
+      || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
+    const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
+    if (!taskIds.length || !eventIds.length
+      || taskIds.some(id => !expected.taskIds.includes(id))
+      || eventIds.some(id => !expected.eventIds.includes(id))) return false;
+
+    const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
+    if (manual && (!["pending", "resolved"].includes(manual.status) || manual.profile !== expected.profile
+      || manual.decisionId !== caseId)) return false;
+    const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
+      ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
+    const detail = source?.detail && typeof source.detail === "object"
+      ? source.detail as Record<string, unknown> : undefined;
+    const attribution = detail ? retainedAuditProviderIds(detail) : { taskIds: [], eventIds: [] };
+    const attributable = Boolean(source && detail && attribution.taskIds.length + attribution.eventIds.length > 0
+      && attribution.taskIds.every(id => expected.taskIds.includes(id))
+      && attribution.eventIds.every(id => expected.eventIds.includes(id)));
+    const pointerKey = current.conflictKey && current.id.startsWith("incident-")
+      ? { pk: `REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`, sk: `INCIDENT#${caseId}` }
+      : undefined;
+    const pointer = pointerKey ? (await this.db.send(new GetCommand({
+      TableName: reviewTable(), Key: pointerKey, ConsistentRead: true,
+    }))).Item as { incidentId?: string } | undefined : undefined;
+    // This method is the final transaction authority, not the classifier.
+    // A caller MUST provide the complete exact recurring identity and its
+    // Calendar iCalUID recurrence key before closure of a recurring decision.
+    const recurring = current.decision?.type?.includes("recurrence_task_deleted") === true;
+    const recordedMaster = current.decision?.masterEventId || current.decision?.mappingSnapshot?.masterEventId;
+    const recordedActive = current.decision?.activeInstanceId || current.decision?.mappingSnapshot?.activeInstanceId;
+    const seriesKeys = [...new Set(expected.seriesKeys || [...expected.taskIds, ...expected.eventIds])];
+    if (!seriesKeys.length || seriesKeys.length > 20
+      || [...expected.taskIds, ...expected.eventIds].some(id => !seriesKeys.includes(id))) return false;
+    if (recurring && (!expected.masterId || !expected.activeInstanceId || !expected.masterSeriesId
+      || recordedMaster !== expected.masterId || recordedActive !== expected.activeInstanceId
+      || expected.masterId === expected.activeInstanceId
+      || !expected.eventIds.includes(expected.masterId)
+      || !expected.eventIds.includes(expected.activeInstanceId)
+      || !seriesKeys.includes(expected.masterSeriesId)
+      || !seriesKeys.includes(expected.masterId)
+      || !seriesKeys.includes(expected.activeInstanceId)
+      || current.decision?.seriesId && !seriesKeys.includes(current.decision.seriesId)
+      || current.decision?.mappingSnapshot?.seriesId && !seriesKeys.includes(current.decision.mappingSnapshot.seriesId)))
+      return false;
+    const staleLinks = expected.staleLinks || [];
+    const seenLinks = new Set<string>();
+    for (const link of staleLinks) {
+      const identity = `${link.profile}/${link.seriesId}`;
+      if (seenLinks.has(identity) || link.profile !== expected.profile || link.owner !== "todoist"
+        || link.seriesId !== link.taskId || !expected.taskIds.includes(link.taskId)
+        || !expected.eventIds.includes(link.eventId)
+        || !link.masterEventId || !expected.eventIds.includes(link.masterEventId)
+        || !link.activeInstanceId || !expected.eventIds.includes(link.activeInstanceId)
+        || link.activeInstanceId === link.masterEventId
+        || recurring && (link.masterEventId !== expected.masterId
+          || link.activeInstanceId !== expected.activeInstanceId)
+        || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return false;
+      seenLinks.add(identity);
+    }
+    const now = new Date().toISOString();
+    const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
+    const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
+      { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
+        UpdateExpression: "SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now, expiresAt = :expiry REMOVE decision, taskId, eventId, sourceAuditKey, lookupPk, lookupSk, conflictKey, reconciliationGeneration, progressCheckpoint, coalescedInto",
+        ConditionExpression: "#status = :old AND updatedAt = :version AND attribute_not_exists(operationId)",
+        ExpressionAttributeNames: { "#status": "status", "#result": "result", "#title": "title", "#reason": "reason" },
+        ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution, ":title": "Verified deletion", ":reason": "verified_deletion",
+          ":now": now, ":old": current.status, ":version": current.updatedAt,
+          ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
+      } },
+    ];
+    if (manual) items.push({ Update: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
+      UpdateExpression: "SET #status = :resolved, resolution = :result, resolvedAt = :now REMOVE lookupPk, lookupSk, #context, taskId, eventId, masterEventId, activeInstanceId, seriesId, mappingSnapshot",
+      ConditionExpression: "#status = :old AND profile = :profile AND decisionId = :id AND createdAt = :createdAt",
+      ExpressionAttributeNames: { "#status": "status", "#context": "context" },
+      ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
+        ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
+    } });
+    // Retire the stale active link inside the same transaction as the case and
+    // pending manual decision. All identity/ownership/version fields are CAS
+    // fenced; a revived or re-owned series cancels the entire operation.
+    for (const link of staleLinks) {
+      const values: Record<string, unknown> = {
+        ":profile": link.profile, ":owner": "todoist", ":series": link.seriesId,
+        ":task": link.taskId, ":event": link.eventId, ":updated": link.updatedAt,
+      };
+      const conditions = [
+        "#profile = :profile", "#owner = :owner", "seriesId = :series",
+        "taskId = :task", "eventId = :event", "updatedAt = :updated",
+      ];
+      for (const field of ["masterEventId", "activeInstanceId"] as const) {
+        if (link[field]) { conditions.push(`${field} = :${field}`); values[`:${field}`] = link[field]; }
+        else conditions.push(`attribute_not_exists(${field})`);
+      }
+      items.push({ Delete: { TableName: reviewTable(),
+        Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
+        ConditionExpression: conditions.join(" AND "),
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: values,
+      } });
+    }
+    // Remove exact case-scoped deletion-review guards. Their unique case sort
+    // key means this cannot remove guards owned by other unresolved cases.
+    const refs = [
+      ...expected.taskIds.map(id => ({ side: "todoist", id })),
+      ...expected.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of refs) items.push({ Delete: { TableName: reviewTable(),
+      Key: { pk: `DELETION_REVIEW#${expected.profile}#${ref.side}#${ref.id}`,
+        sk: `CASE#${caseId}` },
+    } });
+    if (pointer?.incidentId === caseId && pointerKey) items.push({ Delete: {
+      TableName: reviewTable(), Key: pointerKey,
+      ConditionExpression: "incidentId = :id", ExpressionAttributeValues: { ":id": caseId },
+    } });
+    if (attributable && source && current.sourceAuditKey) {
+      items.push({ Delete: {
+        TableName: reviewTable(), Key: key(current.sourceAuditKey),
+        ConditionExpression: "createdAt = :createdAt AND #action = :action",
+        ExpressionAttributeNames: { "#action": "action" },
+        ExpressionAttributeValues: { ":createdAt": source.createdAt, ":action": source.action },
+      } });
+      const parsed = /^AUDIT#[^#]+#CONFLICT#([a-f0-9]{64})#(.+)$/.exec(current.sourceAuditKey);
+      const entity = detail && retainedConflictEntity(detail);
+      if (parsed && entity) {
+        const entityHash = createHash("sha256").update(entity).digest("hex");
+        const conflictStateKey = key(`CONFLICT_STATE#${expected.profile}#${entityHash}`);
+        const lifecycle = (await this.db.send(new GetCommand({
+          TableName: reviewTable(), Key: conflictStateKey, ConsistentRead: true,
+        }))).Item as { fingerprint?: string; incidentId?: string } | undefined;
+        if (lifecycle?.fingerprint === parsed[1] && lifecycle.incidentId === parsed[2]) {
+          items.push({ Delete: {
+            TableName: reviewTable(), Key: conflictStateKey,
+            ConditionExpression: "fingerprint = :fingerprint AND incidentId = :incident",
+            ExpressionAttributeValues: { ":fingerprint": parsed[1], ":incident": parsed[2] },
+          } });
+        }
+      }
+    }
+    // Retire only canonical identity and reconciliation baseline snapshots
+    // scoped to the fully absent provider IDs. Every delete is version-fenced:
+    // a concurrent new provider identity or repair aborts the whole transaction
+    // instead of stripping a newer baseline or live canonical pointer.
+    const canonicalRefs = [
+      ...expected.taskIds.map(id => ({ side: "todoist", id })),
+      ...expected.eventIds.map(id => ({ side: "calendar", id })),
+    ];
+    for (const ref of canonicalRefs) {
+      const pk = `CANONICAL#${expected.profile}#${ref.side}#${ref.id}`;
+      const currentIdentity = await this.get<Record<string, unknown>>(pk);
+      if (!currentIdentity) continue;
+      if (currentIdentity.profile !== expected.profile || currentIdentity.side !== ref.side
+        || currentIdentity.providerId !== ref.id
+        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return false;
+      items.push({ Delete: { TableName: reviewTable(), Key: key(pk),
+        ConditionExpression: "#profile = :profile AND #side = :side AND providerId = :id AND updatedAt = :updated AND #identity = :identity",
+        ExpressionAttributeNames: { "#profile": "profile", "#side": "side", "#identity": "identity" },
+        ExpressionAttributeValues: { ":profile": expected.profile, ":side": ref.side, ":id": ref.id,
+          ":updated": currentIdentity.updatedAt, ":identity": currentIdentity.identity },
+      } });
+    }
+    for (const taskId of expected.taskIds) {
+      const baselineKey = { pk: `BASELINE#${expected.profile}#TASK#${taskId}`, sk: "RECONCILE" };
+      const currentBaseline = (await this.db.send(new GetCommand({
+        TableName: reviewTable(), Key: baselineKey, ConsistentRead: true,
+      }))).Item;
+      if (!currentBaseline) continue;
+      if (typeof currentBaseline.updatedAt !== "string" || !currentBaseline.baseline) return false;
+      items.push({ Delete: { TableName: reviewTable(), Key: baselineKey,
+        ConditionExpression: "updatedAt = :updated AND baseline = :baseline",
+        ExpressionAttributeValues: { ":updated": currentBaseline.updatedAt, ":baseline": currentBaseline.baseline },
+      } });
+    }
+    // Query only exact-provider reverse indexes. Do not scan the audit table:
+    // older records without these pointers retain their original 7-day TTL.
+    // Every candidate audit is re-read and deleted only when *all* its
+    // recorded provider IDs are within this verified-deleted fixture.
+    const auditDeletes = new Set(items.filter(x => x.Delete)
+      .map(x => x.Delete?.Key?.pk).filter((value): value is string => typeof value === "string"));
+    const referenceKeys = [
+      ...expected.taskIds.map(id => `AUDIT_REF#${expected.profile}#todoist#${id}`),
+      ...expected.eventIds.map(id => `AUDIT_REF#${expected.profile}#calendar#${id}`),
+    ];
+    const referencedAudits = new Map<string, Record<string, unknown>>();
+    const auditPointers = new Map<string, { key: { pk: string; sk: string }; auditKey: string }>();
+    for (const pk of referenceKeys) {
+      const page = await this.db.send(new QueryCommand({ TableName: reviewTable(),
+        KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
+        ExpressionAttributeValues: { ":pk": pk, ":prefix": "AUDIT#" },
+        ConsistentRead: true, Limit: 50 }));
+      if (page.LastEvaluatedKey) return false; // no partially attributed cleanup
+      for (const row of page.Items || []) {
+        if (typeof row.auditKey !== "string" || !row.auditKey.startsWith(`AUDIT#${expected.profile}#`)
+          || typeof row.sk !== "string") continue;
+        const pointerKey = { pk, sk: row.sk };
+        auditPointers.set(`${pk}|${row.sk}`, { key: pointerKey, auditKey: row.auditKey });
+        if (!referencedAudits.has(row.auditKey)) {
+          const record = await this.get<Record<string, unknown>>(row.auditKey);
+          if (record) referencedAudits.set(row.auditKey, record);
+        }
+      }
+    }
+    const safeAudits = new Set<string>();
+    for (const [auditKey, record] of referencedAudits) {
+      const auditDetail = record.detail && typeof record.detail === "object"
+        ? record.detail as Record<string, unknown> : undefined;
+      if (!auditDetail || typeof record.action !== "string"
+        || /(?:operational|dlq)/.test(record.action)) continue;
+      const identities = retainedAuditProviderIds(auditDetail);
+      if (!identities.taskIds.length && !identities.eventIds.length) continue;
+      if (identities.taskIds.every(id => expected.taskIds.includes(id))
+        && identities.eventIds.every(id => expected.eventIds.includes(id))) safeAudits.add(auditKey);
+    }
+    for (const auditKey of safeAudits) {
+      if (auditDeletes.has(auditKey)) continue;
+      const record = referencedAudits.get(auditKey)!;
+      items.push({ Delete: { TableName: reviewTable(), Key: key(auditKey),
+        ConditionExpression: "createdAt = :createdAt AND #action = :action",
+        ExpressionAttributeNames: { "#action": "action" },
+        ExpressionAttributeValues: { ":createdAt": record.createdAt, ":action": record.action },
+      } });
+    }
+    for (const pointer of auditPointers.values()) {
+      if (!safeAudits.has(pointer.auditKey) && referencedAudits.has(pointer.auditKey)) continue;
+      items.push({ Delete: { TableName: reviewTable(), Key: pointer.key,
+        ConditionExpression: "auditKey = :auditKey",
+        ExpressionAttributeValues: { ":auditKey": pointer.auditKey },
+      } });
+    }
+    // The earlier provider/state reads are only a preflight. Fence the shared
+    // DynamoDB ownership and repair/completion indexes in the SAME atomic
+    // transaction as the terminal case update. A concurrent sync or repair
+    // that claims any verified identity must cancel the entire retirement.
+    const profiles: Profile[] = ["home", "antonio", "work"];
+    const absence = new Map<string, { pk: string; sk: string }>();
+    const checkAbsent = (pk: string, sk = "MAP"): void => {
+      absence.set(`${pk}|${sk}`, { pk, sk });
+    };
+    for (const taskId of expected.taskIds) {
+      checkAbsent(`TASKOWNER#${taskId}`);
+      for (const candidateProfile of profiles) {
+        checkAbsent(`TASK#${candidateProfile}#${taskId}`);
+        // Every recurrence identity is fenced together below, including
+        // the Calendar iCalUID key rather than only task-ID keys.
+      }
+    }
+    for (const eventId of expected.eventIds) {
+      for (const candidateProfile of profiles) {
+        checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
+        // Completed task/event projections remain untouched and are not
+        // considered live ownership of a deleted recurrence.
+      }
+    }
+    for (const seriesId of seriesKeys) for (const candidateProfile of profiles) {
+      checkAbsent(`RECURRENCE#${candidateProfile}#${seriesId}`, "STATE");
+    }
+    // Never ConditionCheck a key that is also deleted in this transaction.
+    // Such a duplicate would invalidate all DynamoDB transactions.
+    const modified = new Set(items.flatMap(x =>
+      [x.Update?.Key, x.Delete?.Key, x.Put?.Item].filter(Boolean)
+        .map(key => `${key!.pk}|${key!.sk}`)));
+    for (const [k, Key] of absence) {
+      if (modified.has(k)) continue;
+      items.push({ ConditionCheck: { TableName: reviewTable(), Key,
+        ConditionExpression: "attribute_not_exists(pk)" } });
+    }
+    for (const ref of refs) {
+      items.push({ ConditionCheck: { TableName: reviewTable(),
+        Key: key(`SYNC_CONTROL#${expected.profile}:${ref.side}:${ref.id}`),
+        ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
+        ExpressionAttributeValues: { ":no": false },
+      } });
+    }
+    if (items.length > 95) return false; // leave open for safe bounded retry
+    try {
+      await this.db.send(new TransactWriteCommand({ TransactItems: items }));
+      return true;
+    } catch (error) {
+      if (conditional(error) || (error as { name?: string }).name === "TransactionCanceledException") return false;
+      throw error;
+    }
+  }
+
+  async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string): Promise<void> {
+    try {
+      await this.db.send(new UpdateCommand({ TableName: reviewTable(),
+        Key: key(`REVIEW_CASE#${caseId}`),
+        UpdateExpression: "SET #result = :message, updatedAt = :now",
+        ConditionExpression: "#status = :open AND updatedAt = :version AND attribute_not_exists(operationId)",
+        ExpressionAttributeNames: { "#status": "status", "#result": "result" },
+        ExpressionAttributeValues: { ":open": "open", ":version": expectedUpdatedAt,
+          ":message": "deletion_cleanup_deferred: current provider, mapping or audit state changed; retry is required",
+          ":now": new Date().toISOString() },
+      }));
+    } catch (error) {
+      // A changed case is not ours to update; preserve newer review/repair state.
+      if (!conditional(error)) throw error;
+    }
+  }
+
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);

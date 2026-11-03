@@ -472,6 +472,25 @@ test("all-day recurrence timezone mismatch fails closed before Todoist or mappin
   assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_timezone_mismatch"));
 });
 
+test("historical standalone events do not consume the single-item reconciliation budget", async () => {
+  const old = {
+    id: "a-history", status: "confirmed", summary: "Completed history", description: "",
+    start: { date: "2000-01-01" }, end: { date: "2000-01-02" },
+  };
+  const future = futureEvent("z-current", 10, "Current item");
+  const state = fakeState();
+  const clients = fakeClients([old, future]);
+
+  const summary = await reconcileUnmappedCalendar(
+    "home", state, async () => clients.pair, new ReconciliationMutationBudget(10),
+    undefined, 1,
+  );
+  assert.equal(summary.imported, 1);
+  assert.equal(summary.scanned, 1, "history is excluded before candidate pagination");
+  assert.equal(summary.continuation, undefined, "no extra reconciliation chunk for irrelevant history");
+  assert.deepEqual(state.mappings.map(({ eventId }) => eventId), ["z-current"]);
+});
+
 test("snapshot recovery skips elapsed Calendar history and imports the future event", async () => {
   const historical = {
     id: "elapsed", status: "confirmed", summary: "Historical event", description: "",

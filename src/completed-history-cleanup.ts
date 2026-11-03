@@ -12,7 +12,7 @@ const profiles: Profile[] = ["home", "antonio", "work"];
 const cursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "STATE" };
 const dryRunCursorKey = { pk: "MAINTENANCE#TERMINAL_COMPLETED_TASK", sk: "DRY_RUN_STATE" };
 const MAX_HISTORY_ROWS = 12; // conservative: all guards and deletes fit in one DynamoDB transaction
-type Row = CompletedCalendarProjection & { pk: string; sk: string };
+type Row = CompletedCalendarProjection & { pk: string; sk: string; recurrenceId?: string; activeInstanceId?: string; activeEffectiveStart?: string };
 type ScanKey = Record<string, unknown>;
 export type CleanupCounts = {
   eligible: number; retired: number; skipped_active: number;
@@ -62,8 +62,29 @@ async function processTask(
   const decision = terminalCompletionDecision(rows, nowMs, certificate);
   if (decision !== "eligible") return decision === "too_recent" ? "too_recent" : "skipped_ambiguous";
 
+  // Standalone completion now retains its exact active mapping for seven
+  // days. Its three indexes may be removed by this same guarded transaction,
+  // never by the completion webhook. Old deployments may already have removed
+  // them, so the legacy zero-index path also remains supported.
+  const standalone = rows.length === 1 && !rows[0].recurrenceOwner
+    && !rows[0].recurrenceId && !rows[0].seriesId && !rows[0].masterEventId
+    && !rows[0].activeInstanceId && !rows[0].originalStart && !rows[0].activeEffectiveStart;
+  const ownedKeys = [
+    key(`TASKOWNER#${taskId}`, "MAP"),
+    key(`TASK#${profile}#${taskId}`, "MAP"),
+    ...(standalone ? [key(`EVENT#${profile}#${rows[0].eventId}`, "MAP")] : []),
+  ];
+  const ownedRows = await Promise.all(ownedKeys.map((k) => strongGet(table, k.pk, k.sk)));
+  const ownPresent = ownedRows.some(Boolean);
+  if (ownPresent && (!standalone || ownedRows.some((row) =>
+    !row || row.profile !== profile || row.taskId !== taskId || row.eventId !== rows[0].eventId
+    || !row.updatedAt || typeof row.updatedAt !== "string"
+    || row.recurrenceOwner || row.recurrenceId || row.seriesId || row.masterEventId
+    || row.activeInstanceId || row.originalStart || row.activeEffectiveStart
+    || row.updatedAt !== ownedRows[0]?.updatedAt))) return "skipped_active";
   // The preflight is a courtesy for diagnostics. Conditions in the transaction
   // below are authoritative if a new mapping/recurrence races the cleanup.
+  const retainedKeys = new Set(ownPresent ? ownedKeys.map((k) => `${k.pk}|${k.sk}`) : []);
   const absent = new Set<string>();
   absent.add(`TASKOWNER#${taskId}|MAP`);
   for (const candidateProfile of profiles) {
@@ -73,6 +94,7 @@ async function processTask(
       absent.add(`RECURRENCE#${candidateProfile}#${seriesId}|STATE`);
     }
   }
+  for (const entry of retainedKeys) absent.delete(entry);
   for (const entry of absent) {
     const separator = entry.lastIndexOf("|");
     if (await strongGet(table, entry.slice(0, separator), entry.slice(separator + 1))) return "skipped_active";
@@ -115,6 +137,16 @@ async function processTask(
     tx.push({ ConditionCheck: {
       TableName: table, Key: key(reference.slice(0, separator), reference.slice(separator + 1)),
       ConditionExpression: "attribute_not_exists(pk)",
+    } });
+  }
+  if (ownPresent) {
+    const values = { ":profile": profile, ":task": taskId, ":event": rows[0].eventId,
+      ":updated": ownedRows[0]!.updatedAt };
+    for (const rowKey of ownedKeys) tx.push({ Delete: {
+      TableName: table, Key: rowKey,
+      ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(recurrenceId) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId) AND attribute_not_exists(activeInstanceId) AND attribute_not_exists(originalStart) AND attribute_not_exists(activeEffectiveStart)",
+      ExpressionAttributeNames: { "#profile": "profile" },
+      ExpressionAttributeValues: values,
     } });
   }
   for (const row of rows) {
