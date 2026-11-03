@@ -55,7 +55,8 @@ function familyFor(key: string): TodoistPhaseBFamily | undefined {
   const phrase = key.replace(clockSuffix, "").trim();
   if (/^every\s+\d{1,2}(?:\s*,\s*\d{1,2})+$/.test(phrase)) return "multi_month_day";
   if (new RegExp("^every\\s+other\\s+" + weekdays + "$").test(phrase)) return "alternate_weekday";
-  if (phrase === "every quarter" || phrase === "quarterly" || phrase === "every quarterly") return "quarterly";
+  if (phrase === "every quarter" || phrase === "quarterly" || phrase === "every quarterly"
+    || phrase === "every 3 months") return "quarterly";
   return undefined;
 }
 
@@ -63,9 +64,10 @@ function localDue(task: TodoistTask, timeZone?: string): { date: string; time?: 
   const value = task.due?.datetime || task.due?.date;
   if (!value) return undefined;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return { date: value };
-  if (!timeZone) return undefined;
+  if (!timeZone || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return undefined;
+  // Floating times cannot be interpreted with the runner machine timezone.
   const parsed = new Date(value);
-  if (!Number.isFinite(parsed.getTime())) return undefined;
+  if (!Number.isFinite(parsed.getTime()) || parsed.getUTCMilliseconds() !== 0) return undefined;
   try {
     const fields = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
       timeZone, year: "numeric", month: "2-digit", day: "2-digit",
@@ -198,7 +200,9 @@ export function verifyTodoistPhaseBReadback(
   for (const instance of instances) {
     if (!instance.id || ids.has(instance.id) || instance.recurringEventId !== master.id
       || instance.status !== "confirmed" || instance.recurrence?.length
-      || instance.originalStartTime === undefined)
+      || instance.originalStartTime === undefined
+      || (result.semantic.timeZone && ((instance.start?.timeZone && instance.start.timeZone !== result.semantic.timeZone)
+        || (instance.originalStartTime.timeZone && instance.originalStartTime.timeZone !== result.semantic.timeZone))))
       return reject("calendar_instance_identity_or_exception_mismatch");
     ids.add(instance.id);
     const original = instance.originalStartTime;
