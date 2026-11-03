@@ -70,7 +70,10 @@ export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreview
   if(noWrites&&identical)return "pre_write";
   const noProviders=!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent
     &&snapshot.actionPlan.comments.length===0;
-  if(snapshot.blockers.length===0&&noProviders&&snapshot.inventory.length===0)return "fully_deleted";
+  // A completely absent provider inventory is not proof when its exact
+  // preview fingerprint is inconsistent with the readback; fail closed.
+  if(snapshot.blockers.length===0&&noProviders&&snapshot.inventory.length===0
+    &&erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint)return "fully_deleted";
   return "partial_or_ambiguous";
 }
 /** Query every strong-consistent page. Never treat a partial read as a safe, empty lease inventory. */
