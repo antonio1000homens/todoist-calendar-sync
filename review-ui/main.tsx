@@ -4,7 +4,8 @@ import { SYNC_PROFILES, reviewScopeLabel, reconciliationScopes, manualReconcilia
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility, revalidateRepairAction } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
-import { ErasurePanel } from "./erasure-panel";
+import { ErasureRecoveryPanel } from "./erasure-recovery-panel";
+import { OrphanDeletionPanel } from "./orphan-deletion-panel";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
@@ -535,7 +536,7 @@ function App() {
         </section>}
       </React.Fragment>;
     })}
-    <ErasurePanel api={api} />
+    <ErasureRecoveryPanel api={api} />
     <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Manual reconciliation · single profile</h3>
           {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
@@ -603,6 +604,9 @@ function App() {
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
+        {details&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
+          item={details.item} snapshots={details.snapshots||[]} loading={busy}
+          recheck={refreshAffected}/>}
         <div className="preview">
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>

@@ -15,6 +15,10 @@ const event=(path,method,headers={},body)=>({rawPath:path,headers,body:body===un
   isBase64Encoded:false,requestContext:{http:{method}},queryStringParameters:{}});
 
 test("preview issues one-use confirmation; create rechecks inventory and persists only an exact fresh operation",async t=>{
+  // Legacy protocol coverage is opt-in; normal production review cannot issue unscoped erasures.
+  const previousLegacy=process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;
+  process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED="true";
+  t.after(()=>{if(previousLegacy===undefined)delete process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;else process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED=previousLegacy;});
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
     operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION,
     enabled:process.env.ERASURE_EXECUTION_ENABLED};
@@ -74,6 +78,9 @@ test("preview issues one-use confirmation; create rechecks inventory and persist
 });
 
 test("operation creation refuses a changed exact inventory and leaves confirmation unconsumed",async t=>{
+  const previousLegacy=process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;
+  process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED="true";
+  t.after(()=>{if(previousLegacy===undefined)delete process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;else process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED=previousLegacy;});
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
     operators:process.env.REVIEW_OPERATOR_EMAILS};
   globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
@@ -112,4 +119,37 @@ test("legacy preview-only operation cannot be started after deployment enables e
     {createErasureOperationStore:()=>store,acquireWriteLease:async()=>async()=>{}});
   assert.equal(result.statusCode,409);
   assert.match(JSON.parse(result.body).error,/provider deletion and postflight workflow is not available/);
+});
+
+test("unscoped legacy erasure issuance is rejected without its independent opt-in, regardless of execution readiness",async t=>{
+  const previous={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
+    operators:process.env.REVIEW_OPERATOR_EMAILS,legacy:process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED,
+    protocol:process.env.ERASURE_PROTOCOL_VERSION,enabled:process.env.ERASURE_EXECUTION_ENABLED};
+  globalThis.fetch=async input=>String(input).startsWith(`${issuer}/cdn-cgi/access/certs`)
+    ?new Response(JSON.stringify({keys:[jwk]}),{status:200}):new Response("unexpected",{status:500});
+  Object.assign(process.env,{CF_ACCESS_ISSUER:issuer,CF_ACCESS_AUDIENCE:audience,
+    REVIEW_OPERATOR_EMAILS:"operator@example.test",ERASURE_PROTOCOL_VERSION:"1",ERASURE_EXECUTION_ENABLED:"true"});
+  delete process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;
+  t.after(()=>{
+    globalThis.fetch=previous.fetch;
+    for(const [key,value] of Object.entries({CF_ACCESS_ISSUER:previous.issuer,CF_ACCESS_AUDIENCE:previous.audience,
+      REVIEW_OPERATOR_EMAILS:previous.operators,ERASURE_LEGACY_UNSCOPED_API_ENABLED:previous.legacy,
+      ERASURE_PROTOCOL_VERSION:previous.protocol,ERASURE_EXECUTION_ENABLED:previous.enabled}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  });
+  const headers=await signedHeaders();
+  let reads=0,issues=0,created=0;
+  const deps={acquireWriteLease:async()=>{reads++;return async()=>{};},
+    buildErasurePreview:async()=>{issues++;throw new Error("must not be reached");},
+    createErasureOperationStore:()=>({getIssuedPreview:async()=>{created++;throw new Error("must not be reached");}})};
+  for(const [path,payload] of [
+    ["/review/api/erasure-previews",{profile:"home",taskId:"unrelated",deleteCalendar:false}],
+    ["/review/api/erasure-operations",{operationId:"unrelated",confirmationId:"token"}],
+  ]){
+    const result=await handler(event(path,"POST",headers,payload),deps);
+    assert.equal(result.statusCode,410);
+    assert.match(JSON.parse(result.body).error,/Unscoped item erasure is retired/);
+  }
+  assert.equal(reads,0,"No lease or provider work must begin");
+  assert.equal(issues,0);assert.equal(created,0);
 });
