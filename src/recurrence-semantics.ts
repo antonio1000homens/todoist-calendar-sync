@@ -282,7 +282,7 @@ export function occurrenceDates(rule: RecurrenceSemantics, limit = 12): string[]
       && rule.byMonthDay?.length === 1 && rule.byMonthDay[0] === 29)
     || (!rule.byMonth?.length && !rule.byMonthDay?.length && anchorMonth === 2 && anchorDay === 29));
   const sparsity = leapDay ? 4 : rule.frequency === "MONTHLY" && rule.byDay?.some((day) => day.length > 2) ? 6
-    : rule.frequency === "MONTHLY" && rule.byMonthDay?.every((day) => day > 28) ? 2 : 1;
+    : rule.frequency === "MONTHLY" && (anchorDay > 28 || rule.byMonthDay?.some((day) => day > 28)) ? 2 : 1;
   const periodDays = rule.frequency === "YEARLY" ? 366 : rule.frequency === "MONTHLY" ? 31
     : rule.frequency === "WEEKLY" ? 7 : 1;
   const horizonDays = Math.min(366 * 160, Math.ceil(periodDays * rule.interval * (limit + 1) * sparsity));
