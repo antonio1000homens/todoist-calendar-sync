@@ -20,7 +20,7 @@ test("all production Todoist creation entrypoints carry explicit Calendar source
   const checked=[];
   for(const file of await sourceFiles(src)) {
     const source=await readFile(file,"utf8");
-    const parsed=ts.createSourceFile(file,source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TS);
+    const parsed=ts.createSourceFile(file,source,(ts.ScriptTarget?.Latest ?? 99),true,(ts.ScriptKind?.TS ?? 3));
     const visit=node=>{
       if(ts.isCallExpression(node)&&ts.isPropertyAccessExpression(node.expression)){
         const method=node.expression.name.text;
