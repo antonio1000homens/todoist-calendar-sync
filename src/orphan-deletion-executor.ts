@@ -200,7 +200,8 @@ export async function advanceGuardedOrphanDeletion(
     await adapters.assertQuiescent(operation);
     return journal.advance(operation,"fenced","workers_drained_fence_verified");
   }
-  await adapters.assertQuiescent(operation);
+  // Reconciliation observation runs after the exclusive fence is released.
+  if(operation.phase!=="observing") await adapters.assertQuiescent(operation);
   if(operation.phase==="fenced") {
     assertTrustedProof(operation,await adapters.verifyProof(operation));
     assertLiveTarget(operation,await adapters.readTarget(operation));
