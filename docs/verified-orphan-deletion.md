@@ -8,6 +8,20 @@ The review page now offers a single case-scoped `Item to delete` dropdown with t
 
 The standalone two-ID plus Calendar-checkbox erasure UI is removed. Its previously-started durable operations remain inspectable, and an independently verified `review_required` operation can use the existing typed `RESTORE SYNC` recovery. Recovery cannot start or resume provider deletion.
 
+## Unscoped API retirement (phase 2 hardening)
+
+The old `POST /review/api/erasure-previews` and `POST /review/api/erasure-operations`
+are now **410 Gone by default**, even when generic erasure execution is switched on.
+This prevents the former manual two-ID UI from being recreated by directly calling
+its arbitrary-ID write endpoints. This is *not* the new orphan deletion executor.
+The two endpoints can be explicitly re-enabled only for existing isolated legacy
+operator tooling using `ERASURE_LEGACY_UNSCOPED_API_ENABLED=true`; do not set this
+in normal production deployment. Existing `GET /erasure-operations/{id}`,
+`POST /erasure-operations/{id}/start` (for already-issued operations), and
+`/erasure-recoveries/{id}` remain functional. The new case-bound API must
+have its own authorization/confirmation, not reuse the legacy opt-in flag.
+
+
 ## Safety invariants for the required executor
 
 Before making **any** candidate eligible, the backend must issue an immutable, single-case, single-profile, single-provider and exact-ID preview with all of the following proof:
