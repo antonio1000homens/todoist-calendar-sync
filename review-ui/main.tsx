@@ -110,6 +110,7 @@ function App() {
     setLeftovers({});setRequiredDispositionRef(undefined);setTargetProfile("");setDecisionAction("");
   };
   const selectCase=(item?:Case,options:{syncUrl?:boolean}={})=>{
+    navigationSequence.current++;
     invalidatePreview();
     if(item){
       requestGate.switchScope(item.profile);
@@ -136,7 +137,8 @@ function App() {
   const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
   const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
   const refresh=async (signal?:AbortSignal)=>{
-    const ticket=requestGate.begin("inbox");
+    const ticket=requestGate.begin("inbox",profile);
+    if(!ticket)return;
     setInboxStatus("loading");
     try {
       const data=await api(`cases?profile=${profile}&history=${history}`,signal?{signal}:undefined);
@@ -148,7 +150,8 @@ function App() {
   };
   const refreshReconciliation=async(forProfile:string,options:{signal?:AbortSignal;quiet?:boolean}={})=>{
     if(!SYNC_PROFILES.includes(forProfile))return undefined;
-    const ticket=requestGate.begin(`reconcile:${forProfile}`);
+    const ticket=requestGate.begin(`reconcile:${forProfile}`,profile);
+    if(!ticket)return undefined;
     if(!options.quiet)setRunViews(current=>({...current,[forProfile]:{status:"loading",diagnostics:[]}}));
     try {
       const data=await api(`reconciliation?profile=${forProfile}`,options.signal?{signal:options.signal}:undefined);
@@ -176,7 +179,8 @@ function App() {
   const loadMoreReconciliationDiagnostics=async(forProfile:string)=>{
     const view=runViews[forProfile],generation=view?.data?.reconciliation?.generation,cursor=view?.cursor;
     if(!generation||!cursor)return;
-    const ticket=requestGate.begin(`more:${forProfile}`);
+    const ticket=requestGate.begin(`more:${forProfile}`,profile);
+    if(!ticket)return;
     try {
       const next=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(cursor)}`);
       if(!requestGate.current(ticket))return;
@@ -426,7 +430,8 @@ function App() {
     if(!target){setMessage("Choose one sync profile before requesting reconciliation.");return;}
     if(selected?.decision?.type==="operational_reconciliation_stuck"
       && !window.confirm(`Request reconciliation for ${target}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
-    const ticket=requestGate.begin(`manual:${target}`);
+    const ticket=requestGate.begin(`manual:${target}`,profile);
+    if(!ticket)return;
     setBusy(true);setMessage("");
     try{
       const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:target})});
