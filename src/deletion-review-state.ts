@@ -41,7 +41,7 @@ export async function deletedRecurrenceStatus(
     if (!snapshot || snapshot.lookupError || snapshot.object?.id !== undefined && snapshot.object.id !== id)
       return "unverified";
     return snapshot.object === null ? "gone"
-      : snapshot.object?.status === "cancelled" ? "gone"
+      : "status" in snapshot.object && snapshot.object.status === "cancelled" ? "gone"
       : snapshot.object ? "live" : "unverified";
   })];
   if (statuses.includes("unverified"))
