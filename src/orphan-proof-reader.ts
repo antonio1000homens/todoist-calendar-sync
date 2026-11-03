@@ -106,6 +106,14 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   const otherRows=wellFormed?data.stateRows.filter(row=>refers(row,op.targetId) &&
     row.pk!=="REVIEW_CASE#"+op.caseId && row.pk!=="MANUAL#"+op.caseId &&
     row.pk!=="ORPHAN_DELETE#"+op.id &&
+    // The preview that authorized this operation (and another preview by the
+    // same operator for this exact alert/item) is evidence, not a provider
+    // association. A foreign or differently targeted preview still blocks.
+    !(String(row.pk).startsWith("ORPHAN_PREVIEW#") && row.caseId===op.caseId
+      && row.profile===op.profile && row.side===op.side
+      && row.targetId===op.targetId && row.actorSubject===op.actorSubject) &&
+    !(row.pk==="ORPHAN_CASE_LOCK#"+op.caseId && row.operationId===op.id
+      && row.profile===op.profile && row.targetId===op.targetId) &&
     !(String(row.pk).startsWith("AUDIT#") && row.pk===item?.sourceAuditKey) &&
     !(String(row.pk).startsWith("REVIEW_CONFLICT#") && row.incidentId===op.caseId) &&
     !String(row.pk).startsWith("RECONCILE#")):[];

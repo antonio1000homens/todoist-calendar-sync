@@ -113,6 +113,24 @@ test("unrelated audit and conflict pointers are not silently discarded",()=>{
   assert.equal(ownPointer.checks.canonical_records_clear,true);
 });
 
+test("own short-lived case preview does not poison fresh proof, foreign approval still blocks",()=>{
+  const own=proof("todoist",data=>{
+    data.stateRows.push({pk:"ORPHAN_PREVIEW#preview",sk:"STATE",caseId:"alert-287",
+      profile:"home",side:"todoist",targetId:"task-1",actorSubject:"actor",operationId:"op-287"});
+  });
+  assert.equal(own.checks.canonical_records_clear,true);
+  const foreign=proof("todoist",data=>{
+    data.stateRows.push({pk:"ORPHAN_PREVIEW#foreign",sk:"STATE",caseId:"alert-287",
+      profile:"home",side:"todoist",targetId:"task-1",actorSubject:"other-operator",operationId:"another"});
+  });
+  assert.equal(foreign.checks.canonical_records_clear,false);
+  const differentTarget=proof("todoist",data=>{
+    data.stateRows.push({pk:"ORPHAN_PREVIEW#other-target",sk:"STATE",caseId:"alert-287",
+      profile:"home",side:"calendar",targetId:"task-1",actorSubject:"actor",operationId:"another"});
+  });
+  assert.equal(differentTarget.checks.canonical_records_clear,false);
+});
+
 test("active repairs/fences block, own durable fence permitted only for this operation",()=>{
   const p=proof("calendar",data=>{
     data.stateRows.push({pk:"ERASURE#home",sk:"FENCE",operationId:"different-operation"});
