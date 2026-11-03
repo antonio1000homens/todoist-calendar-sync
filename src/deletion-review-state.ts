@@ -74,7 +74,8 @@ export async function deletedRecurrenceStatus(
     return { ...common, state: "unverified", bothGone: false,
       reason: "Unable to strongly verify all profile and Calendar-series recurrence keys" };
   }
-  const classification = classifyDeletedRecurrenceLinks(item.profile, taskIds, eventIds, links, keys);
+  const classification = classifyDeletedRecurrenceLinks(item.profile, taskIds, eventIds, links, keys,
+    { masterId, activeInstanceId });
   if (classification.blocked.length)
     return { ...common, state: "mapping_blocked", bothGone: false,
       reason: classification.blocked.slice(0, 3).join("; ") };
