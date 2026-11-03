@@ -17,7 +17,7 @@ function fixture(side="todoist") {
   };
   const lock={operationId:op.id,caseId:op.caseId,profile:op.profile,
     side:op.side,targetId:op.targetId,caseUpdatedAt:op.caseUpdatedAt};
-  const calls={journal:0,db:0,fence:0,proof:0,writes:0};
+  const calls={journal:0,db:0,fence:0,mappings:0,proof:0,writes:0};
   const sources={
     now:()=>now,
     journal:{get:async id=>{calls.journal++;assert.equal(id,op.id);return op;}},
@@ -32,6 +32,11 @@ function fixture(side="todoist") {
       calls.fence++;
       assert.equal(profile,op.profile);
       return {fence:undefined,leases:[]};
+    },
+    inspectMappings:async()=>{
+      calls.mappings++;
+      return {verified:true,mappingCount:1,timeoutSeconds:135,
+        fingerprint:"f".repeat(64),blockers:[],checkedAt:now.toISOString()};
     },
     collectProof:async operation=>{
       calls.proof++;
@@ -63,7 +68,7 @@ test("confirmed singleton Todoist and Calendar operations are inspected without 
       assert.equal(x.deletionAuthorized,false);
       assert.equal(x.executionQueued,false);
       assert.deepEqual(x.blockers,[]);
-      assert.deepEqual(f.calls,{journal:1,db:1,fence:1,proof:1,writes:0});
+      assert.deepEqual(f.calls,{journal:1,db:1,fence:1,mappings:1,proof:1,writes:0});
       assert.equal(JSON.stringify(x).includes(f.op.targetId),false);
       assert.equal(JSON.stringify(x).includes(f.op.providerDigest),false);
     }
@@ -149,4 +154,31 @@ test("inspection is default-deny and cannot become a deletion queue command",asy
     if(old===undefined)delete process.env.ORPHAN_WORKER_INSPECTION_ENABLED;
     else process.env.ORPHAN_WORKER_INSPECTION_ENABLED=old;
   }
+});
+
+test("unsafe or incomplete mapping inventory blocks before any provider enumeration",async()=>{
+  await enabledTest(async()=>{
+    for(const snapshot of [
+      {verified:false,mappingCount:1,timeoutSeconds:135,fingerprint:"f".repeat(64),blockers:["Disabled"]},
+      {verified:true,mappingCount:0,timeoutSeconds:135,fingerprint:"f".repeat(64),blockers:[]},
+      {verified:true,mappingCount:1,timeoutSeconds:undefined,fingerprint:"f".repeat(64),blockers:[]},
+      {verified:true,mappingCount:1,timeoutSeconds:135,fingerprint:"invalid",blockers:[]},
+    ]){
+      const f=fixture();
+      f.sources.inspectMappings=async()=>snapshot;
+      const result=await inspectConfirmedOrphanOperation(f.op.id,f.sources);
+      assert.equal(result.status,"blocked");
+      assert.equal(result.deletionAuthorized,false);
+      assert.equal(f.calls.proof,0);
+    }
+  });
+});
+test("mapping API outages propagate to retryable inspection failures, not success",async()=>{
+  await enabledTest(async()=>{
+    const f=fixture();
+    f.sources.inspectMappings=async()=>{throw Object.assign(new Error("mapping inventory 429"),{status:429});};
+    await assert.rejects(()=>inspectConfirmedOrphanOperation(f.op.id,f.sources),/mapping inventory 429/);
+    assert.equal(f.calls.proof,0);
+    assert.equal(f.calls.writes,0);
+  });
 });
