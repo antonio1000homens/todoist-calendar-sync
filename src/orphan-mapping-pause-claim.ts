@@ -157,7 +157,13 @@ export async function claimOrphanWorkerPause(
   if(epochs[op.profile]!==manifest.epoch)
     throw new OrphanSafetyError("Erasure epoch advanced since immutable manifest staging");
 
-  const claimedAt=now.toISOString();
+  // Evidence collection can take time. Do not reserve an expired approval
+  // even when the initial preflight was valid.
+  const actionTime=sources.now?.()??new Date();
+  if(!Number.isFinite(actionTime.getTime()))
+    throw new OrphanSafetyError("Invalid action-time pause-claim clock");
+  expectConfirmed(op,actionTime.getTime());
+  const claimedAt=actionTime.toISOString();
   const ownerPk=OWNER_PREFIX+digest;
   const receipt:OrphanPauseClaim={...key(PAUSE_PREFIX+id),
     operationId:id,caseId:op.caseId,profile:op.profile,
