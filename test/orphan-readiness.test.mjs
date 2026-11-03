@@ -96,10 +96,12 @@ test("no counterpart ID, invalid IDs or unknown provider state remain blocked",(
   assert.match(bad.blockers.join(" "),/invalid/);
 });
 
-test("UI inspection is a GET-only diagnostic and cannot start deletion",()=>{
+test("UI readiness remains GET-only; independent POST issues a safety preview but cannot confirm deletion",()=>{
   const panel=readFileSync(new URL("../review-ui/orphan-deletion-panel.tsx",import.meta.url),"utf8");
   assert.match(panel,/\/orphan-readiness/);
   assert.match(panel,/Inspect deletion readiness \(read-only\)/);
   assert.match(panel,/no deletion is enabled/);
-  assert.doesNotMatch(panel,/method:"POST"|deleteTask\(|deleteEvent\(|startErasure/);
+  assert.match(panel,/\/orphan-previews/);
+  assert.match(panel,/method:"POST"/);
+  assert.doesNotMatch(panel,/orphan-confirmations|deleteTask\(|deleteEvent\(|startErasure|enqueueErasure/);
 });
