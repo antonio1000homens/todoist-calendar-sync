@@ -220,10 +220,10 @@ test("postflight never converts provider failures or scan budget truncation to v
   rateLimited.setDirect(async()=>{throw Object.assign(new Error("rate limited"),{status:429});});
   await assert.rejects(()=>collectOrphanPostflight(rateLimited.op,rateLimited.sources),/rate limited/);
   const scan=liveFixture("calendar");
-  scan.rows.push({pk:"EVENT#home#event-deleted",sk:"MAP",eventId:"event-deleted"});
+  scan.rows.push({pk:`EVENT#home#${scan.op.targetId}`,sk:"MAP",eventId:scan.op.targetId});
   await assert.rejects(()=>collectOrphanPostflight(scan.op,{...scan.sources,maxRows:1}),/exceeds safe review budget/);
   const foreign=liveFixture("calendar");
-  foreign.rows.push({pk:"EVENT#work#event-deleted",sk:"MAP",eventId:"event-deleted"});
+  foreign.rows.push({pk:`EVENT#work#${foreign.op.targetId}`,sk:"MAP",eventId:foreign.op.targetId});
   const result=await collectOrphanPostflight(foreign.op,foreign.sources);
   assert.equal(result.verified,false);
   assert.match(result.blockers.join(" "),/Dangling or unattributed state reference/);
