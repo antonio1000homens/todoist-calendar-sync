@@ -50,11 +50,27 @@ An ambiguous partial failure leaves a recovery journal and the remaining
 fence/barrier in place, not an invented success. Code paths for a
 `needs_review` terminal state preserve operator evidence.
 
+## Preliminary authoritative read-only inventory
+
+This branch also adds `src/orphan-proof-reader.ts` and
+`test/orphan-proof-reader.test.mjs`. It fetches the selected alert's direct
+provider identities, fully enumerates Todoist project tasks and Google Calendar
+events for all three profiles, inventories project/task comments, and performs a
+bounded, strongly consistent multi-page DynamoDB read. It then evaluates the
+complete set of required proof conditions. Partial paging, failed APIs,
+timeouts and scan budget overruns throw rather than suggesting absence.
+
+The reader is **not yet wired** into the execution worker and its strong scan
+is not a transactional snapshot across pages. Therefore the worker must repeat
+the proof **after** its global drain/profile fence has been verified. Stale
+mapping or historical records currently block execution; they need a
+separately reviewed conditional cleanup plan, never a generic purge.
+
 ## Required integration before enabling deletion
 
-- Build a trusted, fully paginated direct-provider and strongly consistent
-  DynamoDB proof reader for all checks, including exact title/ID and
-  cross-profile ownership; do not treat 404/empty lookup alone as absence.
+- Wire and harden the preliminary read-only proof reader as the trusted worker
+  proof callback; validate performance, complete canonical/reverse references,
+  and read again under the durable fence. Never treat 404 alone as absence.
 - Wire immutable case-bound preview, expiry and typed confirmation to the
   journal. Only a verified, signed-in review operator can issue it. The
   current manual two-ID erasure endpoint must remain disabled.
