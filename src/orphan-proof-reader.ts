@@ -106,8 +106,8 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   const otherRows=wellFormed?data.stateRows.filter(row=>refers(row,op.targetId) &&
     row.pk!=="REVIEW_CASE#"+op.caseId && row.pk!=="MANUAL#"+op.caseId &&
     row.pk!=="ORPHAN_DELETE#"+op.id &&
-    !String(row.pk).startsWith("AUDIT#") &&
-    !String(row.pk).startsWith("REVIEW_CONFLICT#") &&
+    !(String(row.pk).startsWith("AUDIT#") && row.pk===item?.sourceAuditKey) &&
+    !(String(row.pk).startsWith("REVIEW_CONFLICT#") && row.incidentId===op.caseId) &&
     !String(row.pk).startsWith("RECONCILE#")):[];
   checks.cross_profile_mapping_indexes_clear=wellFormed&&!otherRows.some(isMapping);
   checks.recurrence_ownership_clear=wellFormed&&!otherRows.some(isRecurrence);
