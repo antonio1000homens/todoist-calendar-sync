@@ -419,13 +419,29 @@ function App() {
     }
     catch(e:any){if(e.data?.operation)setOperation(e.data.operation);setMessage(e.message);} finally{setBusy(false);}
   };
-  const runReconciliation=async () => {
-    const targetProfile=selected?.profile||reconcileProfile;
+  const runReconciliation=async()=>{
+    // The rendered target and the POST body are derived from one value. There
+    // is deliberately no "all" target or automatic multi-profile fan-out.
+    const target=manualTarget;
+    if(!target){setMessage("Choose one sync profile before requesting reconciliation.");return;}
     if(selected?.decision?.type==="operational_reconciliation_stuck"
-      && !window.confirm(`Request reconciliation for ${targetProfile}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
+      && !window.confirm(`Request reconciliation for ${target}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
+    const ticket=requestGate.begin(`manual:${target}`);
     setBusy(true);setMessage("");
-    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:targetProfile})});setReconciliation({reconciliation:result.run,summary:result.summary});const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${targetProfile}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain; run outcome and inbox status are tracked separately.`); }
-    catch(e:any){setMessage(e.message);} finally{setBusy(false);}
+    try{
+      const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:target})});
+      if(!requestGate.current(ticket))return;
+      setRunViews(current=>({...current,[target]:{
+        status:"ready",data:{reconciliation:result.run,summary:result.summary},diagnostics:[],
+      }}));
+      const cleared=result.clearedDlq?.deleted||0;
+      setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${target}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain for this profile; run diagnostics and inbox counts are tracked separately.`);
+      refreshReconciliation(target,{quiet:true}).catch(e=>{
+        if(requestGate.current(ticket)&&!isAbortError(e))setMessage(`Reconciliation requested for ${target}, but status refresh failed: ${e.message}`);
+      });
+    }catch(error:any){
+      if(requestGate.current(ticket))setMessage(error.message);
+    }finally{if(requestGate.current(ticket))setBusy(false);}
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
@@ -458,43 +474,67 @@ function App() {
     ||alertContext.providerTaskId||alertContext.providerEventId);
   const showProviderPanels=Boolean(hasPrimaryProviderIds||hasLiveIdentity);
   const openCaseCount=cases.filter(item=>item.status==="open"||item.status==="repairing").length;
-  const latestRun=reconciliation?.reconciliation;
-  const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
-      <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);selectCase(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
+      <div className="header-actions"><label>Review alerts — profile <select aria-label="Review alerts — profile" value={profile} onChange={e=>changeReviewProfile(e.target.value)}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All profiles":p}</option>)}</select></label>
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
-    {message && <p className="notice" role="status">{message}</p>}
-    {reconciliation?.summary&&<section className="preview reconciliation-overview" aria-label="Latest reconciliation">
-      <h2>Latest reconciliation · {reconcileProfile}</h2>
-      <dl className="overview-grid"><dt>Run status</dt><dd>{reconciliation.summary.runStatus.replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
-        <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
-        <dt>Last run activity</dt><dd>{latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</dd>
-        <dt>Unresolved diagnostic counter</dt><dd>{reconciliation.summary.runUnresolved}</dd>
-        <dt>Items counted as blocked</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
-        <dt>Open review alerts</dt><dd>{openCaseCount} in this inbox · {reconciliation.summary.actionableCaseCount} actionable across the profile</dd></dl>
-      <p>Run diagnostics describe work deferred, blocked or in conflict during this generation. Open review alerts are persistent decisions in the review inbox; these counts measure different things. An intentional exclusion can still be counted as blocked, and an unchanged item can reappear if its inconsistency remains. Case status and a diagnostic's “review case” status show whether an alert is open, historic, or newly created.</p>
-    </section>}
-    {reconciliation?.reconciliation?.generation&&<section className="preview reconciliation-items"><h2>Items deferred or blocked during this run</h2>
-      <p>Generation {reconciliation.reconciliation.generation} · {latestRunAt?`run activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These are run diagnostics, not a count of open alerts. Provider objects are not changed by this report.</p>
-      {reconciliationDiagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
-        {reconciliationDiagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
-          <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
-          <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
-          {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
-          {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
-          {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
-          {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
-          {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
-          <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
-        </li>)}
-      </ul>}
-      {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more run diagnostics</button>}
-    </section>}
+    {message&&<p className="notice" role="status">{message}</p>}
+    {profile==="all"&&<p className="notice">All profiles shows separate reconciliation runs for home, antonio and work. The combined review-alert list is not a reconciliation run and does not trigger any provider actions.</p>}
+    {overviewProfiles.map(runProfile=>{
+      const view=runViews[runProfile];
+      const reconciliation=view?.data;
+      const latestRun=reconciliation?.reconciliation;
+      const summary=reconciliation?.summary;
+      const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
+      return <React.Fragment key={runProfile}>
+        <section className="preview reconciliation-overview" aria-label={`Latest reconciliation for ${runProfile}`}>
+          <h2>Latest reconciliation · {runProfile}</h2>
+          {(!view||view.status==="loading")&&<p role="status">Loading reconciliation state for {runProfile}…</p>}
+          {view?.status==="error"&&<p className="warning" role="status">Could not load reconciliation for {runProfile}: {view.error}. This is not evidence of a successful or failed run.</p>}
+          {view?.status==="ready"&&!summary&&<p>No recorded reconciliation summary for {runProfile}.</p>}
+          {view?.status==="ready"&&summary&&<>
+            <dl className="overview-grid">
+              <dt>Run status</dt><dd>{(summary.runStatus||"unknown").replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
+              <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
+              <dt>Last run activity</dt><dd>{latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</dd>
+              <dt>Unresolved diagnostic counter for {runProfile}</dt><dd>{summary.runUnresolved??"Not recorded"}</dd>
+              <dt>Items counted as blocked in this run</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
+              <dt>Actionable review cases for {runProfile}</dt><dd>{summary.actionableCaseCount??"Not recorded"}</dd>
+            </dl>
+            <p>These are {runProfile}-only reconciliation results. The unresolved and blocked figures describe run diagnostics, not the number of open alerts in the review filter. Actionable cases are counted separately from run results and from the inbox list.</p>
+          </>}
+        </section>
+        {view?.status==="ready"&&latestRun?.generation&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
+          <h3>Run diagnostics · {runProfile}</h3>
+          <p>Generation {latestRun.generation} · {latestRunAt?`activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These per-run diagnostics are not open-alert counts and this report does not change provider data.</p>
+          {view.diagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
+            {view.diagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
+              <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
+              <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
+              {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
+              {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
+              {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
+              {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
+              {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
+              <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
+            </li>)}
+          </ul>}
+          {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
+        </section>}
+      </React.Fragment>;
+    })}
     <ErasurePanel api={api} />
-    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{openCaseCount} open/actionable case(s) shown in this inbox.</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
-      <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
+      <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Manual reconciliation · single profile</h3>
+          {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
+            <option value="">Select a profile — no reconciliation requested</option>
+            {SYNC_PROFILES.map(p=><option key={p} value={p}>{p}</option>)}
+          </select></label>}
+          <p>Target sync profile: <strong>{manualTarget||"Choose one profile above"}</strong>. This action runs only for the indicated profile; changing the review-alert filter never starts reconciliation.</p>
+          <button onClick={runReconciliation} disabled={busy||!manualTarget}>Run reconciliation {manualTarget?`for ${manualTarget}`:"(select profile)"}</button>
+          {manualTarget&&runViews[manualTarget]?.data&&<details><summary>Latest status for {manualTarget}</summary><pre>{JSON.stringify(runViews[manualTarget].data,null,2)}</pre></details>}
+        </div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         <section className="preview alert-evidence">
           <details><summary>Recorded alert evidence</summary>
