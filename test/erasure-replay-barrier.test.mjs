@@ -62,9 +62,13 @@ test("calendar IDs are profile-scoped: unrelated profile event IDs are not rejec
 
 function proof(){
   return {
-    operationId:"operator-operation-id",epoch:7,confirmationId:"fresh-single-use-confirmation",
-    recoveryFingerprint:"a".repeat(64),postflightFingerprint:"b".repeat(64),
+    operationId:"operator-operation-id",epoch:7,
+    confirmationId:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    inspectedFingerprint:"a".repeat(64),postflightFingerprint:"b".repeat(64),
+    originalPreviewFingerprint:"c".repeat(64),
+    reviewedAt:"2026-11-03T19:40:00.000Z",
     identity:{profile:"work",taskId:"deleted-task",eventIds:["deleted-event","deleted-alias"]},
+    calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-alias"]},
     journalPresent:true,
   };
 }
@@ -86,8 +90,10 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_POSTWRITE_CONFIRMATION#")
     &&x.Delete.ConditionExpression.includes("#status=:consumed")));
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_OPERATION#")
-    &&x.Delete.ConditionExpression.includes("recovery.mode=:mode")
-    &&x.Delete.ConditionExpression.includes("recovery.postflightFingerprint=:postflight")));
+    &&x.Delete.ConditionExpression.includes("postwriteReview.mode=:mode")
+    &&x.Delete.ConditionExpression.includes("postwriteReview.postflightFingerprint=:postflight")
+    &&x.Delete.ConditionExpression.includes("postwriteReview.#status=:reviewed")
+    &&x.Delete.ConditionExpression.includes("attribute_not_exists(recovery)")));
   // Every action's value map must match its own condition exactly. DynamoDB
   // rejects unused values (even if used by a neighbouring transaction action).
   for (const action of tx) {
@@ -121,7 +127,97 @@ test("missing new confirmation, epoch and oversize alias set cannot construct a 
     {confirmationId:""},
     {epoch:0},
     {postflightFingerprint:""},
+    {inspectedFingerprint:"not-a-hash"},
+    {originalPreviewFingerprint:""},
+    {reviewedAt:"not-a-timestamp"},
+    {confirmationId:"non-uuid-token"},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:[]}},
+    {calendarAliases:{home:[],antonio:[],work:["deleted-event"]}},
+    {calendarAliases:{home:[],work:["deleted-event","deleted-alias"]}},
+    {calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-event"]}},
+    {calendarAliases:{home:[],antonio:[],work:Array.from({length:33},(_,i)=>"event-"+i)}},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:Array.from({length:33},(_,i)=>"event-"+i)}},
   ]) assert.throws(()=>atomicReplayRelease({...proof(),...patch}),ErasureReplayUnavailableError);
+});
+
+test("release transaction matches the exact reviewed-fenced and consumed-token schema from #304",()=>{
+  const input=proof();
+  const tx=atomicReplayRelease(input).input.TransactItems;
+  const operation=tx.find(x=>x.Delete?.Key?.pk==="ERASURE_OPERATION#"+input.operationId)?.Delete;
+  const token=tx.find(x=>x.Delete?.Key?.pk==="ERASURE_POSTWRITE_CONFIRMATION#"+input.operationId)?.Delete;
+  assert.ok(operation && token);
+  const sourceOperation={
+    status:"review_required",profile:"work",
+    selectedActions:{deleteTodoist:true,deleteCalendar:true},target:{deleteCalendar:true},
+    actionPlan:{todoistTask:{id:"deleted-task"},calendarEvent:{id:"deleted-event"}},
+    previewFingerprint:input.originalPreviewFingerprint,updatedAt:input.reviewedAt,
+    postwriteReview:{mode:"post_write",status:"reviewed_fenced",epoch:7,
+      confirmationId:input.confirmationId,inspectedFingerprint:input.inspectedFingerprint,
+      postflightFingerprint:input.postflightFingerprint,reviewedAt:input.reviewedAt},
+  };
+  const sourceToken={
+    mode:"post_write",status:"consumed",operationId:input.operationId,profile:"work",epoch:7,
+    confirmationId:input.confirmationId,inspectedFingerprint:input.inspectedFingerprint,
+    postflightFingerprint:input.postflightFingerprint,
+    originalPreviewFingerprint:input.originalPreviewFingerprint,
+  };
+  // Validate each attribute referenced by the DynamoDB condition actually
+  // exists on the separate durable operation and token shapes from PR #304.
+  for(const key of ["status","mode","epoch","confirmationId","inspectedFingerprint",
+    "postflightFingerprint","reviewedAt"])
+    assert.equal(sourceOperation.postwriteReview[key], key==="status"?"reviewed_fenced":
+      key==="mode"?"post_write":key==="epoch"?7:input[key]);
+  for(const [name,value] of Object.entries({
+    ":required":"review_required",":reviewed":"reviewed_fenced",
+    ":mode":"post_write",":epoch:":7,
+  })) {
+    if(name===":epoch:")continue;
+    assert.equal(operation.ExpressionAttributeValues[name],value);
+  }
+  assert.ok(operation.ConditionExpression.includes("postwriteReview.#status=:reviewed"));
+  assert.ok(operation.ConditionExpression.includes("postwriteReview.reviewedAt=:reviewedAt"));
+  assert.ok(operation.ConditionExpression.includes("updatedAt=:reviewedAt"));
+  assert.ok(operation.ConditionExpression.includes("selectedActions.deleteCalendar=:yes"));
+  assert.ok(operation.ConditionExpression.includes("selectedActions.deleteTodoist=:yes"));
+  assert.ok(operation.ConditionExpression.includes("attribute_exists(actionPlan.calendarEvent)"));
+  assert.ok(operation.ConditionExpression.includes("attribute_exists(actionPlan.todoistTask)"));
+  assert.ok(operation.ConditionExpression.includes("attribute_not_exists(recovery)"));
+  assert.ok(token.ConditionExpression.includes("originalPreviewFingerprint=:original"));
+  assert.ok(token.ConditionExpression.includes("attribute_not_exists(expiresAtMs)"));
+  assert.equal(token.ExpressionAttributeValues[":inspected"],sourceToken.inspectedFingerprint);
+  assert.equal(token.ExpressionAttributeValues[":postflight"],sourceToken.postflightFingerprint);
+  assert.equal(token.ExpressionAttributeValues[":original"],sourceToken.originalPreviewFingerprint);
+  assert.equal(token.ExpressionAttributeValues[":epoch"],sourceToken.epoch);
+  assert.equal(sourceOperation.updatedAt,sourceOperation.postwriteReview.reviewedAt);
+  assert.equal(sourceToken.status,"consumed");
+});
+test("cross-profile Calendar aliases create scoped HMAC markers without blocking unrelated event IDs",()=>{
+  const p={...proof(),calendarAliases:{
+    home:["home-recurring-master"],antonio:["antonio-moved-instance"],
+    work:["deleted-event","deleted-alias"]}};
+  const tx=atomicReplayRelease(p).input.TransactItems;
+  const markerPuts=tx.filter(x=>x.Put).map(x=>x.Put);
+  assert.equal(markerPuts.length,REPLAY_PROFILES.length+4);
+  assert.equal(markerPuts.filter(x=>x.Item.sk.startsWith("EVENT#")).length,4);
+  for(const profile of REPLAY_PROFILES){
+    const expected=p.calendarAliases[profile].length;
+    assert.equal(markerPuts.filter(x=>x.Item.sk.startsWith("EVENT#")
+      &&x.Item.pk==="ERASURE_REPLAY#"+profile).length,expected);
+  }
+  assert.equal(markerPuts.some(x=>Object.keys(x.Item).some(key=>key==="taskId"||key==="eventId")),false);
+  assert.equal(JSON.stringify(markerPuts).includes("home-recurring-master"),false);
+  assert.equal(JSON.stringify(markerPuts).includes("antonio-moved-instance"),false);
+  const original=atomicReplayRelease(proof()).input.TransactItems;
+  assert.equal(original.filter(x=>x.Put).length,REPLAY_PROFILES.length+2,
+    "unrelated calendars are not automatically marked");
+});
+test("overflow of one DynamoDB transaction refuses release instead of split batches",()=>{
+  const p={...proof(),identity:{
+    ...proof().identity,eventIds:Array.from({length:32},(_,i)=>"work-"+i)},
+    calendarAliases:{
+      home:Array.from({length:32},(_,i)=>"home-"+i),
+      antonio:Array.from({length:32},(_,i)=>"antonio-"+i),
+      work:Array.from({length:32},(_,i)=>"work-"+i),
+    }};
+  assert.throws(()=>atomicReplayRelease(p),ErasureReplayUnavailableError);
 });

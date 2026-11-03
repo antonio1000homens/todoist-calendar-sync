@@ -173,3 +173,51 @@ This increment does not finish the source-inventory security review, unknown
 comment ownership, Calendar creation provenance, old qualified Lambda versions,
 atomic post-write postflight/confirmation, or Work-profile disposable staging.
 It does not unlock post-write recovery or justify closing #243, #239 or #113.
+
+## Staged post-write finalisation contract after merged #304 (no executor)
+
+The prospective `atomicReplayRelease()` command builder has been updated to
+match the **actual durable fields** written by the now-merged post-write
+acknowledgement:
+
+- `ERASURE_OPERATION#{id}/STATE` must remain `review_required`, with
+  `postwriteReview.status=reviewed_fenced`,
+  `postwriteReview.mode=post_write`, the matching consumed confirmation,
+  expected epoch, original preview fingerprint, reviewed timestamp (equal
+  to `updatedAt`) and inspected/postflight evidence fingerprints.
+  Original selected Todoist **and** Calendar deletion, both original
+  provider action-plan entries and absence of a pre-write recovery are
+  required in the same conditional delete.
+- The distinct `ERASURE_POSTWRITE_CONFIRMATION#{id}/STATE` must be
+  `consumed`, match the **same** operation, profile, token, epoch and
+  fingerprints, and have no remaining expiry field. An issued, expired,
+  previous pre-write or old deletion token cannot satisfy it.
+- A future independently verified alias manifest must specify
+  `home`, `antonio` and `work` (even when some are empty), plus the
+  exact source-profile Calendar aliases. A Todoist task marker is placed
+  in all three profiles; each Calendar event/recurrence alias is marked
+  only in its independently verified profile. Any incomplete, malformed,
+  duplicate, mismatched or oversized manifest is rejected. **Merely
+  supplying an array does not constitute proof that a profile was scanned.**
+- In **one** DynamoDB transaction, insert only pseudonymous HMAC marker
+  keys, conditionally delete the identity-bearing original operation and
+  consumed confirmation, verify the monotonic epoch and atomically remove
+  only the matching active fence and its journal (or verify journal absence).
+  Never split this transaction; the 100-action limit is fail-closed.
+  The builder **does not send** the transaction to DynamoDB.
+
+This increment contains **no production caller** for the builder; an
+executable test asserts that no source worker/API/controller imports or
+invokes the release function. The intended privileged post-write executor
+is still missing. Specifically, independent action-time provider readback,
+all-profile alias discovery and absence, old qualified Lambda version
+retirement, complete writer-admission proof, explicit mapping state
+restoration sequencing, single-use release authorization and
+cross-profile failure injection are unimplemented. A successful
+`REVIEW AND KEEP FENCED` acknowledgement is **not** release
+authorization.
+
+The original #243 issue was closed when PR #304 merged, but that is not
+technical acceptance of these missing safety requirements. Continue
+tracking them separately before enabling `ERASURE_REPLAY_BARRIER_VERSION`,
+deploying any executable release, or removing the original fence.
