@@ -221,3 +221,39 @@ The original #243 issue was closed when PR #304 merged, but that is not
 technical acceptance of these missing safety requirements. Continue
 tracking them separately before enabling `ERASURE_REPLAY_BARRIER_VERSION`,
 deploying any executable release, or removing the original fence.
+
+## Cross-profile Calendar task-link observation after historical Lambda audit (#307)
+
+The read-only Calendar provider now offers
+`listLinkedEventsByTodoistTaskId(taskId)`, which returns *all* events matching
+the provider's shared task-ID index (including cancelled records and explicit
+recurrence overrides). The existing `findByTodoistTaskId` retains its
+unique-winner/ambiguous refusal behaviour. The complete query tracks all
+pages, rejects repeated page tokens, conflicting duplicate event snapshots,
+invalid pages and missing event IDs. It does not mutate Calendar data.
+
+`observeCrossProfileCalendarAliases` accepts independently configured
+per-profile readers and **requires fresh successful reads for home, antonio
+and work**. It records exact observed event IDs, cancelled aliases and
+recurrence parent *hints* without exposing a release-authoritative
+`calendarAliases` property.
+
+These reads are **insufficient** for marker installation or fence release.
+The Google sharedExtendedProperty filter can omit historic/untagged links,
+series instances, legacy comments and mapping records. Even a successful
+empty result in one profile is only an observation, **never** proof of
+absence. The collector does not scan DynamoDB, independently resolve
+Todoist/comment ownership, validate source and destination recurrence
+masters, compare direct provider ETags, or confirm leases/epochs.
+
+**No deployed worker/API imports this observation as authorisation.** A
+future privileged verifier must reconcile these observations with fully
+paginated strong DynamoDB state, all project/task comments, direct Todoist
+and Calendar item/master/instance reads in every profile, old versions and
+new independent operator confirmation before calling
+`atomicReplayRelease()`. Any missing provenance keeps the fence in place.
+
+This is a staged read-only primitive, not an accepted #307 safety gate.
+`ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
+mappings, replay old queues or delete any historical Lambda version based
+on these results.
