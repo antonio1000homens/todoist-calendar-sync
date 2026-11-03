@@ -2421,16 +2421,17 @@ export class Synchronizer {
     const desiredRrule = todoistRecurrenceToRrule(task);
     const phaseBPreview = phaseBProjectionPreview(task, desiredRrule);
     const previousSeriesId = mapping?.recurrenceOwner === "todoist" ? mapping.seriesId : undefined;
+    // Even when the DynamoDB mapping is missing, the provider master may
+    // retain a verified Todoist ownership marker. Never overwrite/delete
+    // that master for a still-unverified Phase B cadence.
+    if (phaseBPreview.phaseBFamily && !desiredRrule && existingEvent?.recurrence?.length
+      && (mapping?.recurrenceOwner === "todoist"
+        || existingEvent.extendedProperties?.shared?.syncRecurrenceOwner === "todoist")) {
+      return this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
+      });
+    }
     if (mapping?.recurrenceOwner === "todoist" && existingEvent?.recurrence?.length && !desiredRrule) {
-      // A newly recognized-but-unverified Phase B phrase must never cause
-      // deletion of the established Calendar master, its past occurrences,
-      // recurrence link or active mapping. Defer this edit for review until
-      // original anchor, provider completion and instance readback are proved.
-      if (phaseBPreview.phaseBFamily) {
-        return this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
-          taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
-        });
-      }
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
       await calendar.deleteEvent(existingEvent.id).catch((error: unknown) => {
