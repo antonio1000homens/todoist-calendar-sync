@@ -326,3 +326,43 @@ partial deletion flow, fault-injection matrix and disposable Work-profile
 staging. Do not enable `ERASURE_REPLAY_BARRIER_VERSION`, restore worker
 event-source mappings, remove fences, replay the DLQ, or run a live destructive
 test based solely on this preview.
+
+
+## Post-write fenced-review acknowledgement (issue #243, staged)
+
+An independently verified `fully_deleted_candidate` may now be bound to a
+**new, distinct, single-use review acknowledgement**, but this is NOT an
+authorisation to execute a post-write recovery.
+
+The authenticated review portal offers `POST
+/review/api/erasure-postwrite-recoveries/{operationId}/review-token` to issue
+a 5-minute token and `POST .../{operationId}/acknowledge` to consume it,
+after typing **REVIEW AND KEEP FENCED**, the exact original operation ID,
+and profile. The service checks full recovery evidence afresh before each
+action. The token is bound to operator, immutable original selections,
+provider action plan, exact target/alias inventory, operation revision,
+strong postflight snapshot, epoch and fenced worker state. Confirmation
+consumption is a conditional DynamoDB transaction, including the owned
+fence, epoch and journal, that persists only
+`postwriteReview.status=reviewed_fenced` and consumes a post-write-specific
+confirmation row. The expired token can be replaced before consumption;
+a consumed token cannot be reissued or replayed.
+
+**Explicit rollout gate:** `ERASURE_POSTWRITE_REVIEW_VERSION` defaults to
+off. No deployment/template change enables it. Even if set to `1`,
+the API can only record an operator's review while preserving the original
+`review_required` operation, all provider data/absence evidence, the
+existing erasure fence, writer mappings and the monotonic epoch.
+
+No SQS dispatch, provider mutation, replay-marker installation or fence
+release is possible through this acknowledgement. The future privileged
+post-write executor will need **new independent verification and staged
+review** before any recovery. The pre-write `RESTORE SYNC` confirmation
+and the original erasure confirmation are not accepted.
+
+The partial/ambiguous cases do not qualify for this acknowledgement:
+they remain fenced until a separately reviewed, newly authorised
+action-time deletion/completion implementation exists. Keep #243 open
+until the full replay barrier, qualified Lambda/version audit, fault
+matrix, privacy/IAM approval and disposable Work-profile staging are
+complete. No production erasure or recovery is part of this increment.
