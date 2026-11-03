@@ -293,7 +293,10 @@ export function compareOccurrenceSemantics(left: RecurrenceSemantics, right: Rec
   limit = 12): { equivalent: boolean; reason: RecurrenceReason; leftDates: string[]; rightDates: string[] } {
   const leftDates = occurrenceDates(left, limit);
   const rightDates = occurrenceDates(right, limit);
-  const equivalent = left.localTime === right.localTime && left.timeZone === right.timeZone
+  // Inadequate horizons must not look equivalent merely because both rules
+  // yielded one distant occurrence. Finite families stay in rolling fallback.
+  const fullWindow = leftDates.length === limit && rightDates.length === limit;
+  const equivalent = fullWindow && left.localTime === right.localTime && left.timeZone === right.timeZone
     && leftDates.length === rightDates.length
     && leftDates.every((value, index) => value === rightDates[index])
     && left.count === right.count && left.until === right.until;
