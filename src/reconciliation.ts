@@ -1,7 +1,7 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
-import { classifyDeletedRecurrenceLinks } from "./verified-deletion.js";
+import { classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -575,9 +575,6 @@ export class SnapshotReconciler {
   private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair, includeHistory = false): Promise<void> {
     if (!(this.state instanceof StateRepository)) return;
     const review = new ReviewStore();
-    // Do not scan the recurrence GSI until a candidate has independently
-    // verified provider deletions. Every actual removal uses a base-table CAS.
-    let links: Awaited<ReturnType<StateRepository["listRecurrenceLinks"]>> | undefined;
     let cursor = await review.deletionSweepCursor(profile, includeHistory);
     let examined = 0;
     do {
@@ -588,29 +585,49 @@ export class SnapshotReconciler {
           || item.reason.startsWith("operational_")) continue;
         const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
         if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
-        const recurring = item.decision?.type?.includes("recurrence_task_deleted");
+        const recurring = item.decision?.type?.includes("recurrence_task_deleted") === true;
         const masterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
-        // A cancelled active occurrence alone is never evidence of deleting
-        // the recurring master. Unidentified masters must remain in review.
-        if (recurring && (!masterId || !eventIds.includes(masterId))) continue;
-        let absent = true;
-        for (const taskId of taskIds) {
-          if (await this.currentTask(clients.todoist, taskId)
-            || await this.state.getMappingByTaskAnyProfile(taskId)
-            || await this.state.syncBlocked(profile, { taskId })) { absent = false; break; }
-        }
-        if (!absent) continue;
-        for (const eventId of eventIds) {
-          const event = await this.currentEvent(clients.calendar, eventId);
-          if ((event && event.status !== "cancelled")
-            || (await Promise.all((["home", "antonio", "work"] as const)
+        const activeInstanceId = item.decision?.activeInstanceId || item.decision?.mappingSnapshot?.activeInstanceId;
+        if (recurring && (!masterId || !activeInstanceId
+          || !eventIds.includes(masterId) || !eventIds.includes(activeInstanceId))) continue;
+
+        const readProviders = async (): Promise<{
+          absent: boolean; masterSeriesId?: string; reason?: string;
+        }> => {
+          for (const taskId of taskIds) {
+            if (await this.currentTask(clients.todoist, taskId)
+              || await this.state.getMappingByTaskAnyProfile(taskId)
+              || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
+          }
+          const events = new Map<string, CalendarEvent | undefined>();
+          for (const eventId of eventIds) {
+            const event = await this.currentEvent(clients.calendar, eventId);
+            events.set(eventId, event);
+            if (event && event.status !== "cancelled") return { absent: false };
+            if ((await Promise.all((["home", "antonio", "work"] as const)
               .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
-            || await this.state.syncBlocked(profile, { eventId })) { absent = false; break; }
-        }
-        if (!absent) continue;
-        links ||= (await Promise.all((["home", "antonio", "work"] as const)
-          .map(candidate => this.state.listRecurrenceLinks(candidate)))).flat();
-        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links);
+              || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
+          }
+          if (!recurring) return { absent: true };
+          const relationship = verifyCancelledSeries(masterId, activeInstanceId, eventIds, events);
+          return { absent: relationship.valid, masterSeriesId: relationship.masterSeriesId,
+            reason: relationship.reason };
+        };
+        const first = await readProviders();
+        if (!first.absent || recurring && !first.masterSeriesId) continue;
+        const seriesKeys = recurring
+          ? deletedSeriesKeys(taskIds, eventIds, first.masterSeriesId!,
+            [item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId])
+          : [...new Set([...taskIds, ...eventIds])];
+        if (seriesKeys.length > 20) continue;
+
+        // The profile lookup GSI is eventually consistent and cannot prove
+        // absence. The exact task-, master-, occurrence- and iCalUID-keyed
+        // recurrence records are read strongly across all profiles instead.
+        // Their absences are fenced again INSIDE the terminal transaction.
+        const links = await readExactRecurrenceLinks(seriesKeys,
+          (owner, seriesId) => this.state.getRecurrenceLink(owner, seriesId));
+        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links, seriesKeys);
         if (classification.blocked.length) {
           await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
             taskId: taskIds[0], eventId: eventIds[0],
@@ -618,28 +635,17 @@ export class SnapshotReconciler {
           });
           continue;
         }
-        // A GSI inventory can lag. Re-read all proposed stale links strongly,
-        // and refuse anything that changed before the conditional transaction.
-        for (const link of classification.stale) {
-          const current = await this.state.getRecurrenceLink(link.profile, link.seriesId);
-          if (!current || !same(current, link)) { absent = false; break; }
-        }
-        if (!absent) continue;
-        // Tighten the provider read/write gap before committing. DynamoDB
-        // ownership/mapping/repair fences are rechecked within the transaction.
-        for (const taskId of taskIds) if (await this.currentTask(clients.todoist, taskId)) { absent = false; break; }
-        if (!absent) continue;
-        for (const eventId of eventIds) {
-          const event = await this.currentEvent(clients.calendar, eventId);
-          if (event && event.status !== "cancelled") { absent = false; break; }
-        }
-        if (!absent) continue;
+        // Re-read all provider identities after the state inventory. A changed
+        // master UID invalidates the series-key set rather than using old data.
+        const final = await readProviders();
+        if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, {
           profile, taskIds, eventIds, staleLinks: classification.stale,
+          seriesKeys, ...(recurring ? {
+            masterId, activeInstanceId, masterSeriesId: first.masterSeriesId,
+          } : {}),
         });
         if (closed) {
-          const retired = new Set(classification.stale.map(link => `${link.profile}/${link.seriesId}`));
-          links = links.filter(link => !retired.has(`${link.profile}/${link.seriesId}`));
           await this.state.audit(profile, "verified_deletion_cleanup_completed", {
             taskId: taskIds[0], eventId: eventIds[0],
             retiredRecurrenceLinks: classification.stale.map(link => link.seriesId),
