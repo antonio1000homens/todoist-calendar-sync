@@ -134,7 +134,7 @@ test("Calendar provider evidence cannot be inferred from an HTTP write or genera
 
 test("finite and completion-relative Todoist rules are excluded from Phase B", () => {
   for (const phrase of ["every! 3 months", "every 2, 15, 27 until 1 Dec",
-    "every other Friday starting 2 Jan", "every last workday", "every 3 months"]) {
+    "every other Friday starting 2 Jan", "every last workday"]) {
     assert.equal(todoistPhaseBCandidate(task("2027-01-02", phrase)).disposition, "unsupported", phrase);
   }
 });
@@ -166,4 +166,23 @@ test("timed Phase B needs observed timezone and consistent DST-aware local wall-
   assert.equal(verifyTodoistPhaseBReadback(before, anchor, { ...readback,
     calendarMaster: { ...calendar, start: { ...calendar.start, timeZone: "UTC" } } }).disposition,
     "rolling_required");
+});
+
+
+test("quarterly provider normalization to every 3 months retains the same guarded candidate", () => {
+  const anchor = knownAnchor("2027-01-15");
+  const first = todoistPhaseBCandidate(task("2027-01-15", "every quarter"), anchor);
+  const normalized = todoistPhaseBCandidate(task("2027-04-15", "every 3 months"), anchor);
+  assert.equal(normalized.disposition, "rolling_required");
+  assert.equal(normalized.candidateRrule, first.candidateRrule);
+  assert.equal(normalized.reason, "provider_readback_required");
+});
+
+test("timed candidates reject floating datetimes and sub-minute precision", () => {
+  const anchor = knownAnchor("2027-01-15T09:00:00+00:00", "Europe/London");
+  for (const datetime of ["2027-01-15T09:00:00", "2027-01-15T09:00:00.500Z"]) {
+    const item = task("2027-01-15", "every other friday", "task-phase-b",
+      { date: undefined, datetime, timezone: "Europe/London" });
+    assert.equal(todoistPhaseBCandidate(item, anchor).disposition, "rolling_required", datetime);
+  }
 });
