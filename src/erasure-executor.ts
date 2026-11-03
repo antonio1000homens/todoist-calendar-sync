@@ -46,6 +46,12 @@ export interface ErasureOperation {
   status: ErasureOperationStatus;
   lifecycle?: FencedLifecycle;
   recovery?: import("./erasure-recovery.js").RecoveryState;
+  /** Post-write operator acknowledgement only: no executor, admission or fence release. */
+  postwriteReview?: {
+    mode:"post_write";status:"reviewed_fenced";epoch:number;
+    confirmationId:string;inspectedFingerprint:string;postflightFingerprint:string;
+    reviewedAt:string;
+  };
   createdAt: string;
   updatedAt: string;
   requestId?: string;

@@ -1,5 +1,5 @@
 import React, {useEffect,useState} from "react";
-import {canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
+import {canAcknowledgeFencedPostWrite,canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
 
 // Historical erasure operations must remain inspectable/recoverable after the
 // arbitrary item-erasure UI is removed. Never start or resume provider deletes.
@@ -13,11 +13,15 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [busy,setBusy]=useState(false),[notice,setNotice]=useState("");
   const [preview,setPreview]=useState<any>(),[confirmation,setConfirmation]=useState<any>();
   const [postWriteAssessment,setPostWriteAssessment]=useState<any>();
+  const [postWriteToken,setPostWriteToken]=useState<any>();
+  const [postWriteTyped,setPostWriteTyped]=useState({phrase:"",operationId:"",profile:""});
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
   const [recoveryStatus,setRecoveryStatus]=useState<string>();
   const lookup=async()=>{
     if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
-    setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
+    setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
+    setPostWriteTyped({phrase:"",operationId:"",profile:""});
+    setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
     try{
       const result=await api("erasure-operations/"+encodeURIComponent(operationId));
       setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);
@@ -40,11 +44,37 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   };
   const inspectPostWrite=async()=>{
     if(!operation||busy)return;
-    setBusy(true);setPostWriteAssessment(undefined);setNotice("");
+    setBusy(true);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
+    setPostWriteTyped({phrase:"",operationId:"",profile:""});setNotice("");
     try{
       const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId));
       setPostWriteAssessment(result.assessment);
     }catch(e:any){setNotice(e.message||"Post-write evidence inspection failed; fence remains protected");}
+    finally{setBusy(false);}
+  };
+  const requestPostWriteToken=async()=>{
+    if(!operation||busy||postWriteAssessment?.reviewEnabled!==true
+      ||postWriteAssessment?.classification!=="fully_deleted_candidate"
+      ||postWriteAssessment?.reviewStatus==="reviewed_fenced")return;
+    setBusy(true);setPostWriteToken(undefined);setNotice("");
+    try{
+      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/review-token",
+        {method:"POST",body:"{}"});
+      setPostWriteToken(result);
+    }catch(e:any){setNotice(e.message||"Post-write review token unavailable; preserve fence");}
+    finally{setBusy(false);}
+  };
+  const acknowledgePostWrite=async()=>{
+    if(!operation||busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation))return;
+    setBusy(true);
+    try{
+      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/acknowledge",{
+        method:"POST",body:JSON.stringify({...postWriteTyped,confirmationId:postWriteToken.confirmationId}),
+      });
+      setPostWriteToken(undefined);setPostWriteTyped({phrase:"",operationId:"",profile:""});
+      setPostWriteAssessment((value:any)=>({...value,reviewStatus:result.review?.status||"reviewed_fenced"}));
+      setNotice("Review recorded. Profile remains fenced; no deletion, worker dispatch or sync restoration was performed.");
+    }catch(e:any){setPostWriteToken(undefined);setNotice(e.message||"Post-write review rejected; fence remains protected");}
     finally{setBusy(false);}
   };
   const requestConfirmation=async()=>{
@@ -117,7 +147,19 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile <strong>{postWriteAssessment.profile}</strong> · fence release: <strong>not authorised</strong></p>
           <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · both original targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · matching fence: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"}</p>
           <p>Provider items absent: {postWriteAssessment.evidence?.providersAbsent?"yes":"no"} · state rows absent: {postWriteAssessment.evidence?.stateRowsAbsent?"yes":"no"} · original worker mappings restored: {postWriteAssessment.evidence?.workerMappingsRestored?"yes":"no"}</p>
-          <p className="warning">Only safe action: preserve the existing fence for independently authorised follow-up. No post-write confirmation or apply action exists.</p>
+          <p className="warning">Only safe action: preserve the existing fence. Recording a review does not authorise provider changes, recovery, or fence release.</p>
+          {postWriteAssessment.reviewStatus==="reviewed_fenced"&&<p role="status">Post-write evidence review recorded; still fenced.</p>}
+          {postWriteAssessment.reviewEnabled===true&&postWriteAssessment.classification==="fully_deleted_candidate"
+            &&!postWriteAssessment.reviewStatus&&!postWriteToken&&
+            <button className="secondary" disabled={busy} onClick={()=>void requestPostWriteToken()}>Request fenced-review token</button>}
+          {postWriteToken&&<div className="erasure-results" aria-label="Post-write review acknowledgement">
+            <p>This records a single-use evidence acknowledgement ONLY. It cannot resume deletion, restore synchronization or remove the fence. Token expires {new Date(postWriteToken.expiresAt).toLocaleString()}.</p>
+            <label>Type REVIEW AND KEEP FENCED<input autoComplete="off" value={postWriteTyped.phrase} onChange={e=>setPostWriteTyped(v=>({...v,phrase:e.target.value}))}/></label>
+            <label>Repeat operation ID<input autoComplete="off" value={postWriteTyped.operationId} onChange={e=>setPostWriteTyped(v=>({...v,operationId:e.target.value}))}/></label>
+            <label>Repeat profile<input autoComplete="off" value={postWriteTyped.profile} onChange={e=>setPostWriteTyped(v=>({...v,profile:e.target.value}))}/></label>
+            <button disabled={busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation)}
+              onClick={()=>void acknowledgePostWrite()}>Record review (remain fenced)</button>
+          </div>}
           {postWriteAssessment.blockers?.length>0&&<ul>{postWriteAssessment.blockers.map((message:string,i:number)=><li key={i} className="warning">{message}</li>)}</ul>}
         </div>}
         {confirmation&&<>
