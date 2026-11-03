@@ -4,6 +4,7 @@ import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
+import { assessOrphanReadiness } from "./orphan-readiness.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
@@ -411,6 +412,29 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const results = await Promise.all(profiles.map(async item => ({ profile:item, ...(await store.listCases(item,undefined,history)) })));
       const items = results.flatMap(result=>result.items).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
       return response(200,{items});
+    }
+    // #287: explicit on-demand server diagnostic. Never returns a deletion token,
+    // never accepts arbitrary IDs, and makes no provider or DynamoDB writes.
+    if (method === "GET" && segments[0] === "cases" && segments[2] === "orphan-readiness" && segments.length === 3) {
+      if (Object.keys(event.queryStringParameters || {}).length) fail(400,"Orphan readiness accepts no IDs or other query parameters");
+      const item = await store.getCase(segments[1]);
+      if (!item) return response(404,{error:"conflict_not_found"});
+      if (item.status !== "open" || item.operationId)
+        return response(200,{readiness:assessOrphanReadiness(item,[])});
+      const intent:RepairIntent = {caseId:item.id,profile:item.profile,action:item.decision?"decision":"link",
+        taskId:item.taskId || (typeof item.decision?.context?.providerTaskId==="string" ? item.decision.context.providerTaskId : undefined),
+        eventId:item.eventId || (typeof item.decision?.context?.providerEventId==="string" ? item.decision.context.providerEventId : undefined),
+        winner:"none",scope:"occurrence",leftovers:{}};
+      let snapshots:ReviewSnapshot[];
+      try {
+        snapshots = await hydrateCaseOrphanEvidence(item,
+          await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
+      } catch {
+        // A failed provider or state read must never be treated as an absent
+        // counterpart. Fail the diagnostic rather than returning eligibility.
+        fail(503,"A direct provider or ownership lookup failed; orphan readiness cannot be established");
+      }
+      return response(200,{readiness:assessOrphanReadiness(item,snapshots)});
     }
     if (method === "GET" && segments[0] === "cases" && segments.length === 2) {
       const item = await store.getCase(segments[1]);
