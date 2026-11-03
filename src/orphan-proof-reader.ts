@@ -70,15 +70,25 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   const sameSide=op.side==="todoist"?evidence.taskIds:evidence.eventIds;
   const otherSide=op.side==="todoist"?"calendar":"todoist";
   const others=otherSide==="todoist"?evidence.taskIds:evidence.eventIds;
-  checks.all_recorded_counterparts_absent=sameSide.length===1 && sameSide[0]===op.targetId &&
-    others.length<=20 && data.counterparts.length===others.length &&
-    others.every(id=>data.counterparts.filter(entry=>entry.side===otherSide&&entry.id===id&&entry.object===null).length===1);
-  // No empty list is accepted as a substitute for a complete three-profile
-  // provider enumeration. Real reader enumerates every page, or throws.
+  // A direct 404 in the alert profile alone is not authoritative absence:
+  // a moved/foreign counterpart may still be visible in another profile.
+  // Require the complete provider inventory, and cross-check EVERY recorded
+  // counterpart ID across all three profiles before allowing deletion.
   checks.complete_provider_enumeration=data.providers.length===3 &&
     allProfiles.every(profile=>data.providers.filter(value=>value.profile===profile).length===1) &&
     data.providers.every(value=>Array.isArray(value.tasks)&&Array.isArray(value.events)&&Array.isArray(value.comments));
-  const reverse:string[]=[];
+  const liveRecordedCounterparts:string[]=[];
+  if(checks.complete_provider_enumeration) for(const provider of data.providers) {
+    const objects=otherSide==="todoist"?provider.tasks:provider.events;
+    for(const id of others) if(objects.some(object=>object.id===id&&live(otherSide,object)))
+      liveRecordedCounterparts.push(provider.profile+":"+otherSide+":"+id);
+  }
+  checks.all_recorded_counterparts_absent=checks.complete_provider_enumeration &&
+    sameSide.length===1 && sameSide[0]===op.targetId &&
+    others.length<=20 && data.counterparts.length===others.length &&
+    others.every(id=>data.counterparts.filter(entry=>entry.side===otherSide&&entry.id===id&&entry.object===null).length===1) &&
+    liveRecordedCounterparts.length===0;
+  const reverse:string[]=[...liveRecordedCounterparts];
   if(obj && checks.complete_provider_enumeration) {
     for(const provider of data.providers) {
       if(op.side==="todoist") {
