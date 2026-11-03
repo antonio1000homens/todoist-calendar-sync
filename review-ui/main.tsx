@@ -135,46 +135,87 @@ function App() {
   };
   const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
   const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
-  const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
-  const refreshReconciliation = async (forProfile:string) => {
-    const data=await api(`reconciliation?profile=${forProfile}`);
-    setReconciliation(data);
-    const generation=data.reconciliation?.generation;
-    if(generation){
-      const diagnostics=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}`);
-      setReconciliationDiagnostics(diagnostics.items||[]);setDiagnosticCursor(diagnostics.next);
-    } else {setReconciliationDiagnostics([]);setDiagnosticCursor(undefined);}
-    return data;
-  };
-  const loadMoreReconciliationDiagnostics = async () => {
-    const generation=reconciliation?.reconciliation?.generation;
-    if(!generation||!diagnosticCursor)return;
+  const refresh=async (signal?:AbortSignal)=>{
+    const ticket=requestGate.begin("inbox");
+    setInboxStatus("loading");
     try {
-      const next=await api(`reconciliation/diagnostics?profile=${reconcileProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(diagnosticCursor)}`);
-      setReconciliationDiagnostics(current=>[...current,...(next.items||[])]);setDiagnosticCursor(next.next);
-    } catch(error:any) {setMessage(error.message);}
+      const data=await api(`cases?profile=${profile}&history=${history}`,signal?{signal}:undefined);
+      if(requestGate.current(ticket)){setCases(data.items||[]);setInboxStatus("ready");}
+    } catch(error:any) {
+      if(requestGate.current(ticket)&&!isAbortError(error)){setCases([]);setInboxStatus("error");}
+      throw error;
+    }
+  };
+  const refreshReconciliation=async(forProfile:string,options:{signal?:AbortSignal;quiet?:boolean}={})=>{
+    if(!SYNC_PROFILES.includes(forProfile))return undefined;
+    const ticket=requestGate.begin(`reconcile:${forProfile}`);
+    if(!options.quiet)setRunViews(current=>({...current,[forProfile]:{status:"loading",diagnostics:[]}}));
+    try {
+      const data=await api(`reconciliation?profile=${forProfile}`,options.signal?{signal:options.signal}:undefined);
+      if(!requestGate.current(ticket))return undefined;
+      const generation=data.reconciliation?.generation;
+      const diagnostics=generation?await api(
+        `reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}`,
+        options.signal?{signal:options.signal}:undefined):undefined;
+      if(requestGate.current(ticket)){
+        setRunViews(current=>({...current,[forProfile]:{
+          status:"ready",data,diagnostics:diagnostics?.items||[],cursor:diagnostics?.next,
+        }}));
+        return data;
+      }
+      return undefined;
+    } catch(error:any) {
+      if(!isAbortError(error)&&requestGate.current(ticket)){
+        setRunViews(current=>({...current,[forProfile]:{
+          status:"error",diagnostics:[],error:error.message,
+        }}));
+      }
+      throw error;
+    }
+  };
+  const loadMoreReconciliationDiagnostics=async(forProfile:string)=>{
+    const view=runViews[forProfile],generation=view?.data?.reconciliation?.generation,cursor=view?.cursor;
+    if(!generation||!cursor)return;
+    const ticket=requestGate.begin(`more:${forProfile}`);
+    try {
+      const next=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(cursor)}`);
+      if(!requestGate.current(ticket))return;
+      setRunViews(current=>{
+        const existing=current[forProfile];
+        if(existing?.data?.reconciliation?.generation!==generation||existing.cursor!==cursor)return current;
+        return {...current,[forProfile]:{...existing,diagnostics:[...existing.diagnostics,...(next.items||[])],cursor:next.next}};
+      });
+    } catch(error:any) {if(requestGate.current(ticket)&&!isAbortError(error))setMessage(error.message);}
   };
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
     const controller=new AbortController();
+    const navigationId=++navigationSequence.current;
     api(`cases/${encodeURIComponent(caseId)}`,{signal:controller.signal})
-      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});}})
-      .catch(e=>{if(!isAbortError(e))setMessage(e.message);});
+      .then(data=>{if(!controller.signal.aborted&&navigationId===navigationSequence.current)selectCase(data.item,{syncUrl:false});})
+      .catch(e=>{if(!controller.signal.aborted&&navigationId===navigationSequence.current&&!isAbortError(e))setMessage(e.message);});
     return ()=>controller.abort();
   },[]);
   useEffect(()=>{
     const onPopState=()=>{
       const caseId=new URLSearchParams(location.search).get("case");
       if(!caseId){selectionVersion.current++;selectCase(undefined,{syncUrl:false});return;}
+      const navigationId=++navigationSequence.current;
       api(`cases/${encodeURIComponent(caseId)}`).then(data=>{
-        selectionVersion.current++;setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});
-      }).catch((error:any)=>setMessage(error.message));
+        if(navigationId!==navigationSequence.current)return;
+        selectionVersion.current++;selectCase(data.item,{syncUrl:false});
+      }).catch((error:any)=>{if(navigationId===navigationSequence.current)setMessage(error.message);});
     };
     window.addEventListener("popstate",onPopState);
     return()=>window.removeEventListener("popstate",onPopState);
   },[]);
-  useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
+  useEffect(()=>{
+    const controller=new AbortController();
+    setCases([]);setInboxStatus("loading");
+    refresh(controller.signal).catch(e=>{if(!controller.signal.aborted&&!isAbortError(e))setMessage(e.message);});
+    return ()=>controller.abort();
+  },[profile,history]);
   useEffect(() => {
     if (!selected) { setDetails(undefined); setPreview(undefined); setOperation(undefined); return; }
     const controller=new AbortController();
@@ -202,31 +243,51 @@ function App() {
     });
     return ()=>controller.abort();
   },[selected,detailRetry]);
-  useEffect(() => {
-    refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
-  },[reconcileProfile]);
-  useEffect(() => {
-    const currentRunStatus=reconciliation?.summary?.runStatus||reconciliation?.reconciliation?.status;
-    if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
-    let cancelled=false;
-    let timer:number;
-    let pollFailures=0;
+  useEffect(()=>{
+    // Switching filters invalidates every older profile response, including
+    // the home -> work -> home race. Never render the previous scope as current.
+    requestGate.switchScope(profile);
+    setRunViews({});
+    const controller=new AbortController();
+    for(const target of reconciliationScopes(profile)) {
+      refreshReconciliation(target,{signal:controller.signal}).catch(e=>{
+        if(!controller.signal.aborted&&!isAbortError(e))setMessage(`Could not load reconciliation for ${target}: ${e.message}`);
+      });
+    }
+    return ()=>controller.abort();
+  },[profile]);
+  const pollingProfiles=overviewProfiles.filter(target=>{
+    const data=runViews[target]?.data;
+    const status=data?.summary?.runStatus||data?.reconciliation?.status;
+    return Boolean(data?.reconciliation?.pending&&!["succeeded","needs_review","failed"].includes(status||""));
+  });
+  const pollingKey=pollingProfiles.map(target=>`${target}:${runViews[target]?.data?.reconciliation?.generation}:${runViews[target]?.data?.reconciliation?.status}`).join("|");
+  useEffect(()=>{
+    if(!pollingKey)return;
+    let cancelled=false,timer:number,pollFailures=0;
+    const targets=[...pollingProfiles];
     const poll=async()=>{
-      try {
-        const data=await refreshReconciliation(reconcileProfile);
+      try{
+        const updates=await Promise.all(targets.map(target=>refreshReconciliation(target,{quiet:true})));
         if(cancelled)return;
         pollFailures=0;
-        const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
-        const terminal=["succeeded","needs_review","failed"].includes(runStatus);
-        if(terminal||!data.reconciliation?.pending) {
-          setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
-          setTerminalInboxRefreshPending(true);
-        } else timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
-      } catch(e:any) { if(!cancelled){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));} }
+        let keepPolling=false;
+        updates.forEach((data,index)=>{
+          if(!data)return;
+          const status=data.summary?.runStatus||data.reconciliation?.status||"unknown";
+          if(["succeeded","needs_review","failed"].includes(status)||!data.reconciliation?.pending){
+            setMessage(`Run for ${targets[index]}: ${status}. ${data.summary?.actionableCaseCount??"Some"} actionable profile alerts remain.`);
+            setTerminalInboxRefreshPending(true);
+          }else keepPolling=true;
+        });
+        if(keepPolling)timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
+      }catch(e:any){
+        if(!cancelled&&!isAbortError(e)){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));}
+      }
     };
     timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
     return ()=>{cancelled=true;window.clearTimeout(timer);};
-  },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
+  },[profile,pollingKey]);
   useEffect(() => {
     if (!terminalInboxRefreshPending) return;
     const refreshTask=createRetryingTask({
