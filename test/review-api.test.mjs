@@ -43,6 +43,9 @@ test("reconciliation alert hydration distinguishes superseded, progressed, compl
 });
 
 test("all review, reconciliation, and erasure writers hold the profile admission lease through state/queue handoff",async (t)=>{
+  const previousLegacy=process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;
+  process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED="true";
+  t.after(()=>{if(previousLegacy===undefined)delete process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED;else process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED=previousLegacy;});
   const leaseIssuer="https://lease.alf1000cloudflare.com";
   const old={fetch:globalThis.fetch,issuer:process.env.CF_ACCESS_ISSUER,audience:process.env.CF_ACCESS_AUDIENCE,
     operators:process.env.REVIEW_OPERATOR_EMAILS,protocol:process.env.ERASURE_PROTOCOL_VERSION};
