@@ -280,7 +280,7 @@ export class DynamoOrphanJournal implements OrphanJournal {
     if(operation.phase!=="confirmed" || operation.version!==0 || !deadlineValid(operation))
       throw new OrphanSafetyError("Only a fresh confirmed singleton may be recorded");
     await this.db.send(new PutCommand({TableName:tableName(),
-      Item:{...key(operation.id),...operation},
+      Item:{...operation,...key(operation.id)},
       ConditionExpression:"attribute_not_exists(pk)",
     }));
   }
@@ -302,18 +302,22 @@ export class DynamoOrphanJournal implements OrphanJournal {
       lastCheckpoint:checkpoint,...(lastError?{lastError}:{})};
     // Attribute aliases avoid reserved-word errors (e.g. version/status).
     const names:Record<string,string>={"#phase":"phase","#version":"version","#updated":"updatedAt",
-      "#checkpoint":"lastCheckpoint"};
+      "#checkpoint":"lastCheckpoint","#profile":"profile","#case":"caseId",
+      "#side":"side","#target":"targetId","#caseVersion":"caseUpdatedAt",
+      "#digest":"providerDigest","#actor":"actorSubject","#etag":"providerEtag"};
     const values:Record<string,unknown>={":old":operation.phase,":oldVersion":operation.version,
       ":new":to,":newVersion":next.version,":updated":now,":checkpoint":checkpoint,
       ":profile":operation.profile,":case":operation.caseId,":side":operation.side,":target":operation.targetId,
-      ":caseVersion":operation.caseUpdatedAt,":digest":operation.providerDigest,":actor":operation.actorSubject};
+      ":caseVersion":operation.caseUpdatedAt,":digest":operation.providerDigest,":actor":operation.actorSubject,
+      ":etag":operation.providerEtag || ""};
     if(lastError){names["#error"]="lastError";values[":error"]=lastError;}
     await this.db.send(new UpdateCommand({TableName:tableName(),Key:key(operation.id),
       UpdateExpression:"SET #phase = :new, #version = :newVersion, #updated = :updated, #checkpoint = :checkpoint"
         +(lastError?", #error = :error":""),
-      ConditionExpression:"#phase = :old AND #version = :oldVersion AND profile = :profile AND caseId = :case"
-        +" AND side = :side AND targetId = :target AND caseUpdatedAt = :caseVersion"
-        +" AND providerDigest = :digest AND actorSubject = :actor",
+      ConditionExpression:"#phase = :old AND #version = :oldVersion AND #profile = :profile AND #case = :case"
+        +" AND #side = :side AND #target = :target AND #caseVersion = :caseVersion"
+        +" AND #digest = :digest AND #actor = :actor"
+        +(operation.side==="calendar"?" AND #etag = :etag":" AND attribute_not_exists(#etag)"),
       ExpressionAttributeNames:names,ExpressionAttributeValues:values,
     }));
     return next;
