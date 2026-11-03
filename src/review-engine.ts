@@ -1,4 +1,5 @@
 import { planRecurrenceFlatten, flattenStandaloneId, flattenStandalone, flattenMasterProjection, assertFlattenedMaster, assertFlattenInstances } from "./recurrence-flatten.js";
+import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
 import { randomUUID } from "node:crypto";
 import { profiles } from "./config.js";
 import { CanonicalIdentityStore, calendarCanonicalIdentity, todoistCanonicalIdentity } from "./canonical-identity.js";
@@ -1960,7 +1961,7 @@ export class ReviewEngine {
             } else {
               const source = await clients.calendar.getEvent(snapshot.ref.id);
               const created = await step(`transfer-create-task:${source.id}`, () => trackedWrite(snapshot.ref.profile,
-                () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+source.id)));
+                () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+source.id,calendarReplaySourceIds(source))));
               await bind(snapshot.ref.profile,created,source,undefined);
             }
           }
@@ -2104,7 +2105,7 @@ export class ReviewEngine {
             } else {
               const event=await clients.calendar.getEvent(snapshot.ref.id);let source=event;
               if(event.recurrence?.length){const instances=await clients.calendar.listInstances(event.id);const needsVerifiedZone=finiteWeeklyCalendarRuleCandidate(event)||instances.some((instance)=>instance.end?.date&&!instance.end.dateTime);const timeZone=needsVerifiedZone?await resolveCalendarTimeZone(event,clients.calendar.getTimeZone.bind(clients.calendar)):event.start?.timeZone;if(needsVerifiedZone&&await clients.todoist.getTimeZone()!==timeZone)throw new Error("Todoist and Calendar timezones differ; refresh the recurrence before repairing it");source=selectCalendarRecurrenceInstance(instances,undefined,Date.now(),timeZone)!;if(!source)throw new Error("No active occurrence to mirror");}
-              const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id)));
+              const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id,calendarReplaySourceIds(source,event.id))));
               await bind(snapshot.ref.profile,task,event,event.recurrence?.length || event.recurringEventId ? "calendar":undefined);
             }
           }

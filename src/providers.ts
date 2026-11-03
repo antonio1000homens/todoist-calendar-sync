@@ -426,7 +426,9 @@ export class Todoist {
     return this.request<TodoistTask>(`/tasks/${encodeURIComponent(taskId)}`);
   }
 
-  async upsertTask(task: Omit<TodoistTask, "id">, existingId?: string): Promise<TodoistTask> {
+  // sourceEventIds is a trusted, provider-read Calendar provenance hint for the
+  // replay-admission wrapper; it is never sent to Todoist's /tasks API.
+  async upsertTask(task: Omit<TodoistTask, "id">, existingId?: string, sourceEventIds?: readonly string[]): Promise<TodoistTask> {
     const path = existingId ? `/tasks/${encodeURIComponent(existingId)}` : "/tasks";
     const projectId = todoistProjectForToken(this.token);
     const payload = todoistTaskPayload(existingId ? task : { ...task, ...(task.project_id || !projectId ? {} : { project_id: projectId }) });
@@ -442,7 +444,9 @@ export class Todoist {
     return this.getTask(taskId);
   }
 
-  async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string): Promise<TodoistTask> {
+  // requestKey is an idempotency token, NOT an erasure identity. The replay
+  // wrapper admits creation only when sourceEventIds are supplied and checked.
+  async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string, sourceEventIds?: readonly string[]): Promise<TodoistTask> {
     const { createHash } = await import("node:crypto");
     const h = createHash("sha256").update(requestKey).digest("hex");
     const uuid = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;

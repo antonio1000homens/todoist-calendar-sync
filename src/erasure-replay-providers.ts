@@ -51,6 +51,24 @@ function commentIdentity(profile:Profile,content:unknown):ReplayIdentity {
     throw new ErasureReplayUnavailableError("Unidentifiable or wrong-profile project comment mutation");
   return mappingReplayIdentity(parsed.payload);
 }
+/** Derive complete Calendar provenance from a provider-read event and its known
+ * recurrence aliases. Never use task payload.id or a Todoist request ID here. */
+export function calendarReplaySourceIds(event:Pick<CalendarEvent,"id"|"recurringEventId">,...aliases:(string|undefined)[]):string[] {
+  if(!event || !event.id)throw new ErasureReplayUnavailableError("Calendar provenance is required for task creation");
+  const values=[event.id,event.recurringEventId,...aliases];
+  if(values.some(value=>value!==undefined&&(typeof value!=="string"||!value)))
+    throw new ErasureReplayUnavailableError("Malformed Calendar provenance alias");
+  const unique=[...new Set(values.filter((value):value is string=>typeof value==="string"&&value.length>0))];
+  if(unique.length>32)throw new ErasureReplayUnavailableError("Calendar provenance alias limit exceeded");
+  return unique;
+}
+function sourceEventIds(value:unknown):string[] {
+  if(!Array.isArray(value)||value.length===0||value.length>32
+    ||value.some(id=>typeof id!=="string"||!id)
+    ||new Set(value).size!==value.length)
+    throw new ErasureReplayUnavailableError("A complete, unique Calendar source identity is required");
+  return value as string[];
+}
 function taskIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdentity {
   if(["createProjectComment","upsertProjectComment"].includes(method))return commentIdentity(profile,args[1]);
   if(method==="updateComment")return commentIdentity(profile,args[1]);
@@ -67,17 +85,17 @@ function taskIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdenti
   }
   if(method==="updateRecurringOccurrence")return {profile,taskId:(args[0] as TodoistTask)?.id};
   if(method==="upsertTask") {
-    // Todoist POST /tasks creates a NEW ID and deliberately drops task.id from
-    // the payload. Only existingId selects a known provider identity for PATCH.
-    // Do not admit anonymous creation by validating an ignored task.id.
+    // Todoist POST /tasks creates a NEW ID and ignores task.id. The only
+    // allowed creation proof is the provider-read Calendar source/aliases.
     const existingId=args[1];
+    const eventIds=args[2]===undefined?undefined:sourceEventIds(args[2]);
     return {profile,...(typeof existingId==="string"&&existingId
-      ?{taskId:existingId}:{})};
+      ?{taskId:existingId}:{}),...(eventIds?{eventIds}:{})};
   }
   if(method==="createTaskOnce") {
-    // Request IDs and timestamps are not Todoist task IDs. The *source*
-    // Calendar identity must be passed explicitly by the future repair API.
-    return {profile};
+    // The request key is idempotency-only: it does not identify an erased
+    // Todoist task. Require provider-read Calendar provenance instead.
+    return {profile,eventIds:sourceEventIds(args[2])};
   }
   return {profile,taskId:args[0] as string};
 }
