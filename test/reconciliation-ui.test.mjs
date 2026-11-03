@@ -30,7 +30,7 @@ test('profile-scoped active run polling refreshes the inbox and distinguishes di
   assert.match(source,/Latest reconciliation · \{runProfile\}/);
   assert.match(source,/Run diagnostics · \{runProfile\}/);
   assert.match(source,/Actionable review cases for \{runProfile\}/);
-  assert.match(source,/open or repairing review alerts in/);
+  assert.match(source,/open or repairing review alerts shown in/);
   assert.match(source,/run diagnostics, not the number of open alerts/);
   assert.doesNotMatch(source,/Latest reconciliation · \{reconcileProfile\}/);
   assert.ok(source.includes('Candidate tasks: {item.detail.candidateTaskIds.join(", ")}'));
