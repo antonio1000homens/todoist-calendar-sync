@@ -170,7 +170,7 @@ export function guardRepairProviders(operation: RepairOperation, factory: Provid
               }
               if (side === "todoist" && Date.now()-Date.parse(creation.startedAt) > 23*3600000) throw new Error("Delegated task creation acknowledgement is uncertain and its idempotency window expired; inspect provider state before retrying");
               result = side === "todoist"
-                ? await clients.todoist.createTaskOnce(args[0] as TodoistTask,creation.requestId)
+                ? await clients.todoist.createTaskOnce(args[0] as TodoistTask,creation.requestId,args[2] as readonly string[]|undefined)
                 : await clients.calendar.createRepairEventOnce({...args[0] as CalendarEvent,id:creation.requestId},operation.id);
               if (side === "calendar") {
                 const desired=args[0] as CalendarEvent, actual=result as CalendarEvent;
