@@ -130,70 +130,115 @@ export async function assertReplayAdmission(identity:ReplayIdentity,db:Db=docume
     if(result.Item)throw new ErasureReplayBlockedError();
   }
 }
+/**
+ * Prospective post-write release transaction inputs.
+ *
+ * This shape is deliberately stronger than the reviewed-fenced token created
+ * by #304. A future privileged worker must independently re-read every
+ * provider/profile and obtain a complete, strongly verified alias manifest
+ * before it may construct this proof. It is NOT an authorization to execute.
+ */
 export type PostWriteReleaseProof = {
   operationId:string;
   epoch:number;
-  /** Must be produced by a distinct, consumed, operator-approved post-write flow. */
   confirmationId:string;
-  recoveryFingerprint:string;
+  /** Matched with the persisted postwriteReview and single-use consumed token. */
+  inspectedFingerprint:string;
   postflightFingerprint:string;
-  /** Exact reviewed alias inventory; all selected Calendar aliases must have been deleted. */
-  identity:ReplayIdentity & {taskId:string};
+  originalPreviewFingerprint:string;
+  /** The original atomic review timestamp also becomes operation.updatedAt. */
+  reviewedAt:string;
+  identity:ReplayIdentity & {taskId:string;eventIds:readonly string[]};
+  /** Exhaustive per-profile Calendar aliases, independently verified by a
+   * future privileged worker. Empty arrays require proof of absence, not
+   * merely missing keys. Aliases for the source profile must match eventIds. */
+  calendarAliases:Record<Profile,readonly string[]>;
   journalPresent:boolean;
 };
-function proofText(value:string):boolean {return typeof value==="string"&&value.length>=8&&value.length<=256;}
+const SHA256=/^[a-f0-9]{64}$/;
+const OPERATION_ID=/^[A-Za-z0-9_-]{1,128}$/;
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:Profile;eventId:string}> {
+  const aliases=proof.calendarAliases;
+  if(!aliases||typeof aliases!=="object"||Array.isArray(aliases)
+    ||Object.keys(aliases).length!==REPLAY_PROFILES.length
+    ||Object.keys(aliases).some(key=>!REPLAY_PROFILES.includes(key as Profile)))
+    throw new ErasureReplayUnavailableError("Complete Calendar alias inventory is required for every profile");
+  const all:Array<{profile:Profile;eventId:string}>=[];
+  for(const profile of REPLAY_PROFILES) {
+    const items=aliases[profile];
+    if(!Array.isArray(items)||items.length>MAX_EVENT_ALIASES
+      ||items.some(id=>typeof id!=="string"||!ID.test(id))
+      ||new Set(items).size!==items.length)
+      throw new ErasureReplayUnavailableError("Invalid Calendar replay aliases");
+    for(const eventId of items)all.push({profile,eventId});
+  }
+  const selected=new Set(proof.identity.eventIds);
+  const supplied=new Set(aliases[proof.identity.profile]);
+  if(!selected.size||selected.size!==supplied.size
+    ||[...selected].some(id=>!supplied.has(id)))
+    throw new ErasureReplayUnavailableError("Selected Calendar aliases differ from the reviewed source inventory");
+  return all;
+}
+
 /**
- * Constructs (but does not execute) the ONLY valid marker + fence release
- * transaction for fully deleted post-write operations.
+ * Construct a transaction WITHOUT EXECUTING IT. This is a staged contract;
+ * the production worker must not call it before independently proving replay
+ * admission on every live/qualified writer, action-time full deletion,
+ * cross-profile alias completeness, privacy approval and staged failure tests.
  *
- * All external postflight, alias, mapping and lease verification is the
- * responsibility of the future trusted recovery worker. The transaction
- * deliberately requires NEW post-write state/confirmation attributes absent
- * from the existing pre-write recovery, so it cannot be used to bypass it.
+ * No executor, API route, queue command or deployment switch currently calls
+ * this function. All markers, proof removal and fence cleanup are atomic.
  */
 export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCommand {
   validate(proof.identity);
-  if(!proofText(proof.operationId)||!Number.isSafeInteger(proof.epoch)||proof.epoch<1
-    ||![proof.confirmationId,proof.recoveryFingerprint,proof.postflightFingerprint].every(proofText)
-    ||proof.identity.eventIds?.length===0)
+  if(!OPERATION_ID.test(proof.operationId)||!UUID.test(proof.confirmationId)
+    ||!Number.isSafeInteger(proof.epoch)||proof.epoch<1
+    ||![proof.inspectedFingerprint,proof.postflightFingerprint,
+      proof.originalPreviewFingerprint].every(value=>typeof value==="string"&&SHA256.test(value))
+    ||typeof proof.reviewedAt!=="string"
+    ||!Number.isFinite(Date.parse(proof.reviewedAt))
+    ||new Date(proof.reviewedAt).toISOString()!==proof.reviewedAt
+    ||typeof proof.journalPresent!=="boolean"
+    ||!proof.identity.taskId||!proof.identity.eventIds.length)
     throw new ErasureReplayUnavailableError("Post-write release proof is incomplete");
+  const aliases=validatedPostWriteAliases(proof);
   const ring=keyRing(),secret=ring.keys.get(ring.current)!;
-  const pairs:ReplayKey[]=[];
-  // Every profile is fenced against re-admission of this Todoist task, including
-  // cross-project/profile moves. Event IDs are scoped to their calendar profile
-  // so an unrelated profile's coincidentally equal Calendar ID is not removed.
+  const keys:ReplayKey[]=[];
+  // Todoist IDs are protected across all sync profiles. Calendar aliases are
+  // scoped to their own profile to avoid blocking an unrelated calendar.
   for(const profile of REPLAY_PROFILES)
-    pairs.push(marker(profile,"TASK",proof.identity.taskId,ring.current,secret));
-  for(const eventId of proof.identity.eventIds||[])
-    pairs.push(marker(proof.identity.profile,"EVENT",eventId,ring.current,secret));
+    keys.push(marker(profile,"TASK",proof.identity.taskId,ring.current,secret));
+  for(const {profile,eventId} of aliases)
+    keys.push(marker(profile,"EVENT",eventId,ring.current,secret));
   const table=tableName();
-  const profileKey=(sk:string)=>({pk:`ERASURE#${proof.identity.profile}`,sk});
-  // DynamoDB rejects expression values unused by a *specific* transaction
-  // action. Keep independent, exact placeholder sets for each conditional delete.
+  const profileKey=(sk:string)=>({pk:"ERASURE#"+proof.identity.profile,sk});
   const operationValues={
-    ":review":"review_required",":verifying":"verifying",":mode":"post_write",
-    ":epoch":proof.epoch,":confirmationId":proof.confirmationId,
-    ":fingerprint":proof.recoveryFingerprint,":postflight":proof.postflightFingerprint,
+    ":required":"review_required",":reviewed":"reviewed_fenced",":mode":"post_write",
+    ":epoch":proof.epoch,":token":proof.confirmationId,":inspected":proof.inspectedFingerprint,
+    ":postflight":proof.postflightFingerprint,":original":proof.originalPreviewFingerprint,
+    ":reviewedAt":proof.reviewedAt,":profile":proof.identity.profile,":yes":true,
   };
-  const confirmationValues={
-    ":consumed":"consumed",":id":proof.operationId,
-    ":confirmationId":proof.confirmationId,
-    ":fingerprint":proof.recoveryFingerprint,":postflight":proof.postflightFingerprint,
+  const tokenValues={
+    ":consumed":"consumed",":mode":"post_write",":id":proof.operationId,
+    ":profile":proof.identity.profile,":token":proof.confirmationId,
+    ":inspected":proof.inspectedFingerprint,":postflight":proof.postflightFingerprint,
+    ":original":proof.originalPreviewFingerprint,":epoch":proof.epoch,
   };
   const tx:any[]=[
-    ...pairs.map(key=>({Put:{TableName:table,Item:{...key,markerVersion:1},
+    ...keys.map(key=>({Put:{TableName:table,Item:{...key,markerVersion:1},
       ConditionExpression:"attribute_not_exists(pk)"}})),
-    // Preserve immutable review_required evidence until the independently verified
-    // postflight. Then remove the identity-bearing operation and consumed token
-    // in the SAME transaction that installs markers and drops the fence.
-    {Delete:{TableName:table,Key:{pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"},
-      ConditionExpression:"#status=:review AND recovery.#status=:verifying AND recovery.mode=:mode AND recovery.epoch=:epoch AND recovery.confirmationId=:confirmationId AND recovery.fingerprint=:fingerprint AND recovery.postflightFingerprint=:postflight",
-      ExpressionAttributeNames:{"#status":"status"},
-      ExpressionAttributeValues:operationValues}},
-    {Delete:{TableName:table,Key:{pk:`ERASURE_POSTWRITE_CONFIRMATION#${proof.operationId}`,sk:"STATE"},
-      ConditionExpression:"#status=:consumed AND operationId=:id AND confirmationId=:confirmationId AND inspectedFingerprint=:fingerprint AND postflightFingerprint=:postflight",
-      ExpressionAttributeNames:{"#status":"status"},
-      ExpressionAttributeValues:confirmationValues}},
+    // #304 atomically writes postwriteReview, NOT recovery. Check precisely
+    // the saved reviewed_fenced fields and original selection before deletion.
+    {Delete:{TableName:table,Key:{pk:"ERASURE_OPERATION#"+proof.operationId,sk:"STATE"},
+      ConditionExpression:"#status=:required AND profile=:profile AND postwriteReview.#status=:reviewed AND postwriteReview.mode=:mode AND postwriteReview.epoch=:epoch AND postwriteReview.confirmationId=:token AND postwriteReview.inspectedFingerprint=:inspected AND postwriteReview.postflightFingerprint=:postflight AND postwriteReview.reviewedAt=:reviewedAt AND previewFingerprint=:original AND updatedAt=:reviewedAt AND selectedActions.deleteTodoist=:yes AND selectedActions.deleteCalendar=:yes AND target.deleteCalendar=:yes AND attribute_exists(actionPlan.todoistTask) AND attribute_exists(actionPlan.calendarEvent) AND attribute_not_exists(recovery)",
+      ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:operationValues}},
+    // Consumed token (including operator field and TTL already removed) must
+    // still match the exact operation, epoch and originally reviewed evidence.
+    {Delete:{TableName:table,Key:{pk:"ERASURE_POSTWRITE_CONFIRMATION#"+proof.operationId,sk:"STATE"},
+      ConditionExpression:"#status=:consumed AND mode=:mode AND operationId=:id AND profile=:profile AND confirmationId=:token AND inspectedFingerprint=:inspected AND postflightFingerprint=:postflight AND originalPreviewFingerprint=:original AND epoch=:epoch AND attribute_not_exists(expiresAtMs)",
+      ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:tokenValues}},
     {ConditionCheck:{TableName:table,Key:profileKey("EPOCH"),
       ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":proof.epoch}}},
     {Delete:{TableName:table,Key:profileKey("FENCE"),
@@ -206,8 +251,8 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
       :{ConditionCheck:{TableName:table,Key:profileKey("JOURNAL"),
         ConditionExpression:"attribute_not_exists(pk)"}},
   ];
-  // A single DynamoDB transaction is required: never write markers and release
-  // the fence in separate requests or accept a partially successful page.
-  if(tx.length>100)throw new ErasureReplayUnavailableError();
+  // DynamoDB transactions max out at 100 actions. Never fall back to a
+  // partially committed batch or release a fence in multiple requests.
+  if(tx.length>100)throw new ErasureReplayUnavailableError("Replay release exceeds the atomic transaction limit");
   return new TransactWriteCommand({TransactItems:tx});
 }
