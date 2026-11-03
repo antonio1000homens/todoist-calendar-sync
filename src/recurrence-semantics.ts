@@ -14,7 +14,8 @@ export type RecurrenceReason =
   | "calendar_exception" | "unsupported_component" | "duplicate_component"
   | "invalid_component" | "invalid_start" | "timezone_not_verified"
   | "unknown_todoist_phrase" | "compound_rule_not_verified"
-  | "occurrence_mismatch";
+  | "occurrence_mismatch" | "subminute_precision_not_supported"
+  | "timed_until_requires_instant_expansion";
 
 export interface RecurrenceSemantics {
   frequency: RecurrenceFrequency;
@@ -36,6 +37,8 @@ export interface RecurrenceEvidence {
   anchorVerified: boolean;
   progressionVerified: boolean;
   exceptionInventoryComplete: boolean;
+  /** Independently read back from both providers for timed recurring rules. */
+  timeZoneVerified: boolean;
 }
 
 export interface RecurrenceClassification {
@@ -74,9 +77,13 @@ function validDate(iso: string): boolean {
 function localAnchor(context: RecurrenceContext): { date: string; time?: string } | RecurrenceReason {
   const start = context.start;
   if (validDate(start)) return { date: start };
-  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$/.exec(start);
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/.exec(start);
   if (!match || !validDate(match[1]) || Number(match[2]) > 23 || Number(match[3]) > 59
     || (match[4] && Number(match[4]) > 59)) return "invalid_start";
+  // This date-only expander cannot represent different sub-minute instants.
+  // Reject them instead of claiming that 09:00:30 is equivalent to 09:00:00.
+  if (Number(match[4] || "0") !== 0 || (match[5] && /[1-9]/.test(match[5])))
+    return "subminute_precision_not_supported";
   if (!context.timeZone) return "timezone_not_verified";
   try {
     // Reject invalid timezones and convert offset timestamps to their actual
@@ -85,7 +92,7 @@ function localAnchor(context: RecurrenceContext): { date: string; time?: string 
       timeZone: context.timeZone, year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", hourCycle: "h23",
     });
-    if (!match[5]) return { date: match[1], time: match[2] + ":" + match[3] };
+    if (!match[6]) return { date: match[1], time: match[2] + ":" + match[3] };
     const date = new Date(start);
     if (Number.isNaN(date.getTime())) return "invalid_start";
     const parts = Object.fromEntries(formatter.formatToParts(date)
@@ -113,10 +120,13 @@ function finish(semantic: RecurrenceSemantics, context: RecurrenceContext,
   limitation?: RecurrenceReason): RecurrenceClassification {
   const canonicalRrule = canonical(semantic);
   const evidence = context.evidence;
+  const timeZoneVerified = !semantic.localTime || Boolean(evidence?.timeZoneVerified);
   const complete = Boolean(evidence?.calendarReadback && evidence.todoistReadback
-    && evidence.anchorVerified && evidence.progressionVerified && evidence.exceptionInventoryComplete);
+    && evidence.anchorVerified && evidence.progressionVerified && evidence.exceptionInventoryComplete
+    && timeZoneVerified);
   const reason: RecurrenceReason = context.exceptionPresent ? "calendar_exception"
-    : limitation || (!evidence?.anchorVerified ? "anchor_not_verified" : "provider_readback_required");
+    : limitation || (!evidence?.anchorVerified ? "anchor_not_verified"
+      : !timeZoneVerified ? "timezone_not_verified" : "provider_readback_required");
   return { semantic, canonicalRrule,
     disposition: !context.exceptionPresent && !limitation && complete ? "native_exact" : "rolling_required",
     reason: !context.exceptionPresent && !limitation && complete ? "verified_equivalent" : reason };
@@ -159,8 +169,11 @@ export function classifyCalendarRule(rule: string, context: RecurrenceContext): 
     const values = fields.BYDAY.split(",");
     if (!values.every((value) => /^(?:-1|[1-5])?(?:MO|TU|WE|TH|FR|SA|SU)$/.test(value)))
       return decline("invalid_component");
-    byDay = [...new Set(values)].sort((a, b) => days.indexOf(a.slice(-2) as typeof days[number])
-      - days.indexOf(b.slice(-2) as typeof days[number]));
+    byDay = [...new Set(values)].sort((a, b) => {
+      const weekdayOrder = days.indexOf(a.slice(-2) as typeof days[number])
+        - days.indexOf(b.slice(-2) as typeof days[number]);
+      return weekdayOrder || Number(a.slice(0, -2) || "0") - Number(b.slice(0, -2) || "0");
+    });
   }
   if ((fields.FREQ === "DAILY" && (byDay || byMonthDay || byMonth))
     || (fields.FREQ === "WEEKLY" && (byMonthDay || byMonth || byDay?.some((value) => value.length !== 2)))
@@ -169,10 +182,17 @@ export function classifyCalendarRule(rule: string, context: RecurrenceContext): 
   const count = fields.COUNT ? positive(fields.COUNT, 1000) : undefined;
   if (fields.COUNT && !count) return decline("invalid_component");
   if (fields.COUNT && fields.UNTIL) return decline("invalid_component");
-  if (fields.UNTIL && !/^\d{8}(?:T\d{6}Z)?$/.test(fields.UNTIL)) return decline("invalid_component");
   const until = fields.UNTIL;
-  if (until && !validDate(until.slice(0, 4) + "-" + until.slice(4, 6) + "-" + until.slice(6, 8)))
-    return decline("invalid_component");
+  if (until) {
+    const cutoff = /^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})Z)?$/.exec(until);
+    if (!cutoff || !validDate(`${cutoff[1]}-${cutoff[2]}-${cutoff[3]}`)
+      || (cutoff[4] && (Number(cutoff[4]) > 23 || Number(cutoff[5]) > 59 || Number(cutoff[6]) > 59)))
+      return decline("invalid_component");
+    // A UTC UNTIL needs full instant conversion including DST. Do not silently
+    // compare only the civil date or turn a timed finite rule into a native one.
+    if (cutoff[4]) return decline("timed_until_requires_instant_expansion");
+    if (anchor.time) return decline("invalid_component");
+  }
   const semantic: RecurrenceSemantics = {
     frequency: fields.FREQ as RecurrenceFrequency, interval,
     startDate: anchor.date,
@@ -246,6 +266,7 @@ export function occurrenceDates(rule: RecurrenceSemantics, limit = 12): string[]
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error("invalid occurrence limit");
   if (!validDate(rule.startDate) || !Number.isSafeInteger(rule.interval) || rule.interval < 1)
     throw new Error("invalid recurrence anchor or interval");
+  if (rule.until?.includes("T")) throw new Error("timed UNTIL requires instant-aware expansion");
   const start = new Date(rule.startDate + "T00:00:00Z");
   const startMonday = new Date(start);
   startMonday.setUTCDate(start.getUTCDate() - ((start.getUTCDay() + 6) % 7));
@@ -253,7 +274,18 @@ export function occurrenceDates(rule: RecurrenceSemantics, limit = 12): string[]
   const dayCode = (date: Date): string => days[(date.getUTCDay() + 6) % 7];
   const anchorDay = start.getUTCDate();
   const anchorMonth = start.getUTCMonth() + 1;
-  const horizonDays = Math.min(366 * 50, 366 * Math.max(8, rule.interval * 3));
+  // Scale from the requested number of dates, not a fixed eight-year window.
+  // Sparse rules (fifth weekday, leap day) require a longer civil-date horizon.
+  // Hard-cap at 160 years; insufficient evidence fails closed in comparison.
+  const leapDay = rule.frequency === "YEARLY" && (
+    (rule.byMonth?.length === 1 && rule.byMonth[0] === 2
+      && rule.byMonthDay?.length === 1 && rule.byMonthDay[0] === 29)
+    || (!rule.byMonth?.length && !rule.byMonthDay?.length && anchorMonth === 2 && anchorDay === 29));
+  const sparsity = leapDay ? 4 : rule.frequency === "MONTHLY" && rule.byDay?.some((day) => day.length > 2) ? 6
+    : rule.frequency === "MONTHLY" && rule.byMonthDay?.every((day) => day > 28) ? 2 : 1;
+  const periodDays = rule.frequency === "YEARLY" ? 366 : rule.frequency === "MONTHLY" ? 31
+    : rule.frequency === "WEEKLY" ? 7 : 1;
+  const horizonDays = Math.min(366 * 160, Math.ceil(periodDays * rule.interval * (limit + 1) * sparsity));
   for (let offset = 0; offset < horizonDays && occurrences.length < limit; offset++) {
     const date = new Date(start);
     date.setUTCDate(start.getUTCDate() + offset);
