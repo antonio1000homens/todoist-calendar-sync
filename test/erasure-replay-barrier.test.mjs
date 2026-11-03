@@ -62,9 +62,13 @@ test("calendar IDs are profile-scoped: unrelated profile event IDs are not rejec
 
 function proof(){
   return {
-    operationId:"operator-operation-id",epoch:7,confirmationId:"fresh-single-use-confirmation",
-    recoveryFingerprint:"a".repeat(64),postflightFingerprint:"b".repeat(64),
+    operationId:"operator-operation-id",epoch:7,
+    confirmationId:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    inspectedFingerprint:"a".repeat(64),postflightFingerprint:"b".repeat(64),
+    originalPreviewFingerprint:"c".repeat(64),
+    reviewedAt:"2026-11-03T19:40:00.000Z",
     identity:{profile:"work",taskId:"deleted-task",eventIds:["deleted-event","deleted-alias"]},
+    calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-alias"]},
     journalPresent:true,
   };
 }
@@ -86,8 +90,10 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_POSTWRITE_CONFIRMATION#")
     &&x.Delete.ConditionExpression.includes("#status=:consumed")));
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_OPERATION#")
-    &&x.Delete.ConditionExpression.includes("recovery.mode=:mode")
-    &&x.Delete.ConditionExpression.includes("recovery.postflightFingerprint=:postflight")));
+    &&x.Delete.ConditionExpression.includes("postwriteReview.mode=:mode")
+    &&x.Delete.ConditionExpression.includes("postwriteReview.postflightFingerprint=:postflight")
+    &&x.Delete.ConditionExpression.includes("postwriteReview.#status=:reviewed")
+    &&x.Delete.ConditionExpression.includes("attribute_not_exists(recovery)")));
   // Every action's value map must match its own condition exactly. DynamoDB
   // rejects unused values (even if used by a neighbouring transaction action).
   for (const action of tx) {
@@ -121,7 +127,15 @@ test("missing new confirmation, epoch and oversize alias set cannot construct a 
     {confirmationId:""},
     {epoch:0},
     {postflightFingerprint:""},
+    {inspectedFingerprint:"not-a-hash"},
+    {originalPreviewFingerprint:""},
+    {reviewedAt:"not-a-timestamp"},
+    {confirmationId:"non-uuid-token"},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:[]}},
+    {calendarAliases:{home:[],antonio:[],work:["deleted-event"]}},
+    {calendarAliases:{home:[],work:["deleted-event","deleted-alias"]}},
+    {calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-event"]}},
+    {calendarAliases:{home:[],antonio:[],work:Array.from({length:33},(_,i)=>"event-"+i)}},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:Array.from({length:33},(_,i)=>"event-"+i)}},
   ]) assert.throws(()=>atomicReplayRelease({...proof(),...patch}),ErasureReplayUnavailableError);
 });
