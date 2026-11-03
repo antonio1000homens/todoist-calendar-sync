@@ -10,7 +10,8 @@
  */
 import {reviewCaseEvidenceIds} from "./deleted-review-identities.js";
 import type {OrphanDeletionOperation} from "./orphan-deletion-executor.js";
-import type {OrphanEvidenceInventory} from "./orphan-proof-reader.js";
+import {collectOrphanInventory, type OrphanEvidenceInventory,
+  type OrphanEvidenceSources} from "./orphan-proof-reader.js";
 import type {Profile} from "./types.js";
 
 const PROFILES:readonly Profile[]=["home","antonio","work"];
@@ -115,4 +116,13 @@ export function evaluateOrphanPostflight(op:OrphanDeletionOperation,
   }
   return {caseId:op.caseId,profile:op.profile,operationId:op.id,checkedAt,
     verified:blockers.length===0,blockers};
+}
+
+/** Reuse the preflight provider/state reader for independent postflight.
+ * A failed read or truncated inventory rejects the call; no destructive
+ * mutation or case retirement can be triggered through this function. */
+export async function collectOrphanPostflight(op:OrphanDeletionOperation,
+  sources:OrphanEvidenceSources={}):Promise<OrphanPostflightAssessment> {
+  const evidence=await collectOrphanInventory(op,sources);
+  return evaluateOrphanPostflight(op,evidence);
 }
