@@ -283,3 +283,46 @@ DynamoDB point-in-time recovery and external backups may retain erased values.
 This procedure only proves current table/provider state and does not delete
 backups. Historical repair and forensic evidence for the item is intentionally
 lost.
+
+
+## Post-write evidence inspection (issue #243; read-only staging)
+
+Following the staged replay-admission foundation (#251) and Calendar-source
+identity propagation (#299), an operator can inspect a *recorded*
+`review_required` erasure using the **Post-write evidence (read-only)** section
+of the review portal. The authenticated endpoint is
+`GET /review/api/erasure-postwrite-recoveries/{operationId}`.
+
+This endpoint reuses the strongly consistent, paginated provider/DynamoDB
+snapshot, owner-fence and epoch inspection, and original SQS worker mapping
+inventory used by pre-write inspection. It produces **only a redacted evidence
+assessment**: no Todoist/Calendar IDs, titles, timestamps, mapping UUIDs,
+comment bodies or underlying operation inventory are returned in the result.
+
+- **Not post-write:** no durable write stage was indicated. The existing,
+  independently verified *pre-write* procedure is the only possible recovery.
+- **Fully deleted candidate:** original selected actions and both exact
+  targets, a durable original deletion-start receipt, strong provider and
+  DynamoDB absence, an owned fence, epoch and drained leases have been
+  observed with no unexpected inspection blockers. This is a classification,
+  **not** authorisation for a recovery, mapping write or fence release.
+- **Partial or ambiguous:** an original deletion target, alias, worker
+  mapping, fence, snapshot integrity or another safety criterion is missing
+  or inconsistent. A future attempt to finish deletion will require a
+  **new**, independently reviewed deletion authorisation and action-time
+  provider version/digest checks. An old confirmation must not be reused.
+
+The endpoint does **not** have `POST /confirm`, `/apply`, or `/dispatch`
+routes. The assessment always returns `releaseAllowed: false` and
+`onlyAvailableAction: keep_fenced`. The legacy `RESTORE SYNC` flow
+continues to require `pre_write` classification and cannot act on a
+post-write assessment.
+
+**Still blocked:** source alias and cross-profile coverage, qualified old
+Lambda versions, privacy and IAM review, an independently verified
+postflight tied to an immutable new single-use typed confirmation, a fully
+conditional marker+fence release with no early admission, a newly authorised
+partial deletion flow, fault-injection matrix and disposable Work-profile
+staging. Do not enable `ERASURE_REPLAY_BARRIER_VERSION`, restore worker
+event-source mappings, remove fences, replay the DLQ, or run a live destructive
+test based solely on this preview.
