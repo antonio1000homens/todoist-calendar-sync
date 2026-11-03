@@ -31,6 +31,18 @@ export function OrphanDeletionPanel({item,snapshots,loading=false,recheck,api}:O
     setInspection(undefined);setInspectionError("");setInspecting(false);
     setKey("");setPreview(undefined);setPreviewError("");setPreviewing(false);
   },[item.id,item.profile,item.updatedAt,evidenceVersion]);
+  // A provider safety preview is short-lived. Clear it on expiry rather than
+  // keeping an apparently usable authorization visible on an idle review tab.
+  useEffect(()=>{
+    if(!preview?.expiresAt)return;
+    const remaining=Date.parse(preview.expiresAt)-Date.now();
+    if(!Number.isFinite(remaining)||remaining<=0) {
+      setPreview(undefined);
+      return;
+    }
+    const timer=setTimeout(()=>setPreview(undefined),remaining);
+    return ()=>clearTimeout(timer);
+  },[preview?.expiresAt]);
   const change=(next:string)=>{
     requestSequence.current++;
     setKey(next);
