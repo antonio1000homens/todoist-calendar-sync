@@ -4,6 +4,7 @@ import { documentClient } from "./dynamodb-capacity.js";
 import { DynamoOrphanJournal, assertTrustedProof, type OrphanJournal, type OrphanDeletionOperation, type VerifiedOrphanProof } from "./orphan-deletion-executor.js";
 import { collectOrphanEvidence } from "./orphan-proof-reader.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
+import { inspectOrphanWorkerMappings, type OrphanWorkerMappingInventory } from "./orphan-worker-mappings.js";
 import type { Profile } from "./types.js";
 
 const OP_ID=/^[A-Za-z0-9_-]{1,128}$/;
@@ -20,6 +21,7 @@ export interface OrphanInspectionSources {
   db?:DB;
   collectProof?:(op:OrphanDeletionOperation)=>Promise<VerifiedOrphanProof>;
   inspectFence?:(profile:Profile)=>Promise<{fence?:Record<string,unknown>;leases:Record<string,unknown>[]}>;
+  inspectMappings?:()=>Promise<OrphanWorkerMappingInventory>;
   now?:()=>Date;
 }
 const lockKey=(id:string)=>({pk:"ORPHAN_CASE_LOCK#"+id,sk:"STATE"});
@@ -86,6 +88,16 @@ export async function inspectConfirmedOrphanOperation(
   else if(fence.leases.length)
     blockers.push("Writer or admission leases are still in flight");
   if(blockers.length)return result();
+  // A complete, stable SQS mapping manifest is required for a successful
+  // read-only inspection. This is not an authorization to disable it.
+  const mappings=await (sources.inspectMappings??(()=>inspectOrphanWorkerMappings()))();
+  if(!mappings.verified||!mappings.fingerprint||!/^[a-f0-9]{64}$/.test(mappings.fingerprint)
+    ||typeof mappings.timeoutSeconds!=="number"||!Number.isInteger(mappings.timeoutSeconds)
+    ||!mappings.mappingCount
+    ||mappings.blockers.length){
+    blockers.push("Target worker SQS mapping inventory is missing, changing or unsafe");
+    return result();
+  }
   const proof=await (sources.collectProof??(operation=>collectOrphanEvidence(operation)))(op);
   try {assertTrustedProof(op,proof);}
   catch {blockers.push("Fresh direct-provider and state orphan proof is blocked or changed");}
