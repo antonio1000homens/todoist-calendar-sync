@@ -3,6 +3,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
+import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
@@ -436,6 +437,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         winner:"none", scope:"occurrence", leftovers:{} };
       const snapshots = await hydrateCaseOrphanEvidence(item,
         await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
+      const deletionCleanup = await deletedRecurrenceStatus(item, snapshots,
+        (profile, seriesId) => reviewEngine.state.getRecurrenceLink(profile, seriesId));
       const reconciliation = item.decision?.type === "operational_reconciliation_stuck"
         ? await new StateRepository().getReconciliationState(item.profile) : undefined;
       const alertedGeneration = item.reconciliationGeneration || item.decision?.context?.reconciliationGeneration;
@@ -451,7 +454,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         progressCheckpoint: reconciliation.progressCheckpoint, nextContinuation: reconciliation.nextContinuation,
         result: reconciliation.result, failureContext: reconciliation.failureContext,
       } : undefined;
-      return response(200,{item,snapshots,...(item.decision?.type === "operational_reconciliation_stuck"
+      return response(200,{item,snapshots,deletionCleanup,...(item.decision?.type === "operational_reconciliation_stuck"
         ? { reconciliation: { run: liveRun, relationToAlert: liveRelation, observedAt: new Date().toISOString() } } : {})});
     }
     if (method === "GET" && segments[0] === "search" && segments.length === 1) {
@@ -497,7 +500,9 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         taskId:selectedTaskId,eventId:selectedEventId,winner:"none",scope:"occurrence",leftovers:{}};
       const snapshots = await hydrateCaseOrphanEvidence(item,
         await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
-      return response(200,{item,snapshots});
+      const deletionCleanup = await deletedRecurrenceStatus(item, snapshots,
+        (profile, seriesId) => reviewEngine.state.getRecurrenceLink(profile, seriesId));
+      return response(200,{item,snapshots,deletionCleanup});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
       const item = await store.getCase(segments[1]);
