@@ -625,7 +625,7 @@ function App() {
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
         {details&&!details.deletionCleanup?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
           item={details.item} snapshots={details.snapshots||[]} loading={busy}
-          recheck={refreshAffected}/>}
+          recheck={refreshAffected} api={api}/>}
         {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Verified recurring deletion</h3>
           <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
