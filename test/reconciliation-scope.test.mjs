@@ -90,3 +90,15 @@ test("a latest manual target is always a single concrete profile",()=>{
   gate.switchScope("home");
   assert.equal(gate.current(response),false,"response to old operator action must not alter the new scope");
 });
+
+test("closures from a previous profile cannot start a request in the new scope",()=>{
+  const gate=createScopedRequestGate("home");
+  gate.switchScope("work");
+  assert.equal(gate.begin("inbox","home"),undefined);
+  assert.equal(gate.begin("reconcile:home","home"),undefined);
+  const work=gate.begin("inbox","work");
+  assert.equal(gate.current(work),true);
+  gate.switchScope("all");
+  assert.equal(gate.begin("inbox","work"),undefined);
+  assert.equal(gate.current(work),false);
+});
