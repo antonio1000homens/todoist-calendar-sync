@@ -8,12 +8,13 @@ function task(date, phrase, id = "task-phase-b", extras = {}) {
   return { id, content: "Phase B", due: { date, string: phrase, is_recurring: true, ...extras } };
 }
 
-function master(taskId, anchor, rule, timeZone) {
+function master(taskId, anchor, rule, timeZone, phrase) {
   return {
     id: "calendar-master", etag: "etag-live", status: "confirmed",
     start: timeZone ? { dateTime: anchor, timeZone } : { date: anchor },
     recurrence: [rule],
-    extendedProperties: { shared: { taskId, syncRecurrenceOwner: "todoist" } },
+    extendedProperties: { shared: { taskId, syncRecurrenceOwner: "todoist",
+      todoistRecurrence: phrase?.toLowerCase(), todoistAnchorStart: anchor } },
   };
 }
 
@@ -34,7 +35,7 @@ function readbacks(phrase, anchor, dates, index = 0, options = {}) {
   const candidate = todoistPhaseBCandidate(before, knownAnchor(anchor));
   return {
     beforeCompletion: before, afterCompletion: after,
-    calendarMaster: master(before.id, anchor, candidate.candidateRrule),
+    calendarMaster: master(before.id, anchor, candidate.candidateRrule, undefined, phrase),
     calendarInstances: instances("calendar-master", dates.slice(0, 3)),
     exceptionInventoryComplete: true, timeZoneVerified: true,
     ...options,
@@ -144,7 +145,7 @@ test("timed Phase B needs observed timezone and consistent DST-aware local wall-
     string: "every other Friday at 9am", is_recurring: true };
   const before = { id: "task-phase-b", content: "Phase B", due };
   const after = { ...before, due: { ...due, datetime: "2027-01-29T09:00:00+00:00" } };
-  const calendar = master(before.id, anchor.start, "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", "Europe/London");
+  const calendar = master(before.id, anchor.start, "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", "Europe/London", due.string);
   const make = (date) => ({
     id: "instance-" + date, recurringEventId: calendar.id, status: "confirmed",
     originalStartTime: { dateTime: date, timeZone: "Europe/London" },
