@@ -5,11 +5,14 @@ Issue #49 adds a human-in-the-loop control plane for sync decisions that are uns
 ## Safety model
 
 - Slack is only an authenticated control surface.
-- `aws2022-slack-handler` verifies Slack signatures and enqueues a typed `kind: manual` delivery.
+- `aws2022-slack-handler` verifies Slack signatures and enqueues a typed, versioned interaction envelope in `kind: manual` deliveries. The worker parses `/sync` commands and existing `gcp_sync_*` button values before creating its established manual-control payload.
+- The gateway's internal envelope is trusted only at the queue/IAM boundary. The worker ignores user-supplied `realm` for authorization, checks the routed profile against the parsed control, and applies `SLACK_CONTROL_ALLOWED_USER_IDS` when configured. An empty list preserves the current Slack-workspace access policy.
+- Current decision cards retain their single-click approval. A preexisting card explicitly marked `confirmRequired` still gets its old confirmation prompt; only the subsequent confirmed action reaches decision execution.
+- Envelopes omit `response_url`, raw signed request bytes, signatures and secret-bearing headers. Command text and the allowlisted typed button fields are the only interaction values persisted to SQS.
 - Manual deliveries use `sync:<profile>`, the same FIFO message group as webhooks and reconciliation.
 - Provider changes are executed only by the normal todoist-calendar-sync worker.
 - The worker re-reads mapping/provider state before applying a decision. A stale decision is closed without mutation.
-- Choosing a Slack decision button is the single explicit approval. There is no secondary destructive-action confirmation; worker-side checks, current provider readback and mutation circuits remain in force.
+- Current Slack decision buttons are the single explicit approval. Preexisting cards marked `confirmRequired` retain their legacy second step; worker-side checks, current provider readback and mutation circuits remain in force.
 - Routine deletion of a **verified native recurring Todoist task** is **automatic**: it deletes the complete corresponding Google Calendar master series (past and future occurrences included) and removes the active mapping/link. No per-series/profile defaults or manual choices are offered for this native-mirror operation. A Calendar-owned rolling one-off Todoist projection still uses its separate manual review workflow, because deleting one such task does not prove intent to delete the whole Calendar series. Completion of an occurrence is distinct and does not delete the series. Provider failures are quarantined; safety controls and identity/readback checks still apply.
 - A remembered default is not the same thing as unattended execution; routine, unambiguous standalone Todoist deletions use a catalog-level auto policy.
 - Only catalog actions explicitly marked `autoAllowed` can be configured in `auto` mode.
@@ -158,6 +161,8 @@ The mapping must still point to the same provider IDs when the decision executes
 ## Operator commands
 
 Configure the Slack app slash command `/sync` against the existing `aws2022-slack-handler` Function URL.
+
+Deployment order for the gateway migration is worker first, ingress second. If restricting Slack users, set the Todoist production variable `TODOIST_SLACK_ALLOWED_USER_IDS` before cutover; an empty value preserves current behavior. Deploy the parser before setting the Lambdas deployment variable `TODOIST_SLACK_GATEWAY_ENABLED=true`. The gateway variable defaults to `false`; rollback to the existing parser by setting it back to `false`. Already queued typed envelopes continue through the worker parser during rollback.
 
 ```text
 /sync status <home|antonio|work>
