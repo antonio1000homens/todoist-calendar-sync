@@ -147,9 +147,6 @@ export async function claimOrphanWorkerPause(
   }
   const epochs:Record<Profile,number>={antonio:0,home:0,work:0};
   for(const profile of PROFILES){
-    const row=await stronglyConsistent(db,"ERASURE#"+profile);
-    // Real epoch rows use pk ERASURE#profile / sk EPOCH.
-    void row;
     const result=await db.send(new GetCommand({TableName:table(),
       Key:{pk:"ERASURE#"+profile,sk:"EPOCH"},ConsistentRead:true}));
     const epoch=result.Item?.epoch;
@@ -173,10 +170,10 @@ export async function claimOrphanWorkerPause(
     {Put:{TableName:table(),Item:receipt,ConditionExpression:"attribute_not_exists(pk)"}},
     {Put:{TableName:table(),Item:owner,ConditionExpression:"attribute_not_exists(pk)"}},
     {ConditionCheck:{TableName:table(),Key:key("ORPHAN_DELETE#"+id),
-      ConditionExpression:"#phase=:confirmed AND #version=:zero AND caseId=:caseId AND profile=:profile AND side=:side AND targetId=:target AND providerDigest=:digest AND actorSubject=:actor AND caseUpdatedAt=:caseUpdatedAt AND confirmedAt=:confirmed AND confirmationExpiresAt=:expiry"
+      ConditionExpression:"#phase=:confirmed AND #version=:zero AND caseId=:caseId AND profile=:profile AND side=:side AND targetId=:target AND providerDigest=:digest AND actorSubject=:actor AND caseUpdatedAt=:caseUpdatedAt AND confirmedAt=:confirmedAt AND confirmationExpiresAt=:expiry"
         +(op.side==="calendar"?" AND providerEtag=:etag":" AND attribute_not_exists(providerEtag)"),
       ExpressionAttributeNames:{"#phase":"phase","#version":"version"},
-      ExpressionAttributeValues:{":confirmed":"confirmed",":zero":0,":caseId":op.caseId,
+      ExpressionAttributeValues:{":confirmed":"confirmed",":confirmedAt":op.confirmedAt,":zero":0,":caseId":op.caseId,
         ":profile":op.profile,":side":op.side,":target":op.targetId,
         ":digest":op.providerDigest,":actor":op.actorSubject,
         ":caseUpdatedAt":op.caseUpdatedAt,":expiry":op.confirmationExpiresAt,
