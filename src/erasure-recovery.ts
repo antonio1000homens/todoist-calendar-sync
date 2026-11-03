@@ -61,6 +61,8 @@ function postwriteReviewEnabled():void {
 function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
   const {operation,preview,fingerprint}=inspection;
   return digest({mode:"post_write",fingerprint,epoch:preview.epoch,profile:operation.profile,
+    originalUpdatedAt:operation.updatedAt,originalStatus:operation.status,
+    originalConfirmationId:operation.confirmationId,
     originalPreviewFingerprint:operation.previewFingerprint,originalSelections:operation.selectedActions,
     originalTargets:operation.target,originalActionPlan:operation.actionPlan,originalInventory:operation.inventory,
     lifecycle:operation.lifecycle});
