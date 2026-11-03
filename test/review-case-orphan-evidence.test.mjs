@@ -51,7 +51,7 @@ test("failed provider reads and foreign ownership are visibly unverified, never 
     return {ref:identity,object:identity.side==="todoist"?todoist(identity.id):calendar(identity.id)};
   });
   const failure=fetched.filter(s=>s.lookupError);
-  assert.deepEqual(failure.map(s=>s.ref.id),["recorded-event","recorded-task"]);
+  assert.deepEqual(failure.map(s=>s.ref.id),["recorded-task","recorded-event"]);
   const options=orphanItemsForCase({item,snapshots:fetched});
   for(const id of ["recorded-event","recorded-task"]){
     const option=options.find(x=>x.id===id);
