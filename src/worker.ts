@@ -30,6 +30,7 @@ import {
 } from "./sqs-failure-policy.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
+import { decodeSlackInteractionDelivery, isSlackControlUserAllowed } from "./slack-interaction.js";
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-worker", event, ...detail }));
@@ -525,6 +526,28 @@ export const handler: SQSHandler = async (event, context: Context) => {
           delivery: deliverySummary(delivery),
         });
         continue;
+      }
+
+      if (delivery.slackInteraction) {
+        const interaction = delivery.slackInteraction;
+        delivery = decodeSlackInteractionDelivery(delivery);
+        const userId = delivery.manual?.slackUserId || "";
+        if (!isSlackControlUserAllowed(userId)) {
+          log("slack_interaction_rejected", {
+            awsRequestId: context.awsRequestId,
+            deliveryId: delivery.id,
+            reason: "user_not_allowlisted",
+            allowlistConfigured: String(process.env.SLACK_CONTROL_ALLOWED_USER_IDS || "").split(",").some((id) => Boolean(id.trim())),
+          });
+          continue;
+        }
+        log("slack_interaction_decoded", {
+          awsRequestId: context.awsRequestId,
+          deliveryId: delivery.id,
+          schemaVersion: interaction.schemaVersion,
+          interactionType: interaction.type,
+          profile: delivery.profile,
+        });
       }
 
       if (delivery.kind === "manual") {

@@ -36,6 +36,10 @@ Parameters:
   TodoistCalendarSyncSlackChannel:
     Type: String
     MinLength: 2
+  SlackControlAllowedUserIds:
+    Type: String
+    Default: ""
+    Description: Optional comma-separated Slack user allowlist for typed /sync and decision-button deliveries; empty preserves the current authenticated-workspace access policy.
   ProfileConfigJson:
     Type: String
     NoEcho: true
@@ -437,6 +441,7 @@ Resources:
           TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED: !Ref ManualInterventionEnabled
           TODOIST_CALENDAR_SYNC_SLACK_CHANNEL: !Ref TodoistCalendarSyncSlackChannel
           SLACK_BOT_TOKEN_PARAMETER: !Ref SlackBotTokenParameter
+          SLACK_CONTROL_ALLOWED_USER_IDS: !Ref SlackControlAllowedUserIds
           DLQ_URL: !Ref SyncDlq
           SYNC_QUEUE_URL: !Ref SyncQueue
       Policies:

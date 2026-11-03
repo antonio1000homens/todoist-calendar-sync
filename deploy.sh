@@ -15,6 +15,7 @@ google_prefix="${GOOGLE_CREDENTIALS_PARAMETER_PREFIX:-${ssm_prefix%/}/google}"
 todoist_prefix="${TODOIST_TOKEN_PARAMETER_PREFIX:-${ssm_prefix%/}/todoist}"
 slack_bot_token_parameter="${SLACK_BOT_TOKEN_PARAMETER:-/lambdas/shared/slack-bot-token}"
 todoist_calendar_sync_slack_channel="${TODOIST_CALENDAR_SYNC_SLACK_CHANNEL:-}"
+slack_control_allowed_user_ids="${TODOIST_SLACK_ALLOWED_USER_IDS:-}"
 sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
 cloudflare_access_issuer="${CF_ACCESS_ISSUER:-}"
 cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
@@ -211,6 +212,7 @@ sam deploy \
     "TodoistTokenParameterPrefix=$todoist_prefix" \
     "SlackBotTokenParameter=$slack_bot_token_parameter" \
     "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel" \
+    "SlackControlAllowedUserIds=$slack_control_allowed_user_ids" \
     "ProfileConfigJson=$sam_profile_config_json" \
     "CloudflareAccessIssuer=$cloudflare_access_issuer" \
     "CloudflareAccessAudience=$cloudflare_access_audience" \
