@@ -10,13 +10,17 @@ parseable rule is **not** proof that two provider APIs behave identically.
 - `native_exact`: canonical rule, independently verified original DTSTART
   phase, Calendar master and instance readback, Todoist normalized due string,
   at least one completion progression, and complete explicit Calendar exception
-  inventory are all evidenced. The caller must furnish **all five** evidence
-  fields; the classifier cannot obtain these from a string alone.
+  inventory are all evidenced. Timed rules additionally require independently
+  proven `timeZoneVerified` from provider readback: specifying an IANA name
+  alone never authorizes promotion. The caller must furnish all five standard
+  evidence fields plus the sixth timezone field for timed recurrence; the
+  classifier cannot obtain provider evidence from a string alone.
 - `rolling_required`: recognizable recurrence, but some provider evidence is
   absent or a known exclusion (completion-relative `every!`, finite endpoints,
   Calendar overrides) requires the existing owner-aware rolling/repair path.
 - `unsupported`: malformed or ambiguous input, duplicate/unknown components,
-  invalid civil time, or an unsupported Todoist natural-language idiom.
+  invalid civil time, unsupported sub-minute precision or timed UTC `UNTIL`
+  (which requires an instant-aware expander), or an unsupported Todoist phrase.
 
 An `RRULE` with reordered fields, omitted `INTERVAL=1`, or reordered weekday
 and month-day sets has one canonical form. The canonical form is descriptive,
@@ -42,7 +46,11 @@ wall-time, IANA timezone and termination fields, never raw rule strings.
 
 The semantic expander models civil Gregorian dates and fixed local clock times.
 Monthly 29/30/31 and February 29 **skip nonexistent dates**. Weekly two-week
-phase derives from independently verified DTSTART, not the current clock. A
+phase derives from independently verified DTSTART, not the current clock.
+The occurrence horizon scales with the requested number of dates and interval,
+with a fixed 160-year safety cap; an incomplete window never proves equality.
+Date-only `UNTIL` remains finite/rolling, while timed UTC `UNTIL` is
+explicitly rejected rather than treated as a date-only cutoff. A
 bounded comparison is only one part of verification; it does not prove unknown
 future provider normalization or exceptions. For timed occurrences, readback
 must verify identical local wall time and timezone across BST/DST.
