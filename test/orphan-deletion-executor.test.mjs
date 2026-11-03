@@ -224,6 +224,13 @@ test("DynamoDB journal enforces immutable identity and phase/version conditional
   assert.match(writes[1].input.ConditionExpression,/#version = :oldVersion/);
   assert.match(writes[1].input.ConditionExpression,/#target = :target/);
   assert.equal(writes[1].input.ExpressionAttributeValues[":oldVersion"],0);
+  assert.equal(writes[1].input.ExpressionAttributeValues[":etag"],"etag-1");
+  const todoistWrites=[];
+  const taskJournal=new DynamoOrphanJournal({send:async command=>{todoistWrites.push(command);return {};}});
+  const task=makeOperation("todoist");
+  await taskJournal.advance(task,"fenced","task safety");
+  assert.equal(Object.hasOwn(todoistWrites[0].input.ExpressionAttributeValues,":etag"),false,
+    "Todoist CAS must not send an unused Calendar ETag value");
   await assert.rejects(journal.advance(operation,"succeeded","skipped"),/Invalid guarded orphan transition/);
   const review=await journal.requireReview(after,"state conflict");
   assert.equal(review.phase,"needs_review");
