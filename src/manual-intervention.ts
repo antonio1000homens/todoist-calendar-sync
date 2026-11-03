@@ -1357,6 +1357,15 @@ export class ManualInterventionService {
       mode = "prompt";
     }
 
+    if (catalog.defaultMode === "auto" && mode !== "auto") {
+      console.warn(JSON.stringify({
+        service: "todoist-calendar-sync-manual", event: "intervention_policy_auto_overridden",
+        profile, type, catalogMode: catalog.defaultMode, catalogAction: catalog.defaultAction,
+        resolvedMode: resolvedPolicy.mode, policySource: resolvedPolicy.source,
+        effectiveMode: mode, effectiveAction: defaultAction,
+        reason: resolvedPolicy.mode !== "auto" ? "effective_policy_override" : "invalid_or_unsafe_auto_action",
+      }));
+    }
     const key = decisionKey(profile, type, identity);
     let decisionContext = context;
     if (mode === "prompt" && contextEnricher) {
