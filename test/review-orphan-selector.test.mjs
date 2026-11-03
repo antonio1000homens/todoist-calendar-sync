@@ -6,7 +6,7 @@ import {recordedOrphanIdentities,orphanItemsForCase,chosenOrphan} from "../revie
 const item={id:"case-287",profile:"home",status:"open",taskId:"task-1",eventId:"event-1",
   decision:{context:{candidateTaskIds:["task-2"],candidateEventIds:["event-2"]}}};
 const snap=(side,id,object,more={})=>({ref:{profile:"home",side,id},object,...more});
-const task=(id,content="Fix school uniform")=>({id,content,project_id:"project",due:{date:"2026-11-10",is_recurring:false}});
+const task=(id,content="Fix school uniform")=>({id,content,project_id:"project",is_deleted:false,is_completed:false,due:{date:"2026-11-10",is_recurring:false}});
 const event=(id,summary="Fix school uniform")=>({id,summary,status:"confirmed",start:{date:"2026-11-10"},end:{date:"2026-11-11"},etag:"etag"});
 const entries=snapshots=>orphanItemsForCase({item,snapshots});
 
@@ -87,6 +87,31 @@ test("bounded case evidence lists support both explicitly recorded candidate sid
   assert.deepEqual(orphanItemsForCase({item:blank,snapshots:[snap("todoist","task-1",task("task-1"))]}),[]);
 });
 
+test("repair-search includedBy does not establish membership in an immutable alert",()=>{
+  const unrelated=snap("calendar","search-operator-chose",event("search-operator-chose"),
+    {includedBy:["Selected Calendar item for this repair"]});
+  const linked=snap("todoist","task-1",task("task-1"),
+    {includedBy:["Exact identity recorded on selected review alert"]});
+  assert.deepEqual(entries([unrelated,linked]).map(x=>x.id),["task-1"]);
+  assert.deepEqual(entries([unrelated]),[], "even a collected search-only item cannot anchor deletion candidates");
+});
+
+test("candidate-only IDs are case-scoped and failed provider lookups never count as verified missing",()=>{
+  const candidate=snap("todoist","task-2",null,{lookupError:"The direct provider lookup failed"});
+  const options=entries([candidate,snap("calendar","event-2",event("event-2"))]);
+  assert.deepEqual(options.map(x=>x.id),["event-2","task-2"]);
+  const failure=options.find(x=>x.id==="task-2");
+  assert.equal(failure.status,"unverified");
+  assert.match(failure.reason,/could not be verified/);
+  assert.equal(failure.eligible,false);
+});
+
+test("a Todoist task with absent completion/deletion fields is not verified live",()=>{
+  const incomplete=snap("todoist","task-1",{id:"task-1",content:"Incomplete",project_id:"project"});
+  assert.equal(entries([incomplete])[0].live,false);
+  assert.match(entries([incomplete])[0].reason,/missing explicit Todoist status fields/);
+});
+
 test("terminal alert statuses cannot enable deletion and exact selection is immutable",()=>{
   const closed={...item,status:"resolved"};
   const candidates=orphanItemsForCase({item:closed,snapshots:[snap("todoist","task-1",task("task-1"))]});
@@ -101,6 +126,9 @@ test("new UI includes one case-bound provider/title/ID dropdown with no second-I
   const main=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
   const recovery=readFileSync(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
   assert.match(panel,/<label>Item to delete/);
+  assert.match(panel,/disabled=\{!candidate.eligible\}/);
+  assert.match(panel,/blocked:.*candidate.reason/);
+  assert.match(panel,/All case-recorded items are blocked/);
   assert.equal((panel.match(/<select /g)||[]).length,1);
   assert.doesNotMatch(panel,/Exact Todoist task ID|Exact Calendar event ID|Separately delete|delete both/);
   assert.match(panel,/setPreview\(undefined\);setTyped\(\{phrase:"",id:""\}\)/);
