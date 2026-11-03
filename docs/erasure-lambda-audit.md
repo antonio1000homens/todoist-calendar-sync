@@ -61,33 +61,63 @@ Other versions receive a review-only designation with safeToDelete=false.
 Resource-policy absence is not evidence of non-invokability: same-account
 identity-based IAM and cross-account principals still require audit.
 
-### Initial live read-only findings (3 Nov 2026, London account hosting sync)
+### Live read-only findings (3 Nov 2026, Windsor account)
 
-- Ingress: 70 numbered published versions (2–71), live alias points to 71.
-  Review API: 90 numbered published versions (2–91), live points to 91.
-- Two enabled SQS event-source mappings targeted unqualified worker and
-  erasure-worker functions; none targeted old ingress/review-api qualifiers.
-- Sampled historical numeric qualifiers had no version resource policy.
-  The unqualified and live ingress/review-api URLs had resource-based
-  invoke permissions with additional Function URL conditions.
-- The sync deployment GitHub Actions role did not explicitly allow
-  lambda:InvokeFunction in inspected policy statements. However, an
-  AdministratorAccess role has a policy permitting all actions, and a
-  vsstudio IAM user has AWSLambda_FullAccess (lambda:* on all resources).
-  Removing version resource policies cannot deny these identity grants.
-- Current seven Lambda configurations showed ERASURE_REPLAY_BARRIER_VERSION
-  and ERASURE_POSTWRITE_REVIEW_VERSION absent. The existing independent
-  ERASURE_EXECUTION_ENABLED flag was true on the review API and erasure worker.
+The connected AWS identity was verified as account `243857182133`. An
+all-enabled-region scan covered 17 regions and found the seven
+`todoist-calendar-sync-*` functions only in `eu-west-2`:
 
-Before any future version retirement, enumerate all IAM principals, permission
-boundaries, SSO permission sets and cross-account invocation; validate
-CodeDeploy rollback targets, CloudFormation/SAM ownership, Function URLs,
-EventBridge/Step Functions, legacy names and every deployed region. Inspect
-CloudTrail Lambda data-event recording coverage and qualified invocation
-metrics (no CloudTrail records is NOT proof of no invocation), and confirm
-old deployment bundles and their code digests. Obtain operator/security
-approval and a rollback plan; published Lambda version deletion is
-irreversible and may break deployment rollback.
+- Ingress: 70 numbered versions (2–71); `live` points to 71.
+- Review API: 93 numbered versions (2–94); `live` points to 94.
+- Watch, worker, reconciler, erasure-worker and completed-cleanup each have
+  `$LATEST` only. No weighted aliases were present.
+- Two enabled SQS event-source mappings target the unqualified worker and
+  erasure-worker. Resource policies also show EventBridge rules for watch,
+  reconciliation and completed-cleanup.
+- `GetPolicy` succeeded for every numbered ingress/review-api version; none
+  had a version resource policy. The `live` ingress/review-api aliases have
+  Function URLs with `AuthType=NONE` and wildcard resource permissions
+  conditioned on `InvokedViaFunctionUrl`. Unqualified functions have no
+  Function URL configuration, although their resource policies retain
+  URL-conditioned statements. The current source review API checks a
+  Cloudflare Access assertion before route dispatch; version 94 still needs
+  to be matched to audited source before claiming this for the deployment.
+- Read-only identity-policy scans covered all 49 IAM roles and 6 IAM users;
+  `ListGroups` returned none. Broad same-account invocation grants include
+  `AdministratorAccess` on the SSO admin role and `WindsorVsstudioAccess`,
+  `AWSLambda_FullAccess` on `S3-access-github-actions`, and `AWSLambda_FullAccess`
+  plus a `function:*` invoke grant on user `vsstudio`. The former role trusts
+  GitHub Actions subjects matching `repo:antonio1000homens/lambdas:*`.
+  These identity grants can reach historical qualified versions even when
+  those versions have no resource policy.
+- `GitHubActionsTodoistCalendarSyncDeployRole` is scoped by OIDC to the
+  repository's production environment. Its policies allow code/config updates,
+  version publication, alias and permission changes, and mapping changes, but
+  the inspected statements do not grant `lambda:InvokeFunction`.
+- `GetFunctionConfiguration` was read for every published ingress/review-api
+  version and for all seven `$LATEST` versions. Both replay-barrier and
+  post-write-review variables were absent on all 163 published versions and
+  all seven `$LATEST` versions. There were 65 distinct ingress code digests
+  and 92 distinct review-api digests. Review API had the separate
+  `ERASURE_EXECUTION_ENABLED=true` setting on 31 historical versions and
+  `$LATEST`; 2 historical versions set it to `false` and 60 omitted it.
+  Erasure-worker `$LATEST` also had that separate execution flag set to
+  `true`. These config values do not prove which code each digest contains.
+
+This does not complete the independent audit. IAM permission boundaries,
+Organizations SCPs and SSO permission-set provenance were not enumerated;
+CloudTrail Lambda data-event coverage and qualified invocation metrics were
+not checked. Nor were all historical bundles compared with replay-admission
+source, CloudFormation/CodeDeploy rollback references exhaustively verified,
+or nonstandard legacy names/accounts proved absent. A complete historical
+writer audit must establish these before any retirement or denial change.
+The local Windsor SSO CLI token was expired during this review, so these reads
+used the connected Windsor AWS account instead. No AWS resource or IAM policy
+was changed.
+
+Obtain independent operator/security approval and a rollback plan before any
+IAM update or version retirement. Published version deletion is irreversible
+and can break deployment rollback.
 
 This report does not authorize production mutation, nor complete the first
 issue #307 acceptance box. Keep ERASURE_REPLAY_BARRIER_VERSION OFF,

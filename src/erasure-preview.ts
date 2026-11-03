@@ -6,6 +6,7 @@ import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
+import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
@@ -30,6 +31,7 @@ export interface ErasurePreviewResult {
   backupRetentionNotice: string;
   classificationCounts: Record<string, number>;
   blockers: string[];
+  crossProfileEvidence?:CrossProfileErasureEvidence;
   confirmation?: { confirmationId: string; expiresAt: number };
 }
 
@@ -43,6 +45,7 @@ type Dependencies = {
   allowJournalOperationId?: string;
   allowLeaseOwner?: string;
   scanDeadlineMs?: number;
+  auditCrossProfileIdentity?:boolean;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -68,12 +71,19 @@ class ErasurePreviewDeadlineError extends Error {
 
 async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: Dependencies): Promise<Record<string, unknown>[]> {
   const rows: Record<string, unknown>[] = [];
+  const seenCursors=new Set<string>();
+  const seenKeys=new Set<string>();
   let cursor: Record<string, unknown> | undefined;
   const started=Date.now();
   const deadline=started+(dependencies.scanDeadlineMs??80_000);
   const sleep=dependencies.sleep || (ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   do {
     if(Date.now()>=deadline) throw new ErasurePreviewDeadlineError();
+    if(cursor) {
+      const cursorKey=JSON.stringify(cursor);
+      if(seenCursors.has(cursorKey))throw new Error("Strong state inventory repeated a pagination cursor");
+      seenCursors.add(cursorKey);
+    }
     const pageStarted=Date.now();
     let result;
     for(let attempt=0;;attempt++) {
@@ -88,7 +98,13 @@ async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: D
         await sleep(Math.min(8000,250*2**attempt));
       }
     }
-    rows.push(...(result.Items || []) as Record<string, unknown>[]);
+    for(const row of (result.Items||[]) as Record<string,unknown>[]) {
+      if(typeof row.pk!=="string"||typeof row.sk!=="string")
+        throw new Error("Strong state inventory returned a row without its exact key");
+      const rowKey=JSON.stringify([row.pk,row.sk]);
+      if(seenKeys.has(rowKey))throw new Error("Strong state inventory repeated a row across pages");
+      seenKeys.add(rowKey);rows.push(row);
+    }
     cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
     if(cursor) await sleep(pacingDelayMs(Number(result.ConsumedCapacity?.CapacityUnits||0),Date.now()-pageStarted));
   } while (cursor);
@@ -191,7 +207,12 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
   const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
     digest: record.digest, classification: record.classification }));
-  const providerSnapshotFingerprint = fingerprint(providerData);
+  const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
+    taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
+    readerForProfile:async profile=>profile===target.profile?providerClients:defaultProviderClientFactory(profile),
+  }):undefined;
+  const providerSnapshotFingerprint = fingerprint(crossProfileEvidence
+    ?{primary:providerData,crossProfileEvidence}:providerData);
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
     calendarEvent: event ? { id: target.eventId!, digest: fingerprint(event), etag:event.etag as string } : undefined,
     comments: [
@@ -208,5 +229,6 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     actionPlan,
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
+    ...(crossProfileEvidence?{crossProfileEvidence}:{}),
   };
 }

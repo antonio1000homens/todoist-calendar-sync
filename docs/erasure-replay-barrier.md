@@ -233,25 +233,60 @@ pages, rejects repeated page tokens, conflicting duplicate event snapshots,
 invalid pages and missing event IDs. It does not mutate Calendar data.
 
 `observeCrossProfileCalendarAliases` accepts independently configured
-per-profile readers and **requires fresh successful reads for home, antonio
-and work**. It records exact observed event IDs, cancelled aliases and
-recurrence parent *hints* without exposing a release-authoritative
-`calendarAliases` property.
+per-profile readers and requires fresh successful reads for home, antonio and
+work. For indexed recurring links it reads exact masters and every instance
+page, including cancellations and exceptions, with a 32-ID bound.
 
-These reads are **insufficient** for marker installation or fence release.
-The Google sharedExtendedProperty filter can omit historic/untagged links,
-series instances, legacy comments and mapping records. Even a successful
-empty result in one profile is only an observation, **never** proof of
-absence. The collector does not scan DynamoDB, independently resolve
-Todoist/comment ownership, validate source and destination recurrence
-masters, compare direct provider ETags, or confirm leases/epochs.
+The post-write inspection now also calls
+`observeCrossProfileErasureEvidence`. It consumes the already completed
+strongly consistent, fully paginated DynamoDB scan and independently reads all
+three profiles' comments from every active project, archived personal project
+and archived workspace project, active Todoist task inventory, full unfiltered
+Calendar event inventory, tagged event lookup, exact candidate events and
+recurring instances. Project and comment pages are bounded and strictly
+validated; an inaccessible workspace archive refuses the inventory. The report
+binds a fingerprint of the full project ID/workspace inventory without returning
+those IDs. It follows identity fields from mapping,
+completed and audit rows plus parsed comments; it does not match titles or
+dates. DynamoDB, Calendar, task and comment pagination reject repeated cursors,
+invalid identities and conflicting duplicate snapshots. The inspection binds
+the read-only evidence fingerprint into its fresh inspection fingerprint.
+Todoist's [Get Comments endpoint](https://developer.todoist.com/api/v1/)
+requires exactly one project or task ID, so completeness depends on first
+enumerating active and archived projects for each profile.
+
+The report returns counts and SHA-256 fingerprints only, with no task/event
+IDs, titles, descriptions or comment bodies. A `knownIdentitiesAbsentFromCurrentProviders`
+result requires all three profiles' complete provider inventories, no related
+provider comments, and a closed identity walk; a 404/410 response alone never
+sets it. An oversized or
+nonconvergent identity walk remains incomplete. The result always sets
+`eligibleForPostWriteRelease:false`, has explicit blockers, and deliberately
+has no `calendarAliases` field accepted by the offline transaction
+constructor.
+
+These reads still do not prove historical aliases that have no provider tag,
+state row or comment provenance, nor do they establish a transactionally
+consistent provider/DynamoDB snapshot. Direct ETags and ownership must be
+rechecked at action time. Old Lambda versions, IAM invoke paths, writer
+fence/lease invariants, privacy approval and Work-profile staging remain
+independent gates.
 
 **No deployed worker/API imports this observation as authorisation.** A
 future privileged verifier must reconcile these observations with fully
-paginated strong DynamoDB state, all project/task comments, direct Todoist
-and Calendar item/master/instance reads in every profile, old versions and
-new independent operator confirmation before calling
+paginated strong DynamoDB state, every accessible project comment and task
+comments for discovered task identities, direct Todoist and Calendar
+item/master/instance reads in every profile, old versions and new independent
+operator confirmation before calling
 `atomicReplayRelease()`. Any missing provenance keeps the fence in place.
+
+Calendar inventory currently reads each profile's configured sync calendar,
+not every calendar the profile can access. Aliases in other calendars remain
+unqueried. Todoist v1 also does not offer a global task-comment listing
+endpoint: task comments require a known task ID. Therefore comments on
+unrelated or otherwise unknown tasks are not enumerated by this observer.
+These limitations prevent the observation from establishing complete
+cross-profile absence.
 
 This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker

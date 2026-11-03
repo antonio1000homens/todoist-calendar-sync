@@ -7,6 +7,43 @@ const CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3";
 const TODOIST_ROOT = "https://api.todoist.com/api/v1";
 const TODOIST_COMMENTS_ROOT = "https://api.todoist.com/api/v1/comments";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const MAX_ERASURE_AUDIT_PROJECTS=2048;
+const MAX_ERASURE_AUDIT_COMMENTS=100000;
+export type TodoistProjectCommentAudit={
+  projects:Array<{id:string;workspaceId?:number}>;
+  comments:TodoistCommentRecord[];
+};
+
+async function listTodoistCommentPages(
+  readPage:(cursor?:string)=>Promise<{results?:TodoistCommentRecord[];next_cursor?:unknown}>,
+  resource:string,
+):Promise<TodoistCommentRecord[]> {
+  const comments=new Map<string,TodoistCommentRecord>();
+  const seenCursors=new Set<string>();
+  let cursor:string|undefined;
+  for(let page=0;page<1000;page++) {
+    const result=await readPage(cursor);
+    if(!result||!Array.isArray(result.results))
+      throw new Error("Todoist "+resource+" comment inventory returned invalid results");
+    for(const comment of result.results) {
+      if(!comment||typeof comment.id!=="string"||!comment.id)
+        throw new Error("Todoist "+resource+" comment inventory returned an unidentified comment");
+      const previous=comments.get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist "+resource+" comment changed during pagination");
+      comments.set(comment.id,comment);
+      if(comments.size>50000)
+        throw new Error("Todoist "+resource+" comment inventory exceeded the result limit");
+    }
+    const next=result.next_cursor;
+    if(next===undefined||next===null||next==="")return [...comments.values()];
+    if(typeof next!=="string"||seenCursors.has(next))
+      throw new Error("Todoist "+resource+" comment inventory returned a repeated/invalid cursor");
+    seenCursors.add(next);
+    cursor=next;
+  }
+  throw new Error("Todoist "+resource+" comment inventory exceeded the page limit");
+}
 
 async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -153,6 +190,36 @@ export class GoogleCalendar {
     throw new Error("Calendar task link lookup exceeded page limit");
   }
 
+  /** Complete unfiltered Calendar event inventory for privileged read-only audits. */
+  async listAllEventsForErasureAudit(): Promise<CalendarEvent[]> {
+    const query=new URLSearchParams({showDeleted:"true",singleEvents:"false",maxResults:"2500"});
+    const found=new Map<string,CalendarEvent>();
+    const seenTokens=new Set<string>();
+    for(let page=0;page<1000;page++) {
+      const response=await this.request<{items?:CalendarEvent[];nextPageToken?:string}>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+      );
+      if(response.items!==undefined&&!Array.isArray(response.items))
+        throw new Error("Calendar full inventory returned invalid items");
+      for(const event of response.items||[]) {
+        if(!event||typeof event.id!=="string"||!/^[A-Za-z0-9_.-]{1,1024}$/.test(event.id))
+          throw new Error("Calendar full inventory returned an unidentified event");
+        const previous=found.get(event.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(event))
+          throw new Error("Calendar event changed during full inventory pagination");
+        found.set(event.id,event);
+        if(found.size>100000)throw new Error("Calendar full inventory exceeded the audit result limit");
+      }
+      const next=response.nextPageToken;
+      if(next===undefined)return [...found.values()];
+      if(typeof next!=="string"||!next||seenTokens.has(next))
+        throw new Error("Calendar full inventory returned a repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken",next);
+    }
+    throw new Error("Calendar full inventory exceeded the page limit");
+  }
+
   async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
     // Existing sync uses an exact UNIQUE candidate, never the first result.
     return selectLinkedCalendarEvent(taskId, await this.listLinkedEventsByTodoistTaskId(taskId));
@@ -238,6 +305,43 @@ export class GoogleCalendar {
       if (response.nextPageToken) query.set("pageToken", response.nextPageToken);
       else return items;
     } while (true);
+  }
+
+  /**
+   * Bounded complete instance observation for the #307 recovery audit. Unlike
+   * date-windowed normal sync reads, this enumerates every page (including
+   * cancellations and exceptions) and refuses oversized series.
+   */
+  async listEventInstances(masterId: string): Promise<CalendarEvent[]> {
+    if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
+      throw new Error("Calendar instance inventory requires an exact master ID");
+    const query = new URLSearchParams({ showDeleted: "true", maxResults: "2500" });
+    const found = new Map<string, CalendarEvent>();
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 20; page += 1) {
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
+      );
+      if (response.items !== undefined && !Array.isArray(response.items))
+        throw new Error("Calendar instance inventory returned invalid items");
+      for (const event of response.items || []) {
+        if (!event || typeof event.id !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(event.id)
+          || event.recurringEventId !== masterId)
+          throw new Error("Calendar instance inventory returned an unattributable instance");
+        const previous = found.get(event.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(event))
+          throw new Error("Calendar instance inventory changed during pagination");
+        found.set(event.id, event);
+        if (found.size > 32) throw new Error("Calendar recurring series exceeds replay marker bound");
+      }
+      const next = response.nextPageToken;
+      if (next === undefined) return [...found.values()];
+      if (typeof next !== "string" || !next || seenTokens.has(next))
+        throw new Error("Calendar instance inventory returned repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken", next);
+    }
+    throw new Error("Calendar instance inventory exceeded page limit");
   }
 
   /** Bounded instance read: never expand an open-ended recurrence without limits. */
@@ -430,18 +534,41 @@ export class Todoist {
   }
 
   async listTasks(projectId = todoistProjectForToken(this.token)): Promise<TodoistTask[]> {
-    const tasks: TodoistTask[] = [];
-    let cursor: string | undefined;
-    do {
+    return this.readTasks(projectId);
+  }
+
+  /** Paginate the complete active-task collection for a read-only identity audit. */
+  async listAllTasksForErasureAudit(): Promise<TodoistTask[]> {
+    return this.readTasks(undefined);
+  }
+
+  private async readTasks(projectId?:string): Promise<TodoistTask[]> {
+    const tasks=new Map<string,TodoistTask>();
+    const seenCursors=new Set<string>();
+    let cursor:string|undefined;
+    for(let pageNumber=0;pageNumber<1000;pageNumber++) {
       const query = new URLSearchParams();
       if (projectId) query.set("project_id", projectId);
       if (cursor) query.set("cursor", cursor);
       const suffix = query.size ? `?${query}` : "";
       const page = await this.request<{ results?: TodoistTask[]; next_cursor?: string }>(`/tasks${suffix}`);
-      tasks.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
-    return tasks;
+      if(!page||!Array.isArray(page.results))throw new Error("Todoist task inventory returned invalid results");
+      for(const task of page.results) {
+        if(!task||typeof task.id!=="string"||!task.id)
+          throw new Error("Todoist task inventory returned an unidentified task");
+        const previous=tasks.get(task.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(task))
+          throw new Error("Todoist task changed during inventory pagination");
+        tasks.set(task.id,task);
+        if(tasks.size>100000)throw new Error("Todoist task inventory exceeded the audit result limit");
+      }
+      const next=page.next_cursor;
+      if(next===undefined||next===null||next==="")return [...tasks.values()];
+      if(typeof next!=="string"||seenCursors.has(next))
+        throw new Error("Todoist task inventory returned a repeated/invalid cursor");
+      seenCursors.add(next);cursor=next;
+    }
+    throw new Error("Todoist task inventory exceeded the page limit");
   }
 
   async getTask(taskId: string): Promise<TodoistTask> {
@@ -519,30 +646,101 @@ export class Todoist {
   async listProjectComments(projectId: string, refresh = false): Promise<TodoistCommentRecord[]> {
     const cached = this.projectCommentCache.get(projectId);
     if (cached && !refresh) return cached.slice();
-    const comments: TodoistCommentRecord[] = [];
-    let cursor: string | undefined;
-    do {
+    const comments=await listTodoistCommentPages(async cursor=>{
       const query = new URLSearchParams({ project_id: projectId });
       if (cursor) query.set("cursor", cursor);
-      const page = await this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
-      comments.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
+      return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
+    },"project");
     this.projectCommentCache.set(projectId, comments.slice());
     return comments;
   }
 
+  /**
+   * Read project comments across the complete accessible project inventory,
+   * including archived personal and workspace projects. Todoist's comments
+   * endpoint requires exactly one project_id or task_id, so querying only the
+   * configured sync project would miss provenance left after a project move.
+   * Inaccessible archived workspace inventories fail closed.
+   */
+  async listAllProjectCommentsForErasureAudit():Promise<TodoistProjectCommentAudit> {
+    const projects=new Map<string,number|null|undefined>();
+    const addProject=(value:unknown,workspaceId?:number)=>{
+      if(!value||typeof value!=="object")throw new Error("Todoist project audit returned an invalid project");
+      const project=value as {id?:unknown;workspace_id?:unknown};
+      if(typeof project.id!=="string"||!project.id)
+        throw new Error("Todoist project audit returned a project without an ID");
+      if(workspaceId!==undefined&&project.workspace_id!==undefined&&project.workspace_id!==workspaceId)
+        throw new Error("Todoist archived project disagrees with its workspace inventory");
+      const owner=workspaceId??(typeof project.workspace_id==="number"?project.workspace_id:
+        project.workspace_id===null?null:undefined);
+      const previous=projects.get(project.id);
+      if(projects.has(project.id)&&previous!==undefined&&owner!==undefined&&previous!==owner)
+        throw new Error("Todoist project audit found conflicting workspace ownership");
+      if(!projects.has(project.id)||previous===undefined)projects.set(project.id,owner);
+      if(projects.size>MAX_ERASURE_AUDIT_PROJECTS)
+        throw new Error("Todoist project audit exceeded its bounded project inventory");
+    };
+    const readPages=async(path:string,resultKey:"results"|"workspace_projects",workspaceId?:number)=>{
+      const seenCursors=new Set<string>();let cursor:string|undefined;
+      for(let pageNumber=0;pageNumber<1000;pageNumber++) {
+        const query=new URLSearchParams({limit:"200"});
+        if(cursor)query.set("cursor",cursor);
+        const page=await this.request<Record<string,unknown>>(`${path}?${query}`);
+        const items=page?.[resultKey];
+        if(!Array.isArray(items))throw new Error("Todoist project audit returned an invalid page");
+        for(const project of items)addProject(project,workspaceId);
+        const next=page.next_cursor;
+        if(next===undefined||next===null||next==="")return;
+        if(typeof next!=="string"||seenCursors.has(next))
+          throw new Error("Todoist project audit returned a repeated/invalid cursor");
+        seenCursors.add(next);cursor=next;
+      }
+      throw new Error("Todoist project audit exceeded its page limit");
+    };
+
+    await readPages("/projects","results");
+    await readPages("/projects/archived","results");
+    const workspaces=await this.request<unknown>("/workspaces");
+    if(!Array.isArray(workspaces))throw new Error("Todoist workspace audit returned an invalid inventory");
+    const workspaceIds=new Set<number>();
+    for(const workspace of workspaces) {
+      if(!workspace||typeof workspace!=="object"
+        ||!Number.isSafeInteger((workspace as {id?:unknown}).id)
+        ||Number((workspace as {id:number}).id)<=0)
+        throw new Error("Todoist workspace audit returned an invalid workspace ID");
+      workspaceIds.add(Number((workspace as {id:number}).id));
+    }
+    for(const workspaceId of workspaceIds)
+      await readPages(`/workspaces/${workspaceId}/projects/archived`,"workspace_projects",workspaceId);
+
+    const comments=new Map<string,TodoistCommentRecord>();
+    for(const projectId of projects.keys()) {
+      const projectComments=await this.listProjectComments(projectId,true);
+      for(const comment of projectComments) {
+        if(comment.project_id!==undefined&&comment.project_id!==projectId)
+          throw new Error("Todoist project comment audit returned a comment for another project");
+        const normalized={...comment,project_id:projectId};
+        const previous=comments.get(comment.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(normalized))
+          throw new Error("Todoist project comment changed across project inventories");
+        comments.set(comment.id,normalized);
+        if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
+          throw new Error("Todoist project comment audit exceeded its bounded result limit");
+      }
+    }
+    return {
+      projects:[...projects].map(([id,workspaceId])=>({id,...(typeof workspaceId==="number"?{workspaceId}:{})}))
+        .sort((left,right)=>left.id.localeCompare(right.id)),
+      comments:[...comments.values()],
+    };
+  }
+
   async listTaskComments(taskId: string): Promise<TodoistCommentRecord[]> {
-    const comments: TodoistCommentRecord[] = [];
-    let cursor: string | undefined;
-    do {
+    return listTodoistCommentPages(async cursor=>{
       const query = new URLSearchParams({ task_id: taskId });
       if (cursor) query.set("cursor", cursor);
-      const page = await this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
-      comments.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
-    return comments;
+      return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
+    },"task");
   }
 
   async createProjectComment(projectId: string, content: string): Promise<TodoistCommentRecord> {
