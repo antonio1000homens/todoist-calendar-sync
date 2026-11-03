@@ -55,8 +55,9 @@ test("deleted fixture audits are retired only when every provider ID is attribut
   for(const profile of ["home","antonio","work"]){
     assert.ok(checked(`TASK#${profile}#task-a`,"MAP"));
     assert.ok(checked(`EVENT#${profile}#event-a`,"MAP"));
-    assert.ok(checked(`COMPLETED_EVENT#${profile}#event-a`,"STATE"));
-    assert.ok(checked(`COMPLETED_TASK#${profile}#task-a`,"EVENT#event-a"));
+    assert.ok(!checked(`COMPLETED_EVENT#${profile}#event-a`,"STATE"));
+    assert.ok(!checked(`COMPLETED_TASK#${profile}#task-a`,"EVENT#event-a"));
+    assert.ok(checked(`RECURRENCE#${profile}#event-a`,"STATE"));
   }
   assert.ok(checked("TASKOWNER#task-a","MAP"));
   assert.ok(checks.some(x=>x.Key.pk==="SYNC_CONTROL#home:todoist:task-a"
@@ -75,5 +76,35 @@ test("provider identity not in the exact verified-deleted set refuses cleanup be
   const f=fixture();
   assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
     {profile:"home",taskIds:["other-task"],eventIds:["event-a"]}),false);
+  assert.equal(f.getTransaction(),undefined);
+});
+
+test("verified-deleted recurring task retires only the exact versioned link in the case transaction",async()=>{
+  const f=fixture();
+  const link={profile:"home",owner:"todoist",seriesId:"task-a",taskId:"task-a",
+    eventId:"event-a",masterEventId:"event-a",activeInstanceId:"event-a",
+    updatedAt:"2026-10-25T19:09:07.680Z"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
+    {profile:"home",taskIds:["task-a"],eventIds:["event-a"],staleLinks:[link]}),true);
+  const tx=f.getTransaction();
+  const deleted=tx.find(x=>x.Delete?.Key.pk==="RECURRENCE#home#task-a");
+  assert.ok(deleted);
+  assert.match(deleted.Delete.ConditionExpression,/updatedAt = :updated/);
+  assert.match(deleted.Delete.ConditionExpression,/masterEventId = :masterEventId/);
+  assert.match(deleted.Delete.ConditionExpression,/activeInstanceId = :activeInstanceId/);
+  assert.equal(deleted.Delete.ExpressionAttributeValues[":updated"],link.updatedAt);
+  assert.ok(!tx.some(x=>x.Delete?.Key.pk?.startsWith("COMPLETED_")));
+  assert.ok(!tx.some(x=>x.ConditionCheck?.Key.pk==="RECURRENCE#home#task-a"));
+  const receipt=tx.find(x=>x.Update?.Key.pk==="REVIEW_CASE#review-a").Update;
+  assert.match(receipt.UpdateExpression,/REMOVE decision, taskId, eventId/);
+  assert.match(receipt.UpdateExpression,/expiresAt/);
+});
+
+test("changed or foreign recurrence identity refuses cleanup before any transaction",async()=>{
+  const f=fixture();
+  const link={profile:"work",owner:"todoist",seriesId:"task-a",taskId:"task-a",
+    eventId:"event-a",updatedAt:"2026-10-25T19:09:07.680Z"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
+    {profile:"home",taskIds:["task-a"],eventIds:["event-a"],staleLinks:[link]}),false);
   assert.equal(f.getTransaction(),undefined);
 });
