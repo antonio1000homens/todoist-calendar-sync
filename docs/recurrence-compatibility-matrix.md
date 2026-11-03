@@ -79,18 +79,18 @@ Provider documentation:
 
 ## Phase B implementation: guarded Todoist → Calendar evidence (#290)
 
-The optional module \`src/todoist-calendar-phase-b.ts\` proposes exact
-\`BYMONTHDAY\` lists, anchored \`INTERVAL=2;BYDAY\` alternating weekdays
-and quarterly \`INTERVAL=3\` candidates. These are **read-only candidates** by
-default; \`todoistPhaseBCandidate()\` always reports a rolling outcome, even
+The optional module `src/todoist-calendar-phase-b.ts` proposes exact
+`BYMONTHDAY` lists, anchored `INTERVAL=2;BYDAY` alternating weekdays
+and quarterly `INTERVAL=3` candidates. These are **read-only candidates** by
+default; `todoistPhaseBCandidate()` always reports a rolling outcome, even
 when the syntax parses. No existing user recurrence is bulk-migrated.
 
-\`verifyTodoistPhaseBReadback()\` can return \`native_exact\` only after the
+`verifyTodoistPhaseBReadback()` can return `native_exact` only after the
 caller supplies all of the following independently observed evidence:
 
 - Original recurrence DTSTART/phase from verified provider/history records,
   not merely the current Todoist due date or today's date. Todoist's
-  \`every other Friday\` can begin on the *second* upcoming Friday.
+  `every other Friday` can begin on the *second* upcoming Friday.
 - Normalised Todoist task readbacks immediately before and after an actual
   completion, proving a single unchanged task ID and the expected next date.
   This conservative verifier rejects overdue-skipped progressions pending a
