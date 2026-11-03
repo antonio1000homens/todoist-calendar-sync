@@ -59,6 +59,36 @@ test("a directly absent recorded counterpart can be accepted only with exact rea
   assert.equal(notVerified.checks.all_recorded_counterparts_absent,false);
 });
 
+test("recorded counterpart's direct 404 cannot override a live item in another profile",()=>{
+  for(const side of ["todoist","calendar"]){
+    const counterpartSide=side==="todoist"?"calendar":"todoist";
+    const counterpartId=side==="todoist"?"recorded-event":"recorded-task";
+    const p=proof(side,data=>{
+      data.item={...data.item,...(side==="todoist"?{eventId:counterpartId}:{taskId:counterpartId})};
+      // A direct lookup of the recorded ID in the selected case profile
+      // returned 404, but the full cross-profile enumeration found it alive.
+      data.counterparts=[{side:counterpartSide,id:counterpartId,object:null}];
+      if(side==="todoist")
+        data.providers[1].events.push({...calendar,id:counterpartId,summary:"Unrelated title"});
+      else
+        data.providers[2].tasks.push({...todoist,id:counterpartId,content:"Unrelated title"});
+    });
+    assert.equal(p.checks.all_recorded_counterparts_absent,false);
+    assert.equal(p.checks.no_reverse_provider_links,false);
+    assert.match(p.blockers.join(" "),new RegExp(counterpartId));
+  }
+});
+
+test("a recorded counterpart requires a complete enumeration, not just a 404",()=>{
+  const p=proof("todoist",data=>{
+    data.item={...data.item,eventId:"old-calendar-id"};
+    data.counterparts=[{side:"calendar",id:"old-calendar-id",object:null}];
+    data.providers.pop();
+  });
+  assert.equal(p.checks.complete_provider_enumeration,false);
+  assert.equal(p.checks.all_recorded_counterparts_absent,false);
+});
+
 test("title matches and explicit provider links block side-specific deletion",()=>{
   const p=proof("todoist",data=>{
     data.providers[0].events.push({id:"linked-calendar",summary:"Independent Todoist",status:"confirmed",
