@@ -77,6 +77,7 @@ function fixture(options={}) {
           assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
           operation.postwriteReview=input.TransactItems[0].Update.ExpressionAttributeValues[":review"];
           postwriteToken.status="consumed";
+          delete postwriteToken.operator;
           delete postwriteToken.expiresAt;
           delete postwriteToken.expiresAtMs;
           return {};
@@ -439,6 +440,7 @@ test("single-use post-write review token binds fresh evidence and records only a
   assert.equal(f.operation.postwriteReview.epoch,7);
   assert.equal(f.operation.recovery,undefined,"recovery worker is never started");
   assert.equal(f.postwriteToken.status,"consumed");
+  assert.equal(f.postwriteToken.operator,undefined,"do not retain operator PII after token consumption");
   assert.equal(f.postwriteToken.expiresAt,undefined,"consumed proof survives TTL until atomic future release");
   assert.equal(f.external.restored.length,0);
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"),"fence must remain active");
