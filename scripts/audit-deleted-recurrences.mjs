@@ -6,7 +6,6 @@ import { ReviewStore } from "../dist/review-store.js";
 import { StateRepository } from "../dist/repository.js";
 import { reviewCaseEvidenceIds } from "../dist/deleted-review-identities.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
-import { classifyDeletedRecurrenceLinks } from "../dist/verified-deletion.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 
 const table = process.env.STATE_TABLE_NAME?.trim();
@@ -30,10 +29,6 @@ let truncated = false;
 for (const profile of profiles) {
   const provider = await defaultProviderClientFactory(profile);
   let cursor;
-  // Exact links across profiles are informational preflight; base-table CAS
-  // plus provider reads inside the worker ultimately guard any real cleanup.
-  const allLinks = (await Promise.all(["home", "antonio", "work"]
-    .map(owner => state.listRecurrenceLinks(owner)))).flat();
   do {
     const page = await store.listCases(profile, cursor, false, 10);
     cursor = page.cursor;
@@ -66,15 +61,9 @@ for (const profile of profiles) {
       for (const id of eventIds) await read("calendar", id);
       const deletion = await deletedRecurrenceStatus(item, snapshots,
         (owner, seriesId) => state.getRecurrenceLink(owner, seriesId));
-      const links = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, allLinks);
       report.push({
-        ...entry, deletion, ownershipBlockers: links.blocked,
-        recurrenceLinks: links.stale.map(link => ({
-          profile: link.profile, taskId: link.taskId, seriesId: link.seriesId,
-          masterEventId: link.masterEventId, activeInstanceId: link.activeInstanceId,
-          updatedAt: link.updatedAt,
-        })),
-        action: deletion?.bothGone && !links.blocked.length
+        ...entry, deletion, recurrenceLinks: deletion?.staleLinks || [],
+        action: deletion?.bothGone && ["pending_cleanup","stale_recurrence"].includes(deletion.state)
           ? "candidate_for_guarded_reconciliation" : "retain_for_manual_review",
       });
     }
