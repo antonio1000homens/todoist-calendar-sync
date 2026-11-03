@@ -95,8 +95,8 @@ test("deployment defaults deny every provider write and even worker fencing",asy
 test("Calendar singleton: durable delete intent, conditional cleanup, postflight, two passes and replay",async(t)=>withExecution(t,async()=>{
   const f=fixture("calendar");
   const phases=[];
-  for(let i=0;i<6;i++)phases.push((await advanceOne(f)).phase);
-  assert.deepEqual(phases,["fenced","delete_started","provider_absent","state_cleaned","observing","succeeded"]);
+  for(let i=0;i<7;i++)phases.push((await advanceOne(f)).phase);
+  assert.deepEqual(phases,["fenced","delete_started","provider_absent","state_cleaned","workers_resume_started","observing","succeeded"]);
   assert.equal(f.calls.calendar,1);
   assert.equal(f.calls.todoist,0,"no implicit Todoist deletion");
   assert.equal(f.calls.retire,1);
@@ -108,7 +108,7 @@ test("Calendar singleton: durable delete intent, conditional cleanup, postflight
 
 test("Todoist singleton: delete only Todoist; preserve Calendar provider",async(t)=>withExecution(t,async()=>{
   const f=fixture("todoist");
-  for(let i=0;i<6;i++)await advanceOne(f);
+  for(let i=0;i<7;i++)await advanceOne(f);
   assert.equal(f.calls.todoist,1);
   assert.equal(f.calls.calendar,0);
   assert.equal(f.journal.operation.phase,"succeeded");
@@ -168,7 +168,7 @@ test("conditional cleanup failure retains deletion evidence, fence and replay ba
 
 test("no premature orphan_removed if fewer than two full reconciliation passes or replay missing",async(t)=>withExecution(t,async()=>{
   const f=fixture();
-  for(let i=0;i<5;i++)await advanceOne(f);
+  for(let i=0;i<6;i++)await advanceOne(f);
   f.state.passes=1;
   await assert.rejects(advanceOne(f),/two full generations/);
   assert.equal(f.journal.operation.phase,"observing");
@@ -178,6 +178,24 @@ test("no premature orphan_removed if fewer than two full reconciliation passes o
   f.state.replayed=true;
   assert.equal((await advanceOne(f)).phase,"succeeded");
   assert.equal(f.calls.retire,1);
+}));
+
+test("lost journal acknowledgement after workers resume is retryable without assuming the fence remains",async(t)=>withExecution(t,async()=>{
+  const f=fixture();
+  for(let i=0;i<5;i++)await advanceOne(f);
+  assert.equal(f.journal.operation.phase,"workers_resume_started");
+  const firstAdvance=f.journal.advance.bind(f.journal);
+  let loseAck=true;
+  f.journal.advance=async(op,to,checkpoint)=>{
+    if(to==="observing"&&loseAck){loseAck=false;throw new Error("DynamoDB update timed out");}
+    return firstAdvance(op,to,checkpoint);
+  };
+  await assert.rejects(advanceOne(f),/timed out/);
+  assert.equal(f.state.fenced,false);
+  assert.equal(f.journal.operation.phase,"workers_resume_started");
+  assert.equal((await advanceOne(f)).phase,"observing");
+  assert.equal(f.calls.calendar,1);
+  assert.equal(f.calls.todoist,0);
 }));
 
 test("full exact-ID typed confirmation and <=5-minute approval window",()=>{
