@@ -132,6 +132,14 @@ test("fifth and last Friday remain distinct; months without a fifth occurrence a
   assert.equal(compareOccurrenceSemantics(fifth.semantic, last.semantic).equivalent, false);
 });
 
+test("truncated windows never prove equivalence for distant long intervals", () => {
+  const a = classifyCalendarRule("RRULE:FREQ=YEARLY;INTERVAL=900", verified("2027-01-01"));
+  const b = classifyCalendarRule("RRULE:FREQ=YEARLY;INTERVAL=1000", verified("2027-01-01"));
+  assert.deepEqual(occurrenceDates(a.semantic, 12), ["2027-01-01"]);
+  assert.deepEqual(occurrenceDates(b.semantic, 12), ["2027-01-01"]);
+  assert.equal(compareOccurrenceSemantics(a.semantic, b.semantic).equivalent, false);
+});
+
 test("timed and all-day rules do not compare equivalent; timezone is semantic", () => {
   const allDay = classifyCalendarRule("RRULE:FREQ=WEEKLY;BYDAY=MO", {
     start:"2027-01-04", evidence,
