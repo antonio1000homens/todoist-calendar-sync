@@ -6,7 +6,8 @@ import {
 
 const london = { timeZone: "Europe/London", start: "2027-01-01" };
 const evidence = { calendarReadback: true, todoistReadback: true,
-  anchorVerified: true, progressionVerified: true, exceptionInventoryComplete: true };
+  anchorVerified: true, progressionVerified: true, exceptionInventoryComplete: true,
+  timeZoneVerified: true };
 const verified = (start, timeZone = "Europe/London") => ({ start, timeZone, evidence });
 
 test("multiple monthly days are the same anchored sequence in either direction", () => {
@@ -149,4 +150,98 @@ test("timed and all-day rules do not compare equivalent; timezone is semantic", 
     verified("2027-01-04T09:00:00Z", "Europe/Paris")).semantic;
   assert.equal(compareOccurrenceSemantics(allDay, timed).equivalent, false);
   assert.equal(compareOccurrenceSemantics(timed, otherZone).equivalent, false);
+});
+
+
+test("timed native_exact requires independently verified timezone readback", () => {
+  const start = "2027-03-26T09:00:00Z";
+  const partialEvidence = { ...evidence, timeZoneVerified: false };
+  for (const classify of [
+    (context) => classifyCalendarRule("RRULE:FREQ=WEEKLY;BYDAY=FR", context),
+    (context) => classifyTodoistRule("every Friday", context),
+  ]) {
+    const unverified = classify({ start, timeZone: "Europe/London", evidence: partialEvidence });
+    assert.equal(unverified.disposition, "rolling_required");
+    assert.equal(unverified.reason, "timezone_not_verified");
+    const confirmed = classify({ start, timeZone: "Europe/London", evidence });
+    assert.equal(confirmed.disposition, "native_exact");
+  }
+  // All-day recurrence needs no timed-zone verification.
+  const allDay = classifyCalendarRule("RRULE:FREQ=WEEKLY", {
+    start: "2027-03-26", evidence: partialEvidence,
+  });
+  assert.equal(allDay.disposition, "native_exact");
+});
+
+test("reject non-zero seconds and fractional seconds instead of losing precision", () => {
+  for (const start of [
+    "2027-01-04T09:00:30Z",
+    "2027-01-04T09:00:00.100Z",
+    "2027-01-04T09:00:00.0001+00:00",
+    "2027-01-04T09:00:30",
+  ]) {
+    const c = classifyCalendarRule("RRULE:FREQ=WEEKLY", verified(start));
+    const t = classifyTodoistRule("every week", verified(start));
+    assert.equal(c.disposition, "unsupported", start);
+    assert.equal(c.reason, "subminute_precision_not_supported", start);
+    assert.equal(t.reason, c.reason, start);
+  }
+  const zero = classifyCalendarRule("RRULE:FREQ=WEEKLY",
+    verified("2027-01-04T09:00:00.000Z"));
+  assert.equal(zero.disposition, "native_exact");
+  assert.equal(zero.semantic.localTime, "09:00");
+});
+
+test("canonical BYDAY includes a deterministic tie-breaker for ordinal positions", () => {
+  const a = classifyCalendarRule("RRULE:FREQ=MONTHLY;BYDAY=5FR,1FR", verified("2027-01-01"));
+  const b = classifyCalendarRule("RRULE:BYDAY=1FR,5FR;FREQ=MONTHLY", verified("2027-01-01"));
+  const negative = classifyCalendarRule("RRULE:BYDAY=5FR,-1FR,1FR;FREQ=MONTHLY", verified("2027-01-01"));
+  assert.equal(a.canonicalRrule, "RRULE:FREQ=MONTHLY;BYDAY=1FR,5FR");
+  assert.equal(a.canonicalRrule, b.canonicalRrule);
+  assert.equal(negative.canonicalRrule, "RRULE:FREQ=MONTHLY;BYDAY=-1FR,1FR,5FR");
+  assert.equal(a.disposition, "rolling_required", "compound monthly ordinals are not enabled");
+});
+
+test("UNTIL clock range is validated and timed cutoffs are never date-truncated", () => {
+  for (const until of [
+    "20270101T996000Z",
+    "20270101T246000Z",
+    "20270101T236099Z",
+    "20270101T235960Z",
+    "20270230T090000Z",
+  ]) {
+    const rule = classifyCalendarRule("RRULE:FREQ=DAILY;UNTIL=" + until, verified("2027-01-01"));
+    assert.equal(rule.disposition, "unsupported", until);
+    assert.equal(rule.reason, "invalid_component", until);
+  }
+  for (const until of ["20270101T010000Z", "20270101T090000Z"]) {
+    const rule = classifyCalendarRule("RRULE:FREQ=DAILY;UNTIL=" + until,
+      verified("2027-01-01T09:00:00Z"));
+    assert.equal(rule.disposition, "unsupported");
+    assert.equal(rule.reason, "timed_until_requires_instant_expansion");
+    assert.equal(rule.semantic, undefined);
+  }
+  const open = classifyCalendarRule("RRULE:FREQ=DAILY", verified("2027-01-01")).semantic;
+  assert.throws(() => occurrenceDates({ ...open, until: "20270101T010000Z" }),
+    /instant-aware expansion/);
+  const allDay = classifyCalendarRule("RRULE:FREQ=DAILY;UNTIL=20270105", verified("2027-01-01"));
+  assert.equal(allDay.disposition, "rolling_required");
+  assert.deepEqual(occurrenceDates(allDay.semantic, 12),
+    ["2027-01-01", "2027-01-02", "2027-01-03", "2027-01-04", "2027-01-05"]);
+});
+
+test("yearly and larger yearly intervals provide the full comparison window", () => {
+  for (const interval of [1, 2, 3, 10]) {
+    const rule = "RRULE:FREQ=YEARLY" + (interval === 1 ? "" : ";INTERVAL=" + interval);
+    const a = classifyCalendarRule(rule, verified("2027-01-01"));
+    const b = classifyTodoistRule("every " + interval + " years", verified("2027-01-01"));
+    const dates = occurrenceDates(a.semantic, 12);
+    assert.equal(dates.length, 12, rule);
+    assert.equal(dates[0], "2027-01-01");
+    assert.equal(dates.at(-1), String(2027 + 11 * interval) + "-01-01");
+    assert.equal(compareOccurrenceSemantics(a.semantic, b.semantic).equivalent, true);
+  }
+  const leap = classifyCalendarRule("RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
+    verified("2028-02-29"));
+  assert.equal(occurrenceDates(leap.semantic, 12).length, 12);
 });
