@@ -187,6 +187,34 @@ done
 
 echo "Validated required SSM parameter names without decrypting values."
 
+parameter_overrides=(
+  "ResourceNamePrefix=$resource_name_prefix"
+  "StateTableReadCapacity=$state_table_read_capacity"
+  "StateTableWriteCapacity=$state_table_write_capacity"
+  "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity"
+  "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity"
+  "CompletedHistoryCleanupApply=$completed_history_cleanup_apply"
+  "ErasureExecutionEnabled=$erasure_execution_enabled"
+  "CalendarWatchTokenParameter=$calendar_watch_token_parameter"
+  "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter"
+  "ProxySharedSecretParameter=$proxy_shared_secret_parameter"
+  "CalendarWatchCallbackUrl=$calendar_watch_callback_url"
+  "GoogleCredentialsParameterPrefix=$google_prefix"
+  "TodoistTokenParameterPrefix=$todoist_prefix"
+  "SlackBotTokenParameter=$slack_bot_token_parameter"
+  "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel"
+  "ProfileConfigJson=$sam_profile_config_json"
+  "CloudflareAccessIssuer=$cloudflare_access_issuer"
+  "CloudflareAccessAudience=$cloudflare_access_audience"
+  "ReviewOperatorEmails=$review_operator_emails"
+)
+if [[ -n "$slack_control_allowed_user_ids" ]]; then
+  parameter_overrides+=("SlackControlAllowedUserIds=$slack_control_allowed_user_ids")
+fi
+if [[ -n "${BILLING_ALARM_EMAIL:-}" ]]; then
+  parameter_overrides+=("BillingAlarmEmail=$BILLING_ALARM_EMAIL")
+fi
+
 sam deploy \
   --template-file .aws-sam/build/template.yaml \
   --stack-name "$stack_name" \
@@ -196,25 +224,4 @@ sam deploy \
   --capabilities CAPABILITY_IAM \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
-  --parameter-overrides \
-    "ResourceNamePrefix=$resource_name_prefix" \
-    "StateTableReadCapacity=$state_table_read_capacity" \
-    "StateTableWriteCapacity=$state_table_write_capacity" \
-    "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity" \
-    "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity" \
-    "CompletedHistoryCleanupApply=$completed_history_cleanup_apply" \
-    "ErasureExecutionEnabled=$erasure_execution_enabled" \
-    "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
-    "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \
-    "ProxySharedSecretParameter=$proxy_shared_secret_parameter" \
-    "CalendarWatchCallbackUrl=$calendar_watch_callback_url" \
-    "GoogleCredentialsParameterPrefix=$google_prefix" \
-    "TodoistTokenParameterPrefix=$todoist_prefix" \
-    "SlackBotTokenParameter=$slack_bot_token_parameter" \
-    "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel" \
-    "SlackControlAllowedUserIds=$slack_control_allowed_user_ids" \
-    "ProfileConfigJson=$sam_profile_config_json" \
-    "CloudflareAccessIssuer=$cloudflare_access_issuer" \
-    "CloudflareAccessAudience=$cloudflare_access_audience" \
-    "ReviewOperatorEmails=$review_operator_emails" \
-    ${BILLING_ALARM_EMAIL:+"BillingAlarmEmail=$BILLING_ALARM_EMAIL"}
+  --parameter-overrides "${parameter_overrides[@]}"
