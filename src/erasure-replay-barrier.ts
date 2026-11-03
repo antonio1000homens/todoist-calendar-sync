@@ -8,6 +8,7 @@ import {createHmac} from "node:crypto";
 import {GetCommand, TransactWriteCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import type {Profile} from "./types.js";
+import type {OrphanDeletionOperation} from "./orphan-deletion-executor.js";
 
 export const REPLAY_PROFILES = ["home","antonio","work"] as const satisfies readonly Profile[];
 export type ReplayIdentity = {
@@ -255,4 +256,138 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
   // partially committed batch or release a fence in multiple requests.
   if(tx.length>100)throw new ErasureReplayUnavailableError("Replay release exceeds the atomic transaction limit");
   return new TransactWriteCommand({TransactItems:tx});
+}
+
+
+/**
+ * #287 (staged): a singleton orphan requires its own replay marker transaction.
+ * The original post-write two-provider release cannot represent one-sided
+ * deletion. Only standalone, exact case-bound targets may be included here.
+ *
+ * This builder performs NO DDB writes, disables NO workers, and is not connected
+ * to the review API or queue. An eventual privileged executor must acquire the
+ * profile fence, drain all admissions/writers, recheck provider/state proof and
+ * inspect existing markers BEFORE executing the returned transaction.
+ *
+ * Todoist IDs are global across the configured profiles and are marked in all
+ * three. Calendar event IDs are calendar-scoped: only the selected case profile
+ * is marked, avoiding collateral suppression of an unrelated calendar.
+ */
+const ORPHAN_MARKER_PHASES=new Set([
+  "fenced","delete_started","provider_absent","state_cleaned",
+  "workers_resume_started","observing","succeeded",
+]);
+function orphanReplayReady():void {
+  if(process.env.ORPHAN_DELETION_EXECUTION_ENABLED!=="true" ||
+    process.env.ERASURE_PROTOCOL_VERSION!=="1" || !replayAdmissionEnabled())
+    throw new ErasureReplayUnavailableError(
+      "Orphan replay installation requires independently enabled deletion, protocol and replay-admission gates");
+}
+function validateOrphanIdentity(op:OrphanDeletionOperation):void {
+  if(!OPERATION_ID.test(op.id)||typeof op.caseId!=="string"||!op.caseId.trim()||
+    !REPLAY_PROFILES.includes(op.profile)||!["todoist","calendar"].includes(op.side)||
+    !ID.test(op.targetId)||!SHA256.test(op.providerDigest)||
+    typeof op.actorSubject!=="string"||!op.actorSubject.trim()||
+    typeof op.caseUpdatedAt!=="string"||!op.caseUpdatedAt.trim()||
+    !Number.isInteger(op.version)||op.version<1||
+    (op.side==="calendar" ? !op.providerEtag : op.providerEtag!==undefined))
+    throw new ErasureReplayUnavailableError("Incomplete, malformed or cross-provider orphan identity");
+}
+function orphanKeys(op:OrphanDeletionOperation,kid:string,secret:Buffer):ReplayKey[] {
+  return op.side==="todoist"
+    ? REPLAY_PROFILES.map(profile=>marker(profile,"TASK",op.targetId,kid,secret))
+    : [marker(op.profile,"EVENT",op.targetId,kid,secret)];
+}
+function orphanGuardKey(op:OrphanDeletionOperation):ReplayKey {
+  return {pk:"ORPHAN_REPLAY_GUARD#"+op.id,sk:"STATE"};
+}
+function orphanGuardMatches(guard:Record<string,unknown>|undefined,op:OrphanDeletionOperation,
+  ring:KeyRing):guard is Record<string,unknown> {
+  return Boolean(guard&&guard.operationId===op.id&&guard.profile===op.profile&&
+    guard.side===op.side&&guard.caseId===op.caseId&&
+    guard.providerDigest===op.providerDigest&&guard.caseUpdatedAt===op.caseUpdatedAt&&
+    guard.markerVersion===1&&guard.markerCount===(op.side==="todoist"?3:1)&&
+    typeof guard.keyId==="string"&&ring.keys.has(guard.keyId));
+}
+/**
+ * Construct the complete, single atomic marker install. The transaction
+ * checks operation phase/version, case lock, unchanged alert, active profile
+ * fence and epoch; it cannot run against a missing or already-retired fence.
+ * Marker rows contain NO plaintext provider identities or operation IDs.
+ */
+export function orphanReplayInstallTransaction(
+  op:OrphanDeletionOperation,epoch:number,
+):TransactWriteCommand {
+  orphanReplayReady();
+  validateOrphanIdentity(op);
+  if(op.phase!=="fenced"||!Number.isSafeInteger(epoch)||epoch<1)
+    throw new ErasureReplayUnavailableError("Orphan marker install requires a fenced operation and a positive epoch");
+  const ring=keyRing(),secret=ring.keys.get(ring.current)!;
+  const keys=orphanKeys(op,ring.current,secret),table=tableName();
+  const tx:any[]=[
+    ...keys.map(key=>({Put:{TableName:table,
+      Item:{...key,markerVersion:1},ConditionExpression:"attribute_not_exists(pk)"}})),
+    {Put:{TableName:table,Item:{...orphanGuardKey(op),
+      operationId:op.id,caseId:op.caseId,profile:op.profile,side:op.side,
+      caseUpdatedAt:op.caseUpdatedAt,providerDigest:op.providerDigest,
+      keyId:ring.current,markerVersion:1,markerCount:keys.length},
+      ConditionExpression:"attribute_not_exists(pk)"}},
+    {ConditionCheck:{TableName:table,Key:{pk:"ORPHAN_DELETE#"+op.id,sk:"STATE"},
+      ConditionExpression:"#phase=:fenced AND #version=:version AND caseId=:case AND profile=:profile AND side=:side AND targetId=:target AND providerDigest=:digest AND actorSubject=:actor AND caseUpdatedAt=:caseVersion"
+        +(op.side==="calendar"?" AND providerEtag=:etag":" AND attribute_not_exists(providerEtag)"),
+      ExpressionAttributeNames:{"#phase":"phase","#version":"version"},
+      ExpressionAttributeValues:{":fenced":"fenced",":version":op.version,
+        ":case":op.caseId,":profile":op.profile,":side":op.side,
+        ":target":op.targetId,":digest":op.providerDigest,
+        ":actor":op.actorSubject,":caseVersion":op.caseUpdatedAt,
+        ...(op.side==="calendar"?{":etag":op.providerEtag}:{})}}},
+    {ConditionCheck:{TableName:table,Key:{pk:"ORPHAN_CASE_LOCK#"+op.caseId,sk:"STATE"},
+      ConditionExpression:"operationId=:id AND caseId=:case AND profile=:profile AND side=:side AND targetId=:target AND caseUpdatedAt=:caseVersion",
+      ExpressionAttributeValues:{":id":op.id,":case":op.caseId,":profile":op.profile,
+        ":side":op.side,":target":op.targetId,":caseVersion":op.caseUpdatedAt}}},
+    {ConditionCheck:{TableName:table,Key:{pk:"REVIEW_CASE#"+op.caseId,sk:"STATE"},
+      ConditionExpression:"#status=:open AND updatedAt=:caseVersion AND profile=:profile AND attribute_not_exists(operationId)",
+      ExpressionAttributeNames:{"#status":"status"},
+      ExpressionAttributeValues:{":open":"open",":caseVersion":op.caseUpdatedAt,":profile":op.profile}}},
+    {ConditionCheck:{TableName:table,Key:{pk:"ERASURE#"+op.profile,sk:"FENCE"},
+      ConditionExpression:"operationId=:id AND #state=:active",
+      ExpressionAttributeNames:{"#state":"state"},
+      ExpressionAttributeValues:{":id":op.id,":active":"active"}}},
+    {ConditionCheck:{TableName:table,Key:{pk:"ERASURE#"+op.profile,sk:"EPOCH"},
+      ConditionExpression:"epoch=:epoch",
+      ExpressionAttributeValues:{":epoch":epoch}}},
+  ];
+  if(tx.length>100)throw new ErasureReplayUnavailableError("Orphan replay install exceeds atomic transaction limit");
+  return new TransactWriteCommand({TransactItems:tx});
+}
+
+/** Strong, read-only replay-guard verification used after the future
+ * install transaction, including after worker resumption. It checks the
+ * recorded historical key ID so HMAC key rotation cannot invalidate an
+ * existing fence. A missing or malformed guard/marker always blocks. */
+export async function assertOrphanReplayGuard(op:OrphanDeletionOperation,
+  db:Db=documentClient):Promise<void> {
+  orphanReplayReady();
+  validateOrphanIdentity(op);
+  if(!ORPHAN_MARKER_PHASES.has(op.phase))
+    throw new ErasureReplayUnavailableError("Orphan replay guard is not available in this operation phase");
+  const ring=keyRing(),table=tableName();
+  let guard:Record<string,unknown>|undefined;
+  try {
+    const result=await db.send(new GetCommand({TableName:table,
+      Key:orphanGuardKey(op),ConsistentRead:true}));
+    guard=result.Item as Record<string,unknown>|undefined;
+  } catch {throw new ErasureReplayUnavailableError();}
+  if(!orphanGuardMatches(guard,op,ring))
+    throw new ErasureReplayUnavailableError("The durable orphan replay guard is missing or mismatched");
+  const keyId=guard.keyId as string,secret=ring.keys.get(keyId)!;
+  for(const key of orphanKeys(op,keyId,secret)) {
+    let row:Record<string,unknown>|undefined;
+    try {
+      const result=await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true}));
+      row=result.Item as Record<string,unknown>|undefined;
+    } catch {throw new ErasureReplayUnavailableError();}
+    if(row?.pk!==key.pk||row.sk!==key.sk||row.markerVersion!==1)
+      throw new ErasureReplayUnavailableError("The immutable orphan replay marker is missing or malformed");
+  }
 }
