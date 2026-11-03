@@ -74,7 +74,7 @@ function matchesManifest(op:OrphanDeletionOperation,m:OrphanFenceManifest|undefi
     &&m.caseUpdatedAt===op.caseUpdatedAt&&m.side===op.side
     &&m.targetId===op.targetId&&m.providerDigest===op.providerDigest
     &&m.targetWorkerFunction===worker&&SHA.test(m.mappingFingerprint)
-    &&Number.isInteger(m.mappingCount??m.mappingIds?.length)
+    &&Array.isArray(m.mappingIds)
     &&Array.isArray(m.mappingIds)&&m.mappingIds.length>0
     &&Array.isArray(m.originallyEnabledIds)
     &&JSON.stringify(m.mappingIds)===JSON.stringify(m.originallyEnabledIds)
@@ -160,7 +160,7 @@ export async function inspectOrphanPauseRecovery(
     if(fence.fence||!Array.isArray(fence.leases)||fence.leases.length)
       blockers.push("PROFILE_FENCE_OR_LEASE_PRESENT");
     const epoch=await get(db,"ERASURE#"+profile,"EPOCH");
-    if(epoch?.epoch!==undefined&&(!Number.isSafeInteger(epoch.epoch)||epoch.epoch<0))
+    if(epoch?.epoch!==undefined&&(typeof epoch.epoch!=="number"||!Number.isSafeInteger(epoch.epoch)||epoch.epoch<0))
       blockers.push("ERASURE_EPOCH_CHANGED");
     if(profile===approved.profile&&(epoch?.epoch??0)!==m.epoch)
       blockers.push("ERASURE_EPOCH_CHANGED");
