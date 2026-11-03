@@ -158,6 +158,16 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     const segments = path.slice("/review/api/".length).split("/").filter(Boolean).map(decodeURIComponent);
     const body = method === "POST" ? bodyJson(event) : undefined;
     const actor = await authenticate(event, method === "POST");
+    // #287: the old global task-ID erasure flow is not a valid orphan deletion
+    // workflow. Its preview/confirmation creation must be explicitly opted in
+    // for legacy operator tooling; the review page can no longer reach it.
+    // Keep already recorded operation status, queue handoff and break-glass
+    // recovery available so an interrupted durable erasure is not stranded.
+    if (method === "POST" && ((segments[0] === "erasure-previews" && segments.length === 1)
+      || (segments[0] === "erasure-operations" && segments.length === 1))
+      && process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED !== "true") {
+      fail(410, "Unscoped item erasure is retired from review. Use the selected alert's verified-orphan workflow; existing operation status and recovery remain available.");
+    }
     const store = dependencies.createReviewStore?.() || new ReviewStore();
     const reviewEngine=dependencies.createReviewEngine?.(store) || new ReviewEngine(store);
     const enqueueRepairFn=dependencies.enqueueRepair || enqueueRepair;
