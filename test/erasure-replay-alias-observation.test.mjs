@@ -60,13 +60,38 @@ function response(body,status=200) {
   return new Response(JSON.stringify(body),{status});
 }
 
+// Classify mocked requests by their parsed, exact HTTPS origin and path.
+// A hostname containing "oauth2.googleapis.com" must never receive a token.
+function googleProviderRequest(rawUrl) {
+  const url=new URL(String(rawUrl));
+  if(url.origin==="https://oauth2.googleapis.com" &&
+    url.pathname==="/token" && !url.search && !url.hash)
+    return {kind:"token",url};
+  assert.equal(url.origin,"https://www.googleapis.com","Unexpected Google provider origin");
+  assert.match(url.pathname,/^\/calendar\/v3\/calendars\/[^/]+\/events$/,
+    "Unexpected Google Calendar API path");
+  return {kind:"calendar",url};
+}
+
+test("OAuth fetch mock rejects deceptive hosts, insecure URLs and token paths",()=>{
+  assert.equal(googleProviderRequest("https://oauth2.googleapis.com/token").kind,"token");
+  for(const url of [
+    "https://oauth2.googleapis.com.attacker.invalid/token",
+    "https://attacker.invalid/oauth2.googleapis.com/token",
+    "https://oauth2.googleapis.com@attacker.invalid/token",
+    "http://oauth2.googleapis.com/token",
+    "https://oauth2.googleapis.com/token/extra",
+    "https://oauth2.googleapis.com/token?destination=attacker.invalid",
+  ]) assert.throws(()=>googleProviderRequest(url));
+});
+
 test("all-link provider read includes every page, cancelled and recurring identities without ambiguous selection",async()=>{
   const previous=globalThis.fetch,calls=[];
   globalThis.fetch=async url=>{
-    const u=String(url);
-    if(u.includes("oauth2.googleapis.com"))return response({access_token:"token"});
-    calls.push(u);
-    const next=new URL(u).searchParams.get("pageToken");
+    const request=googleProviderRequest(url);
+    if(request.kind==="token")return response({access_token:"token"});
+    calls.push(request.url.href);
+    const next=request.url.searchParams.get("pageToken");
     return next?response({items:[link("occurrence",{recurringEventId:"master"})]}):
       response({items:[link("cancelled",{status:"cancelled"})],nextPageToken:"page-2"});
   };
@@ -87,7 +112,8 @@ test("provider page loops, conflicting duplicate snapshots and unidentified resu
     for(const mode of ["repeat","changed","no-id","items-invalid"]) {
       let call=0;
       globalThis.fetch=async url=>{
-        if(String(url).includes("oauth2.googleapis.com"))return response({access_token:"token"});
+        const request=googleProviderRequest(url);
+        if(request.kind==="token")return response({access_token:"token"});
         call++;
         if(mode==="repeat")return response({items:[],nextPageToken:"same-token"});
         if(mode==="changed")return response(call===1?
