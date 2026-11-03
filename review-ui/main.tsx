@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
+import { SYNC_PROFILES, reviewScopeLabel, reconciliationScopes, manualReconciliationTarget, createScopedRequestGate } from "./reconciliation-scope.mjs";
 import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility, revalidateRepairAction } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
 import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
@@ -12,7 +13,7 @@ type ProviderObject = { id:string; content?:string; summary?:string; description
 type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
-const profiles = ["all","home","antonio","work"];
+const profiles = ["all",...SYNC_PROFILES];
 const api = createReviewApiClient();
 function IdentityDetails({value,scope}:{value:any;scope?:string}) {
   const identity=providerIdentity(value);
@@ -40,6 +41,9 @@ function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,upda
 }
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
+  const [inboxStatus,setInboxStatus]=useState<"loading"|"ready"|"error">("loading");
+  const requestGate=useRef(createScopedRequestGate("home")).current;
+  const navigationSequence=useRef(0);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
   const [action,setAction] = useState(""), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
@@ -47,8 +51,9 @@ function App() {
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
-  const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
-  const [reconciliationDiagnostics,setReconciliationDiagnostics] = useState<any[]>([]), [diagnosticCursor,setDiagnosticCursor] = useState<string>();
+  const [reconcileProfile,setReconcileProfile] = useState("home");
+  type RunView={status:"loading"|"ready"|"error"; data?:any; diagnostics:any[]; cursor?:string; error?:string};
+  const [runViews,setRunViews]=useState<Record<string,RunView>>({});
   const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
@@ -64,6 +69,8 @@ function App() {
     setDetailRetry(value=>value+1);
   };
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
+  const overviewProfiles=reconciliationScopes(profile);
+  const manualTarget=manualReconciliationTarget({filter:profile,selectedProfile:selected?.profile,chosenProfile:reconcileProfile});
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
   const capabilities=availableRepairActions({caseItem:details?.item,snapshots:details?.snapshots||[],
@@ -104,12 +111,24 @@ function App() {
   };
   const selectCase=(item?:Case,options:{syncUrl?:boolean}={})=>{
     invalidatePreview();
-    if(item)setProfile(item.profile);
+    if(item){
+      requestGate.switchScope(item.profile);
+      if(item.profile!==profile){setProfile(item.profile);setCases([]);setInboxStatus("loading");setRunViews({});}
+      setReconcileProfile(item.profile);
+    }
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
     setAction("");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
+  };
+  const changeReviewProfile=(next:string)=>{
+    if(!profiles.includes(next))return;
+    navigationSequence.current++;
+    requestGate.switchScope(next);
+    setProfile(next);setReconcileProfile(next==="all"?"":next);
+    setCases([]);setInboxStatus("loading");setRunViews({});
+    selectCase(undefined);
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
     invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified,searchedItem));
