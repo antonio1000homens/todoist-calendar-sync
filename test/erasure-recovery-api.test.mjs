@@ -92,7 +92,7 @@ test("authenticated recovery is separate from fenced admission, requires exact t
     {operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED"}]);
   const unauthenticatedAcknowledge=await run(request("/review/api/erasure-postwrite-recoveries/op-1/acknowledge",
     "POST",{}, {operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED",confirmationId:"token-123"}));
-  assert.equal(unauthenticatedAcknowledge.statusCode,401);
+  assert.equal(unauthenticatedAcknowledge.statusCode,403,"POST without trusted origin must fail CSRF validation");
   const unauthorizedPostWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",{}));
   assert.equal(unauthorizedPostWrite.statusCode,401);
   const issued=await run(request("/review/api/erasure-recoveries/op-1/confirm","POST",headers,{}));
