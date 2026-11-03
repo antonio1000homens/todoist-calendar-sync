@@ -20,7 +20,7 @@ const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SQS_ARN=/^arn:[a-z0-9-]+:sqs:[a-z0-9-]+:\d{12}:[a-zA-Z0-9_.-]+$/;
 const PROFILES=new Set<Profile>(["home","antonio","work"]);
 const MAX_MAPPINGS=100, MAX_PROOF_AGE=120000;
-const key=(opId:string)=>({pk:"ORPHAN_FENCE_MANIFEST#"+opId,sk:"STATE"});
+const key=(opId:string)=>({pk:"ORPHAN_FENCE_MANIFEST#"+opId,sk:"STATE" as const});
 type Db=Pick<DynamoDBDocumentClient,"send">;
 
 export interface OrphanMappingRow {
@@ -144,9 +144,10 @@ export async function stageOrphanFenceManifest(
     {ConditionCheck:{TableName:table(),Key:{pk:"ERASURE#"+op.profile,sk:"FENCE"},
       ConditionExpression:"attribute_not_exists(pk)"}},
     {ConditionCheck:{TableName:table(),Key:{pk:"ERASURE#"+op.profile,sk:"EPOCH"},
-      ConditionExpression:"(attribute_not_exists(#epoch) AND :epoch=:zero) OR #epoch=:epoch",
+      ConditionExpression:manifest.epoch===0
+        ?"attribute_not_exists(#epoch) OR #epoch=:epoch":"#epoch=:epoch",
       ExpressionAttributeNames:{"#epoch":"epoch"},
-      ExpressionAttributeValues:{":epoch":manifest.epoch,":zero":0}}},
+      ExpressionAttributeValues:{":epoch":manifest.epoch}}},
   ]}));
   return manifest;
 }
