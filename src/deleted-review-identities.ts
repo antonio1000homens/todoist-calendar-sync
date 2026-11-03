@@ -9,9 +9,10 @@ export function reviewCaseEvidenceIds(item: ReviewCase): { taskIds: string[]; ev
   const context = item.decision?.context || {};
   const candidates = Array.isArray(context.candidates)
     ? context.candidates.map(entry => (entry as { id?: unknown } | null)?.id) : [];
-  const tasks = [item.taskId, item.decision?.taskId, context.providerTaskId, context.taskId,
+  const mapping = item.decision?.mappingSnapshot;
+  const tasks = [item.taskId, item.decision?.taskId, mapping?.taskId, context.providerTaskId, context.taskId,
     context.masterTaskId, ...strings(context.candidateTaskIds), ...candidates];
-  const events = [item.eventId, item.decision?.eventId, item.decision?.masterEventId,
+  const events = [item.eventId, item.decision?.eventId, mapping?.eventId, mapping?.masterEventId, mapping?.activeInstanceId, item.decision?.masterEventId,
     item.decision?.activeInstanceId, context.providerEventId, context.eventId,
     context.masterEventId, context.activeInstanceId, ...strings(context.candidateEventIds)];
   return {

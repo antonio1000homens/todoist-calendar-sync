@@ -48,6 +48,7 @@ export function recordedProviderState(side, id, snapshots=[], profile) {
   const snapshot=snapshots.find(entry=>entry?.ref?.side===side && entry.ref.id===id
     && (!profile || entry.ref.profile===profile));
   if (!snapshot) return "candidate / unverified";
+  if (snapshot.lookupError) return "provider lookup failed / unverified";
   if (!snapshot.object) return "missing (404/410)";
   if (snapshot.object.id!==id) return "identity mismatch / unverified";
   if (side==="calendar") {

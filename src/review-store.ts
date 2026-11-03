@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { Profile } from "./types.js";
+import type { Profile, RecurrenceLink } from "./types.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
@@ -302,7 +302,11 @@ export class ReviewStore {
    */
   async resolveVerifiedDeletedCase(
     caseId: string,
-    expected: { profile: Profile; taskIds: string[]; eventIds: string[] },
+    expected: {
+      profile: Profile; taskIds: string[]; eventIds: string[];
+      staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
+      masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
+    },
   ): Promise<boolean> {
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
@@ -329,6 +333,41 @@ export class ReviewStore {
     const pointer = pointerKey ? (await this.db.send(new GetCommand({
       TableName: reviewTable(), Key: pointerKey, ConsistentRead: true,
     }))).Item as { incidentId?: string } | undefined : undefined;
+    // This method is the final transaction authority, not the classifier.
+    // A caller MUST provide the complete exact recurring identity and its
+    // Calendar iCalUID recurrence key before closure of a recurring decision.
+    const recurring = current.decision?.type?.includes("recurrence_task_deleted") === true;
+    const recordedMaster = current.decision?.masterEventId || current.decision?.mappingSnapshot?.masterEventId;
+    const recordedActive = current.decision?.activeInstanceId || current.decision?.mappingSnapshot?.activeInstanceId;
+    const seriesKeys = [...new Set(expected.seriesKeys || [...expected.taskIds, ...expected.eventIds])];
+    if (!seriesKeys.length || seriesKeys.length > 20
+      || [...expected.taskIds, ...expected.eventIds].some(id => !seriesKeys.includes(id))) return false;
+    if (recurring && (!expected.masterId || !expected.activeInstanceId || !expected.masterSeriesId
+      || recordedMaster !== expected.masterId || recordedActive !== expected.activeInstanceId
+      || expected.masterId === expected.activeInstanceId
+      || !expected.eventIds.includes(expected.masterId)
+      || !expected.eventIds.includes(expected.activeInstanceId)
+      || !seriesKeys.includes(expected.masterSeriesId)
+      || !seriesKeys.includes(expected.masterId)
+      || !seriesKeys.includes(expected.activeInstanceId)
+      || current.decision?.seriesId && !seriesKeys.includes(current.decision.seriesId)
+      || current.decision?.mappingSnapshot?.seriesId && !seriesKeys.includes(current.decision.mappingSnapshot.seriesId)))
+      return false;
+    const staleLinks = expected.staleLinks || [];
+    const seenLinks = new Set<string>();
+    for (const link of staleLinks) {
+      const identity = `${link.profile}/${link.seriesId}`;
+      if (seenLinks.has(identity) || link.profile !== expected.profile || link.owner !== "todoist"
+        || link.seriesId !== link.taskId || !expected.taskIds.includes(link.taskId)
+        || !expected.eventIds.includes(link.eventId)
+        || !link.masterEventId || !expected.eventIds.includes(link.masterEventId)
+        || !link.activeInstanceId || !expected.eventIds.includes(link.activeInstanceId)
+        || link.activeInstanceId === link.masterEventId
+        || recurring && (link.masterEventId !== expected.masterId
+          || link.activeInstanceId !== expected.activeInstanceId)
+        || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return false;
+      seenLinks.add(identity);
+    }
     const now = new Date().toISOString();
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
@@ -348,6 +387,29 @@ export class ReviewStore {
       ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
         ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
     } });
+    // Retire the stale active link inside the same transaction as the case and
+    // pending manual decision. All identity/ownership/version fields are CAS
+    // fenced; a revived or re-owned series cancels the entire operation.
+    for (const link of staleLinks) {
+      const values: Record<string, unknown> = {
+        ":profile": link.profile, ":owner": "todoist", ":series": link.seriesId,
+        ":task": link.taskId, ":event": link.eventId, ":updated": link.updatedAt,
+      };
+      const conditions = [
+        "#profile = :profile", "#owner = :owner", "seriesId = :series",
+        "taskId = :task", "eventId = :event", "updatedAt = :updated",
+      ];
+      for (const field of ["masterEventId", "activeInstanceId"] as const) {
+        if (link[field]) { conditions.push(`${field} = :${field}`); values[`:${field}`] = link[field]; }
+        else conditions.push(`attribute_not_exists(${field})`);
+      }
+      items.push({ Delete: { TableName: reviewTable(),
+        Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
+        ConditionExpression: conditions.join(" AND "),
+        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
+        ExpressionAttributeValues: values,
+      } });
+    }
     // Remove exact case-scoped deletion-review guards. Their unique case sort
     // key means this cannot remove guards owned by other unresolved cases.
     const refs = [
@@ -489,18 +551,19 @@ export class ReviewStore {
       checkAbsent(`TASKOWNER#${taskId}`);
       for (const candidateProfile of profiles) {
         checkAbsent(`TASK#${candidateProfile}#${taskId}`);
-        // Todoist-owned recurrence key uses task ID as its series identity.
-        checkAbsent(`RECURRENCE#${candidateProfile}#${taskId}`, "STATE");
+        // Every recurrence identity is fenced together below, including
+        // the Calendar iCalUID key rather than only task-ID keys.
       }
     }
     for (const eventId of expected.eventIds) {
       for (const candidateProfile of profiles) {
         checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
-        checkAbsent(`COMPLETED_EVENT#${candidateProfile}#${eventId}`, "STATE");
-        for (const taskId of expected.taskIds) {
-          checkAbsent(`COMPLETED_TASK#${candidateProfile}#${taskId}`, `EVENT#${eventId}`);
-        }
+        // Completed task/event projections remain untouched and are not
+        // considered live ownership of a deleted recurrence.
       }
+    }
+    for (const seriesId of seriesKeys) for (const candidateProfile of profiles) {
+      checkAbsent(`RECURRENCE#${candidateProfile}#${seriesId}`, "STATE");
     }
     // Never ConditionCheck a key that is also deleted in this transaction.
     // Such a duplicate would invalidate all DynamoDB transactions.

@@ -10,6 +10,8 @@ function fixture({ race = false } = {}) {
     ["REVIEW_CASE#review-a",c],
     ["AUDIT#home#new-safe",{action:"calendar_snapshot_recurring_identity_conflict",createdAt:"2026-10-25T00:00:00Z",
       detail:{taskId:"task-a",eventId:"event-a"}}],
+    ["COMPLETED_EVENT#home#history-a",{taskId:"task-a",eventId:"history-a",completedAt:"2026-10-25T00:00:00Z"}],
+    ["COMPLETED_TASK#home#task-a",{taskId:"task-a",eventId:"history-a",completedAt:"2026-10-25T00:00:00Z"}],
     ["AUDIT#home#shared-live",{action:"calendar_snapshot_recurring_identity_conflict",createdAt:"2026-10-25T00:00:00Z",
       detail:{taskId:"task-a",eventId:"event-OTHER"}}],
   ]);
@@ -55,8 +57,9 @@ test("deleted fixture audits are retired only when every provider ID is attribut
   for(const profile of ["home","antonio","work"]){
     assert.ok(checked(`TASK#${profile}#task-a`,"MAP"));
     assert.ok(checked(`EVENT#${profile}#event-a`,"MAP"));
-    assert.ok(checked(`COMPLETED_EVENT#${profile}#event-a`,"STATE"));
-    assert.ok(checked(`COMPLETED_TASK#${profile}#task-a`,"EVENT#event-a"));
+    assert.ok(!checked(`COMPLETED_EVENT#${profile}#event-a`,"STATE"));
+    assert.ok(!checked(`COMPLETED_TASK#${profile}#task-a`,"EVENT#event-a"));
+    assert.ok(checked(`RECURRENCE#${profile}#event-a`,"STATE"));
   }
   assert.ok(checked("TASKOWNER#task-a","MAP"));
   assert.ok(checks.some(x=>x.Key.pk==="SYNC_CONTROL#home:todoist:task-a"
@@ -76,4 +79,56 @@ test("provider identity not in the exact verified-deleted set refuses cleanup be
   assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
     {profile:"home",taskIds:["other-task"],eventIds:["event-a"]}),false);
   assert.equal(f.getTransaction(),undefined);
+});
+
+test("verified-deleted recurring task retires only the exact versioned link in the case transaction",async()=>{
+  const f=fixture();
+  const link={profile:"home",owner:"todoist",seriesId:"task-a",taskId:"task-a",
+    eventId:"event-a",masterEventId:"event-a",activeInstanceId:"active-a",
+    updatedAt:"2026-10-25T19:09:07.680Z"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
+    {profile:"home",taskIds:["task-a"],eventIds:["event-a","active-a"],staleLinks:[link]}),true);
+  const tx=f.getTransaction();
+  const deleted=tx.find(x=>x.Delete?.Key.pk==="RECURRENCE#home#task-a");
+  assert.ok(deleted);
+  assert.match(deleted.Delete.ConditionExpression,/updatedAt = :updated/);
+  assert.match(deleted.Delete.ConditionExpression,/masterEventId = :masterEventId/);
+  assert.match(deleted.Delete.ConditionExpression,/activeInstanceId = :activeInstanceId/);
+  assert.equal(deleted.Delete.ExpressionAttributeValues[":updated"],link.updatedAt);
+  assert.ok(!tx.some(x=>x.Delete?.Key.pk?.startsWith("COMPLETED_")));
+  assert.ok(!tx.some(x=>x.ConditionCheck?.Key.pk==="RECURRENCE#home#task-a"));
+  const receipt=tx.find(x=>x.Update?.Key.pk==="REVIEW_CASE#review-a").Update;
+  assert.match(receipt.UpdateExpression,/REMOVE decision, taskId, eventId/);
+  assert.match(receipt.UpdateExpression,/expiresAt = :expiry/);
+  assert.ok(receipt.ExpressionAttributeValues[":expiry"] > Date.now()/1000);
+});
+
+test("changed or foreign recurrence identity refuses cleanup before any transaction",async()=>{
+  const f=fixture();
+  const link={profile:"work",owner:"todoist",seriesId:"task-a",taskId:"task-a",
+    eventId:"event-a",updatedAt:"2026-10-25T19:09:07.680Z"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
+    {profile:"home",taskIds:["task-a"],eventIds:["event-a"],staleLinks:[link]}),false);
+  assert.equal(f.getTransaction(),undefined);
+});
+
+test("stale link with an absent active identifier is rejected independently by transaction",async()=>{
+  const f=fixture();
+  const link={profile:"home",owner:"todoist",seriesId:"task-a",taskId:"task-a",
+    eventId:"event-a",masterEventId:"event-a",updatedAt:"2026-10-25T19:09:07Z"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
+    {profile:"home",taskIds:["task-a"],eventIds:["event-a"],staleLinks:[link]}),false);
+  assert.equal(f.getTransaction(),undefined);
+});
+test("a verified Calendar iCalUID key is fenced on all profiles in the terminal transaction",async()=>{
+  const f=fixture();
+  const uid="calendar-master-series-uid";
+  const result=await f.store.resolveVerifiedDeletedCase("review-a",{
+    profile:"home",taskIds:["task-a"],eventIds:["event-a"],seriesKeys:["task-a","event-a",uid],
+  });
+  assert.equal(result,true);
+  const checks=f.getTransaction().filter(x=>x.ConditionCheck).map(x=>x.ConditionCheck);
+  for(const profile of ["home","antonio","work"])
+    assert.ok(checks.some(c=>c.Key.pk===`RECURRENCE#${profile}#${uid}`&&c.Key.sk==="STATE"));
+  assert.ok(!f.getTransaction().some(x=>x.Delete?.Key.pk?.startsWith("COMPLETED_")));
 });
