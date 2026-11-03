@@ -308,8 +308,8 @@ export class DynamoOrphanJournal implements OrphanJournal {
     const values:Record<string,unknown>={":old":operation.phase,":oldVersion":operation.version,
       ":new":to,":newVersion":next.version,":updated":now,":checkpoint":checkpoint,
       ":profile":operation.profile,":case":operation.caseId,":side":operation.side,":target":operation.targetId,
-      ":caseVersion":operation.caseUpdatedAt,":digest":operation.providerDigest,":actor":operation.actorSubject,
-      ":etag":operation.providerEtag || ""};
+      ":caseVersion":operation.caseUpdatedAt,":digest":operation.providerDigest,":actor":operation.actorSubject};
+    if(operation.side==="calendar")values[":etag"]=operation.providerEtag!;
     if(lastError){names["#error"]="lastError";values[":error"]=lastError;}
     await this.db.send(new UpdateCommand({TableName:tableName(),Key:key(operation.id),
       UpdateExpression:"SET #phase = :new, #version = :newVersion, #updated = :updated, #checkpoint = :checkpoint"
