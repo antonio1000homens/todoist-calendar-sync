@@ -4,6 +4,7 @@ import {GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComman
 import {documentClient} from "./dynamodb-capacity.js";
 import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation, type FencedMapping} from "./erasure-executor.js";
 import type {ErasurePreviewResult} from "./erasure-preview.js";
+import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
 export interface RecoveryState {
@@ -69,7 +70,10 @@ export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreview
   if(noWrites&&identical)return "pre_write";
   const noProviders=!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent
     &&snapshot.actionPlan.comments.length===0;
-  if(snapshot.blockers.length===0&&noProviders&&snapshot.inventory.length===0)return "fully_deleted";
+  // A completely absent provider inventory is not proof when its exact
+  // preview fingerprint is inconsistent with the readback; fail closed.
+  if(snapshot.blockers.length===0&&noProviders&&snapshot.inventory.length===0
+    &&erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint)return "fully_deleted";
   return "partial_or_ambiguous";
 }
 /** Query every strong-consistent page. Never treat a partial read as a safe, empty lease inventory. */
@@ -190,6 +194,13 @@ export class ErasureRecoveryService {
       mappingInventory:mappings.sort((a,b)=>a.id.localeCompare(b.id)),mappingStates,
       snapshotFingerprint:snapshot.previewFingerprint,classification});
     return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal)};
+  }
+
+  /** Independent post-write inspection. Intentionally has no confirm/apply
+   * counterpart: release and partial deletion are not yet authorised. */
+  async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
+    const inspection=await this.inspect(id);
+    return assessPostWriteRecovery(inspection.operation,inspection.preview);
   }
 
   async issueConfirmation(id:string,operator:string):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number}> {
