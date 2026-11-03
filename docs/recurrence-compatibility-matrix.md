@@ -143,3 +143,34 @@ Remaining: independently observed real-provider completion and instance
 readbacks, explicit approval/feature gate for native writes, idempotent
 mapping after Calendar POST/PUT and rollback/quarantine on failures. No
 production enabling or migration is implied by the safety follow-up.
+
+## Phase B read-only provider validation collector
+
+`src/todoist-calendar-phase-b-evidence.ts` supplies
+`assessTodoistPhaseBProviders()`. An isolated test or an explicitly approved
+operator workflow may pass **genuine**, already-captured Todoist before/after
+completion readbacks and an independently verified original cadence anchor.
+The collector then performs only five kinds of provider **GET** operation:
+
+- Fetch the current Todoist task and assert it still matches the captured
+  post-completion state and the exact task/project identity.
+- Fetch the specific Calendar master and look up the same Todoist task ID
+  independently, rejecting an absent, ambiguous or different Calendar link.
+- Read the paginated explicit Calendar exception inventory; any exception
+  blocks native exactness.
+- For timed rules, independently read the Calendar timezone and compare it
+  with the original schedule, Todoist and event timezones.
+- Read a bounded, paginated Calendar instance window covering the first four
+  expected dates with two-day boundary margins, then verify actual ordered
+  instances and completion progression using the existing Phase B verifier.
+
+Any failed or incomplete provider read produces `rolling_required`. No
+Calendar or Todoist writes, task completions, DynamoDB mapping writes, bulk
+backfills or new periodic polls occur. A `native_exact` assessment certifies
+only the supplied *observations*, not authorization to enable production
+native conversion. Before doing so, separately substantiate original-anchor
+provenance and actual completion-capture provenance, use isolated accounts,
+test retries/restarts and require a future-only rollback/quarantine plan.
+
+**Deployment boundary:** the collector is not invoked by the production
+synchronizer. All unverified Phase B schedules continue rolling.
