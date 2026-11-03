@@ -111,9 +111,39 @@ not checked. Nor were all historical bundles compared with replay-admission
 source, CloudFormation/CodeDeploy rollback references exhaustively verified,
 or nonstandard legacy names/accounts proved absent. A complete historical
 writer audit must establish these before any retirement or denial change.
-The local Windsor SSO CLI token was expired during this review, so these reads
-used the connected Windsor AWS account instead. No AWS resource or IAM policy
-was changed.
+The initial inventory above was captured while the local Windsor SSO CLI token
+was expired. The direct Windsor CLI follow-up below re-ran the regional and
+identity-policy checks after SSO re-authentication. No AWS resource or IAM
+policy was changed.
+
+### Direct Windsor CLI follow-up (3 Nov 2026)
+
+`AWS_PROFILE=windsor aws sts get-caller-identity` returned account
+`243857182133` and the expected Windsor SSO administrator role.
+`ec2:DescribeRegions` returned 17 enabled regions. The repository's read-only
+Lambda inventory was run in every region; it found the same seven
+`todoist-calendar-sync-*-production` functions only in `eu-west-2` and no
+matching function in the other 16 enabled regions. Fresh alias reads showed
+`ingress live → 71` and `review-api live → 94`, with no weighted targets. The
+worker and erasure-worker SQS mappings remained enabled and unqualified.
+
+`iam:GetAccountAuthorizationDetails` returned 49 roles, 6 users and no groups.
+The `AWSReservedSSO_AdministratorAccess` and `WindsorVsstudioAccess` roles both
+reference AWS managed `AdministratorAccess`; its current policy document is
+`Allow *` on `*`. The `vsstudio` user and `S3-access-github-actions` role
+reference AWS managed `AWSLambda_FullAccess`; its current default policy
+version includes `Allow lambda:*` on `*`. These identity-based permissions
+can invoke historical qualified versions without a version resource policy.
+This confirms an unresolved bypass; it does not show which identities invoked
+a version or complete effective-permission analysis.
+
+This follow-up is scoped to the Windsor account and its 17 currently enabled
+regions. It does not establish the state of permission boundaries, Organizations
+SCPs, SSO permission-set provenance, all role trust/session paths, CloudTrail
+data-event coverage, CodeDeploy rollback references or nonstandard legacy
+names. Do not remove or deny these broad principals as part of this read-only
+audit. Any policy or version-retirement change needs a separately reviewed,
+exact change plan and rollback decision.
 
 Obtain independent operator/security approval and a rollback plan before any
 IAM update or version retirement. Published version deletion is irreversible
