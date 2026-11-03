@@ -126,12 +126,14 @@ test("new UI includes one case-bound provider/title/ID dropdown with no second-I
   const main=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
   const recovery=readFileSync(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
   assert.match(panel,/<label>Item to delete/);
-  assert.match(panel,/disabled=\{!candidate.eligible\}/);
+  assert.match(panel,/disabled=\{!candidate.live\}/);
+  assert.match(panel,/Request verified deletion preview \(no changes\)/);
   assert.match(panel,/blocked:.*candidate.reason/);
   assert.match(panel,/All case-recorded items are blocked/);
   assert.equal((panel.match(/<select /g)||[]).length,1);
   assert.doesNotMatch(panel,/Exact Todoist task ID|Exact Calendar event ID|Separately delete|delete both/);
-  assert.match(panel,/setPreview\(undefined\);setTyped\(\{phrase:"",id:""\}\)/);
+  assert.match(panel,/setPreview\(undefined\);setPreviewError\("";?\)/);
+  assert.doesNotMatch(panel,/setTyped|onClick=\{.*deleteTask/);
   assert.match(main,/<OrphanDeletionPanel key=/);
   assert.match(main,/item=\{details\.item\} snapshots=\{details\.snapshots\|\|\[\]\}/);
   assert.match(main,/<ErasureRecoveryPanel api=\{api\}/);
@@ -141,9 +143,11 @@ test("new UI includes one case-bound provider/title/ID dropdown with no second-I
   assert.match(recovery,/erasure-operations/);
 });
 
-test("no deletion can be started from the orphan panel while backend proof and durable executor are missing",()=>{
+test("only server safety preview can be requested; no deletion or confirmation can start from the panel",()=>{
   const source=readFileSync(new URL("../review-ui/orphan-deletion-panel.tsx",import.meta.url),"utf8");
-  assert.doesNotMatch(source,/method:"POST"|deleteTask\(|deleteEvent\(|Start guarded erasure/);
-  assert.match(source,/No verified orphan item available for deletion/);
+  assert.match(source,/method:"POST"/);
+  assert.match(source,/\/orphan-previews/);
+  assert.doesNotMatch(source,/orphan-confirmations|deleteTask\(|deleteEvent\(|Start guarded erasure|executeDeletion/);
+  assert.match(source,/No provider deletion is available/);
   assert.match(source,/recheck\(\)/);
 });
