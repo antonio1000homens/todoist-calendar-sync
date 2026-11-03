@@ -33,7 +33,7 @@ function fakeClient({loop=false,failOnPolicy=false}={}) {
       seen.push({kind,input});
       switch(kind) {
         case "ListFunctionsCommand":
-          return input.Marker?{Functions:[{FunctionName:worker,FunctionArn:base+worker}]}:
+          return input.Marker?{Functions:[{FunctionName:worker,FunctionArn:base+worker}],...(loop?{NextMarker:"repeat"}:{})}:
             {Functions:[{FunctionName:ingress,FunctionArn:base+ingress}],NextMarker:loop?"repeat":"second"};
         case "ListEventSourceMappingsCommand":
           return {EventSourceMappings:[
