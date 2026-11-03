@@ -179,10 +179,12 @@ async function fullStateRead(db:Pick<DynamoDBDocumentClient,"send">,limit:number
   } while(cursor);
   return rows;
 }
-/** Trusted on-demand provider/state reader; any incomplete pagination, API
- * failure, rate limit or deadline throws. No provider/state writes occur. */
-export async function collectOrphanEvidence(op:OrphanDeletionOperation,sources:OrphanEvidenceSources={}):
-  Promise<VerifiedOrphanProof> {
+/** Capture the complete, live, read-only provider + state inventory.
+ * Shared by pre-deletion eligibility and post-deletion verification, so the
+ * two phases cannot silently diverge on what constitutes a complete scan.
+ * Collection alone never constitutes deletion or fence-release authority. */
+export async function collectOrphanInventory(op:OrphanDeletionOperation,sources:OrphanEvidenceSources={}):
+  Promise<OrphanEvidenceInventory> {
   const deadline=Date.now()+(sources.deadlineMs??80_000);
   const store=sources.store||new ReviewStore();
   const cached=new Map<Profile,Clients>();
@@ -201,7 +203,10 @@ export async function collectOrphanEvidence(op:OrphanDeletionOperation,sources:O
     try {
       const result=side==="todoist"?await pair.todoist.getTask(id):await pair.calendar.getEvent(id);
       if(result.id!==id)throw new OrphanEvidenceUnavailable("Provider returned a different identity");
+      // Treat only explicit deletion/tombstone status as absent. Todoist
+      // completion is NOT a deletion; an ambiguous status remains observable.
       if(side==="calendar"&&(result as CalendarEvent).status==="cancelled")return null;
+      if(side==="todoist"&&(result as TodoistTask).is_deleted===true)return null;
       return result;
     } catch(error){if(providerNotFound(error))return null;throw error;}
   };
@@ -228,6 +233,12 @@ export async function collectOrphanEvidence(op:OrphanDeletionOperation,sources:O
     providers.push({profile,tasks,events:delta.items,comments});
   }
   const rows=await fullStateRead(sources.db||documentClient,sources.maxRows??20000,deadline);
-  return evaluateOrphanEvidence(op,{item,target:target?{side:op.side,item:target} as ProviderTarget:null,
-    counterparts:opposite.map((id,index)=>({side,id,object:values[index]})),providers,stateRows:rows});
+  return {item,target:target?{side:op.side,item:target} as ProviderTarget:null,
+    counterparts:opposite.map((id,index)=>({side,id,object:values[index]})),providers,stateRows:rows};
+}
+
+/** Legacy/public preview proof retains the identical authoritative reader. */
+export async function collectOrphanEvidence(op:OrphanDeletionOperation,sources:OrphanEvidenceSources={}):
+  Promise<VerifiedOrphanProof> {
+  return evaluateOrphanEvidence(op,await collectOrphanInventory(op,sources));
 }

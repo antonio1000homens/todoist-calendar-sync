@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {evaluateOrphanPostflight} from "../dist/orphan-postflight.js";
+import {evaluateOrphanPostflight,collectOrphanPostflight} from "../dist/orphan-postflight.js";
 
 const stamp="2026-11-03T20:00:00.000Z";
 function operation(side="todoist") {
@@ -116,4 +116,115 @@ test("partial inventory, stale phase and unknown provider object status are bloc
     data.providers[0].events.push({id:op.targetId,status:"cancelled"});
   });
   assert.equal(cancelled.verified,true);
+});
+
+
+/** Source-backed postflight: use the same complete inventory that preview
+ * collects, but do not use an injected preconstructed evidence object. */
+function liveFixture(side="todoist") {
+  const op={...operation(side),phase:"provider_absent"};
+  const absentCounterpart=side==="todoist"?"event-gone":"task-gone";
+  const caseItem={...inventory(side).item,
+    ...(side==="todoist"?{eventId:absentCounterpart}:{taskId:absentCounterpart})};
+  const rows=[{pk:"REVIEW_CASE#alert-287",sk:"STATE",taskId:op.targetId,eventId:op.targetId},
+    {pk:"ORPHAN_DELETE#orphan-op",sk:"STATE",caseId:op.caseId,profile:op.profile,
+      side:op.side,targetId:op.targetId}];
+  const catalog=Object.fromEntries(["home","antonio","work"].map(profile=>[profile,{
+    tasks:[],events:[],comments:[],
+  }]));
+  const calls={getTask:[],getEvent:[],listTasks:[],listDelta:[],scan:0,writes:0};
+  let directOverride;
+  const clients=async profile=>({
+    todoist:{
+      getTask:async id=>{
+        calls.getTask.push({profile,id});
+        if(directOverride && profile===op.profile && id===op.targetId)
+          return directOverride();
+        throw Object.assign(new Error("not found"),{status:404});
+      },
+      listTasks:async projectId=>{
+        calls.listTasks.push({profile,projectId});
+        return catalog[profile].tasks;
+      },
+      listProjectComments:async()=>catalog[profile].comments,
+      listTaskComments:async()=>[],
+    },
+    calendar:{
+      getEvent:async id=>{
+        calls.getEvent.push({profile,id});
+        if(directOverride && profile===op.profile && id===op.targetId)
+          return directOverride();
+        throw Object.assign(new Error("not found"),{status:404});
+      },
+      listDelta:async()=>{
+        calls.listDelta.push(profile);
+        return {items:catalog[profile].events};
+      },
+    },
+  });
+  const db={send:async command=>{
+    if(command.constructor.name!=="ScanCommand"){calls.writes++;throw Error("Unexpected DynamoDB write");}
+    calls.scan++;
+    return {Items:rows};
+  }};
+  return {op,catalog,rows,calls,sources:{
+    store:{getCase:async id=>id===op.caseId?caseItem:undefined},
+    clients,db,
+  },setDirect:fn=>{directOverride=fn;}};
+}
+test("live postflight collector checks all three profiles without mutation for both provider sides",async()=>{
+  for(const side of ["todoist","calendar"]){
+    const f=liveFixture(side);
+    const result=await collectOrphanPostflight(f.op,f.sources);
+    assert.equal(result.verified,true,JSON.stringify(result.blockers));
+    assert.equal(f.calls.scan,1);
+    assert.equal(f.calls.writes,0);
+    assert.deepEqual(f.calls.listDelta.sort(),["antonio","home","work"]);
+    assert.equal(f.calls.listTasks.length,3);
+    assert.equal(f.calls.getTask.length,side==="todoist"?1:1);
+    assert.equal(f.calls.getEvent.length,side==="calendar"?1:1);
+  }
+});
+test("live postflight collector rejects target reappearance despite selected-profile 404",async()=>{
+  for(const side of ["todoist","calendar"]){
+    const f=liveFixture(side);
+    if(side==="todoist")
+      f.catalog.work.tasks.push({id:f.op.targetId,is_deleted:false,is_completed:false});
+    else
+      f.catalog.antonio.events.push({id:f.op.targetId,status:"confirmed"});
+    const result=await collectOrphanPostflight(f.op,f.sources);
+    assert.equal(result.verified,false);
+    assert.match(result.blockers.join(" "),/reappeared/);
+    assert.equal(f.calls.writes,0);
+  }
+});
+test("recorded counterpart still live in another profile blocks source-backed postflight",async()=>{
+  const f=liveFixture("todoist");
+  f.catalog.work.events.push({id:"event-gone",status:"confirmed"});
+  const result=await collectOrphanPostflight(f.op,f.sources);
+  assert.equal(result.verified,false);
+  assert.match(result.blockers.join(" "),/Recorded counterpart remains present/);
+});
+test("completed Todoist is not deleted; explicit deleted task tombstone is",async()=>{
+  const f=liveFixture("todoist");
+  f.setDirect(async()=>({id:f.op.targetId,is_completed:true,is_deleted:false}));
+  const completed=await collectOrphanPostflight(f.op,f.sources);
+  assert.equal(completed.verified,false);
+  assert.match(completed.blockers.join(" "),/target direct readback/);
+  f.setDirect(async()=>({id:f.op.targetId,is_completed:false,is_deleted:true}));
+  const deleted=await collectOrphanPostflight(f.op,f.sources);
+  assert.equal(deleted.verified,true,JSON.stringify(deleted.blockers));
+});
+test("postflight never converts provider failures or scan budget truncation to verified absence",async()=>{
+  const rateLimited=liveFixture("todoist");
+  rateLimited.setDirect(async()=>{throw Object.assign(new Error("rate limited"),{status:429});});
+  await assert.rejects(()=>collectOrphanPostflight(rateLimited.op,rateLimited.sources),/rate limited/);
+  const scan=liveFixture("calendar");
+  scan.rows.push({pk:`EVENT#home#${scan.op.targetId}`,sk:"MAP",eventId:scan.op.targetId});
+  await assert.rejects(()=>collectOrphanPostflight(scan.op,{...scan.sources,maxRows:1}),/exceeds safe review budget/);
+  const foreign=liveFixture("calendar");
+  foreign.rows.push({pk:`EVENT#work#${foreign.op.targetId}`,sk:"MAP",eventId:foreign.op.targetId});
+  const result=await collectOrphanPostflight(foreign.op,foreign.sources);
+  assert.equal(result.verified,false);
+  assert.match(result.blockers.join(" "),/Dangling or unattributed state reference/);
 });
