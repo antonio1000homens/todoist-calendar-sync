@@ -270,7 +270,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           ||!REVIEW_PROFILES.includes(body.profile as Profile))
           fail(400,"Post-write review requires exact operation, profile and REVIEW AND KEEP FENCED phrase");
         const reviewed=await recovery.acknowledgePostWriteReview(id,body.confirmationId,actor.subject,{
-          operationId:body.operationId,profile:body.profile,phrase:body.phrase,
+          operationId:body.operationId,profile:body.profile as Profile,phrase:body.phrase,
         });
         console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
           event:"postwrite_review_recorded_fenced",operationId:id}));
