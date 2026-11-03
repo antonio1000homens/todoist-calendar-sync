@@ -96,3 +96,16 @@ test("unrelated snapshot mapping does not block verified exact deleted IDs",asyn
   const status=await deletedRecurrenceStatus(deletedCase,[...snapshots,extra],getLink);
   assert.equal(status.state,"stale_recurrence");
 });
+
+test("cross-matched master/active IDs are blocked even though both IDs are cancelled",async()=>{
+  const swapped={...linked,masterEventId:active,activeInstanceId:master};
+  const keys=[taskId,master,active,masterSeriesId];
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],
+    [swapped],keys,{masterId:master,activeInstanceId:active}).stale.length,0);
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],
+    [swapped],keys,{masterId:master,activeInstanceId:active}).blocked.length,1);
+  const status=await deletedRecurrenceStatus(deletedCase,snapshots,
+    async(profile,key)=>profile==="antonio"&&key===taskId?swapped:undefined);
+  assert.equal(status.bothGone,false);
+  assert.equal(status.state,"mapping_blocked");
+});
