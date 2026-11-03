@@ -92,7 +92,8 @@ export async function inspectConfirmedOrphanOperation(
   // read-only inspection. This is not an authorization to disable it.
   const mappings=await (sources.inspectMappings??(()=>inspectOrphanWorkerMappings()))();
   if(!mappings.verified||!mappings.fingerprint||!/^[a-f0-9]{64}$/.test(mappings.fingerprint)
-    ||!Number.isInteger(mappings.timeoutSeconds)||!mappings.mappingCount
+    ||typeof mappings.timeoutSeconds!=="number"||!Number.isInteger(mappings.timeoutSeconds)
+    ||!mappings.mappingCount
     ||mappings.blockers.length){
     blockers.push("Target worker SQS mapping inventory is missing, changing or unsafe");
     return result();
