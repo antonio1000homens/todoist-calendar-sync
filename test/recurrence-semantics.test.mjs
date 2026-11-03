@@ -123,6 +123,15 @@ test("strictly rejects unknown/duplicated/invalid and compound components", () =
   assert.equal(classifyCalendarRule("RRULE:FREQ=DAILY", verified("2027-02-31")).reason, "invalid_start");
 });
 
+test("fifth and last Friday remain distinct; months without a fifth occurrence are skipped", () => {
+  const fifth = classifyCalendarRule("RRULE:FREQ=MONTHLY;BYDAY=5FR", verified("2027-01-29"));
+  const last = classifyCalendarRule("RRULE:FREQ=MONTHLY;BYDAY=-1FR", verified("2027-01-29"));
+  assert.equal(fifth.disposition, "rolling_required", "ordinal family is not promoted without its own provider proof");
+  assert.deepEqual(occurrenceDates(fifth.semantic, 3), ["2027-01-29", "2027-04-30", "2027-07-30"]);
+  assert.deepEqual(occurrenceDates(last.semantic, 3), ["2027-01-29", "2027-02-26", "2027-03-26"]);
+  assert.equal(compareOccurrenceSemantics(fifth.semantic, last.semantic).equivalent, false);
+});
+
 test("timed and all-day rules do not compare equivalent; timezone is semantic", () => {
   const allDay = classifyCalendarRule("RRULE:FREQ=WEEKLY;BYDAY=MO", {
     start:"2027-01-04", evidence,
