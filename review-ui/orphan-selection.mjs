@@ -17,8 +17,8 @@ export function recordedOrphanIdentities(item) {
   return {todoist:unique(tasks),calendar:unique(events)};
 }
 const key=(ref)=>`${ref.profile}:${ref.side}:${ref.id}`;
-const isLive=s=>Boolean(s?.object?.id===s?.ref?.id&&(s.ref.side==="todoist"
-  ?!s.object.is_deleted&&!s.object.is_completed
+const isLive=s=>Boolean(s?.object?.id===s?.ref?.id&&!s.lookupError&&(s.ref.side==="todoist"
+  ?s.object.is_deleted===false&&s.object.is_completed===false
   :s.object.status==="confirmed"));
 const isRecurring=s=>s?.ref?.side==="todoist"?s.object?.due?.is_recurring===true
   :Boolean(s?.object?.recurringEventId||s?.object?.recurrence?.length
@@ -26,8 +26,9 @@ const isRecurring=s=>s?.ref?.side==="todoist"?s.object?.due?.is_recurring===true
 const title=s=>s.ref.side==="todoist"?s.object?.content:s.object?.summary;
 const reasonFor=s=>{
   if(!s)return "Provider identity has not been directly verified";
+  if(s.lookupError)return "Provider identity or ownership could not be verified; retry the direct lookup before considering deletion";
   if(!s.object)return "Missing (404/410); this object cannot be deleted again";
-  if(!isLive(s))return s.ref.side==="calendar"?"Cancelled or unverified Calendar object":"Deleted, completed or unverified Todoist task";
+  if(!isLive(s))return s.ref.side==="calendar"?"Cancelled or unverified Calendar object":"Deleted, completed or missing explicit Todoist status fields";
   if(s.mapping||s.recurrence||s.control?.activeRepair||s.control?.excluded)return "Linked, controlled, or mapping/ownership evidence requires repair";
   if(s.object?.extendedProperties?.shared?.taskId)return "Calendar metadata references a Todoist counterpart";
   if(isRecurring(s))return "Recurring item requires separately verified owner and scope";
@@ -46,8 +47,10 @@ export function orphanItemsForCase({item,snapshots=[]}={}) {
     if(!snap?.ref||snap.ref.profile!==item.profile
       ||!["todoist","calendar"].includes(snap.ref.side)||!exactId(snap.ref.id))continue;
     const ref=snap.ref;
-    const allowed=(ref.side==="todoist"?ids.todoist:ids.calendar).includes(ref.id)
-      ||Array.isArray(snap.includedBy)&&snap.includedBy.length>0;
+    // includedBy describes repair graph discovery, NOT immutable alert membership.
+    // Search/recheck can introduce arbitrary other objects, which may never
+    // become deletion candidates merely because they appear in snapshots.
+    const allowed=(ref.side==="todoist"?ids.todoist:ids.calendar).includes(ref.id);
     if(!allowed)continue;
     if(!refs.has(key(ref)))refs.set(key(ref),snap);
   }
@@ -62,7 +65,7 @@ export function orphanItemsForCase({item,snapshots=[]}={}) {
       key:key(s.ref),profile:item.profile,side,id,title:currentTitle,
       label:`${provider} · ${currentTitle} · ${id}`,
       live,eligibility:"blocked",reason,
-      status:!s.object?"missing":!live?"not live":s.mapping||s.recurrence?"linked":"verification required",
+      status:s.lookupError?"unverified":!s.object?"missing":!live?"not live":s.mapping||s.recurrence?"linked":"verification required",
       // No UI-only proof may elevate a candidate to eligible; only a future
       // durable server-side operation can do so after complete postflight.
       eligible:false,
