@@ -98,6 +98,21 @@ test("project/task comments and unknown canonical state block destructive proof"
   assert.match(p.blockers.join(" "),/manual review/);
 });
 
+test("unrelated audit and conflict pointers are not silently discarded",()=>{
+  const otherAudit=proof("calendar",data=>{
+    data.stateRows.push({pk:"AUDIT#home#historical",sk:"STATE",eventId:"cal-1"});
+  });
+  assert.equal(otherAudit.checks.canonical_records_clear,false);
+  const otherConflict=proof("todoist",data=>{
+    data.stateRows.push({pk:"REVIEW_CONFLICT#home#other",sk:"INCIDENT#other",incidentId:"other",taskId:"task-1"});
+  });
+  assert.equal(otherConflict.checks.canonical_records_clear,false);
+  const ownPointer=proof("todoist",data=>{
+    data.stateRows.push({pk:"REVIEW_CONFLICT#home#own",sk:"INCIDENT#alert-287",incidentId:"alert-287",taskId:"task-1"});
+  });
+  assert.equal(ownPointer.checks.canonical_records_clear,true);
+});
+
 test("active repairs/fences block, own durable fence permitted only for this operation",()=>{
   const p=proof("calendar",data=>{
     data.stateRows.push({pk:"ERASURE#home",sk:"FENCE",operationId:"different-operation"});
