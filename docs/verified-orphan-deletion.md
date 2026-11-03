@@ -1,8 +1,34 @@
 # Issue #287 — verified, single-target orphan deletion
 
+## Phase 3 — authenticated, read-only server readiness diagnostic
+
+A follow-up branch implements `GET /review/api/cases/{caseId}/orphan-readiness`. This
+endpoint uses the authenticated operator's selected, persisted review case;
+it **rejects arbitrary query IDs**, reads the current provider graph and exact
+case-recorded identities, and reports why each recorded Todoist/Calendar
+candidate cannot currently be deleted. The UI has a separate **Inspect
+deletion readiness (read-only)** control with explicit per-ID blockers.
+Failed provider discovery yields HTTP 503 rather than treating incomplete
+reads as verified absence.
+
+The diagnostic rejects/flags closed or operation-owned cases, stale or
+failed direct reads, recurring items, active controls, saved mapping links,
+Calendar task metadata, other live items in the read-only graph and missing
+counterpart IDs. It retains the exact case profile, ignores search-only IDs as
+selection candidates, and never authorizes a provider write. Its
+`canExecute` fields are **always false**, and it issues no preview token,
+confirmation ID, operation record, mutation, or terminal case state.
+
+**Important:** This is **not** exhaustive cross-provider absence proof. The
+backend still needs canonical/reverse metadata enumeration, owner and completed
+history inventory, a durable preview/confirmation record, worker admission and
+replay fencing, transactional state cleanup, deletion readback, orphan-specific
+retirement and two completed reconciliation passes. No deletion is enabled in
+the UI or API, even if the read-only report shows an absent recorded counterpart.
+
 ## Scope and present implementation status
 
-PR #289 implements the **non-destructive review UI and recovery transition only**. It is deliberately draft. **The actual orphan deletion is not implemented, enabled or safe to approve.** A displayed 404 or missing mapping is not sufficient to prove an orphan.
+Merged PR #289 implements the **non-destructive review UI and recovery transition**. This follow-up adds an on-demand read-only server diagnostic. **The actual orphan deletion is not implemented, enabled or safe to approve.** A displayed 404 or missing mapping is not sufficient to prove an orphan.
 
 The review page now offers a single case-scoped `Item to delete` dropdown with title, provider, full ID and status. Candidates come solely from the exact selected case's recorded provider identities and provider snapshots. Rechecking uses the existing read-only current-case endpoint; the operator cannot paste arbitrary IDs into the orphan selector. No orphan is currently eligible or confirmable.
 
