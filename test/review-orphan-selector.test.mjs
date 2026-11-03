@@ -132,7 +132,7 @@ test("new UI includes one case-bound provider/title/ID dropdown with no second-I
   assert.match(panel,/All case-recorded items are blocked/);
   assert.equal((panel.match(/<select /g)||[]).length,1);
   assert.doesNotMatch(panel,/Exact Todoist task ID|Exact Calendar event ID|Separately delete|delete both/);
-  assert.match(panel,/setPreview\(undefined\);setPreviewError\("";?\)/);
+  assert.match(panel,/setPreview\(undefined\);setPreviewError\(""\)/);
   assert.doesNotMatch(panel,/setTyped|onClick=\{.*deleteTask/);
   assert.match(main,/<OrphanDeletionPanel key=/);
   assert.match(main,/item=\{details\.item\} snapshots=\{details\.snapshots\|\|\[\]\}/);
