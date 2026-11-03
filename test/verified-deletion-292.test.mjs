@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyDeletedRecurrenceLinks } from "../dist/verified-deletion.js";
+import { classifyDeletedRecurrenceLinks, readExactRecurrenceLinks } from "../dist/verified-deletion.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
 
 const taskId="6hqp4fFR45WvJ5VV";
 const master="agejr3i89v5p13lfl95uss11o8";
 const active=master+"_20261116";
 const completed=master+"_20261102";
+const masterSeriesId=master+"-gcal-series";
+const getLink=async(profile,key)=>profile==="antonio"&&key===taskId?linked:undefined;
 const linked={profile:"antonio",owner:"todoist",seriesId:taskId,taskId,
   eventId:master,masterEventId:master,activeInstanceId:active,updatedAt:"2026-10-25T19:09:07.680Z"};
 const deletedCase={id:"antonio-todoist_owned_recurrence_task_deleted-1227dad2ad8dd7071bdb",
@@ -17,12 +19,12 @@ const deletedCase={id:"antonio-todoist_owned_recurrence_task_deleted-1227dad2ad8
     masterEventId:master,activeInstanceId:active,mappingSnapshot:{...linked,recurrenceOwner:"todoist"}}};
 const snapshots=[
   {ref:{profile:"antonio",side:"todoist",id:taskId},object:null,checkedAt:"2026-11-03T12:00:00Z"},
-  {ref:{profile:"antonio",side:"calendar",id:master},object:{id:master,status:"cancelled",recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]}},
+  {ref:{profile:"antonio",side:"calendar",id:master},object:{id:master,status:"cancelled",iCalUID:masterSeriesId,recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]}},
   {ref:{profile:"antonio",side:"calendar",id:active},object:{id:active,status:"cancelled",recurringEventId:master}},
 ];
 
 test("production-shaped pair verifies deleted master and active while identifying the stale index",async()=>{
-  const result=await deletedRecurrenceStatus(deletedCase,snapshots,async()=>linked);
+  const result=await deletedRecurrenceStatus(deletedCase,snapshots,getLink);
   assert.equal(result.bothGone,true);
   assert.equal(result.state,"stale_recurrence");
   assert.deepEqual(result.staleLinks.map(link=>link.seriesId),[taskId]);
@@ -31,15 +33,15 @@ test("production-shaped pair verifies deleted master and active while identifyin
 });
 test("one cancelled occurrence cannot retire a live master",async()=>{
   const live=snapshots.map(s=>s.ref.id===master?{...s,object:{id:master,status:"confirmed"}}:s);
-  const result=await deletedRecurrenceStatus(deletedCase,live,async()=>linked);
+  const result=await deletedRecurrenceStatus(deletedCase,live,getLink);
   assert.equal(result.state,"partial");
   assert.equal(result.bothGone,false);
 });
 test("lookup failures and unknown master are never treated as missing",async()=>{
   const failed=snapshots.map(s=>s.ref.id===taskId?{...s,lookupError:"HTTP 429"}:s);
-  assert.equal((await deletedRecurrenceStatus(deletedCase,failed,async()=>linked)).state,"unverified");
+  assert.equal((await deletedRecurrenceStatus(deletedCase,failed,getLink)).state,"unverified");
   const unknown={...deletedCase,decision:{...deletedCase.decision,masterEventId:undefined,mappingSnapshot:{eventId:master}}};
-  assert.equal((await deletedRecurrenceStatus(unknown,snapshots,async()=>linked)).bothGone,false);
+  assert.equal((await deletedRecurrenceStatus(unknown,snapshots,getLink)).bothGone,false);
 });
 test("retirement classifier rejects foreign, Calendar-owned, new and incomplete associations",()=>{
   const extra={...linked,profile:"work"};
@@ -56,4 +58,41 @@ test("completed occurrence history is not part of active recurrence deletion tar
   const result=classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],[linked]);
   assert.equal(result.stale.length,1);
   assert.ok(![master,active].includes(completed));
+});
+
+test("cancelled unrelated occurrence and missing master iCalUID cannot verify deleted series",async()=>{
+  const foreign=snapshots.map(s=>s.ref.id===active?{...s,object:{id:active,status:"cancelled",recurringEventId:"another-series"}}:s);
+  assert.equal((await deletedRecurrenceStatus(deletedCase,foreign,getLink)).state,"unverified");
+  const noUid=snapshots.map(s=>s.ref.id===master?{...s,object:{id:master,status:"cancelled",recurrence:["RRULE:FREQ=WEEKLY"]}}:s);
+  assert.equal((await deletedRecurrenceStatus(deletedCase,noUid,getLink)).bothGone,false);
+});
+test("incomplete active/master link is not marked stale",async()=>{
+  const incomplete={...linked,activeInstanceId:undefined};
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],[incomplete]).blocked.length,1);
+  const status=await deletedRecurrenceStatus(deletedCase,snapshots,
+    async(profile,key)=>profile==="antonio"&&key===taskId?incomplete:undefined);
+  assert.equal(status.state,"mapping_blocked");
+  assert.equal(status.bothGone,false);
+});
+test("strong exact-key inventory finds Calendar-owned iCalUID link in another profile",async()=>{
+  const foreign={...linked,profile:"work",owner:"calendar",seriesId:masterSeriesId};
+  const reads=[];
+  const keys=[taskId,master,active,masterSeriesId];
+  const links=await readExactRecurrenceLinks(keys,async(profile,key)=>{
+    reads.push(profile+"/"+key);
+    return profile==="antonio"&&key===taskId?linked:profile==="work"&&key===masterSeriesId?foreign:undefined;
+  });
+  assert.equal(reads.length,12);
+  assert.ok(reads.includes("work/"+masterSeriesId));
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],links,keys).blocked.length,1);
+  const status=await deletedRecurrenceStatus(deletedCase,snapshots,
+    async(profile,key)=>profile==="antonio"&&key===taskId?linked:profile==="work"&&key===masterSeriesId?foreign:undefined);
+  assert.equal(status.state,"mapping_blocked");
+  assert.equal(status.bothGone,false);
+});
+test("unrelated snapshot mapping does not block verified exact deleted IDs",async()=>{
+  const extra={ref:{profile:"antonio",side:"calendar",id:"unrelated"},object:{id:"unrelated",status:"confirmed"},
+    mapping:{profile:"antonio",taskId:"unrelated-task",eventId:"unrelated",updatedAt:"2026-10-25T00:00:00Z"}};
+  const status=await deletedRecurrenceStatus(deletedCase,[...snapshots,extra],getLink);
+  assert.equal(status.state,"stale_recurrence");
 });
