@@ -59,6 +59,7 @@ export async function readExactRecurrenceLinks(
 export function classifyDeletedRecurrenceLinks(
   profile: Profile, taskIds: string[], eventIds: string[], links: RecurrenceLink[],
   seriesKeys: string[] = [...taskIds, ...eventIds],
+  identity?: { masterId: string; activeInstanceId: string },
 ): { stale: RecurrenceLink[]; blocked: string[] } {
   const tasks = new Set(taskIds), events = new Set(eventIds), keys = new Set(seriesKeys);
   const stale: RecurrenceLink[] = [], blocked: string[] = [];
@@ -72,6 +73,8 @@ export function classifyDeletedRecurrenceLinks(
       && events.has(link.eventId) && Boolean(link.masterEventId && events.has(link.masterEventId))
       && Boolean(link.activeInstanceId && events.has(link.activeInstanceId))
       && link.activeInstanceId !== link.masterEventId
+      && (!identity || link.masterEventId === identity.masterId
+        && link.activeInstanceId === identity.activeInstanceId)
       && typeof link.updatedAt === "string" && Boolean(link.updatedAt)) {
       stale.push(link);
     } else {
