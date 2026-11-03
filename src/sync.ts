@@ -19,6 +19,7 @@ import {
   todoistRecurrenceToRrule,
 } from "./todoist-recurrence.js";
 import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
+import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
@@ -210,6 +211,28 @@ export function toTodoistTask(event: CalendarEvent): Omit<TodoistTask, "id"> {
     content: normalizedText(event.summary) || "Untitled calendar event",
     description: normalizedDescription(event.description),
     due,
+  };
+}
+
+/**
+ * Phase B does not change the live Calendar projection policy. Add its read-only
+ * candidate to existing audit records only, without additional provider calls,
+ * DynamoDB writes or a new audit transaction.
+ */
+function phaseBProjectionPreview(task: TodoistTask, nativeRrule?: string): {
+  phaseBFamily?: string;
+  phaseBCandidateRrule?: string;
+  phaseBReason?: string;
+  phaseBDisposition?: string;
+} {
+  if (nativeRrule || !task.due?.is_recurring) return {};
+  const result = todoistPhaseBCandidate(task);
+  if (!result.family) return {};
+  return {
+    phaseBFamily: result.family,
+    ...(result.candidateRrule ? { phaseBCandidateRrule: result.candidateRrule } : {}),
+    phaseBReason: result.reason,
+    phaseBDisposition: result.disposition,
   };
 }
 
@@ -2240,7 +2263,10 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       await this.state.recordMutation(delivery.profile);
-      return this.state.audit(delivery.profile, projectedRrule ? "todoist_recurrence_completed_calendar_series_created" : "todoist_recurrence_completed_rolled", { taskId: task.id, eventId: stored.id });
+      return this.state.audit(delivery.profile, projectedRrule ? "todoist_recurrence_completed_calendar_series_created" : "todoist_recurrence_completed_rolled", {
+        taskId: task.id, eventId: stored.id,
+        ...phaseBProjectionPreview(current, projectedRrule),
+      });
     }
     if (lifecycle.action === "complete_projection") {
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
@@ -2393,8 +2419,18 @@ export class Synchronizer {
     // completion from racing this check until the provider write is finished.
     if (existingEvent && await this.calendarMutationBlockedByCompletion(delivery, existingEvent.id)) return;
     const desiredRrule = todoistRecurrenceToRrule(task);
+    const phaseBPreview = phaseBProjectionPreview(task, desiredRrule);
     const previousSeriesId = mapping?.recurrenceOwner === "todoist" ? mapping.seriesId : undefined;
     if (mapping?.recurrenceOwner === "todoist" && existingEvent?.recurrence?.length && !desiredRrule) {
+      // A newly recognized-but-unverified Phase B phrase must never cause
+      // deletion of the established Calendar master, its past occurrences,
+      // recurrence link or active mapping. Defer this edit for review until
+      // original anchor, provider completion and instance readback are proved.
+      if (phaseBPreview.phaseBFamily) {
+        return this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+          taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
+        });
+      }
       await this.state.deleteMapping(mapping);
       if (mapping.seriesId) await this.state.deleteRecurrenceLink(delivery.profile, mapping.seriesId);
       await calendar.deleteEvent(existingEvent.id).catch((error: unknown) => {
@@ -2461,7 +2497,9 @@ export class Synchronizer {
       if (todoistRecurring && !preservedCalendarMapping) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
       // Only the verified uncompletion path can withdraw completion markers.
-      return this.state.audit(delivery.profile, "todoist_noop_canonical_state", { taskId: task.id, eventId: existingEvent.id });
+      return this.state.audit(delivery.profile, "todoist_noop_canonical_state", {
+        taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
+      });
     }
     const event = toCalendarEvent(task, existingEvent, !recurringDateEdit);
     const stored = await calendar.upsertEvent(event, existingEvent?.id || mapping?.eventId);
@@ -2508,6 +2546,7 @@ export class Synchronizer {
       recurrenceProjection: todoistRrule ? "rrule" : todoistRecurring ? "rolling" : "none",
       activeInstanceId: active?.id,
       recurrenceReanchored: recurringDateEdit && todoistRrule,
+      ...phaseBPreview,
     });
     } finally {
       if (writeFence) await this.state.endTodoistCalendarWrite?.(task.id, writeFence);
