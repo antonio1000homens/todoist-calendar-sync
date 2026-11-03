@@ -311,10 +311,23 @@ function App() {
   },[terminalInboxRefreshPending,profile,history]);
   const displaySnapshot=(sideName:"todoist"|"calendar") => {
     const matches=details?.snapshots?.filter((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName)||[];
-    const requestedId=sideName==="todoist"?taskId:eventId;
+    // Recorded evidence remains the primary identity even if there is no
+    // selectable live repair target.
+    const evidence=recordedPrimaryProviderIds(selected);
+    const requestedId=sideName==="todoist"?(taskId||evidence.taskId):(eventId||evidence.eventId);
     const current=matches.find((s:any)=>s.ref.id===requestedId)||(!requestedId&&matches.length===1?matches[0]:undefined);
     const item=current?.object as ProviderObject|undefined;
-    if (!item) return <p>{current?`The provider could not find ${sideName} item ${current.ref.id}.`:requestedId?`No live provider snapshot is available for recorded ${sideName} ID ${requestedId}.`:`No ${sideName} item ID is attached to this alert. Search for the item below to continue.`}</p>;
+    if (!item) return <div>
+      <p>{current?.lookupError?`The lookup for ${sideName} ${current.ref.id} could not be verified: ${current.lookupError}`:
+        current?`Recorded ${sideName} ${current.ref.id}: missing (404/410).`:
+        requestedId?`Recorded ${sideName} ID ${requestedId} has not been verified by a direct read.`:
+        `No ${sideName} ID is recorded on this alert.`}</p>
+      {matches.filter((candidate:any)=>candidate.ref.id!==current?.ref.id).map((candidate:any)=><p key={candidate.ref.id}>
+        {sideName==="calendar"&&candidate.ref.id===selected?.decision?.masterEventId?"Series master":
+          sideName==="calendar"&&candidate.ref.id===selected?.decision?.activeInstanceId?"Active instance":"Related identity"}:
+        <code>{candidate.ref.id}</code> — {recordedProviderState(sideName,candidate.ref.id,details?.snapshots,selected?.profile)}
+      </p>)}
+    </div>;
     const start=sideName==="todoist"?(item.due?.datetime||item.due?.date):(item.start?.dateTime||item.start?.date);
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
     const recurrence=sideName==="todoist"?(item.due?.is_recurring?item.due.string||"Recurring":"None"):(item.recurrence?.join(" · ")||(item.recurringEventId?"Part of a recurring series":"None"));
@@ -373,7 +386,13 @@ function App() {
       const result=await api(`cases/${encodeURIComponent(selected.id)}/affected?${query}`);
       if(requestVersion!==selectionVersion.current)return;
       if(result.item?.id!==selected.id||result.item?.profile!==selected.profile)throw new Error("Case changed during recheck");
-      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots}:current);
+      if (result.item?.status==="resolved" && result.item?.result?.startsWith("resolved_deleted")) {
+        selectCase(undefined);
+        await refresh();
+        setMessage("Verified deletion cleanup completed; the alert is no longer open. A terminal receipt is retained.");
+        return;
+      }
+      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots,deletionCleanup:result.deletionCleanup}:current);
       setRepairSelection(current=>reconcileRepairSelection(result.item,result.snapshots,current));setLeftovers({});
       if(operationResumeEligibility(operation)==="fresh-preview") {
         const refreshedSelection=reconcileRepairSelection(result.item,result.snapshots,emptyRepairSelection(result.item));
@@ -604,10 +623,30 @@ function App() {
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
-        {details&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
+        {details&&!details.deletionCleanup?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
           item={details.item} snapshots={details.snapshots||[]} loading={busy}
           recheck={refreshAffected}/>}
-        <div className="preview">
+        {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
+          <h3>Verified recurring deletion</h3>
+          <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
+          <p>Task: <code>{details.deletionCleanup.taskIds.join(", ")}</code> · Calendar master: <code>{details.deletionCleanup.masterId}</code>
+            {details.deletionCleanup.activeInstanceId&&<> · Active instance: <code>{details.deletionCleanup.activeInstanceId}</code></>}</p>
+          <ol>
+            <li>Provider items deleted — verified by direct reads</li>
+            <li>DynamoDB mappings/recurrence links — {details.deletionCleanup.state==="stale_recurrence"?
+              "obsolete recurrence link still present":details.deletionCleanup.state==="mapping_blocked"?
+              "mapping/ownership needs investigation":"no task-keyed recurrence link remains"}</li>
+            <li>Pending decisions/guards — {selected.decision?.status==="pending"?"pending automatic retirement":"checking persisted state"}</li>
+            <li>Verified conflict closure — {selected.status==="resolved"?"complete":"awaiting guarded cleanup"}</li>
+          </ol>
+          {details.deletionCleanup.state==="stale_recurrence"&&<p className="warning">Calendar and Todoist are deleted, but an obsolete recurrence link remains; automatic cleanup required.
+            {details.deletionCleanup.staleLinks.map((link:any)=><span key={link.seriesId}> <code>{link.seriesId}</code> (active <code>{link.activeInstanceId||link.eventId}</code>)</span>)}</p>}
+          {details.deletionCleanup.reason&&<p className="warning">{details.deletionCleanup.reason}</p>}
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck deletion state (read-only)</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Retry guarded cleanup via reconciliation</button>
+          <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
+        </section>}
+        {!details?.deletionCleanup?.bothGone&&<div className="preview">
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
@@ -681,7 +720,7 @@ function App() {
           <p className="action-explanation">Run reconciliation scans the whole profile; it does not apply this one-case repair. Dismissing an alert hides the notification only and does not fix provider data or mappings.</p>
           {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
           {selected&&runViews[selected.profile]?.data&&<details><summary>Reconciliation status · {selected.profile}</summary><pre>{JSON.stringify(runViews[selected.profile].data,null,2)}</pre></details>}
-        </div>
+        </div>}
         {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p>{formFields.scope&&<p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p>}<h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={formFields.scope?validPreview.intent.scope:undefined} />{item.includedBy?.length>0&&<p className="relationship-reasons">Included because: {item.includedBy.join("; ")}</p>}<div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{operationResumeEligibility(operation)==="fresh-preview"?<><p>This failed operation has no recorded provider write. Refresh affected items and create a new preview; the old operation will remain available for audit.</p><button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh and create new preview</button></>:operationResumeEligibility(operation)==="resume"&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
