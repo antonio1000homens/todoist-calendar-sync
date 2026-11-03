@@ -182,7 +182,8 @@ export function classifyCalendarRule(rule: string, context: RecurrenceContext): 
   };
   return finish(semantic, context, fields.COUNT || fields.UNTIL ? "finite_provider_validation_required"
     : fields.FREQ === "YEARLY" && byDay ? "compound_rule_not_verified"
-      : byDay?.some((value) => value.length !== 2) ? "compound_rule_not_verified" : undefined);
+      : fields.FREQ === "MONTHLY" && byDay ? "compound_rule_not_verified"
+        : byDay?.some((value) => value.length !== 2) ? "compound_rule_not_verified" : undefined);
 }
 
 /** Parse precisely-known Todoist idioms; all other phrases retain the rolling path. */
@@ -267,7 +268,13 @@ export function occurrenceDates(rule: RecurrenceSemantics, limit = 12): string[]
       : (date.getUTCFullYear() - start.getUTCFullYear()) % rule.interval === 0;
     const weekday = dayCode(date);
     const matchesDay = rule.byDay?.length
-      ? rule.byDay.includes(weekday)
+      ? rule.byDay.some((entry) => {
+        if (entry.slice(-2) !== weekday) return false;
+        const ordinal = entry.slice(0, -2);
+        if (!ordinal) return true;
+        if (ordinal === "-1") return date.getUTCDate() + 7 > new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+        return Math.floor((date.getUTCDate() - 1) / 7) + 1 === Number(ordinal);
+      })
       : rule.frequency === "WEEKLY" ? weekday === dayCode(start) : true;
     const matchesMonth = rule.byMonth?.length ? rule.byMonth.includes(date.getUTCMonth() + 1)
       : rule.frequency === "YEARLY" ? date.getUTCMonth() + 1 === anchorMonth : true;
