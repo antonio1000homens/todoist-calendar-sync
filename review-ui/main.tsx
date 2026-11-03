@@ -169,9 +169,15 @@ function App() {
       return undefined;
     } catch(error:any) {
       if(!isAbortError(error)&&requestGate.current(ticket)){
-        setRunViews(current=>({...current,[forProfile]:{
-          status:"error",diagnostics:[],error:error.message,
-        }}));
+        setRunViews(current=>{
+          const previous=current[forProfile];
+          // A transient poll failure (including HTTP 429) must not erase a
+          // previously running generation: keep it visible and retry with
+          // backoff rather than silently stopping the polling effect.
+          if(options.quiet&&previous?.data)
+            return {...current,[forProfile]:{...previous,error:error.message}};
+          return {...current,[forProfile]:{status:"error",diagnostics:[],error:error.message}};
+        });
       }
       throw error;
     }
@@ -530,7 +536,7 @@ function App() {
       </React.Fragment>;
     })}
     <ErasurePanel api={api} />
-    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Manual reconciliation · single profile</h3>
           {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
             <option value="">Select a profile — no reconciliation requested</option>
