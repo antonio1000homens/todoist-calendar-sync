@@ -161,11 +161,16 @@ test("ingress grants only the DynamoDB table actions required by admission lease
   assert.doesNotMatch(tablePolicy, /\*/);
 });
 
-test("failed webhook admission returns a retryable non-2xx response without claiming acceptance", () => {
+test("only verified erased-item replay is acknowledged; all other enqueue failures stay retryable", () => {
   const enqueueCatch = handlerSource.match(/await enqueueDelivery\(delivery\);([\s\S]*?)log\("webhook_enqueued"/)?.[1] || "";
-  assert.match(enqueueCatch, /logError\("webhook_enqueue_failed"/);
-  assert.match(enqueueCatch, /return response\(503,\s*\{\s*error:\s*"enqueue_failed",\s*accepted:\s*false/);
-  assert.doesNotMatch(enqueueCatch, /response\(202/);
+  // A newly installed tombstone can appear after ingress but before SQS sends.
+  // Suppression is the sole acceptable 202 branch, because retrying a deleted
+  // item indefinitely would reintroduce identity-bearing webhook deliveries.
+  assert.match(enqueueCatch, /if\s*\(error instanceof ErasureReplayBlockedError\)\s*\{[\s\S]*?return response\(202,\s*\{\s*accepted:\s*true,\s*suppressed:\s*true/);
+  const fallback = enqueueCatch.split('logError("webhook_enqueue_failed"')[1];
+  assert.ok(fallback, "generic enqueue errors must be logged and handled separately");
+  assert.match(fallback, /return response\(503,\s*\{\s*error:\s*"enqueue_failed",\s*accepted:\s*false/);
+  assert.doesNotMatch(fallback, /response\(202/, "non-erasure failures must never be accepted");
 });
 
 test("state table uses budgeted 20/20 provisioned capacity, remains protected and worker can transact mappings", () => {

@@ -1,6 +1,7 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
 import { acquireProfileAdmissionLeaseWithEpoch, ErasureEpochChangedError } from "./erasure-protocol.js";
+import { assertReplayAdmission, ErasureReplayUnavailableError, replayAdmissionEnabled } from "./erasure-replay-barrier.js";
 import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
@@ -19,6 +20,12 @@ export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kin
 
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   const protocolEnabled = process.env.ERASURE_PROTOCOL_VERSION === "1";
+  const checkTodoistReplay = delivery.kind === "todoist" && replayAdmissionEnabled();
+  // A replay lookup outside an admission lease cannot serialize with a fence
+  // and must never be used to authorize an SQS write.
+  if (checkTodoistReplay && !protocolEnabled) {
+    throw new ErasureReplayUnavailableError("Todoist replay admission requires an enabled erasure protocol lease");
+  }
   let epoch: number | undefined;
   let release: (() => Promise<void>) | undefined;
   if (protocolEnabled) {
@@ -36,6 +43,18 @@ export async function enqueueDelivery(delivery: Delivery): Promise<void> {
     }
   }
   try {
+    if (checkTodoistReplay) {
+      let taskId: string | undefined;
+      try {
+        const payload = JSON.parse(delivery.body) as { event_data?: { id?: unknown } };
+        if (typeof payload.event_data?.id === "string" && payload.event_data.id)
+          taskId = payload.event_data.id;
+      } catch { /* Missing or invalid identity is denied below. */ }
+      if (!taskId) throw new ErasureReplayUnavailableError("Queued Todoist webhook has no verified task identity");
+      // This second, strongly consistent lookup MUST run after acquiring the
+      // admission lease. Keep the lease until SQS acknowledges the send.
+      await assertReplayAdmission({ profile: delivery.profile, taskId });
+    }
     const admittedDelivery = protocolEnabled
       ? { ...delivery, erasureEpoch: epoch }
       : delivery;

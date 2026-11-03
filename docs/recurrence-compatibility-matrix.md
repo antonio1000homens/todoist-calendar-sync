@@ -119,3 +119,27 @@ unproven Todoist anchor or completion rule.
 3. Record verified rollout/config policy; leave unsupported and unverified
    series on the existing rolling path. Do not treat this PR as completing all
    of parent issue #290.
+
+## Phase B synchronizer safety follow-up
+
+The normal Todoist webhook synchronizer now classifies potential new Phase B
+patterns **only for fields appended to existing audit events**. The
+`phaseBFamily`, `phaseBCandidateRrule`, `phaseBDisposition` and
+`phaseBReason` fields are observational: there is no new audit transaction,
+no additional provider/API read, and **no change to the Calendar event
+written for a new candidate**. Such tasks continue on the original rolling
+one-off mirror until provider evidence permits promotion.
+
+When an edit would replace an already-established Todoist-owned Calendar RRULE
+master with an unverified Phase B pattern, the webhook path instead retains
+the master, mapping and historical Calendar instances and records
+`todoist_phase_b_existing_series_requires_review`. This covers a lost
+DynamoDB mapping where the Google master still declares Todoist ownership.
+The changed recurrence **has not been applied**; the audit event is a
+diagnostic, *not* a newly created review-inbox case. A later approved
+future-only split/repair is required before applying that cadence change.
+
+Remaining: independently observed real-provider completion and instance
+readbacks, explicit approval/feature gate for native writes, idempotent
+mapping after Calendar POST/PUT and rollback/quarantine on failures. No
+production enabling or migration is implied by the safety follow-up.
