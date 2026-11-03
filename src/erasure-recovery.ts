@@ -214,6 +214,7 @@ export class ErasureRecoveryService {
   async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
     const inspection=await this.inspect(id);
     return {...assessPostWriteRecovery(inspection.operation,inspection.preview),
+      reviewEnabled:process.env.ERASURE_POSTWRITE_REVIEW_VERSION==="1",
       ...(inspection.operation.postwriteReview?.status==="reviewed_fenced"
         ?{reviewStatus:"reviewed_fenced" as const}:{})};
   }
