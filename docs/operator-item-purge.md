@@ -345,7 +345,7 @@ strong postflight snapshot, epoch and fenced worker state. Confirmation
 consumption is a conditional DynamoDB transaction, including the owned
 fence, epoch and journal, that persists only
 `postwriteReview.status=reviewed_fenced` and consumes a post-write-specific
-confirmation row. The expired token can be replaced before consumption;
+confirmation row. The operator identifier is removed when its token is consumed. The expired token can be replaced before consumption;
 a consumed token cannot be reissued or replayed.
 
 **Explicit rollout gate:** `ERASURE_POSTWRITE_REVIEW_VERSION` defaults to
