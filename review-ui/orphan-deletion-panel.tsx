@@ -33,8 +33,8 @@ export function OrphanDeletionPanel({item,snapshots,loading=false,recheck}:Orpha
     <label>Item to delete
       <select value={candidates.some(candidate=>candidate.key===key)?key:""} onChange={e=>change(e.target.value)}>
         <option value="">Choose exactly one Todoist or Calendar item from this alert</option>
-        {candidates.map(candidate=><option key={candidate.key} value={candidate.key}>
-          {candidate.label} · {candidate.status} · {candidate.eligible?"eligible":"blocked"}
+        {candidates.map(candidate=><option key={candidate.key} value={candidate.key} disabled={!candidate.eligible}>
+          {candidate.label} · {candidate.status} · {candidate.eligible?"eligible":`blocked: ${candidate.reason}`}
         </option>)}
       </select>
     </label>
@@ -45,6 +45,10 @@ export function OrphanDeletionPanel({item,snapshots,loading=false,recheck}:Orpha
       <p className="warning">{selected.reason}</p>
     </div>}
     {!eligible&&<p className="notice" role="status">No verified orphan item available for deletion. The current review cannot prove an exact safe one-sided deletion with a durable fence, cross-provider absence and replay suppression. Use the existing Link / Repair / Exclude / Dismiss options instead.</p>}
+    {candidates.length>0&&!candidates.some(candidate=>candidate.eligible)&&<div className="orphan-blockers">
+      <p>All case-recorded items are blocked. Reasons:</p>
+      <ul>{candidates.map(candidate=><li key={candidate.key}><strong>{candidate.label}</strong> — {candidate.reason}</li>)}</ul>
+    </div>}
     <button className="secondary" disabled={loading} onClick={()=>void recheck()}>
       {loading?"Rechecking…":"Recheck this alert's provider items (no changes)"}
     </button>
