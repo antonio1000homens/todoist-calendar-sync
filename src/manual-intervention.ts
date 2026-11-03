@@ -1094,6 +1094,40 @@ export class SlackManualNotifier {
     }
   }
 
+  async cancelLegacyConfirmation(channel: string | undefined, messageTs: string | undefined, decisionId: string): Promise<void> {
+    const text = `Confirmation cancelled for ${decisionId}. The decision remains pending; use /sync conflicts to reopen it.`;
+    if (!slackEnabled()) return;
+    if (channel && messageTs) {
+      await slackApi("chat.update", { channel, ts: messageTs, text, blocks: [] });
+      return;
+    }
+    await this.postText(text, channel);
+  }
+
+  async requestLegacyConfirmation(
+    profile: Profile,
+    channel: string | undefined,
+    messageTs: string | undefined,
+    decisionId: string,
+    action: string,
+  ): Promise<void> {
+    if (!channel || !messageTs) throw new Error("Legacy confirmation requires its original Slack message location");
+    const text = `Confirm sync action ${action} for ${decisionId}`;
+    if (!slackEnabled()) return;
+    await slackApi("chat.update", {
+      channel,
+      ts: messageTs,
+      text,
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `⚠️ *Confirm sync action*\n\`${action}\`\nDecision: \`${decisionId}\`` } },
+        { type: "actions", elements: [
+          { type: "button", action_id: "gcp_sync_decision_confirm", style: "danger", text: { type: "plain_text", text: "Confirm" }, value: JSON.stringify({ profile, decisionId, action, confirmed: true }) },
+          { type: "button", action_id: "gcp_sync_confirmation_cancel", text: { type: "plain_text", text: "Cancel" }, value: JSON.stringify({ profile, decisionId }) },
+        ] },
+      ],
+    });
+  }
+
   async reconciliationOutcome(channel: string | undefined, threadTs: string | undefined, text: string): Promise<string | undefined> {
     return this.postText(text, channel, threadTs);
   }
@@ -2667,6 +2701,24 @@ export class ManualInterventionService {
 
     if (manual.command) {
       const channel = manual.slackChannelId;
+      if (manual.command === "help") {
+        await this.notifier.postText(manual.message || "Use /sync status, reconcile, conflicts, inspect, resume, policies or policy.", channel);
+        return;
+      }
+      if (manual.command === "invalid_request") {
+        await this.notifier.postText("That /sync request or button is unsupported or incomplete. No sync changes were made; use /sync help for supported controls.", channel);
+        return;
+      }
+      if (manual.command === "confirm_legacy_action") {
+        if (!manual.targetId || !manual.action) throw new Error("Legacy confirmation requires decision ID and action");
+        await this.notifier.requestLegacyConfirmation(delivery.profile, channel, manual.slackMessageTs, manual.targetId, manual.action);
+        return;
+      }
+      if (manual.command === "cancel_confirmation") {
+        if (!manual.targetId) throw new Error("cancel_confirmation requires a decision ID");
+        await this.notifier.cancelLegacyConfirmation(channel, manual.slackMessageTs, manual.targetId);
+        return;
+      }
       if (manual.command === "reconcile_now" || manual.command === "resume_pending_reconciliation") {
         if (manual.slackUserId === "AUTO_POLICY") {
           await this.notifier.postText("Reconciliation requires an explicit request in Slack.", channel);

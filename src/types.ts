@@ -28,6 +28,10 @@ export function syncMessageGroupId(profile: Profile): string {
 }
 
 export type ManualCommand =
+  | "help"
+  | "invalid_request"
+  | "confirm_legacy_action"
+  | "cancel_confirmation"
   | "reconcile_now"
   | "show_status"
   | "list_conflicts"
@@ -57,7 +61,22 @@ export interface ManualControlDelivery {
   slackMessageTs?: string;
   slackThreadTs?: string;
   slackDecisionId?: string;
+  message?: string;
   policy?: ManualPolicyControl;
+}
+
+/** Versioned, secret-minimized event accepted only from the authenticated Slack ingress. */
+export interface SlackInteractionEnvelope {
+  schemaVersion: 1;
+  type: "slash_command" | "block_action";
+  userId: string;
+  command: "/sync";
+  commandText?: string;
+  actionId?: string;
+  value?: Record<string, unknown>;
+  channelId?: string;
+  messageTs?: string;
+  requestTimestamp: string;
 }
 
 export interface ReconciliationContinuation {
@@ -92,6 +111,7 @@ export interface Delivery {
     pendingRefreshRefs?: Array<{ profile:Profile; side:"todoist"|"calendar"; id:string; pendingRefreshAt:string }>;
   };
   manual?: ManualControlDelivery;
+  slackInteraction?: SlackInteractionEnvelope;
   repair?: { operationId:string };
   /** @deprecated Compatibility for any pre-deployment queued reconcile message. */
   reconcileProfiles?: readonly Profile[];
