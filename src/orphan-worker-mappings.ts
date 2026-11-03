@@ -49,7 +49,7 @@ export async function inspectOrphanWorkerMappings(
   const lambda=sources.lambda??new LambdaClient({});
   const config=await lambda.send(new GetFunctionConfigurationCommand({FunctionName:fn}));
   const timeout=config.Timeout;
-  if(!Number.isInteger(timeout)||timeout===undefined||timeout<1||timeout>900)
+  if(typeof timeout!=="number"||!Number.isInteger(timeout)||timeout<1||timeout>900)
     blockers.push("Target worker timeout is unavailable or invalid");
   if(config.State!=="Active"||config.LastUpdateStatus!=="Successful")
     blockers.push("Target worker is not active with a completed configuration update");
