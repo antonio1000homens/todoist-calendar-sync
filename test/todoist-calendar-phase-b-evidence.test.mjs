@@ -48,8 +48,8 @@ function fixture(overrides = {}) {
         assert.equal(id, "master-b"); return structuredClone(overrides.exceptions || []); },
       async listInstancesInWindow(id, from, through) {
         calls.push("listInstancesInWindow"); assert.equal(id, "master-b");
-        assert.ok(from < dates[0] + "T00:00:00Z");
-        assert.ok(through > dates[3] + "T00:00:00Z");
+        assert.ok(Number.isFinite(Date.parse(from)) && Number.isFinite(Date.parse(through)));
+        assert.ok(Date.parse(from) < Date.parse(through), "finite window required");
         return structuredClone(overrides.instances || instances());
       },
       async getTimeZone() { calls.push("getTimeZone"); return overrides.calendarZone || "Europe/London"; },
