@@ -1,7 +1,7 @@
 /**
  * #307: independently observe ALL profile Calendar task links before a future
  * post-write release verifier is constructed. This is NOT a complete alias
- * manifest and MUST NOT be given to atomicReplayRelease().
+ * manifest and MUST NOT be passed to any fence-release transaction.
  *
  * Unknown historical mapping/comment provenance, untagged series and full
  * provider-deletion confirmation are deliberately left as blockers.
