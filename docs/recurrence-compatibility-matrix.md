@@ -75,3 +75,47 @@ Provider documentation:
 - [Todoist recurring dates](https://www.todoist.com/help/todoist/features/introduction-to-recurring-dates-YUYVJJAV)
 - [Google Calendar events and recurrence](https://developers.google.com/workspace/calendar/api/concepts/events-calendars)
 - [RFC 5545 recurrence rules](https://www.rfc-editor.org/rfc/rfc5545#section-3.3.10)
+
+
+## Phase B implementation: guarded Todoist → Calendar evidence (#290)
+
+The optional module `src/todoist-calendar-phase-b.ts` proposes exact
+`BYMONTHDAY` lists, anchored `INTERVAL=2;BYDAY` alternating weekdays
+and quarterly `INTERVAL=3` candidates. These are **read-only candidates** by
+default; `todoistPhaseBCandidate()` always reports a rolling outcome, even
+when the syntax parses. No existing user recurrence is bulk-migrated.
+
+`verifyTodoistPhaseBReadback()` can return `native_exact` only after the
+caller supplies all of the following independently observed evidence:
+
+- Original recurrence DTSTART/phase from verified provider/history records,
+  not merely the current Todoist due date or today's date. Todoist's
+  `every other Friday` can begin on the *second* upcoming Friday.
+- Normalised Todoist task readbacks immediately before and after an actual
+  completion, proving a single unchanged task ID and the expected next date.
+  This conservative verifier rejects overdue-skipped progressions pending a
+  separately tested policy.
+- Confirmed Google Calendar master with stable identity and ETag, exact
+  persisted RRULE and DTSTART, matching ownership metadata, plus at least
+  three consecutive independently fetched, unchanged instances.
+- Complete relevant exception inventory; cancellations, moved instances,
+  missing/truncated instances, ambiguous timezones and DST shifts fail closed.
+  Timed recurrences additionally require provider-confirmed IANA timezone.
+
+A successful Calendar HTTP write alone is insufficient; neither a generated
+RRULE nor a string-level match counts as provider readback. The production
+synchronizer does **not** call the verifier yet: opt-in integration must await
+real provider fixtures in an isolated test scope and a guarded fallback or
+rollback plan. This deliberately avoids enabling a new native series with an
+unproven Todoist anchor or completion rule.
+
+### Phase B provider acceptance remaining
+
+1. Run isolated Todoist and Google Calendar integration fixtures for each
+   candidate family, including overdue completion, month 29/30/31, BST/DST,
+   all-day versus timed, repeated delivery and cross-profile ownership.
+2. Wire verified candidate creation/readback into the synchronizer with
+   idempotent matching, no history rewrite and recovery on provider failures.
+3. Record verified rollout/config policy; leave unsupported and unverified
+   series on the existing rolling path. Do not treat this PR as completing all
+   of parent issue #290.
