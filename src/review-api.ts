@@ -5,6 +5,7 @@ import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { assessOrphanReadiness } from "./orphan-readiness.js";
+import { OrphanApprovalService } from "./orphan-approval.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
@@ -176,6 +177,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   enqueueErasureRecovery?: typeof enqueueErasureRecovery;
   acquireWriteLease?: (selectedProfile:Profile,owner:string)=>Promise<()=>Promise<void>>;
   createReviewStore?:()=>ReviewStore;
+  createOrphanApprovalService?:(store:ReviewStore)=>OrphanApprovalService;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
   createStateRepository?:()=>StateRepository;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
@@ -206,6 +208,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       fail(410, "Unscoped item erasure is retired from review. Use the selected alert's verified-orphan workflow; existing operation status and recovery remain available.");
     }
     const store = dependencies.createReviewStore?.() || new ReviewStore();
+    const orphanApproval = () => dependencies.createOrphanApprovalService?.(store)
+      || new OrphanApprovalService({cases:store});
     const reviewEngine=dependencies.createReviewEngine?.(store) || new ReviewEngine(store);
     const enqueueRepairFn=dependencies.enqueueRepair || enqueueRepair;
     const admissionOwner=randomUUID();
@@ -435,6 +439,45 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         fail(503,"A direct provider or ownership lookup failed; orphan readiness cannot be established");
       }
       return response(200,{readiness:assessOrphanReadiness(item,snapshots)});
+    }
+    // #287: isolated, selected-alert approval path. No provider DELETE, worker
+    // dispatch or deletion-capable token is exposed by either POST endpoint.
+    // Confirmation is separately default-deny until the full worker/replay
+    // barrier integration has passed destructive acceptance.
+    if (segments[0] === "cases" && segments.length === 3
+      && ["orphan-previews","orphan-confirmations"].includes(segments[2]) && method === "POST") {
+      if(Object.keys(event.queryStringParameters || {}).length)
+        fail(400,"Orphan approval does not accept query parameters");
+      const item=await store.getCase(segments[1]);
+      if(!item)return response(404,{error:"conflict_not_found"});
+      requireAdmissionProfile(item.profile);
+      if(segments[2]==="orphan-previews") {
+        if(Object.keys(body||{}).sort().join(",")!=="id,side"
+          || !["todoist","calendar"].includes(String(body?.side))
+          || typeof body?.id!=="string")
+          fail(400,"Preview requires exactly one recorded provider side and ID");
+        const preview=await orphanApproval().issue(item.id,body!.side as Side,body!.id as string,actor);
+        return response(200,{preview});
+      }
+      if(Object.keys(body||{}).sort().join(",")!=="confirmationId,exactId,phrase,previewId"
+        || ["confirmationId","exactId","phrase","previewId"].some(key=>typeof body?.[key]!=="string"))
+        fail(400,"Confirmation requires the exact preview, nonce, ID and typed phrase");
+      if(process.env.ORPHAN_APPROVAL_CONFIRMATION_ENABLED!=="true")
+        fail(409,"Orphan confirmation recording is disabled until production safety integration has passed review");
+      const operation=await orphanApproval().confirm(item.id,{
+        previewId:body!.previewId as string,confirmationId:body!.confirmationId as string,
+        exactId:body!.exactId as string,phrase:body!.phrase as string,
+      },actor);
+      return response(201,{operation});
+    }
+    // Operator-scoped, read-only status for a confirmed but un-dispatched
+    // operation. An operation ID from another case is never sufficient.
+    if (segments[0]==="cases" && segments[2]==="orphan-operations"
+      && segments.length===4 && method==="GET") {
+      if(Object.keys(event.queryStringParameters || {}).length)
+        fail(400,"Orphan operation status accepts no query parameters");
+      const operation=await orphanApproval().status(segments[1],segments[3],actor);
+      return response(200,{operation});
     }
     if (method === "GET" && segments[0] === "cases" && segments.length === 2) {
       const item = await store.getCase(segments[1]);
