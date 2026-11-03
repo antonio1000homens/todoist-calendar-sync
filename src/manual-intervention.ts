@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
 import {
   GetCommand,
   PutCommand,
@@ -2403,7 +2404,7 @@ export class ManualInterventionService {
   private async restoreTodoistFromEvent(decision: ManualDecision, mapping: Mapping, state: StateRepository): Promise<void> {
     const pair = await this.providerClients(decision.profile);
     const event = await pair.calendar.getEvent(mapping.eventId);
-    const task = await pair.todoist.upsertTask(toTodoistTask(event));
+    const task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     await state.deleteMapping(mapping);
     const next: Mapping = { ...mapping, taskId: task.id, updatedAt: isoNow() };
     await state.putMapping(next);
@@ -2553,7 +2554,7 @@ export class ManualInterventionService {
           })
           .sort((a, b) => String(eventStart(a)).localeCompare(String(eventStart(b))))[0];
         if (next) {
-          const nextTask = await pair.todoist.upsertTask(toTodoistTask(next));
+          const nextTask = await pair.todoist.upsertTask(toTodoistTask(next), undefined, calendarReplaySourceIds(next));
           const nextMapping: Mapping = {
             ...mapping,
             eventId: next.id,
@@ -2597,7 +2598,7 @@ export class ManualInterventionService {
       if (!hasCanonicalState(event, task)) return this.markStale(decision, "The selected Todoist task no longer matches the Calendar event.", slackUserId);
       if (await state.getMappingByTaskAnyProfile(taskId)) return this.markStale(decision, "The selected Todoist task is now owned by another mapping.", slackUserId);
     } else if (action === "create_new_task") {
-      task = await pair.todoist.upsertTask(toTodoistTask(event));
+      task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     } else {
       throw new Error(`Unsupported snapshot conflict action ${action}`);
     }
@@ -2643,7 +2644,7 @@ export class ManualInterventionService {
       if (task) {
         await pair.todoist.upsertTask(toTodoistTask(event), task.id);
       } else {
-        const recreated = await pair.todoist.upsertTask(toTodoistTask(event));
+        const recreated = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
         await state.deleteMapping(mapping);
         await state.putMapping({ ...mapping, taskId: recreated.id, updatedAt: isoNow() });
       }
