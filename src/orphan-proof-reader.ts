@@ -106,6 +106,8 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   const otherRows=wellFormed?data.stateRows.filter(row=>refers(row,op.targetId) &&
     row.pk!=="REVIEW_CASE#"+op.caseId && row.pk!=="MANUAL#"+op.caseId &&
     row.pk!=="ORPHAN_DELETE#"+op.id &&
+    !(row.pk==="ORPHAN_CASE_LOCK#"+op.caseId && row.operationId===op.id
+      && row.profile===op.profile && row.targetId===op.targetId) &&
     !(String(row.pk).startsWith("AUDIT#") && row.pk===item?.sourceAuditKey) &&
     !(String(row.pk).startsWith("REVIEW_CONFLICT#") && row.incidentId===op.caseId) &&
     !String(row.pk).startsWith("RECONCILE#")):[];
