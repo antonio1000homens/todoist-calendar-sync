@@ -227,6 +227,20 @@ test("review API requires a valid owner Access JWT and same-origin mutations", a
   assert.equal(inbox.status,200);
   assert.deepEqual(inbox.body.items.map(item=>item.id),["case-1"]);
 
+  // A logged-in operator may inspect read-only orphan blockers, but cannot
+  // submit arbitrary IDs or obtain deletion authority from this endpoint.
+  const orphanReadiness=await jsonResponse(await handler(event("/review/api/cases/case-1/orphan-readiness","GET",headers)));
+  assert.equal(orphanReadiness.status,200,JSON.stringify(orphanReadiness.body));
+  assert.equal(orphanReadiness.body.readiness.caseId,"case-1");
+  assert.equal(orphanReadiness.body.readiness.profile,"home");
+  assert.equal(orphanReadiness.body.readiness.canExecute,false);
+  assert.equal(orphanReadiness.body.readiness.status,"blocked");
+  const invalidOrphanQuery=await jsonResponse(await handler(event("/review/api/cases/case-1/orphan-readiness?taskId=another-task","GET",headers)));
+  assert.equal(invalidOrphanQuery.status,400,"the diagnostic must use immutable case IDs, not operator-chosen IDs");
+  assert.equal(persistedPreviews.length,0);
+  assert.equal(caseUpdates.length,0);
+  assert.equal(queueCalls.length,0);
+
   // A no-action recheck uses GET with the selected exact provider IDs. It
   // must never synthesize a mutation or require a repair action.
   const readOnly=await jsonResponse(await handler(event("/review/api/cases/case-1/affected?taskId=task-1&eventId=occurrence","GET",headers)));
