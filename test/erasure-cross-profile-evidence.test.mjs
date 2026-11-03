@@ -60,7 +60,12 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
           async listAllProjectCommentsForErasureAudit(){return {
             projects:[{id:`project-${profile}`}],comments,
           };},
-          async listTaskComments(id){return id===taskTwo?[{id:"legacy-comment",content:"todoist-calendar-sync\ncalendarEventId=legacy-event"}]:[];},
+          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date().toISOString(),comments:profile==="work"?[{
+            id:"legacy-comment",task_id:taskTwo,content:"todoist-calendar-sync\ncalendarEventId=legacy-event",
+          }]:[]};},
+          async listTaskComments(id){return profile==="work"&&id===taskTwo?[{
+            id:"legacy-comment",content:"todoist-calendar-sync\ncalendarEventId=legacy-event",
+          }]:[];},
         },
       };
     },
@@ -78,6 +83,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.equal(report.profiles.home.recurrenceInstances,1);
   assert.equal(report.profiles.antonio.relatedProjectComments,1);
   assert.ok(report.profiles.work.relatedLegacyComments>0);
+  assert.ok(report.profiles.work.taskCommentInventoryMatches>0);
   assert.ok(report.stateScan.stronglyConsistent&&report.stateScan.allPagesReceived);
   assert.ok(report.stateScan.relatedRowCount>=2);
   assert.ok(report.missingProof.some(reason=>reason.includes("404/410")));
@@ -108,6 +114,22 @@ test("profile read failures and bounded identity overflow fail closed",async()=>
   assert.equal(overflow.closureComplete,false);
   assert.ok(overflow.identities.overflowCount>0);
   assert.ok(overflow.missingProof.some(reason=>reason.includes("bounded observer capacity")));
+});
+
+test("stale Todoist task-comment full-sync snapshots cannot establish absence",async()=>{
+  const reader=async()=>({
+    calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
+      async getEvent(){throw missing();},async listEventInstances(){return[];}},
+    todoist:{async listAllTasksForErasureAudit(){return[{id:taskOne,content:"task"}];},
+      async getTask(id){return{id,content:"task"};},async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],fullSyncDateUtc:new Date(Date.now()-6*60_000).toISOString()};},
+      async listTaskComments(){return[];}},
+  });
+  const report=await observeCrossProfileErasureEvidence({taskId:taskOne,rows:[],fullRows:[],readerForProfile:reader});
+  assert.equal(report.profiles.home.taskCommentInventoryComplete,true);
+  assert.equal(report.profiles.home.taskCommentInventoryFresh,false);
+  assert.equal(report.knownIdentitiesAbsentFromCurrentProviders,false);
+  assert.ok(report.missingProof.some(reason=>reason.includes("older than five minutes")));
 });
 
 test("Google audit inventory covers every page without time or task filters and closes recurring instances",async()=>{
@@ -232,6 +254,36 @@ test("Todoist all-task inventory is unfiltered, paginated and rejects cursor loo
     assert.equal(calls[0].searchParams.has("project_id"),false);
     assert.equal(calls[1].searchParams.get("cursor"),"page-two");
   } finally { globalThis.fetch=previous; }
+});
+
+test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rejects partial sync",async()=>{
+  const previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async(raw,init)=>{
+    const url=new URL(String(raw));calls.push({url,init});
+    return new Response(JSON.stringify({full_sync:true,sync_token:"opaque-sync-token",
+      full_sync_date_utc:new Date().toISOString(),notes:[
+      {id:"note-one",item_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
+      {id:"note-two",item_id:"task-two",content:"old mapping",is_deleted:true},
+    ]}));
+  };
+  try {
+    const todoist=new Todoist("test-token");
+    const audit=await todoist.listAllTaskCommentsForErasureAudit();
+    assert.deepEqual(audit.comments,[
+      {id:"note-one",task_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
+      {id:"note-two",task_id:"task-two",content:"old mapping",is_deleted:true},
+    ]);
+    assert.ok(Number.isFinite(Date.parse(audit.fullSyncDateUtc)));
+    assert.equal(calls[0].url.pathname,"/api/v1/sync");
+    assert.equal(calls[0].init.method,"POST");
+    const body=new URLSearchParams(calls[0].init.body);
+    assert.equal(body.get("sync_token"),"*");
+    assert.equal(body.get("resource_types"),'["notes"]');
+
+    globalThis.fetch=async()=>new Response(JSON.stringify({full_sync:false,sync_token:"partial",
+      full_sync_date_utc:new Date().toISOString(),notes:[]}));
+    await assert.rejects(todoist.listAllTaskCommentsForErasureAudit(),/full sync was incomplete/);
+  } finally {globalThis.fetch=previous;}
 });
 
 test("full Calendar inventory rejects repeated page tokens",async()=>{

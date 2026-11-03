@@ -542,6 +542,50 @@ export class Todoist {
     return this.readTasks(undefined);
   }
 
+  /** Complete read-only task-comment inventory from Todoist's full Sync snapshot. */
+  async listAllTaskCommentsForErasureAudit(): Promise<{
+    comments:TodoistCommentRecord[];fullSyncDateUtc:string;
+  }> {
+    const headers=new Headers({authorization:`Bearer ${this.token}`});
+    headers.set("content-type","application/x-www-form-urlencoded");
+    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["notes"])});
+    let snapshot: {full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown};
+    for(let attempt=0;;attempt++) {
+      try {
+        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown}>(
+          await fetch(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body}));
+        break;
+      } catch(error) {
+        const status=Number((error as {status?:number}).status);
+        const transient=!status||status===408||status===429||status>=500;
+        if(!transient||attempt>=2)throw error;
+        await new Promise(resolve=>setTimeout(resolve,attempt===0?250:750));
+      }
+    }
+    if(snapshot.full_sync!==true||typeof snapshot.sync_token!=="string"||!snapshot.sync_token
+      ||!Array.isArray(snapshot.notes)||typeof snapshot.full_sync_date_utc!=="string"
+      ||!Number.isFinite(Date.parse(snapshot.full_sync_date_utc)))
+      throw new Error("Todoist task-comment full sync was incomplete");
+    const comments=new Map<string,TodoistCommentRecord>();
+    for(const value of snapshot.notes) {
+      if(!value||typeof value!=="object")throw new Error("Todoist task-comment full sync returned an invalid note");
+      const note=value as Record<string,unknown>;
+      if(typeof note.id!=="string"||!note.id||typeof note.item_id!=="string"||!note.item_id
+        ||typeof note.content!=="string"||(note.is_deleted!==undefined&&typeof note.is_deleted!=="boolean"))
+        throw new Error("Todoist task-comment full sync returned an unidentified note");
+      const comment:TodoistCommentRecord={id:note.id,task_id:note.item_id,content:note.content,
+        ...(note.is_deleted===undefined?{}:{is_deleted:note.is_deleted}),
+        ...(typeof note.posted_at==="string"?{posted_at:note.posted_at}:{})};
+      const previous=comments.get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist task comment changed within its full sync snapshot");
+      comments.set(comment.id,comment);
+      if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
+        throw new Error("Todoist task-comment full sync exceeded the audit result limit");
+    }
+    return {comments:[...comments.values()],fullSyncDateUtc:snapshot.full_sync_date_utc};
+  }
+
   private async readTasks(projectId?:string): Promise<TodoistTask[]> {
     const tasks=new Map<string,TodoistTask>();
     const seenCursors=new Set<string>();

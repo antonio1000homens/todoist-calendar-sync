@@ -242,8 +242,12 @@ The post-write inspection now also calls
 strongly consistent, fully paginated DynamoDB scan and independently reads all
 three profiles' comments from every active project, archived personal project
 and archived workspace project, active Todoist task inventory, full unfiltered
-Calendar event inventory, tagged event lookup, exact candidate events and
-recurring instances. Project and comment pages are bounded and strictly
+Calendar event inventory, a full Todoist Sync `notes` snapshot for task
+comments, tagged event lookup, exact candidate events and recurring instances.
+The task-comment snapshot must report `full_sync:true`, a sync token and a
+parseable `full_sync_date_utc`; snapshots older than five minutes do not prove
+current absence. Comments for known task IDs are also read directly and
+compared with the snapshot. Project and comment pages are bounded and strictly
 validated; an inaccessible workspace archive refuses the inventory. The report
 binds a fingerprint of the full project ID/workspace inventory without returning
 those IDs. It follows identity fields from mapping,
@@ -252,8 +256,9 @@ dates. DynamoDB, Calendar, task and comment pagination reject repeated cursors,
 invalid identities and conflicting duplicate snapshots. The inspection binds
 the read-only evidence fingerprint into its fresh inspection fingerprint.
 Todoist's [Get Comments endpoint](https://developer.todoist.com/api/v1/)
-requires exactly one project or task ID, so completeness depends on first
-enumerating active and archived projects for each profile.
+requires exactly one project or task ID. The [Sync API full read](https://developer.todoist.com/api/v1/)
+also returns `notes` (task comments), which this audit uses to discover comments
+on tasks whose IDs were not known before the read.
 
 The report returns counts and SHA-256 fingerprints only, with no task/event
 IDs, titles, descriptions or comment bodies. A `knownIdentitiesAbsentFromCurrentProviders`
@@ -275,16 +280,17 @@ independent gates.
 **No deployed worker/API imports this observation as authorisation.** A
 future privileged verifier must reconcile these observations with fully
 paginated strong DynamoDB state, every accessible project comment and task
-comments for discovered task identities, direct Todoist and Calendar
+comments from a recent full Sync read plus direct reads for discovered task
+identities, direct Todoist and Calendar
 item/master/instance reads in every profile, old versions and new independent
 operator confirmation before calling
 `atomicReplayRelease()`. Any missing provenance keeps the fence in place.
 
 Calendar inventory currently reads each profile's configured sync calendar,
 not every calendar the profile can access. Aliases in other calendars remain
-unqueried. Todoist v1 also does not offer a global task-comment listing
-endpoint: task comments require a known task ID. Therefore comments on
-unrelated or otherwise unknown tasks are not enumerated by this observer.
+unqueried. Todoist's full Sync `notes` snapshot is generated separately from
+the project, task and DynamoDB reads, and large accounts may receive a delayed
+full-sync timestamp. Direct ETag and action-time checks are still required.
 These limitations prevent the observation from establishing complete
 cross-profile absence.
 

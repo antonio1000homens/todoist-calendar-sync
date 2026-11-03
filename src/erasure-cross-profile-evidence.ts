@@ -21,6 +21,7 @@ type ProviderPair={
     listAllProjectCommentsForErasureAudit():Promise<{
       projects:Array<{id:string;workspaceId?:number}>;comments:TodoistCommentRecord[];
     }>;
+    listAllTaskCommentsForErasureAudit?():Promise<{comments:TodoistCommentRecord[];fullSyncDateUtc:string}>;
     listTaskComments(taskId:string):Promise<TodoistCommentRecord[]>;
   };
 };
@@ -51,6 +52,9 @@ export interface CrossProfileErasureEvidence {
     eventReadConflicts:number;eventsMissingEtag:number;
     projectInventoryCount:number;projectInventoryFingerprint:string;
     projectCommentsRead:number;relatedProjectComments:number;taskCommentsRead:number;relatedLegacyComments:number;
+    taskCommentInventoryCount:number;taskCommentInventoryMatches:number;taskCommentInventoryFingerprint:string;
+    taskCommentInventoryComplete:boolean;taskCommentInventoryFresh:boolean;
+    taskCommentInventorySnapshotAt:string|null;taskCommentReadConflicts:number;
     calendarInventoryFingerprint:string;commentInventoryFingerprint:string;
     taskInventoryFingerprint:string;
     evidenceFingerprint:string;
@@ -139,6 +143,9 @@ export async function observeCrossProfileErasureEvidence(input:{
   const projectInventoryCounts={} as Record<Profile,number>;
   const projectInventoryFingerprints={} as Record<Profile,string>;
   const taskInventories={} as Record<Profile,Map<string,TodoistTask>>;
+  const taskCommentInventories={} as Record<Profile,Map<string,TodoistCommentRecord>>;
+  const taskCommentInventoryComplete={} as Record<Profile,boolean>;
+  const taskCommentInventorySnapshotAt={} as Record<Profile,string|null>;
   const calendarById={} as Record<Profile,Map<string,CalendarEvent>>;
   const calendarByTask={} as Record<Profile,Map<string,CalendarEvent[]>>;
   const calendarByParent={} as Record<Profile,Map<string,CalendarEvent[]>>;
@@ -157,12 +164,15 @@ export async function observeCrossProfileErasureEvidence(input:{
   let provider404s=0,passes=0;
   const malformedComments=new Set<string>();
   const taskReadConflicts=new Set<string>(),eventReadConflicts=new Set<string>(),missingEtags=new Set<string>();
+  const taskCommentReadConflicts=new Set<string>();
   for(const profile of PROFILES) {
     profileReaders[profile]=await input.readerForProfile(profile);
-    const [projectAudit,events,tasks]=await Promise.all([
+    const taskCommentAudit=profileReaders[profile].todoist.listAllTaskCommentsForErasureAudit;
+    const [projectAudit,events,tasks,taskComments]=await Promise.all([
       profileReaders[profile].todoist.listAllProjectCommentsForErasureAudit(),
       profileReaders[profile].calendar.listAllEventsForErasureAudit(),
       profileReaders[profile].todoist.listAllTasksForErasureAudit(),
+      taskCommentAudit?taskCommentAudit.call(profileReaders[profile].todoist):Promise.resolve(undefined),
     ]);
     if(!projectAudit||!Array.isArray(projectAudit.projects)||!Array.isArray(projectAudit.comments))
       throw new Error("Todoist project/comment audit returned an invalid inventory");
@@ -183,6 +193,19 @@ export async function observeCrossProfileErasureEvidence(input:{
         throw new Error("Todoist task changed during audit inventory");
       taskInventories[profile].set(task.id,task);
     }
+    taskCommentInventories[profile]=new Map();
+    const taskCommentRows=taskComments?.comments;
+    taskCommentInventorySnapshotAt[profile]=typeof taskComments?.fullSyncDateUtc==="string"
+      &&Number.isFinite(Date.parse(taskComments.fullSyncDateUtc))?taskComments.fullSyncDateUtc:null;
+    taskCommentInventoryComplete[profile]=Array.isArray(taskCommentRows)&&taskCommentInventorySnapshotAt[profile]!==null;
+    for(const comment of taskCommentRows||[]) {
+      if(!comment||!validId(comment.id)||!validId(comment.task_id)||typeof comment.content!=="string")
+        throw new Error("Todoist full task-comment inventory contains an invalid note");
+      const previous=taskCommentInventories[profile].get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist task comment changed during full inventory");
+      taskCommentInventories[profile].set(comment.id,comment);
+    }
     calendarById[profile]=new Map();calendarByTask[profile]=new Map();
     calendarByParent[profile]=new Map();calendarByHistoryMaster[profile]=new Map();calendarBySeries[profile]=new Map();
     inventoryMatchedIds[profile]=new Set<string>();
@@ -201,6 +224,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     projectIndexes[profile]=buildProjectMappingIndex(projects[profile]);
     commentInventoryDigests[profile]=new Set(projects[profile].map(comment=>
       "project:"+fingerprint([comment.id,comment.content||""])));
+    for(const comment of taskCommentInventories[profile].values())commentInventoryDigests[profile].add(
+      "task:"+fingerprint([comment.id,comment.task_id,comment.content||"",comment.is_deleted===true]));
     stats[profile]={taskReadsFound:0,task404Responses:0,tagQueries:0,taggedEvents:0,
       todoistTaskInventoryCount:taskInventories[profile].size,taskInventoryMatches:0,taskReadConflicts:0,
       directEventReadsFound:0,event404Responses:0,recurringMasters:0,recurrenceInstances:0,
@@ -210,6 +235,13 @@ export async function observeCrossProfileErasureEvidence(input:{
       projectInventoryFingerprint:projectInventoryFingerprints[profile],
       projectCommentsRead:projects[profile].length,relatedProjectComments:0,
       taskCommentsRead:0,relatedLegacyComments:0,calendarInventoryFingerprint:"",
+      taskCommentInventoryCount:taskCommentInventories[profile].size,taskCommentInventoryMatches:0,
+      taskCommentInventoryComplete:taskCommentInventoryComplete[profile],
+      taskCommentInventoryFresh:false,
+      taskCommentInventorySnapshotAt:taskCommentInventorySnapshotAt[profile],
+      taskCommentInventoryFingerprint:fingerprint([...taskCommentInventories[profile].values()]
+        .map(comment=>[comment.id,comment.task_id,fingerprint([comment.content||"",comment.is_deleted===true])])
+        .sort(([left],[right])=>String(left).localeCompare(String(right)))),taskCommentReadConflicts:0,
       commentInventoryFingerprint:"",taskInventoryFingerprint:"",evidenceFingerprint:""};
     matchedComments.set(profile,new Set<string>());
   }
@@ -246,6 +278,20 @@ export async function observeCrossProfileErasureEvidence(input:{
         const marker="malformed:"+item.comment.id+":"+fingerprint(item.comment.content||"");
         malformedComments.add(profile+"/"+marker);
         matched.add(marker);
+      }
+      for(const comment of taskCommentInventories[profile].values()) {
+        const content=String(comment.content||"");
+        if(!taskIds.has(comment.task_id||"")&&!([...taskIds,...eventIds].some(id=>content.includes(id))))continue;
+        const marker="task:"+comment.id+":"+fingerprint(content);
+        matched.add(marker);
+        if(add(taskIds,comment.task_id))changed=true;
+        if(LEGACY_TASK_COMMENT_MARKERS.has(content.split(/\r?\n/)[0]||"")) {
+          const ids=commentEventIds(comment);
+          if(ids.length===0)malformedComments.add(profile+"/task-malformed/"+marker);
+          for(const eventId of ids)if(add(eventIds,eventId))changed=true;
+        } else if([...taskIds,...eventIds].some(id=>content.includes(id))) {
+          unparsedTaskComments.add(profile+"/task-unparsed/"+marker);
+        }
       }
     }
     for(const profile of PROFILES)for(const taskId of taskIds) {
@@ -313,6 +359,15 @@ export async function observeCrossProfileErasureEvidence(input:{
               matched.add(marker);unparsedTaskComments.add(profile+"/"+marker);
             }
           }
+          if(taskCommentInventoryComplete[profile]) {
+            const snapshot=[...taskCommentInventories[profile].values()].filter(comment=>comment.task_id===taskId&&!comment.is_deleted);
+            const direct=new Map(comments.map(comment=>[comment.id,comment]));
+            if(snapshot.some(comment=>direct.get(comment.id)?.content!==comment.content)
+              ||comments.some(comment=>taskCommentInventories[profile].get(comment.id)?.task_id!==taskId
+                ||taskCommentInventories[profile].get(comment.id)?.content!==comment.content))
+              taskCommentReadConflicts.add(taskKey);
+            stats[profile].taskCommentInventoryMatches+=snapshot.length;
+          }
         }
         const tagKey=profile+"/"+taskId;
         if(!processedTags.has(tagKey)) {
@@ -377,12 +432,18 @@ export async function observeCrossProfileErasureEvidence(input:{
   const tableFingerprint=fingerprint(input.fullRows.map(row=>({key:[row.pk,row.sk],digest:fingerprint(row)}))
     .sort((a,b)=>JSON.stringify(a.key).localeCompare(JSON.stringify(b.key))));
   const aliases={tasks:[...taskIds].sort(),events:[...eventIds].sort(),series:[...seriesIds].sort()};
+  const now=Date.now();
   for(const profile of PROFILES) {
     const comments=[...matchedComments.get(profile)!].sort();
     stats[profile].relatedProjectComments=comments.filter(value=>value.startsWith("project:")||value.startsWith("malformed:")).length;
     stats[profile].relatedLegacyComments=comments.filter(value=>value.startsWith("task:")).length;
     stats[profile].taskInventoryMatches=taskInventoryMatchIds[profile].size;
     stats[profile].taskReadConflicts=[...taskReadConflicts].filter(key=>key.startsWith(profile+"/")).length;
+    stats[profile].taskCommentReadConflicts=[...taskCommentReadConflicts].filter(key=>key.startsWith(profile+"/")).length;
+    const snapshotAt=taskCommentInventorySnapshotAt[profile];
+    const snapshotAge=snapshotAt===null?Infinity:now-Date.parse(snapshotAt);
+    stats[profile].taskCommentInventoryFresh=taskCommentInventoryComplete[profile]
+      &&snapshotAge<=5*60_000&&snapshotAge>=-60_000;
     stats[profile].eventReadConflicts=[...eventReadConflicts].filter(key=>key.startsWith(profile+"/")).length;
     stats[profile].eventsMissingEtag=[...missingEtags].filter(key=>key.startsWith(profile+"/")).length;
     stats[profile].calendarInventoryEvents=calendarById[profile].size;
@@ -408,19 +469,29 @@ export async function observeCrossProfileErasureEvidence(input:{
       todoistTaskInventoryCount:stats[profile].todoistTaskInventoryCount,
       taskInventoryMatches:stats[profile].taskInventoryMatches,
       taskInventoryFingerprint:stats[profile].taskInventoryFingerprint,
+      taskCommentInventoryCount:stats[profile].taskCommentInventoryCount,
+      taskCommentInventoryMatches:stats[profile].taskCommentInventoryMatches,
+      taskCommentInventoryFingerprint:stats[profile].taskCommentInventoryFingerprint,
+      taskCommentInventoryComplete:stats[profile].taskCommentInventoryComplete,
+      taskCommentInventoryFresh:stats[profile].taskCommentInventoryFresh,
+      taskCommentInventorySnapshotAt:stats[profile].taskCommentInventorySnapshotAt,
+      taskCommentReadConflicts:stats[profile].taskCommentReadConflicts,
     });
   }
   const closureComplete=!changed&&passes<=MAX_PASSES&&overflow.count===0
-    &&taskReadConflicts.size===0&&eventReadConflicts.size===0&&missingEtags.size===0;
+    &&taskReadConflicts.size===0&&eventReadConflicts.size===0&&missingEtags.size===0
+    &&taskCommentReadConflicts.size===0;
+  const fullTaskCommentInventoryComplete=PROFILES.every(profile=>stats[profile].taskCommentInventoryFresh);
   const allProfilesQueried=PROFILES.every(profile=>Boolean(profileReaders[profile]));
-  const knownIdentitiesAbsentFromCurrentProviders=closureComplete&&allProfilesQueried&&provider404s===0&&PROFILES.every(profile=>
+  const knownIdentitiesAbsentFromCurrentProviders=closureComplete&&allProfilesQueried&&fullTaskCommentInventoryComplete
+    &&provider404s===0&&PROFILES.every(profile=>
     stats[profile].taskReadsFound===0&&stats[profile].taskInventoryMatches===0
       &&stats[profile].taggedEvents===0&&stats[profile].directEventReadsFound===0
       &&inventoryMatchedIds[profile].size===0&&matchedComments.get(profile)?.size===0);
   const missingProof=[
     "Calendar inventories cover only each profile's configured sync calendar; other accessible calendars are not enumerated",
     "Unlinked or untagged Calendar events still require explicit identity provenance; title or date matching is not accepted",
-    "Todoist v1 has no global task-comment inventory; comments on unrelated or unknown tasks are not enumerated",
+    ...(!fullTaskCommentInventoryComplete?["Todoist full Sync task-comment inventory is missing, incomplete, or older than five minutes for one or more profiles"]:[]),
     "Provider 404/410 responses are observations, not proof of identity absence",
     "Project/task comment results and provider reads can change; direct ETag and action-time rechecks remain required",
     "A strongly consistent paginated table scan is not a transactionally consistent table snapshot",
@@ -430,6 +501,7 @@ export async function observeCrossProfileErasureEvidence(input:{
     ...(unparsedTaskComments.size?["Unparsed task comments mention one or more candidate identities"]:[]),
     ...(taskReadConflicts.size?["Todoist direct reads disagreed with the complete active-task inventories"]:[]),
     ...(eventReadConflicts.size?["Calendar direct reads disagreed with the complete unfiltered inventories"]:[]),
+    ...(taskCommentReadConflicts.size?["Todoist direct task-comment reads disagreed with the full Sync task-comment inventories"]:[]),
     ...(missingEtags.size?["One or more direct Calendar events have no ETag for independent version checks"]:[]),
     ...(provider404s?["One or more direct provider reads returned 404/410; keep absence unverified"]:[]),
     ...(overflow.count?["Identity closure exceeded the bounded observer capacity"]:[]),
