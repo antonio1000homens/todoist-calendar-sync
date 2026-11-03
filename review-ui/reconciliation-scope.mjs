@@ -24,7 +24,10 @@ export function createScopedRequestGate(initialScope="home") {
     switchScope(next) {
       if(next!==scope){scope=next;epoch++;latest.clear();}
     },
-    begin(lane) {
+    begin(lane,expectedScope=scope) {
+      // A closure from the previous filter must not open a new request lane
+      // under the new filter's epoch.
+      if(expectedScope!==scope)return undefined;
       const sequence=(latest.get(lane)||0)+1;
       latest.set(lane,sequence);
       return {scope,epoch,lane,sequence};
