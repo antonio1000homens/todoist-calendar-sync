@@ -61,6 +61,8 @@ test("unknown task creation, comment deletion and anonymous Calendar creation fa
   t.mock.method(documentClient,"send",async()=>{reads++;return {};});
   const {clients,called}=fixture();
   await assert.rejects(clients.todoist.upsertTask({content:"Calendar-origin task"}),ErasureReplayUnavailableError);
+  await assert.rejects(clients.todoist.upsertTask({id:"erased-task",content:"ignored id"}),ErasureReplayUnavailableError);
+  await assert.rejects(clients.todoist.upsertTask({id:"erased-task",content:"ignored id"},""),ErasureReplayUnavailableError);
   await assert.rejects(clients.todoist.createTaskOnce({content:"Calendar-origin task"},"repair-request-key"),ErasureReplayUnavailableError);
   await assert.rejects(clients.todoist.deleteComment("comment-with-unknown-owner"),ErasureReplayUnavailableError);
   await assert.rejects(clients.calendar.upsertEvent({id:"",summary:"anonymous event"}),ErasureReplayUnavailableError);
