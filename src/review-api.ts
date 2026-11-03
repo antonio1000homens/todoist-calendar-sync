@@ -145,7 +145,9 @@ export async function hydrateCaseOrphanEvidence(
     }
     found.set(key,{...snapshot,includedBy:[...(snapshot.includedBy||[]),"Exact identity recorded on selected review alert"]});
   }
-  return [...found.values()].sort((left,right)=>entityKey(left.ref).localeCompare(entityKey(right.ref)));
+  // Preserve the pre-existing affected-item ordering; append extra case
+  // evidence without reshuffling repair selections or their test fixtures.
+  return [...found.values()];
 }
 export function reconciliationAlertRelation(
   alertedGeneration: unknown, observedAt: unknown, current?: ReconciliationState,
