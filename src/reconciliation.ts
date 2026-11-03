@@ -627,7 +627,8 @@ export class SnapshotReconciler {
         // Their absences are fenced again INSIDE the terminal transaction.
         const links = await readExactRecurrenceLinks(seriesKeys,
           (owner, seriesId) => this.state.getRecurrenceLink(owner, seriesId));
-        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links, seriesKeys);
+        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links, seriesKeys,
+          recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId! } : undefined);
         if (classification.blocked.length) {
           await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
             taskId: taskIds[0], eventId: eventIds[0],
