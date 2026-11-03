@@ -32,7 +32,7 @@ export async function deletedRecurrenceStatus(
     if (!snapshot || snapshot.lookupError || snapshot.object && snapshot.object.id !== id) return "unverified";
     if (snapshot.object === null) return "gone";
     if (!snapshot.object) return "unverified";
-    if (side === "calendar") return snapshot.object.status === "cancelled" ? "gone" : "live";
+    if (side === "calendar") return "status" in snapshot.object && snapshot.object.status === "cancelled" ? "gone" : "live";
     return "live"; // A normal Todoist response is not a verified 404/410.
   };
   const statuses = [...taskIds.map(id => verified("todoist", id)),
