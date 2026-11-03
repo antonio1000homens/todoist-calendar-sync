@@ -1,5 +1,5 @@
 import {defaultProviderClientFactory} from "./mutation-budget.js";
-import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import {calendarReplaySourceIds,guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
@@ -935,7 +935,7 @@ export class Synchronizer {
           ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
           : await todoist.upsertTask(
             recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
-            progressAware ? task?.id : undefined,
+            progressAware ? task?.id : undefined, calendarReplaySourceIds(active),
           );
       if (providerAlreadyAdvanced) await this.state.audit(profile, "calendar_owned_completion_provider_already_advanced", {
         seriesId: link.seriesId, taskId: link.taskId, nextEventId: active.id, origin: "scheduled_reconcile",
@@ -1332,10 +1332,10 @@ export class Synchronizer {
         const nextTask = successorRule
           ? previousTask?.due?.is_recurring
             ? await todoist.updateRecurringOccurrence(previousTask, toTodoistTask(next))
-            : await todoist.upsertTask(calendarOwnedRecurringTaskPayload(next, successorRule, verifiedTimeZone), previousTask?.id)
+            : await todoist.upsertTask(calendarOwnedRecurringTaskPayload(next, successorRule, verifiedTimeZone), previousTask?.id, calendarReplaySourceIds(next))
           : await (async () => {
             if (previousTask) await todoist.deleteTask(previousTask.id);
-            return todoist.upsertTask(toTodoistTask(next));
+            return todoist.upsertTask(toTodoistTask(next), undefined, calendarReplaySourceIds(next));
           })();
         if (successorRule && !matchesCalendarOwnedRecurringTask(nextTask, next, successorRule, verifiedTimeZone)) {
           return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
@@ -1422,7 +1422,7 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
     }
-    const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id);
+    const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id, calendarReplaySourceIds(event));
     const knownCommentId = mapping?.projectCommentId || mapping?.commentId;
     const existingComment = knownCommentId ? { id: knownCommentId } : await todoist.findComment(nextTask.id, event.id);
     const projectId = nextTask.project_id || mapping?.projectId || profiles[delivery.profile].todoistProjectId;
@@ -1649,6 +1649,7 @@ export class Synchronizer {
     }
     const nextTask = await todoist.upsertTask(
       calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence, calendarTimeZone) : toTodoistTask(active), task?.id,
+      calendarReplaySourceIds(active, master.id),
     );
     const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence, calendarTimeZone) : undefined;
     if (readback && !readback.matches) {
@@ -2064,7 +2065,7 @@ export class Synchronizer {
         ? currentRecurringTask
         : currentCalendarRecurrence && currentRecurringTask
           ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
-          : await todoist.upsertTask(toTodoistTask(next));
+          : await todoist.upsertTask(toTodoistTask(next), undefined, calendarReplaySourceIds(next));
       if (alreadyAdvanced) {
         await this.state.audit(delivery.profile, "calendar_owned_completion_provider_already_advanced", {
           seriesId: mapping.seriesId, taskId: task.id, nextEventId: next.id,
