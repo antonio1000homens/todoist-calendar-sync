@@ -11,6 +11,7 @@ import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
 import { executeErasureDeletionStep, verifyErasurePostflight } from "./erasure-deletion.js";
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
+import { inspectConfirmedOrphanOperation } from "./orphan-worker-inspection.js";
 
 const lambda=new LambdaClient({});
 function targetWorkerFunction(): string {
@@ -88,16 +89,18 @@ const adapters: ErasureWorkerAdapters={
 const store=new ErasureOperationStore(documentClient,undefined,adapters);
 const recoveryService=new ErasureRecoveryService(recoveryAdapters(true),documentClient,store);
 
-export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery";id:string} {
+export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery"|"orphan_inspection";id:string} {
   let payload:unknown;
   try { payload=JSON.parse(record.body); } catch { throw new Error("Invalid erasure queue message JSON"); }
   if(!payload||typeof payload!=="object"||Array.isArray(payload)) throw new Error("Invalid erasure queue message");
   const value=payload as Record<string,unknown>;
   if(value.version!==1)throw new Error("Invalid erasure queue message protocol version");
   const keys=Object.keys(value).sort().join(",");
-  const kind=keys==="operationId,version"?"erasure":keys==="recoveryOperationId,version"?"recovery":undefined;
+  const kind=keys==="operationId,version"?"erasure":keys==="recoveryOperationId,version"?"recovery"
+    :keys==="orphanInspectionOperationId,version"?"orphan_inspection":undefined;
   if(!kind)throw new Error("Invalid erasure queue message schema");
-  const id=kind==="erasure"?value.operationId:value.recoveryOperationId;
+  const id=kind==="erasure"?value.operationId
+    :kind==="recovery"?value.recoveryOperationId:value.orphanInspectionOperationId;
   if(typeof id!=="string"||!/^[A-Za-z0-9_-]{1,128}$/.test(id))throw new Error("Invalid queue operation ID");
   return {kind,id};
 }
@@ -177,7 +180,14 @@ export const handler:SQSHandler=async event=>{
   for(const record of event.Records){
     try {
       const command=parseErasureQueueCommand(record);
-      if(command.kind==="recovery") {
+      if(command.kind==="orphan_inspection") {
+        // Read-only diagnostic path; never call the deletion state machine,
+        // modify an operation or enqueue a provider-mutation command.
+        const diagnostic=await inspectConfirmedOrphanOperation(command.id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"orphan_inspection",operationId:command.id,status:diagnostic.status,
+          blockerCount:diagnostic.blockers.length,deletionAuthorized:false,executionQueued:false}));
+      } else if(command.kind==="recovery") {
         const result=await recoveryService.process(command.id);
         console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"recovery_step",
           operationId:command.id,status:result.status}));
