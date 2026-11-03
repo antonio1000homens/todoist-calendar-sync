@@ -38,6 +38,11 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
   const lifecycle=operation.lifecycle;
   const indicated=Boolean(lifecycle && (lifecycle.evidence?.deletionStarted
     || lifecycle.deletionProgress || afterWritePhases.has(lifecycle.phase)));
+  const writeReceipt=Boolean(lifecycle?.evidence?.deletionStarted
+    &&lifecycle.evidence.deletionStarted.operationId===operation.operationId
+    &&lifecycle.evidence.deletionStarted.phase==="deletionStarted");
+  const unrelatedBlockers=inspection.blockers.filter(x=>
+    x!=="Full deletion needs durable replay/tombstone assurance before restoring admission");
   const deletionSelected=operation.selectedActions.deleteCalendar===true
     && operation.selectedActions.deleteTodoist===true
     && operation.target.deleteCalendar===true;
@@ -47,12 +52,15 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
   const mappingsRestored=Boolean(lifecycle && inspection.mappingStates.length===lifecycle.mappingIds.length
     &&inspection.mappingStates.every(m=>m.state===(m.originallyEnabled?"Enabled":"Disabled")));
   const candidate=inspection.classification==="fully_deleted"
-    &&indicated&&deletionSelected&&targets
+    &&indicated&&writeReceipt&&deletionSelected&&targets
+    &&inspection.fenceOwned&&Boolean(inspection.epoch)&&inspection.leaseCount===0
+    &&unrelatedBlockers.length===0
     &&inspection.providerItemsAbsent&&inspection.stateRowsAbsent;
   const classification:PostWriteClassification=!indicated?"not_post_write":
     candidate?"fully_deleted_candidate":"partial_or_ambiguous";
   const blockers=[...inspection.blockers];
-  if(!indicated)blockers.push("No durable provider-write boundary is recorded; use pre-write recovery if independently verified");
+  if(!indicated)blockers.push("No provider-write boundary is indicated; use pre-write recovery if independently verified");
+  if(indicated&&!writeReceipt)blockers.push("No valid durable deletion-start receipt proves the original provider-write stage");
   if(!deletionSelected)blockers.push("Original confirmation did not select deletion of both Todoist and Calendar");
   if(!targets)blockers.push("Original immutable inventory lacks both exact provider targets; aliases require separate verification");
   if(!inspection.fenceOwned)blockers.push("Matching active profile fence is not verified");
@@ -61,8 +69,8 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
   if(!inspection.providerItemsAbsent || !inspection.stateRowsAbsent)
     blockers.push("One or more original provider items, mapping comments or attributable state rows remain or are ambiguous");
   if(!mappingsRestored)blockers.push("Worker mapping states differ from original enablement; restoration remains guarded");
-  if(inspection.classification==="partial_or_ambiguous")
-    blockers.push("Partial deletion requires a NEW independently reviewed authorization and action-time version checks");
+  if(classification==="partial_or_ambiguous")
+    blockers.push("Partial or unverified deletion requires a NEW independently reviewed authorization and action-time version checks");
   // Even a perfect snapshot does not prove source/alias completeness, old
   // qualified consumer safety, or the immutable marker/fence transaction.
   blockers.push("Complete replay-barrier rollout, alias and old-Lambda coverage, single-use post-write confirmation and verified atomic release are not yet accepted");
