@@ -2,7 +2,7 @@
 
 ## Phase 3 — authenticated, read-only server readiness diagnostic
 
-A follow-up branch implements \`GET /review/api/cases/{caseId}/orphan-readiness\`. This
+A follow-up branch implements `GET /review/api/cases/{caseId}/orphan-readiness`. This
 endpoint uses the authenticated operator's selected, persisted review case;
 it **rejects arbitrary query IDs**, reads the current provider graph and exact
 case-recorded identities, and reports why each recorded Todoist/Calendar
@@ -16,7 +16,7 @@ failed direct reads, recurring items, active controls, saved mapping links,
 Calendar task metadata, other live items in the read-only graph and missing
 counterpart IDs. It retains the exact case profile, ignores search-only IDs as
 selection candidates, and never authorizes a provider write. Its
-\`canExecute\` fields are **always false**, and it issues no preview token,
+`canExecute` fields are **always false**, and it issues no preview token,
 confirmation ID, operation record, mutation, or terminal case state.
 
 **Important:** This is **not** exhaustive cross-provider absence proof. The
