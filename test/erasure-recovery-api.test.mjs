@@ -31,6 +31,9 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   const calls=[],messages=[];
   const erasures={async get(){return {operationId:"op-1",profile:"work",status:"review_required"};}};
   const recovery={
+    async inspectPostWrite(id){calls.push(["postwrite",id]);return {operationId:id,profile:"work",
+      classification:"fully_deleted_candidate",releaseAllowed:false,onlyAvailableAction:"keep_fenced",
+      blockers:["not yet authorised"],evidence:{matchingFence:true,leasesDrained:true}};},
     async inspect(id){calls.push(["inspect",id]);return {preview:{operationId:id,profile:"work",
       phase:"wait_worker_timeout",classification:"pre_write",allowed:true,blockers:[],mappingStates:[],
       fenceOwned:true,leaseCount:0,providerItemsAbsent:false,stateRowsAbsent:false,epoch:3}};},
@@ -48,6 +51,18 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   assert.equal(badAuth.statusCode,401);
   const inspect=await run(request("/review/api/erasure-recoveries/op-1","GET",headers));
   assert.equal(inspect.statusCode,200);assert.equal(JSON.parse(inspect.body).preview.allowed,true);
+  const postWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",headers));
+  assert.equal(postWrite.statusCode,200);
+  assert.deepEqual(JSON.parse(postWrite.body).assessment.onlyAvailableAction,"keep_fenced");
+  assert.deepEqual(calls.find(x=>x[0]==="postwrite"),["postwrite","op-1"]);
+  for(const action of ["confirm","apply","dispatch"]){
+    const refused=await run(request("/review/api/erasure-postwrite-recoveries/op-1/"+action,"POST",headers,{}));
+    assert.equal(refused.statusCode,404,"Post-write must never expose a mutating route");
+  }
+  const refusedRoot=await run(request("/review/api/erasure-postwrite-recoveries/op-1","POST",headers,{}));
+  assert.equal(refusedRoot.statusCode,404);
+  const unauthorizedPostWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",{}));
+  assert.equal(unauthorizedPostWrite.statusCode,401);
   const issued=await run(request("/review/api/erasure-recoveries/op-1/confirm","POST",headers,{}));
   assert.equal(issued.statusCode,200);assert.equal(JSON.parse(issued.body).confirmationId,"fresh-recovery");
   const invalid=await run(request("/review/api/erasure-recoveries/op-1/apply","POST",headers,{
