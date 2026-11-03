@@ -43,7 +43,7 @@ test("lookup failures and unknown master are never treated as missing",async()=>
 });
 test("retirement classifier rejects foreign, Calendar-owned, new and incomplete associations",()=>{
   const extra={...linked,profile:"work"};
-  const calendar={...linked,owner:"calendar",seriesId:master+"@google.com"};
+  const calendar={...linked,owner:"calendar",seriesId:master+"-google-series"};
   const changed={...linked,eventId:"different"};
   assert.deepEqual(classifyDeletedRecurrenceLinks("antonio",[taskId],[master,active],[linked]),
     {stale:[linked],blocked:[]});
