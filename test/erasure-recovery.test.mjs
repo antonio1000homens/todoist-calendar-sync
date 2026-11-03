@@ -31,7 +31,7 @@ function fixture(options={}) {
   Object.assign(operation,options.operation||{});
   Object.assign(external,options.external||{});
   const opKey="ERASURE_OPERATION#op-recovery";
-  let confirmation;
+  let confirmation,postwriteToken;
   const db={
     async send(command) {
       const kind=command.constructor.name;
@@ -39,6 +39,7 @@ function fixture(options={}) {
       if(kind==="GetCommand") {
         if(input.Key.pk===opKey)return {Item:operation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
+        if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         return {Item:undefined};
       }
       if(kind==="QueryCommand") {
@@ -48,6 +49,10 @@ function fixture(options={}) {
       }
       if(kind==="PutCommand") {
         external.writes.push(input);
+        if(input.Item.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery"){
+          if(postwriteToken&&postwriteToken.status==="consumed")throw new Error("Reviewed token is already consumed");
+          postwriteToken={...input.Item};return {};
+        }
         confirmation={...input.Item};
         return {};
       }
@@ -61,6 +66,21 @@ function fixture(options={}) {
       }
       if(kind==="TransactWriteCommand") {
         external.writes.push(input);
+        if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET postwriteReview=:review"))){
+          if(options.failPostwriteTransaction)throw Object.assign(new Error("Transaction conflict"),{name:"TransactionCanceledException"});
+          assert.equal(operation.postwriteReview,undefined);
+          assert.equal(operation.recovery,undefined);
+          assert.equal(postwriteToken.status,"issued");
+          assert.equal(input.TransactItems.filter(x=>x.Delete||x.Put).length,0,
+            "post-write acknowledgement cannot delete or write any provider/replay/fence item");
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="FENCE"));
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
+          operation.postwriteReview=input.TransactItems[0].Update.ExpressionAttributeValues[":review"];
+          postwriteToken.status="consumed";
+          delete postwriteToken.expiresAt;
+          delete postwriteToken.expiresAtMs;
+          return {};
+        }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET recovery=:recovery"))) {
           assert.equal(operation.status,"review_required");
           assert.equal(operation.recovery,undefined,"confirmation must not be reused");
@@ -97,8 +117,9 @@ function fixture(options={}) {
     async readSnapshot(){external.providerCalls++;return external.snapshot;},
   };
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
-  const service=new ErasureRecoveryService(adapters,db,store,()=>"fresh-recovery-token");
-  return {service,operation,external,db,get confirmation(){return confirmation;}};
+  const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
+  return {service,operation,external,db,get confirmation(){return confirmation;},
+    get postwriteToken(){return postwriteToken;}};
 }
 
 test("read-only preview paginates controls and checks original mappings and immutable provider inventory",async()=>{
