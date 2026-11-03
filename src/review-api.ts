@@ -2,6 +2,7 @@ import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
@@ -13,7 +14,7 @@ import { buildErasurePreview } from "./erasure-preview.js";
 import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
-import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
+import { REVIEW_PROFILES, operationHasWriteEvidence, entityKey, type EntityRef, type ReviewCase, type ReviewSnapshot, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 import { randomUUID } from "node:crypto";
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
 
@@ -113,6 +114,38 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
 }
 function assertOwned(subject: string, owner: string): void {
   if (subject !== owner) fail(403, "This record belongs to another review operator");
+}
+/** Enrich read-only case snapshots with *only* identities recorded by this
+ * immutable alert, never arbitrary repair-search IDs or `includedBy` links.
+ * A failed candidate lookup is reported as unverified, not an absent item.
+ * This helper grants no deletion eligibility or provider-write authority. */
+export async function hydrateCaseOrphanEvidence(
+  item: ReviewCase,
+  snapshots: ReviewSnapshot[],
+  readSnapshot: (ref: EntityRef) => Promise<ReviewSnapshot>,
+): Promise<ReviewSnapshot[]> {
+  const ids=reviewCaseEvidenceIds(item);
+  const refs:EntityRef[]=[
+    ...ids.taskIds.map(id=>({profile:item.profile,side:"todoist" as const,id})),
+    ...ids.eventIds.map(id=>({profile:item.profile,side:"calendar" as const,id})),
+  ];
+  if(refs.length>20) fail(409,"The review alert references more than 20 provider identities; narrow the case before verifying an orphan");
+  const found=new Map(snapshots.map(snapshot=>[entityKey(snapshot.ref),snapshot]));
+  for(const ref of refs){
+    const key=entityKey(ref);
+    if(found.has(key))continue;
+    let snapshot:ReviewSnapshot;
+    try {
+      snapshot=await readSnapshot(ref);
+      if(snapshot.ref.profile!==item.profile||snapshot.ref.side!==ref.side||snapshot.ref.id!==ref.id)
+        throw new Error("Provider snapshot identity mismatch");
+    } catch {
+      // An API outage, foreign ownership, or failed lookup is not a 404/410.
+      snapshot={ref,object:null,lookupError:"The direct provider lookup or ownership verification failed",checkedAt:new Date().toISOString()};
+    }
+    found.set(key,{...snapshot,includedBy:[...(snapshot.includedBy||[]),"Exact identity recorded on selected review alert"]});
+  }
+  return [...found.values()].sort((left,right)=>entityKey(left.ref).localeCompare(entityKey(right.ref)));
 }
 export function reconciliationAlertRelation(
   alertedGeneration: unknown, observedAt: unknown, current?: ReconciliationState,
@@ -390,7 +423,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           || (operation.status !== "failed" && operation.status !== "needs_review")) {
           fail(409,"Repair operation does not match this incident; provider items cannot be safely hydrated");
         }
-        const snapshots = await reviewEngine.collect(preview.intent,item.decision);
+        const snapshots = await hydrateCaseOrphanEvidence(item,
+          await reviewEngine.collect(preview.intent,item.decision),ref=>reviewEngine.snapshot(ref));
         return response(200,{item:{...item,taskId:preview.intent.taskId,eventId:preview.intent.eventId,
           repairContext:{operationId:operation.id,status:operation.status,itemPlan:preview.itemPlan}},snapshots});
       }
@@ -398,7 +432,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         taskId:item.taskId || (typeof item.decision?.context?.providerTaskId === "string" ? item.decision.context.providerTaskId : undefined),
         eventId:item.eventId || (typeof item.decision?.context?.providerEventId === "string" ? item.decision.context.providerEventId : undefined),
         winner:"none", scope:"occurrence", leftovers:{} };
-      const snapshots = await reviewEngine.collect(intent,item.decision);
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
       const reconciliation = item.decision?.type === "operational_reconciliation_stuck"
         ? await new StateRepository().getReconciliationState(item.profile) : undefined;
       const alertedGeneration = item.reconciliationGeneration || item.decision?.context?.reconciliationGeneration;
@@ -458,14 +493,16 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const selectedEventId = checkedId(query.eventId) || undefined;
       const intent: RepairIntent = {caseId:item.id,profile:item.profile,action:"link",
         taskId:selectedTaskId,eventId:selectedEventId,winner:"none",scope:"occurrence",leftovers:{}};
-      const snapshots = await reviewEngine.collect(intent,item.decision);
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
       return response(200,{item,snapshots});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
       const intent = selectedIntent(body!,item.id,item.profile);
-      const snapshots = await reviewEngine.collect(intent,item.decision);
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
       return response(200,{snapshots});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "dismiss" && segments.length === 3) {
