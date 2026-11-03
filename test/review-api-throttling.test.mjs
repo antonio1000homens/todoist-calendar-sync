@@ -169,6 +169,8 @@ test("reconciliation status polling starts slowly and backs off under repeated 4
   assert.match(source,/if\(\["succeeded","needs_review","failed"\]\.includes\(status\)\|\|!data\.reconciliation\?\.pending\)[\s\S]*?setTerminalInboxRefreshPending\(true\)/);
   assert.match(source,/createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
   assert.doesNotMatch(source,/else timer=window\.setTimeout\(poll,1500\)/);
+  assert.match(source,/if\(options\.quiet&&previous\?\.data\)/,
+    "transient polling errors must preserve the current run for backoff and retry");
 });
 
 test("terminal inbox refresh retries independently after a failed refresh", async () => {
