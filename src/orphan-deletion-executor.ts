@@ -29,7 +29,7 @@ export const ORPHAN_REQUIRED_CHECKS = [
 ] as const;
 export type OrphanProofCheck = typeof ORPHAN_REQUIRED_CHECKS[number];
 export type OrphanPhase = "confirmed" | "fenced" | "delete_started" | "provider_absent"
-  | "state_cleaned" | "observing" | "succeeded" | "needs_review";
+  | "state_cleaned" | "workers_resume_started" | "observing" | "succeeded" | "needs_review";
 export type ProviderTarget = { side: "todoist"; item: TodoistTask } | { side: "calendar"; item: CalendarEvent };
 export interface VerifiedOrphanProof {
   caseId: string;
@@ -112,14 +112,15 @@ export class OrphanSafetyError extends Error {
   }
 }
 const knownPhases: ReadonlySet<string> = new Set([
-  "confirmed","fenced","delete_started","provider_absent","state_cleaned","observing","succeeded","needs_review",
+  "confirmed","fenced","delete_started","provider_absent","state_cleaned","workers_resume_started","observing","succeeded","needs_review",
 ]);
 const graph: Record<Exclude<OrphanPhase,"succeeded"|"needs_review">,OrphanPhase> = {
   confirmed:"fenced",
   fenced:"delete_started",
   delete_started:"provider_absent",
   provider_absent:"state_cleaned",
-  state_cleaned:"observing",
+  state_cleaned:"workers_resume_started",
+  workers_resume_started:"observing",
   observing:"succeeded",
 };
 const validId = (id: unknown): id is string => typeof id === "string" && !!id && id.length <= 1024
@@ -201,7 +202,7 @@ export async function advanceGuardedOrphanDeletion(
     return journal.advance(operation,"fenced","workers_drained_fence_verified");
   }
   // Reconciliation observation runs after the exclusive fence is released.
-  if(operation.phase!=="observing") await adapters.assertQuiescent(operation);
+  if(operation.phase!=="observing" && operation.phase!=="workers_resume_started") await adapters.assertQuiescent(operation);
   if(operation.phase==="fenced") {
     assertTrustedProof(operation,await adapters.verifyProof(operation));
     assertLiveTarget(operation,await adapters.readTarget(operation));
@@ -235,6 +236,12 @@ export async function advanceGuardedOrphanDeletion(
   }
   if(operation.phase==="state_cleaned") {
     await adapters.verifyPostflight(operation);
+    await adapters.assertReplayBarrier(operation);
+    // Durable before resuming: a retry cannot assume the exclusive fence is
+    // still held if the external resume succeeded but our CAS acknowledgement failed.
+    return journal.advance(operation,"workers_resume_started","replay_barrier_verified_before_worker_resume");
+  }
+  if(operation.phase==="workers_resume_started") {
     await adapters.assertReplayBarrier(operation);
     await adapters.resumeWorkersWithBarrier(operation);
     return journal.advance(operation,"observing","workers_resumed_with_replay_barrier");
