@@ -107,7 +107,7 @@ the following entrypoints **before** post-write recovery is allowed:
 | `src/orphan-recovery.ts` | orphan reattachment and state re-mapping | check both sides before repair and putMapping |
 | `src/repair-provider-guard.ts`, `src/review-engine.ts`, `src/manual-intervention.ts` | approved repair creation and replay/DLQ resumes | check against newly fresh provider state; never trust an old preview |
 | `src/repository.ts` | `putMapping`, `putNewRecurrenceMappingIfUnowned`, `putRecurrenceLink`, mapping comment indexes | guard all mapping and recurrence write routes |
-| `src/providers.ts`, `src/mutation-budget.ts` | `createTaskOnce`, `createRepairEventOnce`, `createFutureMasterOnce`, `upsertTask`, `upsertEvent`, metadata edits | enforce in production client factories AND test alternate/mock factories |
+| `src/providers.ts`, `src/mutation-budget.ts`, `src/completed-project-comment-cleanup.ts` | `createTaskOnce`, `createRepairEventOnce`, `createFutureMasterOnce`, `upsertTask`, `upsertEvent`, metadata edits, operator-only project-comment cleanup | enforce in production client factories AND test alternate/mock factories; bare comment deletion must fail closed when owner identity is unavailable |
 | `src/erasure-deletion.ts`, `src/erasure-recovery.ts`, `src/erasure-worker.ts` | deletion steps, independent readback, mapping restore and final fence release | independent strongly consistent postflight and atomic release |
 | `src/erasure-preview.ts`, `src/erasure-recovery-adapters.ts` | full DynamoDB inventory plus direct provider/comments reads | verify every scan page; fail closed on unknown aliases and recurrence |
 
