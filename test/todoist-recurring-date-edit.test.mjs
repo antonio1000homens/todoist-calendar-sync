@@ -110,9 +110,9 @@ class FakeState {
 
 let currentTodoistTask;
 
-function fixture() {
-  const state = new FakeState(mapping());
-  const events = new Map([[MASTER_ID, masterEvent()]]);
+function fixture({ unlinked = false } = {}) {
+  const state = new FakeState(unlinked ? undefined : mapping());
+  const events = new Map(unlinked ? [] : [[MASTER_ID, masterEvent()]]);
   const instances = [
     instance("instance-14", "2026-09-14"),
     instance("instance-21", "2026-09-21"),
@@ -207,4 +207,44 @@ test("completion-originated recurring due advance keeps the existing Calendar an
   assert.equal(upserts.length, 0, "a completion echo must not shift the RRULE master");
   assert.equal(state.mapping.activeInstanceId, "instance-21");
   assert.equal(state.mapping.originalStart, "2026-09-21");
+});
+
+test("Phase B recurrence edits never delete an existing Calendar RRULE master or its mapping", async () => {
+  const oldTask = recurringTask("2026-09-14");
+  const task = recurringTask("2026-09-14", "Water plants", "2026-09-14T10:09:00Z");
+  task.due.string = "every other Monday";
+  const { state, sync, upserts } = fixture();
+  await sync.process(delivery(task, oldTask));
+  assert.equal(upserts.length, 0, "unproven Phase B edit must not replace the master");
+  assert.equal(state.mapping.masterEventId, MASTER_ID, "preserve the existing recurrence mapping");
+  assert.equal(state.mapping.activeInstanceId, "instance-14", "preserve active occurrence identity");
+  const record = state.audits.at(-1);
+  assert.equal(record.action, "todoist_phase_b_existing_series_requires_review");
+  assert.equal(record.detail.phaseBFamily, "alternate_weekday");
+  assert.equal(record.detail.phaseBDisposition, "rolling_required");
+  assert.equal(record.detail.phaseBReason, "anchor_not_verified");
+  assert.equal(record.detail.phaseBCandidateRrule, "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO");
+});
+
+test("new unsupported Phase B schedules remain one-off rolling projections with diagnostic evidence", async () => {
+  for (const [date, phrase, family, rule] of [
+    ["2026-09-14", "every other Monday", "alternate_weekday", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"],
+    ["2026-09-15", "every 2, 15, 27", "multi_month_day", "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27"],
+    ["2026-09-15", "every quarter", "quarterly", "RRULE:FREQ=MONTHLY;INTERVAL=3"],
+  ]) {
+    const task = recurringTask(date, "Water plants", "2026-09-14T11:00:00Z");
+    task.due.string = phrase;
+    const { state, sync, upserts } = fixture({ unlinked: true });
+    await sync.process(delivery(task));
+    assert.equal(upserts.length, 1, phrase);
+    assert.equal(upserts[0].payload.recurrence, undefined, phrase);
+    assert.equal(state.mapping.recurrenceOwner, "todoist", phrase);
+    assert.equal(state.mapping.masterEventId, undefined, phrase);
+    const record = state.audits.at(-1);
+    assert.equal(record.action, "todoist_created_calendar", phrase);
+    assert.equal(record.detail.recurrenceProjection, "rolling", phrase);
+    assert.equal(record.detail.phaseBFamily, family, phrase);
+    assert.equal(record.detail.phaseBCandidateRrule, rule, phrase);
+    assert.equal(record.detail.phaseBReason, "anchor_not_verified", phrase);
+  }
 });
