@@ -114,7 +114,7 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   checks.completed_history_safe=wellFormed&&!otherRows.some(isCompleted);
   checks.sync_controls_clear=wellFormed&&!otherRows.some(row=>isControl(row)&&
     (row.activeRepair||row.excluded===true||row.fencedAt||row.pendingRefresh));
-  checks.no_active_repair_or_erasure=wellFormed&&!otherRows.some(isOtherOperation)&&!data.stateRows.some(isFence);
+  checks.no_active_repair_or_erasure=wellFormed&&!otherRows.some(isOtherOperation)&&!data.stateRows.some(row=>isFence(row) && !(row.pk==="ERASURE#"+op.profile && row.sk==="FENCE" && row.operationId===op.id));
   checks.canonical_records_clear=wellFormed&&!otherRows.some(row=>!isMapping(row)&&!isRecurrence(row)&&
     !isCompleted(row)&&!isControl(row)&&!isOtherOperation(row)&&!isFence(row));
   const comments=data.providers.flatMap(profile=>profile.comments.filter(comment=>refers(comment.content,op.targetId))
