@@ -98,7 +98,7 @@ function candidate(task: TodoistTask, anchor?: TodoistPhaseBAnchor): TodoistPhas
     candidateRrule: classified.canonicalRrule, semantic: classified.semantic,
   };
   if (!anchor || anchor.source !== "verified_original_schedule") return provisional;
-  const dates = occurrenceDates(classified.semantic, 128);
+  const dates = occurrenceDates(classified.semantic, 100);
   if (!dates.length || dates[0] !== classified.semantic.startDate || !dates.includes(due.date)
     || (classified.semantic.localTime || undefined) !== (due.time || undefined))
     return { ...provisional, reason: "anchor_or_occurrence_mismatch" };
@@ -164,7 +164,7 @@ export function verifyTodoistPhaseBReadback(
       || master.start?.timeZone !== result.semantic.timeZone))
     return reject("timezone_not_verified");
 
-  const dates = occurrenceDates(result.semantic, 128);
+  const dates = occurrenceDates(result.semantic, 100);
   const priorDue = localDue(before, result.semantic.timeZone);
   const nextDue = localDue(after, result.semantic.timeZone);
   const previousIndex = priorDue ? dates.indexOf(priorDue.date) : -1;
@@ -176,6 +176,8 @@ export function verifyTodoistPhaseBReadback(
   const shared = master.extendedProperties?.shared;
   if (!master.id || !master.etag || master.status !== "confirmed" || master.recurringEventId
     || shared?.taskId !== task.id || shared.syncRecurrenceOwner !== "todoist"
+    || shared.todoistRecurrence !== todoistRecurrenceKey(before)
+    || shared.todoistAnchorStart !== anchor.start
     || master.recurrence?.length !== 1 || !readback.exceptionInventoryComplete)
     return reject("calendar_master_or_exception_inventory_unverified");
   const persisted = classifyCalendarRule(master.recurrence[0], {
