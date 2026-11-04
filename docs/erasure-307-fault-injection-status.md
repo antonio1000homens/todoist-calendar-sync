@@ -43,6 +43,23 @@ provider inventory or DLQ state was collected, so those acceptance checks
 remain open. The provider IDs and title are intentionally omitted from this
 public report.
 
+## Connector-created staging fixture and bounded-capture failure (4 Nov 2026)
+
+A fresh private event was created through the Google Calendar connector in the
+Work calendar. The normal sync asynchronously created exactly one matching
+task in the Work Todoist project. A direct event read showed this fixture was a
+single, non-recurring event. The paired task and event were clearly labeled as
+disposable #307 fixtures; the redundant task created before the asynchronous
+sync result was observed was removed through Todoist.
+
+The read-only all-profile preview was then run against the exact pair. It
+failed closed while expanding a discovered Calendar alias with
+`Calendar recurring series exceeds replay marker bound`. The capture did not
+identify which discovered series exceeded the bound, so this cannot be
+attributed to the fixture itself. No provider deletion, executor, marker,
+fence release, queue action or AWS mutation occurred. The fixture remains
+staged for follow-up; this attempt provides no post-write recovery evidence.
+
 ## Connector-only cross-profile fixture probe (4 Nov 2026)
 
 The configured calendar and Todoist project identifiers were read from the
