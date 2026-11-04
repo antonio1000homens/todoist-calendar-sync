@@ -351,9 +351,14 @@ match the original enabled/disabled states and the pending record has the same
 manifest. Originally disabled mappings must remain disabled. Transitional,
 missing, extra or mismatched mappings cannot complete the record.
 
-These are offline transaction contracts only: neither builder reads AWS,
-updates an event-source mapping, nor is imported by an executor, API route or
-queue. A future executor still needs to re-read and validate mapping ownership,
-perform idempotent enablement only after marker commit, verify the full mapping
-set, and retry from the durable pending record. No deployment or mapping change
-is authorized; the replay barrier remains OFF.
+`restorePostWriteWorkerMappings()` now implements the standalone runtime retry
+step. It requires both protocol flags enabled, strongly reads the pending item,
+checks its profile epoch, acquires a profile writer lease, re-reads the item,
+and compares the complete current SQS mapping inventory and ownership with the
+recorded manifest. It enables only originally enabled mappings, leaves
+originally disabled mappings untouched, and verifies the complete inventory
+and every final state before constructing the conditional completion update.
+Failures leave the durable item pending; retries are idempotent. The helper is
+not imported by an executor, API route or queue, and it was not invoked during
+implementation. No deployment or mapping change is authorized; the replay
+barrier remains OFF.
