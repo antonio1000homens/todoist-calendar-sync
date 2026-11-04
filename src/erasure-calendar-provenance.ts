@@ -67,11 +67,11 @@ export function calendarProvenanceIsFresh(value:Pick<CalendarCoverageAttestation
  * never from this document or an accompanying CLI flag. Missing trust -> reject.
  * The external ACL evidence SHA binds the signing review to its private source.
  */
-export function verifyCalendarProvenance(raw:unknown,trustPublicKeyPem:string,expected:{
+export function verifyCalendarProvenance(raw:unknown,trustPublicKeySpkiB64:string,expected:{
   accountId:string;region:string;functionName:string;qualifier:string;routingFingerprint:string;
 }):VerifiedCalendarProvenance {
   const failed=()=>{throw new Error("Calendar provenance signature, scope or registry is invalid");};
-  if(!raw||typeof raw!=="object"||Array.isArray(raw)||!trustPublicKeyPem) return failed();
+  if(!raw||typeof raw!=="object"||Array.isArray(raw)||!trustPublicKeySpkiB64) return failed();
   const document=raw as Record<string,unknown>;
   const signature=document.signature;
   const {signature:_signature,...payload}=document;
@@ -106,7 +106,7 @@ export function verifyCalendarProvenance(raw:unknown,trustPublicKeyPem:string,ex
     if(configured!==1||source===0||destination===0)return failed();
   }
   let key;
-  try { key=createPublicKey(trustPublicKeyPem); }catch{return failed();}
+  try { key=createPublicKey({key:Buffer.from(trustPublicKeySpkiB64,"base64"),format:"der",type:"spki"}); }catch{return failed();}
   if(key.asymmetricKeyType!=="ed25519")return failed();
   const signed=Buffer.from(canonicalCalendarProvenanceJson(payload),"utf8");
   if(!verify(null,signed,key,Buffer.from(signature,"base64")))return failed();
