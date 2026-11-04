@@ -22,6 +22,7 @@ type KeyRing = {current:string;keys:Map<string,Buffer>};
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
 const KEY_ID=/^[A-Za-z0-9_-]{1,32}$/;
 const MAX_EVENT_ALIASES=32;
+const MAX_POSTWRITE_WORKER_MAPPINGS=100;
 
 export class ErasureReplayBlockedError extends Error {
   constructor() {
@@ -170,10 +171,11 @@ const SHA256=/^[a-f0-9]{64}$/;
 const OPERATION_ID=/^[A-Za-z0-9_-]{1,128}$/;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function validatedWorkerMappings(value:PostWriteReleaseProof["workerMappings"]):{
+export function postWriteWorkerMappingManifest(value:PostWriteReleaseProof["workerMappings"]):{
   mappingIds:string[];enabledMappingIds:string[];fingerprint:string;
 } {
   if(!value||!Array.isArray(value.mappingIds)||!Array.isArray(value.enabledMappingIds)
+    ||value.mappingIds.length===0||value.mappingIds.length>MAX_POSTWRITE_WORKER_MAPPINGS
     ||value.mappingIds.some(id=>typeof id!=="string"||!UUID.test(id))
     ||value.enabledMappingIds.some(id=>typeof id!=="string"||!UUID.test(id))
     ||new Set(value.mappingIds).size!==value.mappingIds.length
@@ -204,7 +206,7 @@ export function completePostWriteMappingRestore(proof:PostWriteMappingRestoreCom
     ||new Date(proof.verifiedAt).toISOString()!==proof.verifiedAt
     ||!Array.isArray(proof.observedStates))
     throw new ErasureReplayUnavailableError("Worker mapping restoration proof is incomplete");
-  const manifest=validatedWorkerMappings({mappingIds:proof.mappingIds,
+  const manifest=postWriteWorkerMappingManifest({mappingIds:proof.mappingIds,
     enabledMappingIds:proof.enabledMappingIds});
   if(proof.observedStates.length!==manifest.mappingIds.length
     ||proof.observedStates.some(item=>!item||!manifest.mappingIds.includes(item.id)
@@ -269,7 +271,7 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     ||!proof.identity.taskId||!proof.identity.eventIds.length)
     throw new ErasureReplayUnavailableError("Post-write release proof is incomplete");
   const aliases=validatedPostWriteAliases(proof);
-  const workerMappings=validatedWorkerMappings(proof.workerMappings);
+  const workerMappings=postWriteWorkerMappingManifest(proof.workerMappings);
   const ring=keyRing(),secret=ring.keys.get(ring.current)!;
   const keys:ReplayKey[]=[];
   // Todoist IDs are protected across all sync profiles. Calendar aliases are
