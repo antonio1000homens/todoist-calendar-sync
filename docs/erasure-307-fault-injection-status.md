@@ -118,3 +118,11 @@ cancelled-event handling, unlisted-calendar provenance, transaction-snapshot
 gaps, independent writer/IAM review, action-time ETag checks, and full fresh
 reconciliation remain unresolved. Neither `ERASURE_REPLAY_BARRIER_VERSION`
 nor executable recovery was enabled, and the AWS reads made no mutations.
+
+The redacted item-preview summary classified 178 `DELIVERY` receipts for the
+Work profile: 174 were `unattributable` because they lack exact task/event
+references, and four contained a selected identity. These identity-free legacy
+receipts must remain blockers until their queue/replay provenance is resolved;
+the audit does not delete or infer ownership for them. The live preview has
+178 blockers overall, so the current Work profile cannot pass the item-level
+cleanup gate even after provider deletion.

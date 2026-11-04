@@ -108,6 +108,20 @@ function readOnlyProviderPair(clients) {
   });
 }
 
+function summarizeInventory(records) {
+  const summary={};
+  for(const record of records) {
+    const family=record.type;
+    const classification=record.classification;
+    if(typeof family!=="string"||typeof classification!=="string")
+      throw new Error("Sanitized state inventory summary is invalid");
+    const item=summary[family]||(summary[family]={count:0,classifications:{}});
+    item.count++;
+    item.classifications[classification]=(item.classifications[classification]||0)+1;
+  }
+  return Object.fromEntries(Object.entries(summary).sort(([left],[right])=>left.localeCompare(right)));
+}
+
 export async function collectLiveCrossProfileEvidence(options) {
   const identity=verifiedCliIdentity(options.profile);
   if(identity.Account!==options.account)throw new Error("AWS profile account did not match expected account");
@@ -150,7 +164,8 @@ export async function collectLiveCrossProfileEvidence(options) {
     providerMutationPerformed:false,
     crossProfileEvidence:preview.crossProfileEvidence,
     preview:{blockerCount:preview.blockers.length,relatedStateRowCount:preview.inventory.length,
-      classificationCounts:preview.classificationCounts},
+      classificationCounts:preview.classificationCounts,
+      stateInventoryByFamily:summarizeInventory(preview.inventory)},
     replayBarrierMayBeEnabled:false,
     executableRecoveryMayBeEnabled:false,
   };
