@@ -590,15 +590,21 @@ export class Todoist {
 
   /** Complete read-only task-comment inventory from Todoist's full Sync snapshot. */
   async listAllTaskCommentsForErasureAudit(): Promise<{
-    comments:TodoistCommentRecord[];fullSyncDateUtc:string;
+    comments:TodoistCommentRecord[];projectComments:TodoistCommentRecord[];
+    projectIds:string[];fullSyncDateUtc:string;
   }> {
     const headers=new Headers({authorization:`Bearer ${this.token}`});
     headers.set("content-type","application/x-www-form-urlencoded");
-    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["notes"])});
-    let snapshot: {full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown};
+    // Todoist only exposes project_notes alongside notes in the full "all"
+    // resource response. Reuse that snapshot to avoid one REST comments call
+    // for every active project during cross-profile erasure audits.
+    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["all"])});
+    let snapshot: {full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;
+      sync_token?:unknown;full_sync_date_utc?:unknown};
     for(let attempt=0;;attempt++) {
       try {
-        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown}>(
+        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;
+          sync_token?:unknown;full_sync_date_utc?:unknown}>(
           await fetch(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body}));
         break;
       } catch(error) {
@@ -609,7 +615,8 @@ export class Todoist {
       }
     }
     if(snapshot.full_sync!==true||typeof snapshot.sync_token!=="string"||!snapshot.sync_token
-      ||!Array.isArray(snapshot.notes)||typeof snapshot.full_sync_date_utc!=="string"
+      ||!Array.isArray(snapshot.notes)||!Array.isArray(snapshot.project_notes)||!Array.isArray(snapshot.projects)
+      ||typeof snapshot.full_sync_date_utc!=="string"
       ||!Number.isFinite(Date.parse(snapshot.full_sync_date_utc)))
       throw new Error("Todoist task-comment full sync was incomplete");
     const comments=new Map<string,TodoistCommentRecord>();
@@ -629,7 +636,34 @@ export class Todoist {
       if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
         throw new Error("Todoist task-comment full sync exceeded the audit result limit");
     }
-    return {comments:[...comments.values()],fullSyncDateUtc:snapshot.full_sync_date_utc};
+    const projectComments=new Map<string,TodoistCommentRecord>();
+    for(const value of snapshot.project_notes) {
+      if(!value||typeof value!=="object")throw new Error("Todoist project-comment full sync returned an invalid note");
+      const note=value as Record<string,unknown>;
+      if(typeof note.id!=="string"||!note.id||typeof note.project_id!=="string"||!note.project_id
+        ||typeof note.content!=="string"||(note.is_deleted!==undefined&&typeof note.is_deleted!=="boolean"))
+        throw new Error("Todoist project-comment full sync returned an unidentified note");
+      const comment:TodoistCommentRecord={id:note.id,project_id:note.project_id,content:note.content,
+        ...(note.is_deleted===undefined?{}:{is_deleted:note.is_deleted}),
+        ...(typeof note.posted_at==="string"?{posted_at:note.posted_at}:{})};
+      const previous=projectComments.get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist project comment changed within its full sync snapshot");
+      projectComments.set(comment.id,comment);
+      if(projectComments.size>MAX_ERASURE_AUDIT_COMMENTS)
+        throw new Error("Todoist project-comment full sync exceeded the audit result limit");
+    }
+    const projectIds=new Set<string>();
+    for(const value of snapshot.projects) {
+      if(!value||typeof value!=="object"||typeof (value as {id?:unknown}).id!=="string"
+        ||!(value as {id:string}).id)
+        throw new Error("Todoist project full sync returned an unidentified project");
+      projectIds.add((value as {id:string}).id);
+      if(projectIds.size>MAX_ERASURE_AUDIT_PROJECTS)
+        throw new Error("Todoist project full sync exceeded the audit project limit");
+    }
+    return {comments:[...comments.values()],projectComments:[...projectComments.values()],
+      projectIds:[...projectIds],fullSyncDateUtc:snapshot.full_sync_date_utc};
   }
 
   private async readTasks(projectId?:string): Promise<TodoistTask[]> {
@@ -752,8 +786,11 @@ export class Todoist {
    * configured sync project would miss provenance left after a project move.
    * Inaccessible archived workspace inventories fail closed.
    */
-  async listAllProjectCommentsForErasureAudit():Promise<TodoistProjectCommentAudit> {
+  async listAllProjectCommentsForErasureAudit(snapshotPromise?:Promise<{
+    projectComments?:TodoistCommentRecord[];projectIds?:string[];
+  }|undefined>):Promise<TodoistProjectCommentAudit> {
     const projects=new Map<string,number|null|undefined>();
+    const activeProjectIds=new Set<string>();
     const addProject=(value:unknown,workspaceId?:number)=>{
       if(!value||typeof value!=="object")throw new Error("Todoist project audit returned an invalid project");
       const project=value as {id?:unknown;workspace_id?:unknown};
@@ -770,7 +807,8 @@ export class Todoist {
       if(projects.size>MAX_ERASURE_AUDIT_PROJECTS)
         throw new Error("Todoist project audit exceeded its bounded project inventory");
     };
-    const readPages=async(path:string,resultKey:"results"|"workspace_projects",workspaceId?:number)=>{
+    const readPages=async(path:string,resultKey:"results"|"workspace_projects",workspaceId?:number,
+      active=false)=>{
       const seenCursors=new Set<string>();let cursor:string|undefined;
       for(let pageNumber=0;pageNumber<1000;pageNumber++) {
         const query=new URLSearchParams({limit:"200"});
@@ -778,7 +816,10 @@ export class Todoist {
         const page=await this.request<Record<string,unknown>>(`${path}?${query}`);
         const items=page?.[resultKey];
         if(!Array.isArray(items))throw new Error("Todoist project audit returned an invalid page");
-        for(const project of items)addProject(project,workspaceId);
+        for(const project of items) {
+          addProject(project,workspaceId);
+          if(active)activeProjectIds.add((project as {id:string}).id);
+        }
         const next=page.next_cursor;
         if(next===undefined||next===null||next==="")return;
         if(typeof next!=="string"||seenCursors.has(next))
@@ -788,7 +829,7 @@ export class Todoist {
       throw new Error("Todoist project audit exceeded its page limit");
     };
 
-    await readPages("/projects","results");
+    await readPages("/projects","results",undefined,true);
     await readPages("/projects/archived","results");
     const workspaces=await this.request<unknown>("/workspaces");
     if(!Array.isArray(workspaces))throw new Error("Todoist workspace audit returned an invalid inventory");
@@ -803,9 +844,23 @@ export class Todoist {
     for(const workspaceId of workspaceIds)
       await readPages(`/workspaces/${workspaceId}/projects/archived`,"workspace_projects",workspaceId);
 
+    const snapshot=await snapshotPromise;
+    const snapshotProjectIds=new Set(snapshot?.projectIds||[]);
     const comments=new Map<string,TodoistCommentRecord>();
     let complete=true,unavailableProjectCommentCount=0;
     for(const projectId of projects.keys()) {
+      if(activeProjectIds.has(projectId)&&snapshotProjectIds.has(projectId)) {
+        for(const comment of snapshot?.projectComments||[]) {
+          if(comment.project_id!==projectId)continue;
+          const previous=comments.get(comment.id);
+          if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+            throw new Error("Todoist project comment changed across project inventories");
+          comments.set(comment.id,comment);
+          if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
+            throw new Error("Todoist project comment audit exceeded its bounded result limit");
+        }
+        continue;
+      }
       let projectComments:TodoistCommentRecord[];
       try {projectComments=await this.listProjectComments(projectId,true);}
       catch(error) {

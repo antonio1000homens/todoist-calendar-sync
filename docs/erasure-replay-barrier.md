@@ -260,8 +260,12 @@ The post-write inspection now also calls
 strongly consistent, fully paginated DynamoDB scan and independently reads all
 three profiles' comments from every active project, archived personal project
 and archived workspace project, active Todoist task inventory, full unfiltered
-Calendar event inventory, a full Todoist Sync `notes` snapshot for task
-comments, tagged event lookup, exact candidate events and recurring instances.
+Calendar event inventory, a full Todoist Sync `all` snapshot for task and
+active-project comments, tagged-event inventory matches (with exact tag-query
+fallback only when an all-calendar inventory is incomplete), exact candidate
+events and recurring instances. Active project comments use the snapshot only when that
+project is present in its full project inventory; archived projects and any
+active project omitted from the snapshot retain per-project REST reads.
 The task-comment snapshot must report `full_sync:true`, a sync token and a
 parseable `full_sync_date_utc`; snapshots older than five minutes do not prove
 current absence. Comments for known task IDs are also read directly and
@@ -274,9 +278,11 @@ dates. DynamoDB, Calendar, task and comment pagination reject repeated cursors,
 invalid identities and conflicting duplicate snapshots. The inspection binds
 the read-only evidence fingerprint into its fresh inspection fingerprint.
 Todoist's [Get Comments endpoint](https://developer.todoist.com/api/v1/)
-requires exactly one project or task ID. The [Sync API full read](https://developer.todoist.com/api/v1/)
-also returns `notes` (task comments), which this audit uses to discover comments
-on tasks whose IDs were not known before the read.
+requires exactly one project or task ID. A [Sync API full read](https://developer.todoist.com/api/v1/)
+with `resource_types=["all"]` returns both `notes` (task comments) and
+`project_notes` (project comments). This audit uses the batched snapshot to
+discover comments on tasks and active projects whose IDs were not known before
+the read.
 
 The report returns counts and SHA-256 fingerprints only, with no task/event
 IDs, titles, descriptions or comment bodies. A `knownIdentitiesAbsentFromCurrentProviders`
@@ -310,7 +316,10 @@ free/busy-only calendar or a calendar that hides private events blocks complete
 coverage. Google's CalendarList API returns calendars on the user's calendar
 list; it does not prove there are no other calendars reachable only by a known
 calendar ID. That direct-ID ACL scope still needs independent source/destination
-calendar provenance. Untagged events still cannot be associated with an erased
+calendar provenance. The observer therefore hardcodes
+`allAccessibleCalendarCoverageProven=false`; follow-up [#333](https://github.com/antonio1000homens/todoist-calendar-sync/issues/333)
+tracks identifying an authoritative source for those direct-ID calendars.
+Untagged events still cannot be associated with an erased
 identity from title or date alone. Todoist's full Sync `notes` snapshot is
 generated separately from the project, task and DynamoDB reads, and large
 accounts may receive a delayed full-sync timestamp. Direct ETag and action-time

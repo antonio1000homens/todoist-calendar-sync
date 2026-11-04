@@ -19,11 +19,14 @@ type ProviderPair={
   todoist:{
     getTask(taskId:string):Promise<TodoistTask>;
     listAllTasksForErasureAudit():Promise<TodoistTask[]>;
-    listAllProjectCommentsForErasureAudit():Promise<{
+    listAllProjectCommentsForErasureAudit(snapshotPromise?:Promise<{
+      projectComments?:TodoistCommentRecord[];projectIds?:string[];
+    }|undefined>):Promise<{
       projects:Array<{id:string;workspaceId?:number}>;comments:TodoistCommentRecord[];
       complete?:boolean;unavailableProjectCommentCount?:number;
     }>;
-    listAllTaskCommentsForErasureAudit?():Promise<{comments:TodoistCommentRecord[];fullSyncDateUtc:string}>;
+    listAllTaskCommentsForErasureAudit?():Promise<{comments:TodoistCommentRecord[];
+      projectComments?:TodoistCommentRecord[];projectIds?:string[];fullSyncDateUtc:string}>;
     listTaskComments(taskId:string):Promise<TodoistCommentRecord[]>;
   };
 };
@@ -272,11 +275,13 @@ export async function observeCrossProfileErasureEvidence(input:{
       return {descriptors:listed,events:inventories.flatMap(inventory=>inventory.events.map(event=>({
         calendarId:inventory.calendarId,event}))),complete:listed.every(calendar=>!restrictedRoles.has(calendar.accessRole))};
     })();
+    const taskCommentsPromise=taskCommentAudit
+      ?taskCommentAudit.call(profileReaders[profile].todoist):Promise.resolve(undefined);
     const [projectAudit,calendarAudit,tasks,taskComments]=await Promise.all([
-      profileReaders[profile].todoist.listAllProjectCommentsForErasureAudit(),
+      profileReaders[profile].todoist.listAllProjectCommentsForErasureAudit(taskCommentsPromise),
       calendarInventoryPromise,
       profileReaders[profile].todoist.listAllTasksForErasureAudit(),
-      taskCommentAudit?taskCommentAudit.call(profileReaders[profile].todoist):Promise.resolve(undefined),
+      taskCommentsPromise,
     ]);
     if(!projectAudit||!Array.isArray(projectAudit.projects)||!Array.isArray(projectAudit.comments))
       throw new Error("Todoist project/comment audit returned an invalid inventory");
@@ -467,17 +472,22 @@ export async function observeCrossProfileErasureEvidence(input:{
         const taskKey=profile+"/"+taskId;
         if(!processedTaskReads.has(taskKey)) {
           processedTaskReads.add(taskKey);
-          try {
-            const task=await profileReaders[profile].todoist.getTask(taskId);
-            if(task?.id!==taskId)throw new Error("Todoist task read returned a different identity");
-            stats[profile].taskReadsFound++;
-            if(!taskInventories[profile].has(taskId))taskReadConflicts.add(taskKey);
-            const parentId=(task as TodoistTask&{parent_id?:string}).parent_id;
-            if(validId(parentId)&&add(taskIds,parentId))changed=true;
-          } catch(error) {
-            if(statusOf(error)!==404)throw error;
-            stats[profile].task404Responses++;provider404s++;
-            if(taskInventories[profile].has(taskId))taskReadConflicts.add(taskKey);
+          // The complete task inventory is already the authoritative read for
+          // active tasks. An exact GET adds value only for IDs outside that
+          // inventory, where an archived or otherwise non-listed task might
+          // still be individually readable.
+          if(!taskInventories[profile].has(taskId)) {
+            try {
+              const task=await profileReaders[profile].todoist.getTask(taskId);
+              if(task?.id!==taskId)throw new Error("Todoist task read returned a different identity");
+              stats[profile].taskReadsFound++;
+              taskReadConflicts.add(taskKey);
+              const parentId=(task as TodoistTask&{parent_id?:string}).parent_id;
+              if(validId(parentId)&&add(taskIds,parentId))changed=true;
+            } catch(error) {
+              if(statusOf(error)!==404)throw error;
+              stats[profile].task404Responses++;provider404s++;
+            }
           }
         }
         if(!processedTaskComments.has(taskKey)) {
@@ -515,15 +525,23 @@ export async function observeCrossProfileErasureEvidence(input:{
         }
         const tagKey=profile+"/"+taskId;
         if(!processedTags.has(tagKey)) {
-          processedTags.add(tagKey);stats[profile].tagQueries++;
-          const events=await profileReaders[profile].calendar.listLinkedEventsByTodoistTaskId(taskId);
-          for(const event of events) {
-            if(!event||!validId(event.id)||event.extendedProperties?.shared?.taskId!==taskId)
-              throw new Error("Calendar task-link query returned an unattributable event");
-            stats[profile].taggedEvents++;
-            if(addEventId(event.id,"calendar-task-tag"))changed=true;
-            if(addEventId(event.recurringEventId,"calendar-task-tag-parent"))changed=true;
-            if(addEventId(event.extendedProperties?.shared?.syncHistoryMasterId,"calendar-history-master"))changed=true;
+          processedTags.add(tagKey);
+          // A complete all-calendar inventory already indexed every shared
+          // taskId property, including cancelled events. Repeat the indexed
+          // query only when the broader inventory is incomplete.
+          if(calendarInventoryCompleteByProfile[profile]) {
+            stats[profile].taggedEvents+=(calendarByTask[profile].get(taskId)||[]).length;
+          } else {
+            stats[profile].tagQueries++;
+            const events=await profileReaders[profile].calendar.listLinkedEventsByTodoistTaskId(taskId);
+            for(const event of events) {
+              if(!event||!validId(event.id)||event.extendedProperties?.shared?.taskId!==taskId)
+                throw new Error("Calendar task-link query returned an unattributable event");
+              stats[profile].taggedEvents++;
+              if(addEventId(event.id,"calendar-task-tag"))changed=true;
+              if(addEventId(event.recurringEventId,"calendar-task-tag-parent"))changed=true;
+              if(addEventId(event.extendedProperties?.shared?.syncHistoryMasterId,"calendar-history-master"))changed=true;
+            }
           }
         }
       }

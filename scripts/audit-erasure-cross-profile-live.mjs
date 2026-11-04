@@ -15,7 +15,8 @@ const FUNCTION=/^[A-Za-z0-9_-]{2,64}$/;
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
 const PROFILE_NAMES=["home","antonio","work"];
 const PROGRESS_FIELDS=["stateScanPages","stateScanRows","stateScanConsumedCapacityUnits",
-  "stateScanElapsedMs","providerRequestsStarted","providerRequestsCompleted","providerRequestsInFlight"];
+  "stateScanElapsedMs","providerRequestsStarted","providerRequestsCompleted","providerRequestsInFlight",
+  "todoistRequestsStarted","googleRequestsStarted","otherProviderRequestsStarted"];
 const AMBIENT_CREDENTIALS=["AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN",
   "AWS_SECURITY_TOKEN","AWS_WEB_IDENTITY_TOKEN_FILE","AWS_ROLE_ARN",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI","AWS_CONTAINER_CREDENTIALS_FULL_URI"];
@@ -302,7 +303,8 @@ export async function collectLiveCrossProfileEvidence(options) {
   const originalFetch=globalThis.fetch;
   const providerDeadline=new AbortController();
   const progress={stateScanPages:0,stateScanRows:0,stateScanConsumedCapacityUnits:0,stateScanElapsedMs:0,
-    providerRequestsStarted:0,providerRequestsCompleted:0,providerRequestsInFlight:0};
+    providerRequestsStarted:0,providerRequestsCompleted:0,providerRequestsInFlight:0,
+    todoistRequestsStarted:0,googleRequestsStarted:0,otherProviderRequestsStarted:0};
   const snapshotProgress=()=>({...progress});
   const deadlineError=()=>{
     const error=new Error("Cross-profile provider audit deadline exceeded");
@@ -322,6 +324,11 @@ export async function collectLiveCrossProfileEvidence(options) {
     const signals=[providerDeadline.signal,requestDeadline,...(init.signal?[init.signal]:[])];
     progress.providerRequestsStarted++;
     progress.providerRequestsInFlight++;
+    let host="";
+    try {host=new URL(typeof input==="string"?input:input.url).hostname;} catch {}
+    if(host==="todoist.com"||host.endsWith(".todoist.com"))progress.todoistRequestsStarted++;
+    else if(host==="googleapis.com"||host.endsWith(".googleapis.com"))progress.googleRequestsStarted++;
+    else progress.otherProviderRequestsStarted++;
     try {
       return await originalFetch(input,{...init,signal:AbortSignal.any(signals)});
     } catch(error) {

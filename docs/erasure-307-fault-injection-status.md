@@ -245,10 +245,11 @@ incomplete evidence; it is not evidence that an identity or alias is absent.
 Each individual provider request also has a 120-second limit and reports
 `CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT` if it does not finish in time.
 The CLI emits a 30-second heartbeat to stderr containing only strong-scan page,
-row, capacity and elapsed-time counters plus provider request counts. The same
-allowlisted counters may appear in a deadline result. The overall deadline
-aborts both provider fetches and the in-flight DynamoDB scan request; no IDs,
-URLs, titles, row keys or credential values are included in progress output.
+row, capacity and elapsed-time counters plus aggregate provider request counts,
+including a Todoist/Google split. The same allowlisted counters may appear in a
+deadline result. The overall deadline aborts both provider fetches and the
+in-flight DynamoDB scan request; no IDs, URLs, titles, row keys or credential
+values are included in progress output.
 
 The report is redacted and always exits with status 2 because this capture is
 not release-authoritative and cannot issue an erasure confirmation. A complete
@@ -430,3 +431,27 @@ master, and three related delivery rows that referenced neither selected ID.
 The audit remains incomplete. No AWS or provider writes were performed, and
 the fixture must not be deleted or considered absent until the conflicting
 profile evidence and recurrence chain are resolved.
+
+### Optimized separate-fixture observation and direct-ID coverage gap (4 Nov 2026, 21:16 UTC)
+
+A separate, clearly labeled private event in the Work calendar asynchronously
+produced one task in the Work project. The Windsor read-only audit verified
+account `243857182133`, completed the strongly consistent DynamoDB scan (4,827
+rows, 10 related rows), and completed the three-profile provider observation
+in about one minute. It found the selected task/event through the Work and
+Antonio profile paths; Home returned no match. The observer reached identity
+closure for this fixture (one task, one event, no recurrence aliases), but
+`knownIdentitiesAbsentFromCurrentProviders` stayed false because the fixture
+was present and direct-ID Calendar ACL coverage is not enumerable from
+CalendarList. This is positive alias evidence for the staged item, not a
+complete absence proof or release authorization.
+
+The code currently hardcodes `allAccessibleCalendarCoverageProven=false` for
+that API coverage limitation. Follow-up [#333](https://github.com/antonio1000homens/todoist-calendar-sync/issues/333)
+tracks defining authoritative provenance for direct-ID shared/legacy calendars
+before that field can become true. The separate event and task were removed
+with the Google Calendar and Todoist connectors; immediate bounded searches
+returned no fixture in the Work calendar or Todoist. Google may retain
+cancelled event records for deployed credentials, so removal is not
+provider-absence evidence. The earlier recurrence-linked fixture above remains
+unresolved. No AWS or post-write recovery mutation occurred.
