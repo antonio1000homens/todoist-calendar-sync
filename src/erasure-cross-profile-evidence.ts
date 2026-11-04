@@ -800,6 +800,7 @@ export async function observeCrossProfileErasureEvidence(input:{
   // Signed, independently reviewed ACL registry + fresh provider inventory are
   // independent evidence. Neither can establish complete coverage alone.
   const allAccessibleCalendarCoverageProven=fullCalendarInventoryComplete
+    &&eventReadConflicts.size===0&&missingEtags.size===0&&provider410s===0
     &&PROFILES.every(profile=>calendarProvenanceCompleteByProfile[profile]);
   const knownIdentitiesAbsentFromCurrentProviders=allAccessibleCalendarCoverageProven
     &&closureComplete&&allProfilesQueried&&fullTaskCommentInventoryComplete
