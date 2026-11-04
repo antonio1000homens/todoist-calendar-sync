@@ -105,6 +105,27 @@ test("queued repair admission walks embedded decision and review aliases", async
   assert.equal(calls.length, 3, "embedded historical aliases are checked before the operation can resume");
 });
 
+for (const [field, erasedId] of [
+  ["calendarProjectionId", "erased-calendar-projection"],
+  ["syncHistoryMasterId", "erased-sync-history-master"],
+]) test(`queued repair admission checks nested ${field}`, async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", erasedId)) return { Item: { markerVersion: 1 } };
+    return {};
+  });
+  const preview = {
+    intent: {profile:"home",action:"link",taskId:"safe-task",eventId:"safe-event"},
+    snapshots: [{ref:{profile:"home",side:"todoist",id:"safe-task"},[field]:erasedId}], itemPlan: [],
+  };
+  await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
+  assert.ok(calls.some(command => command.constructor.name === "GetCommand"
+    && command.input.Key.sk === markerKey("home", "EVENT", erasedId)));
+});
+
 test("review admission checks recurring master aliases carried by history plans", async t => {
   enableBarrier(t);
   const calls = [];

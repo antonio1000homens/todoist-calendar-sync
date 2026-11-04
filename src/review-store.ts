@@ -28,7 +28,14 @@ async function admitEntityRef(ref: EntityRef): Promise<void> {
 async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
   const refs = new Map<string, EntityRef>();
   const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
-  const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId","activeInstanceId","occurrenceId","selectedEventId","seriesId"]);
+  const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId",
+    "activeInstanceId","occurrenceId","selectedEventId","seriesId","calendarProjectionId",
+    "oldMasterId","newMasterId","lastEventId","previousEventId","cancelledEventId",
+    "syncHistoryMasterId","recurringEventId","originalEventId","activeCalendarId","afterEventId",
+    "consolidationCancelledEventId","consolidationMasterEventId","contextEventId","existingActiveInstanceId",
+    "existingMasterId","metadataEventId","masterSeriesId","preferredEventId","providerSeriesId",
+    "reconcileAfterEventId","recoveredEventId","sourceEventId","splitHistoryMasterId",
+    "syncFlattenOccurrenceId"]);
   const taskArrayFields = new Set(["taskIds","candidateTaskIds"]);
   const eventArrayFields = new Set(["eventIds","candidateEventIds"]);
   const add = (profile: Profile, side: EntityRef["side"], id: string) => {
