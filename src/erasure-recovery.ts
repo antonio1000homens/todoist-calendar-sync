@@ -3,6 +3,7 @@ import {createHash, randomUUID} from "node:crypto";
 import {GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation, type FencedMapping} from "./erasure-executor.js";
+import type {CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {ErasurePreviewResult} from "./erasure-preview.js";
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
 
@@ -31,6 +32,7 @@ export interface RecoveryPreview {
   stateRowsAbsent:boolean;
   operationFingerprint:string;
   recoveryStatus?:RecoveryStatus;
+  crossProfileEvidence?:CrossProfileErasureEvidence;
 }
 export interface RecoveryAdapters {
   listWorkerMappings():Promise<FencedMapping[]>;
@@ -200,14 +202,19 @@ export class ErasureRecoveryService {
       blockers:[...new Set(blockers)].sort(),allowed:blockers.length===0,
       mappingStates,epoch:control.epoch,fenceOwned:control.fence?.operationId===id,
       leaseCount:control.leases.length,
-      providerItemsAbsent:!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent&&snapshot.actionPlan.comments.length===0,
-      stateRowsAbsent:snapshot.inventory.length===0,operationFingerprint:op.previewFingerprint,
-      recoveryStatus:op.recovery?.status};
+      providerItemsAbsent:!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent&&snapshot.actionPlan.comments.length===0
+        &&snapshot.crossProfileEvidence?.knownIdentitiesAbsentFromCurrentProviders===true,
+      stateRowsAbsent:snapshot.inventory.length===0
+        &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
+      operationFingerprint:op.previewFingerprint,
+      recoveryStatus:op.recovery?.status,
+      ...(snapshot.crossProfileEvidence?{crossProfileEvidence:snapshot.crossProfileEvidence}:{})};
     const fingerprint=digest({operationId:id,profile:op.profile,epoch:control.epoch,
       fence:control.fence,hasJournal:Boolean(control.journal),
       lifecycle:op.lifecycle,operationFingerprint:op.previewFingerprint,
       mappingInventory:mappings.sort((a,b)=>a.id.localeCompare(b.id)),mappingStates,
-      snapshotFingerprint:snapshot.previewFingerprint,classification});
+      snapshotFingerprint:snapshot.previewFingerprint,
+      crossProfileEvidenceFingerprint:snapshot.crossProfileEvidence?.evidenceFingerprint,classification});
     return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal)};
   }
 

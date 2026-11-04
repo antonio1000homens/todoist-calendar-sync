@@ -14,16 +14,21 @@ import {
 import type {CalendarEvent, Mapping, Profile, TodoistTask} from "./types.js";
 
 type Side="calendar"|"todoist";
-const calendarWrites=new Set([
+/** Identity-bearing provider mutation surface reviewed for replay admission. */
+export const REPLAY_GUARDED_PROVIDER_WRITES={
+  calendar:[
   "createFutureMasterOnce","upsertEvent","patchEventMetadataIfUnchanged",
   "createRepairEventOnce","upsertEventIfUnchanged",
   "updateSharedEventPropertiesIfUnchanged","deleteEvent","deleteEventIfUnchanged",
-]);
-const todoistWrites=new Set([
+  ],
+  todoist:[
   "upsertTask","updateTaskMetadata","createTaskOnce","moveTask",
   "updateRecurringOccurrence","deleteTask","createProjectComment",
   "updateComment","upsertProjectComment","upsertComment","deleteComment",
-]);
+  ],
+} as const;
+const calendarWrites=new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.calendar);
+const todoistWrites=new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.todoist);
 const active=new WeakSet<object>();
 function ids(values:unknown[]):string[] {
   return [...new Set(values.filter((value):value is string=>typeof value==="string"&&value.length>0))];
@@ -123,8 +128,11 @@ function guardClient<T extends object>(profile:Profile,side:Side,target:T):T {
   active.add(proxy);
   return proxy;
 }
+export function guardReplayCalendarClient<T extends object>(profile:Profile,target:T):T {
+  return guardClient(profile,"calendar",target);
+}
 /** Wrap BOTH production and injected/mock factories; repeated wrapping is idempotent. */
 export function guardReplayProviderClients<T extends {calendar:object;todoist:object}>(profile:Profile,clients:T):T {
-  return {...clients,calendar:guardClient(profile,"calendar",clients.calendar),
+  return {...clients,calendar:guardReplayCalendarClient(profile,clients.calendar),
     todoist:guardClient(profile,"todoist",clients.todoist)};
 }

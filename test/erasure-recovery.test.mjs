@@ -8,6 +8,18 @@ const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
 
+function verifiedCurrentProviderAbsence(){
+  return {
+    phase:"read_only_cross_profile_observation",eligibleForPostWriteRelease:false,
+    allProfilesQueried:true,closureComplete:true,knownIdentitiesAbsentFromCurrentProviders:true,
+    stateScan:{stronglyConsistent:true,allPagesReceived:true,rowCount:0,relatedRowCount:0,
+      fingerprint:"a".repeat(64),tableFingerprint:"b".repeat(64)},
+    identities:{taskCount:1,eventCount:1,seriesCount:0,overflowCount:0,fingerprint:"c".repeat(64)},
+    profiles:{},evidenceFingerprint:"d".repeat(64),
+    missingProof:["Unknown historical aliases and required independent review remain"],
+  };
+}
+
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},
@@ -167,6 +179,7 @@ test("strong exact postflight is a read-only candidate only with an original del
     operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],
     actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    crossProfileEvidence:verifiedCurrentProviderAbsence(),
   };
   snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
   f.external.snapshot=snapshot;
@@ -384,7 +397,8 @@ function fullyDeletedPostWriteFixture(options={}) {
   f.external.mappingStates.set(enabledId,"Enabled");
   const snapshot={operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],actionPlan:{comments:[]},
-    providerSnapshotFingerprint:"9".repeat(64),blockers:[]};
+    providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    crossProfileEvidence:verifiedCurrentProviderAbsence()};
   snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
   f.external.snapshot=snapshot;
   return f;

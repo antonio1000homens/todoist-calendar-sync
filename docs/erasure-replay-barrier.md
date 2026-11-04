@@ -101,13 +101,13 @@ the following entrypoints **before** post-write recovery is allowed:
 | --- | --- | --- |
 | `src/worker.ts`, `src/handler.ts`, `src/queue.ts` | delivery admission, retries, old epochs, orphan and manual payloads | reject old epochs and new-epoch delayed admission; test old qualified Lambda versions |
 | `src/sync.ts` | `todoist.upsertTask`, `calendar.upsertEvent`, `upsertComment`, recurrence rebind | check full task/event/master/instance identity under writer lease |
-| `src/reconciliation.ts` | `upsertTask`, `upsertEvent`, comment/mapping save | check both snapshot and action-time identities |
+| `src/reconciliation.ts`, `src/canonical-identity.ts`, `src/completed-history-cleanup.ts` | `upsertTask`, `upsertEvent`, comment/mapping/baseline/canonical identity save or cleanup, terminal history retirement | check both snapshot and action-time identities; DDB baseline/canonical/history rows check task/event replay markers at their write boundary; terminal history retirement holds a profile writer lease through its transaction |
 | `src/calendar-reconciliation.ts` | standalone and recurring Todoist creation/rebind, mapping creation | check event, series and linked task aliases |
 | `src/project-sync.ts` | source/destination projections, cross-profile moves, recurrence migration | check source AND destination before any provider or DynamoDB write |
 | `src/orphan-recovery.ts` | orphan reattachment and state re-mapping | check both sides before repair and putMapping |
 | `src/repair-provider-guard.ts`, `src/review-engine.ts`, `src/manual-intervention.ts` | approved repair creation and replay/DLQ resumes | check against newly fresh provider state; never trust an old preview |
 | `src/repository.ts` | `putMapping`, `putNewRecurrenceMappingIfUnowned`, `putRecurrenceLink`, mapping comment indexes | guard all mapping and recurrence write routes |
-| `src/providers.ts`, `src/mutation-budget.ts` | `createTaskOnce`, `createRepairEventOnce`, `createFutureMasterOnce`, `upsertTask`, `upsertEvent`, metadata edits | enforce in production client factories AND test alternate/mock factories |
+| `src/providers.ts`, `src/mutation-budget.ts`, `src/completed-project-comment-cleanup.ts` | `createTaskOnce`, `createRepairEventOnce`, `createFutureMasterOnce`, `upsertTask`, `upsertEvent`, metadata edits, operator-only project-comment cleanup | enforce in production client factories AND test alternate/mock factories; bare comment deletion must fail closed when owner identity is unavailable |
 | `src/erasure-deletion.ts`, `src/erasure-recovery.ts`, `src/erasure-worker.ts` | deletion steps, independent readback, mapping restore and final fence release | independent strongly consistent postflight and atomic release |
 | `src/erasure-preview.ts`, `src/erasure-recovery-adapters.ts` | full DynamoDB inventory plus direct provider/comments reads | verify every scan page; fail closed on unknown aliases and recurrence |
 
@@ -233,25 +233,71 @@ pages, rejects repeated page tokens, conflicting duplicate event snapshots,
 invalid pages and missing event IDs. It does not mutate Calendar data.
 
 `observeCrossProfileCalendarAliases` accepts independently configured
-per-profile readers and **requires fresh successful reads for home, antonio
-and work**. It records exact observed event IDs, cancelled aliases and
-recurrence parent *hints* without exposing a release-authoritative
-`calendarAliases` property.
+per-profile readers and requires fresh successful reads for home, antonio and
+work. For indexed recurring links it reads exact masters and every instance
+page, including cancellations and exceptions, with a 32-ID bound.
 
-These reads are **insufficient** for marker installation or fence release.
-The Google sharedExtendedProperty filter can omit historic/untagged links,
-series instances, legacy comments and mapping records. Even a successful
-empty result in one profile is only an observation, **never** proof of
-absence. The collector does not scan DynamoDB, independently resolve
-Todoist/comment ownership, validate source and destination recurrence
-masters, compare direct provider ETags, or confirm leases/epochs.
+The post-write inspection now also calls
+`observeCrossProfileErasureEvidence`. It consumes the already completed
+strongly consistent, fully paginated DynamoDB scan and independently reads all
+three profiles' comments from every active project, archived personal project
+and archived workspace project, active Todoist task inventory, full unfiltered
+Calendar event inventory, a full Todoist Sync `notes` snapshot for task
+comments, tagged event lookup, exact candidate events and recurring instances.
+The task-comment snapshot must report `full_sync:true`, a sync token and a
+parseable `full_sync_date_utc`; snapshots older than five minutes do not prove
+current absence. Comments for known task IDs are also read directly and
+compared with the snapshot. Project and comment pages are bounded and strictly
+validated; an inaccessible workspace archive refuses the inventory. The report
+binds a fingerprint of the full project ID/workspace inventory without returning
+those IDs. It follows identity fields from mapping,
+completed and audit rows plus parsed comments; it does not match titles or
+dates. DynamoDB, Calendar, task and comment pagination reject repeated cursors,
+invalid identities and conflicting duplicate snapshots. The inspection binds
+the read-only evidence fingerprint into its fresh inspection fingerprint.
+Todoist's [Get Comments endpoint](https://developer.todoist.com/api/v1/)
+requires exactly one project or task ID. The [Sync API full read](https://developer.todoist.com/api/v1/)
+also returns `notes` (task comments), which this audit uses to discover comments
+on tasks whose IDs were not known before the read.
+
+The report returns counts and SHA-256 fingerprints only, with no task/event
+IDs, titles, descriptions or comment bodies. A `knownIdentitiesAbsentFromCurrentProviders`
+result requires all three profiles' complete provider inventories, no related
+provider comments, and a closed identity walk; a 404/410 response alone never
+sets it. An oversized or
+nonconvergent identity walk remains incomplete. The result always sets
+`eligibleForPostWriteRelease:false`, has explicit blockers, and deliberately
+has no `calendarAliases` field accepted by the offline transaction
+constructor.
+
+These reads still do not prove historical aliases that have no provider tag,
+state row or comment provenance, nor do they establish a transactionally
+consistent provider/DynamoDB snapshot. Direct ETags and ownership must be
+rechecked at action time. Old Lambda versions, IAM invoke paths, writer
+fence/lease invariants, privacy approval and Work-profile staging remain
+independent gates.
 
 **No deployed worker/API imports this observation as authorisation.** A
 future privileged verifier must reconcile these observations with fully
-paginated strong DynamoDB state, all project/task comments, direct Todoist
-and Calendar item/master/instance reads in every profile, old versions and
-new independent operator confirmation before calling
+paginated strong DynamoDB state, every accessible project comment and task
+comments from a recent full Sync read plus direct reads for discovered task
+identities, direct Todoist and Calendar
+item/master/instance reads in every profile, old versions and new independent
+operator confirmation before calling
 `atomicReplayRelease()`. Any missing provenance keeps the fence in place.
+
+Calendar inventory now paginates each profile's CalendarList, including hidden
+entries, and scans event details for entries with sufficient access. A
+free/busy-only calendar or a calendar that hides private events blocks complete
+coverage. Google's CalendarList API returns calendars on the user's calendar
+list; it does not prove there are no other calendars reachable only by a known
+calendar ID. That direct-ID ACL scope still needs independent source/destination
+calendar provenance. Untagged events still cannot be associated with an erased
+identity from title or date alone. Todoist's full Sync `notes` snapshot is
+generated separately from the project, task and DynamoDB reads, and large
+accounts may receive a delayed full-sync timestamp. Direct ETag and action-time
+checks are still required. These limitations prevent the observation from
+establishing complete cross-profile absence.
 
 This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
