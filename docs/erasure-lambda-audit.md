@@ -4,12 +4,16 @@ This is a source+deployment audit aid, NOT erasure recovery authorisation. It re
 all published Lambda versions, aliases and weighted targets, event-source
 mappings in the selected region, resource invocation policies and Function URLs.
 It does not call any AWS mutation or invoke providers.
-Resource-policy summaries include only bounded wildcard-action/Function-URL
-booleans and omit policy text and principals.
+Resource-policy summaries include bounded wildcard-action/Function-URL booleans
+and per-qualifier principal counts (same-account, external AWS, unknown AWS,
+service, federated, wildcard, and unknown principal statements). They omit
+policy text and principal values. Counts are classification aids, not an
+effective-permissions calculation; conditions, `NotPrincipal`, IAM identity
+policies, Organizations policies and service trust still require review.
 
 ## Run
 
-node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=eu-west-2 > lambda-inventory.json
+node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=eu-west-2 --profile=<profile> --expected-account=<12-digit-account> > lambda-inventory.json
 
 The region here is only an example. Run for the actual region, each account,
 stage and legacy prefix where these functions might have been deployed. Use an

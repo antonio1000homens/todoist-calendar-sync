@@ -39,6 +39,47 @@ function actionMayMatch(statement,action) {
   if(Object.hasOwn(statement,"NotAction"))return !asArray(statement.NotAction).some(item=>actionMatches(item,action));
   return true;
 }
+function principalEntries(value) {
+  if(typeof value==="string")return [value];
+  if(Array.isArray(value))return value.filter(item=>typeof item==="string");
+  return [];
+}
+function principalAccountId(value) {
+  if(/^\d{12}$/.test(value))return value;
+  return /^arn:[^:]+:iam::(\d{12}):/.exec(value)?.[1]??null;
+}
+function resourcePolicyPrincipalSummary(statements,accountId) {
+  const counts={wildcardPrincipalStatementCount:0,sameAccountAwsPrincipalCount:0,
+    externalAwsPrincipalCount:0,unknownAwsPrincipalCount:0,servicePrincipalCount:0,
+    federatedPrincipalCount:0,unknownPrincipalStatementCount:0,
+    externalInvokeFunctionAllowCount:0,externalInvokeFunctionUrlAllowCount:0,
+    externalInvokeAsyncAllowCount:0};
+  for(const statement of statements) {
+    const principal=statement?.Principal;
+    if(wildcardPrincipal(principal))counts.wildcardPrincipalStatementCount++;
+    const aws=typeof principal==="string"&&principal!=="*"?[principal]:
+      principalEntries(typeof principal==="object"&&!Array.isArray(principal)?principal.AWS:undefined);
+    const services=principalEntries(typeof principal==="object"&&!Array.isArray(principal)?principal.Service:undefined);
+    const federated=principalEntries(typeof principal==="object"&&!Array.isArray(principal)?principal.Federated:undefined);
+    counts.servicePrincipalCount+=services.length;
+    counts.federatedPrincipalCount+=federated.length;
+    let hasExternal=false;
+    for(const entry of aws) {
+      const id=principalAccountId(entry);
+      if(!id) counts.unknownAwsPrincipalCount++;
+      else if(accountId&&id===accountId)counts.sameAccountAwsPrincipalCount++;
+      else {counts.externalAwsPrincipalCount++;hasExternal=true;}
+    }
+    if(statement?.NotPrincipal!==undefined||(!principal&&services.length===0&&federated.length===0&&aws.length===0))
+      counts.unknownPrincipalStatementCount++;
+    if(statement?.Effect==="Allow"&&hasExternal) {
+      if(actionMayMatch(statement,"lambda:InvokeFunction"))counts.externalInvokeFunctionAllowCount++;
+      if(actionMayMatch(statement,"lambda:InvokeFunctionUrl"))counts.externalInvokeFunctionUrlAllowCount++;
+      if(actionMayMatch(statement,"lambda:InvokeAsync"))counts.externalInvokeAsyncAllowCount++;
+    }
+  }
+  return counts;
+}
 
 export function expectedTemplateFunctions(template,prefix,stage) {
   const start="$"+"{ResourceNamePrefix}-";
@@ -76,7 +117,7 @@ export async function pages(client,Command,key,inputs={}) {
   throw new Error("Lambda pagination exceeded limit; incomplete inventory");
 }
 
-async function policySummary(client,name,qualifier) {
+async function policySummary(client,name,qualifier,accountId) {
   try {
     const input={FunctionName:name,...(qualifier?{Qualifier:qualifier}:{})};
     const response=await client.send(new GetPolicyCommand(input));
@@ -97,11 +138,13 @@ async function policySummary(client,name,qualifier) {
       wildcardInvokeFunctionAllowPresent:wildcardAllows("lambda:InvokeFunction"),
       wildcardInvokeFunctionUrlAllowPresent:wildcardAllows("lambda:InvokeFunctionUrl"),
       wildcardInvokeFunctionUrlNoneAllowPresent:urlAction,
-      wildcardInvokeFunctionViaUrlAllowPresent:invokeViaUrl};
+      wildcardInvokeFunctionViaUrlAllowPresent:invokeViaUrl,
+      resourcePolicyPrincipals:resourcePolicyPrincipalSummary(statements,accountId)};
   } catch(error) {
     if(error?.name==="ResourceNotFoundException")return {statementCount:0,wildcardPrincipalPresent:false,
       wildcardInvokeFunctionAllowPresent:false,wildcardInvokeFunctionUrlAllowPresent:false,
-      wildcardInvokeFunctionUrlNoneAllowPresent:false,wildcardInvokeFunctionViaUrlAllowPresent:false};
+      wildcardInvokeFunctionUrlNoneAllowPresent:false,wildcardInvokeFunctionViaUrlAllowPresent:false,
+      resourcePolicyPrincipals:resourcePolicyPrincipalSummary([],accountId)};
     throw error;
   }
 }
@@ -123,7 +166,7 @@ function sourceService(arn) {
   return pieces.length>2?pieces[2]:"unknown";
 }
 
-export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) {
+export async function collectLambdaInventory(client,{prefix,stage,expected=[],accountId}) {
   if(!NAME.test(prefix)||!NAME.test(stage))throw new Error("Explicit valid prefix/stage are required");
   if(!Array.isArray(expected)||expected.some(n=>typeof n!=="string"))
     throw new Error("Expected Lambda name list is required");
@@ -157,9 +200,9 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) 
       ...versions.map(v=>v.Version).filter(v=>v&&v!=="$LATEST"),
       ...aliases.map(a=>a.Name).filter(Boolean),
     ])].sort();
-    const policyDetails={unqualified:await policySummary(client,f.FunctionName)};
+    const policyDetails={unqualified:await policySummary(client,f.FunctionName,undefined,accountId)};
     for(const qualifier of qualifierNames) {
-      policyDetails[qualifier]=await policySummary(client,f.FunctionName,qualifier);
+      policyDetails[qualifier]=await policySummary(client,f.FunctionName,qualifier,accountId);
     }
     const policies=Object.fromEntries(Object.entries(policyDetails).map(([qualifier,policy])=>[qualifier,{
       statementCount:policy.statementCount,wildcardPrincipalPresent:policy.wildcardPrincipalPresent,
@@ -170,6 +213,8 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) 
       wildcardInvokeFunctionUrlNoneAllowPresent:policy.wildcardInvokeFunctionUrlNoneAllowPresent,
       wildcardInvokeFunctionViaUrlAllowPresent:policy.wildcardInvokeFunctionViaUrlAllowPresent,
     }]));
+    const resourcePolicyPrincipals=Object.fromEntries(Object.entries(policyDetails)
+      .map(([qualifier,policy])=>[qualifier,policy.resourcePolicyPrincipals]));
     const urls={unqualified:await functionUrlSummary(client,f.FunctionName)};
     for(const alias of aliases) {
       if(!alias.Name)throw new Error("Alias with no name: "+f.FunctionName);
@@ -190,7 +235,7 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) 
           m.FunctionArn.slice(f.FunctionArn.length+1),
         state:m.State??"UNKNOWN",sourceService:sourceService(m.EventSourceArn),
       })),
-      policies,functionUrlPolicies,urls,
+      policies,functionUrlPolicies,resourcePolicyPrincipals,urls,
       // IAM identity policies, legacy functions and direct invocations are not
       // established by these read-only Lambda APIs.
       approvedForReplayRelease:false,
@@ -238,7 +283,7 @@ export async function main(argv=process.argv.slice(2)) {
   const expected=expectedTemplateFunctions(template,prefix,stage);
   const client=new LambdaClient({region,profile,maxAttempts:5});
   try {
-    const report=await collectLambdaInventory(client,{prefix,stage,expected});
+    const report=await collectLambdaInventory(client,{prefix,stage,expected,accountId:identity.Account});
     process.stdout.write(JSON.stringify({region,verifiedAccount:identity.Account,...report},null,2)+"\n");
     // Inventory is never proof of safe erasure or authorisation to release.
     // Non-zero by design: fail closed for automation/CI consumers.
