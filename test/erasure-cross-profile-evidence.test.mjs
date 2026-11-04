@@ -93,7 +93,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.equal(report.profiles.work.calendarInventoryComplete,false);
   assert.ok(calendarDirectReads.some(read=>read.profile==="work"&&read.id===eventTwo&&read.calendarId==="shared-work"),
     "a tagged task event in a secondary accessible calendar is directly read using that calendar ID");
-  assert.equal(report.closureComplete,true);
+  assert.equal(report.closureComplete,true,JSON.stringify({profiles:report.profiles,missingProof:report.missingProof}));
   assert.equal(report.allAccessibleCalendarCoverageProven,false,
     "CalendarList cannot prove coverage of directly addressable calendars outside the user's list");
   assert.equal(report.knownIdentitiesAbsentFromCurrentProviders,false);
