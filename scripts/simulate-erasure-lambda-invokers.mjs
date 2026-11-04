@@ -77,7 +77,7 @@ function functionUrlInventory(inventory,accountId,partition) {
       if(url===null)continue;
       if(!url||typeof url!=="object"||!['AWS_IAM','NONE'].includes(url.authType))
         throw new Error("Malformed Lambda Function URL configuration");
-      const policy=fn.policies?.[qualifier.name==="unqualified"?"unqualified":qualifier.name];
+      const policy=fn.functionUrlPolicies?.[qualifier.name==="unqualified"?"unqualified":qualifier.name];
       targets.push({...qualifier,functionName:fn.name,authType:url.authType,
         wildcardUrlInvokeAllow:policy?.wildcardInvokeFunctionUrlNoneAllowPresent===true,
         wildcardFunctionInvokeViaUrlAllow:policy?.wildcardInvokeFunctionViaUrlAllowPresent===true});

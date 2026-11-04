@@ -157,10 +157,19 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) 
       ...versions.map(v=>v.Version).filter(v=>v&&v!=="$LATEST"),
       ...aliases.map(a=>a.Name).filter(Boolean),
     ])].sort();
-    const policies={unqualified:await policySummary(client,f.FunctionName)};
+    const policyDetails={unqualified:await policySummary(client,f.FunctionName)};
     for(const qualifier of qualifierNames) {
-      policies[qualifier]=await policySummary(client,f.FunctionName,qualifier);
+      policyDetails[qualifier]=await policySummary(client,f.FunctionName,qualifier);
     }
+    const policies=Object.fromEntries(Object.entries(policyDetails).map(([qualifier,policy])=>[qualifier,{
+      statementCount:policy.statementCount,wildcardPrincipalPresent:policy.wildcardPrincipalPresent,
+    }]));
+    const functionUrlPolicies=Object.fromEntries(Object.entries(policyDetails).map(([qualifier,policy])=>[qualifier,{
+      wildcardInvokeFunctionAllowPresent:policy.wildcardInvokeFunctionAllowPresent,
+      wildcardInvokeFunctionUrlAllowPresent:policy.wildcardInvokeFunctionUrlAllowPresent,
+      wildcardInvokeFunctionUrlNoneAllowPresent:policy.wildcardInvokeFunctionUrlNoneAllowPresent,
+      wildcardInvokeFunctionViaUrlAllowPresent:policy.wildcardInvokeFunctionViaUrlAllowPresent,
+    }]));
     const urls={unqualified:await functionUrlSummary(client,f.FunctionName)};
     for(const alias of aliases) {
       if(!alias.Name)throw new Error("Alias with no name: "+f.FunctionName);
@@ -181,7 +190,7 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[]}) 
           m.FunctionArn.slice(f.FunctionArn.length+1),
         state:m.State??"UNKNOWN",sourceService:sourceService(m.EventSourceArn),
       })),
-      policies,urls,
+      policies,functionUrlPolicies,urls,
       // IAM identity policies, legacy functions and direct invocations are not
       // established by these read-only Lambda APIs.
       approvedForReplayRelease:false,
