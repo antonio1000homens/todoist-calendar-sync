@@ -56,6 +56,21 @@ test("decision context provider IDs are checked before a review case can be seed
   assert.equal(calls.length, 1, "no review state read or write may follow the marker hit");
 });
 
+test("mapping snapshot recurrence aliases are checked before a decision is persisted", async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", "erased-master-alias")) return { Item: { markerVersion: 1 } };
+    return {};
+  });
+  const mapping = {profile:"home",taskId:"safe-task",eventId:"safe-occurrence",masterEventId:"erased-master-alias",
+    activeInstanceId:"safe-occurrence",seriesId:"erased-master-alias",updatedAt:new Date().toISOString()};
+  await assert.rejects(new ReviewStore().observeDecision(decision({mappingSnapshot:mapping})), ErasureReplayBlockedError);
+  assert.equal(calls.length, 3, "both task and occurrence are checked before the erased master blocks persistence");
+});
+
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {
   enableBarrier(t);
   const calls = [];

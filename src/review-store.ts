@@ -48,9 +48,21 @@ export class ReviewStore {
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const context = decision.context || {};
+    const contextIds = retainedAuditProviderIds(context);
+    const taskIds = new Set([...contextIds.taskIds,
+      ...(decision.taskId ? [decision.taskId] : []),
+      ...(decision.mappingSnapshot?.taskId ? [decision.mappingSnapshot.taskId] : []),
+    ]);
+    const eventIds = new Set([...contextIds.eventIds,
+      ...[decision.eventId, decision.masterEventId, decision.activeInstanceId, decision.seriesId,
+        decision.mappingSnapshot?.eventId, decision.mappingSnapshot?.masterEventId,
+        decision.mappingSnapshot?.activeInstanceId, decision.mappingSnapshot?.seriesId]
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    ]);
+    for (const taskId of taskIds) await admitReviewIdentity(decision.profile, taskId);
+    for (const eventId of eventIds) await admitReviewIdentity(decision.profile, undefined, eventId);
     const taskId = decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined);
     const eventId = decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined);
-    await admitReviewIdentity(decision.profile, taskId, eventId);
     const id = decision.decisionId, existing = await this.getCase(id);
     const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
     if (existing) {
