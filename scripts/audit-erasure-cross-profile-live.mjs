@@ -65,10 +65,11 @@ export function validateRoutingConfig(value) {
 export function redactedFailureCode(error) {
   const message=typeof error?.message==="string"?error.message:"";
   if(error?.name==="CalendarRecurrenceLimitAuditError"
-    &&typeof error.matchesSelectedEvent==="boolean")
+    &&typeof error.matchesSelectedEvent==="boolean") {
     return error.matchesSelectedEvent
       ?"CALENDAR_RECURRENCE_ALIAS_LIMIT_SELECTED_EVENT"
       :"CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER";
+  }
   if(message==="Calendar recurring series exceeds replay marker bound")
     return "CALENDAR_RECURRENCE_ALIAS_LIMIT";
   if(message==="Calendar full inventory exceeded the audit result limit")
@@ -81,6 +82,43 @@ export function redactedFailureCode(error) {
   if(error instanceof Error&&error.name==="ErasurePreviewDeadlineError")
     return "STATE_INVENTORY_DEADLINE";
   return "UNCLASSIFIED";
+}
+
+export function redactedFailureDetails(error) {
+  if(error?.name!=="CalendarRecurrenceLimitAuditError")return {};
+  const allowedOrigins=new Set(["state-row","task-comment","task-comment-read","calendar-task-tag",
+    "calendar-event-identity","calendar-parent-link","calendar-history-master","calendar-series-index",
+    "calendar-direct-read-parent","calendar-task-tag-parent","calendar-recurrence-instance"]);
+  const originPattern=/^project-comment-(event-id|master-event-id|active-instance-id)-(selected-task|other-task)-(home|antonio|work)$/;
+  const allowedFamilies=new Set(["TASK","EVENT","TASKOWNER","MAPPING","RECURRENCE",
+    "CANONICAL","ERASURE","DELIVERY","MANUAL","ORPHAN","SYNC"]);
+  const allowedFields=new Set(["taskId","providerTaskId","linkedTaskId","discardedTaskId","retainedTaskId",
+    "ownerTaskId","eventId","providerEventId","masterEventId","activeInstanceId","calendarProjectionId",
+    "oldMasterId","newMasterId","lastEventId","occurrenceId","selectedEventId","previousEventId",
+    "cancelledEventId","syncHistoryMasterId","candidateTaskIds","taskIds","candidateEventIds","eventIds",
+    "seriesId","seriesIds"]);
+  const allowedDeliveryKinds=new Set(["calendar","todoist","manual","orphan","reconcile","repair","erasure","other"]);
+  const strings=(value,allowed)=>Array.isArray(value)?[...new Set(value.filter(item=>allowed.has(item)))].sort():[];
+  const origins=Array.isArray(error.auditOriginKinds)
+    ?[...new Set(error.auditOriginKinds.filter(value=>allowedOrigins.has(value)||originPattern.test(value)))].sort():[];
+  const details={
+    selectedEvent:Boolean(error.matchesSelectedEvent),
+    ...(typeof error.auditProfile==="string"&&["home","antonio","work"].includes(error.auditProfile)
+      ?{profile:error.auditProfile}:{}),
+    relationOrigins:origins,
+    stateFamilies:strings(error.auditStateFamilies,allowedFamilies),
+    stateReferenceFields:strings(error.auditStateRefFields,allowedFields),
+    deliveryKinds:strings(error.auditDeliveryKinds,allowedDeliveryKinds),
+  };
+  for(const [name,value] of [["otherTaskMappingCount",error.auditOtherTaskMappingCount],
+    ["activeOtherTaskMappingCount",error.auditActiveOtherTaskMappingCount],
+    ["taggedEventCount",error.auditTaggedEventCount],
+    ["taggedRecurringMasterCount",error.auditTaggedRecurringMasterCount],
+    ["deliveryRowCount",error.auditDeliveryRowCount],
+    ["deliveryRowsWithSelectedTask",error.auditDeliveryRowsWithSelectedTask],
+    ["deliveryRowsWithSelectedEvent",error.auditDeliveryRowsWithSelectedEvent]])
+    if(Number.isSafeInteger(value)&&value>=0)details[name]=value;
+  return details;
 }
 
 function verifiedCliIdentity(profile) {
@@ -117,7 +155,7 @@ function selectReadMethods(instance,names,optional=[]) {
   return Object.freeze(selected);
 }
 
-export function readOnlyProviderPair(clients,selectedEventId) {
+export function readOnlyProviderPair(clients,selectedEventId,profile) {
   const selectedCalendar=selectReadMethods(clients.calendar,[
     "findByTodoistTaskId","getEvent","listAllEventsForErasureAudit",
     "listCalendarListForErasureAudit","listEventInstances","listLinkedEventsByTodoistTaskId",
@@ -130,6 +168,18 @@ export function readOnlyProviderPair(clients,selectedEventId) {
         const diagnostic=new Error("Calendar recurrence alias bound exceeded");
         diagnostic.name="CalendarRecurrenceLimitAuditError";
         diagnostic.matchesSelectedEvent=masterId===selectedEventId;
+        diagnostic.auditProfile=profile;
+        const origins=Array.isArray(error.auditOriginKinds)?error.auditOriginKinds:[];
+        diagnostic.auditOriginKinds=origins.filter(value=>typeof value==="string");
+        const families=Array.isArray(error.auditStateFamilies)?error.auditStateFamilies:[];
+        diagnostic.auditStateFamilies=families.filter(value=>typeof value==="string");
+        const fields=Array.isArray(error.auditStateRefFields)?error.auditStateRefFields:[];
+        diagnostic.auditStateRefFields=fields.filter(value=>typeof value==="string");
+        for(const field of ["auditOtherTaskMappingCount","auditActiveOtherTaskMappingCount",
+          "auditTaggedEventCount","auditTaggedRecurringMasterCount","auditDeliveryRowCount",
+          "auditDeliveryRowsWithSelectedTask","auditDeliveryRowsWithSelectedEvent"])
+          diagnostic[field]=Number.isSafeInteger(error[field])?error[field]:undefined;
+        diagnostic.auditDeliveryKinds=Array.isArray(error.auditDeliveryKinds)?error.auditDeliveryKinds:[];
         throw diagnostic;
       }
       throw error;
@@ -185,7 +235,7 @@ export async function collectLiveCrossProfileEvidence(options) {
     import(new URL("../dist/mutation-budget.js",import.meta.url).href),
   ]);
   const providerFactory=async profile=>readOnlyProviderPair(
-    await defaultProviderClientFactory(profile),options.eventId);
+    await defaultProviderClientFactory(profile),options.eventId,profile);
   const preview=await buildErasurePreview({profile:"work",taskId:options.taskId,eventId:options.eventId,deleteCalendar:true},{
     scanDeadlineMs:options.scanDeadlineMs,
     auditCrossProfileIdentity:true,
@@ -219,8 +269,9 @@ export async function main(argv=process.argv.slice(2)) {
 
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
   main().catch(error=>{
-    process.stderr.write("Live cross-profile evidence INCOMPLETE; failureCode="
-      +redactedFailureCode(error)+"; provider IDs and credentials withheld.\n");
+    process.stderr.write(JSON.stringify({status:"Live cross-profile evidence INCOMPLETE",
+      failureCode:redactedFailureCode(error),details:redactedFailureDetails(error),
+      providerIdsAndCredentials:"withheld"})+"\n");
     process.exitCode=2;
   });
 }

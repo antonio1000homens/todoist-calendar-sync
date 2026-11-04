@@ -117,6 +117,26 @@ function rowMatches(row:Record<string,unknown>,tasks:Set<string>,events:Set<stri
   return [...rowTasks].some(id=>tasks.has(id))||[...rowEvents].some(id=>events.has(id))
     ||[...rowSeries].some(id=>series.has(id));
 }
+function valueContainsIdentity(value:unknown,identity:string,depth=0):boolean {
+  if(depth>12)return false;
+  if(typeof value==="string")return value===identity;
+  if(Array.isArray(value))return value.some(child=>valueContainsIdentity(child,identity,depth+1));
+  if(value&&typeof value==="object")
+    return Object.values(value as Record<string,unknown>).some(child=>valueContainsIdentity(child,identity,depth+1));
+  return false;
+}
+function identityFieldNames(value:unknown,identity:string,key="",depth=0):Set<string> {
+  if(depth>24)return new Set();
+  if(typeof value==="string")return value===identity&&key?new Set([key]):new Set();
+  if(Array.isArray(value))return new Set(value.flatMap(child=>[...identityFieldNames(child,identity,key,depth+1)]));
+  if(value&&typeof value==="object") {
+    const names=new Set<string>();
+    for(const [childKey,child] of Object.entries(value as Record<string,unknown>))
+      for(const name of identityFieldNames(child,identity,childKey,depth+1))names.add(name);
+    return names;
+  }
+  return new Set();
+}
 function boundIds(set:Set<string>,overflow:{count:number}):void {
   if(set.size<=MAX_IDENTITIES)return;
   const retained=[...set].slice(0,MAX_IDENTITIES);
@@ -144,12 +164,20 @@ export async function observeCrossProfileErasureEvidence(input:{
     throw new Error("Exact erased identity, complete state rows and all-profile readers are required");
   const taskIds=new Set<string>([input.taskId]);
   const eventIds=new Set<string>(input.eventId?[input.eventId]:[]);
+  const eventIdOrigins=new Map<string,Set<string>>();
+  if(input.eventId)eventIdOrigins.set(input.eventId,new Set(["selected-event"]));
   const seriesIds=new Set<string>();
   const overflow={count:0};
   const add=(set:Set<string>,value:unknown)=>{
     if(!validId(value)||set.has(value))return false;
     if(set.size>=MAX_IDENTITIES){overflow.count++;return false;}
     set.add(value);return true;
+  };
+  const addEventId=(value:unknown,origin:string)=>{
+    if(!validId(value))return false;
+    const origins=eventIdOrigins.get(value)||new Set<string>();
+    origins.add(origin);eventIdOrigins.set(value,origins);
+    return add(eventIds,value);
   };
   const profileReaders={} as Record<Profile,ProviderPair>;
   const projects={} as Record<Profile,TodoistCommentRecord[]>;
@@ -324,7 +352,12 @@ export async function observeCrossProfileErasureEvidence(input:{
       const key=JSON.stringify([row.pk,row.sk]);
       if(!matchedState.has(key)){matchedState.set(key,row);changed=true;}
       const before=taskIds.size+eventIds.size;
+      const previousEventIds=new Set(eventIds);
       rowRefs(row,taskIds,eventIds,seriesIds);
+      for(const eventId of eventIds)if(!previousEventIds.has(eventId)) {
+        const origins=eventIdOrigins.get(eventId)||new Set<string>();
+        origins.add("state-row");eventIdOrigins.set(eventId,origins);
+      }
       boundIds(taskIds,overflow);boundIds(eventIds,overflow);boundIds(seriesIds,overflow);
       if(taskIds.size+eventIds.size>before)changed=true;
     }
@@ -338,8 +371,11 @@ export async function observeCrossProfileErasureEvidence(input:{
           &&!(item.payload.masterEventId&&eventIds.has(item.payload.masterEventId))
           &&!(item.payload.activeInstanceId&&eventIds.has(item.payload.activeInstanceId)))continue;
         const before=taskIds.size+eventIds.size;
-        add(taskIds,item.payload.taskId);add(eventIds,item.payload.eventId);
-        add(eventIds,item.payload.masterEventId);add(eventIds,item.payload.activeInstanceId);
+        const taskRelation=item.payload.taskId===input.taskId?"selected-task":"other-task";
+        add(taskIds,item.payload.taskId);
+        addEventId(item.payload.eventId,`project-comment-event-id-${taskRelation}-${profile}`);
+        addEventId(item.payload.masterEventId,`project-comment-master-event-id-${taskRelation}-${profile}`);
+        addEventId(item.payload.activeInstanceId,`project-comment-active-instance-id-${taskRelation}-${profile}`);
         add(seriesIds,item.payload.seriesId);
         matched.add("project:"+item.comment.id+":"+fingerprint(item.comment.content||""));
         if(taskIds.size+eventIds.size>before)changed=true;
@@ -358,7 +394,7 @@ export async function observeCrossProfileErasureEvidence(input:{
         if(LEGACY_TASK_COMMENT_MARKERS.has(content.split(/\r?\n/)[0]||"")) {
           const ids=commentEventIds(comment);
           if(ids.length===0)malformedComments.add(profile+"/task-malformed/"+marker);
-          for(const eventId of ids)if(add(eventIds,eventId))changed=true;
+          for(const eventId of ids)if(addEventId(eventId,"task-comment"))changed=true;
         } else if([...taskIds,...eventIds].some(id=>content.includes(id))) {
           unparsedTaskComments.add(profile+"/task-unparsed/"+marker);
         }
@@ -375,23 +411,31 @@ export async function observeCrossProfileErasureEvidence(input:{
     // not only the provider's shared-property index.
     for(const profile of PROFILES) {
       const candidates=new Map<string,CalendarAuditEvent>();
-      const addCandidate=(item:CalendarAuditEvent)=>candidates.set(calendarEventKey(item.calendarId,item.event.id),item);
-      for(const taskId of taskIds)for(const item of calendarByTask[profile].get(taskId)||[])addCandidate(item);
+      const candidateOrigins=new Map<string,Set<string>>();
+      const addCandidate=(item:CalendarAuditEvent,origin:string)=>{
+        const key=calendarEventKey(item.calendarId,item.event.id);
+        candidates.set(key,item);
+        const origins=candidateOrigins.get(key)||new Set<string>();
+        origins.add(origin);candidateOrigins.set(key,origins);
+      };
+      for(const taskId of taskIds)for(const item of calendarByTask[profile].get(taskId)||[])
+        addCandidate(item,"calendar-task-tag");
       for(const eventId of eventIds) {
-        for(const item of calendarByProviderId[profile].get(eventId)||[])addCandidate(item);
-        for(const item of calendarByParent[profile].get(eventId)||[])addCandidate(item);
-        for(const item of calendarByHistoryMaster[profile].get(eventId)||[])addCandidate(item);
+        for(const item of calendarByProviderId[profile].get(eventId)||[])addCandidate(item,"calendar-event-identity");
+        for(const item of calendarByParent[profile].get(eventId)||[])addCandidate(item,"calendar-parent-link");
+        for(const item of calendarByHistoryMaster[profile].get(eventId)||[])addCandidate(item,"calendar-history-master");
       }
-      for(const seriesId of seriesIds)for(const item of calendarBySeries[profile].get(seriesId)||[])addCandidate(item);
-      for(const item of candidates.values()) {
+      for(const seriesId of seriesIds)for(const item of calendarBySeries[profile].get(seriesId)||[])
+        addCandidate(item,"calendar-series-index");
+      for(const [candidateKey,item] of candidates) {
         const event=item.event;
-        const candidateKey=calendarEventKey(item.calendarId,event.id);
         inventoryMatchedIds[profile].add(candidateKey);
         if(event.status==="cancelled")cancelledInventoryIds[profile].add(candidateKey);
-        if(add(eventIds,event.id))changed=true;
+        for(const origin of candidateOrigins.get(candidateKey)||[])
+          if(addEventId(event.id,origin))changed=true;
         if(add(taskIds,event.extendedProperties?.shared?.taskId))changed=true;
-        if(add(eventIds,event.recurringEventId))changed=true;
-        if(add(eventIds,event.extendedProperties?.shared?.syncHistoryMasterId))changed=true;
+        if(addEventId(event.recurringEventId,"calendar-parent-link"))changed=true;
+        if(addEventId(event.extendedProperties?.shared?.syncHistoryMasterId,"calendar-history-master"))changed=true;
         if(add(seriesIds,event.iCalUID))changed=true;
       }
       stats[profile].inventoryMatchedEvents=inventoryMatchedIds[profile].size;
@@ -426,7 +470,7 @@ export async function observeCrossProfileErasureEvidence(input:{
           for(const comment of comments) {
             const content=String(comment.content||"");
             if(LEGACY_TASK_COMMENT_MARKERS.has(content.split(/\r?\n/)[0]||"")) {
-              for(const eventId of commentEventIds(comment))if(add(eventIds,eventId))changed=true;
+              for(const eventId of commentEventIds(comment))if(addEventId(eventId,"task-comment-read"))changed=true;
               matched.add("task:"+comment.id+":"+fingerprint(content));
             } else if([...taskIds,...eventIds].some(id=>content.includes(id))) {
               const marker="task-unparsed:"+comment.id+":"+fingerprint(content);
@@ -451,9 +495,9 @@ export async function observeCrossProfileErasureEvidence(input:{
             if(!event||!validId(event.id)||event.extendedProperties?.shared?.taskId!==taskId)
               throw new Error("Calendar task-link query returned an unattributable event");
             stats[profile].taggedEvents++;
-            if(add(eventIds,event.id))changed=true;
-            if(add(eventIds,event.recurringEventId))changed=true;
-            if(add(eventIds,event.extendedProperties?.shared?.syncHistoryMasterId))changed=true;
+            if(addEventId(event.id,"calendar-task-tag"))changed=true;
+            if(addEventId(event.recurringEventId,"calendar-task-tag-parent"))changed=true;
+            if(addEventId(event.extendedProperties?.shared?.syncHistoryMasterId,"calendar-history-master"))changed=true;
           }
         }
       }
@@ -484,15 +528,68 @@ export async function observeCrossProfileErasureEvidence(input:{
           if(!inventoryEvent||!sameCalendarIdentityVersion(event,inventoryEvent.event))eventReadConflicts.add(eventKey);
           if(typeof event.etag!=="string"||!event.etag)missingEtags.add(eventKey);
           if(add(taskIds,event.extendedProperties?.shared?.taskId))changed=true;
-          if(add(eventIds,event.recurringEventId))changed=true;
-          if(add(eventIds,event.extendedProperties?.shared?.syncHistoryMasterId))changed=true;
+          if(addEventId(event.recurringEventId,"calendar-direct-read-parent"))changed=true;
+          if(addEventId(event.extendedProperties?.shared?.syncHistoryMasterId,"calendar-history-master"))changed=true;
           if(event.recurrence?.length) {
             stats[profile].recurringMasters++;
             const instanceKey=eventKey;
             if(!processedInstances.has(instanceKey)) {
               processedInstances.add(instanceKey);
-              const instances=await profileReaders[profile].calendar.listEventInstances(eventId,
-                calendarId==="configured-calendar-unverified"?undefined:calendarId);
+              let instances:CalendarEvent[];
+              try {
+                instances=await profileReaders[profile].calendar.listEventInstances(eventId,
+                  calendarId==="configured-calendar-unverified"?undefined:calendarId);
+              } catch(error) {
+                if((error as {name?:unknown})?.name==="CalendarRecurrenceLimitAuditError") {
+                  const origins=[...(eventIdOrigins.get(eventId)||[])].sort();
+                  (error as {auditOriginKinds?:string[]}).auditOriginKinds=origins;
+                  (error as {auditProfile?:Profile}).auditProfile=profile;
+                  const safeFamilies=new Set(["TASK","EVENT","TASKOWNER","MAPPING","RECURRENCE",
+                    "CANONICAL","ERASURE","DELIVERY","MANUAL","ORPHAN","SYNC"]);
+                  const families=[...new Set([...matchedState.values()]
+                    .filter(row=>valueContainsIdentity(row,eventId))
+                    .map(row=>String(row.pk||"").split("#",1)[0])
+                    .filter(family=>safeFamilies.has(family)))].sort();
+                  (error as {auditStateFamilies?:string[]}).auditStateFamilies=families;
+                  const safeFields=new Set([...TASK_FIELDS,...EVENT_FIELDS,...TASK_ARRAYS,...EVENT_ARRAYS,"seriesIds"]);
+                  const fields=[...new Set([...matchedState.values()]
+                    .filter(row=>valueContainsIdentity(row,eventId))
+                    .flatMap(row=>[...identityFieldNames(row,eventId)]))]
+                    .filter(field=>safeFields.has(field)).sort();
+                  (error as {auditStateRefFields?:string[]}).auditStateRefFields=fields;
+                  const otherMappings=new Map<string,{profile:Profile;taskId:string}>();
+                  for(const mappedProfile of PROFILES)for(const mapping of projectIndexes[mappedProfile].parsed) {
+                    const payload=mapping.payload;
+                    if(payload.taskId===input.taskId
+                      ||![payload.eventId,payload.masterEventId,payload.activeInstanceId].includes(eventId))continue;
+                    otherMappings.set(mappedProfile+"/"+payload.taskId,{profile:mappedProfile,taskId:payload.taskId});
+                  }
+                  const activeOtherMappings=[...otherMappings.values()].filter(mapping=>
+                    taskInventories[mapping.profile].has(mapping.taskId));
+                  (error as {auditOtherTaskMappingCount?:number}).auditOtherTaskMappingCount=otherMappings.size;
+                  (error as {auditActiveOtherTaskMappingCount?:number}).auditActiveOtherTaskMappingCount=activeOtherMappings.length;
+                  const taggedEvents=new Map<string,CalendarEvent>();
+                  for(const taggedProfile of PROFILES)for(const item of calendarByTask[taggedProfile].get(input.taskId)||[])
+                    taggedEvents.set(calendarEventKey(item.calendarId,item.event.id),item.event);
+                  (error as {auditTaggedEventCount?:number}).auditTaggedEventCount=taggedEvents.size;
+                  (error as {auditTaggedRecurringMasterCount?:number}).auditTaggedRecurringMasterCount=
+                    [...taggedEvents.values()].filter(candidate=>Boolean(candidate.recurrence?.length)).length;
+                  const deliveryRows=[...matchedState.values()].filter(row=>
+                    typeof row.pk==="string"&&row.pk.startsWith("DELIVERY#")&&valueContainsIdentity(row,eventId));
+                  const deliveryRef=(row:Record<string,unknown>,field:"taskIds"|"eventIds",id:string|undefined)=>
+                    id!==undefined&&Array.isArray((row.identityRefs as Record<string,unknown>|undefined)?.[field])
+                    &&((row.identityRefs as Record<string,unknown>)[field] as unknown[]).includes(id);
+                  (error as {auditDeliveryRowCount?:number}).auditDeliveryRowCount=deliveryRows.length;
+                  (error as {auditDeliveryRowsWithSelectedTask?:number}).auditDeliveryRowsWithSelectedTask=
+                    deliveryRows.filter(row=>deliveryRef(row,"taskIds",input.taskId)).length;
+                  (error as {auditDeliveryRowsWithSelectedEvent?:number}).auditDeliveryRowsWithSelectedEvent=
+                    deliveryRows.filter(row=>deliveryRef(row,"eventIds",input.eventId)).length;
+                  const deliveryKinds=[...new Set(deliveryRows.map(row=>row.kind)
+                    .filter((kind):kind is string=>typeof kind==="string"&&/^[a-z][a-z0-9_-]{0,31}$/.test(kind)))].sort();
+                  (error as {auditDeliveryKinds?:string[]}).auditDeliveryKinds=deliveryKinds;
+                }
+                throw error;
+              }
               stats[profile].recurrenceInstances+=instances.length;
               for(const instance of instances) {
                 if(!instance||!validId(instance.id)||instance.recurringEventId!==eventId)
@@ -501,7 +598,7 @@ export async function observeCrossProfileErasureEvidence(input:{
                 if(indexed&&!sameCalendarIdentityVersion(indexed.event,instance))
                   eventReadConflicts.add(profile+"/"+calendarEventKey(calendarId,instance.id));
                 recordCalendarEvent(profile,{calendarId,event:instance});
-                if(add(eventIds,instance.id))changed=true;
+                if(addEventId(instance.id,"calendar-recurrence-instance"))changed=true;
                 if(add(taskIds,instance.extendedProperties?.shared?.taskId))changed=true;
               }
             }

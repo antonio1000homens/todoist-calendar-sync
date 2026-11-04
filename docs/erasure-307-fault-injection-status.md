@@ -62,6 +62,24 @@ closure remains incomplete. No provider deletion, executor, marker, fence
 release, queue action or AWS mutation occurred. The fixture remains staged for
 follow-up; this attempt provides no post-write recovery evidence.
 
+### Bounded recurrence failure provenance (4 Nov 2026)
+
+The connector-created Work task/event pair was rerun through the read-only
+cross-profile capture after adding allowlisted failure diagnostics. The
+selected event was confirmed as a non-recurring one-off, and the capture
+failed closed while expanding a different oversized Calendar master. The
+redacted provenance shows that master was reached through Calendar event
+identity/task-tag edges, other-task project comments in Antonio and Work, and
+a delivery state row. Two mappings for other task identities referenced it,
+but neither task was present in the complete active task inventories. The one
+related delivery row was a reconcile receipt and referenced neither the
+selected task nor selected event. The selected task had one tagged Calendar
+event and no tagged recurring master. These observations identify a stale or
+otherwise unrepresented cross-profile identity conflict; they do not prove
+that the mapping is safe to discard. No provider deletion, recovery,
+reconciliation, queue action, or AWS mutation occurred. The closure remains
+incomplete and recovery remains blocked.
+
 ## Connector-only cross-profile fixture probe (4 Nov 2026)
 
 The configured calendar and Todoist project identifiers were read from the
