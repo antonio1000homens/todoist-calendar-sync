@@ -14,16 +14,21 @@ import {
 import type {CalendarEvent, Mapping, Profile, TodoistTask} from "./types.js";
 
 type Side="calendar"|"todoist";
-const calendarWrites=new Set([
+/** Identity-bearing provider mutation surface reviewed for replay admission. */
+export const REPLAY_GUARDED_PROVIDER_WRITES={
+  calendar:[
   "createFutureMasterOnce","upsertEvent","patchEventMetadataIfUnchanged",
   "createRepairEventOnce","upsertEventIfUnchanged",
   "updateSharedEventPropertiesIfUnchanged","deleteEvent","deleteEventIfUnchanged",
-]);
-const todoistWrites=new Set([
+  ],
+  todoist:[
   "upsertTask","updateTaskMetadata","createTaskOnce","moveTask",
   "updateRecurringOccurrence","deleteTask","createProjectComment",
   "updateComment","upsertProjectComment","upsertComment","deleteComment",
-]);
+  ],
+} as const;
+const calendarWrites=new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.calendar);
+const todoistWrites=new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.todoist);
 const active=new WeakSet<object>();
 function ids(values:unknown[]):string[] {
   return [...new Set(values.filter((value):value is string=>typeof value==="string"&&value.length>0))];

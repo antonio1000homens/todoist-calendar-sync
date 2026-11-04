@@ -37,6 +37,19 @@ queues and secret environment variables.
 - Independently verify provider/Calendar identity aliases and strong provider
   absence before any future privileged recovery executor can be considered.
 
+### Provider source surface check
+
+`test/erasure-provider-surface-audit.test.mjs` inventories every concrete
+`GoogleCalendar` and `Todoist` method. Each method must be classified as an
+identity write, provider control operation, read, or internal helper. The
+identity-write list is shared by the replay admission proxy and reconciliation
+mutation-budget proxy, so adding an identity writer cannot silently omit one
+boundary. Calendar watch renewal/stop are separately classified as subscription
+control operations; they do not create, update, or delete task/event identities.
+This is source-level regression evidence only: it does not prove every caller
+uses the current source, every DynamoDB mutation is lease-protected, or any
+deployed historical Lambda digest contains these guards.
+
 ERASURE_REPLAY_BARRIER_VERSION remains OFF. Do not run the offline atomic release
 builder against production, restore suspended consumers, replay a DLQ, alter
 fences or perform any destructive production test based on this report.
