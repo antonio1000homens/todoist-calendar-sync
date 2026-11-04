@@ -134,14 +134,15 @@ Run the code package audit:
 
 Run the redacted configuration audit:
 
-    AWS_PROFILE=windsor node scripts/audit-erasure-lambda-config.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production --function=todoist-calendar-sync-watch-production --function=todoist-calendar-sync-worker-production --function=todoist-calendar-sync-reconciler-production --function=todoist-calendar-sync-erasure-worker-production --function=todoist-calendar-sync-completed-cleanup-production > deployed-config-audit.json
+    node scripts/audit-erasure-lambda-config.mjs --profile=windsor --expected-account=243857182133 --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production --function=todoist-calendar-sync-watch-production --function=todoist-calendar-sync-worker-production --function=todoist-calendar-sync-reconciler-production --function=todoist-calendar-sync-erasure-worker-production --function=todoist-calendar-sync-completed-cleanup-production > deployed-config-audit.json
 
 Both commands deliberately exit with status 2 because inventory is not release
 approval. The code scanner verifies the selected profile's STS account before
 reading Lambda packages, binds the SDK to that profile, and includes the
-verified account in its report. It omits presigned URLs; the configuration
-scanner omits environment values and fails on incomplete pages, alias drift or
-configuration drift. These commands do not clear the all-account/region,
+verified account in its report. The configuration scanner also verifies STS
+against an explicit profile and expected account, then binds Lambda reads to
+that profile. It omits environment values and fails on incomplete pages, alias
+drift or configuration drift. These commands do not clear the all-account/region,
 legacy-name, identity-IAM, CodeDeploy rollback or independent approval
 blockers above.
 

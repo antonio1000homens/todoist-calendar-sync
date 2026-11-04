@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {collectRuntimeConfigAudit} from "../scripts/audit-erasure-lambda-config.mjs";
+import {readFile} from "node:fs/promises";
+import {collectRuntimeConfigAudit,verifyExpectedAccount} from "../scripts/audit-erasure-lambda-config.mjs";
+
+test("Lambda config audit binds its STS identity and SDK credentials to an explicit account/profile",async()=>{
+  assert.equal(verifyExpectedAccount({Account:"243857182133"},"243857182133"),"243857182133");
+  assert.throws(()=>verifyExpectedAccount({Account:"553490163883"},"243857182133"),/did not match/);
+  assert.throws(()=>verifyExpectedAccount({Account:"243857182133"},"invalid"),/did not match/);
+  const source=await readFile(new URL("../scripts/audit-erasure-lambda-config.mjs",import.meta.url),"utf8");
+  assert.match(source,/\["sts","get-caller-identity","--profile",profile/);
+  assert.match(source,/credentials:fromIni\(\{profile\}\)/);
+});
 
 test("Lambda config audit reads every published version and alias target but omits environment values",async()=>{
   const sha1="a".repeat(44),sha2="b".repeat(44),seen=[];
