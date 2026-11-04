@@ -130,8 +130,6 @@ test("untagged direct-ID events and cancelled recurring instances enter identity
 });
 
 test("missing, stale and incomplete signed ACL scope never establishes coverage",async()=>{
-  const noManifest=await inspect({},undefined);
-  // Passing undefined uses the helper's default; call the observer directly for no manifest.
   const reader=readers().readerForProfile;
   const missing=await observeCrossProfileErasureEvidence({
     taskId:"removed-task",rows:[],fullRows:[],readerForProfile:reader,
@@ -139,7 +137,6 @@ test("missing, stale and incomplete signed ACL scope never establishes coverage"
   assert.equal(missing.allAccessibleCalendarCoverageProven,false);
   assert.equal(missing.profiles.work.calendarProvenanceComplete,false);
   assert.ok(missing.missingProof.some(reason=>reason.includes("independently signed")));
-  assert.equal(noManifest.report.allAccessibleCalendarCoverageProven,true);
   const stale=trusted(signedCoverage(payload=>{
     payload.observedAt=new Date(Date.now()-600_000).toISOString();
     payload.expiresAt=new Date(Date.now()-300_000).toISOString();
