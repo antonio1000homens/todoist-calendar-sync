@@ -38,6 +38,7 @@ export interface ErasurePreviewResult {
 type Dependencies = {
   db?: Pick<DynamoDBDocumentClient, "send">;
   clients?: Awaited<ReturnType<typeof defaultProviderClientFactory>>;
+  providerFactory?: typeof defaultProviderClientFactory;
   inspectFence?: typeof inspectErasureFence;
   newOperationId?: () => string;
   ignoreOperationId?: string;
@@ -142,7 +143,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const target = validateTarget(input);
   const db = dependencies.db || documentClient;
   const [allRows, providerClients] = await Promise.all([
-    scanAll(db,dependencies), dependencies.clients ? Promise.resolve(dependencies.clients) : defaultProviderClientFactory(target.profile),
+    scanAll(db,dependencies), dependencies.clients ? Promise.resolve(dependencies.clients)
+      : (dependencies.providerFactory || defaultProviderClientFactory)(target.profile),
   ]);
   const rows = allRows.filter(row => row.pk !== `ERASURE#${target.profile}`
     && !(dependencies.ignoreOperationId && (row.pk===`ERASURE_OPERATION#${dependencies.ignoreOperationId}`
@@ -209,7 +211,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     digest: record.digest, classification: record.classification }));
   const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
     taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
-    readerForProfile:async profile=>profile===target.profile?providerClients:defaultProviderClientFactory(profile),
+    readerForProfile:async profile=>profile===target.profile?providerClients
+      :(dependencies.providerFactory || defaultProviderClientFactory)(profile),
   }):undefined;
   const providerSnapshotFingerprint = fingerprint(crossProfileEvidence
     ?{primary:providerData,crossProfileEvidence}:providerData);

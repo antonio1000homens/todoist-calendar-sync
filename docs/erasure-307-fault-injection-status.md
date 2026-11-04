@@ -64,3 +64,34 @@ exact mapping keys. The fixture was removed. These bounded reads do not replace
 the complete related-row scan, comment/recurrence provenance, or fresh full
 reconciliation required before recovery. The probe did not stage post-write
 recovery, markers, mapping restoration, fences, or SQS replay.
+
+## Deployed-credential cross-profile capture
+
+`scripts/audit-erasure-cross-profile-live.mjs` runs the repository's full
+read-only erasure preview against one exact disposable (or already-erased)
+Work task/event identity. It verifies `AWS_PROFILE=windsor` resolves to account
+`243857182133`, reads the selected Lambda's routing configuration, then reads
+DynamoDB state and all-profile Todoist/Calendar inventories using the deployed
+profile routing and Windsor-backed SSM parameters. Provider clients are
+projected to an explicit read-method allowlist before they reach the preview.
+
+Example invocation (replace both IDs with the exact fixture IDs from its
+creation record):
+
+```sh
+npm run build --silent
+node scripts/audit-erasure-cross-profile-live.mjs \
+  --profile=windsor \
+  --expected-account=243857182133 \
+  --region=eu-west-2 \
+  --function=todoist-calendar-sync-worker-production \
+  --qualifier='$LATEST' \
+  --task-id='<disposable-task-id>' \
+  --event-id='<disposable-event-id>'
+```
+
+The report is redacted and always exits with status 2 because this capture is
+not release-authoritative and cannot issue an erasure confirmation. A complete
+read only proves the observed provider/state evidence for those exact IDs; it
+does not authorize enabling the replay barrier or executable recovery. No AWS
+or provider mutation is performed.
