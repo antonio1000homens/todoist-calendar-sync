@@ -71,6 +71,8 @@ export function redactedFailureCode(error) {
   }
   if(message==="Calendar recurring series exceeds replay marker bound")
     return "CALENDAR_RECURRENCE_ALIAS_LIMIT";
+  if(message==="Calendar recurring series exceeds audit inventory bound")
+    return "CALENDAR_RECURRENCE_AUDIT_INVENTORY_LIMIT";
   if(message==="Calendar full inventory exceeded the audit result limit")
     return "CALENDAR_INVENTORY_LIMIT";
   if(message==="Todoist task inventory exceeded the audit result limit")

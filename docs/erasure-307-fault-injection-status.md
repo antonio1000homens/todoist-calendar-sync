@@ -26,6 +26,45 @@ remain open. Do not treat this matrix as acceptance of that executor. Keep
 independent writer/IAM review, security approvals and disposable Work-profile
 staging evidence are complete.
 
+## Targeted source-level fault-injection suites (4 Nov 2026, 17:46 UTC)
+
+The 11 test files listed in the fault matrix were run together with the
+repository test environment. The result was 107 tests passed, zero failed,
+zero skipped. Coverage includes the source-level provider failure, paging,
+ETag drift, single-use confirmation, replay marker race, lease/fence, mapping
+state and qualified-inventory regressions described above. This is not live
+queue/DLQ replay, does not inject a lost acknowledgement into the future
+post-write marker/fence transaction (there is no executor for it), and does
+not verify a live cross-profile move or production deployment.
+
+Command:
+
+```sh
+node --import ./test/setup-env.mjs --test \
+  test/erasure-replay-ingress.test.mjs test/erasure-worker.test.mjs \
+  test/erasure-protocol.test.mjs test/erasure-cross-profile-evidence.test.mjs \
+  test/erasure-preview.test.mjs test/erasure-deletion.test.mjs \
+  test/erasure-executor.test.mjs test/erasure-recovery.test.mjs \
+  test/erasure-replay-barrier.test.mjs test/erasure-lambda-inventory.test.mjs \
+  test/erasure-replay-alias-observation.test.mjs
+```
+
+### Provider and DynamoDB writer-surface regressions (4 Nov 2026, 17:51 UTC)
+
+Two additional source-audit test files passed: 12 tests, zero failures. They
+inventory every concrete Todoist/Calendar method and production provider
+construction site, and require replay admission before identity-bearing
+DynamoDB writes. Regressions cover blocked mapping/canonical/recurrence writes
+and writer-lease creation. This does not inventory every DynamoDB control
+write or prove that every historical deployed package contains the source
+guards.
+
+```sh
+node --import ./test/setup-env.mjs --test \
+  test/erasure-provider-surface-audit.test.mjs \
+  test/erasure-replay-state-write-audit.test.mjs
+```
+
 ## Work-profile normal-sync smoke test (4 Nov 2026)
 
 Using the connected Todoist and Google Calendar apps, a clearly labeled
@@ -280,6 +319,21 @@ diagnostic only: the 74 IDs exceed the current 32-alias recovery limit, and
 the observer remains incomplete for post-write recovery. AWS and provider
 operations were read-only.
 
+### Separate read-only discovery from release bounds (4 Nov 2026)
+
+The recurrence audit previously stopped returning instance IDs at the same
+32-alias threshold used by the prospective atomic marker transaction. That
+prevented the all-profile evidence collector from finishing the 74-instance
+identity walk. The collector now allows up to 512 total task/event/series
+identities, and the provider recurrence reader permits up to 256 instances per
+master before failing closed. The 32-alias replay proof and 100-action atomic
+transaction limits are unchanged. This is source-level progress only: the
+74-instance production chain has not yet been recaptured with this change, and
+the larger observation does not make it eligible for release. The remaining
+identity references, inaccessible-calendar coverage, IAM/version audit,
+privacy/security approvals, and disposable recovery acceptance still gate
+completion.
+
 ### Independent connector lookup of unresolved mapped task (4 Nov 2026, 17:04 UTC)
 
 A fresh read-only Windsor capture against the still-active disposable Work
@@ -338,3 +392,29 @@ reads immediately; deletion is asynchronous and expired items remain visible
 until the background deletion occurs ([TTL behavior](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)).
 Re-run the exact audit after TTL deletion, and continue to require queue/DLQ
 replay evidence before allowing recovery.
+
+### Provider identity recheck (4 Nov 2026, 17:30 UTC)
+
+The connected Todoist search and exact task read now both return the disposable
+fixture as an active task in the Work project. Its activity feed contains the
+original add at 14:24 and updates at 14:29 and 17:12; it contains no deletion
+entry in the queried interval. This differs from the earlier deployed-profile
+404 observations. The available activity feed does not explain the mismatch,
+so the task cannot be treated as absent or as proof of recreation.
+
+Calendar reads must specify the calendar explicitly: the selected fixture is
+`confirmed` on the Work calendar, while the same event ID is `cancelled` on the
+Antonio calendar. The default-calendar read returned the Antonio copy and is
+not evidence that the Work event is absent. The live
+provider state therefore includes a confirmed Work event and active Work task,
+as well as a cancelled Antonio-calendar copy; it is not a clean post-deletion
+snapshot.
+
+A fresh deployed-credential audit of this fixture again stopped at
+`CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER`: the non-selected recurrence
+expanded to 74 instances. Its redacted report found two other-task mappings
+(both direct reads returned 404), one tagged event, no tagged recurring
+master, and three related delivery rows that referenced neither selected ID.
+The audit remains incomplete. No AWS or provider writes were performed, and
+the fixture must not be deleted or considered absent until the conflicting
+profile evidence and recurrence chain are resolved.
