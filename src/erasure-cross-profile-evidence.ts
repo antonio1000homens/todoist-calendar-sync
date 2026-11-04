@@ -34,7 +34,11 @@ const TASK_FIELDS=new Set(["taskId","providerTaskId","linkedTaskId","discardedTa
 const EVENT_FIELDS=new Set(["eventId","providerEventId","masterEventId","activeInstanceId","calendarProjectionId","oldMasterId","newMasterId","lastEventId","occurrenceId","selectedEventId","previousEventId","cancelledEventId","syncHistoryMasterId"]);
 const TASK_ARRAYS=new Set(["candidateTaskIds","taskIds"]);
 const EVENT_ARRAYS=new Set(["candidateEventIds","eventIds"]);
-const MAX_IDENTITIES=32;
+// This is the read-only discovery cap, not the replay transaction limit.
+// Keep enough capacity to observe common oversized series (including the
+// 74-instance production blocker) while preserving a hard memory/work bound.
+// The release proof in erasure-replay-barrier.ts remains independently capped.
+const MAX_IDENTITIES=512;
 const MAX_PASSES=64;
 
 export interface CrossProfileErasureEvidence {

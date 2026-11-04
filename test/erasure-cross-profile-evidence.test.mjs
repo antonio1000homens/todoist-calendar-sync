@@ -235,7 +235,7 @@ test("Google audit inventory covers every page without time or task filters and 
   } finally { globalThis.fetch=previous; }
 });
 
-test("Google recurrence audit paginates an oversized series before returning only its safe count",async()=>{
+test("Google recurrence audit paginates an oversized-for-release series for complete read-only discovery",async()=>{
   const previous=globalThis.fetch,calls=[];
   globalThis.fetch=async raw=>{
     const url=new URL(String(raw));
@@ -251,12 +251,10 @@ test("Google recurrence audit paginates an oversized series before returning onl
   };
   try {
     const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"audit@example.test");
-    await assert.rejects(calendar.listEventInstances("oversized-master"),error=>{
-      assert.equal(error.message,"Calendar recurring series exceeds replay marker bound");
-      assert.equal(error.auditAliasCount,33);
-      assert.equal(error.message.includes("instance-"),false);
-      return true;
-    });
+    const instances=await calendar.listEventInstances("oversized-master");
+    assert.equal(instances.length,33);
+    assert.equal(instances[0].id,"instance-0");
+    assert.equal(instances.at(-1).id,"instance-32");
     assert.equal(calls.length,2);
     assert.equal(calls[1].searchParams.get("pageToken"),"second-page");
     assert.equal(calls.every(url=>url.searchParams.get("showDeleted")==="true"),true);

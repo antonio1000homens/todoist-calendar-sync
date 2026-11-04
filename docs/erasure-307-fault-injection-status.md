@@ -319,6 +319,21 @@ diagnostic only: the 74 IDs exceed the current 32-alias recovery limit, and
 the observer remains incomplete for post-write recovery. AWS and provider
 operations were read-only.
 
+### Separate read-only discovery from release bounds (4 Nov 2026)
+
+The recurrence audit previously stopped returning instance IDs at the same
+32-alias threshold used by the prospective atomic marker transaction. That
+prevented the all-profile evidence collector from finishing the 74-instance
+identity walk. The collector now allows up to 512 total task/event/series
+identities, and the provider recurrence reader permits up to 256 instances per
+master before failing closed. The 32-alias replay proof and 100-action atomic
+transaction limits are unchanged. This is source-level progress only: the
+74-instance production chain has not yet been recaptured with this change, and
+the larger observation does not make it eligible for release. The remaining
+identity references, inaccessible-calendar coverage, IAM/version audit,
+privacy/security approvals, and disposable recovery acceptance still gate
+completion.
+
 ### Independent connector lookup of unresolved mapped task (4 Nov 2026, 17:04 UTC)
 
 A fresh read-only Windsor capture against the still-active disposable Work
