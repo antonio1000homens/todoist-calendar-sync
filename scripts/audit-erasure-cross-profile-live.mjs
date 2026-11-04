@@ -64,6 +64,11 @@ export function validateRoutingConfig(value) {
 /** Classify only a small set of reviewed, non-sensitive failure strings. */
 export function redactedFailureCode(error) {
   const message=typeof error?.message==="string"?error.message:"";
+  if(error?.name==="CalendarRecurrenceLimitAuditError"
+    &&typeof error.matchesSelectedEvent==="boolean")
+    return error.matchesSelectedEvent
+      ?"CALENDAR_RECURRENCE_ALIAS_LIMIT_SELECTED_EVENT"
+      :"CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER";
   if(message==="Calendar recurring series exceeds replay marker bound")
     return "CALENDAR_RECURRENCE_ALIAS_LIMIT";
   if(message==="Calendar full inventory exceeded the audit result limit")
@@ -112,12 +117,26 @@ function selectReadMethods(instance,names,optional=[]) {
   return Object.freeze(selected);
 }
 
-function readOnlyProviderPair(clients) {
+export function readOnlyProviderPair(clients,selectedEventId) {
+  const selectedCalendar=selectReadMethods(clients.calendar,[
+    "findByTodoistTaskId","getEvent","listAllEventsForErasureAudit",
+    "listCalendarListForErasureAudit","listEventInstances","listLinkedEventsByTodoistTaskId",
+  ],["listCalendarListForErasureAudit"]);
+  const listEventInstances=selectedCalendar.listEventInstances;
+  const calendar=Object.freeze({...selectedCalendar,listEventInstances:async(masterId,calendarId)=>{
+    try {return await listEventInstances(masterId,calendarId);}
+    catch(error) {
+      if(error?.message==="Calendar recurring series exceeds replay marker bound") {
+        const diagnostic=new Error("Calendar recurrence alias bound exceeded");
+        diagnostic.name="CalendarRecurrenceLimitAuditError";
+        diagnostic.matchesSelectedEvent=masterId===selectedEventId;
+        throw diagnostic;
+      }
+      throw error;
+    }
+  }});
   return Object.freeze({
-    calendar:selectReadMethods(clients.calendar,[
-      "findByTodoistTaskId","getEvent","listAllEventsForErasureAudit",
-      "listCalendarListForErasureAudit","listEventInstances","listLinkedEventsByTodoistTaskId",
-    ],["listCalendarListForErasureAudit"]),
+    calendar,
     todoist:selectReadMethods(clients.todoist,[
       "getTask","listAllProjectCommentsForErasureAudit","listAllTaskCommentsForErasureAudit",
       "listAllTasksForErasureAudit","listProjectComments","listTaskComments",
@@ -165,7 +184,8 @@ export async function collectLiveCrossProfileEvidence(options) {
     import(new URL("../dist/erasure-preview.js",import.meta.url).href),
     import(new URL("../dist/mutation-budget.js",import.meta.url).href),
   ]);
-  const providerFactory=async profile=>readOnlyProviderPair(await defaultProviderClientFactory(profile));
+  const providerFactory=async profile=>readOnlyProviderPair(
+    await defaultProviderClientFactory(profile),options.eventId);
   const preview=await buildErasurePreview({profile:"work",taskId:options.taskId,eventId:options.eventId,deleteCalendar:true},{
     scanDeadlineMs:options.scanDeadlineMs,
     auditCrossProfileIdentity:true,

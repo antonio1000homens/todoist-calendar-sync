@@ -54,11 +54,13 @@ sync result was observed was removed through Todoist.
 
 The read-only all-profile preview was then run against the exact pair. It
 failed closed while expanding a discovered Calendar alias with
-`Calendar recurring series exceeds replay marker bound`. The capture did not
-identify which discovered series exceeded the bound, so this cannot be
-attributed to the fixture itself. No provider deletion, executor, marker,
-fence release, queue action or AWS mutation occurred. The fixture remains
-staged for follow-up; this attempt provides no post-write recovery evidence.
+`CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER`: the oversized master was not
+the selected event ID. The report deliberately does not disclose the master
+ID or establish its relationship to the selected task beyond its presence in
+the discovered identity closure. The fixture itself is non-recurring, but the
+closure remains incomplete. No provider deletion, executor, marker, fence
+release, queue action or AWS mutation occurred. The fixture remains staged for
+follow-up; this attempt provides no post-write recovery evidence.
 
 ## Connector-only cross-profile fixture probe (4 Nov 2026)
 
