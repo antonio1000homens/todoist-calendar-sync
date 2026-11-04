@@ -38,6 +38,13 @@ async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profi
     if (Array.isArray(item)) {
       if (taskArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"todoist",id);
       if (eventArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"calendar",id);
+      // ManualDecision.context.candidates is a Todoist-task candidate list
+      // whose provider IDs are stored as `id`, unlike named identity fields.
+      if (field === "candidates") for (const candidate of item) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const candidateObject = candidate as Record<string,unknown>;
+        if (typeof candidateObject.id === "string" && candidateObject.id) add(profile,"todoist",candidateObject.id);
+      }
       for (const child of item) collect(child,profile,field);
       return;
     }

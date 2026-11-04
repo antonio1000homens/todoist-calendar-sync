@@ -56,6 +56,21 @@ test("decision context provider IDs are checked before a review case can be seed
   assert.equal(calls.length, 1, "no review state read or write may follow the marker hit");
 });
 
+test("manual decision candidate object IDs are checked before review seeding", async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "TASK", "erased-candidate-object")) return {Item:{markerVersion:1}};
+    return {};
+  });
+  await assert.rejects(new ReviewStore().observeDecision(decision({context:{candidates:[
+    {id:"erased-candidate-object",content:"opaque fixture",due:""},
+  ]}})),ErasureReplayBlockedError);
+  assert.equal(calls.length,1,"the erased candidate is rejected before any review state access");
+});
+
 test("mapping snapshot recurrence aliases are checked before a decision is persisted", async t => {
   enableBarrier(t);
   const calls = [];
