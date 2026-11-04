@@ -52,6 +52,13 @@ regression evidence only: it does not prove every DynamoDB mutation is
 lease-protected or any deployed historical Lambda digest contains these
 guards.
 
+`test/erasure-replay-state-write-audit.test.mjs` also inventories the identified
+identity-bearing mapping/history mutation methods in `StateRepository` and
+requires replay admission before their first DynamoDB write. Runtime regressions
+cover a blocked mapping deletion, recurrence-link deletion, and writer-lease
+creation. This source check does not cover every DynamoDB control-state write,
+prove action-time lease ownership, or validate historical deployed bundles.
+
 ERASURE_REPLAY_BARRIER_VERSION remains OFF. Do not run the offline atomic release
 builder against production, restore suspended consumers, replay a DLQ, alter
 fences or perform any destructive production test based on this report.

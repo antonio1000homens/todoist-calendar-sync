@@ -1292,6 +1292,10 @@ export class StateRepository {
   }
 
   async completeFutureSeriesSplit(profile: Profile, taskId: string, newMasterId: string): Promise<void> {
+    const split = await this.getFutureSeriesSplitAnyProfile(taskId);
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[
+      ...new Set([split?.oldMasterId,newMasterId].filter((id):id is string=>typeof id==="string"&&id.length>0)),
+    ]});
     await client.send(new UpdateCommand({
       TableName: this.ensureTable(),
       Key: key(`FUTURE_SPLIT#TASK#${taskId}`),
@@ -1691,6 +1695,9 @@ export class StateRepository {
     occurrenceId: string,
     staleMapping?: Mapping,
   ): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled({profile:link.profile,taskId:link.taskId,
+      eventIds:[...new Set([occurrenceId,link.eventId,link.masterEventId,link.activeInstanceId]
+        .filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     if (link.owner !== "calendar" || !link.masterEventId || !link.activeInstanceId
       || occurrenceId === link.activeInstanceId || occurrenceId === link.masterEventId
       || (staleMapping && (staleMapping.profile !== link.profile
@@ -1798,6 +1805,7 @@ export class StateRepository {
   }
 
   async deleteMapping(mapping: Mapping): Promise<void> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     const owner = await client.send(new GetCommand({
       TableName: this.ensureTable(),
       Key: key(`TASKOWNER#${mapping.taskId}`, "MAP"),
@@ -1850,6 +1858,10 @@ export class StateRepository {
    * active repair, or a completed-history guard prevents partial retirement.
    */
   async retireDeletedTodoistRecurrenceIfUnchanged(mapping: Mapping, expectedLink: RecurrenceLink): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
+    await assertReplayAdmissionIfEnabled({profile:expectedLink.profile,taskId:expectedLink.taskId,
+      eventIds:[...new Set([expectedLink.eventId,expectedLink.masterEventId,expectedLink.activeInstanceId]
+        .filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     if (mapping.recurrenceOwner !== "todoist" || !mapping.seriesId || !mapping.updatedAt
       || expectedLink.owner !== "todoist" || !expectedLink.updatedAt
       || expectedLink.profile !== mapping.profile || expectedLink.seriesId !== mapping.seriesId
@@ -1917,6 +1929,7 @@ export class StateRepository {
   /** Delete an exact standalone mapping only when every primary index still has its previewed version. */
   async deleteMappingIfUnchanged(mapping: Mapping): Promise<boolean> {
     if (!mapping.updatedAt || mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     const table=this.ensureTable();
     const conditions=(taskOwner=false)=>({
       ConditionExpression: taskOwner
@@ -1953,6 +1966,12 @@ export class StateRepository {
     operationId:string; profile:Profile; eventId:string; taskId:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedEventMappings?:Mapping[];
   }):Promise<boolean> {
     const {operationId,profile,eventId,taskId,eventMapping,taskMapping,retainedEventMappings=[]}=input;
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[...new Set([
+      eventId,eventMapping?.eventId,taskMapping?.eventId,
+      ...retainedEventMappings.map(mapping=>mapping.eventId),
+      ...[eventMapping,taskMapping,...retainedEventMappings].flatMap(mapping=>mapping
+        ?[mapping.masterEventId,mapping.activeInstanceId]:[]),
+    ].filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     const same=(mapping:Mapping|undefined,event:string)=>Boolean(mapping&&mapping.profile===profile
       &&mapping.taskId===taskId&&mapping.eventId===event&&mapping.updatedAt);
     if(eventMapping&&!same(eventMapping,eventId))throw new Error("Elapsed Calendar mapping identity is invalid");
@@ -2009,7 +2028,7 @@ export class StateRepository {
   }
 
   async acceptTaskVersion(profile: Profile, taskId: string, updatedAt: string | undefined, deliveryId?: string): Promise<boolean> {
-    void profile;
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     if (!updatedAt || !Number.isFinite(Date.parse(updatedAt))) return true;
     const versionKey = key(`VERSION#TASK#${taskId}`);
     const id = deliveryId || "";
@@ -2097,7 +2116,31 @@ export class StateRepository {
   }
 
   async deleteRecurrenceLink(profile: Profile, seriesId: string): Promise<void> {
-    await client.send(new DeleteCommand({ TableName: this.ensureTable(), Key: key(`RECURRENCE#${profile}#${seriesId}`) }));
+    const link=await this.getRecurrenceLink(profile,seriesId);
+    if(!link)return;
+    if(!link.taskId||!link.eventId)throw new Error("Recurrence deletion requires a complete identity snapshot");
+    await assertReplayAdmissionIfEnabled({profile:link.profile,taskId:link.taskId,
+      eventIds:[...new Set([link.eventId,link.masterEventId,link.activeInstanceId]
+        .filter((id):id is string=>typeof id==="string"&&id.length>0))]});
+    const names:Record<string,string>={"#profile":"profile"};
+    const values:Record<string,unknown>={":profile":link.profile,":task":link.taskId,":event":link.eventId};
+    const conditions=["#profile = :profile","taskId = :task","eventId = :event"];
+    for(const [field,value] of Object.entries({owner:link.owner,seriesId:link.seriesId,
+      masterEventId:link.masterEventId,activeInstanceId:link.activeInstanceId,updatedAt:link.updatedAt})) {
+      if(value===undefined||value===null)conditions.push(`attribute_not_exists(${field})`);
+      else {
+        const placeholder=`:${field}`;
+        if(field==="owner")names["#owner"]="owner";
+        conditions.push(`${field==="owner"?"#owner":field} = ${placeholder}`);
+        values[placeholder]=value;
+      }
+    }
+    try {
+      await client.send(new DeleteCommand({TableName:this.ensureTable(),Key: key(`RECURRENCE#${profile}#${seriesId}`),
+        ConditionExpression:conditions.join(" AND "),ExpressionAttributeNames:names,ExpressionAttributeValues:values}));
+    } catch(error) {
+      if(!conditionalFailure(error))throw error;
+    }
   }
 
   async listRecurrenceLinks(profile: Profile): Promise<RecurrenceLink[]> {
@@ -2143,6 +2186,7 @@ export class StateRepository {
     sourceUpdatedAt: string,
     reason?: CalendarProjectionTombstoneReason,
   ): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     await client.send(new PutCommand({
       TableName: this.ensureTable(),
       Item: {
@@ -2156,6 +2200,7 @@ export class StateRepository {
   }
 
   async deleteCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     await client.send(new DeleteCommand({
       TableName: this.ensureTable(),
       Key: key(`PROJECTION#${profile}#TASK#${taskId}`, "TOMBSTONE"),
@@ -2206,6 +2251,7 @@ export class StateRepository {
    * can recover without permanently blocking the task.
    */
   async beginTodoistCalendarWrite(taskId: string): Promise<string> {
+    for(const profile of allProfiles)await assertReplayAdmissionIfEnabled({profile,taskId});
     const nowMs = Date.now();
     const token = randomUUID();
     await client.send(new PutCommand({
@@ -2300,6 +2346,10 @@ export class StateRepository {
     projection: CompletedCalendarProjection,
     expectedLink: RecurrenceLink,
   ): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled({profile:projection.profile,taskId:projection.taskId,
+      eventIds:[...new Set([projection.eventId,projection.masterEventId,expectedLink.eventId,
+        expectedLink.masterEventId,expectedLink.activeInstanceId]
+        .filter((id):id is string=>typeof id==="string"&&id.length>0))]});
     if (projection.recurrenceOwner !== "calendar" || !projection.seriesId
       || expectedLink.owner !== "calendar" || expectedLink.profile !== projection.profile
       || expectedLink.seriesId !== projection.seriesId || expectedLink.taskId !== projection.taskId
@@ -2372,6 +2422,7 @@ export class StateRepository {
    * is deliberately NOT restored, even if provider comments still exist.
    */
   async reopenRetainedStandaloneMapping(mapping: Mapping, taskUpdatedAt: string | undefined): Promise<boolean> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     if (mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
       || mapping.activeInstanceId || mapping.originalStart || mapping.activeEffectiveStart
       || !taskUpdatedAt || !Number.isFinite(Date.parse(taskUpdatedAt))) return false;
@@ -2423,6 +2474,7 @@ export class StateRepository {
   }
 
   async deleteCompletedCalendarProjection(projection: CompletedCalendarProjection): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile:projection.profile,taskId:projection.taskId,eventIds:[projection.eventId]});
     await client.send(new TransactWriteCommand({
       TransactItems: [
         { Delete: { TableName: this.ensureTable(), Key: key(`COMPLETED_EVENT#${projection.profile}#${projection.eventId}`) } },
