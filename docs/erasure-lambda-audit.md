@@ -113,6 +113,21 @@ configuration drift. These commands do not clear the all-account/region,
 legacy-name, identity-IAM, CodeDeploy rollback or independent approval
 blockers above.
 
+For a local candidate scan of attached identity policies, first save a fresh
+Lambda invoker inventory to a private local file, then run:
+
+    node scripts/audit-erasure-lambda-identity-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> > <private-identity-candidates.json>
+
+This collects IAM users, roles, groups and attached policy documents, then
+reports statements that could match the inventoried function qualifiers. The
+report deliberately omits policy document bodies and environment values. Keep
+the output private: principal and policy names, grants and function inventory
+are operational details. The scan does not evaluate combined effective
+permissions, trust/session policies, permission boundaries, explicit denies,
+Organizations policies, cross-account principals or resource policies. It
+always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
+an IAM change or enable replay/recovery.
+
 Obtain independent operator/security approval and a rollback plan before any
 IAM update or version retirement. Published version deletion is irreversible
 and can break deployment rollback.
