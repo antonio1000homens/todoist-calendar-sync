@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  assertReplayAdmission, atomicReplayRelease, ErasureReplayBlockedError,
+  assertReplayAdmission, atomicReplayRelease, completePostWriteMappingRestore, ErasureReplayBlockedError,
   ErasureReplayUnavailableError, REPLAY_PROFILES,
 } from "../dist/erasure-replay-barrier.js";
 
@@ -71,6 +71,8 @@ function proof(){
     reviewedAt:"2026-11-03T19:40:00.000Z",
     identity:{profile:"work",taskId:"deleted-task",eventIds:["deleted-event","deleted-alias"]},
     calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-alias"]},
+    workerMappings:{mappingIds:["11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222"],enabledMappingIds:["11111111-1111-4111-8111-111111111111"]},
     journalPresent:true,
   };
 }
@@ -78,7 +80,7 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   const command=atomicReplayRelease(proof());
   assert.equal(command.constructor.name,"TransactWriteCommand");
   const tx=command.input.TransactItems;
-  const markers=tx.filter(entry=>entry.Put).map(entry=>entry.Put);
+  const markers=tx.filter(entry=>entry.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).map(entry=>entry.Put);
   assert.equal(markers.length,REPLAY_PROFILES.length+2);
   assert.deepEqual(markers.filter(x=>x.Item.sk.startsWith("TASK#")).map(x=>x.Item.pk).sort(),
     REPLAY_PROFILES.map(x=>"ERASURE_REPLAY#"+x).sort());
@@ -88,6 +90,17 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   assert.ok(markers.every(x=>Object.keys(x.Item).sort().join(",")==="markerVersion,pk,sk"));
   assert.ok(tx.some(x=>x.Delete?.Key.sk==="FENCE"&&x.Delete.ConditionExpression.includes("operationId=:id")));
   assert.ok(tx.some(x=>x.Delete?.Key.sk==="JOURNAL"));
+  const restoreIndex=tx.findIndex(x=>x.Put?.Item?.pk==="ERASURE_POSTWRITE_RESTORE#"+proof().operationId);
+  const fenceIndex=tx.findIndex(x=>x.Delete?.Key?.sk==="FENCE");
+  assert.ok(restoreIndex>=0&&fenceIndex>=0,
+    "the restore retry record, markers and fence cleanup share one atomic transaction");
+  const restore=tx[restoreIndex].Put;
+  assert.equal(restore.Item.state,"pending");
+  assert.deepEqual(restore.Item.mappingIds,["11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222"]);
+  assert.deepEqual(restore.Item.enabledMappingIds,["11111111-1111-4111-8111-111111111111"]);
+  assert.ok(!JSON.stringify(restore.Item).includes("deleted-task")
+    &&!JSON.stringify(restore.Item).includes("deleted-event"));
   assert.ok(tx.some(x=>x.ConditionCheck?.Key.sk==="EPOCH"));
   assert.ok(tx.some(x=>x.Delete?.Key.pk.startsWith("ERASURE_POSTWRITE_CONFIRMATION#")
     &&x.Delete.ConditionExpression.includes("#status=:consumed")));
@@ -114,7 +127,8 @@ test("marker writes and fence release are ONE conditional transaction, with no p
 
 test("every new erasure marker uses only the current key; historical keys remain verification-only",async()=>{
   const tx=atomicReplayRelease(proof()).input.TransactItems;
-  assert.ok(tx.filter(item=>item.Put).every(item=>item.Put.Item.sk.includes("#current#")));
+  assert.ok(tx.filter(item=>item.Put?.Item?.pk.startsWith("ERASURE_REPLAY#"))
+    .every(item=>item.Put.Item.sk.includes("#current#")));
   const seen=[];
   await assertReplayAdmission({profile:"antonio",taskId:"deleted-task"},{async send(cmd){
     seen.push(cmd.input.Key.sk);return {};
@@ -122,6 +136,26 @@ test("every new erasure marker uses only the current key; historical keys remain
   assert.equal(seen.length,2);
   assert.ok(seen.some(x=>x.includes("#old#")));
   assert.ok(seen.some(x=>x.includes("#current#")));
+});
+
+test("mapping restore completion requires exact original enabled states and durable pending record",()=>{
+  const mappings=proof().workerMappings;
+  const complete=completePostWriteMappingRestore({operationId:proof().operationId,profile:"work",epoch:7,
+    ...mappings,observedStates:mappings.mappingIds.map(id=>({id,
+      state:mappings.enabledMappingIds.includes(id)?"Enabled":"Disabled"})),
+    verifiedAt:"2026-11-04T21:00:00.000Z"});
+  assert.equal(complete.constructor.name,"UpdateCommand");
+  assert.equal(complete.input.Key.pk,"ERASURE_POSTWRITE_RESTORE#operator-operation-id");
+  assert.equal(complete.input.ExpressionAttributeValues[":pending"],"pending");
+  assert.equal(complete.input.ExpressionAttributeValues[":complete"],"complete");
+  assert.ok(complete.input.ConditionExpression.includes("mappingIds=:mappingIds"));
+  assert.ok(complete.input.ConditionExpression.includes("enabledMappingIds=:enabledMappingIds"));
+  for(const observedStates of [
+    mappings.mappingIds.slice(0,1).map(id=>({id,state:"Enabled"})),
+    mappings.mappingIds.map(id=>({id,state:"Enabled"})),
+    mappings.mappingIds.map(id=>({id,state:"Enabling"})),
+  ]) assert.throws(()=>completePostWriteMappingRestore({operationId:proof().operationId,profile:"work",epoch:7,
+    ...mappings,observedStates,verifiedAt:"2026-11-04T21:00:00.000Z"}),ErasureReplayUnavailableError);
 });
 
 test("missing new confirmation, epoch and oversize alias set cannot construct a release",()=>{
@@ -139,6 +173,8 @@ test("missing new confirmation, epoch and oversize alias set cannot construct a 
     {calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-event"]}},
     {calendarAliases:{home:[],antonio:[],work:Array.from({length:33},(_,i)=>"event-"+i)}},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:Array.from({length:33},(_,i)=>"event-"+i)}},
+    {workerMappings:{mappingIds:[],enabledMappingIds:["11111111-1111-4111-8111-111111111111"]}},
+    {workerMappings:{mappingIds:["not-a-uuid"],enabledMappingIds:[]}},
   ]) assert.throws(()=>atomicReplayRelease({...proof(),...patch}),ErasureReplayUnavailableError);
 });
 
@@ -198,7 +234,7 @@ test("cross-profile Calendar aliases create scoped HMAC markers without blocking
     home:["home-recurring-master"],antonio:["antonio-moved-instance"],
     work:["deleted-event","deleted-alias"]}};
   const tx=atomicReplayRelease(p).input.TransactItems;
-  const markerPuts=tx.filter(x=>x.Put).map(x=>x.Put);
+  const markerPuts=tx.filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).map(x=>x.Put);
   assert.equal(markerPuts.length,REPLAY_PROFILES.length+4);
   assert.equal(markerPuts.filter(x=>x.Item.sk.startsWith("EVENT#")).length,4);
   for(const profile of REPLAY_PROFILES){
@@ -210,7 +246,7 @@ test("cross-profile Calendar aliases create scoped HMAC markers without blocking
   assert.equal(JSON.stringify(markerPuts).includes("home-recurring-master"),false);
   assert.equal(JSON.stringify(markerPuts).includes("antonio-moved-instance"),false);
   const original=atomicReplayRelease(proof()).input.TransactItems;
-  assert.equal(original.filter(x=>x.Put).length,REPLAY_PROFILES.length+2,
+  assert.equal(original.filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).length,REPLAY_PROFILES.length+2,
     "unrelated calendars are not automatically marked");
 });
 test("overflow of one DynamoDB transaction refuses release instead of split batches",()=>{
