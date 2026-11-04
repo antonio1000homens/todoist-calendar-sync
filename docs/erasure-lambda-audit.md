@@ -76,126 +76,42 @@ Other versions receive a review-only designation with safeToDelete=false.
 Resource-policy absence is not evidence of non-invokability: same-account
 identity-based IAM and cross-account principals still require audit.
 
-### Live read-only findings (3 Nov 2026, Windsor account)
+### Live audit status
 
-The connected AWS identity was verified as account `243857182133`. An
-all-enabled-region scan covered 17 regions and found the seven
-`todoist-calendar-sync-*` functions only in `eu-west-2`:
+Read-only inspection has confirmed that production has historical published
+Lambda versions and identity-based invocation paths that need a complete
+independent review. The exact account inventory, principals, alias targets,
+version counts and configuration values are intentionally kept out of this
+public report. No AWS resource or IAM policy was changed during inspection.
 
-- Ingress: 70 numbered versions (2–71); `live` points to 71.
-- Review API: 93 numbered versions (2–94); `live` points to 94.
-- Watch, worker, reconciler, erasure-worker and completed-cleanup each have
-  `$LATEST` only. No weighted aliases were present.
-- Two enabled SQS event-source mappings target the unqualified worker and
-  erasure-worker. Resource policies also show EventBridge rules for watch,
-  reconciliation and completed-cleanup.
-- `GetPolicy` succeeded for every numbered ingress/review-api version; none
-  had a version resource policy. The `live` ingress/review-api aliases have
-  Function URLs with `AuthType=NONE` and wildcard resource permissions
-  conditioned on `InvokedViaFunctionUrl`. Unqualified functions have no
-  Function URL configuration, although their resource policies retain
-  URL-conditioned statements. The current source review API checks a
-  Cloudflare Access assertion before route dispatch; version 94 still needs
-  to be matched to audited source before claiming this for the deployment.
-- Read-only identity-policy scans covered all 49 IAM roles and 6 IAM users;
-  `ListGroups` returned none. Broad same-account invocation grants include
-  `AdministratorAccess` on the SSO admin role and `WindsorVsstudioAccess`,
-  `AWSLambda_FullAccess` on `S3-access-github-actions`, and `AWSLambda_FullAccess`
-  plus a `function:*` invoke grant on user `vsstudio`. The former role trusts
-  GitHub Actions subjects matching `repo:antonio1000homens/lambdas:*`.
-  These identity grants can reach historical qualified versions even when
-  those versions have no resource policy.
-- `GitHubActionsTodoistCalendarSyncDeployRole` is scoped by OIDC to the
-  repository's production environment. Its policies allow code/config updates,
-  version publication, alias and permission changes, and mapping changes, but
-  the inspected statements do not grant `lambda:InvokeFunction`.
-- `GetFunctionConfiguration` was read for every published ingress/review-api
-  version and for all seven `$LATEST` versions. Both replay-barrier and
-  post-write-review variables were absent on all 163 published versions and
-  all seven `$LATEST` versions. There were 65 distinct ingress code digests
-  and 92 distinct review-api digests. Review API had the separate
-  `ERASURE_EXECUTION_ENABLED=true` setting on 31 historical versions and
-  `$LATEST`; 2 historical versions set it to `false` and 60 omitted it.
-  Erasure-worker `$LATEST` also had that separate execution flag set to
-  `true`. These config values do not prove which code each digest contains.
+The audit is incomplete: it has not established all permission boundaries,
+organization policies and role trust/session paths; CloudTrail data-event
+coverage and qualified invocation metrics; all historical writer paths;
+deployment rollback references; or absence of nonstandard legacy names and
+accounts. Do not change IAM or retire versions based on this partial inventory.
+Those changes require a separately reviewed exact plan and rollback decision.
 
-This does not complete the independent audit. IAM permission boundaries,
-Organizations SCPs and SSO permission-set provenance were not enumerated;
-CloudTrail Lambda data-event coverage and qualified invocation metrics were
-not checked. Nor were all historical bundles compared with replay-admission
-source, CloudFormation/CodeDeploy rollback references exhaustively verified,
-or nonstandard legacy names/accounts proved absent. A complete historical
-writer audit must establish these before any retirement or denial change.
-The initial inventory above was captured while the local Windsor SSO CLI token
-was expired. The direct Windsor CLI follow-up below re-ran the regional and
-identity-policy checks after SSO re-authentication. No AWS resource or IAM
-policy was changed.
+### Reproducible published-code and configuration audits
 
-### Direct Windsor CLI follow-up (3 Nov 2026)
+The read-only commands below enumerate the named deployed functions and write
+reports to local files. Review and sanitize those reports before sharing them;
+function versions, code digests, alias targets and deployment flags can expose
+operational details. No generated live-inventory report is committed here.
 
-`AWS_PROFILE=windsor aws sts get-caller-identity` returned account
-`243857182133` and the expected Windsor SSO administrator role.
-`ec2:DescribeRegions` returned 17 enabled regions. The repository's read-only
-Lambda inventory was run in every region; it found the same seven
-`todoist-calendar-sync-*-production` functions only in `eu-west-2` and no
-matching function in the other 16 enabled regions. Fresh alias reads showed
-`ingress live → 71` and `review-api live → 94`, with no weighted targets. The
-worker and erasure-worker SQS mappings remained enabled and unqualified.
-
-`iam:GetAccountAuthorizationDetails` returned 49 roles, 6 users and no groups.
-The `AWSReservedSSO_AdministratorAccess` and `WindsorVsstudioAccess` roles both
-reference AWS managed `AdministratorAccess`; its current policy document is
-`Allow *` on `*`. The `vsstudio` user and `S3-access-github-actions` role
-reference AWS managed `AWSLambda_FullAccess`; its current default policy
-version includes `Allow lambda:*` on `*`. These identity-based permissions
-can invoke historical qualified versions without a version resource policy.
-This confirms an unresolved bypass; it does not show which identities invoked
-a version or complete effective-permission analysis.
-
-This follow-up is scoped to the Windsor account and its 17 currently enabled
-regions. It does not establish the state of permission boundaries, Organizations
-SCPs, SSO permission-set provenance, all role trust/session paths, CloudTrail
-data-event coverage, CodeDeploy rollback references or nonstandard legacy
-names. Do not remove or deny these broad principals as part of this read-only
-audit. Any policy or version-retirement change needs a separately reviewed,
-exact change plan and rollback decision.
-
-### Historical published code package digest scan (4 Nov 2026)
-
-After re-verifying the Windsor identity with STS as account `243857182133`, a
-read-only scan enumerated the 70 published ingress versions (2–71) and 93
-published review-api versions (2–94) in `eu-west-2`. Identical `CodeSha256`
-values were deduplicated; all 65 unique ingress packages and 92 unique review
-packages (157 total) were fetched, SHA-256 checked against Lambda's
-`CodeSha256`, and searched for the current replay-marker implementation
-strings. The downloaded packages totalled 46,681,101 bytes. No package URL,
-environment value or bundle content was written to the report.
-
-Only 2/65 ingress digests and 11/92 review-api digests contain the literal
-`ERASURE_REPLAY_BARRIER_VERSION`, marker-key format and HMAC keyring names.
-String presence is only a locator, not proof that the check is called. The
-alias-target bundles were separately pretty-printed and inspected: ingress
-version 71 gates Todoist webhook enqueue on the replay version and strongly
-consistent marker reads; review-api version 94 wraps provider mutations with
-identity derivation and the same strongly consistent marker check. This proves
-those two bundles contain an admission path; it does not prove all helper or
-alternate mutation call paths are covered. The 3 Nov environment/config
-inventory recorded above found the barrier flag absent on all sampled versions
-and `$LATEST`; re-read function configuration before treating that setting as
-current. The 4 Nov package scan inspected code only and did not recheck the
-environment flag.
-
-The reproducible command is:
+Run the code package audit:
 
     AWS_PROFILE=windsor node scripts/audit-erasure-lambda-code.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production > deployed-code-audit.json
 
-It emits digest-grouped marker strings, omits presigned URLs and deliberately
-exits with status 2 because static marker evidence is not authorization. The
-4 Nov package scan was completed before this reusable CLI was added; rerun the
-command after Windsor SSO refresh to retain its complete JSON report. The
-scan covers these two function names in one account/region only; it does not
-clear the all-regions/accounts, legacy-name, IAM, CodeDeploy rollback or
-approval blockers above.
+Run the redacted configuration audit:
+
+    AWS_PROFILE=windsor node scripts/audit-erasure-lambda-config.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production --function=todoist-calendar-sync-watch-production --function=todoist-calendar-sync-worker-production --function=todoist-calendar-sync-reconciler-production --function=todoist-calendar-sync-erasure-worker-production --function=todoist-calendar-sync-completed-cleanup-production > deployed-config-audit.json
+
+Both commands deliberately exit with status 2 because inventory is not release
+approval. The code scanner omits presigned URLs; the configuration scanner
+omits environment values and fails on incomplete pages, alias drift or
+configuration drift. These commands do not clear the all-account/region,
+legacy-name, identity-IAM, CodeDeploy rollback or independent approval
+blockers above.
 
 Obtain independent operator/security approval and a rollback plan before any
 IAM update or version retirement. Published version deletion is irreversible
