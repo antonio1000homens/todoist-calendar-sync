@@ -198,14 +198,14 @@ contain the recognizable barrier strings. This is direct evidence that old
 published versions cannot be accepted as barrier-protected from the current
 source alone.
 
-The read-only identity scan examined 55 users, roles and groups and found five
-candidate policy grants across four principals. The AWS policy simulator
-evaluated eight direct/legacy invocation cases; each allowed all 175 inventoried
-function targets, including all 168 qualified targets, with no permission
-boundary reported. This remains simulation evidence: trust/session policies,
-resource policies, external credentials and a combined effective-permission
-decision were not proven. The verified account is the organization management
-account, so SCPs do not constrain these principals.
+The latest 4 November read-only identity scan examined 58 users, roles and
+groups and found five candidate policy grants across four principals. The
+associated AWS policy simulation evaluated four candidate-principal scenarios;
+each allowed all 183 inventoried function targets, including all 176 qualified
+targets. This remains simulation evidence: trust/session policies, resource
+policies, external credentials and a combined effective-permission decision
+were not proven. The verified account is the organization management account,
+so SCPs do not constrain these principals.
 
 The same invocation inventory found `AuthType=NONE` Function URLs on ingress
 and review-api, with wildcard URL/invoke statements on the unqualified and
