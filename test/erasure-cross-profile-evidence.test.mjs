@@ -152,6 +152,41 @@ test("stale Todoist task-comment full-sync snapshots cannot establish absence",a
   assert.ok(report.missingProof.some(reason=>reason.includes("older than five minutes")));
 });
 
+test("Todoist 429/5xx direct identity reads fail the cross-profile audit closed",async()=>{
+  for(const status of [429,500,503]) {
+    const reader=async()=>({
+      calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
+        async getEvent(){throw missing();},async listEventInstances(){return[];}},
+      todoist:{async listAllTasksForErasureAudit(){return[];},
+        async getTask(){throw missing(status);},async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
+        async listTaskComments(){return[];}},
+    });
+    await assert.rejects(observeCrossProfileErasureEvidence({taskId:"transient-task",rows:[],fullRows:[],readerForProfile:reader}),
+      error=>error.status===status,
+      `HTTP ${status} must not be converted into an empty task inventory`);
+  }
+});
+
+test("Calendar 410 remains ambiguous while Calendar 429/5xx fail the cross-profile audit closed",async()=>{
+  const readerFor=(status)=>async()=>({
+    calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
+      async getEvent(){throw missing(status);},async listEventInstances(){return[];}},
+    todoist:{async listAllTasksForErasureAudit(){return[];},async getTask(){throw missing();},
+      async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},async listTaskComments(){return[];}},
+  });
+  const rows=[{pk:"EVENT#home#expired-event",sk:"MAP",profile:"home",eventId:"expired-event"}];
+  const gone=await observeCrossProfileErasureEvidence({taskId:taskOne,eventId:"expired-event",rows,fullRows:rows,
+    readerForProfile:readerFor(410)});
+  assert.ok(gone.profiles.home.event404Responses>0);
+  assert.equal(gone.knownIdentitiesAbsentFromCurrentProviders,false);
+  assert.ok(gone.missingProof.some(reason=>reason.includes("404/410")));
+  for(const status of [429,500,503]) {
+    await assert.rejects(observeCrossProfileErasureEvidence({taskId:taskOne,eventId:"expired-event",rows,fullRows:rows,
+      readerForProfile:readerFor(status)}),error=>error.status===status,
+      `HTTP ${status} must not be converted into a missing Calendar event`);
+  }
+});
+
 test("Google audit inventory covers every page without time or task filters and closes recurring instances",async()=>{
   const previous=globalThis.fetch,calls=[];
   globalThis.fetch=async raw=>{
