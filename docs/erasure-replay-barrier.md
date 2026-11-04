@@ -330,3 +330,28 @@ This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
 mappings, replay old queues or delete any historical Lambda version based
 on these results.
+
+## Staged post-write mapping restoration retry record
+
+The offline `atomicReplayRelease()` contract now requires the action-time
+inventory of every worker SQS mapping and the subset that was originally
+enabled. Its single DynamoDB transaction installs the replay markers, writes a
+separate `ERASURE_POSTWRITE_RESTORE#<operation>` record in `pending` state,
+and conditionally removes the reviewed operation, token, fence and journal.
+Those actions commit together; no mapping update is issued by the builder.
+
+After that transaction commits, a future privileged executor may restore only
+the IDs in `enabledMappingIds`. The record retains the complete mapping
+inventory and a manifest fingerprint, so an interrupted or failed restore has
+a durable retry point. `completePostWriteMappingRestore()` constructs a
+conditional completion update only when fresh observed mapping states exactly
+match the original enabled/disabled states and the pending record has the same
+manifest. Originally disabled mappings must remain disabled. Transitional,
+missing, extra or mismatched mappings cannot complete the record.
+
+These are offline transaction contracts only: neither builder reads AWS,
+updates an event-source mapping, nor is imported by an executor, API route or
+queue. A future executor still needs to re-read and validate mapping ownership,
+perform idempotent enablement only after marker commit, verify the full mapping
+set, and retry from the durable pending record. No deployment or mapping change
+is authorized; the replay barrier remains OFF.
