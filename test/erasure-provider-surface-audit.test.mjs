@@ -90,13 +90,14 @@ test("production provider construction has only guarded identity routes or class
 });
 
 test("calendarForProfile checks the exact profile marker before its provider write",async t=>{
-  const prior={version:process.env.ERASURE_REPLAY_BARRIER_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
+  const prior={version:process.env.ERASURE_REPLAY_BARRIER_VERSION,protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
     current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
   process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,7).toString("base64")});
   process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
   t.after(()=>{
-    for(const [key,value] of Object.entries({ERASURE_REPLAY_BARRIER_VERSION:prior.version,
+    for(const [key,value] of Object.entries({ERASURE_REPLAY_BARRIER_VERSION:prior.version,ERASURE_PROTOCOL_VERSION:prior.protocol,
       ERASURE_REPLAY_HMAC_KEYS:prior.keys,ERASURE_REPLAY_HMAC_CURRENT_KEY:prior.current}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
   });

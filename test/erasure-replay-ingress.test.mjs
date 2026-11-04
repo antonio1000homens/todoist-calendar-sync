@@ -9,12 +9,14 @@ import {handler} from "../dist/handler.js";
 
 const before={
   version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+  protocol:process.env.ERASURE_PROTOCOL_VERSION,
   keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
   current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
   proxy:process.env.PROXY_SHARED_SECRET_PARAMETER,
   todoist:process.env.TODOIST_WEBHOOK_SECRET_PARAMETER,
 };
 process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+process.env.ERASURE_PROTOCOL_VERSION="1";
 process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,9).toString("base64")});
 process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
 process.env.PROXY_SHARED_SECRET_PARAMETER="/test/replay/proxy";
@@ -22,6 +24,7 @@ process.env.TODOIST_WEBHOOK_SECRET_PARAMETER="/test/replay/todoist";
 test.after(()=>{
   for(const [key,value] of [
     ["ERASURE_REPLAY_BARRIER_VERSION",before.version],
+    ["ERASURE_PROTOCOL_VERSION",before.protocol],
     ["ERASURE_REPLAY_HMAC_KEYS",before.keys],
     ["ERASURE_REPLAY_HMAC_CURRENT_KEY",before.current],
     ["PROXY_SHARED_SECRET_PARAMETER",before.proxy],
@@ -165,6 +168,6 @@ test("a replay-enabled Todoist ingress refuses to enqueue without the erasure le
   const result=await handler(webhook(JSON.stringify({event_name:"item:updated",event_data:{id:"unleased-task"}})));
   assert.equal(result.statusCode,503);
   assert.equal(JSON.parse(result.body).accepted,false);
-  assert.equal(reads,1,"only the initial read is allowed without a protocol lease");
+  assert.equal(reads,0,"mismatched barrier/lease configuration is rejected before any state read");
   assert.equal(sends,0);
 });

@@ -48,11 +48,20 @@ This draft now includes an additional integration tranche:
 - Tests exercise the real repository writers, wrapped provider methods and
   signed webhook ingress under injected DynamoDB marker/failure conditions.
   The existing profile fence/epoch and writer lease remain independent.
+- Identity-bearing `StateRepository` and reconciliation-baseline mutations
+  check replay markers before state writes. The versioned barrier now refuses
+  to report enabled unless `ERASURE_PROTOCOL_VERSION=1` is also set; webhook
+  ingress, the SQS admission boundary and the worker enforce this paired
+  configuration so a marker read is never treated as a substitute for a
+  durable profile lease.
 
 **Rollout gate:** `ERASURE_REPLAY_BARRIER_VERSION` is **unset/off** in this
 draft. `0` or absent preserves current production behaviour; `1` requires
-valid HMAC configuration and fail-closes missing/unavailable marker reads.
-Unexpected values fail closed. This flag is *not* an operational bypass:
+`ERASURE_PROTOCOL_VERSION=1`, valid HMAC configuration and fail-closes
+missing/unavailable marker reads. Ingress and queue admission reject any
+barrier/lease configuration mismatch before enqueue; the worker also rejects
+it before processing a delivery. Unexpected values fail closed. This flag is
+not an operational bypass:
 after the first durable post-write marker exists it must never be disabled
 and every live/qualified writer must run the enabled implementation. Do not
 turn on the gate yet: the remaining identity propagation, old Lambda-version

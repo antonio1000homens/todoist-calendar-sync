@@ -268,3 +268,23 @@ test("failed erased-item suppression audit cannot create an identity-bearing inc
   assert.equal(completed.mock.callCount(), 0);
   assert.equal(failureReports.mock.callCount(), 0);
 });
+
+test("worker rejects replay barrier without lease protocol before any DynamoDB write",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  process.env.ERASURE_PROTOCOL_VERSION="0";
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  let calls=0;
+  t.mock.method(documentClient,"send",async()=>{calls++;throw new Error("worker must not touch state");});
+  t.after(()=>{
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+  });
+  const delivery={id:"calendar-replay-config-mismatch",kind:"calendar",profile:"work",mode:"aws",
+    receivedAt:"2026-11-04T00:00:00.000Z",headers:{},body:""};
+  const result=await handler({Records:[{messageId:"mismatch-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"mismatch-request"});
+  assert.deepEqual(result.batchItemFailures,[{itemIdentifier:"mismatch-message"}]);
+  assert.equal(calls,0);
+});

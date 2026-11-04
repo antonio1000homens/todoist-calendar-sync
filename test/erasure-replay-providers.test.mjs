@@ -6,14 +6,17 @@ import {ErasureReplayBlockedError,ErasureReplayUnavailableError} from "../dist/e
 
 const original={
   version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+  protocol:process.env.ERASURE_PROTOCOL_VERSION,
   keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
   current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
 };
 process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+process.env.ERASURE_PROTOCOL_VERSION="1";
 process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,8).toString("base64")});
 process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
 test.after(()=>{for(const [key,value] of [
   ["ERASURE_REPLAY_BARRIER_VERSION",original.version],
+  ["ERASURE_PROTOCOL_VERSION",original.protocol],
   ["ERASURE_REPLAY_HMAC_KEYS",original.keys],
   ["ERASURE_REPLAY_HMAC_CURRENT_KEY",original.current],
 ])if(value===undefined)delete process.env[key];else process.env[key]=value;});

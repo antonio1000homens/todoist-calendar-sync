@@ -91,7 +91,11 @@ function checkKeys(identity:ReplayIdentity,ring:KeyRing):ReplayKey[] {
 export function replayAdmissionEnabled():boolean {
   const version=process.env.ERASURE_REPLAY_BARRIER_VERSION;
   if(version===undefined||version===""||version==="0")return false;
-  if(version==="1")return true;
+  if(version==="1") {
+    if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
+      throw new ErasureReplayUnavailableError("Erasure replay admission requires the profile writer/admission lease protocol");
+    return true;
+  }
   throw new ErasureReplayUnavailableError("Unrecognised erasure replay barrier version");
 }
 /**
@@ -119,6 +123,8 @@ export function mappingReplayIdentity(mapping:{
  * An unconfigured keyring or failed DynamoDB read MUST reject the operation.
  */
 export async function assertReplayAdmission(identity:ReplayIdentity,db:Db=documentClient):Promise<void> {
+  if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
+    throw new ErasureReplayUnavailableError("Erasure replay admission requires the profile writer/admission lease protocol");
   validate(identity);
   const ring=keyRing(),table=tableName();
   const keys=checkKeys(identity,ring);

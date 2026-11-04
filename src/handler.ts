@@ -86,11 +86,21 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
     }
   }
 
+  let replayAdmission=false;
+  try {
+    // The replay barrier is only valid together with durable profile admission
+    // leases. Validate this for both provider ingress routes before enqueue.
+    replayAdmission=replayAdmissionEnabled();
+  } catch(error) {
+    logError("erasure_replay_admission_failed",error,{kind,profile});
+    return response(503,{error:"replay_admission_unavailable",accepted:false});
+  }
+
   // Reject erased identities before they can be re-admitted into durable SQS,
   // even if this is a newly signed webhook arriving long after fence release.
   // enqueueDelivery independently rechecks the marker under its admission
   // lease, covering a fence/marker installed after this fast-path read.
-  if(kind==="todoist"&&replayAdmissionEnabled()) {
+  if(kind==="todoist"&&replayAdmission) {
     let taskId:string|undefined;
     try {
       const payload=JSON.parse(body) as {event_data?:{id?:unknown}};

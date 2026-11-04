@@ -71,16 +71,19 @@ test("reconciliation baseline mutators check replay admission before state acces
 async function withReplayBarrier(t,send){
   const prior={
     version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    protocol:process.env.ERASURE_PROTOCOL_VERSION,
     keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
     current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
     table:process.env.STATE_TABLE_NAME,
   };
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
   process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,19).toString("base64")});
   process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
   process.env.STATE_TABLE_NAME||="test-state";
   t.after(()=>{
     for(const [key,value] of Object.entries({ERASURE_REPLAY_BARRIER_VERSION:prior.version,
+      ERASURE_PROTOCOL_VERSION:prior.protocol,
       ERASURE_REPLAY_HMAC_KEYS:prior.keys,ERASURE_REPLAY_HMAC_CURRENT_KEY:prior.current,
       STATE_TABLE_NAME:prior.table}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;

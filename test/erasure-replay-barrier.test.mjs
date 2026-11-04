@@ -5,16 +5,18 @@ import {
   ErasureReplayUnavailableError, REPLAY_PROFILES,
 } from "../dist/erasure-replay-barrier.js";
 
-const original={table:process.env.STATE_TABLE_NAME,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
+const original={table:process.env.STATE_TABLE_NAME,protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
   current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
 const oldKey=Buffer.alloc(32,1).toString("base64");
 const newKey=Buffer.alloc(32,2).toString("base64");
 process.env.STATE_TABLE_NAME="test-state";
+process.env.ERASURE_PROTOCOL_VERSION="1";
 process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({old:oldKey,current:newKey});
 process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="current";
 test.after(()=>{
   for(const [env,value] of [
     ["STATE_TABLE_NAME",original.table],
+    ["ERASURE_PROTOCOL_VERSION",original.protocol],
     ["ERASURE_REPLAY_HMAC_KEYS",original.keys],
     ["ERASURE_REPLAY_HMAC_CURRENT_KEY",original.current],
   ]) if(value===undefined)delete process.env[env];else process.env[env]=value;
