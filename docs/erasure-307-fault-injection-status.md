@@ -280,6 +280,25 @@ diagnostic only: the 74 IDs exceed the current 32-alias recovery limit, and
 the observer remains incomplete for post-write recovery. AWS and provider
 operations were read-only.
 
+### Independent connector lookup of unresolved mapped task (4 Nov 2026, 17:04 UTC)
+
+A fresh read-only Windsor capture against the still-active disposable Work
+fixture reproduced the same 74-instance non-selected Calendar master, two
+other-task mappings and two deployed-profile Todoist 404 responses. Both
+profile mappings resolve to the same task identity. The connected Todoist
+provider was then queried directly for that exact task: its fetch also returned
+404, and the task-scoped comment query returned no comments. An exact task
+activity-history lookup over the required older interval was denied because
+that history exceeds the connected plan's access limit. The connected
+Calendar account independently confirmed the selected fixture remains a
+confirmed one-off event in the Work calendar.
+
+These independent 404s and the empty comment read still do not prove that the
+mapped task is safely absent from historical or deleted-task records. The
+activity-history limitation leaves completion/deletion provenance unverified,
+and the 74-instance Calendar identity chain remains unresolved. No provider or
+AWS writes occurred; recovery remains blocked.
+
 ### Point-in-time queue attributes
 
 A read-only `GetQueueAttributes` call against the source and DLQ URLs configured
