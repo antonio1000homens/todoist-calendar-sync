@@ -179,6 +179,42 @@ This confirms that an SCP-based deployment boundary requires a separate
 member-account provisioning and workload migration decision. No account or
 workload was created or moved.
 
+### Windsor qualified-code and invoker snapshot (4 Nov 2026, 14:12 UTC)
+
+Fresh read-only invoker and package audits verified the same Windsor account
+and region. The complete seven-function inventory had no missing expected
+functions. Ingress had 71 published numeric versions and `live` pointed to
+version 72; review-api had 95 and `live` pointed to version 96. The two SQS
+event-source mappings remained Enabled and targeted the unqualified worker and
+erasure-worker functions.
+
+All unique deployed ingress and review-api packages passed the AWS
+`CodeSha256` download check: 66 digests for ingress and 94 for review-api.
+Static marker-string inspection found replay-barrier strings only in ingress
+versions 70–72 and review-api versions 84–96. The `reviewed_fenced` string was
+present in review-api versions 89–96. These strings do not establish that
+checks dominate every write, but the other published versions do not even
+contain the recognizable barrier strings. This is direct evidence that old
+published versions cannot be accepted as barrier-protected from the current
+source alone.
+
+The read-only identity scan examined 55 users, roles and groups and found five
+candidate policy grants across four principals. The AWS policy simulator
+evaluated eight direct/legacy invocation cases; each allowed all 175 inventoried
+function targets, including all 168 qualified targets, with no permission
+boundary reported. This remains simulation evidence: trust/session policies,
+resource policies, external credentials and a combined effective-permission
+decision were not proven. The verified account is the organization management
+account, so SCPs do not constrain these principals.
+
+The same invocation inventory found `AuthType=NONE` Function URLs on ingress
+and review-api, with wildcard URL/invoke statements on the unqualified and
+`live` resource-policy summaries. Handler-level authentication and webhook
+signature checks remain separate controls to review; this snapshot does not
+prove they protect every action. No policy, URL, alias, version, queue,
+environment, fence or replay setting was changed. The replay barrier and
+executable recovery remain prohibited.
+
 For a local candidate scan of attached identity policies, first save a fresh
 Lambda invoker inventory to a private local file, then run:
 
