@@ -185,6 +185,27 @@ function runAws(profile,args) {
     env:{...process.env,AWS_RETRY_MODE:"standard",AWS_MAX_ATTEMPTS:"8"},
   }));
 }
+function organizationContext(profile,accountId) {
+  try {
+    const organization=runAws(profile,["organizations","describe-organization"]).Organization;
+    if(!organization||typeof organization.MasterAccountId!=="string"
+      ||!Array.isArray(organization.AvailablePolicyTypes))
+      return {status:"INCOMPLETE",targetIsManagementAccount:null,scpPolicyTypeEnabled:null,
+        scpAppliesToTargetAccount:null};
+    const targetIsManagementAccount=organization.MasterAccountId===accountId;
+    const scpPolicyTypeEnabled=organization.AvailablePolicyTypes.some(policy=>
+      policy?.Type==="SERVICE_CONTROL_POLICY"&&policy?.Status==="ENABLED");
+    return {status:"VERIFIED",targetIsManagementAccount,scpPolicyTypeEnabled,
+      scpAppliesToTargetAccount:scpPolicyTypeEnabled&&!targetIsManagementAccount};
+  } catch(error) {
+    const message=String(error?.stderr||"");
+    if(message.includes("AWSOrganizationsNotInUseException"))
+      return {status:"NOT_IN_ORGANIZATION",targetIsManagementAccount:false,scpPolicyTypeEnabled:false,
+        scpAppliesToTargetAccount:false};
+    return {status:"UNAVAILABLE",targetIsManagementAccount:null,scpPolicyTypeEnabled:null,
+      scpAppliesToTargetAccount:null};
+  }
+}
 function loadManagedPolicyDocuments(profile,authorization) {
   const attachments=new Set();
   for(const collection of [authorization.Users,authorization.Roles,authorization.Groups])for(const principal of collection||[])
@@ -224,7 +245,8 @@ export function main(argv=process.argv.slice(2)) {
   const summary=findLambdaInvocationCandidates({inventory,accountId:identity.Account,
     partition:typeof identity.Arn==="string"?identity.Arn.split(":")[1]:"aws",
     authorization:{...authorization,Policies:[...policyDocuments].map(([Arn,PolicyDocument])=>({Arn,PolicyDocument}))}});
-  process.stdout.write(JSON.stringify({verifiedAccount:identity.Account,...summary},null,2)+"\n");
+  process.stdout.write(JSON.stringify({verifiedAccount:identity.Account,
+    organizationContext:organizationContext(profile,identity.Account),...summary},null,2)+"\n");
   // Identity policy candidates cannot establish effective access or approval.
   process.exitCode=2;
 }

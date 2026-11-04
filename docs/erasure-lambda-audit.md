@@ -164,6 +164,15 @@ role simulations do not include Lambda resource policies. Other context values,
 resource controls and unscanned regions/accounts remain separate gates. The
 report is a simulation, not a live invocation or approval; keep it private.
 
+The identity-candidate audit also needs `organizations:DescribeOrganization`.
+Its redacted `organizationContext` says whether the verified target account is
+the organization management account and whether SCPs can apply there; it does
+not return organization IDs or policy documents and does not prove a specific
+effective deny. AWS Organizations SCPs do not affect management-account roles
+([AWS documentation](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)).
+An unavailable organization read remains `UNAVAILABLE` and cannot be treated as
+evidence that a guardrail applies.
+
 To query invocation metrics for each inventoried published version, alias,
 alias-executed version and unqualified function over the CloudWatch retention
 window, run:
