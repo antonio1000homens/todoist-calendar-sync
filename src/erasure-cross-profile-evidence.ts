@@ -302,7 +302,7 @@ export async function observeCrossProfileErasureEvidence(input:{
         .map(async calendar=>{
           try {
             return {calendarId:calendar.id,
-              events:await calendarReader.listAllEventsForErasureAudit(calendar.id)};
+              events:await calendarReader.listAllEventsForErasureAudit(calendar.configured?undefined:calendar.id)};
           } catch(error) {
             if(statusOf(error)!==403&&statusOf(error)!==404)throw error;
             inaccessibleCount++;
