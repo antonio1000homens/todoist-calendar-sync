@@ -17,7 +17,8 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
     updatedAt:"2026-11-03T20:00:00.000Z"},"project-antonio",undefined,1);
   const homeMaster=linked(master,taskOne,{recurrence:["RRULE:FREQ=DAILY"]});
   const homeEvent=linked(eventOne,taskOne,{recurringEventId:master});
-  const homeInstance=linked(instance,taskOne,{recurringEventId:master,originalStartTime:{date:"2026-11-03"}});
+  const homeInstance=linked(instance,taskOne,{status:"cancelled",recurringEventId:master,
+    originalStartTime:{date:"2026-11-03"}});
   const workEvent=linked(eventTwo,taskTwo);
   const calendarByProfile={home:[homeMaster,homeEvent],antonio:[],work:[workEvent]};
   const calls=[],calendarDirectReads=[];
@@ -100,6 +101,8 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.ok(report.identities.eventCount>=5,"selected, mapped, recurring and legacy event aliases are retained");
   assert.equal(report.profiles.home.recurringMasters,1);
   assert.equal(report.profiles.home.recurrenceInstances,1);
+  assert.equal(report.profiles.home.cancelledDirectEventReads,1);
+  assert.equal(report.profiles.home.cancelledInventoryMatches,1);
   assert.equal(report.profiles.antonio.relatedProjectComments,1);
   assert.ok(report.profiles.work.relatedLegacyComments>0);
   assert.ok(report.profiles.work.taskCommentInventoryMatches>0);

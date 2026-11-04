@@ -124,6 +124,17 @@ fence release ran. The fixture was deleted through the provider connector; its
 cancelled Calendar records remain observable and must not be treated as proof
 of absence.
 
+The observer now reports redacted cancelled-event counters separately from
+404/410 reads. A fresh post-delete run at 13:31 UTC confirmed three cancelled
+direct reads and three cancelled inventory matches in each of Work and
+Antonio, comprising the master and two instances. Home had no matches. The
+strong scan received all pages (4,833 rows, 9 related rows); the preview still
+had 178 blockers and 165 unattributable delivery records (25 Calendar, 138
+reconcile, 1 manual, 1 repair). Four receipt rows previously observed past TTL
+expiry were no longer counted as expired, consistent with asynchronous TTL
+cleanup. `knownIdentitiesAbsentFromCurrentProviders` and
+`eligibleForPostWriteRelease` remained false.
+
 ## Deployed-credential cross-profile capture
 
 `scripts/audit-erasure-cross-profile-live.mjs` runs the repository's full

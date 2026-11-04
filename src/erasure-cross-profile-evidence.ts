@@ -50,8 +50,10 @@ export interface CrossProfileErasureEvidence {
     taskReadsFound:number;task404Responses:number;tagQueries:number;taggedEvents:number;
     todoistTaskInventoryCount:number;taskInventoryMatches:number;
     taskReadConflicts:number;
-    directEventReadsFound:number;event404Responses:number;recurringMasters:number;recurrenceInstances:number;
+    directEventReadsFound:number;cancelledDirectEventReads:number;event404Responses:number;
+    recurringMasters:number;recurrenceInstances:number;
     calendarInventoryEvents:number;inventoryMatchedEvents:number;accessibleCalendarCount:number;
+    cancelledInventoryMatches:number;
     freeBusyOnlyCalendarCount:number;restrictedCalendarCount:number;
     calendarInventoryComplete:boolean;calendarIdsFingerprint:string;
     eventReadConflicts:number;eventsMissingEtag:number;
@@ -168,6 +170,8 @@ export async function observeCrossProfileErasureEvidence(input:{
   const calendarInventoryCompleteByProfile={} as Record<Profile,boolean>;
   const calendarAccessCounts={} as Record<Profile,{accessible:number;freeBusyOnly:number}>;
   const inventoryMatchedIds={} as Record<Profile,Set<string>>;
+  const cancelledDirectEventIds={} as Record<Profile,Set<string>>;
+  const cancelledInventoryIds={} as Record<Profile,Set<string>>;
   const taskInventoryMatchIds={} as Record<Profile,Set<string>>;
   const projectIndexes={} as Record<Profile,ReturnType<typeof buildProjectMappingIndex>>;
   const stats={} as CrossProfileErasureEvidence["profiles"];
@@ -276,6 +280,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     calendarAccessCounts[profile]={accessible:calendarAudit.descriptors.length,
       freeBusyOnly:calendarAudit.descriptors.filter(calendar=>calendar.accessRole==="freeBusyReader").length};
     inventoryMatchedIds[profile]=new Set<string>();
+    cancelledDirectEventIds[profile]=new Set<string>();
+    cancelledInventoryIds[profile]=new Set<string>();
     taskInventoryMatchIds[profile]=new Set<string>();
     for(const item of calendarAudit.events)recordCalendarEvent(profile,item);
     projectIndexes[profile]=buildProjectMappingIndex(projects[profile]);
@@ -285,8 +291,9 @@ export async function observeCrossProfileErasureEvidence(input:{
       "task:"+fingerprint([comment.id,comment.task_id,comment.content||"",comment.is_deleted===true]));
     stats[profile]={taskReadsFound:0,task404Responses:0,tagQueries:0,taggedEvents:0,
       todoistTaskInventoryCount:taskInventories[profile].size,taskInventoryMatches:0,taskReadConflicts:0,
-      directEventReadsFound:0,event404Responses:0,recurringMasters:0,recurrenceInstances:0,
-      calendarInventoryEvents:calendarById[profile].size,inventoryMatchedEvents:0,
+      directEventReadsFound:0,cancelledDirectEventReads:0,event404Responses:0,
+      recurringMasters:0,recurrenceInstances:0,
+      calendarInventoryEvents:calendarById[profile].size,inventoryMatchedEvents:0,cancelledInventoryMatches:0,
       accessibleCalendarCount:calendarAccessCounts[profile].accessible,
       freeBusyOnlyCalendarCount:calendarAccessCounts[profile].freeBusyOnly,
       restrictedCalendarCount:calendarAudit.descriptors.filter(calendar=>
@@ -378,7 +385,9 @@ export async function observeCrossProfileErasureEvidence(input:{
       for(const seriesId of seriesIds)for(const item of calendarBySeries[profile].get(seriesId)||[])addCandidate(item);
       for(const item of candidates.values()) {
         const event=item.event;
-        inventoryMatchedIds[profile].add(calendarEventKey(item.calendarId,event.id));
+        const candidateKey=calendarEventKey(item.calendarId,event.id);
+        inventoryMatchedIds[profile].add(candidateKey);
+        if(event.status==="cancelled")cancelledInventoryIds[profile].add(candidateKey);
         if(add(eventIds,event.id))changed=true;
         if(add(taskIds,event.extendedProperties?.shared?.taskId))changed=true;
         if(add(eventIds,event.recurringEventId))changed=true;
@@ -470,6 +479,7 @@ export async function observeCrossProfileErasureEvidence(input:{
             calendarId==="configured-calendar-unverified"?undefined:calendarId);
           if(!event||event.id!==eventId)throw new Error("Calendar direct read returned a different identity");
           stats[profile].directEventReadsFound++;
+          if(event.status==="cancelled")cancelledDirectEventIds[profile].add(calendarEventKey(calendarId,event.id));
           const inventoryEvent=calendarById[profile].get(calendarEventKey(calendarId,eventId));
           if(!inventoryEvent||!sameCalendarIdentityVersion(event,inventoryEvent.event))eventReadConflicts.add(eventKey);
           if(typeof event.etag!=="string"||!event.etag)missingEtags.add(eventKey);
@@ -525,6 +535,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     stats[profile].eventsMissingEtag=[...missingEtags].filter(key=>key.startsWith(profile+"/")).length;
     stats[profile].calendarInventoryEvents=calendarById[profile].size;
     stats[profile].inventoryMatchedEvents=inventoryMatchedIds[profile].size;
+    stats[profile].cancelledDirectEventReads=cancelledDirectEventIds[profile].size;
+    stats[profile].cancelledInventoryMatches=cancelledInventoryIds[profile].size;
     stats[profile].taskInventoryFingerprint=fingerprint([...taskInventories[profile].values()]
       .map(task=>[task.id,fingerprint(task)]).sort(([left],[right])=>String(left).localeCompare(String(right))));
     stats[profile].calendarInventoryFingerprint=fingerprint([...calendarById[profile].values()]
@@ -539,10 +551,12 @@ export async function observeCrossProfileErasureEvidence(input:{
       taskReadsFound:stats[profile].taskReadsFound,task404Responses:stats[profile].task404Responses,
       taskReadConflicts:stats[profile].taskReadConflicts,
       taggedEvents:stats[profile].taggedEvents,directEventReadsFound:stats[profile].directEventReadsFound,
+      cancelledDirectEventReads:stats[profile].cancelledDirectEventReads,
       event404Responses:stats[profile].event404Responses,recurrenceInstances:stats[profile].recurrenceInstances,
       eventReadConflicts:stats[profile].eventReadConflicts,eventsMissingEtag:stats[profile].eventsMissingEtag,
       calendarInventoryEvents:stats[profile].calendarInventoryEvents,
       inventoryMatchedEvents:stats[profile].inventoryMatchedEvents,
+      cancelledInventoryMatches:stats[profile].cancelledInventoryMatches,
       accessibleCalendarCount:stats[profile].accessibleCalendarCount,
       freeBusyOnlyCalendarCount:stats[profile].freeBusyOnlyCalendarCount,
       restrictedCalendarCount:stats[profile].restrictedCalendarCount,
