@@ -209,11 +209,38 @@ account, so SCPs do not constrain these principals.
 
 The same invocation inventory found `AuthType=NONE` Function URLs on ingress
 and review-api, with wildcard URL/invoke statements on the unqualified and
-`live` resource-policy summaries. Handler-level authentication and webhook
-signature checks remain separate controls to review; this snapshot does not
-prove they protect every action. No policy, URL, alias, version, queue,
-environment, fence or replay setting was changed. The replay barrier and
-executable recovery remain prohibited.
+`live` resource-policy summaries. AWS documents that `AuthType=NONE` means
+Lambda itself does not authenticate URL requests; the resource policy permits
+public invocation. The application checks are a separate layer:
+
+- Ingress requires the shared proxy secret, and then validates the Calendar
+  channel token or Todoist webhook signature. This protects the current
+  ingress handler path when its deployed code and secret are correct, but does
+  not restrict who can reach the public URL or invoke other published versions.
+- Review API validates the Cloudflare Access JWT, audience, issuer and operator
+  email, plus same-origin on applicable routes. A direct request to its public
+  Lambda URL bypasses Cloudflare's network perimeter and relies on those
+  handler checks. Deployed historical versions still require independent
+  review for equivalent checks.
+
+This URL exposure is intentional in the current template. Both Cloudflare
+Worker routes call the Lambda URLs using ordinary HTTPS fetch; they do not sign
+AWS requests. Changing Function URLs to `AWS_IAM` therefore requires a reviewed
+architecture change (for example, a signing/authenticated intermediary) and
+coordinated Cloudflare configuration. It is not a standalone IAM toggle.
+Likewise, an IAM allowlist in the Windsor management account would not constrain
+all possible callers, and an SCP does not apply to that account. A durable
+historical-version boundary therefore needs a separately approved account
+boundary and migration design, or an explicitly temporary reviewed set of
+account-local denies with a maintained update procedure and proved principal
+coverage. Neither plan has been authorized or applied.
+
+No policy, URL, alias, version, queue, environment, fence or replay setting was
+changed. The replay barrier and executable recovery remain prohibited.
+
+AWS references: [Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html),
+[Lambda service authorization condition keys](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lambda.html),
+[SCP effects and limitations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html).
 
 For a local candidate scan of attached identity policies, first save a fresh
 Lambda invoker inventory to a private local file, then run:
