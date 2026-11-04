@@ -364,3 +364,24 @@ identity closure and all-profile alias proof open; the counts are a
 point-in-time baseline, not recovery evidence. Only counts and profile labels
 were recorded; provider IDs, titles, comments and credentials were not
 persisted. No AWS or provider mutation was performed.
+
+### Qualified invocation metric snapshot (4 Nov 2026)
+
+The read-only metric collector queried 341 daily `AWS/Lambda Invocations`
+series for all seven inventoried functions, published versions, aliases and
+alias-executed versions over the preceding 455 days
+(`2025-08-06T16:12:33Z` through `2026-11-04T16:12:33Z`). All metric queries
+completed. The 166 direct published-version series had no datapoints. This is
+inconclusive for direct invocation: CloudWatch metric absence is not evidence
+that a version was never invoked.
+
+Alias-executed-version metrics had datapoints for 95 published version series;
+94 were not a primary or weighted target of their alias at capture time. This
+proves those versions received alias-routed invocations during the metric
+window, not that they were directly invoked or that their code enforced the
+replay barrier. The two alias totals summed to 10,176 invocations. These
+metrics identify neither callers nor the full history beyond CloudWatch
+retention, and do not replace code-digest, IAM, CloudTrail or rollback review.
+They strengthen the reason to retain and audit historical versions; they do
+not authorize retirement, denial, barrier activation or recovery execution.
+No AWS or provider mutation was performed.
