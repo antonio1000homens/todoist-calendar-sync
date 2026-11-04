@@ -401,7 +401,9 @@ test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rej
   globalThis.fetch=async(raw,init)=>{
     const url=new URL(String(raw));calls.push({url,init});
     return new Response(JSON.stringify({full_sync:true,sync_token:"opaque-sync-token",
-      full_sync_date_utc:new Date().toISOString(),notes:[
+      full_sync_date_utc:new Date().toISOString(),projects:[{id:"project-one"}],project_notes:[
+        {id:"project-note-one",project_id:"project-one",content:"calendarEventId=project-event"},
+      ],notes:[
       {id:"note-one",item_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
       {id:"note-two",item_id:"task-two",content:"old mapping",is_deleted:true},
     ]}));
@@ -413,12 +415,16 @@ test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rej
       {id:"note-one",task_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
       {id:"note-two",task_id:"task-two",content:"old mapping",is_deleted:true},
     ]);
+    assert.deepEqual(audit.projectIds,["project-one"]);
+    assert.deepEqual(audit.projectComments,[{
+      id:"project-note-one",project_id:"project-one",content:"calendarEventId=project-event",
+    }]);
     assert.ok(Number.isFinite(Date.parse(audit.fullSyncDateUtc)));
     assert.equal(calls[0].url.pathname,"/api/v1/sync");
     assert.equal(calls[0].init.method,"POST");
     const body=new URLSearchParams(calls[0].init.body);
     assert.equal(body.get("sync_token"),"*");
-    assert.equal(body.get("resource_types"),'["notes"]');
+    assert.equal(body.get("resource_types"),'["all"]');
 
     globalThis.fetch=async()=>new Response(JSON.stringify({full_sync:false,sync_token:"partial",
       full_sync_date_utc:new Date().toISOString(),notes:[]}));
