@@ -14,6 +14,8 @@ const REGION=/^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/;
 const FUNCTION=/^[A-Za-z0-9_-]{2,64}$/;
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
 const PROFILE_NAMES=["home","antonio","work"];
+const PROGRESS_FIELDS=["stateScanPages","stateScanRows","stateScanConsumedCapacityUnits",
+  "stateScanElapsedMs","providerRequestsStarted","providerRequestsCompleted","providerRequestsInFlight"];
 const AMBIENT_CREDENTIALS=["AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESSION_TOKEN",
   "AWS_SECURITY_TOKEN","AWS_WEB_IDENTITY_TOKEN_FILE","AWS_ROLE_ARN",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI","AWS_CONTAINER_CREDENTIALS_FULL_URI"];
@@ -90,6 +92,18 @@ export function redactedFailureCode(error) {
 }
 
 export function redactedFailureDetails(error) {
+  if(error?.name==="CrossProfileAuditDeadlineError") {
+    const values=error.auditProgress&&typeof error.auditProgress==="object"?error.auditProgress:{};
+    const progress=Object.fromEntries(PROGRESS_FIELDS.filter(key=>Number.isSafeInteger(values[key])
+      &&values[key]>=0).map(key=>[key,values[key]]));
+    return Object.keys(progress).length?{progress}:{};
+  }
+  if(error?.name==="ErasurePreviewDeadlineError") {
+    const values=error.auditProgress&&typeof error.auditProgress==="object"?error.auditProgress:{};
+    const progress=Object.fromEntries(PROGRESS_FIELDS.filter(key=>Number.isSafeInteger(values[key])
+      &&values[key]>=0).map(key=>[key,values[key]]));
+    return Object.keys(progress).length?{progress}:{};
+  }
   if(error?.message==="Calendar recurring series exceeds audit inventory bound")
     return Number.isSafeInteger(error.auditAliasCount)&&error.auditAliasCount>=0
       ?{recurrenceAliasCountAtBound:error.auditAliasCount}:{};
@@ -287,30 +301,40 @@ export async function collectLiveCrossProfileEvidence(options) {
   process.env.AWS_SESSION_TOKEN=credentials.sessionToken;
   const originalFetch=globalThis.fetch;
   const providerDeadline=new AbortController();
+  const progress={stateScanPages:0,stateScanRows:0,stateScanConsumedCapacityUnits:0,stateScanElapsedMs:0,
+    providerRequestsStarted:0,providerRequestsCompleted:0,providerRequestsInFlight:0};
+  const snapshotProgress=()=>({...progress});
+  const deadlineError=()=>{
+    const error=new Error("Cross-profile provider audit deadline exceeded");
+    error.name="CrossProfileAuditDeadlineError";
+    error.auditProgress=snapshotProgress();
+    return error;
+  };
   const deadlineTimer=setTimeout(()=>providerDeadline.abort(),options.scanDeadlineMs);
   deadlineTimer.unref?.();
+  const progressTimer=setInterval(()=>process.stderr.write(JSON.stringify({
+    event:"cross_profile_audit_progress",...snapshotProgress(),
+  })+"\n"),30_000);
+  progressTimer.unref?.();
   globalThis.fetch=async(input,init={})=>{
-    if(providerDeadline.signal.aborted) {
-      const error=new Error("Cross-profile provider audit deadline exceeded");
-      error.name="CrossProfileAuditDeadlineError";
-      throw error;
-    }
+    if(providerDeadline.signal.aborted)throw deadlineError();
     const requestDeadline=AbortSignal.timeout(120_000);
     const signals=[providerDeadline.signal,requestDeadline,...(init.signal?[init.signal]:[])];
+    progress.providerRequestsStarted++;
+    progress.providerRequestsInFlight++;
     try {
       return await originalFetch(input,{...init,signal:AbortSignal.any(signals)});
     } catch(error) {
-      if(providerDeadline.signal.aborted) {
-        const deadlineError=new Error("Cross-profile provider audit deadline exceeded");
-        deadlineError.name="CrossProfileAuditDeadlineError";
-        throw deadlineError;
-      }
+      if(providerDeadline.signal.aborted)throw deadlineError();
       if(requestDeadline.aborted) {
         const timeoutError=new Error("Cross-profile provider request timed out");
         timeoutError.name="CrossProfileProviderRequestTimeoutError";
         throw timeoutError;
       }
       throw error;
+    } finally {
+      progress.providerRequestsCompleted++;
+      progress.providerRequestsInFlight--;
     }
   };
   try {
@@ -322,13 +346,24 @@ export async function collectLiveCrossProfileEvidence(options) {
   ]);
   const providerFactory=async profile=>readOnlyProviderPair(
     await defaultProviderClientFactory(profile),options.eventId,profile);
-  const preview=await buildErasurePreview({profile:"work",taskId:options.taskId,eventId:options.eventId,deleteCalendar:true},{
+  let preview;
+  try {preview=await buildErasurePreview({profile:"work",taskId:options.taskId,eventId:options.eventId,deleteCalendar:true},{
     scanDeadlineMs:options.scanDeadlineMs,
+    scanAbortSignal:providerDeadline.signal,
+    onInventoryProgress:value=>{
+      progress.stateScanPages=value.pages;
+      progress.stateScanRows=value.rowCount;
+      progress.stateScanConsumedCapacityUnits=Math.floor(value.consumedCapacityUnits);
+      progress.stateScanElapsedMs=value.elapsedMs;
+    },
     auditCrossProfileIdentity:true,
     auditDeliveryReceipts:true,
     clients:await providerFactory("work"),
     providerFactory,
-  });
+  });} catch(error) {
+    if(providerDeadline.signal.aborted||error?.name==="ErasurePreviewDeadlineError")throw deadlineError();
+    throw error;
+  }
   if(!preview.crossProfileEvidence)throw new Error("Cross-profile evidence was not returned");
   return {
     purpose:"issue-307-live-cross-profile-observation",
@@ -347,6 +382,7 @@ export async function collectLiveCrossProfileEvidence(options) {
   } finally {
     globalThis.fetch=originalFetch;
     clearTimeout(deadlineTimer);
+    clearInterval(progressTimer);
     for(const [name,value] of Object.entries(credentialEnv))
       if(value===undefined)delete process.env[name];else process.env[name]=value;
   }

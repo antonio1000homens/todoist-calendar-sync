@@ -244,6 +244,11 @@ deadline returns `CROSS_PROFILE_AUDIT_DEADLINE` with redacted details and
 incomplete evidence; it is not evidence that an identity or alias is absent.
 Each individual provider request also has a 120-second limit and reports
 `CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT` if it does not finish in time.
+The CLI emits a 30-second heartbeat to stderr containing only strong-scan page,
+row, capacity and elapsed-time counters plus provider request counts. The same
+allowlisted counters may appear in a deadline result. The overall deadline
+aborts both provider fetches and the in-flight DynamoDB scan request; no IDs,
+URLs, titles, row keys or credential values are included in progress output.
 
 The report is redacted and always exits with status 2 because this capture is
 not release-authoritative and cannot issue an erasure confirmation. A complete

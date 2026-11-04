@@ -48,6 +48,8 @@ type Dependencies = {
   allowJournalOperationId?: string;
   allowLeaseOwner?: string;
   scanDeadlineMs?: number;
+  scanAbortSignal?:AbortSignal;
+  onInventoryProgress?:(progress:{pages:number;rowCount:number;consumedCapacityUnits:number;elapsedMs:number})=>void;
   auditCrossProfileIdentity?:boolean;
   auditDeliveryReceipts?:boolean;
   sleep?: (ms: number) => Promise<void>;
@@ -80,6 +82,7 @@ async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: D
   let cursor: Record<string, unknown> | undefined;
   const started=Date.now();
   const deadline=started+(dependencies.scanDeadlineMs??80_000);
+  let pages=0,consumedCapacityUnits=0;
   const sleep=dependencies.sleep || (ms=>new Promise(resolve=>setTimeout(resolve,ms)));
   do {
     if(Date.now()>=deadline) throw new ErasurePreviewDeadlineError();
@@ -93,7 +96,8 @@ async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: D
     for(let attempt=0;;attempt++) {
       try {
         result=await db.send(new ScanCommand({TableName:tableName(),ConsistentRead:true,Limit:scanPageItemLimit(),
-          ExclusiveStartKey:cursor,ReturnConsumedCapacity:"TOTAL"}));
+          ExclusiveStartKey:cursor,ReturnConsumedCapacity:"TOTAL"}),
+        dependencies.scanAbortSignal?{abortSignal:dependencies.scanAbortSignal}:undefined);
         break;
       } catch(error) {
         const name=(error as {name?:string})?.name;
@@ -109,6 +113,9 @@ async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: D
       if(seenKeys.has(rowKey))throw new Error("Strong state inventory repeated a row across pages");
       seenKeys.add(rowKey);rows.push(row);
     }
+    pages++;
+    consumedCapacityUnits+=Number(result.ConsumedCapacity?.CapacityUnits||0);
+    dependencies.onInventoryProgress?.({pages,rowCount:rows.length,consumedCapacityUnits,elapsedMs:Date.now()-started});
     cursor = result.LastEvaluatedKey as Record<string, unknown> | undefined;
     if(cursor) await sleep(pacingDelayMs(Number(result.ConsumedCapacity?.CapacityUnits||0),Date.now()-pageStarted));
   } while (cursor);
