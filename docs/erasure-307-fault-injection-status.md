@@ -236,6 +236,27 @@ the audit does not delete or infer ownership for them. The live preview has
 178 blockers overall, so the current Work profile cannot pass the item-level
 cleanup gate even after provider deletion.
 
+### Recheck of the unresolved alias closure (4 Nov 2026, 16:22 UTC)
+
+The same exact staged Work task/event pair was rerun through the deployed-
+credential observer. It again failed closed with
+`CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER`. The non-selected oversized
+master remained connected through Calendar event identity and task-tag edges,
+Antonio and Work project comments for other tasks, and delivery-state rows.
+Two other-task mappings were found; neither task appeared in the complete
+active task inventories, and both direct Todoist reads returned 404. The
+selected task still had one tagged event and no tagged recurring master. Three
+related delivery rows referenced neither selected ID. Provider IDs and
+credentials remain withheld.
+
+This is not a missing Calendar pagination page: the observer enumerates every
+instance page and refuses when a series exceeds the 32-alias marker bound.
+Because the oversized series is reachable through unresolved identity edges,
+raising the cap or dropping those edges would not prove closure; either change
+would also need to preserve the one-transaction marker bound. No provider or
+AWS writes were made. The capture exited incomplete and does not authorize
+post-write recovery.
+
 ### Point-in-time queue attributes
 
 A read-only `GetQueueAttributes` call against the source and DLQ URLs configured
