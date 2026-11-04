@@ -17,7 +17,8 @@ test("Lambda config audit reads every published version and alias target but omi
       const codeSha256=version==="1"?sha1:sha2;
       return {FunctionName:command.input.FunctionName,Version:version,CodeSha256:codeSha256,
         Environment:{Variables:{ERASURE_REPLAY_BARRIER_VERSION:version==="2"?"1":"0",
-          ERASURE_EXECUTION_ENABLED:version==="1"?"true":"false",TODOIST_API_TOKEN:"private-token"}}};
+          ERASURE_EXECUTION_ENABLED:version==="1"?"true":"false",
+          ERASURE_PROTOCOL_VERSION:version==="1"?"0":"1",TODOIST_API_TOKEN:"private-token"}}};
     }
     throw new Error("Unexpected AWS command");
   }};
@@ -29,6 +30,8 @@ test("Lambda config audit reads every published version and alias target but omi
   assert.equal(fn.replayBarrierEnabledCount,1);assert.equal(fn.replayBarrierPresentCount,3);
   assert.ok(fn.configs.every(item=>item.postwriteReview==="absent"));
   assert.equal(fn.erasureExecutionEnabledCount,1);
+  assert.equal(fn.erasureExecutionReadyCount,0,"execution flag alone is not the runtime readiness predicate");
+  assert.equal(report.erasureExecutionReadyCount,0);
   assert.equal(report.replayBarrierMayBeEnabled,false);
   assert.equal(report.executableRecoveryMayBeEnabled,false);
   assert.equal(JSON.stringify(report).includes("private-token"),false);
@@ -47,6 +50,20 @@ test("Lambda config audit fails closed on pagination loops and alias targets mis
     throw new Error("Unexpected AWS command");
   }};
   await assert.rejects(collectRuntimeConfigAudit(badAlias,{functionNames:["sync-worker"],region:"eu-west-2"}),/Alias target is absent/);
+});
+
+test("Lambda config audit counts executable readiness only when both exact deployment gates are enabled",async()=>{
+  const client={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"latest"}]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[]};
+    if(command.constructor.name==="GetFunctionConfigurationCommand")return {FunctionName:"sync-worker",Version:"$LATEST",
+      CodeSha256:"latest",Environment:{Variables:{ERASURE_EXECUTION_ENABLED:"true",ERASURE_PROTOCOL_VERSION:"1"}}};
+    throw new Error("Unexpected AWS command");
+  }};
+  const report=await collectRuntimeConfigAudit(client,{functionNames:["sync-worker"],region:"eu-west-2"});
+  assert.equal(report.functions[0].erasureExecutionEnabledCount,1);
+  assert.equal(report.functions[0].erasureExecutionReadyCount,1);
+  assert.equal(report.erasureExecutionReadyCount,1);
 });
 
 test("Lambda config audit fails closed when $LATEST environment flags change during the read",async()=>{

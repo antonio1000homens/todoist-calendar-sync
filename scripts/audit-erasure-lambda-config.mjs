@@ -57,11 +57,13 @@ function summarizeEnvironment(config) {
     if(!Object.hasOwn(variables,name))return "absent";
     if(name==="ERASURE_REPLAY_BARRIER_VERSION"||name==="ERASURE_POSTWRITE_REVIEW_VERSION")
       return variables[name]==="1"?"enabled":"present_other";
+    if(name==="ERASURE_PROTOCOL_VERSION")return variables[name]==="1"?"enabled":"present_other";
     return variables[name]==="true"?"enabled":"present_other";
   };
   return {replayBarrier:state("ERASURE_REPLAY_BARRIER_VERSION"),
     postwriteReview:state("ERASURE_POSTWRITE_REVIEW_VERSION"),
-    erasureExecution:state("ERASURE_EXECUTION_ENABLED")};
+    erasureExecution:state("ERASURE_EXECUTION_ENABLED"),
+    erasureProtocol:state("ERASURE_PROTOCOL_VERSION")};
 }
 function normalizedAliases(aliases) {
   const normalized=aliases.map(alias=>({name:alias.Name,version:alias.FunctionVersion,
@@ -121,10 +123,13 @@ export async function collectRuntimeConfigAudit(client,{functionNames,region,sle
       replayBarrierPresentCount:configs.filter(item=>item.replayBarrier!=="absent").length,
       postwriteReviewEnabledCount:count("postwriteReview"),
       postwriteReviewPresentCount:configs.filter(item=>item.postwriteReview!=="absent").length,
-      erasureExecutionEnabledCount:count("erasureExecution")});
+      erasureExecutionEnabledCount:count("erasureExecution"),
+      erasureExecutionReadyCount:configs.filter(item=>item.erasureExecution==="enabled"
+        &&item.erasureProtocol==="enabled").length});
   }
   return {purpose:"issue-307-redacted-lambda-version-configuration-inventory",region,
     status:"BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW",functions,
+    erasureExecutionReadyCount:functions.reduce((n,item)=>n+item.erasureExecutionReadyCount,0),
     environmentValuesOmitted:true,awsMutationsPerformed:false,
     replayBarrierMayBeEnabled:false,executableRecoveryMayBeEnabled:false};
 }
