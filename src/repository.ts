@@ -1652,6 +1652,7 @@ export class StateRepository {
   }
 
   private async deleteProfileMappingIndexes(mapping: Mapping): Promise<void> {
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     try {
       await client.send(new TransactWriteCommand({
         TransactItems: [
@@ -1805,7 +1806,6 @@ export class StateRepository {
   }
 
   async deleteMapping(mapping: Mapping): Promise<void> {
-    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     const owner = await client.send(new GetCommand({
       TableName: this.ensureTable(),
       Key: key(`TASKOWNER#${mapping.taskId}`, "MAP"),
@@ -1817,6 +1817,7 @@ export class StateRepository {
       return;
     }
 
+    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
     try {
       await client.send(new TransactWriteCommand({
         TransactItems: [
@@ -2268,6 +2269,7 @@ export class StateRepository {
   }
 
   async endTodoistCalendarWrite(taskId: string, token: string): Promise<void> {
+    // Releasing a caller-owned lease must remain possible after a blocked write.
     try {
       await client.send(new DeleteCommand({
         TableName: this.ensureTable(), Key: key(`CALENDAR_WRITE#${taskId}`),

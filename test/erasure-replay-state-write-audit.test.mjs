@@ -18,6 +18,7 @@ const guardedIdentityMutators=[
   "putConsolidationGuard",
   "commitRecurrenceConsolidation",
   "restoreMappingIndexesIfOwned",
+  "deleteProfileMappingIndexes",
   "completeFutureSeriesSplit",
   "purgeEarlierCancelledCalendarOccurrence",
   "deleteMapping",
@@ -83,7 +84,8 @@ test("deleted mapping refuses marker and sends no state mutation",async t=>{
   });
   await assert.rejects(new StateRepository().deleteMapping({profile:"work",taskId:"blocked-task",
     eventId:"blocked-event",updatedAt:"2026-11-04T00:00:00.000Z"}),ErasureReplayBlockedError);
-  assert.equal(calls.length,1);
+  assert.ok(calls.length>=1);
+  assert.equal(calls.some(command=>command.constructor.name!=="GetCommand"),false);
 });
 
 test("recurrence deletion reads then checks every known alias before deleting",async t=>{
