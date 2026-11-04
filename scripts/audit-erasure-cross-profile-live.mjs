@@ -152,6 +152,7 @@ export async function collectLiveCrossProfileEvidence(options) {
   const preview=await buildErasurePreview({profile:"work",taskId:options.taskId,eventId:options.eventId,deleteCalendar:true},{
     scanDeadlineMs:options.scanDeadlineMs,
     auditCrossProfileIdentity:true,
+    auditDeliveryReceipts:true,
     clients:await providerFactory("work"),
     providerFactory,
   });
@@ -165,7 +166,8 @@ export async function collectLiveCrossProfileEvidence(options) {
     crossProfileEvidence:preview.crossProfileEvidence,
     preview:{blockerCount:preview.blockers.length,relatedStateRowCount:preview.inventory.length,
       classificationCounts:preview.classificationCounts,
-      stateInventoryByFamily:summarizeInventory(preview.inventory)},
+      stateInventoryByFamily:summarizeInventory(preview.inventory),
+      deliveryReceiptAudit:preview.deliveryReceiptAudit},
     replayBarrierMayBeEnabled:false,
     executableRecoveryMayBeEnabled:false,
   };

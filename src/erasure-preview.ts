@@ -8,6 +8,7 @@ import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
+import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
@@ -32,6 +33,7 @@ export interface ErasurePreviewResult {
   classificationCounts: Record<string, number>;
   blockers: string[];
   crossProfileEvidence?:CrossProfileErasureEvidence;
+  deliveryReceiptAudit?:ErasureDeliveryReceiptAudit;
   confirmation?: { confirmationId: string; expiresAt: number };
 }
 
@@ -47,6 +49,7 @@ type Dependencies = {
   allowLeaseOwner?: string;
   scanDeadlineMs?: number;
   auditCrossProfileIdentity?:boolean;
+  auditDeliveryReceipts?:boolean;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -224,6 +227,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     ].sort((a,b)=>a.id.localeCompare(b.id)) };
   const operationPreview = { operationId, profile: target.profile, target: { ...target, deleteCalendar: input.deleteCalendar },
     selectedActions, inventory, providerSnapshotFingerprint, actionPlan };
+  const deliveryReceiptAudit=dependencies.auditDeliveryReceipts
+    ?summarizeErasureDeliveryReceipts(allRows,target.profile):undefined;
   return {
     operationId, profile: target.profile, target: operationPreview.target, selectedActions,
     previewFingerprint: erasurePreviewFingerprint(operationPreview), providerSnapshotFingerprint, inventoryDigest: plan.inventoryDigest,
@@ -233,5 +238,6 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
     ...(crossProfileEvidence?{crossProfileEvidence}:{}),
+    ...(deliveryReceiptAudit?{deliveryReceiptAudit}:{}),
   };
 }

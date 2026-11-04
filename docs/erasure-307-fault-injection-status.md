@@ -141,3 +141,16 @@ receipt TTL are not by themselves replay-absence evidence ([DLQ retention
 semantics](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/setting-up-dead-letter-queue-retention.html),
 [queue count consistency](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_GetQueueAttributes.html)).
 No message bodies were read and no queue attributes were changed.
+
+The integrated redacted receipt audit observed 740 completed Work delivery
+receipts. Of these, 174 had no identity-reference arrays: 30 Calendar, 142
+reconciliation, one manual and one repair receipt. The full scan completed at
+`2026-11-04T12:52:26Z`. At that time, five
+were past `expiresAt` (three Calendar and two reconciliation) but still present
+in the strong scan; the remaining 169 were all due to expire within seven
+days, with 29 due within one day. The preview therefore still counts all 174
+as unattributable. DynamoDB TTL expiration does not itself remove an item from
+reads immediately; deletion is asynchronous and expired items remain visible
+until the background deletion occurs ([TTL behavior](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html)).
+Re-run the exact audit after TTL deletion, and continue to require queue/DLQ
+replay evidence before allowing recovery.
