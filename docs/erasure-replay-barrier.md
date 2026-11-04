@@ -72,15 +72,17 @@ and every live/qualified writer must run the enabled implementation. Do not
 turn on the gate yet: the remaining identity propagation, old Lambda-version
 retirement and fully verified post-write recovery are unfinished.
 
-**Known remaining gaps:** direct provider clients outside the guarded
-factories, unknown-ID creation and comment deletions, recurrence aliases not
-contained in the currently available mapping, some noncanonical DynamoDB
-writers (including repair/review history), coordinated source/destination
-leases for cross-profile moves, complete Calendar delta ingestion, and old
-qualified Lambda versions. A strongly consistent lookup is not a substitute
-for an atomic provider/API mutation plus marker condition under concurrent
-cross-profile erasure; deployment must prove the serialized lease protocol
-covers these races. There has been **no** production rollout or fault injection.
+The current source-level provider mutation inventory and its limits are
+recorded in [`erasure-writer-source-audit.md`](./erasure-writer-source-audit.md).
+Remaining source and deployment gaps include unknown-ID creation and comment
+deletions, recurrence aliases not contained in the currently available
+mapping, unclassified identity-bearing DynamoDB routes, coordinated
+source/destination leases for cross-profile moves, complete Calendar delta
+ingestion, and old qualified Lambda versions. A strongly consistent lookup is
+not a substitute for an atomic provider/API mutation plus marker condition
+under concurrent cross-profile erasure; deployment must prove the serialized
+lease protocol covers these races. There has been **no** production rollout or
+fault injection.
 
 ## Marker and key lifecycle
 
