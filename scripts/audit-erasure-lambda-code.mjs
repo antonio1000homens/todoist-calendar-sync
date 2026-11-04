@@ -106,7 +106,7 @@ export async function collectCodeAudit(client,{functionNames,region}) {
       }
       const digests=[];
       for(const grouped of byHash.values())digests.push(await inspectDigest(client,functionName,grouped,tempDirectory));
-      functions.push({functionName,versionCount:versions.length,publishedVersionCount:versions.filter(v=>v.Version!=="$LATEST"&&v.Version!=="1").length,
+      functions.push({functionName,versionCount:versions.length,publishedVersionCount:versions.filter(v=>v.Version!=="$LATEST").length,
         uniqueCodeDigestCount:digests.length,verifiedPackageCount:digests.length,
         verifiedPackageBytes:digests.reduce((sum,item)=>sum+item.packageBytes,0),digests});
     }

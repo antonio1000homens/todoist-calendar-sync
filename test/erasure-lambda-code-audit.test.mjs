@@ -26,7 +26,8 @@ test("Lambda code audit verifies one ZIP per unique digest without exposing pack
   t.after(()=>{globalThis.fetch=before;});
   const client={async send(command){
     if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[
-      {Version:"$LATEST",CodeSha256:digest},{Version:"2",CodeSha256:digest},{Version:"3",CodeSha256:digest},
+      {Version:"$LATEST",CodeSha256:digest},{Version:"1",CodeSha256:digest},
+      {Version:"2",CodeSha256:digest},{Version:"3",CodeSha256:digest},
     ]};
     if(command.constructor.name==="GetFunctionCommand")return {
       Configuration:{CodeSha256:digest},Code:{Location:"https://example.invalid/presigned-secret"},
@@ -35,10 +36,11 @@ test("Lambda code audit verifies one ZIP per unique digest without exposing pack
   }};
   const report=await collectCodeAudit(client,{functionNames:["todoist-calendar-sync-ingress-production"],region:"eu-west-2"});
   const fn=report.functions[0];
-  assert.equal(fn.versionCount,3);
+  assert.equal(fn.versionCount,4);
+  assert.equal(fn.publishedVersionCount,3);
   assert.equal(fn.uniqueCodeDigestCount,1);
   assert.equal(fn.verifiedPackageCount,1);
-  assert.deepEqual(fn.digests[0].versions,["2","3","$LATEST"]);
+  assert.deepEqual(fn.digests[0].versions,["1","2","3","$LATEST"]);
   assert.equal(fn.digests[0].markerStrings.replayGate,true);
   assert.equal(fn.digests[0].markerStrings.markerKey,true);
   assert.equal(report.replayBarrierMayBeEnabled,false);
