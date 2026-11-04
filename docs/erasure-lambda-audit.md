@@ -404,3 +404,110 @@ about external copies or earlier exports. Security/privacy approval must
 explicitly account for the 35-day PITR copy and any external retention before
 permanent keyed replay markers are enabled. This read did not authorize that
 retention or change any AWS configuration.
+
+### Windsor IAM and Lambda refresh (4 Nov 2026, 17:24 UTC)
+
+A fresh read-only session again verified `AWS_PROFILE=windsor` as account
+`243857182133`. The eu-west-2 inventory found all seven expected production
+functions. Ingress had 73 published numeric versions and review-api had 97;
+the other five functions had only `$LATEST`. Ingress and review-api each had
+one alias. The two SQS mappings remained enabled, and the two Function URLs
+still had `AuthType=NONE`.
+
+The current identity scan examined 55 users, roles and groups and found five
+candidate identity-policy grants across four principals. No managed policy
+documents were missing. The simulator evaluated eight cases against all 177
+inventoried targets; every case allowed all targets, including 1,360
+qualified-target evaluations. It reported no permission boundary. The target
+account remains the Organizations management account, so SCPs do not apply.
+This remains a candidate scan and policy simulation, not proof of role
+assumption, STS session policy, combined effective access, resource-policy
+access, external callers or actual invocation. The Function URLs require
+separate resource-policy review.
+
+A separate all-active-region Lambda name scan examined 17 opted-in regions.
+Searching names containing `todoist`, `calendar` or `sync` found only the same
+seven expected functions in `eu-west-2`; 17 opt-in-disabled regions were not
+scanned. This is not a complete legacy-name, account or invocation audit.
+
+No AWS or provider mutation was performed. The replay barrier and executable
+recovery remain prohibited. Historical code, writer/identity closure,
+security approval, queue/marker ordering, destructive partial-deletion
+approval, fault injection and disposable Work-profile acceptance remain
+separate open gates.
+
+### Windsor published-package refresh (4 Nov 2026, 17:35 UTC)
+
+A fresh profile-bound package audit verified every current published ingress
+and review-api package against its AWS `CodeSha256`. Ingress had 72 published
+versions represented by 67 unique verified packages; review-api had 96
+published versions represented by 95 unique verified packages. Recognizable
+replay-barrier marker strings appeared in four ingress packages and fourteen
+review-api packages; the `reviewed_fenced` string appeared in nine review-api
+packages. The increases from the earlier snapshot reflect newly published
+packages, not evidence that old invocation paths are guarded.
+
+Marker presence is only a triage signal and does not prove the checks dominate
+every mutation path. The read-only scanner remains
+`BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`; it keeps
+`replayBarrierMayBeEnabled=false` and
+`executableRecoveryMayBeEnabled=false`. No code digest or package was added to
+this public report, and no AWS mutation was performed.
+
+### Windsor full Lambda name and role inventory (4 Nov 2026, 17:38 UTC)
+
+A fresh read-only scan verified the Windsor account with STS and paginated
+`ListFunctions` in all 17 opted-in regions. It found 21 functions total: two
+in `eu-west-1` and nineteen in `eu-west-2`; the other 15 opted-in regions
+returned none. Seventeen opt-in-disabled regions were not queryable. Matching
+`todoist`, `calendar`, `sync` or `erasure` in function names, execution-role
+names or descriptions identified seven functions, all seven expected
+production functions in `eu-west-2`. The other fourteen functions had no such
+name/role/description signal.
+
+This closes the full opted-in-region Lambda-name/role inventory for the
+Windsor account only. It does not prove there are no indirect writers among
+generic functions, non-Lambda triggers, other accounts, disabled regions or
+external credentials. The earlier 14-function package screen is limited to
+the packages and regions it inspected; identity, trust/session, deployment
+rollback and invocation review remain open. No AWS mutation was performed.
+
+### Windsor all-region Lambda versions and aliases (4 Nov 2026, 17:41 UTC)
+
+Read-only `ListVersionsByFunction` and `ListAliases` calls were completed for
+all 21 currently inventoried functions in the 17 opted-in regions. The account
+has 168 published numeric versions and two aliases, all in `eu-west-2` on the
+ingress and review-api functions (72 and 96 versions respectively). No alias
+had weighted secondary targets. The other 19 functions, including all 14
+generic-name functions and the five other expected app functions, were
+`$LATEST`-only with no aliases. `eu-west-1` had two functions and no published
+versions or aliases; the other 15 opted-in regions had no Lambda functions.
+
+This closes the current function/version/alias inventory for the enabled
+Windsor regions. The package snapshot current at 17:41 had not yet inspected
+the other five expected app functions; the 17:43 refresh below fills that
+package-digest gap. Neither scan proves static marker checks protect every
+mutation route, establishes which historical versions are invokable, covers
+the 17 opt-in-disabled regions or other accounts, or audits non-Lambda
+writers. Direct invocation denial, trust/session paths, rollback review and
+separate approval remain outstanding. No AWS mutation was performed.
+
+### Windsor all-function deployed-package digest refresh (4 Nov 2026, 17:43 UTC)
+
+A fresh read-only code audit verified the selected Windsor account with STS
+and downloaded packages for all seven expected application functions in
+`eu-west-2`. It verified 67 distinct ingress package digests, 95 review-api
+package digests and one `$LATEST` package digest for each of the other five
+functions. These per-function digests cover all 168 published numeric
+versions and all seven current `$LATEST` configurations. The other fourteen
+Windsor Lambda functions have no published versions or aliases and had their
+current package digests screened separately as described earlier.
+
+Each of the seven current `$LATEST` packages contained the recognizable
+replay-gate, marker-key and HMAC-keyring strings. Across historical ingress
+and review-api packages, those strings appeared in only four of 67 and
+fourteen of 95 unique packages respectively. Marker presence or absence is
+not a control-flow proof, but the historical package digests without the
+strings cannot be assumed to enforce the barrier. The scanner status remains
+`BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`, with both release flags
+false. No raw digests were recorded here and no AWS mutation was performed.
