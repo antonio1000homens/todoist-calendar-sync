@@ -128,6 +128,16 @@ Organizations policies, cross-account principals or resource policies. It
 always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
 an IAM change or enable replay/recovery.
 
+To simulate candidate identity grants against the inventoried Lambda resource
+ARNs, with only the region request context supplied, run:
+
+    node scripts/simulate-erasure-lambda-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> --candidates=<private-identity-candidates.json> > <private-policy-simulation.json>
+
+The IAM simulator does not prove role assumption or STS session policies, and
+role simulations do not include Lambda resource policies. Other context values,
+resource controls and unscanned regions/accounts remain separate gates. The
+report is a simulation, not a live invocation or approval; keep it private.
+
 To query invocation metrics for each inventoried published version, alias,
 alias-executed version and unqualified function over the CloudWatch retention
 window, run:
