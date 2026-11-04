@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {defaultProviderClientFactory} from "./mutation-budget.js";
 import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
@@ -20,6 +22,35 @@ export interface TodoistProjectTransition {
   action: TodoistProjectAction;
   fromProfile?: Profile;
   toProfile?: Profile;
+}
+
+/** Cross-profile transitions must be visible to each profile's erasure fence.
+ * The worker already holds the delivery-profile lease; acquire the other
+ * affected profile leases before any transition state/provider mutation. */
+export async function acquireMoveWriterLeases(profilesToWrite: Array<Profile | undefined>, deliveryProfile: Profile): Promise<() => Promise<void>> {
+  if (process.env.ERASURE_PROTOCOL_VERSION !== "1") return async () => {};
+  const profiles = [...new Set(profilesToWrite.filter((value): value is Profile => Boolean(value)))]
+    .filter(value => value !== deliveryProfile).sort();
+  const releases: Array<() => Promise<void>> = [];
+  try {
+    for (const profile of profiles) {
+      let release: (() => Promise<void>) | undefined;
+      for (let attempt = 0; attempt < 3 && !release; attempt++) {
+        const epoch = await getErasureEpoch(profile);
+        try {
+          release = await acquireErasureProtocolLease(profile, "writer", randomUUID(), epoch);
+        } catch (error) {
+          if (!(error instanceof ErasureEpochChangedError) || attempt === 2) throw error;
+        }
+      }
+      if (!release) throw new Error("Could not acquire cross-profile erasure writer lease");
+      releases.push(release);
+    }
+  } catch (error) {
+    for (const release of releases.reverse()) await release();
+    throw error;
+  }
+  return async () => { for (const release of releases.reverse()) await release(); };
 }
 
 export function todoistProjectTransition(
@@ -408,6 +439,9 @@ export class ProjectAwareSynchronizer {
     }
 
     if (transition.action === "move_projection" || transition.action === "delete_projection" || transition.action === "create_projection") {
+      const releaseMoveLeases = await acquireMoveWriterLeases(
+        [transition.fromProfile, transition.toProfile, mapping?.profile], delivery.profile);
+      try {
       const versionAccepted = await this.state.acceptTaskVersion(delivery.profile, task.id, task.updated_at, delivery.id);
       if (!versionAccepted && !explicitProjectChange) {
         return this.state.audit(delivery.profile, "todoist_stale_project_move_suppressed", {
@@ -432,6 +466,9 @@ export class ProjectAwareSynchronizer {
       }
       await this.applyProjectMove(delivery, task, lifecycle, transition, mapping);
       return;
+      } finally {
+        await releaseMoveLeases();
+      }
     }
 
     const destinationProfile = transition.toProfile || mapping?.profile;

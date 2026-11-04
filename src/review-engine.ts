@@ -16,7 +16,7 @@ import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { planStandaloneAnnualRepair, verifyStandaloneAnnualOwnership, applyStandaloneAnnualRepair, assertStandaloneHistory } from "./standalone-annual-repair.js";
 import { ManualDecisionStore, ManualInterventionService, type ManualDecision } from "./manual-intervention.js";
-import { ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
+import { acquireMoveWriterLeases, ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
 import { guardRepairProviders } from "./repair-provider-guard.js";
 import { finiteWeeklyCalendarRuleCandidate, resolveCalendarTimeZone } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedText } from "./security.js";
@@ -1246,6 +1246,7 @@ export class ReviewEngine {
       await this.store.saveOperation(operation);
     });
     let claimed = false;
+    let releaseDestinationWriter: (() => Promise<void>) | undefined;
     const queueDeferredRefresh = async (refs:EntityRef[]) => this.queueDeferredRefresh(refs,state);
     // Legacy failed operations can predate the durable abandoned marker. Do not
     // replay them unless persisted execution state proves a write may have begun.
@@ -1274,6 +1275,7 @@ export class ReviewEngine {
       intent = decisionRepairIntent(intent, operation.preview.case.decision);
       const targetTaskRef: EntityRef | undefined = intent.action === "move" && intent.targetProfile && intent.taskId
         ? { profile:intent.targetProfile, side:"todoist", id:intent.taskId } : undefined;
+      if (targetTaskRef) releaseDestinationWriter = await acquireMoveWriterLeases([targetTaskRef.profile], intent.profile);
       // Move claims a destination-profile task barrier not included in the
       // source profile preview. Save its original control state before claiming,
       // so even a no-write validation failure can release the entire lock set.
@@ -2427,6 +2429,7 @@ export class ReviewEngine {
       }
     }
     operation.notificationPending=true;operation.notificationText=`${operation.status === "needs_review"?"Needs review":"Failed"}: ${operation.error}`;
-    await this.store.saveOperation(operation);return operation;
+    try { await this.store.saveOperation(operation); return operation; }
+    finally { await releaseDestinationWriter?.(); }
   }
 }
