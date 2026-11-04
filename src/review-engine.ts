@@ -1,12 +1,13 @@
 import { planRecurrenceFlatten, flattenStandaloneId, flattenStandalone, flattenMasterProjection, assertFlattenedMaster, assertFlattenInstances } from "./recurrence-flatten.js";
 import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { randomUUID } from "node:crypto";
 import { profiles } from "./config.js";
 import { CanonicalIdentityStore, calendarCanonicalIdentity, todoistCanonicalIdentity } from "./canonical-identity.js";
 import { defaultProviderClientFactory, ReconciliationMutationBudget, createBudgetedClientFactory, type ProviderClientFactory } from "./mutation-budget.js";
 import { StateRepository } from "./repository.js";
 import { DynamoReconciliationStore } from "./reconciliation.js";
-import { ReviewStore, SyncControls, reviewHash } from "./review-store.js";
+import { assertRepairPreviewReplayAdmission, ReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
 import { calendarEventHasElapsed, hasCanonicalState, occurrenceStateMatches, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { upsertProjectMappingComment, deleteMappingComments, mappingCommentIds, parseMappingComment, isOwnedLegacyTaskMappingComment } from "./mapping-comments.js";
@@ -1223,6 +1224,16 @@ export class ReviewEngine {
   async execute(id: string): Promise<RepairOperation> {
     const operation = await this.store.getOperation(id); if (!operation) throw new Error("Repair not found");
     if (operation.status === "succeeded") return operation;
+    // Queued and resumed repairs are a separate ingress path from fresh sync
+    // deliveries. Recheck their complete reviewed identities immediately
+    // before any lock claim, checkpoint write, or provider mutation.
+    await assertRepairPreviewReplayAdmission(operation.preview);
+    if (operation.preview.intent.action === "move" && operation.preview.intent.targetProfile
+      && operation.preview.intent.taskId) {
+      const intent = operation.preview.intent;
+      const target = intent.targetProfile;
+      await assertReplayAdmissionIfEnabled({profile:target!,taskId:intent.taskId});
+    }
     // Already-abandoned deliveries are terminal: complete the FIFO receipt rather than
     // throwing a 409 into the dead-letter queue on retry/redelivery.
     if (operation.abandoned || operation.nonResumable) return operation;

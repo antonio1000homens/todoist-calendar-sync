@@ -20,10 +20,20 @@ async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: 
   if (taskId || eventId) await assertReplayAdmissionIfEnabled({ profile,
     ...(taskId ? { taskId } : {}), ...(eventId ? { eventIds: [eventId] } : {}) });
 }
-async function admitPreviewIdentities(preview: RepairPreview): Promise<void> {
+export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
   const refs = new Map<string, EntityRef>();
   for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
   for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
+  for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
+    const mapping = snapshot.mapping;
+    refs.set(entityKey({profile:mapping.profile,side:"todoist",id:mapping.taskId}),
+      {profile:mapping.profile,side:"todoist",id:mapping.taskId});
+    refs.set(entityKey({profile:mapping.profile,side:"calendar",id:mapping.eventId}),
+      {profile:mapping.profile,side:"calendar",id:mapping.eventId});
+    for (const id of [mapping.masterEventId,mapping.activeInstanceId]) if (id)
+      refs.set(entityKey({profile:mapping.profile,side:"calendar",id}),
+        {profile:mapping.profile,side:"calendar",id});
+  }
   const intent: EntityRef[] = [
     ...(preview.intent.taskId ? [{ profile: preview.intent.profile, side: "todoist" as const, id: preview.intent.taskId }] : []),
     ...(preview.intent.eventId ? [{ profile: preview.intent.profile, side: "calendar" as const, id: preview.intent.eventId }] : []),
@@ -651,13 +661,13 @@ export class ReviewStore {
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: values }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
-    await admitPreviewIdentities(preview);
+    await assertRepairPreviewReplayAdmission(preview);
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
   }
   getPreview(id: string): Promise<RepairPreview | undefined> { return this.get(`REPAIR_PREVIEW#${id}`); }
   getOperation(id: string): Promise<RepairOperation | undefined> { return this.get(`REPAIR#${id}`); }
   async submit(preview: RepairPreview, actor: ReviewActor, idempotencyKey: string): Promise<RepairOperation> {
-    await admitPreviewIdentities(preview);
+    await assertRepairPreviewReplayAdmission(preview);
     if (preview.actor.subject !== actor.subject || preview.expiresAt * 1000 <= Date.now()) throw new Error("Preview expired or belongs to another operator");
     const id = reviewHash([actor.subject, preview.id, idempotencyKey]).slice(0, 32);
     const old = await this.getOperation(id); if (old) return old;
@@ -715,7 +725,7 @@ export class ReviewStore {
     return operation;
   }
   async saveOperation(operation: RepairOperation): Promise<void> {
-    await admitPreviewIdentities(operation.preview);
+    await assertRepairPreviewReplayAdmission(operation.preview);
     operation.updatedAt = new Date().toISOString();
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
@@ -734,7 +744,7 @@ export class ReviewStore {
       ExpressionAttributeValues:{":false":false,":now":new Date().toISOString(),":lookup":"REPAIR#HISTORY#"+operationId,":succeeded":"succeeded",":needsReview":"needs_review",":failed":"failed",...(replyTs?{":reply":replyTs}:{})} }));
   }
   async finalizeOperation(operation: RepairOperation, releases: RepairRelease[]): Promise<RepairOperation> {
-    await admitPreviewIdentities(operation.preview);
+    await assertRepairPreviewReplayAdmission(operation.preview);
     for (const release of releases) await admitReviewIdentity(release.ref.profile,
       release.ref.side === "todoist" ? release.ref.id : undefined,
       release.ref.side === "calendar" ? release.ref.id : undefined);
