@@ -208,6 +208,7 @@ export async function observeCrossProfileErasureEvidence(input:{
   const calendarByHistoryMaster={} as Record<Profile,Map<string,CalendarAuditEvent[]>>;
   const calendarBySeries={} as Record<Profile,Map<string,CalendarAuditEvent[]>>;
   const calendarIdsByProfile={} as Record<Profile,Set<string>>;
+  const calendarReadableIdsByProfile={} as Record<Profile,string[]>;
   const configuredCalendarByProfile={} as Record<Profile,string|undefined>;
   const calendarInventoryCompleteByProfile={} as Record<Profile,boolean>;
   const calendarProvenanceCompleteByProfile={} as Record<Profile,boolean>;
@@ -367,6 +368,9 @@ export async function observeCrossProfileErasureEvidence(input:{
     calendarById[profile]=new Map();calendarByProviderId[profile]=new Map();calendarByTask[profile]=new Map();
     calendarByParent[profile]=new Map();calendarByHistoryMaster[profile]=new Map();calendarBySeries[profile]=new Map();
     calendarIdsByProfile[profile]=new Set(calendarAudit.descriptors.map(calendar=>calendar.id));
+    calendarReadableIdsByProfile[profile]=calendarAudit.descriptors
+      .filter(calendar=>!["freeBusyReader","writerWithoutPrivateAccess"].includes(calendar.accessRole))
+      .map(calendar=>calendar.id);
     configuredCalendarByProfile[profile]=calendarAudit.descriptors.find(calendar=>calendar.configured)?.id;
     calendarInventoryCompleteByProfile[profile]=calendarAudit.complete;
     calendarProvenanceCompleteByProfile[profile]=calendarAudit.provenanceComplete;
@@ -594,7 +598,10 @@ export async function observeCrossProfileErasureEvidence(input:{
         inventoryCandidates.set(item.calendarId,item);
       // Direct-ID reads must address *every* declared and listed calendar, not
       // only calendars where a matching inventory record was already found.
-      const targets=[...calendarIdsByProfile[profile]];
+      const targets=calendarProvenanceCompleteByProfile[profile]
+        ?calendarReadableIdsByProfile[profile]
+        :inventoryCandidates.size?[...inventoryCandidates.keys()]:
+          (configuredCalendarByProfile[profile]?[configuredCalendarByProfile[profile]!]:["configured-calendar-unverified"]);
       for(const calendarId of targets) {
         const eventKey=profile+"/"+calendarEventKey(calendarId,eventId);
         if(processedEventReads.has(eventKey))continue;
