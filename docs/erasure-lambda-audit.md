@@ -315,3 +315,32 @@ prove there are no nonstandard writers. The AWS Organizations inventory
 returned only the Windsor management account, so this scan covers no
 out-of-organization credentials or external accounts. No AWS mutation was
 performed.
+
+### Non-sync deployed Lambda package screening (4 Nov 2026)
+
+After verifying the Windsor caller with STS, a read-only screen downloaded the
+14 non-`todoist-calendar-sync-*` Lambda function packages currently returned in
+`eu-west-1` and `eu-west-2`. Each downloaded ZIP's SHA-256 matched the
+`GetFunction` `CodeSha256`. The screen also read and verified the digests of all
+three attached non-sync layer archives. It searched package bytes for Todoist
+API, Google Calendar API, and common task/event mutation markers; package
+contents were not dumped, and environment values were not read. Manual
+verification displayed only selected endpoint and HTTP-method source lines.
+
+No such markers appeared in the unrelated function packages or layer archives.
+The shared `led-publisher` / `led-control-api` Python package contains a
+Todoist task-filter GET and Google Calendar event-list GET. Its only Todoist
+POST is to the OAuth access-token endpoint for refresh; source inspection found
+no Todoist task or Calendar event identity-write request. This package has no
+Calendar event mutation call. Identical shared package matches explain why the
+same static scan result appears for both functions.
+
+This narrows the unreviewed non-sync code surface in the two regions observed,
+but it is not proof that every route is safe: string scans do not establish
+control flow, dynamically assembled requests, indirect calls, IAM
+authorization, other principals/accounts, historical versions, or resources
+outside those two regions. The earlier 17-region scan was name-only; this
+package screen audited code only in the two regions where that scan found
+functions, and does not classify non-Lambda writer routes or historical
+versions. The complete writer-audit checklist therefore remains unchecked. No
+AWS or provider mutation was performed.
