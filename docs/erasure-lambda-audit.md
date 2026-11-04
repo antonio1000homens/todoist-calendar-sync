@@ -591,3 +591,21 @@ identity-based invoke paths, or resource policies. It remains
 `BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`; the replay and executor
 release flags remain false. No AWS mutation, Lambda invocation, queue operation
 or provider write was performed.
+
+### Windsor deployed erasure-gate configuration refresh (4 Nov 2026, 22:09 UTC)
+
+A fresh redacted configuration audit covered all 181 versions of the seven
+expected `eu-west-2` production functions. No version had
+`ERASURE_REPLAY_BARRIER_VERSION` enabled or configured, no version contained
+the HMAC keyring, and no version had post-write review enabled. Both replay
+release flags remain false.
+
+The separate paired pre-write readiness setting
+(`ERASURE_EXECUTION_ENABLED` plus `ERASURE_PROTOCOL_VERSION`) was present on
+41 configurations: 39 published versions and two `$LATEST` configurations.
+Forty are on review-api (including its `live` alias target version 102), and
+one is on the erasure worker. This is the existing pre-write recovery path; it
+does not establish post-write release authorization or replay-barrier
+admission. The audit omitted all environment values and made no AWS changes.
+Historical version invocation rights and the safety of every enabled pre-write
+path remain part of the unchecked writer/IAM review.
