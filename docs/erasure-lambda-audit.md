@@ -511,3 +511,32 @@ not a control-flow proof, but the historical package digests without the
 strings cannot be assumed to enforce the barrier. The scanner status remains
 `BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`, with both release flags
 false. No raw digests were recorded here and no AWS mutation was performed.
+
+### Windsor current identity-policy simulation refresh (4 Nov 2026, 19:58 UTC)
+
+A fresh read-only run verified the Windsor caller with STS, inventoried all
+seven expected production functions in `eu-west-2`, and found no missing
+expected function. The IAM candidate collector paginated 57 users, roles and
+groups, found no missing managed-policy documents, and identified five
+candidate grants across four principals. This is a candidate scan, not a
+complete effective-permission inventory.
+
+The IAM policy simulator evaluated eight direct/legacy invocation cases
+against all 181 inventoried targets. Each case allowed all 181 targets,
+including 174 qualified targets, and reported zero denied targets. The
+candidate report found no permission boundary on those grants. Separately,
+both inventoried Function URLs still use `AuthType=NONE` and both resource
+policy summaries contain wildcard public invocation statements. These results
+confirm that current account-local identities and public URLs cannot be
+treated as barriers against direct invocation of historical versions.
+
+The account is still the Organizations management account, so an SCP cannot
+guard this workload. The candidate scan and simulator do not combine trust,
+session policies, permission boundaries, explicit denies, Lambda resource
+policies, external callers or organization controls into one effective
+authorization result. Public Function URL restriction also needs a reviewed
+Cloudflare-to-Lambda authentication design because the deployed Cloudflare
+Workers currently call those URLs without SigV4. No IAM, Function URL,
+Lambda, alias, queue or application setting was changed. The first #307
+writer/IAM acceptance remains unchecked; no denial or version-retirement
+change is authorized by these read-only results.
