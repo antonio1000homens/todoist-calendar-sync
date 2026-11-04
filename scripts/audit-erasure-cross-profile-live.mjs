@@ -61,6 +61,23 @@ export function validateRoutingConfig(value) {
   return config;
 }
 
+/** Classify only a small set of reviewed, non-sensitive failure strings. */
+export function redactedFailureCode(error) {
+  const message=typeof error?.message==="string"?error.message:"";
+  if(message==="Calendar recurring series exceeds replay marker bound")
+    return "CALENDAR_RECURRENCE_ALIAS_LIMIT";
+  if(message==="Calendar full inventory exceeded the audit result limit")
+    return "CALENDAR_INVENTORY_LIMIT";
+  if(message==="Todoist task inventory exceeded the audit result limit")
+    return "TODOIST_INVENTORY_LIMIT";
+  if(message==="Strong state inventory repeated a pagination cursor"
+    ||message==="Strong state inventory repeated a row across pages")
+    return "STATE_INVENTORY_INCONSISTENT";
+  if(error instanceof Error&&error.name==="ErasurePreviewDeadlineError")
+    return "STATE_INVENTORY_DEADLINE";
+  return "UNCLASSIFIED";
+}
+
 function verifiedCliIdentity(profile) {
   const env={...process.env};
   for(const name of AMBIENT_CREDENTIALS)delete env[name];
@@ -181,8 +198,9 @@ export async function main(argv=process.argv.slice(2)) {
 }
 
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href) {
-  main().catch(()=>{
-    process.stderr.write("Live cross-profile evidence INCOMPLETE; provider IDs and credentials withheld.\n");
+  main().catch(error=>{
+    process.stderr.write("Live cross-profile evidence INCOMPLETE; failureCode="
+      +redactedFailureCode(error)+"; provider IDs and credentials withheld.\n");
     process.exitCode=2;
   });
 }
