@@ -114,6 +114,12 @@ independent review. The exact account inventory, principals, alias targets,
 version counts and configuration values are intentionally kept out of this
 public report. No AWS resource or IAM policy was changed during inspection.
 
+The 4 Nov 2026 profile-bound package audit verified every returned ZIP digest.
+The static marker scan found historical packages without replay-barrier marker
+strings, while current alias targets contain them. Marker presence is only a
+triage signal and does not prove that a guard dominates every mutation path;
+historical direct invocation and IAM access therefore remain unapproved.
+
 The audit is incomplete: it has not established all permission boundaries,
 organization policies and role trust/session paths; CloudTrail data-event
 coverage and qualified invocation metrics; all historical writer paths;
