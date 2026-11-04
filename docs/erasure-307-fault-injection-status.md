@@ -95,3 +95,26 @@ not release-authoritative and cannot issue an erasure confirmation. A complete
 read only proves the observed provider/state evidence for those exact IDs; it
 does not authorize enabling the replay barrier or executable recovery. No AWS
 or provider mutation is performed.
+
+### Windsor read-only capture (4 Nov 2026)
+
+The capture used the disposable Work task/event created through the connected
+Todoist and Google Calendar tools. The script verified Windsor account
+`243857182133`; the strongly consistent scan received all pages (4,749 rows
+before connector cleanup, 4,748 after) and queried all three deployed profiles.
+While the fixture was active, the same Todoist task was found through Work and
+Antonio profile credentials, with one related project comment in each; Home
+had no task match. The selected Calendar event was found only through Work.
+This confirms a cross-profile Todoist identity alias in deployed credentials.
+
+After connector deletion, title searches returned no task in the three
+configured Todoist projects or event in the three configured calendars. Exact
+provider reads then returned Todoist 404s in all profiles, but the Work Calendar
+read returned the exact event as `cancelled`; the all-events inventory still
+matched it. The eight identity-related state rows remained in the post-cleanup
+scan. Accordingly the report kept `knownIdentitiesAbsentFromCurrentProviders`
+false and `eligibleForPostWriteRelease` false. Calendar 404/410 ambiguity,
+cancelled-event handling, unlisted-calendar provenance, transaction-snapshot
+gaps, independent writer/IAM review, action-time ETag checks, and full fresh
+reconciliation remain unresolved. Neither `ERASURE_REPLAY_BARRIER_VERSION`
+nor executable recovery was enabled, and the AWS reads made no mutations.
