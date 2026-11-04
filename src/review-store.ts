@@ -216,6 +216,9 @@ export class ReviewStore {
   ): Promise<Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }>> {
     const marked: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }> = [];
     for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) {
+      await admitReviewIdentity(ref.profile,
+        ref.side === "todoist" ? ref.id : undefined,
+        ref.side === "calendar" ? ref.id : undefined);
       const pendingRefreshAt = randomUUID();
       await this.db.send(new UpdateCommand({ TableName: reviewTable(),
         Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
