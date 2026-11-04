@@ -344,8 +344,9 @@ export class GoogleCalendar {
   /**
    * Bounded complete instance observation for the #307 recovery audit. Unlike
    * date-windowed normal sync reads, this enumerates every page (including
-   * cancellations and exceptions). Oversized series fail closed after paging
-   * so the read-only audit can report a count without exposing any IDs.
+   * cancellations and exceptions). This audit bound is intentionally larger
+   * than the replay marker transaction's alias bound: observation must be able
+   * to discover an oversized identity closure before proving it unreleasable.
    */
   async listEventInstances(masterId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
     if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
@@ -367,14 +368,14 @@ export class GoogleCalendar {
         if (previous && JSON.stringify(previous) !== JSON.stringify(event))
           throw new Error("Calendar instance inventory changed during pagination");
         found.set(event.id, event);
-      }
-      const next = response.nextPageToken;
-      if (next === undefined) {
-        if(found.size>32) {
-          const error=new Error("Calendar recurring series exceeds replay marker bound");
+        if(found.size>256) {
+          const error=new Error("Calendar recurring series exceeds audit inventory bound");
           Object.assign(error,{auditAliasCount:found.size});
           throw error;
         }
+      }
+      const next = response.nextPageToken;
+      if (next === undefined) {
         return [...found.values()];
       }
       if (typeof next !== "string" || !next || seenTokens.has(next))
