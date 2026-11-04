@@ -571,3 +571,23 @@ simulator does not prove role assumption or STS session context, does not
 include Lambda resource policies, and cannot rule out callers or routes outside
 the inventory. The trust summary is structural evidence only. No AWS mutation
 was performed; replay and executable recovery remain disabled.
+
+### Windsor all-function package digest refresh (4 Nov 2026, 21:50 UTC)
+
+A fresh read-only scan verified the seven expected production functions in
+`eu-west-2`. The version inventory and package audit were taken back to back;
+all seven function version counts and all version code digests matched between
+the two reads. The audit downloaded 173 unique deployment packages and verified
+each package against its AWS `CodeSha256`, covering 181 versions including
+`$LATEST` and 174 published versions.
+
+Across the 173 unique packages, recognizable strings appeared in 29 packages
+for each of the replay gate, marker key prefix and HMAC keyring; ingress
+unavailable/suppressed strings appeared in five packages each, and the fenced
+review marker appeared in 15. Marker presence is triage only; it does not prove
+that a guard dominates every provider or DynamoDB mutation. The scan did not
+establish safety in the 17 opt-in-disabled regions, legacy accounts/names,
+identity-based invoke paths, or resource policies. It remains
+`BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`; the replay and executor
+release flags remain false. No AWS mutation, Lambda invocation, queue operation
+or provider write was performed.
