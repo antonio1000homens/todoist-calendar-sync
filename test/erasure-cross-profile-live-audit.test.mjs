@@ -69,6 +69,10 @@ test("cross-profile audit classifies incomplete inventories with fixed safe code
     "STATE_INVENTORY_INCONSISTENT");
   const deadline=new Error("deadline"); deadline.name="ErasurePreviewDeadlineError";
   assert.equal(redactedFailureCode(deadline),"STATE_INVENTORY_DEADLINE");
+  const providerDeadline=new Error("provider deadline");
+  providerDeadline.name="CrossProfileAuditDeadlineError";
+  assert.equal(redactedFailureCode(providerDeadline),"CROSS_PROFILE_AUDIT_DEADLINE");
+  assert.deepEqual(redactedFailureDetails(providerDeadline),{});
 });
 
 test("read-only provider facade tags an oversized recurrence relative to selected event",async()=>{

@@ -62,6 +62,8 @@ export function validateRoutingConfig(value) {
 
 /** Classify only a small set of reviewed, non-sensitive failure strings. */
 export function redactedFailureCode(error) {
+  if(error instanceof Error&&error.name==="CrossProfileAuditDeadlineError")
+    return "CROSS_PROFILE_AUDIT_DEADLINE";
   const message=typeof error?.message==="string"?error.message:"";
   if(error?.name==="CalendarRecurrenceLimitAuditError"
     &&typeof error.matchesSelectedEvent==="boolean") {
@@ -281,6 +283,28 @@ export async function collectLiveCrossProfileEvidence(options) {
   process.env.AWS_ACCESS_KEY_ID=credentials.accessKeyId;
   process.env.AWS_SECRET_ACCESS_KEY=credentials.secretAccessKey;
   process.env.AWS_SESSION_TOKEN=credentials.sessionToken;
+  const originalFetch=globalThis.fetch;
+  const providerDeadline=new AbortController();
+  const deadlineTimer=setTimeout(()=>providerDeadline.abort(),options.scanDeadlineMs);
+  deadlineTimer.unref?.();
+  globalThis.fetch=async(input,init={})=>{
+    if(providerDeadline.signal.aborted) {
+      const error=new Error("Cross-profile provider audit deadline exceeded");
+      error.name="CrossProfileAuditDeadlineError";
+      throw error;
+    }
+    const signals=[providerDeadline.signal,...(init.signal?[init.signal]:[])];
+    try {
+      return await originalFetch(input,{...init,signal:signals.length===1?signals[0]:AbortSignal.any(signals)});
+    } catch(error) {
+      if(providerDeadline.signal.aborted) {
+        const deadlineError=new Error("Cross-profile provider audit deadline exceeded");
+        deadlineError.name="CrossProfileAuditDeadlineError";
+        throw deadlineError;
+      }
+      throw error;
+    }
+  };
   try {
   // Import after installing the verified account's non-secret routing config
   // and temporary credentials so the app's SSM/DynamoDB clients use Windsor.
@@ -313,6 +337,8 @@ export async function collectLiveCrossProfileEvidence(options) {
     executableRecoveryMayBeEnabled:false,
   };
   } finally {
+    globalThis.fetch=originalFetch;
+    clearTimeout(deadlineTimer);
     for(const [name,value] of Object.entries(credentialEnv))
       if(value===undefined)delete process.env[name];else process.env[name]=value;
   }
