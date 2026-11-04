@@ -197,6 +197,7 @@ export async function migrateProjectComments(
     summary.mappingsScanned += 1;
     let releaseWriterLease: () => Promise<void> = async () => {};
     try {
+      if (mapping.profile !== profile) throw new Error("project-comment migration mapping belongs to another profile");
       if (apply && process.env.ERASURE_PROTOCOL_VERSION === "1") {
         releaseWriterLease = await acquireErasureProtocolLease(profile, "writer", undefined, await getErasureEpoch(profile));
       }

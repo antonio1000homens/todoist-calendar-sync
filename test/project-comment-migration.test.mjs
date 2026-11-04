@@ -361,3 +361,13 @@ test("apply migration holds a writer lease and checks replay markers before prov
   assert.ok(sends.includes("GetCommand"), "replay marker was read");
   assert.ok(state.audits.some(entry => String(entry.detail?.error || "").includes("Erasure replay admission refused")));
 });
+
+test("project-comment migration refuses mappings from another profile", async () => {
+  const state = new FakeState();
+  const fake = fakeClients();
+  const summary = await migrateProjectComments("home", [mapping({ profile: "work" })], state, fake.clients, true);
+  assert.equal(summary.failures, 1);
+  assert.equal(fake.creates, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.deepEqual(state.saved, []);
+});
