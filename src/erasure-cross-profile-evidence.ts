@@ -21,6 +21,7 @@ type ProviderPair={
     listAllTasksForErasureAudit():Promise<TodoistTask[]>;
     listAllProjectCommentsForErasureAudit():Promise<{
       projects:Array<{id:string;workspaceId?:number}>;comments:TodoistCommentRecord[];
+      complete?:boolean;unavailableProjectCommentCount?:number;
     }>;
     listAllTaskCommentsForErasureAudit?():Promise<{comments:TodoistCommentRecord[];fullSyncDateUtc:string}>;
     listTaskComments(taskId:string):Promise<TodoistCommentRecord[]>;
@@ -35,10 +36,10 @@ const EVENT_FIELDS=new Set(["eventId","providerEventId","masterEventId","activeI
 const TASK_ARRAYS=new Set(["candidateTaskIds","taskIds"]);
 const EVENT_ARRAYS=new Set(["candidateEventIds","eventIds"]);
 // This is the read-only discovery cap, not the replay transaction limit.
-// Keep enough capacity to observe common oversized series (including the
-// 74-instance production blocker) while preserving a hard memory/work bound.
+// Keep enough capacity to observe large production recurrence chains while
+// preserving a hard memory/work bound.
 // The release proof in erasure-replay-barrier.ts remains independently capped.
-const MAX_IDENTITIES=512;
+const MAX_IDENTITIES=2048;
 const MAX_PASSES=64;
 
 export interface CrossProfileErasureEvidence {
@@ -62,7 +63,9 @@ export interface CrossProfileErasureEvidence {
     calendarInventoryComplete:boolean;calendarIdsFingerprint:string;
     eventReadConflicts:number;eventsMissingEtag:number;
     projectInventoryCount:number;projectInventoryFingerprint:string;
+    projectCommentInventoryComplete:boolean;unavailableProjectCommentCount:number;
     projectCommentsRead:number;relatedProjectComments:number;taskCommentsRead:number;relatedLegacyComments:number;
+    taskCommentReadFailures:number;
     taskCommentInventoryCount:number;taskCommentInventoryMatches:number;taskCommentInventoryFingerprint:string;
     taskCommentInventoryComplete:boolean;taskCommentInventoryFresh:boolean;
     taskCommentInventorySnapshotAt:string|null;taskCommentReadConflicts:number;
@@ -187,6 +190,8 @@ export async function observeCrossProfileErasureEvidence(input:{
   const projects={} as Record<Profile,TodoistCommentRecord[]>;
   const projectInventoryCounts={} as Record<Profile,number>;
   const projectInventoryFingerprints={} as Record<Profile,string>;
+  const projectCommentInventoryComplete={} as Record<Profile,boolean>;
+  const unavailableProjectCommentCounts={} as Record<Profile,number>;
   const taskInventories={} as Record<Profile,Map<string,TodoistTask>>;
   const taskCommentInventories={} as Record<Profile,Map<string,TodoistCommentRecord>>;
   const taskCommentInventoryComplete={} as Record<Profile,boolean>;
@@ -217,6 +222,7 @@ export async function observeCrossProfileErasureEvidence(input:{
   const malformedComments=new Set<string>();
   const taskReadConflicts=new Set<string>(),eventReadConflicts=new Set<string>(),missingEtags=new Set<string>();
   const taskCommentReadConflicts=new Set<string>();
+  const taskCommentReadFailures=new Set<string>();
   const recordCalendarEvent=(profile:Profile,item:CalendarAuditEvent)=>{
     const {calendarId,event}=item;
     if(!validCalendarId(calendarId)||!event||!validId(event.id))
@@ -274,6 +280,11 @@ export async function observeCrossProfileErasureEvidence(input:{
     ]);
     if(!projectAudit||!Array.isArray(projectAudit.projects)||!Array.isArray(projectAudit.comments))
       throw new Error("Todoist project/comment audit returned an invalid inventory");
+    if((projectAudit.complete!==undefined&&typeof projectAudit.complete!=="boolean")
+      ||(projectAudit.unavailableProjectCommentCount!==undefined
+        &&(!Number.isSafeInteger(projectAudit.unavailableProjectCommentCount)
+          ||projectAudit.unavailableProjectCommentCount<0)))
+      throw new Error("Todoist project/comment audit returned invalid completeness metadata");
     if(projectAudit.projects.some(project=>!project||!validId(project.id)
       ||(project.workspaceId!==undefined&&(!Number.isSafeInteger(project.workspaceId)||project.workspaceId<=0))))
       throw new Error("Todoist project inventory contains an invalid project identity");
@@ -283,6 +294,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     projects[profile]=projectAudit.comments;
     projectInventoryCounts[profile]=projectIds.length;
     projectInventoryFingerprints[profile]=fingerprint(projectAudit.projects);
+    projectCommentInventoryComplete[profile]=projectAudit.complete!==false;
+    unavailableProjectCommentCounts[profile]=projectAudit.unavailableProjectCommentCount||0;
     taskInventories[profile]=new Map();
     for(const task of tasks) {
       if(!task||!validId(task.id))throw new Error("Todoist audit inventory contains an invalid task");
@@ -335,8 +348,11 @@ export async function observeCrossProfileErasureEvidence(input:{
       eventReadConflicts:0,eventsMissingEtag:0,
       projectInventoryCount:projectInventoryCounts[profile],
       projectInventoryFingerprint:projectInventoryFingerprints[profile],
+      projectCommentInventoryComplete:projectCommentInventoryComplete[profile],
+      unavailableProjectCommentCount:unavailableProjectCommentCounts[profile],
       projectCommentsRead:projects[profile].length,relatedProjectComments:0,
       taskCommentsRead:0,relatedLegacyComments:0,calendarInventoryFingerprint:"",
+      taskCommentReadFailures:0,
       taskCommentInventoryCount:taskCommentInventories[profile].size,taskCommentInventoryMatches:0,
       taskCommentInventoryComplete:taskCommentInventoryComplete[profile],
       taskCommentInventoryFresh:false,
@@ -466,7 +482,13 @@ export async function observeCrossProfileErasureEvidence(input:{
         }
         if(!processedTaskComments.has(taskKey)) {
           processedTaskComments.add(taskKey);
-          const comments=await profileReaders[profile].todoist.listTaskComments(taskId);
+          let comments:TodoistCommentRecord[];
+          try {comments=await profileReaders[profile].todoist.listTaskComments(taskId);}
+          catch(error) {
+            if(statusOf(error)!==404)throw error;
+            taskCommentReadFailures.add(taskKey);stats[profile].taskCommentReadFailures++;provider404s++;
+            continue;
+          }
           stats[profile].taskCommentsRead+=comments.length;
           for(const comment of comments)commentInventoryDigests[profile].add(
             "task:"+fingerprint([taskId,comment.id,comment.content||""]));
@@ -663,8 +685,11 @@ export async function observeCrossProfileErasureEvidence(input:{
     stats[profile].commentInventoryFingerprint=fingerprint([...commentInventoryDigests[profile]].sort());
     stats[profile].evidenceFingerprint=fingerprint({
       comments,taskCommentsRead:stats[profile].taskCommentsRead,
+      taskCommentReadFailures:stats[profile].taskCommentReadFailures,
       projectInventoryCount:stats[profile].projectInventoryCount,
       projectInventoryFingerprint:stats[profile].projectInventoryFingerprint,
+      projectCommentInventoryComplete:stats[profile].projectCommentInventoryComplete,
+      unavailableProjectCommentCount:stats[profile].unavailableProjectCommentCount,
       taskReadsFound:stats[profile].taskReadsFound,task404Responses:stats[profile].task404Responses,
       taskReadConflicts:stats[profile].taskReadConflicts,
       taggedEvents:stats[profile].taggedEvents,directEventReadsFound:stats[profile].directEventReadsFound,
@@ -695,7 +720,8 @@ export async function observeCrossProfileErasureEvidence(input:{
   }
   const closureComplete=!changed&&passes<=MAX_PASSES&&overflow.count===0
     &&taskReadConflicts.size===0&&eventReadConflicts.size===0&&missingEtags.size===0
-    &&taskCommentReadConflicts.size===0;
+    &&taskCommentReadConflicts.size===0&&taskCommentReadFailures.size===0
+    &&PROFILES.every(profile=>projectCommentInventoryComplete[profile]);
   const fullTaskCommentInventoryComplete=PROFILES.every(profile=>stats[profile].taskCommentInventoryFresh);
   const fullCalendarInventoryComplete=PROFILES.every(profile=>calendarInventoryCompleteByProfile[profile]);
   const allProfilesQueried=PROFILES.every(profile=>Boolean(profileReaders[profile]));
@@ -705,7 +731,7 @@ export async function observeCrossProfileErasureEvidence(input:{
   const allAccessibleCalendarCoverageProven=false as const;
   const knownIdentitiesAbsentFromCurrentProviders=allAccessibleCalendarCoverageProven
     &&closureComplete&&allProfilesQueried&&fullTaskCommentInventoryComplete
-    &&fullCalendarInventoryComplete
+    &&fullCalendarInventoryComplete&&PROFILES.every(profile=>projectCommentInventoryComplete[profile])
     &&provider404s===0&&PROFILES.every(profile=>
     stats[profile].taskReadsFound===0&&stats[profile].taskInventoryMatches===0
       &&stats[profile].taggedEvents===0&&stats[profile].directEventReadsFound===0
@@ -719,6 +745,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     "Google CalendarList enumerates calendars on each user's list; direct-ID calendars outside that list still need independent provenance",
     "Unlinked or untagged Calendar events still require explicit identity provenance; title or date matching is not accepted",
     ...(!fullTaskCommentInventoryComplete?["Todoist full Sync task-comment inventory is missing, incomplete, or older than five minutes for one or more profiles"]:[]),
+    ...(!PROFILES.every(profile=>projectCommentInventoryComplete[profile])
+      ?["One or more Todoist project comment inventories were unavailable during the audit"]:[]),
     "Provider 404/410 responses are observations, not proof of identity absence",
     "Project/task comment results and provider reads can change; direct ETag and action-time rechecks remain required",
     "A strongly consistent paginated table scan is not a transactionally consistent table snapshot",
@@ -729,6 +757,7 @@ export async function observeCrossProfileErasureEvidence(input:{
     ...(taskReadConflicts.size?["Todoist direct reads disagreed with the complete active-task inventories"]:[]),
     ...(eventReadConflicts.size?["Calendar direct reads disagreed with the complete unfiltered inventories"]:[]),
     ...(taskCommentReadConflicts.size?["Todoist direct task-comment reads disagreed with the full Sync task-comment inventories"]:[]),
+    ...(taskCommentReadFailures.size?["One or more exact Todoist task-comment reads returned 404; comment provenance remains incomplete"]:[]),
     ...(missingEtags.size?["One or more direct Calendar events have no ETag for independent version checks"]:[]),
     ...(provider404s?["One or more direct provider reads returned 404/410; keep absence unverified"]:[]),
     ...(overflow.count?["Identity closure exceeded the bounded observer capacity"]:[]),

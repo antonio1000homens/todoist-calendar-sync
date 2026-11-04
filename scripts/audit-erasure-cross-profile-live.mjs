@@ -86,6 +86,9 @@ export function redactedFailureCode(error) {
 }
 
 export function redactedFailureDetails(error) {
+  if(error?.message==="Calendar recurring series exceeds audit inventory bound")
+    return Number.isSafeInteger(error.auditAliasCount)&&error.auditAliasCount>=0
+      ?{recurrenceAliasCountAtBound:error.auditAliasCount}:{};
   if(error?.name!=="CalendarRecurrenceLimitAuditError")return {};
   const allowedOrigins=new Set(["state-row","task-comment","task-comment-read","calendar-task-tag",
     "calendar-event-identity","calendar-parent-link","calendar-history-master","calendar-series-index",

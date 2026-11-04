@@ -13,6 +13,9 @@ const MAX_ERASURE_AUDIT_COMMENTS=100000;
 export type TodoistProjectCommentAudit={
   projects:Array<{id:string;workspaceId?:number}>;
   comments:TodoistCommentRecord[];
+  /** False when a project disappeared or became inaccessible during comment reads. */
+  complete:boolean;
+  unavailableProjectCommentCount:number;
 };
 export type CalendarAuditDescriptor={id:string;accessRole:"freeBusyReader"|"reader"|"writer"|
   "writerWithoutPrivateAccess"|"owner"|"configured-unlisted";configured:boolean};
@@ -347,6 +350,7 @@ export class GoogleCalendar {
    * cancellations and exceptions). This audit bound is intentionally larger
    * than the replay marker transaction's alias bound: observation must be able
    * to discover an oversized identity closure before proving it unreleasable.
+   * The cap is far below the endpoint's 20-page hard bound and fails closed.
    */
   async listEventInstances(masterId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
     if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
@@ -368,7 +372,7 @@ export class GoogleCalendar {
         if (previous && JSON.stringify(previous) !== JSON.stringify(event))
           throw new Error("Calendar instance inventory changed during pagination");
         found.set(event.id, event);
-        if(found.size>256) {
+        if(found.size>1024) {
           const error=new Error("Calendar recurring series exceeds audit inventory bound");
           Object.assign(error,{auditAliasCount:found.size});
           throw error;
@@ -800,8 +804,15 @@ export class Todoist {
       await readPages(`/workspaces/${workspaceId}/projects/archived`,"workspace_projects",workspaceId);
 
     const comments=new Map<string,TodoistCommentRecord>();
+    let complete=true,unavailableProjectCommentCount=0;
     for(const projectId of projects.keys()) {
-      const projectComments=await this.listProjectComments(projectId,true);
+      let projectComments:TodoistCommentRecord[];
+      try {projectComments=await this.listProjectComments(projectId,true);}
+      catch(error) {
+        if(Number((error as {status?:unknown})?.status)!==404)throw error;
+        complete=false;unavailableProjectCommentCount++;
+        continue;
+      }
       for(const comment of projectComments) {
         if(comment.project_id!==undefined&&comment.project_id!==projectId)
           throw new Error("Todoist project comment audit returned a comment for another project");
@@ -818,6 +829,7 @@ export class Todoist {
       projects:[...projects].map(([id,workspaceId])=>({id,...(typeof workspaceId==="number"?{workspaceId}:{})}))
         .sort((left,right)=>left.id.localeCompare(right.id)),
       comments:[...comments.values()],
+      complete,unavailableProjectCommentCount,
     };
   }
 

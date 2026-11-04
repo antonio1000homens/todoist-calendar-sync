@@ -324,8 +324,8 @@ operations were read-only.
 The recurrence audit previously stopped returning instance IDs at the same
 32-alias threshold used by the prospective atomic marker transaction. That
 prevented the all-profile evidence collector from finishing the 74-instance
-identity walk. The collector now allows up to 512 total task/event/series
-identities, and the provider recurrence reader permits up to 256 instances per
+identity walk. The collector now allows up to 2,048 total task/event/series
+identities, and the provider recurrence reader permits up to 1,024 instances per
 master before failing closed. The 32-alias replay proof and 100-action atomic
 transaction limits are unchanged. This is source-level progress only: the
 74-instance production chain has not yet been recaptured with this change, and
