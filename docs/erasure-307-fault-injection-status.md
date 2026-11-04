@@ -126,3 +126,19 @@ receipts must remain blockers until their queue/replay provenance is resolved;
 the audit does not delete or infer ownership for them. The live preview has
 178 blockers overall, so the current Work profile cannot pass the item-level
 cleanup gate even after provider deletion.
+
+### Point-in-time queue attributes
+
+A read-only `GetQueueAttributes` call against the source and DLQ URLs configured
+on the production worker found both queues are FIFO. The source queue reported
+zero approximate available, in-flight and delayed messages, with four-day
+retention and a redrive policy. The DLQ reported zero approximate messages,
+with fourteen-day retention and no further redrive policy. Producers and the
+worker mapping remained enabled; these approximate point-in-time values do not
+a worker mapping remained enabled; these approximate point-in-time values do not
+prove either queue is drained. AWS documents that FIFO message age resets when
+a message moves to a DLQ, so queue retention and the fourteen-day delivery
+receipt TTL are not by themselves replay-absence evidence ([DLQ retention
+semantics](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/setting-up-dead-letter-queue-retention.html),
+[queue count consistency](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_GetQueueAttributes.html)).
+No message bodies were read and no queue attributes were changed.
