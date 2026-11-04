@@ -75,6 +75,8 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
     blockers.push("Partial or unverified deletion requires a NEW independently reviewed authorization and action-time version checks");
   // Even a perfect snapshot does not prove source/alias completeness, old
   // qualified consumer safety, or the immutable marker/fence transaction.
+  if(inspection.crossProfileEvidence)blockers.push(...inspection.crossProfileEvidence.missingProof);
+  else blockers.push("No read-only all-profile provider, comment and state provenance report was collected");
   blockers.push("Complete replay-barrier rollout, alias and old-Lambda coverage, executable post-write authorisation and verified atomic release are not yet accepted");
   blockers.push("Disposable Work-profile staging and independent security/privacy review remain required");
   const potentialDisposition=classification==="not_post_write"?"use_pre_write_recovery":

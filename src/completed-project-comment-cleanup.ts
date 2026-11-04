@@ -9,6 +9,7 @@ import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { profiles, todoistToken } from "./config.js";
 import { Todoist } from "./providers.js";
+import { guardReplayProviderClients } from "./erasure-replay-providers.js";
 import { parseMappingComment, type TodoistCommentRecord } from "./mapping-comments.js";
 import { terminalCompletionDecision, type VerifiedTerminalSeries } from "./completed-history-policy.js";
 import type { CompletedCalendarProjection, Profile } from "./types.js";
@@ -131,7 +132,13 @@ export async function retireCompletedProjectMappingComment(
 export async function completedProjectCommentAdapter(profile: Profile): Promise<CompletedCommentAdapter> {
   if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required");
   const table = process.env.STATE_TABLE_NAME;
-  const todoist = new Todoist(await todoistToken(profile));
+  // This operator-only cleanup builds a narrow adapter instead of using the
+  // normal provider factory. Keep its provider delete behind the same replay
+  // admission boundary; deleteComment intentionally fails closed when enabled
+  // because a bare comment ID cannot establish the owning erased identity.
+  const todoist = guardReplayProviderClients(profile,{
+    calendar:{},todoist:new Todoist(await todoistToken(profile)),
+  }).todoist;
   return {
     async get(pk,sk="STATE") {
       const result = await documentClient.send(new GetCommand({

@@ -5,6 +5,8 @@
  */
 import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as db } from "./dynamodb-capacity.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
+import {acquireErasureProtocolLease,getErasureEpoch} from "./erasure-protocol.js";
 import { terminalCompletionDecision, type VerifiedTerminalSeries } from "./completed-history-policy.js";
 import type { CompletedCalendarProjection, Profile } from "./types.js";
 
@@ -171,12 +173,23 @@ async function processTask(
     ExpressionAttributeValues: { ":expected": baseline.updatedAt },
   } });
   if (tx.length > 100) return "skipped_ambiguous";
+  const protocolEnabled=process.env.ERASURE_PROTOCOL_VERSION==="1";
+  if(process.env.ERASURE_REPLAY_BARRIER_VERSION==="1"&&!protocolEnabled)
+    throw new Error("Terminal history cleanup requires the erasure writer protocol when replay admission is enabled");
+  const releaseWriterLease=protocolEnabled
+    ?await acquireErasureProtocolLease(profile,"writer",undefined,await getErasureEpoch(profile))
+    :async()=>{};
   try {
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:rows.flatMap(row=>[
+      row.eventId,row.masterEventId,row.activeInstanceId,
+    ]).filter((value):value is string=>typeof value==="string"&&value.length>0)});
     await db.send(new TransactWriteCommand({ TransactItems: tx as never }));
     return "retired";
   } catch (error) {
     if (conditionalRace(error)) return "skipped_active";
     throw error;
+  } finally {
+    await releaseWriterLease();
   }
 }
 

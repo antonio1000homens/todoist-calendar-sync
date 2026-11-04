@@ -1,6 +1,6 @@
 import { googleCredentials, profiles, todoistToken } from "./config.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
-import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import {guardReplayProviderClients,REPLAY_GUARDED_PROVIDER_WRITES} from "./erasure-replay-providers.js";
 import type { Profile } from "./types.js";
 
 export const DEFAULT_RECONCILIATION_MUTATION_LIMIT = 10;
@@ -66,20 +66,8 @@ export class ReconciliationMutationBudget {
   }
 }
 
-const CALENDAR_MUTATIONS = new Set(["upsertEvent", "patchEventMetadataIfUnchanged", "upsertEventIfUnchanged", "updateSharedEventPropertiesIfUnchanged", "createFutureMasterOnce", "createRepairEventOnce", "deleteEvent", "deleteEventIfUnchanged"]);
-const TODOIST_MUTATIONS = new Set([
-  "upsertTask",
-  "updateTaskMetadata",
-  "createTaskOnce",
-  "moveTask",
-  "updateRecurringOccurrence",
-  "deleteTask",
-  "upsertComment",
-  "upsertProjectComment",
-  "deleteComment",
-  "createProjectComment",
-  "updateComment",
-]);
+const CALENDAR_MUTATIONS = new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.calendar);
+const TODOIST_MUTATIONS = new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.todoist);
 
 function mutationReservation(provider: "calendar" | "todoist", operation: string, args: unknown[]): number {
   // Todoist.upsertComment(existingId) first attempts an update and, when the

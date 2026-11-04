@@ -1,5 +1,6 @@
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { normalizedText } from "./security.js";
 import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 
@@ -100,6 +101,10 @@ function identityKey(profile: Profile, side: CanonicalIdentitySide, providerId: 
   return { pk: `CANONICAL#${profile}#${side}#${providerId}`, sk: "STATE" };
 }
 
+function replayIdentity(profile:Profile,side:CanonicalIdentitySide,providerId:string) {
+  return side==="todoist"?{profile,taskId:providerId}:{profile,eventIds:[providerId]};
+}
+
 function retentionDays(): number {
   const configured = Number(process.env.TODOIST_CALENDAR_SYNC_CANONICAL_IDENTITY_RETENTION_DAYS);
   return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_RETENTION_DAYS;
@@ -133,6 +138,7 @@ export class CanonicalIdentityStore implements CanonicalIdentityRepository {
 
   async put(profile: Profile, side: CanonicalIdentitySide, providerId: string, identity: CanonicalIdentity): Promise<void> {
     if (!this.table) return;
+    await assertReplayAdmissionIfEnabled(replayIdentity(profile,side,providerId));
     const updatedAt = new Date().toISOString();
     const expiresAt = Math.floor(Date.now() / 1000) + retentionDays() * 24 * 60 * 60;
     await documentClient.send(new PutCommand({
@@ -151,6 +157,7 @@ export class CanonicalIdentityStore implements CanonicalIdentityRepository {
 
   async deleteIfUnchanged(record:CanonicalIdentityRecord):Promise<boolean> {
     if(!this.table) return false;
+    await assertReplayAdmissionIfEnabled(replayIdentity(record.profile,record.side,record.providerId));
     try {
       await documentClient.send(new DeleteCommand({TableName:this.table,Key:identityKey(record.profile,record.side,record.providerId),
         ConditionExpression:"#profile = :profile AND #side = :side AND providerId = :provider AND updatedAt = :updated AND #identity = :identity",
