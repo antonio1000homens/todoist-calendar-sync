@@ -301,3 +301,17 @@ and can break deployment rollback.
 This report does not authorize production mutation, nor complete the first
 issue #307 acceptance box. Keep ERASURE_REPLAY_BARRIER_VERSION OFF,
 post-write recovery blocked and all active fences preserved.
+
+### All opted-in Windsor region Lambda names (4 Nov 2026)
+
+A fresh read-only scan verified Windsor with STS, listed all 17 opted-in
+regions, and let the AWS CLI paginate `ListFunctions` in each region. It found
+21 functions across `eu-west-1` and `eu-west-2`. The seven deployed
+`todoist-calendar-sync-*` functions were all in `eu-west-2`; no function name
+matching `todoist` or `calendar-sync` appeared in the other 16 regions. The
+two `eu-west-1` functions and twelve other `eu-west-2` functions have not been
+code-audited for indirect identity writes, so this name-only scan does not
+prove there are no nonstandard writers. The AWS Organizations inventory
+returned only the Windsor management account, so this scan covers no
+out-of-organization credentials or external accounts. No AWS mutation was
+performed.
