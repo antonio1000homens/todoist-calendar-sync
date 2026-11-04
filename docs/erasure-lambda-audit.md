@@ -158,6 +158,43 @@ names. Do not remove or deny these broad principals as part of this read-only
 audit. Any policy or version-retirement change needs a separately reviewed,
 exact change plan and rollback decision.
 
+### Historical published code package digest scan (4 Nov 2026)
+
+After re-verifying the Windsor identity with STS as account `243857182133`, a
+read-only scan enumerated the 70 published ingress versions (2–71) and 93
+published review-api versions (2–94) in `eu-west-2`. Identical `CodeSha256`
+values were deduplicated; all 65 unique ingress packages and 92 unique review
+packages (157 total) were fetched, SHA-256 checked against Lambda's
+`CodeSha256`, and searched for the current replay-marker implementation
+strings. The downloaded packages totalled 46,681,101 bytes. No package URL,
+environment value or bundle content was written to the report.
+
+Only 2/65 ingress digests and 11/92 review-api digests contain the literal
+`ERASURE_REPLAY_BARRIER_VERSION`, marker-key format and HMAC keyring names.
+String presence is only a locator, not proof that the check is called. The
+alias-target bundles were separately pretty-printed and inspected: ingress
+version 71 gates Todoist webhook enqueue on the replay version and strongly
+consistent marker reads; review-api version 94 wraps provider mutations with
+identity derivation and the same strongly consistent marker check. This proves
+those two bundles contain an admission path; it does not prove all helper or
+alternate mutation call paths are covered. The 3 Nov environment/config
+inventory recorded above found the barrier flag absent on all sampled versions
+and `$LATEST`; re-read function configuration before treating that setting as
+current. The 4 Nov package scan inspected code only and did not recheck the
+environment flag.
+
+The reproducible command is:
+
+    AWS_PROFILE=windsor node scripts/audit-erasure-lambda-code.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production > deployed-code-audit.json
+
+It emits digest-grouped marker strings, omits presigned URLs and deliberately
+exits with status 2 because static marker evidence is not authorization. The
+4 Nov package scan was completed before this reusable CLI was added; rerun the
+command after Windsor SSO refresh to retain its complete JSON report. The
+scan covers these two function names in one account/region only; it does not
+clear the all-regions/accounts, legacy-name, IAM, CodeDeploy rollback or
+approval blockers above.
+
 Obtain independent operator/security approval and a rollback plan before any
 IAM update or version retirement. Published version deletion is irreversible
 and can break deployment rollback.
