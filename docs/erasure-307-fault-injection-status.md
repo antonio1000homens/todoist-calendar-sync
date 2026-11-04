@@ -260,6 +260,26 @@ would also need to preserve the one-transaction marker bound. No provider or
 AWS writes were made. The capture exited incomplete and does not authorize
 post-write recovery.
 
+### Bounded recurrence count and SSO credential path (4 Nov 2026, 16:42 UTC)
+
+After confirming the exact staged Work task/event remained active, the observer
+was rerun against Windsor account `243857182133`. The local AWS SDK INI
+credential provider failed to resolve this SSO profile even though AWS CLI STS
+identity verification succeeded. The read-only tool now consumes the AWS
+CLI's validated, short-lived credential export for its SDK calls and restores
+the prior process credential environment when the capture ends; no credential
+values are logged.
+
+The bounded capture then completed instance pagination for the connected
+non-selected master and counted **74 distinct Calendar instances** before
+refusing release evidence. The redacted result again classified it as
+`CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER`, with the same two inactive
+other-task mappings, two direct Todoist 404s, one tagged event and three
+unrelated delivery rows. The 20-page cap was not reached. This count is
+diagnostic only: the 74 IDs exceed the current 32-alias recovery limit, and
+the observer remains incomplete for post-write recovery. AWS and provider
+operations were read-only.
+
 ### Point-in-time queue attributes
 
 A read-only `GetQueueAttributes` call against the source and DLQ URLs configured

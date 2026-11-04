@@ -5,7 +5,6 @@
  * output contains fingerprints/counts only and can never authorize release.
  */
 import {execFileSync} from "node:child_process";
-import {fromIni} from "@aws-sdk/credential-provider-ini";
 import {GetFunctionConfigurationCommand,LambdaClient} from "@aws-sdk/client-lambda";
 import {pathToFileURL} from "node:url";
 
@@ -147,6 +146,37 @@ function prepareNamedProfile(profile,region,variables) {
     if(variables[name])process.env[name]=variables[name];
 }
 
+export function parseCliExportedCredentials(raw) {
+  let value;
+  try {value=JSON.parse(raw);} catch {throw new Error("AWS CLI profile credentials are unavailable");}
+  if(!value||typeof value!=="object"||Array.isArray(value)||value.Version!==1
+    ||![value.AccessKeyId,value.SecretAccessKey,value.SessionToken].every(item=>
+      typeof item==="string"&&item.length>0)
+    ||typeof value.Expiration!=="string"||!Number.isFinite(Date.parse(value.Expiration))
+    ||Date.parse(value.Expiration)<=Date.now()+60_000)
+    throw new Error("AWS CLI profile credentials are unavailable");
+  return {accessKeyId:value.AccessKeyId,secretAccessKey:value.SecretAccessKey,
+    sessionToken:value.SessionToken,expiration:new Date(value.Expiration)};
+}
+
+function cliProfileCredentials(profile) {
+  return async()=>{
+    const env={...process.env};
+    for(const name of AMBIENT_CREDENTIALS)delete env[name];
+    env.AWS_PROFILE=profile;
+    env.AWS_SDK_LOAD_CONFIG="1";
+    let response;
+    try {
+      response=execFileSync("aws",["configure","export-credentials","--profile",profile,
+        "--format","process","--no-cli-pager"],
+      {encoding:"utf8",maxBuffer:1024*1024,env});
+    } catch {
+      throw new Error("AWS CLI profile credentials are unavailable");
+    }
+    return parseCliExportedCredentials(response);
+  };
+}
+
 function selectReadMethods(instance,names,optional=[]) {
   const selected={};
   for(const name of names) {
@@ -218,8 +248,8 @@ function summarizeInventory(records) {
 export async function collectLiveCrossProfileEvidence(options) {
   const identity=verifiedCliIdentity(options.profile);
   if(identity.Account!==options.account)throw new Error("AWS profile account did not match expected account");
-  const credentials=fromIni({profile:options.profile});
-  const lambda=new LambdaClient({region:options.region,credentials,maxAttempts:5});
+  const credentials=await cliProfileCredentials(options.profile)();
+  const lambda=new LambdaClient({region:options.region,credentials:async()=>credentials,maxAttempts:5});
   try {
     const config=await lambda.send(new GetFunctionConfigurationCommand({
       FunctionName:options.functionName,Qualifier:options.qualifier,
@@ -235,8 +265,20 @@ export async function collectLiveCrossProfileEvidence(options) {
     prepareNamedProfile(options.profile,options.region,variables);
   } finally {lambda.destroy();}
 
+  // This account's configured SSO profile resolves in AWS CLI but not through
+  // the bundled SDK ini provider. Supply the already identity-checked,
+  // short-lived credentials to SDK clients in this process only.
+  const credentialEnv={AWS_PROFILE:process.env.AWS_PROFILE,
+    AWS_ACCESS_KEY_ID:process.env.AWS_ACCESS_KEY_ID,
+    AWS_SECRET_ACCESS_KEY:process.env.AWS_SECRET_ACCESS_KEY,
+    AWS_SESSION_TOKEN:process.env.AWS_SESSION_TOKEN};
+  delete process.env.AWS_PROFILE;
+  process.env.AWS_ACCESS_KEY_ID=credentials.accessKeyId;
+  process.env.AWS_SECRET_ACCESS_KEY=credentials.secretAccessKey;
+  process.env.AWS_SESSION_TOKEN=credentials.sessionToken;
+  try {
   // Import after installing the verified account's non-secret routing config
-  // and named profile so the app's SSM/DynamoDB clients use Windsor credentials.
+  // and temporary credentials so the app's SSM/DynamoDB clients use Windsor.
   const [{buildErasurePreview},{defaultProviderClientFactory}]=await Promise.all([
     import(new URL("../dist/erasure-preview.js",import.meta.url).href),
     import(new URL("../dist/mutation-budget.js",import.meta.url).href),
@@ -265,6 +307,10 @@ export async function collectLiveCrossProfileEvidence(options) {
     replayBarrierMayBeEnabled:false,
     executableRecoveryMayBeEnabled:false,
   };
+  } finally {
+    for(const [name,value] of Object.entries(credentialEnv))
+      if(value===undefined)delete process.env[name];else process.env[name]=value;
+  }
 }
 
 export async function main(argv=process.argv.slice(2)) {
