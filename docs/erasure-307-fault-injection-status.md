@@ -238,6 +238,13 @@ node scripts/audit-erasure-cross-profile-live.mjs \
   --event-id='<disposable-event-id>'
 ```
 
+`--scan-deadline-ms` bounds the complete evidence capture, including Calendar
+and Todoist provider reads (default 300000 ms; maximum 900000 ms). A provider
+deadline returns `CROSS_PROFILE_AUDIT_DEADLINE` with redacted details and
+incomplete evidence; it is not evidence that an identity or alias is absent.
+Each individual provider request also has a 120-second limit and reports
+`CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT` if it does not finish in time.
+
 The report is redacted and always exits with status 2 because this capture is
 not release-authoritative and cannot issue an erasure confirmation. A complete
 read only proves the observed provider/state evidence for those exact IDs; it
@@ -324,8 +331,8 @@ operations were read-only.
 The recurrence audit previously stopped returning instance IDs at the same
 32-alias threshold used by the prospective atomic marker transaction. That
 prevented the all-profile evidence collector from finishing the 74-instance
-identity walk. The collector now allows up to 512 total task/event/series
-identities, and the provider recurrence reader permits up to 256 instances per
+identity walk. The collector now allows up to 2,048 total task/event/series
+identities, and the provider recurrence reader permits up to 1,024 instances per
 master before failing closed. The 32-alias replay proof and 100-action atomic
 transaction limits are unchanged. This is source-level progress only: the
 74-instance production chain has not yet been recaptured with this change, and

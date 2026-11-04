@@ -127,11 +127,21 @@ test("profile read failures and bounded identity overflow fail closed",async()=>
     if(profile==="work")throw new Error("profile credentials missing");
     return emptyReader();
   }}));
+  const partialComments=await observeCrossProfileErasureEvidence({taskId:"task-one",rows:[],fullRows:[],
+    readerForProfile:async()=>{
+      const pair=await emptyReader();
+      return {...pair,todoist:{...pair.todoist,async listAllProjectCommentsForErasureAudit(){
+        return{projects:[],comments:[],complete:false,unavailableProjectCommentCount:1};
+      }}};
+    }});
+  assert.equal(partialComments.closureComplete,false);
+  assert.equal(partialComments.profiles.work.projectCommentInventoryComplete,false);
+  assert.ok(partialComments.missingProof.some(reason=>reason.includes("project comment inventories")));
   const overflow=await observeCrossProfileErasureEvidence({taskId:"task-one",
     rows:[{pk:"TASKOWNER#task-one",sk:"MAP",taskId:"task-one",
-      candidateTaskIds:Array.from({length:520},(_,index)=>"task-alias-"+index)}],
+      candidateTaskIds:Array.from({length:2056},(_,index)=>"task-alias-"+index)}],
     fullRows:[{pk:"TASKOWNER#task-one",sk:"MAP",taskId:"task-one",
-      candidateTaskIds:Array.from({length:520},(_,index)=>"task-alias-"+index)}],
+      candidateTaskIds:Array.from({length:2056},(_,index)=>"task-alias-"+index)}],
     readerForProfile:emptyReader});
   assert.equal(overflow.eligibleForPostWriteRelease,false);
   assert.equal(overflow.closureComplete,false);
@@ -168,6 +178,22 @@ test("Todoist 429/5xx direct identity reads fail the cross-profile audit closed"
       error=>error.status===status,
       `HTTP ${status} must not be converted into an empty task inventory`);
   }
+});
+
+test("Todoist task-comment 404 is retained as incomplete provenance without aborting the capture",async()=>{
+  const reader=async()=>({
+    calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
+      async getEvent(){throw missing();},async listEventInstances(){return[];}},
+    todoist:{async listAllTasksForErasureAudit(){return[];},async getTask(){throw missing();},
+      async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],fullSyncDateUtc:new Date().toISOString()};},
+      async listTaskComments(){throw missing();}},
+  });
+  const report=await observeCrossProfileErasureEvidence({taskId:"deleted-task",rows:[],fullRows:[],readerForProfile:reader});
+  assert.equal(report.closureComplete,false);
+  assert.equal(report.eligibleForPostWriteRelease,false);
+  assert.equal(report.profiles.work.taskCommentReadFailures,1);
+  assert.ok(report.missingProof.some(reason=>reason.includes("task-comment reads returned 404")));
 });
 
 test("Calendar 410 remains ambiguous while Calendar 429/5xx fail the cross-profile audit closed",async()=>{
@@ -330,6 +356,24 @@ test("an inaccessible archived workspace refuses a project-comment completeness 
   try {
     const todoist=new Todoist("test-token");
     await assert.rejects(todoist.listAllProjectCommentsForErasureAudit(),/403/);
+  } finally {globalThis.fetch=previous;}
+});
+
+test("project comments that return 404 are counted and keep the audit incomplete",async()=>{
+  const previous=globalThis.fetch;
+  globalThis.fetch=async raw=>{
+    const url=new URL(String(raw));
+    if(url.pathname==="/api/v1/projects"||url.pathname==="/api/v1/projects/archived")
+      return new Response(JSON.stringify({results:[{id:"vanished-project"}]}));
+    if(url.pathname==="/api/v1/workspaces")return new Response(JSON.stringify([]));
+    if(url.pathname==="/api/v1/comments")return new Response("not found",{status:404});
+    throw new Error(`unexpected API path: ${url.pathname}`);
+  };
+  try {
+    const audit=await new Todoist("test-token").listAllProjectCommentsForErasureAudit();
+    assert.equal(audit.complete,false);
+    assert.equal(audit.unavailableProjectCommentCount,1);
+    assert.deepEqual(audit.comments,[]);
   } finally {globalThis.fetch=previous;}
 });
 

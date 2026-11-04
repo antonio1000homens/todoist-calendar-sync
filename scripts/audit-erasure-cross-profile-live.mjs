@@ -62,6 +62,10 @@ export function validateRoutingConfig(value) {
 
 /** Classify only a small set of reviewed, non-sensitive failure strings. */
 export function redactedFailureCode(error) {
+  if(error instanceof Error&&error.name==="CrossProfileAuditDeadlineError")
+    return "CROSS_PROFILE_AUDIT_DEADLINE";
+  if(error instanceof Error&&error.name==="CrossProfileProviderRequestTimeoutError")
+    return "CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT";
   const message=typeof error?.message==="string"?error.message:"";
   if(error?.name==="CalendarRecurrenceLimitAuditError"
     &&typeof error.matchesSelectedEvent==="boolean") {
@@ -86,6 +90,9 @@ export function redactedFailureCode(error) {
 }
 
 export function redactedFailureDetails(error) {
+  if(error?.message==="Calendar recurring series exceeds audit inventory bound")
+    return Number.isSafeInteger(error.auditAliasCount)&&error.auditAliasCount>=0
+      ?{recurrenceAliasCountAtBound:error.auditAliasCount}:{};
   if(error?.name!=="CalendarRecurrenceLimitAuditError")return {};
   const allowedOrigins=new Set(["state-row","task-comment","task-comment-read","calendar-task-tag",
     "calendar-event-identity","calendar-parent-link","calendar-history-master","calendar-series-index",
@@ -278,6 +285,34 @@ export async function collectLiveCrossProfileEvidence(options) {
   process.env.AWS_ACCESS_KEY_ID=credentials.accessKeyId;
   process.env.AWS_SECRET_ACCESS_KEY=credentials.secretAccessKey;
   process.env.AWS_SESSION_TOKEN=credentials.sessionToken;
+  const originalFetch=globalThis.fetch;
+  const providerDeadline=new AbortController();
+  const deadlineTimer=setTimeout(()=>providerDeadline.abort(),options.scanDeadlineMs);
+  deadlineTimer.unref?.();
+  globalThis.fetch=async(input,init={})=>{
+    if(providerDeadline.signal.aborted) {
+      const error=new Error("Cross-profile provider audit deadline exceeded");
+      error.name="CrossProfileAuditDeadlineError";
+      throw error;
+    }
+    const requestDeadline=AbortSignal.timeout(120_000);
+    const signals=[providerDeadline.signal,requestDeadline,...(init.signal?[init.signal]:[])];
+    try {
+      return await originalFetch(input,{...init,signal:AbortSignal.any(signals)});
+    } catch(error) {
+      if(providerDeadline.signal.aborted) {
+        const deadlineError=new Error("Cross-profile provider audit deadline exceeded");
+        deadlineError.name="CrossProfileAuditDeadlineError";
+        throw deadlineError;
+      }
+      if(requestDeadline.aborted) {
+        const timeoutError=new Error("Cross-profile provider request timed out");
+        timeoutError.name="CrossProfileProviderRequestTimeoutError";
+        throw timeoutError;
+      }
+      throw error;
+    }
+  };
   try {
   // Import after installing the verified account's non-secret routing config
   // and temporary credentials so the app's SSM/DynamoDB clients use Windsor.
@@ -310,6 +345,8 @@ export async function collectLiveCrossProfileEvidence(options) {
     executableRecoveryMayBeEnabled:false,
   };
   } finally {
+    globalThis.fetch=originalFetch;
+    clearTimeout(deadlineTimer);
     for(const [name,value] of Object.entries(credentialEnv))
       if(value===undefined)delete process.env[name];else process.env[name]=value;
   }
