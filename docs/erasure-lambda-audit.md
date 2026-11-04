@@ -128,6 +128,20 @@ Organizations policies, cross-account principals or resource policies. It
 always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
 an IAM change or enable replay/recovery.
 
+To query invocation metrics for each inventoried published version, alias,
+alias-executed version and unqualified function over the CloudWatch retention
+window, run:
+
+    node scripts/audit-erasure-lambda-invocation-metrics.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> > <private-invocation-metrics.json>
+
+The query uses daily sums to keep the full window within bounded API pages.
+`ListMetrics` alone is insufficient for older qualifiers because it omits
+series without recent data. The report labels missing metric datapoints as
+inconclusive, omits no exact live data from this repository, and always remains
+blocked from release or IAM decisions. Keep its output private with the other
+account and qualifier inventories. No generated live metric results are
+committed here.
+
 Obtain independent operator/security approval and a rollback plan before any
 IAM update or version retirement. Published version deletion is irreversible
 and can break deployment rollback.
