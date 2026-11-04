@@ -65,6 +65,19 @@ the complete related-row scan, comment/recurrence provenance, or fresh full
 reconciliation required before recovery. The probe did not stage post-write
 recovery, markers, mapping restoration, fences, or SQS replay.
 
+### Connector staging replay (4 Nov 2026)
+
+A further clearly labeled private event was created with the Google Calendar
+connector in the `work1000homens` calendar. The first immediate Todoist search
+returned no match; a matching task then appeared asynchronously in the
+`work1000homens` project. A separate manual Todoist create happened before that
+delayed result was observed and produced a duplicate, so both tasks and the
+event were deleted through their connectors. Follow-up Todoist searches and a
+bounded Work-calendar search returned no fixture. This confirms the ordinary
+Work event-to-task creation path is asynchronous and the connectors can clean
+up the fixture. It is not post-write erasure, a full-reconciliation result, or
+evidence that an erased item cannot be recreated.
+
 ## Deployed-credential cross-profile capture
 
 `scripts/audit-erasure-cross-profile-live.mjs` runs the repository's full

@@ -156,6 +156,19 @@ drift or configuration drift. These commands do not clear the all-account/region
 legacy-name, identity-IAM, CodeDeploy rollback or independent approval
 blockers above.
 
+### Windsor configuration snapshot (4 Nov 2026)
+
+A fresh read-only run of the configuration audit verified account
+`243857182133` in `eu-west-2` and inspected 173 configurations across the seven
+named functions, including all published versions, aliases and `$LATEST`.
+`ERASURE_REPLAY_BARRIER_VERSION`, `ERASURE_REPLAY_HMAC_KEYS` and
+`ERASURE_REPLAY_HMAC_CURRENT_KEY` were absent from every inspected
+configuration. The audit now reports HMAC variable presence only; it never
+returns environment values. Thirty-five configurations had the existing
+erasure-execution and protocol flags set, but this is not post-write recovery
+readiness: the key ring and replay barrier are absent, and the report keeps
+`executableRecoveryMayBeEnabled=false`. No AWS mutations were performed.
+
 For a local candidate scan of attached identity policies, first save a fresh
 Lambda invoker inventory to a private local file, then run:
 

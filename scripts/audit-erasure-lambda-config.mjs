@@ -70,6 +70,8 @@ function summarizeEnvironment(config) {
     return variables[name]==="true"?"enabled":"present_other";
   };
   return {replayBarrier:state("ERASURE_REPLAY_BARRIER_VERSION"),
+    replayHmacKeyRing:Object.hasOwn(variables,"ERASURE_REPLAY_HMAC_KEYS")?"present":"absent",
+    replayHmacCurrentKey:Object.hasOwn(variables,"ERASURE_REPLAY_HMAC_CURRENT_KEY")?"present":"absent",
     postwriteReview:state("ERASURE_POSTWRITE_REVIEW_VERSION"),
     erasureExecution:state("ERASURE_EXECUTION_ENABLED"),
     erasureProtocol:state("ERASURE_PROTOCOL_VERSION")};
@@ -130,6 +132,8 @@ export async function collectRuntimeConfigAudit(client,{functionNames,region,sle
       aliases:normalizedAliases(aliases),
       configs,replayBarrierEnabledCount:count("replayBarrier"),
       replayBarrierPresentCount:configs.filter(item=>item.replayBarrier!=="absent").length,
+      replayHmacKeyRingPresentCount:configs.filter(item=>item.replayHmacKeyRing==="present").length,
+      replayHmacCurrentKeyPresentCount:configs.filter(item=>item.replayHmacCurrentKey==="present").length,
       postwriteReviewEnabledCount:count("postwriteReview"),
       postwriteReviewPresentCount:configs.filter(item=>item.postwriteReview!=="absent").length,
       erasureExecutionEnabledCount:count("erasureExecution"),
