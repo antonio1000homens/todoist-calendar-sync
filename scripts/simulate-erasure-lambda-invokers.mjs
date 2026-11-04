@@ -11,6 +11,7 @@ const ACCOUNT=/^\d{12}$/;
 const PROFILE=/^[A-Za-z0-9+=,.@_-]{1,128}$/;
 const REGION=/^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/;
 const BATCH_SIZE=50;
+const INVOKE_ACTIONS=["lambda:InvokeFunction","lambda:InvokeAsync","lambda:InvokeFunctionUrl"];
 
 function validateInputs(inventory,identityReport,accountId) {
   if(!ACCOUNT.test(accountId||"")||!inventory||inventory.verifiedAccount!==accountId
@@ -60,68 +61,121 @@ export function buildLambdaInvocationTargets(inventory,accountId,partition="aws"
   return targets;
 }
 
+function functionUrlInventory(inventory,accountId,partition) {
+  const targets=[];
+  let complete=true;
+  for(const fn of inventory.functions) {
+    if(typeof fn?.name!=="string"||!Array.isArray(fn.aliases))throw new Error("Malformed Lambda URL inventory");
+    const base=`arn:${partition}:lambda:${inventory.region}:${accountId}:function:${fn.name}`;
+    const urls=fn.urls;
+    if(!urls||typeof urls!=="object"||Array.isArray(urls)) { complete=false; continue; }
+    const qualifiers=[{name:"unqualified",arn:base},...fn.aliases.map(alias=>({
+      name:alias.name,arn:`${base}:${alias.name}`}))];
+    for(const qualifier of qualifiers) {
+      if(!Object.hasOwn(urls,qualifier.name)) { complete=false; continue; }
+      const url=urls[qualifier.name];
+      if(url===null)continue;
+      if(!url||typeof url!=="object"||!['AWS_IAM','NONE'].includes(url.authType))
+        throw new Error("Malformed Lambda Function URL configuration");
+      const policy=fn.policies?.[qualifier.name==="unqualified"?"unqualified":qualifier.name];
+      targets.push({...qualifier,functionName:fn.name,authType:url.authType,
+        wildcardUrlInvokeAllow:policy?.wildcardInvokeFunctionUrlNoneAllowPresent===true,
+        wildcardFunctionInvokeViaUrlAllow:policy?.wildcardInvokeFunctionViaUrlAllowPresent===true});
+    }
+  }
+  return {targets,complete};
+}
+
 export function collectInvocationSimulations({inventory,identityReport,accountId,partition="aws",run}) {
   validateInputs(inventory,identityReport,accountId);
   if(typeof run!=="function")throw new Error("Read-only IAM simulation runner is required");
   const targets=buildLambdaInvocationTargets(inventory,accountId,partition);
+  const functionUrls=functionUrlInventory(inventory,accountId,partition);
   const principals=new Map();
   for(const candidate of identityReport.candidates) {
     if(!candidate||!['user','role','group'].includes(candidate.principalType)
       ||typeof candidate.principalArn!=="string"||!Array.isArray(candidate.actions))
       throw new Error("IAM candidate report contains a malformed principal");
-    if(candidate.actions.includes("lambda:InvokeFunction")&&candidate.qualifiedPossible)
-      principals.set(candidate.principalArn,candidate.principalType);
+    if(candidate.qualifiedPossible!==true&&candidate.unqualifiedPossible!==true)continue;
+    for(const action of candidate.actions)if(INVOKE_ACTIONS.includes(action)) {
+      const principal=principals.get(candidate.principalArn)||{type:candidate.principalType,actions:new Set()};
+      if(principal.type!==candidate.principalType)throw new Error("IAM candidate principal type changed");
+      principal.actions.add(action);principals.set(candidate.principalArn,principal);
+    }
   }
   const results=[];
-  for(const [policySourceArn,principalType] of [...principals].sort(([left],[right])=>left.localeCompare(right))) {
-    const decisions=new Map();
-    const policyTypeDetails=new Map();
-    const missingContext=new Set();
-    let permissionBoundaryDetail;
-    for(let offset=0;offset<targets.length;offset+=BATCH_SIZE) {
-      const batch=targets.slice(offset,offset+BATCH_SIZE);
-      const response=run({policySourceArn,action:"lambda:InvokeFunction",resourceArns:batch.map(target=>target.arn),
-        region:inventory.region});
-      const evaluations=response?.EvaluationResults;
-      if(!Array.isArray(evaluations)||evaluations.length!==1
-        ||evaluations[0].EvalActionName?.toLowerCase()!=="lambda:invokefunction"
-        ||!Array.isArray(evaluations[0].ResourceSpecificResults))
-        throw new Error("IAM simulator returned an incomplete action/resource page");
-      const evaluation=evaluations[0];
-      for(const [key,value] of Object.entries(evaluation.EvalDecisionDetails||{})) {
-        const values=policyTypeDetails.get(key)||new Set();values.add(value);policyTypeDetails.set(key,values);
+  const publicUrlTargets=functionUrls.targets.filter(target=>target.authType==="NONE");
+  for(const [policySourceArn,principal] of [...principals].sort(([left],[right])=>left.localeCompare(right))) {
+    const scenarios=[];
+    if(principal.actions.has("lambda:InvokeFunction"))
+      scenarios.push({action:"lambda:InvokeFunction",path:"direct",targets,extraContext:[
+        {name:"lambda:InvokedViaFunctionUrl",value:"false",type:"boolean"},
+      ]});
+    if(principal.actions.has("lambda:InvokeAsync"))
+      scenarios.push({action:"lambda:InvokeAsync",path:"legacy_async",targets,extraContext:[]});
+    const iamUrls=functionUrls.targets.filter(target=>target.authType==="AWS_IAM");
+    if(principal.actions.has("lambda:InvokeFunctionUrl"))
+      scenarios.push({action:"lambda:InvokeFunctionUrl",path:"function_url",targets:iamUrls,extraContext:[
+        {name:"lambda:FunctionUrlAuthType",value:"AWS_IAM",type:"string"},
+      ]});
+    if(principal.actions.has("lambda:InvokeFunction"))
+      scenarios.push({action:"lambda:InvokeFunction",path:"function_url",targets:iamUrls,extraContext:[
+        {name:"lambda:InvokedViaFunctionUrl",value:"true",type:"boolean"},
+      ]});
+    for(const scenario of scenarios) {
+      if(!scenario.targets.length)continue;
+      const decisions=new Map(),policyTypeDetails=new Map(),missingContext=new Set();
+      let permissionBoundaryDetail;
+      for(let offset=0;offset<scenario.targets.length;offset+=BATCH_SIZE) {
+        const batch=scenario.targets.slice(offset,offset+BATCH_SIZE);
+        const response=run({policySourceArn,action:scenario.action,resourceArns:batch.map(target=>target.arn),
+          region:inventory.region,contextEntries:scenario.extraContext});
+        const evaluations=response?.EvaluationResults;
+        if(!Array.isArray(evaluations)||evaluations.length!==1
+          ||evaluations[0].EvalActionName?.toLowerCase()!==scenario.action.toLowerCase()
+          ||!Array.isArray(evaluations[0].ResourceSpecificResults))
+          throw new Error("IAM simulator returned an incomplete action/resource page");
+        const evaluation=evaluations[0];
+        for(const [key,value] of Object.entries(evaluation.EvalDecisionDetails||{})) {
+          const values=policyTypeDetails.get(key)||new Set();values.add(value);policyTypeDetails.set(key,values);
+        }
+        for(const key of evaluation.MissingContextValues||[])missingContext.add(key);
+        if(evaluation.PermissionsBoundaryDecisionDetail)permissionBoundaryDetail=evaluation.PermissionsBoundaryDecisionDetail;
+        const page=new Set();
+        for(const item of evaluation.ResourceSpecificResults) {
+          if(typeof item?.EvalResourceName!=="string"||!batch.some(target=>target.arn===item.EvalResourceName)
+            ||typeof item.EvalResourceDecision!=="string"||page.has(item.EvalResourceName))
+            throw new Error("IAM simulator returned an unknown or duplicated resource result");
+          page.add(item.EvalResourceName);decisions.set(item.EvalResourceName,item.EvalResourceDecision);
+        }
+        if(page.size!==batch.length)throw new Error("IAM simulator omitted one or more Lambda action resources");
       }
-      for(const key of evaluation.MissingContextValues||[])missingContext.add(key);
-      if(evaluation.PermissionsBoundaryDecisionDetail)
-        permissionBoundaryDetail=evaluation.PermissionsBoundaryDecisionDetail;
-      const page=new Set();
-      for(const item of evaluation.ResourceSpecificResults) {
-        if(typeof item?.EvalResourceName!=="string"||!batch.some(target=>target.arn===item.EvalResourceName)
-          ||typeof item.EvalResourceDecision!=="string"||page.has(item.EvalResourceName))
-          throw new Error("IAM simulator returned an unknown or duplicated resource result");
-        page.add(item.EvalResourceName);
-        decisions.set(item.EvalResourceName,item.EvalResourceDecision);
-      }
-      if(page.size!==batch.length)throw new Error("IAM simulator omitted one or more requested Lambda qualifiers");
+      const allowed=scenario.targets.filter(target=>decisions.get(target.arn)==="allowed").length;
+      const qualifiedTargets=scenario.targets.filter(target=>target.qualifier!=="unqualified");
+      const qualifiedAllowed=qualifiedTargets.filter(target=>decisions.get(target.arn)==="allowed").length;
+      results.push({principalType:principal.type,policySourceArn,action:scenario.action,path:scenario.path,
+        evaluatedTargets:decisions.size,totalTargets:scenario.targets.length,allowedTargets:allowed,
+        deniedTargets:scenario.targets.length-allowed,qualifiedTargets:qualifiedTargets.length,
+        qualifiedAllowedTargets:qualifiedAllowed,
+        policyTypeDetails:Object.fromEntries([...policyTypeDetails].map(([key,values])=>[key,[...values].sort()])),
+        permissionBoundaryDetail:permissionBoundaryDetail??null,missingContextKeys:[...missingContext].sort()});
     }
-    const allowed=targets.filter(target=>decisions.get(target.arn)==="allowed").length;
-    const denied=targets.filter(target=>decisions.has(target.arn)&&decisions.get(target.arn)!=="allowed").length;
-    const qualifiedTargets=targets.filter(target=>target.qualifier!=="unqualified");
-    const qualifiedAllowed=qualifiedTargets.filter(target=>decisions.get(target.arn)==="allowed").length;
-    results.push({principalType,policySourceArn,evaluatedTargets:decisions.size,totalTargets:targets.length,
-      allowedTargets:allowed,deniedTargets:denied,qualifiedTargets:qualifiedTargets.length,
-      qualifiedAllowedTargets:qualifiedAllowed,
-      policyTypeDetails:Object.fromEntries([...policyTypeDetails].map(([key,values])=>[key,[...values].sort()])),
-      permissionBoundaryDetail:permissionBoundaryDetail??null,missingContextKeys:[...missingContext].sort()});
   }
   return {purpose:"issue-307-iam-lambda-invocation-simulation",status:"SIMULATED_NOT_LIVE_INVOCATION_OR_APPROVAL",
-    verifiedAccount:accountId,region:inventory.region,action:"lambda:InvokeFunction",principalCount:results.length,
-    targetCount:targets.length,results,
+    verifiedAccount:accountId,region:inventory.region,principalCount:new Set(results.map(result=>result.policySourceArn)).size,
+    simulationCount:results.length,targetCount:targets.length,functionUrlInventoryComplete:functionUrls.complete,
+    configuredFunctionUrlCount:functionUrls.targets.length,
+    functionUrlAuthTypeNoneCount:publicUrlTargets.length,
+    wildcardPublicUrlResourcePolicyCount:publicUrlTargets.filter(target=>
+      target.wildcardUrlInvokeAllow&&target.wildcardFunctionInvokeViaUrlAllow).length,
+    unauthenticatedFunctionUrlReviewRequired:publicUrlTargets.length>0,results,
     limitations:[
       "Simulation evaluates configured identity policies and applicable SCPs, but does not verify who can assume each role",
       "STS session policies and the exact caller/session context are not proven by this simulation",
       "No Lambda resource policy was supplied; role simulations cannot evaluate resource policies, and user/group resource grants need separate review",
-      "Only aws:RequestedRegion is supplied; missing context values and other conditional grants remain unresolved",
+      "Function URL AuthType NONE is reported as an unauthenticated endpoint requiring resource-policy review; it is not an identity-policy simulation result",
+      "Missing Function URL inventory is not evidence that no URL exists",
+      "Only aws:RequestedRegion and scenario-specific Function URL context are supplied; other conditional grants remain unresolved",
       "RCPs, all accounts/regions, legacy names and live invocation telemetry require separate evidence",
       "A simulation is not a live invocation and cannot authorize IAM changes, version retirement or replay release",
     ],replayBarrierMayBeEnabled:false,executableRecoveryMayBeEnabled:false};
@@ -153,7 +207,8 @@ export function main(argv=process.argv.slice(2)) {
   const report=collectInvocationSimulations({inventory,identityReport,accountId,partition,
     run:request=>runAws(profile,["iam","simulate-principal-policy","--policy-source-arn",request.policySourceArn,
       "--action-names",request.action,"--resource-arns",...request.resourceArns,"--context-entries",
-      `ContextKeyName=aws:RequestedRegion,ContextKeyValues=${request.region},ContextKeyType=string`])});
+      `ContextKeyName=aws:RequestedRegion,ContextKeyValues=${request.region},ContextKeyType=string`,
+      ...request.contextEntries.map(entry=>`ContextKeyName=${entry.name},ContextKeyValues=${entry.value},ContextKeyType=${entry.type}`)])});
   process.stdout.write(JSON.stringify(report,null,2)+"\n");
   process.exitCode=2;
 }

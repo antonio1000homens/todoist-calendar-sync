@@ -21,6 +21,25 @@ const NAME=/^[a-z0-9-]{2,64}$/;
 const REGION=/^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/;
 const MAX_PAGES=1000;
 
+function asArray(value) { return value===undefined||value===null?[]:Array.isArray(value)?value:[value]; }
+function actionMatches(pattern,action) {
+  const escaped=String(pattern).replace(/[.+^${}()|[\]\\]/g,"\\$&").replaceAll("*",".*").replaceAll("?",".");
+  return new RegExp("^"+escaped+"$","i").test(action);
+}
+function conditionHas(condition,key,expected) {
+  if(!condition||typeof condition!=="object"||Array.isArray(condition))return false;
+  return Object.values(condition).some(values=>values&&typeof values==="object"&&!Array.isArray(values)
+    &&Object.hasOwn(values,key)&&asArray(values[key]).some(value=>String(value).toLowerCase()===expected.toLowerCase()));
+}
+function wildcardPrincipal(principal) {
+  return principal==="*"||principal?.AWS==="*"||(Array.isArray(principal?.AWS)&&principal.AWS.includes("*"));
+}
+function actionMayMatch(statement,action) {
+  if(Object.hasOwn(statement,"Action"))return asArray(statement.Action).some(item=>actionMatches(item,action));
+  if(Object.hasOwn(statement,"NotAction"))return !asArray(statement.NotAction).some(item=>actionMatches(item,action));
+  return true;
+}
+
 export function expectedTemplateFunctions(template,prefix,stage) {
   const start="$"+"{ResourceNamePrefix}-";
   const end="-"+"$"+"{Stage}";
@@ -65,12 +84,24 @@ async function policySummary(client,name,qualifier) {
     const parsed=JSON.parse(response.Policy);
     const statements=Array.isArray(parsed.Statement)?parsed.Statement:
       parsed.Statement?[parsed.Statement]:[];
+    const wildcardAllows=action=>statements.some(statement=>statement?.Effect==="Allow"
+      &&wildcardPrincipal(statement.Principal)&&actionMayMatch(statement,action));
+    const urlAction=statements.some(statement=>statement?.Effect==="Allow"&&wildcardPrincipal(statement.Principal)
+      &&actionMayMatch(statement,"lambda:InvokeFunctionUrl")
+      &&conditionHas(statement.Condition,"lambda:FunctionUrlAuthType","NONE"));
+    const invokeViaUrl=statements.some(statement=>statement?.Effect==="Allow"&&wildcardPrincipal(statement.Principal)
+      &&actionMayMatch(statement,"lambda:InvokeFunction")
+      &&conditionHas(statement.Condition,"lambda:InvokedViaFunctionUrl","true"));
     return {statementCount:statements.length,
-      wildcardPrincipalPresent:statements.some(s=>s.Principal==="*"||
-        s.Principal?.AWS==="*"||
-        (Array.isArray(s.Principal?.AWS)&&s.Principal.AWS.includes("*")))};
+      wildcardPrincipalPresent:statements.some(statement=>wildcardPrincipal(statement.Principal)),
+      wildcardInvokeFunctionAllowPresent:wildcardAllows("lambda:InvokeFunction"),
+      wildcardInvokeFunctionUrlAllowPresent:wildcardAllows("lambda:InvokeFunctionUrl"),
+      wildcardInvokeFunctionUrlNoneAllowPresent:urlAction,
+      wildcardInvokeFunctionViaUrlAllowPresent:invokeViaUrl};
   } catch(error) {
-    if(error?.name==="ResourceNotFoundException")return {statementCount:0,wildcardPrincipalPresent:false};
+    if(error?.name==="ResourceNotFoundException")return {statementCount:0,wildcardPrincipalPresent:false,
+      wildcardInvokeFunctionAllowPresent:false,wildcardInvokeFunctionUrlAllowPresent:false,
+      wildcardInvokeFunctionUrlNoneAllowPresent:false,wildcardInvokeFunctionViaUrlAllowPresent:false};
     throw error;
   }
 }

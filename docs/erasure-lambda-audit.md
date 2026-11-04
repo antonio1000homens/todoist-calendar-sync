@@ -4,6 +4,8 @@ This is a source+deployment audit aid, NOT erasure recovery authorisation. It re
 all published Lambda versions, aliases and weighted targets, event-source
 mappings in the selected region, resource invocation policies and Function URLs.
 It does not call any AWS mutation or invoke providers.
+Resource-policy summaries include only bounded wildcard-action/Function-URL
+booleans and omit policy text and principals.
 
 ## Run
 
@@ -154,15 +156,19 @@ Organizations policies, cross-account principals or resource policies. It
 always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
 an IAM change or enable replay/recovery.
 
-To simulate candidate identity grants against the inventoried Lambda resource
-ARNs, with only the region request context supplied, run:
+To simulate candidate identity grants for `InvokeFunction`, deprecated
+`InvokeAsync`, and configured AWS_IAM Function URLs, with the region and
+Function URL context supplied where relevant, run:
 
     node scripts/simulate-erasure-lambda-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> --candidates=<private-identity-candidates.json> > <private-policy-simulation.json>
 
 The IAM simulator does not prove role assumption or STS session policies, and
-role simulations do not include Lambda resource policies. Other context values,
-resource controls and unscanned regions/accounts remain separate gates. The
-report is a simulation, not a live invocation or approval; keep it private.
+role simulations do not include Lambda resource policies. Function URLs using
+`AuthType=NONE` are reported separately for resource-policy review; they do not
+require an identity-policy simulation. A missing Function URL inventory is not
+evidence that no URL exists. Other context values, resource controls and
+unscanned regions/accounts remain separate gates. The report is a simulation,
+not a live invocation or approval; keep it private.
 
 The identity-candidate audit also needs `organizations:DescribeOrganization`.
 Its redacted `organizationContext` says whether the verified target account is
