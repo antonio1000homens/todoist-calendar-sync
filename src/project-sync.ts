@@ -385,20 +385,26 @@ export class ProjectAwareSynchronizer {
         const ownerProfiles = [...new Set(retained.map((projection) => projection.profile))];
         if (lifecycle.reason === "deleted") {
           for (const ownerProfile of ownerProfiles) {
+            const releaseOwnerWriter = await acquireMoveWriterLeases([ownerProfile], delivery.profile);
+            try {
             await this.delegate.process({
               ...delivery,
               profile: ownerProfile,
               body: JSON.stringify(payload),
             });
+            } finally { await releaseOwnerWriter(); }
           }
           return;
         }
         if (lifecycle.action === "complete_projection") {
-          return this.delegate.process({
+          const releaseOwnerWriter = await acquireMoveWriterLeases([retained[0].profile], delivery.profile);
+          try {
+          return await this.delegate.process({
             ...delivery,
             profile: retained[0].profile,
             body: JSON.stringify(payload),
           });
+          } finally { await releaseOwnerWriter(); }
         }
         return this.state.audit(retained[0].profile, "todoist_completed_projection_terminal_update_ignored", {
           taskId: task.id,
@@ -413,11 +419,14 @@ export class ProjectAwareSynchronizer {
     // the profile that currently owns it rather than interpreting a concurrent
     // project move as a reason to delete Calendar history.
     if (lifecycle.action === "complete_projection" && mapping?.profile) {
-      return this.delegate.process({
+      const releaseOwnerWriter = await acquireMoveWriterLeases([mapping.profile], delivery.profile);
+      try {
+      return await this.delegate.process({
         ...delivery,
         profile: mapping.profile,
         body: JSON.stringify(payload),
       });
+      } finally { await releaseOwnerWriter(); }
     }
 
     const oldProjectId = rawPayload.event_data_extra?.old_item?.project_id;
@@ -473,6 +482,8 @@ export class ProjectAwareSynchronizer {
 
     const destinationProfile = transition.toProfile || mapping?.profile;
     if (!destinationProfile) return;
+    const releaseDestinationWriter = await acquireMoveWriterLeases([destinationProfile], delivery.profile);
+    try {
     if (await this.applyActiveTodoistExceptionEdit(
       delivery,
       task,
@@ -487,7 +498,8 @@ export class ProjectAwareSynchronizer {
       profile: destinationProfile,
       body: JSON.stringify(payload),
     };
-    return this.delegate.process(routed);
+    return await this.delegate.process(routed);
+    } finally { await releaseDestinationWriter(); }
   }
 
   /**
