@@ -20,6 +20,11 @@ async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: 
   if (taskId || eventId) await assertReplayAdmissionIfEnabled({ profile,
     ...(taskId ? { taskId } : {}), ...(eventId ? { eventIds: [eventId] } : {}) });
 }
+async function admitEntityRef(ref: EntityRef): Promise<void> {
+  await admitReviewIdentity(ref.profile,
+    ref.side === "todoist" ? ref.id : undefined,
+    ref.side === "calendar" ? ref.id : undefined);
+}
 export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
   const refs = new Map<string, EntityRef>();
   const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId"]);
@@ -854,13 +859,16 @@ export class SyncControls {
     return Boolean(await new ReviewStore().get(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`));
   }
   async reject(profile: Profile, taskId: string, eventId: string, operationId: string): Promise<void> {
+    await admitReviewIdentity(profile, taskId, eventId);
     await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...key(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`), operationId, createdAt: new Date().toISOString() } }));
   }
   async allow(profile: Profile, taskId: string, eventId: string): Promise<void> {
+    await admitReviewIdentity(profile, taskId, eventId);
     const { DeleteCommand } = await import("@aws-sdk/lib-dynamodb");
     await client.send(new DeleteCommand({ TableName: reviewTable(), Key: key(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`) }));
   }
   async blocked(profile: Profile, ids: { taskId?: string; eventId?: string }, operationId?: string): Promise<boolean> {
+    await admitReviewIdentity(profile, ids.taskId, ids.eventId);
     for (const side of ["todoist", "calendar"] as const) {
       const id = side === "todoist" ? ids.taskId : ids.eventId; if (!id) continue;
       const ref = { profile, side, id }, control = await this.control(ref);
@@ -878,6 +886,7 @@ export class SyncControls {
   }
   async claim(refs: EntityRef[], operationId: string): Promise<void> {
     if (!refs.length) return;
+    for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) await admitEntityRef(ref);
     await client.send(new TransactWriteCommand({ TransactItems: [...new Map(refs.map(ref => [entityKey(ref), ref])).values()].map(ref => ({ Update: {
       TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET activeRepair = :id",
       ConditionExpression: "attribute_not_exists(activeRepair) OR activeRepair = :id", ExpressionAttributeValues: { ":id": operationId },
@@ -892,6 +901,7 @@ export class SyncControls {
     const queued = new Map(queuedRefresh.map(ref => [entityKey(ref), ref.pendingRefreshAt]));
     const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
     if (!unique.length) return;
+    for (const ref of unique) await admitEntityRef(ref);
     const items = unique.map(ref => {
       const before = previous.get(entityKey(ref));
       if (!before) throw new Error(`No preview control snapshot for ${entityKey(ref)}; cannot release its repair barrier`);
@@ -932,10 +942,12 @@ export class SyncControls {
     await client.send(new TransactWriteCommand({ TransactItems: [...items, operationMarker] }));
   }
   async exclude(ref: EntityRef, excluded: boolean, operationId: string): Promise<void> {
+    await admitEntityRef(ref);
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":excluded": excluded, ":id": operationId } }));
   }
   async release(ref: EntityRef, operationId: string, providerUpdatedAt?: string): Promise<void> {
+    await admitEntityRef(ref);
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
       UpdateExpression: "SET fencedAt = :now, providerUpdatedAt = :version REMOVE activeRepair",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":id": operationId, ":now": new Date().toISOString(), ":version": providerUpdatedAt || "" } }));
@@ -950,6 +962,7 @@ export class SyncControls {
   }
   async clearPendingRefresh(refs: Array<EntityRef & {pendingRefreshAt:string}>): Promise<void> {
     for (const ref of refs) {
+      await admitEntityRef(ref);
       try {
         await client.send(new UpdateCommand({TableName:reviewTable(),Key:key(`SYNC_CONTROL#${entityKey(ref)}`),
           UpdateExpression:"REMOVE pendingRefresh, pendingRefreshAt",

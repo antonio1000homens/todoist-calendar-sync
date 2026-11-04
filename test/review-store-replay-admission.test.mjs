@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureReplayBlockedError } from "../dist/erasure-replay-barrier.js";
-import { assertRepairPreviewReplayAdmission, ReviewStore, reviewHash } from "../dist/review-store.js";
+import { assertRepairPreviewReplayAdmission, ReviewStore, reviewHash, SyncControls } from "../dist/review-store.js";
 
 const secret = Buffer.alloc(32, 41);
 function markerKey(profile, kind, id) {
@@ -128,4 +128,28 @@ test("coalescing refuses to close an open case that references an erased candida
   })), ErasureReplayBlockedError);
   assert.equal(calls.some(command => command.constructor.name === "UpdateCommand"), false,
     "the conflict case must remain open when its erased identity is encountered");
+});
+
+const syncControlWrites = [
+  ["pair rejection", controls => controls.reject("home", "erased-control-task", "safe-event", "repair-1")],
+  ["pair allowance", controls => controls.allow("home", "erased-control-task", "safe-event")],
+  ["repair claim", controls => controls.claim([{profile:"home",side:"todoist",id:"erased-control-task"}], "repair-1")],
+  ["unapplied release", controls => controls.releaseUnapplied([{profile:"home",side:"todoist",id:"erased-control-task"}], "repair-1",
+    [{ref:{profile:"home",side:"todoist",id:"erased-control-task"},control:{}}], {error:"failed",nextAction:"refresh"})],
+  ["exclusion update", controls => controls.exclude({profile:"home",side:"todoist",id:"erased-control-task"}, true, "repair-1")],
+  ["repair release", controls => controls.release({profile:"home",side:"todoist",id:"erased-control-task"}, "repair-1")],
+  ["pending refresh clear", controls => controls.clearPendingRefresh([{profile:"home",side:"todoist",id:"erased-control-task",pendingRefreshAt:"token"}])],
+  ["blocked control update", controls => controls.blocked("home", {taskId:"erased-control-task"})],
+];
+for (const [name, invoke] of syncControlWrites) test(`SyncControls refuses ${name} for an erased identity`, async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "TASK", "erased-control-task")) return { Item: { markerVersion: 1 } };
+    return {};
+  });
+  await assert.rejects(invoke(new SyncControls()), ErasureReplayBlockedError);
+  assert.equal(calls.length, 1, "only the strongly consistent replay-marker lookup may run");
 });
