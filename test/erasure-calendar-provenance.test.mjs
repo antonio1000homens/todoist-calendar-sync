@@ -7,7 +7,7 @@ import {canonicalCalendarProvenanceJson,calendarProvenanceIsFresh,calendarRoutin
 
 const profiles=["home","antonio","work"];
 const {privateKey,publicKey}=generateKeyPairSync("ed25519");
-const trustPem=publicKey.export({format:"pem",type:"spki"}).toString();
+const trustPem=publicKey.export({format:"der",type:"spki"}).toString("base64");
 const routing=Object.fromEntries(profiles.map(profile=>[profile,{
   calendarId:"calendar-"+profile,todoistProjectId:"project-"+profile}]));
 const expected={accountId:"123456789012",region:"eu-west-2",
