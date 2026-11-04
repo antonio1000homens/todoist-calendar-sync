@@ -344,3 +344,23 @@ package screen audited code only in the two regions where that scan found
 functions, and does not classify non-Lambda writer routes or historical
 versions. The complete writer-audit checklist therefore remains unchecked. No
 AWS or provider mutation was performed.
+
+### Configured Calendar inventory baseline (4 Nov 2026)
+
+Using the verified Windsor account and the three deployed Google Calendar
+credentials, read-only CalendarList calls returned one listed calendar for
+each profile. The configured Work calendar was not listed by CalendarList, but
+the explicit full event-list query against its configured calendar ID
+succeeded. Full paginated event inventories completed for all three configured
+calendars: 745 Home, 986 Antonio and 413 Work events. No restricted CalendarList
+access roles were observed.
+
+The inventory found cross-profile value overlaps in 26 Calendar event IDs, 4
+Todoist task tags, 19 iCalUIDs and 6 recurrence-parent IDs. These counts show
+that the configured provider identities are not disjoint. They do not identify
+whether any overlap belongs to a selected erasure, nor establish the associated
+Todoist, comment, recurrence, DynamoDB or delivery provenance. Keep full
+identity closure and all-profile alias proof open; the counts are a
+point-in-time baseline, not recovery evidence. Only counts and profile labels
+were recorded; provider IDs, titles, comments and credentials were not
+persisted. No AWS or provider mutation was performed.
