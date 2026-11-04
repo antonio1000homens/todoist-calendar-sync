@@ -299,6 +299,18 @@ activity-history limitation leaves completion/deletion provenance unverified,
 and the 74-instance Calendar identity chain remains unresolved. No provider or
 AWS writes occurred; recovery remains blocked.
 
+### Read-only inspection of the oversized recurrence (4 Nov 2026, 17:11 UTC)
+
+The redacted audit's non-selected Calendar identity was resolved locally for a
+read-only provider lookup. Its Work-calendar record is a cancelled yearly
+recurrence; the event title and description identify it as a temporary Codex
+recurrence test and say to clean it up after verification. The same event ID
+returned 404 when read through the configured Antonio calendar. The Work
+record's recurrence rule explains the 74-instance expansion, but cancellation
+and a cross-calendar 404 do not establish that its mappings and history can be
+discarded. No Calendar or AWS changes were made; independent mapping cleanup
+and ownership approval remain required.
+
 ### Point-in-time queue attributes
 
 A read-only `GetQueueAttributes` call against the source and DLQ URLs configured
