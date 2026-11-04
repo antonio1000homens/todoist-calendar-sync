@@ -31,7 +31,7 @@ import {
 } from "./profile-lookup.js";
 
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
-import { ReviewStore, reviewHash } from "./review-store.js";
+import { assertManualDecisionReplayAdmission, ReviewStore, reviewHash } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -455,6 +455,7 @@ export class ManualDecisionStore {
       createdAt: isoNow(),
       decisionDeadline: plusDays(DEFAULT_DECISION_DEADLINE_DAYS),
     };
+    await assertManualDecisionReplayAdmission(decision);
     await documentClient.send(new PutCommand({
       TableName: tableName(),
       Item: {
@@ -471,6 +472,10 @@ export class ManualDecisionStore {
 
   /** Bind a visible future-split preview to the pending decision before approval. */
   async refreshPendingContext(decisionId: string, context: Record<string, unknown>): Promise<void> {
+    const current = await this.get(decisionId);
+    if (!current || current.status !== "pending") throw new Error("Pending manual decision no longer exists");
+    await assertManualDecisionReplayAdmission(current);
+    await assertManualDecisionReplayAdmission({ ...current, context });
     await documentClient.send(new UpdateCommand({
       TableName: tableName(),
       Key: { pk: `MANUAL#${decisionId}`, sk: "STATE" },
@@ -487,6 +492,9 @@ export class ManualDecisionStore {
   }
 
   async setSlackLocation(decisionId: string, channel: string, ts: string): Promise<void> {
+    const current = await this.get(decisionId);
+    if (!current) throw new Error("Manual decision no longer exists");
+    await assertManualDecisionReplayAdmission(current);
     await documentClient.send(new UpdateCommand({
       TableName: tableName(),
       Key: { pk: `MANUAL#${decisionId}`, sk: "STATE" },
@@ -496,6 +504,9 @@ export class ManualDecisionStore {
   }
 
   async finish(decisionId: string, status: Exclude<ManualDecisionStatus, "pending">, resolution: string, slackUserId?: string): Promise<void> {
+    const decision = await this.get(decisionId);
+    if (!decision) throw new Error("Manual decision no longer exists");
+    await assertManualDecisionReplayAdmission(decision);
     await documentClient.send(new UpdateCommand({
       TableName: tableName(),
       Key: { pk: `MANUAL#${decisionId}`, sk: "STATE" },
@@ -511,13 +522,10 @@ export class ManualDecisionStore {
         ":expiresAt": epochDays(DEFAULT_DECISION_RETENTION_DAYS),
       },
     }));
-    const decision = await this.get(decisionId);
-    if (decision) {
-      const dismissal = ["acknowledge","keep_separate","ignore","dismiss","dismissed"].includes(resolution.toLowerCase());
-      const reviewStatus = status === "resolved" ? dismissal ? "dismissed" : "resolved" : status === "expired" ? "dismissed" : "open";
-      try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
-      catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
-    }
+    const dismissal = ["acknowledge","keep_separate","ignore","dismiss","dismissed"].includes(resolution.toLowerCase());
+    const reviewStatus = status === "resolved" ? dismissal ? "dismissed" : "resolved" : status === "expired" ? "dismissed" : "open";
+    try { await new ReviewStore().updateCase(decisionId, reviewStatus, resolution); }
+    catch (error) { if ((error as {name?:string}).name !== "ConditionalCheckFailedException") throw error; }
   }
 
   private async listPendingIndexed(
