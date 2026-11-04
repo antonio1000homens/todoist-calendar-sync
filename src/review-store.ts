@@ -47,7 +47,10 @@ export class ReviewStore {
     return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
-    await admitReviewIdentity(decision.profile, decision.taskId, decision.eventId);
+    const context = decision.context || {};
+    const taskId = decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined);
+    const eventId = decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined);
+    await admitReviewIdentity(decision.profile, taskId, eventId);
     const id = decision.decisionId, existing = await this.getCase(id);
     const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
     if (existing) {
@@ -56,7 +59,6 @@ export class ReviewStore {
       }
       return;
     }
-    const context = decision.context || {};
     const item: ReviewCase = {
       id, profile: decision.profile, title: decision.type.replaceAll("_", " "), reason: decision.sourceAuditAction || decision.type,
       status: decision.status === "resolved"
@@ -87,13 +89,12 @@ export class ReviewStore {
     }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
-    const incidentDetail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
-    await admitReviewIdentity(profile,
-      typeof incidentDetail.taskId === "string" ? incidentDetail.taskId : undefined,
-      typeof incidentDetail.eventId === "string" ? incidentDetail.eventId : undefined);
+    const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
+    const identities = retainedAuditProviderIds(detail);
+    for (const taskId of identities.taskIds) await admitReviewIdentity(profile, taskId);
+    for (const eventId of identities.eventIds) await admitReviewIdentity(profile, undefined, eventId);
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
     const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
-    const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
     const action = typeof audit.action === "string" ? audit.action : "active conflict";
     const createdAt = typeof audit.createdAt === "string" ? audit.createdAt : new Date().toISOString();
     const item: ReviewCase = {
@@ -151,10 +152,16 @@ export class ReviewStore {
         const detail = audit?.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : undefined;
         const action = typeof audit?.action === "string" ? audit.action : undefined;
         const identity = action && detail ? retainedConflictIdentity(action, detail) : undefined;
-        if (identity && reviewHash(identity) === conflictKey) incidents.push(candidate);
+        if (identity && reviewHash(identity) === conflictKey) {
+          const providerIds = retainedAuditProviderIds(detail!);
+          for (const taskId of providerIds.taskIds) await admitReviewIdentity(profile, taskId);
+          for (const eventId of providerIds.eventIds) await admitReviewIdentity(profile, undefined, eventId);
+          incidents.push(candidate);
+        }
       }
     }
     for (const candidate of incidents) {
+      await admitReviewIdentity(profile, candidate.taskId, candidate.eventId);
       try {
         const condition = candidate.sourceAuditKey
           ? "#s = :open AND (conflictKey = :conflictKey OR attribute_not_exists(conflictKey)) AND sourceAuditKey = :sourceAuditKey"
