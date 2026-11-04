@@ -5,7 +5,7 @@ import { StateRepository } from "./repository.js";
 import type { CalendarWatchState, Profile } from "./types.js";
 
 const CALLBACK_URL = process.env.CALENDAR_WATCH_CALLBACK_URL || "https://calendar-sync.alf-broadcast.co.uk/calendar";
-const RENEW_BEFORE_MS = 48 * 60 * 60_000;
+const RENEW_BEFORE_MS = 6 * 24 * 60 * 60_000;
 const PROFILE_CHANNEL_BASE: Record<Profile, string> = {
   home: "home1000homens-calendar-sync",
   antonio: "antonio1000homens-calendar-sync",
