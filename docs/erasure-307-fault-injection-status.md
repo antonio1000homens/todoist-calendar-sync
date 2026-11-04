@@ -250,9 +250,10 @@ related delivery rows referenced neither selected ID. Provider IDs and
 credentials remain withheld.
 
 This is not an unimplemented pagination path: the observer follows Calendar
-page tokens, but stops as soon as the 33rd distinct instance exceeds the
-32-alias marker bound; it does not claim to finish reading that oversized
-series.
+page tokens up to its 20-page bound. It now finishes a bounded read before
+refusing an oversized series and reports only the distinct instance count in
+the redacted diagnostic. A series beyond 20 pages remains incomplete; the
+count never authorizes those aliases for recovery.
 Because the oversized series is reachable through unresolved identity edges,
 raising the cap or dropping those edges would not prove closure; either change
 would also need to preserve the one-transaction marker bound. No provider or

@@ -344,7 +344,8 @@ export class GoogleCalendar {
   /**
    * Bounded complete instance observation for the #307 recovery audit. Unlike
    * date-windowed normal sync reads, this enumerates every page (including
-   * cancellations and exceptions) and refuses oversized series.
+   * cancellations and exceptions). Oversized series fail closed after paging
+   * so the read-only audit can report a count without exposing any IDs.
    */
   async listEventInstances(masterId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
     if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
@@ -366,10 +367,16 @@ export class GoogleCalendar {
         if (previous && JSON.stringify(previous) !== JSON.stringify(event))
           throw new Error("Calendar instance inventory changed during pagination");
         found.set(event.id, event);
-        if (found.size > 32) throw new Error("Calendar recurring series exceeds replay marker bound");
       }
       const next = response.nextPageToken;
-      if (next === undefined) return [...found.values()];
+      if (next === undefined) {
+        if(found.size>32) {
+          const error=new Error("Calendar recurring series exceeds replay marker bound");
+          Object.assign(error,{auditAliasCount:found.size});
+          throw error;
+        }
+        return [...found.values()];
+      }
       if (typeof next !== "string" || !next || seenTokens.has(next))
         throw new Error("Calendar instance inventory returned repeated/invalid pagination token");
       seenTokens.add(next);

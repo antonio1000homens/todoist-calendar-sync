@@ -28,6 +28,7 @@ test("cross-profile audit classifies oversized Calendar recurrence without expos
   otherMaster.auditDeliveryRowCount=4;
   otherMaster.auditDeliveryRowsWithSelectedTask=0;
   otherMaster.auditDeliveryRowsWithSelectedEvent=0;
+  otherMaster.auditCalendarInstanceCount=33;
   otherMaster.auditDeliveryKinds=["calendar","secret-kind"];
   assert.equal(redactedFailureCode(otherMaster),"CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER");
   assert.deepEqual(redactedFailureDetails(otherMaster),{
@@ -38,6 +39,7 @@ test("cross-profile audit classifies oversized Calendar recurrence without expos
     otherTaskRead404:2,otherTaskReadFailures:0,taggedEventCount:3,
     taggedRecurringMasterCount:1,deliveryRowCount:4,deliveryRowsWithSelectedTask:0,
     deliveryRowsWithSelectedEvent:0,
+    calendarInstanceCount:33,
   });
 });
 
@@ -59,6 +61,7 @@ test("read-only provider facade tags an oversized recurrence relative to selecte
   calendar.listEventInstances=async()=>{
     const error=new Error("Calendar recurring series exceeds replay marker bound");
     error.auditOriginKinds=["calendar-task-tag"];
+    error.auditAliasCount=33;
     throw error;
   };
   const todoist=Object.fromEntries(["getTask","listAllProjectCommentsForErasureAudit",
@@ -73,6 +76,7 @@ test("read-only provider facade tags an oversized recurrence relative to selecte
     assert.equal(error.matchesSelectedEvent,false);
     assert.equal(error.auditOriginKinds[0],"calendar-task-tag");
     assert.equal(error.auditProfile,"work");
+    assert.equal(error.auditCalendarInstanceCount,33);
     assert.equal(redactedFailureCode(error),"CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER");
     assert.deepEqual(redactedFailureDetails(error).relationOrigins,["calendar-task-tag"]);
     return true;

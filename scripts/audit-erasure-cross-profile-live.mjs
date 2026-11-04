@@ -111,6 +111,7 @@ export function redactedFailureDetails(error) {
     deliveryKinds:strings(error.auditDeliveryKinds,allowedDeliveryKinds),
   };
   for(const [name,value] of [["otherTaskMappingCount",error.auditOtherTaskMappingCount],
+    ["calendarInstanceCount",error.auditCalendarInstanceCount],
     ["activeOtherTaskMappingCount",error.auditActiveOtherTaskMappingCount],
     ["otherTaskReadFound",error.auditOtherTaskReadFound],
     ["otherTaskRead404",error.auditOtherTaskRead404],
@@ -172,6 +173,8 @@ export function readOnlyProviderPair(clients,selectedEventId,profile) {
         diagnostic.name="CalendarRecurrenceLimitAuditError";
         diagnostic.matchesSelectedEvent=masterId===selectedEventId;
         diagnostic.auditProfile=profile;
+        diagnostic.auditCalendarInstanceCount=Number.isSafeInteger(error.auditAliasCount)
+          ?error.auditAliasCount:undefined;
         const origins=Array.isArray(error.auditOriginKinds)?error.auditOriginKinds:[];
         diagnostic.auditOriginKinds=origins.filter(value=>typeof value==="string");
         const families=Array.isArray(error.auditStateFamilies)?error.auditStateFamilies:[];
