@@ -12,6 +12,8 @@ import {
   type TodoistCommentRecord,
 } from "./mapping-comments.js";
 import { defaultProviderClientFactory, type ProviderClientFactory } from "./mutation-budget.js";
+import { assertReplayAdmissionIfEnabled, mappingReplayIdentity } from "./erasure-replay-barrier.js";
+import { acquireErasureProtocolLease, getErasureEpoch } from "./erasure-protocol.js";
 import { StateRepository, type CalendarProjectionTombstone } from "./repository.js";
 import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 
@@ -193,7 +195,12 @@ export async function migrateProjectComments(
 
   for (const mapping of mappings) {
     summary.mappingsScanned += 1;
+    let releaseWriterLease: () => Promise<void> = async () => {};
     try {
+      if (apply && process.env.ERASURE_PROTOCOL_VERSION === "1") {
+        releaseWriterLease = await acquireErasureProtocolLease(profile, "writer", undefined, await getErasureEpoch(profile));
+      }
+      if (apply) await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
       const exact = exactProjectComments(index, mapping);
       const referenced = mapping.projectCommentId
         ? exact.find((comment) => comment.id === mapping.projectCommentId)
@@ -305,6 +312,8 @@ export async function migrateProjectComments(
         eventId: mapping.eventId,
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      await releaseWriterLease();
     }
   }
 
