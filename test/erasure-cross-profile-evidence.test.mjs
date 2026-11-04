@@ -20,7 +20,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   const homeInstance=linked(instance,taskOne,{recurringEventId:master,originalStartTime:{date:"2026-11-03"}});
   const workEvent=linked(eventTwo,taskTwo);
   const calendarByProfile={home:[homeMaster,homeEvent],antonio:[],work:[workEvent]};
-  const calls=[];
+  const calls=[],calendarDirectReads=[];
   const report=await observeCrossProfileErasureEvidence({
     taskId:taskOne,eventId:eventOne,
     rows:[
@@ -42,12 +42,24 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
       const activeTaskIds=profile==="home"?[taskOne]:profile==="work"?[taskTwo]:[];
       return {
         calendar:{
-          async listAllEventsForErasureAudit(){return calendarEvents;},
-          async listLinkedEventsByTodoistTaskId(taskId){
+          async listCalendarListForErasureAudit(){return[
+            {id:`calendar-${profile}`,accessRole:"reader",configured:true},
+            {id:`shared-${profile}`,accessRole:"reader",configured:false},
+            {id:`freebusy-${profile}`,accessRole:"freeBusyReader",configured:false},
+          ];},
+          async listAllEventsForErasureAudit(calendarId){
+            if(profile==="work"&&calendarId===`shared-${profile}`)return [workEvent];
+            if(calendarId!==undefined)return[];
+            return profile==="work"?[]:calendarEvents;
+          },
+          async listLinkedEventsByTodoistTaskId(taskId,calendarId){
+            if(profile==="work"&&calendarId===undefined)return[];
             return calendarEvents.filter(event=>event.extendedProperties?.shared?.taskId===taskId);
           },
-          async getEvent(id){
+          async getEvent(id,calendarId){
+            calendarDirectReads.push({profile,id,calendarId});
             const event=profile==="home"&&id===instance?homeInstance:
+              profile==="work"&&id===eventTwo&&calendarId===`shared-${profile}`?workEvent:
               calendarEvents.find(item=>item.id===id);
             if(!event)throw missing();
             return event;
@@ -75,7 +87,14 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.equal(report.phase,"read_only_cross_profile_observation");
   assert.equal(report.eligibleForPostWriteRelease,false);
   assert.equal(report.allProfilesQueried,true);
+  assert.equal(report.profiles.work.accessibleCalendarCount,3);
+  assert.equal(report.profiles.work.freeBusyOnlyCalendarCount,1);
+  assert.equal(report.profiles.work.calendarInventoryComplete,false);
+  assert.ok(calendarDirectReads.some(read=>read.profile==="work"&&read.id===eventTwo&&read.calendarId==="shared-work"),
+    "a tagged task event in a secondary accessible calendar is directly read using that calendar ID");
   assert.equal(report.closureComplete,true);
+  assert.equal(report.allAccessibleCalendarCoverageProven,false,
+    "CalendarList cannot prove coverage of directly addressable calendars outside the user's list");
   assert.equal(report.knownIdentitiesAbsentFromCurrentProviders,false);
   assert.equal(report.identities.taskCount,2);
   assert.ok(report.identities.eventCount>=5,"selected, mapped, recurring and legacy event aliases are retained");
@@ -87,6 +106,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.ok(report.stateScan.stronglyConsistent&&report.stateScan.allPagesReceived);
   assert.ok(report.stateScan.relatedRowCount>=2);
   assert.ok(report.missingProof.some(reason=>reason.includes("404/410")));
+  assert.ok(report.missingProof.some(reason=>reason.includes("free/busy")));
   assert.ok(report.missingProof.some(reason=>reason.includes("never constitute")));
   const serialized=JSON.stringify(report);
   for(const privateValue of [taskOne,taskTwo,eventOne,eventTwo,master,instance,"private task title","legacy-event"])
@@ -139,6 +159,9 @@ test("Google audit inventory covers every page without time or task filters and 
     if(url.origin==="https://oauth2.googleapis.com")return new Response(JSON.stringify({access_token:"token"}));
     assert.equal(url.origin,"https://www.googleapis.com");
     calls.push(url);
+    if(url.pathname.endsWith("/users/me/calendarList"))return url.searchParams.has("pageToken")
+      ?new Response(JSON.stringify({items:[{id:"team@example.test",accessRole:"reader"}]}))
+      :new Response(JSON.stringify({items:[{id:"primary@example.test",accessRole:"owner"}],nextPageToken:"calendar-page-two"}));
     if(url.pathname.endsWith("/events/series-master/instances"))
       return new Response(JSON.stringify({items:[{id:instance,recurringEventId:master,status:"cancelled"}]}));
     assert.ok(url.pathname.endsWith("/events"));
@@ -148,9 +171,18 @@ test("Google audit inventory covers every page without time or task filters and 
   };
   try {
     const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"audit@example.test");
+    const calendars=await calendar.listCalendarListForErasureAudit();
+    assert.deepEqual(calendars,[
+      {id:"audit@example.test",accessRole:"configured-unlisted",configured:true},
+      {id:"primary@example.test",accessRole:"owner",configured:false},
+      {id:"team@example.test",accessRole:"reader",configured:false},
+    ]);
+    assert.equal(calls.filter(url=>url.pathname.endsWith("/users/me/calendarList")).length,2);
+    await calendar.listAllEventsForErasureAudit("team@example.test");
+    assert.ok(calls.some(url=>url.pathname==="/calendar/v3/calendars/team%40example.test/events"));
     const events=await calendar.listAllEventsForErasureAudit();
     assert.deepEqual(events.map(event=>event.id),[master,"later-event"]);
-    const listCalls=calls.filter(url=>url.pathname.endsWith("/events"));
+    const listCalls=calls.filter(url=>url.pathname.includes("audit%40example.test")&&url.pathname.endsWith("/events"));
     assert.equal(listCalls.length,2);
     for(const url of listCalls) {
       assert.equal(url.searchParams.get("showDeleted"),"true");

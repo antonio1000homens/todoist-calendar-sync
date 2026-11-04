@@ -13,6 +13,8 @@ export type TodoistProjectCommentAudit={
   projects:Array<{id:string;workspaceId?:number}>;
   comments:TodoistCommentRecord[];
 };
+export type CalendarAuditDescriptor={id:string;accessRole:"freeBusyReader"|"reader"|"writer"|
+  "writerWithoutPrivateAccess"|"owner"|"configured-unlisted";configured:boolean};
 
 async function listTodoistCommentPages(
   readPage:(cursor?:string)=>Promise<{results?:TodoistCommentRecord[];next_cursor?:unknown}>,
@@ -154,7 +156,7 @@ export class GoogleCalendar {
    * recurrence master/instance relationships and cross-profile provenance
    * still require independent reads.
    */
-  async listLinkedEventsByTodoistTaskId(taskId: string): Promise<CalendarEvent[]> {
+  async listLinkedEventsByTodoistTaskId(taskId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
     if (!/^[A-Za-z0-9_.-]{1,1024}$/.test(taskId))
       throw new Error("Calendar alias inventory requires an exact Todoist task ID");
     const query = new URLSearchParams({
@@ -167,7 +169,7 @@ export class GoogleCalendar {
     const seenTokens = new Set<string>();
     for (let page = 0; page < 20; page += 1) {
       const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
-        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+        `/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
       );
       if (response.items !== undefined && !Array.isArray(response.items))
         throw new Error("Calendar linked-event inventory returned invalid items");
@@ -191,13 +193,44 @@ export class GoogleCalendar {
   }
 
   /** Complete unfiltered Calendar event inventory for privileged read-only audits. */
-  async listAllEventsForErasureAudit(): Promise<CalendarEvent[]> {
+  async listCalendarListForErasureAudit():Promise<CalendarAuditDescriptor[]> {
+    const query=new URLSearchParams({maxResults:"250",showHidden:"true"});
+    const calendars=new Map<string,CalendarAuditDescriptor>();
+    const seenTokens=new Set<string>();
+    for(let page=0;page<100;page++) {
+      const response=await this.request<{items?:Array<{id?:unknown;accessRole?:unknown}>;nextPageToken?:string}>(
+        `/users/me/calendarList?${query}`);
+      if(response.items!==undefined&&!Array.isArray(response.items))
+        throw new Error("Calendar access inventory returned invalid items");
+      for(const item of response.items||[]) {
+        if(!item||typeof item.id!=="string"||!item.id||item.id.length>1024||/[\u0000-\u001f\u007f]/.test(item.id)
+          ||!(["freeBusyReader","reader","writer","writerWithoutPrivateAccess","owner"] as unknown[]).includes(item.accessRole))
+          throw new Error("Calendar access inventory returned an invalid calendar");
+        const descriptor={id:item.id,accessRole:item.accessRole as CalendarAuditDescriptor["accessRole"],configured:item.id===this.calendarId};
+        const previous=calendars.get(descriptor.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(descriptor))
+          throw new Error("Calendar access inventory changed during pagination");
+        calendars.set(descriptor.id,descriptor);
+        if(calendars.size>256)throw new Error("Calendar access inventory exceeded its safe calendar limit");
+      }
+      const next=response.nextPageToken;
+      if(next===undefined)break;
+      if(typeof next!=="string"||!next||seenTokens.has(next))
+        throw new Error("Calendar access inventory returned a repeated/invalid page token");
+      seenTokens.add(next);query.set("pageToken",next);
+      if(page===99)throw new Error("Calendar access inventory exceeded its page limit");
+    }
+    if(!calendars.has(this.calendarId))calendars.set(this.calendarId,{id:this.calendarId,accessRole:"configured-unlisted",configured:true});
+    return [...calendars.values()].sort((left,right)=>left.id.localeCompare(right.id));
+  }
+
+  async listAllEventsForErasureAudit(calendarId=this.calendarId): Promise<CalendarEvent[]> {
     const query=new URLSearchParams({showDeleted:"true",singleEvents:"false",maxResults:"2500"});
     const found=new Map<string,CalendarEvent>();
     const seenTokens=new Set<string>();
     for(let page=0;page<1000;page++) {
       const response=await this.request<{items?:CalendarEvent[];nextPageToken?:string}>(
-        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+        `/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
       );
       if(response.items!==undefined&&!Array.isArray(response.items))
         throw new Error("Calendar full inventory returned invalid items");
@@ -289,8 +322,8 @@ export class GoogleCalendar {
     throw new Error("Calendar exception inventory exceeded page limit");
   }
 
-  async getEvent(eventId: string): Promise<CalendarEvent> {
-    return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`);
+  async getEvent(eventId: string, calendarId=this.calendarId): Promise<CalendarEvent> {
+    return this.request(`/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`);
   }
 
   async listInstances(masterEventId: string, after?: string): Promise<CalendarEvent[]> {
@@ -312,7 +345,7 @@ export class GoogleCalendar {
    * date-windowed normal sync reads, this enumerates every page (including
    * cancellations and exceptions) and refuses oversized series.
    */
-  async listEventInstances(masterId: string): Promise<CalendarEvent[]> {
+  async listEventInstances(masterId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
     if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
       throw new Error("Calendar instance inventory requires an exact master ID");
     const query = new URLSearchParams({ showDeleted: "true", maxResults: "2500" });
@@ -320,7 +353,7 @@ export class GoogleCalendar {
     const seenTokens = new Set<string>();
     for (let page = 0; page < 20; page += 1) {
       const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
-        `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
+        `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
       );
       if (response.items !== undefined && !Array.isArray(response.items))
         throw new Error("Calendar instance inventory returned invalid items");

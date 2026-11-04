@@ -286,13 +286,18 @@ item/master/instance reads in every profile, old versions and new independent
 operator confirmation before calling
 `atomicReplayRelease()`. Any missing provenance keeps the fence in place.
 
-Calendar inventory currently reads each profile's configured sync calendar,
-not every calendar the profile can access. Aliases in other calendars remain
-unqueried. Todoist's full Sync `notes` snapshot is generated separately from
-the project, task and DynamoDB reads, and large accounts may receive a delayed
-full-sync timestamp. Direct ETag and action-time checks are still required.
-These limitations prevent the observation from establishing complete
-cross-profile absence.
+Calendar inventory now paginates each profile's CalendarList, including hidden
+entries, and scans event details for entries with sufficient access. A
+free/busy-only calendar or a calendar that hides private events blocks complete
+coverage. Google's CalendarList API returns calendars on the user's calendar
+list; it does not prove there are no other calendars reachable only by a known
+calendar ID. That direct-ID ACL scope still needs independent source/destination
+calendar provenance. Untagged events still cannot be associated with an erased
+identity from title or date alone. Todoist's full Sync `notes` snapshot is
+generated separately from the project, task and DynamoDB reads, and large
+accounts may receive a delayed full-sync timestamp. Direct ETag and action-time
+checks are still required. These limitations prevent the observation from
+establishing complete cross-profile absence.
 
 This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
