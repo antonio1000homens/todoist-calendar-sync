@@ -71,8 +71,10 @@ failed closed while expanding a different oversized Calendar master. The
 redacted provenance shows that master was reached through Calendar event
 identity/task-tag edges, other-task project comments in Antonio and Work, and
 a delivery state row. Two mappings for other task identities referenced it,
-but neither task was present in the complete active task inventories. The one
-related delivery row was a reconcile receipt and referenced neither the
+but neither task was present in the complete active task inventories. Read-only
+direct task lookups through the two mapping profiles returned 404 for both IDs;
+those responses remain ambiguous and are not treated as proof of absence. The
+one related delivery row was a reconcile receipt and referenced neither the
 selected task nor selected event. The selected task had one tagged Calendar
 event and no tagged recurring master. These observations identify a stale or
 otherwise unrepresented cross-profile identity conflict; they do not prove

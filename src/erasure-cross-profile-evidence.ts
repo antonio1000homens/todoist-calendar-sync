@@ -566,8 +566,24 @@ export async function observeCrossProfileErasureEvidence(input:{
                   }
                   const activeOtherMappings=[...otherMappings.values()].filter(mapping=>
                     taskInventories[mapping.profile].has(mapping.taskId));
+                  let otherTaskReadFound=0;
+                  let otherTaskRead404=0;
+                  let otherTaskReadFailures=0;
+                  for(const mapping of otherMappings.values()) {
+                    try {
+                      const mappedTask=await profileReaders[mapping.profile].todoist.getTask(mapping.taskId);
+                      if(mappedTask?.id===mapping.taskId)otherTaskReadFound++;
+                      else otherTaskReadFailures++;
+                    } catch(readError) {
+                      if(statusOf(readError)===404)otherTaskRead404++;
+                      else otherTaskReadFailures++;
+                    }
+                  }
                   (error as {auditOtherTaskMappingCount?:number}).auditOtherTaskMappingCount=otherMappings.size;
                   (error as {auditActiveOtherTaskMappingCount?:number}).auditActiveOtherTaskMappingCount=activeOtherMappings.length;
+                  (error as {auditOtherTaskReadFound?:number}).auditOtherTaskReadFound=otherTaskReadFound;
+                  (error as {auditOtherTaskRead404?:number}).auditOtherTaskRead404=otherTaskRead404;
+                  (error as {auditOtherTaskReadFailures?:number}).auditOtherTaskReadFailures=otherTaskReadFailures;
                   const taggedEvents=new Map<string,CalendarEvent>();
                   for(const taggedProfile of PROFILES)for(const item of calendarByTask[taggedProfile].get(input.taskId)||[])
                     taggedEvents.set(calendarEventKey(item.calendarId,item.event.id),item.event);

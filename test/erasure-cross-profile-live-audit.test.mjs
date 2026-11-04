@@ -19,6 +19,9 @@ test("cross-profile audit classifies oversized Calendar recurrence without expos
   otherMaster.auditStateRefFields=["masterEventId","SENSITIVE_FIELD_SHOULD_NOT_LEAK"];
   otherMaster.auditOtherTaskMappingCount=2;
   otherMaster.auditActiveOtherTaskMappingCount=1;
+  otherMaster.auditOtherTaskReadFound=0;
+  otherMaster.auditOtherTaskRead404=2;
+  otherMaster.auditOtherTaskReadFailures=0;
   otherMaster.auditTaggedEventCount=3;
   otherMaster.auditTaggedRecurringMasterCount=1;
   otherMaster.auditProfile="work";
@@ -31,7 +34,8 @@ test("cross-profile audit classifies oversized Calendar recurrence without expos
     selectedEvent:false,profile:"work",
     relationOrigins:["calendar-event-identity","project-comment-master-event-id-other-task-work"],
     stateFamilies:["RECURRENCE"],stateReferenceFields:["masterEventId"],deliveryKinds:["calendar"],
-    otherTaskMappingCount:2,activeOtherTaskMappingCount:1,taggedEventCount:3,
+    otherTaskMappingCount:2,activeOtherTaskMappingCount:1,otherTaskReadFound:0,
+    otherTaskRead404:2,otherTaskReadFailures:0,taggedEventCount:3,
     taggedRecurringMasterCount:1,deliveryRowCount:4,deliveryRowsWithSelectedTask:0,
     deliveryRowsWithSelectedEvent:0,
   });

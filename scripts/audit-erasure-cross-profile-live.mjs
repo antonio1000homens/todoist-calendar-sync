@@ -112,6 +112,9 @@ export function redactedFailureDetails(error) {
   };
   for(const [name,value] of [["otherTaskMappingCount",error.auditOtherTaskMappingCount],
     ["activeOtherTaskMappingCount",error.auditActiveOtherTaskMappingCount],
+    ["otherTaskReadFound",error.auditOtherTaskReadFound],
+    ["otherTaskRead404",error.auditOtherTaskRead404],
+    ["otherTaskReadFailures",error.auditOtherTaskReadFailures],
     ["taggedEventCount",error.auditTaggedEventCount],
     ["taggedRecurringMasterCount",error.auditTaggedRecurringMasterCount],
     ["deliveryRowCount",error.auditDeliveryRowCount],
@@ -176,6 +179,7 @@ export function readOnlyProviderPair(clients,selectedEventId,profile) {
         const fields=Array.isArray(error.auditStateRefFields)?error.auditStateRefFields:[];
         diagnostic.auditStateRefFields=fields.filter(value=>typeof value==="string");
         for(const field of ["auditOtherTaskMappingCount","auditActiveOtherTaskMappingCount",
+          "auditOtherTaskReadFound","auditOtherTaskRead404","auditOtherTaskReadFailures",
           "auditTaggedEventCount","auditTaggedRecurringMasterCount","auditDeliveryRowCount",
           "auditDeliveryRowsWithSelectedTask","auditDeliveryRowsWithSelectedEvent"])
           diagnostic[field]=Number.isSafeInteger(error[field])?error[field]:undefined;
