@@ -1,8 +1,9 @@
 # Issue #307 fault-injection evidence
 
 This matrix maps the issue's requested failures to current automated tests. It
-records source-level test coverage only; it is not live Work-profile staging,
-production release evidence, or authorization to run deletion/recovery.
+records source-level test coverage; the separate normal-sync smoke test below
+is not post-write recovery staging, production release evidence, or
+authorization to run deletion/recovery.
 
 | Requested fault | Current automated evidence | Status and limit |
 | --- | --- | --- |
@@ -24,3 +25,20 @@ remain open. Do not treat this matrix as acceptance of that executor. Keep
 `ERASURE_REPLAY_BARRIER_VERSION` off and preserve all active fences until the
 independent writer/IAM review, security approvals and disposable Work-profile
 staging evidence are complete.
+
+## Work-profile normal-sync smoke test (4 Nov 2026)
+
+Using the connected Todoist and Google Calendar apps, a clearly labeled
+disposable event was created in the Work calendar. Exactly one matching task
+appeared in the Work Todoist project. Changing that task's title updated the
+same Calendar event. Cancelling the event then returned it as cancelled, and a
+fresh Todoist search found no active task with the fixture prefix. The fixture
+did not include other guests.
+
+This confirms the ordinary Work-profile create, update and delete sync path via
+the providers. It does not exercise post-write recovery, replay-barrier
+admission, marker installation, fence release, SQS mapping restoration, a
+strong DynamoDB absence proof, or a full fresh reconciliation. No unrelated
+provider inventory or DLQ state was collected, so those acceptance checks
+remain open. The provider IDs and title are intentionally omitted from this
+public report.
