@@ -145,7 +145,7 @@ No message bodies were read and no queue attributes were changed.
 The integrated redacted receipt audit observed 740 completed Work delivery
 receipts. Of these, 174 had no identity-reference arrays: 30 Calendar, 142
 reconciliation, one manual and one repair receipt. The full scan completed at
-`2026-11-04T12:52:26Z`. At that time, five
+`2026-11-04T12:58:12Z`. At that time, five
 were past `expiresAt` (three Calendar and two reconciliation) but still present
 in the strong scan; the remaining 169 were all due to expire within seven
 days, with 29 due within one day. The preview therefore still counts all 174
