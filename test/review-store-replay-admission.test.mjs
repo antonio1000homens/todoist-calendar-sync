@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import test from "node:test";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureReplayBlockedError } from "../dist/erasure-replay-barrier.js";
-import { ReviewStore, reviewHash } from "../dist/review-store.js";
+import { assertRepairPreviewReplayAdmission, ReviewStore, reviewHash } from "../dist/review-store.js";
 
 const secret = Buffer.alloc(32, 41);
 function markerKey(profile, kind, id) {
@@ -69,6 +69,25 @@ test("mapping snapshot recurrence aliases are checked before a decision is persi
     activeInstanceId:"safe-occurrence",seriesId:"erased-master-alias",updatedAt:new Date().toISOString()};
   await assert.rejects(new ReviewStore().observeDecision(decision({mappingSnapshot:mapping})), ErasureReplayBlockedError);
   assert.equal(calls.length, 3, "both task and occurrence are checked before the erased master blocks persistence");
+});
+
+test("queued repair admission walks embedded decision and review aliases", async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", "erased-embedded-master")) return { Item: { markerVersion: 1 } };
+    return {};
+  });
+  const preview = {
+    intent: {profile:"home",action:"link",taskId:"safe-task",eventId:"safe-event"},
+    snapshots: [], itemPlan: [],
+    case: {decision:{profile:"home",mappingSnapshot:{profile:"home",taskId:"safe-task",eventId:"safe-event",
+      masterEventId:"erased-embedded-master"}}},
+  };
+  await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
+  assert.equal(calls.length, 3, "embedded historical aliases are checked before the operation can resume");
 });
 
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {

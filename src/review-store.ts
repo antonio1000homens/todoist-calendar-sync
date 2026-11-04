@@ -6,7 +6,7 @@ import type { Profile, RecurrenceLink } from "./types.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
-import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
+import { assertReplayAdmissionIfEnabled, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -22,6 +22,31 @@ async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: 
 }
 export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
   const refs = new Map<string, EntityRef>();
+  const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId"]);
+  const eventFields = new Set(["eventId","providerEventId","masterEventId","activeInstanceId","occurrenceId","selectedEventId","seriesId"]);
+  const taskArrayFields = new Set(["taskIds","candidateTaskIds"]);
+  const eventArrayFields = new Set(["eventIds","candidateEventIds"]);
+  const add = (profile: Profile, side: EntityRef["side"], id: string) => {
+    const ref = {profile,side,id}; refs.set(entityKey(ref),ref);
+  };
+  const collect = (value: unknown, profile: Profile, field = ""): void => {
+    if (Array.isArray(value)) {
+      if (taskArrayFields.has(field)) for (const id of value) if (typeof id === "string" && id) add(profile,"todoist",id);
+      if (eventArrayFields.has(field)) for (const id of value) if (typeof id === "string" && id) add(profile,"calendar",id);
+      for (const item of value) collect(item,profile,field);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const object = value as Record<string,unknown>;
+    const selectedProfile = typeof object.profile === "string" && REPLAY_PROFILES.includes(object.profile as Profile)
+      ? object.profile as Profile : profile;
+    for (const [name,item] of Object.entries(object)) {
+      if (typeof item === "string" && item && taskFields.has(name)) add(selectedProfile,"todoist",item);
+      if (typeof item === "string" && item && eventFields.has(name)) add(selectedProfile,"calendar",item);
+      collect(item,selectedProfile,name);
+    }
+  };
+  collect(preview,preview.intent.profile);
   for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
   for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
   for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
@@ -37,6 +62,8 @@ export async function assertRepairPreviewReplayAdmission(preview: RepairPreview)
   const intent: EntityRef[] = [
     ...(preview.intent.taskId ? [{ profile: preview.intent.profile, side: "todoist" as const, id: preview.intent.taskId }] : []),
     ...(preview.intent.eventId ? [{ profile: preview.intent.profile, side: "calendar" as const, id: preview.intent.eventId }] : []),
+    ...(preview.intent.action === "move" && preview.intent.targetProfile && preview.intent.taskId
+      ? [{profile:preview.intent.targetProfile,side:"todoist" as const,id:preview.intent.taskId}] : []),
   ];
   for (const ref of [...refs.values(), ...intent]) await admitReviewIdentity(ref.profile,
     ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
