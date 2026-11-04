@@ -55,9 +55,13 @@ guards.
 `test/erasure-replay-state-write-audit.test.mjs` also inventories the identified
 identity-bearing mapping/history mutation methods in `StateRepository` and
 requires replay admission before their first DynamoDB write. Runtime regressions
-cover a blocked mapping deletion, recurrence-link deletion, and writer-lease
-creation. This source check does not cover every DynamoDB control-state write,
-prove action-time lease ownership, or validate historical deployed bundles.
+cover a blocked mapping deletion, recurrence-link deletion, canonical identity
+put/delete, and writer-lease creation. The redacted Lambda configuration audit
+reports the exact paired pre-write readiness predicate
+(`ERASURE_EXECUTION_ENABLED=true` and `ERASURE_PROTOCOL_VERSION=1`) without
+returning either environment value. This source check does not cover every
+DynamoDB control-state write, prove action-time lease ownership, or validate
+historical deployed bundles.
 
 ERASURE_REPLAY_BARRIER_VERSION remains OFF. Do not run the offline atomic release
 builder against production, restore suspended consumers, replay a DLQ, alter

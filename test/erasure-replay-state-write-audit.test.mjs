@@ -5,11 +5,13 @@ import {fileURLToPath} from "node:url";
 import path from "node:path";
 import {StateRepository} from "../dist/repository.js";
 import {DynamoReconciliationStore} from "../dist/reconciliation.js";
+import {CanonicalIdentityStore} from "../dist/canonical-identity.js";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {ErasureReplayBlockedError} from "../dist/erasure-replay-barrier.js";
 
 const repositorySource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/repository.ts"),"utf8");
 const reconciliationSource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/reconciliation.ts"),"utf8");
+const canonicalIdentitySource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/canonical-identity.ts"),"utf8");
 const guardedIdentityMutators=[
   "commitFlattenMapping",
   "putMapping",
@@ -68,6 +70,20 @@ test("reconciliation baseline mutators check replay admission before state acces
   }
 });
 
+test("canonical identity mutators check replay admission before identity writes",()=>{
+  for(const name of ["put","deleteIfUnchanged"]){
+    const start=canonicalIdentitySource.indexOf(`async ${name}(`);
+    assert.notEqual(start,-1,`canonical identity method ${name} is missing`);
+    const next=canonicalIdentitySource.indexOf("\n  async ",start+1);
+    const body=canonicalIdentitySource.slice(start,next<0?canonicalIdentitySource.length:next);
+    const guard=body.indexOf("assertReplayAdmissionIfEnabled(");
+    const firstWrite=body.search(/new (?:Put|Delete)Command\s*\(/);
+    assert.notEqual(guard,-1,`${name} must check replay markers`);
+    assert.notEqual(firstWrite,-1,`${name} must retain an explicit identity write boundary`);
+    assert.ok(guard<firstWrite,`${name} must check replay markers before its DynamoDB write`);
+  }
+});
+
 async function withReplayBarrier(t,send){
   const prior={
     version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
@@ -115,6 +131,20 @@ test("conditional reconciliation baseline deletion refuses a replay marker",asyn
   await assert.rejects(new DynamoReconciliationStore().deleteBaselineIfUnchanged("work","blocked-task",null),
     ErasureReplayBlockedError);
   assert.equal(calls.length,1);
+});
+
+test("canonical identity puts and deletes refuse a replay marker before writing",async t=>{
+  const calls=await withReplayBarrier(t,command=>{
+    assert.equal(command.constructor.name,"GetCommand");
+    return {Item:{markerVersion:1}};
+  });
+  const store=new CanonicalIdentityStore();
+  const identity={normalizedTitle:"task",normalizedStart:"2026-11-04",allDay:true};
+  await assert.rejects(store.put("work","calendar","blocked-event",identity),ErasureReplayBlockedError);
+  await assert.rejects(store.deleteIfUnchanged({profile:"work",side:"calendar",providerId:"blocked-event",
+    identity,updatedAt:"2026-11-04T00:00:00.000Z"}),ErasureReplayBlockedError);
+  assert.equal(calls.length,2);
+  assert.ok(calls.every(command=>command.constructor.name==="GetCommand"));
 });
 
 test("recurrence deletion reads then checks every known alias before deleting",async t=>{
