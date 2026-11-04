@@ -90,6 +90,22 @@ test("queued repair admission walks embedded decision and review aliases", async
   assert.equal(calls.length, 3, "embedded historical aliases are checked before the operation can resume");
 });
 
+test("review admission checks recurring master aliases carried by history plans", async t => {
+  enableBarrier(t);
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", "erased-history-master")) return { Item: { markerVersion: 1 } };
+    return {};
+  });
+  const preview = {intent:{profile:"home",action:"link",taskId:"safe-task",eventId:"safe-event"},snapshots:[],itemPlan:[],
+    case:{decision:{profile:"home",elapsedCalendarHistoryPlan:{taskId:"safe-task",eventId:"safe-event",
+      recurringMasterId:"erased-history-master"}}}};
+  await assert.rejects(assertRepairPreviewReplayAdmission(preview),ErasureReplayBlockedError);
+  assert.equal(calls.length,3,"the erased historical master is admitted before any repair state is read or written");
+});
+
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {
   enableBarrier(t);
   const calls = [];
@@ -135,6 +151,38 @@ test("case status transitions refuse to mutate a case that references an erased 
   });
   await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
   assert.equal(calls.length,1,"no case status write follows the marker hit");
+});
+
+test("deferred deletion cleanup refuses to update a case that references an erased identity", async t => {
+  enableBarrier(t);
+  const store = new ReviewStore();
+  store.getCase = async () => ({id:"case-1",profile:"home",status:"open",masterEventId:"erased-cleanup-master",
+    createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", "erased-cleanup-master")) return {Item:{markerVersion:1}};
+    return {};
+  });
+  await assert.rejects(store.noteVerifiedDeletionCleanupDeferred("case-1",new Date().toISOString()),ErasureReplayBlockedError);
+  assert.equal(calls.length,1,"no deferred-cleanup status write follows the marker hit");
+});
+
+test("verified-deleted case closure refuses an erased identity before cleanup reads", async t => {
+  enableBarrier(t);
+  const store = new ReviewStore();
+  store.getCase = async () => ({id:"case-1",profile:"home",status:"open",taskId:"erased-closure-task",
+    eventId:"safe-event",createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "TASK", "erased-closure-task")) return {Item:{markerVersion:1}};
+    return {};
+  });
+  await assert.rejects(store.resolveVerifiedDeletedCase("case-1",{profile:"home",taskIds:["erased-closure-task"],eventIds:["safe-event"]}),ErasureReplayBlockedError);
+  assert.equal(calls.length,1,"no deletion evidence or review state is read after the marker hit");
 });
 
 test("coalescing refuses to close an open case that references an erased candidate", async t => {
