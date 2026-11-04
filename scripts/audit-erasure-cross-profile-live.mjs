@@ -326,7 +326,7 @@ export async function collectLiveCrossProfileEvidence(options) {
     progress.providerRequestsInFlight++;
     let host="";
     try {host=new URL(typeof input==="string"?input:input.url).hostname;} catch {}
-    if(host.endsWith("todoist.com"))progress.todoistRequestsStarted++;
+    if(host==="todoist.com"||host.endsWith(".todoist.com"))progress.todoistRequestsStarted++;
     else if(host==="googleapis.com"||host.endsWith(".googleapis.com"))progress.googleRequestsStarted++;
     else progress.otherProviderRequestsStarted++;
     try {
