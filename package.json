@@ -20,12 +20,14 @@
     "state:audit-deleted-recurrences": "npm run build --silent && node scripts/audit-deleted-recurrences.mjs",
     "state:cleanup-completed": "npm run build --silent && node scripts/cleanup-terminal-completions.mjs",
     "state:cleanup-completed-comment": "npm run build --silent && node scripts/cleanup-completed-project-comment.mjs",
+    "audit:erasure:codedeploy": "node scripts/audit-erasure-lambda-codedeploy.mjs",
     "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
     "check:public": "bash scripts/check-public-source.sh",
     "check:capacity": "node scripts/check-dynamodb-capacity.mjs",
     "cost:audit": "node scripts/monthly-cost-audit.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-codedeploy": "^3.1161.0",
     "@aws-sdk/client-dynamodb": "^3.1156.0",
     "@aws-sdk/client-lambda": "^3.1156.0",
     "@aws-sdk/client-sqs": "^3.1160.0",

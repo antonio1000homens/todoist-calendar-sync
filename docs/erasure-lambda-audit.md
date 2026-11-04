@@ -76,10 +76,23 @@ Then create a review report (also deliberately exits 2):
 
     node scripts/plan-erasure-lambda-versions.mjs --inventory=lambda-inventory.json > historical-version-review.json
 
+Capture CodeDeploy rollback endpoints separately, using the actual application
+and every relevant deployment group (the command also deliberately exits 2):
+
+    node scripts/audit-erasure-lambda-codedeploy.mjs --profile=<profile> --expected-account=<12-digit-account> --region=<region> --application=<application> --deployment-group=<group> > codedeploy-version-references.json
+
+Include that private report in the offline plan:
+
+    node scripts/plan-erasure-lambda-versions.mjs --inventory=lambda-inventory.json --codedeploy=codedeploy-version-references.json > historical-version-review.json
+
 No AWS client, network call, IAM operation or Lambda deletion is imported in
 the offline planner. A historical version is retained if it is referenced by
-an alias, weighted alias, direct event-source mapping or resource policy.
+an alias, weighted alias, direct event-source mapping, resource policy or
+CodeDeploy current/target rollback endpoint when that evidence is supplied.
 Other versions receive a review-only designation with safeToDelete=false.
+Without a CodeDeploy report, rollback references remain unverified. The
+collector fails closed on incomplete target pages and unknown target types;
+keep its exact output private.
 Resource-policy absence is not evidence of non-invokability: same-account
 identity-based IAM and cross-account principals still require audit.
 
