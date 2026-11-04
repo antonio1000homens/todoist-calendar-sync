@@ -21,6 +21,13 @@ test("reports possible direct and group identity grants without calling them eff
     users:[{UserName:"automation",Arn:`arn:aws:iam::${accountId}:user/automation`,GroupList:["operators"],
       UserPolicyList:[{PolicyName:"version-only",...policy({Effect:"Allow",Action:"lambda:InvokeFunction",Resource:`${base}:8`})}]}],
     roles:[{RoleName:"admin-role",Arn:`arn:aws:iam::${accountId}:role/admin-role`,PermissionsBoundary:{PermissionsBoundaryArn:"arn:aws:iam::123456789012:policy/boundary"},
+      AssumeRolePolicyDocument:{Version:"2012-10-17",Statement:[
+        {Effect:"Allow",Principal:{AWS:"arn:aws:iam::999999999999:root"},Action:"sts:AssumeRole",
+          Condition:{StringEquals:{"aws:PrincipalOrgID":"o-example"}}},
+        {Effect:"Allow",Principal:{Service:"lambda.amazonaws.com"},Action:"sts:AssumeRole",
+          Condition:{ArnLike:{"aws:SourceArn":"arn:aws:lambda:eu-west-2:123456789012:function:*"},
+            StringEquals:{"aws:SourceAccount":accountId}}},
+      ]},
       AttachedManagedPolicies:[{PolicyName:"Admin",PolicyArn:`arn:aws:iam::${accountId}:policy/Admin`}]}],
     groups:[{GroupName:"operators",GroupPolicyList:[{PolicyName:"group-invoke",...policy({Effect:"Allow",Action:"lambda:*",Resource:"*"})}]}],
     policies:[{Arn:`arn:aws:iam::${accountId}:policy/Admin`,PolicyDocument:{Statement:{Effect:"Allow",Action:"*",Resource:"*"}}}],
@@ -31,6 +38,14 @@ test("reports possible direct and group identity grants without calling them eff
   const role=result.candidates.find(item=>item.principalName==="admin-role");
   assert.equal(role.qualifiedPossible,true);
   assert.equal(role.permissionBoundaryPresent,true);
+  assert.equal(role.assumeRoleTrust.status,"SUMMARY_ONLY");
+  assert.equal(role.assumeRoleTrust.externalAwsPrincipalCount,1);
+  assert.equal(role.assumeRoleTrust.servicePrincipalCount,1);
+  assert.equal(role.assumeRoleTrust.sourceAccountConditionPresent,true);
+  assert.equal(role.assumeRoleTrust.sourceArnConditionPresent,true);
+  assert.equal(role.assumeRoleTrust.principalOrgConditionPresent,true);
+  assert.equal(result.roleTrustSummary.observedRoleCount,1);
+  assert.equal(result.roleTrustSummary.externalAwsPrincipalCount,1);
   const exact=result.candidates.find(item=>item.policyName==="version-only");
   assert.equal(exact.qualifiedPossible,true);
   assert.equal(exact.unqualifiedPossible,false);
@@ -79,4 +94,15 @@ test("rejects incomplete inventories and invalid account identities",()=>{
   assert.throws(()=>findLambdaInvocationCandidates({inventory:{region:"eu-west-2",functions:[]},accountId,authorization:authorization()}),/complete Lambda/);
   assert.throws(()=>findLambdaInvocationCandidates({inventory:{...inventory,verifiedAccount:"999999999999"},accountId,authorization:authorization()}),/complete Lambda/);
   assert.throws(()=>findLambdaInvocationCandidates({inventory,accountId,authorization:{Users:[],Roles:[]}}),/IAM authorization inventory/);
+});
+
+test("marks an absent role trust document as unavailable instead of implying non-assumability",()=>{
+  const result=findLambdaInvocationCandidates({inventory,accountId,authorization:authorization({roles:[
+    {RoleName:"role-without-document",RolePolicyList:[{PolicyName:"invoke",...policy({Effect:"Allow",
+      Action:"lambda:InvokeFunction",Resource:`${base}:8`})}]},
+  ]})});
+  const candidate=result.candidates.find(item=>item.principalName==="role-without-document");
+  assert.equal(candidate.assumeRoleTrust.status,"UNAVAILABLE");
+  assert.equal(result.roleTrustSummary.unavailableTrustPolicyCount,1);
+  assert.equal(result.status,"BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF");
 });

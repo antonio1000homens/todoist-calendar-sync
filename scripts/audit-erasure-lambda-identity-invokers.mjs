@@ -102,6 +102,52 @@ function resourceMatches(statement,targetArn) {
   return true;
 }
 
+function trustPolicySummary(document,accountId) {
+  if(document===undefined)return {status:"UNAVAILABLE"};
+  const statements=policyStatements(document);
+  const counts={status:"SUMMARY_ONLY",allowStatementCount:0,denyStatementCount:0,
+    wildcardAllowStatementCount:0,sameAccountAwsPrincipalCount:0,externalAwsPrincipalCount:0,
+    unknownAwsPrincipalCount:0,servicePrincipalCount:0,federatedPrincipalCount:0,
+    unknownAllowStatementCount:0,conditionalAllowStatementCount:0,
+    principalOrgConditionPresent:false,sourceAccountConditionPresent:false,
+    sourceArnConditionPresent:false,principalArnConditionPresent:false};
+  for(const statement of statements) {
+    if(statement.Effect==="Deny")counts.denyStatementCount++;
+    if(statement.Effect!=="Allow")continue;
+    counts.allowStatementCount++;
+    const principal=statement.Principal;
+    const isObject=principal&&typeof principal==="object"&&!Array.isArray(principal);
+    const aws=typeof principal==="string"&&principal!=="*"?[principal]:
+      asArray(isObject?principal.AWS:undefined).filter(value=>typeof value==="string"&&value!=="*");
+    const services=asArray(isObject?principal.Service:undefined).filter(value=>typeof value==="string");
+    const federated=asArray(isObject?principal.Federated:undefined).filter(value=>typeof value==="string");
+    if(principal==="*"||(isObject&&(principal.AWS==="*"||asArray(principal.AWS).includes("*"))))
+      counts.wildcardAllowStatementCount++;
+    for(const entry of aws) {
+      const account=/^arn:[^:]+:iam::(\d{12}):/.exec(entry)?.[1]||
+        (/^\d{12}$/.test(entry)?entry:null);
+      if(!account)counts.unknownAwsPrincipalCount++;
+      else if(account===accountId)counts.sameAccountAwsPrincipalCount++;
+      else counts.externalAwsPrincipalCount++;
+    }
+    counts.servicePrincipalCount+=services.length;
+    counts.federatedPrincipalCount+=federated.length;
+    if(statement.NotPrincipal!==undefined||(!principal&&!services.length&&!federated.length&&!aws.length))
+      counts.unknownAllowStatementCount++;
+    const condition=statement.Condition;
+    if(condition&&typeof condition==="object"&&!Array.isArray(condition)) {
+      const keys=Object.values(condition).flatMap(value=>
+        value&&typeof value==="object"&&!Array.isArray(value)?Object.keys(value):[]);
+      if(keys.length)counts.conditionalAllowStatementCount++;
+      counts.principalOrgConditionPresent||=keys.includes("aws:PrincipalOrgID");
+      counts.sourceAccountConditionPresent||=keys.includes("aws:SourceAccount");
+      counts.sourceArnConditionPresent||=keys.includes("aws:SourceArn");
+      counts.principalArnConditionPresent||=keys.includes("aws:PrincipalArn");
+    }
+  }
+  return counts;
+}
+
 export function findLambdaInvocationCandidates({inventory,accountId,partition="aws",authorization}) {
   if(!ACCOUNT.test(accountId||""))throw new Error("A verified 12-digit AWS account is required");
   if(typeof partition!=="string"||!/^aws(?:-[a-z0-9-]+)?$/.test(partition))throw new Error("Invalid AWS partition");
@@ -151,6 +197,7 @@ export function findLambdaInvocationCandidates({inventory,accountId,partition="a
       if(!matched.length)continue;
       candidates.push({principalType:type,principalName,principalArn:item.Arn||null,
         groupMemberships:type==="user"?asArray(item.GroupList):[],
+        ...(type==="role"?{assumeRoleTrust:trustPolicySummary(item.AssumeRolePolicyDocument,accountId)}:{}),
         policyName:policy.name,policyArn:policy.arn,policySource:policy.source,
         actions,matchedFunctionCount:new Set(matched.map(target=>target.functionName)).size,
         matchedQualifierCount:matched.length,unqualifiedPossible:matched.some(target=>target.qualifier==="unqualified"),
@@ -161,12 +208,26 @@ export function findLambdaInvocationCandidates({inventory,accountId,partition="a
   }
   candidates.sort((a,b)=>a.principalType.localeCompare(b.principalType)||a.principalName.localeCompare(b.principalName)
     ||a.policyName.localeCompare(b.policyName)||a.actions.join(",").localeCompare(b.actions.join(",")));
+  const roleTrustSummary={observedRoleCount:authorization.Roles.length,
+    unavailableTrustPolicyCount:authorization.Roles.filter(role=>role?.AssumeRolePolicyDocument===undefined).length,
+    wildcardAllowStatementCount:0,externalAwsPrincipalCount:0,servicePrincipalCount:0,
+    federatedPrincipalCount:0,unknownAllowStatementCount:0};
+  for(const role of authorization.Roles) {
+    if(role?.AssumeRolePolicyDocument===undefined)continue;
+    const trust=trustPolicySummary(role.AssumeRolePolicyDocument,accountId);
+    roleTrustSummary.wildcardAllowStatementCount+=trust.wildcardAllowStatementCount;
+    roleTrustSummary.externalAwsPrincipalCount+=trust.externalAwsPrincipalCount;
+    roleTrustSummary.servicePrincipalCount+=trust.servicePrincipalCount;
+    roleTrustSummary.federatedPrincipalCount+=trust.federatedPrincipalCount;
+    roleTrustSummary.unknownAllowStatementCount+=trust.unknownAllowStatementCount;
+  }
   return {purpose:"issue-307-iam-identity-invocation-candidates",status:"BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF",
     accountId,region:inventory.region,principalCount:principals.length,candidateGrantCount:candidates.length,
+    roleTrustSummary,
     missingManagedDocumentCount:missingManagedDocuments.length,missingManagedDocuments,candidates,
     unverifiedRequirements:[
       "Organizations SCPs and resource control policies were not evaluated",
-      "Permission boundaries, session policies, trust policies and explicit denies were not evaluated as a combined decision",
+      "Trust policy principals are summarized only; trust conditions, permission boundaries, session policies and explicit denies were not evaluated as a combined decision",
       "Resource-based policies, cross-account principals and external credentials require separate review",
       "Lambda inventory and IAM authorization documents are separate reads and are not one atomic snapshot",
       "A candidate Allow does not prove an identity can assume the principal or that a request is allowed",
