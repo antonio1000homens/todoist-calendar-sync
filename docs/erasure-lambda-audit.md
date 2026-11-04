@@ -169,6 +169,16 @@ erasure-execution and protocol flags set, but this is not post-write recovery
 readiness: the key ring and replay barrier are absent, and the report keeps
 `executableRecoveryMayBeEnabled=false`. No AWS mutations were performed.
 
+The same read-only Windsor session verified `AWS_PROFILE=windsor` as account
+`243857182133` and paginated `organizations:ListAccounts` to completion. The
+organization returned only that active account, which is its management
+account. There is currently no member account to carry this workload under an
+SCP guardrail. AWS Organizations SCPs do not affect the management account
+([AWS documentation](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)).
+This confirms that an SCP-based deployment boundary requires a separate
+member-account provisioning and workload migration decision. No account or
+workload was created or moved.
+
 For a local candidate scan of attached identity policies, first save a fresh
 Lambda invoker inventory to a private local file, then run:
 

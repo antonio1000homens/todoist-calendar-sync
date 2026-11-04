@@ -78,6 +78,31 @@ Work event-to-task creation path is asynchronous and the connectors can clean
 up the fixture. It is not post-write erasure, a full-reconciliation result, or
 evidence that an erased item cannot be recreated.
 
+### Fresh cross-profile observation and cancellation check (4 Nov 2026)
+
+A new private Work-calendar event asynchronously produced one task in the Work
+Todoist project. Before deletion, the read-only Windsor capture queried all
+three configured profiles and strongly scanned every DynamoDB page (4,825
+rows). Work and Antonio credentials both found the exact task, event and one
+related project comment; Home's complete observed inventories had no matching
+task, event or comment. No recurrence alias or tagged-event match was found.
+The report's bounded identity walk completed, but accessible-calendar coverage
+was not proven.
+
+After deleting the event with the Calendar connector, a fresh capture again
+read every DynamoDB page (4,828 rows). Todoist direct reads and complete task
+inventories found no task in any profile, and project/task-comment inventories
+found no related comment. However, the connector's direct Work-calendar read
+returned the event as `cancelled`, and the deployed Work and Antonio profiles'
+full event inventories still matched it. Therefore
+`knownIdentitiesAbsentFromCurrentProviders=false` and
+`eligibleForPostWriteRelease=false`; 404s in Home do not override the positive
+cancelled-event observations. The post-delete preview retained 179 blockers,
+including 169 unattributable delivery records (27 Calendar, 140 reconcile, 1
+manual, 1 repair). Four of those records were past TTL expiry but still
+visible, consistent with asynchronous DynamoDB TTL deletion. No recovery
+executor, marker install, fence release, or SQS replay was exercised.
+
 ## Deployed-credential cross-profile capture
 
 `scripts/audit-erasure-cross-profile-live.mjs` runs the repository's full
