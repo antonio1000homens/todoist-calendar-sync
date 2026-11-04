@@ -1,7 +1,7 @@
 /**
  * Staged post-write mapping retry. This is deliberately not imported by an API,
- * queue, or deployed worker route. It may run only after atomicReplayRelease()
- * has committed the marker/fence transaction and the replay protocol is live.
+ * queue, or deployed worker route. It may run only after the atomic replay
+ * release transaction has committed the marker/fence and the protocol is live.
  */
 import {GetEventSourceMappingCommand,ListEventSourceMappingsCommand,
   UpdateEventSourceMappingCommand,LambdaClient} from "@aws-sdk/client-lambda";
