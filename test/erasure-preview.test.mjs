@@ -4,12 +4,18 @@ import { buildErasurePreview } from "../dist/erasure-preview.js";
 
 test("erasure preview scans complete state and providers read-only and returns a canonical exact inventory", async () => {
   const commands=[];
-  const db={send:async command=>{
+  const scanProgress=[];
+  const scanAbortController=new AbortController();
+  let scanSignal;
+  const db={send:async (command,options)=>{
     commands.push(command.constructor.name);
-    if(command.constructor.name==="ScanCommand") return {Items:[
+    if(command.constructor.name==="ScanCommand") {
+      scanSignal=options?.abortSignal;
+      return {ConsumedCapacity:{CapacityUnits:2},Items:[
       {pk:"TASK#home#task-123",sk:"MAP",profile:"home",taskId:"task-123"},
       {pk:"AUDIT#home#one",sk:"STATE",detail:{taskId:"task-123"}},
-    ],ScannedCount:2};
+      ],ScannedCount:2};
+    }
     return {};
   }};
   const clients={
@@ -19,13 +25,18 @@ test("erasure preview scans complete state and providers read-only and returns a
       findByTodoistTaskId:async()=>undefined},
   };
   const preview=await buildErasurePreview({profile:"home",taskId:"task-123",deleteCalendar:false},
-    {db,clients,inspectFence:async()=>({leases:[]}),newOperationId:()=>"op-preview-1"});
+    {db,clients,inspectFence:async()=>({leases:[]}),newOperationId:()=>"op-preview-1",
+      scanAbortSignal:scanAbortController.signal,onInventoryProgress:progress=>scanProgress.push(progress)});
   assert.equal(preview.operationId,"op-preview-1");
   assert.equal(preview.inventory.length,2);
   assert.ok(preview.inventory.every(row=>row.key.pk&&row.key.sk&&row.digest&&row.classification));
   assert.deepEqual(preview.blockers,[]);
   assert.equal(JSON.stringify(preview).includes("private title"),false);
   assert.deepEqual(commands.sort(),["GetCommand","ScanCommand"]);
+  assert.equal(scanSignal,scanAbortController.signal);
+  assert.equal(scanProgress.length,1);
+  assert.deepEqual({...scanProgress[0],elapsedMs:undefined},
+    {pages:1,rowCount:2,consumedCapacityUnits:2,elapsedMs:undefined});
 });
 
 test("unsafe recurrence or active fence blocks confirmation-ready preview", async () => {

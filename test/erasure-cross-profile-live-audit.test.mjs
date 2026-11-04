@@ -73,6 +73,12 @@ test("cross-profile audit classifies incomplete inventories with fixed safe code
   providerDeadline.name="CrossProfileAuditDeadlineError";
   assert.equal(redactedFailureCode(providerDeadline),"CROSS_PROFILE_AUDIT_DEADLINE");
   assert.deepEqual(redactedFailureDetails(providerDeadline),{});
+  providerDeadline.auditProgress={stateScanPages:4,stateScanRows:100,stateScanConsumedCapacityUnits:91,
+    stateScanElapsedMs:30000,providerRequestsStarted:12,providerRequestsCompleted:10,
+    providerRequestsInFlight:2,taskId:"private-task-id",calendarId:"private-calendar-id"};
+  assert.deepEqual(redactedFailureDetails(providerDeadline),{progress:{stateScanPages:4,stateScanRows:100,
+    stateScanConsumedCapacityUnits:91,stateScanElapsedMs:30000,providerRequestsStarted:12,
+    providerRequestsCompleted:10,providerRequestsInFlight:2}});
   const requestTimeout=new Error("provider request timed out");
   requestTimeout.name="CrossProfileProviderRequestTimeoutError";
   assert.equal(redactedFailureCode(requestTimeout),"CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT");
