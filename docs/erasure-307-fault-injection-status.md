@@ -260,6 +260,57 @@ would also need to preserve the one-transaction marker bound. No provider or
 AWS writes were made. The capture exited incomplete and does not authorize
 post-write recovery.
 
+### Bounded recurrence count and SSO credential path (4 Nov 2026, 16:42 UTC)
+
+After confirming the exact staged Work task/event remained active, the observer
+was rerun against Windsor account `243857182133`. The local AWS SDK INI
+credential provider failed to resolve this SSO profile even though AWS CLI STS
+identity verification succeeded. The read-only tool now consumes the AWS
+CLI's validated, short-lived credential export for its SDK calls and restores
+the prior process credential environment when the capture ends; no credential
+values are logged.
+
+The bounded capture then completed instance pagination for the connected
+non-selected master and counted **74 distinct Calendar instances** before
+refusing release evidence. The redacted result again classified it as
+`CALENDAR_RECURRENCE_ALIAS_LIMIT_OTHER_MASTER`, with the same two inactive
+other-task mappings, two direct Todoist 404s, one tagged event and three
+unrelated delivery rows. The 20-page cap was not reached. This count is
+diagnostic only: the 74 IDs exceed the current 32-alias recovery limit, and
+the observer remains incomplete for post-write recovery. AWS and provider
+operations were read-only.
+
+### Independent connector lookup of unresolved mapped task (4 Nov 2026, 17:04 UTC)
+
+A fresh read-only Windsor capture against the still-active disposable Work
+fixture reproduced the same 74-instance non-selected Calendar master, two
+other-task mappings and two deployed-profile Todoist 404 responses. Both
+profile mappings resolve to the same task identity. The connected Todoist
+provider was then queried directly for that exact task: its fetch also returned
+404, and the task-scoped comment query returned no comments. An exact task
+activity-history lookup over the required older interval was denied because
+that history exceeds the connected plan's access limit. The connected
+Calendar account independently confirmed the selected fixture remains a
+confirmed one-off event in the Work calendar.
+
+These independent 404s and the empty comment read still do not prove that the
+mapped task is safely absent from historical or deleted-task records. The
+activity-history limitation leaves completion/deletion provenance unverified,
+and the 74-instance Calendar identity chain remains unresolved. No provider or
+AWS writes occurred; recovery remains blocked.
+
+### Read-only inspection of the oversized recurrence (4 Nov 2026, 17:11 UTC)
+
+The redacted audit's non-selected Calendar identity was resolved locally for a
+read-only provider lookup. Its Work-calendar record is a cancelled yearly
+recurrence; the event title and description identify it as a temporary Codex
+recurrence test and say to clean it up after verification. The same event ID
+returned 404 when read through the configured Antonio calendar. The Work
+record's recurrence rule explains the 74-instance expansion, but cancellation
+and a cross-calendar 404 do not establish that its mappings and history can be
+discarded. No Calendar or AWS changes were made; independent mapping cleanup
+and ownership approval remain required.
+
 ### Point-in-time queue attributes
 
 A read-only `GetQueueAttributes` call against the source and DLQ URLs configured

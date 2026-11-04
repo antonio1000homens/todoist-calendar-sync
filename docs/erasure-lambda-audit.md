@@ -385,3 +385,22 @@ retention, and do not replace code-digest, IAM, CloudTrail or rollback review.
 They strengthen the reason to retain and audit historical versions; they do
 not authorize retirement, denial, barrier activation or recovery execution.
 No AWS or provider mutation was performed.
+
+### State-table backup and TTL baseline (4 Nov 2026)
+
+Read-only inspection of the configured Windsor state table in `eu-west-2`
+confirmed DynamoDB point-in-time recovery is enabled with a 35-day recovery
+period. The same read returned a latest restorable time of
+`2026-11-04T16:45:01Z`; point-in-time recovery can therefore retain deleted
+identity-bearing state after the live row is removed. TTL is enabled on
+`expiresAt`; TTL expiration is asynchronous and does not shorten the separate
+PITR window.
+
+At capture time, `ListBackups` returned no on-demand backup summaries for the
+table, `ListProtectedResources` found no AWS Backup protected-resource record,
+`ListBackupPlans` returned no regional plans, and `ListExports` returned no
+table export jobs. These are current regional observations, not evidence
+about external copies or earlier exports. Security/privacy approval must
+explicitly account for the 35-day PITR copy and any external retention before
+permanent keyed replay markers are enabled. This read did not authorize that
+retention or change any AWS configuration.

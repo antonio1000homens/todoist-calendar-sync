@@ -1,6 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {readOnlyProviderPair,redactedFailureCode,redactedFailureDetails} from "../scripts/audit-erasure-cross-profile-live.mjs";
+import {parseCliExportedCredentials,readOnlyProviderPair,redactedFailureCode,redactedFailureDetails} from "../scripts/audit-erasure-cross-profile-live.mjs";
+
+test("AWS CLI SSO credential export is validated and mapped without exposing secrets",()=>{
+  const input={Version:1,AccessKeyId:"AKIA_TEST_SECRET",SecretAccessKey:"secret-value",
+    SessionToken:"session-value",Expiration:"2099-01-01T00:00:00Z"};
+  const result=parseCliExportedCredentials(JSON.stringify(input));
+  assert.deepEqual(result,{accessKeyId:input.AccessKeyId,secretAccessKey:input.SecretAccessKey,
+    sessionToken:input.SessionToken,expiration:new Date(input.Expiration)});
+  for(const invalid of ["not-json",JSON.stringify({...input,Version:2}),
+    JSON.stringify({...input,SessionToken:""}),JSON.stringify({...input,Expiration:"invalid"}),
+    JSON.stringify({...input,Expiration:"2000-01-01T00:00:00Z"})]) {
+    assert.throws(()=>parseCliExportedCredentials(invalid),error=>{
+      assert.equal(error.message,"AWS CLI profile credentials are unavailable");
+      assert.equal(error.message.includes(input.SecretAccessKey),false);
+      return true;
+    });
+  }
+});
 
 test("cross-profile audit classifies oversized Calendar recurrence without exposing input",()=>{
   const secret="Calendar recurring series exceeds replay marker bound: event-secret-123";
