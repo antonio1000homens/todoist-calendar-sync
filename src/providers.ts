@@ -1,4 +1,5 @@
 import { createSign, randomUUID } from "node:crypto";
+import {guardReplayCalendarClient} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
@@ -975,6 +976,5 @@ export function todoistTaskPayload(task: Omit<TodoistTask, "id">): Record<string
 }
 
 export function calendarForProfile(credentials: GoogleCredentials, profile: Profile, calendarId: string): GoogleCalendar {
-  void profile;
-  return new GoogleCalendar(credentials, calendarId);
+  return guardReplayCalendarClient(profile,new GoogleCalendar(credentials, calendarId));
 }

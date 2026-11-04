@@ -128,8 +128,11 @@ function guardClient<T extends object>(profile:Profile,side:Side,target:T):T {
   active.add(proxy);
   return proxy;
 }
+export function guardReplayCalendarClient<T extends object>(profile:Profile,target:T):T {
+  return guardClient(profile,"calendar",target);
+}
 /** Wrap BOTH production and injected/mock factories; repeated wrapping is idempotent. */
 export function guardReplayProviderClients<T extends {calendar:object;todoist:object}>(profile:Profile,clients:T):T {
-  return {...clients,calendar:guardClient(profile,"calendar",clients.calendar),
+  return {...clients,calendar:guardReplayCalendarClient(profile,clients.calendar),
     todoist:guardClient(profile,"todoist",clients.todoist)};
 }
