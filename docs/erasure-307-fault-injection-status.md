@@ -238,6 +238,11 @@ node scripts/audit-erasure-cross-profile-live.mjs \
   --event-id='<disposable-event-id>'
 ```
 
+`--scan-deadline-ms` bounds the complete evidence capture, including Calendar
+and Todoist provider reads (default 300000 ms; maximum 900000 ms). A provider
+deadline returns `CROSS_PROFILE_AUDIT_DEADLINE` with redacted details and
+incomplete evidence; it is not evidence that an identity or alias is absent.
+
 The report is redacted and always exits with status 2 because this capture is
 not release-authoritative and cannot issue an erasure confirmation. A complete
 read only proves the observed provider/state evidence for those exact IDs; it
