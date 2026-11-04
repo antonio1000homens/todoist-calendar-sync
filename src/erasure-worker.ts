@@ -13,6 +13,7 @@ import { executeErasureDeletionStep, verifyErasurePostflight } from "./erasure-d
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
 import { inspectConfirmedOrphanOperation } from "./orphan-worker-inspection.js";
 import { processOrphanManifestStage } from "./orphan-manifest-stage-worker.js";
+import { inspectOrphanPauseRecovery } from "./orphan-pause-recovery-inspection.js";
 
 const lambda=new LambdaClient({});
 function targetWorkerFunction(): string {
@@ -90,7 +91,7 @@ const adapters: ErasureWorkerAdapters={
 const store=new ErasureOperationStore(documentClient,undefined,adapters);
 const recoveryService=new ErasureRecoveryService(recoveryAdapters(true),documentClient,store);
 
-export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery"|"orphan_inspection"|"orphan_manifest_stage";id:string} {
+export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"erasure"|"recovery"|"orphan_inspection"|"orphan_manifest_stage"|"orphan_pause_recovery";id:string} {
   let payload:unknown;
   try { payload=JSON.parse(record.body); } catch { throw new Error("Invalid erasure queue message JSON"); }
   if(!payload||typeof payload!=="object"||Array.isArray(payload)) throw new Error("Invalid erasure queue message");
@@ -99,11 +100,13 @@ export function parseErasureQueueCommand(record: Pick<SQSRecord,"body">):{kind:"
   const keys=Object.keys(value).sort().join(",");
   const kind=keys==="operationId,version"?"erasure":keys==="recoveryOperationId,version"?"recovery"
     :keys==="orphanInspectionOperationId,version"?"orphan_inspection"
-    :keys==="orphanManifestStageOperationId,version"?"orphan_manifest_stage":undefined;
+    :keys==="orphanManifestStageOperationId,version"?"orphan_manifest_stage"
+    :keys==="orphanPauseRecoveryOperationId,version"?"orphan_pause_recovery":undefined;
   if(!kind)throw new Error("Invalid erasure queue message schema");
   const id=kind==="erasure"?value.operationId
     :kind==="recovery"?value.recoveryOperationId
-    :kind==="orphan_inspection"?value.orphanInspectionOperationId:value.orphanManifestStageOperationId;
+    :kind==="orphan_inspection"?value.orphanInspectionOperationId
+    :kind==="orphan_manifest_stage"?value.orphanManifestStageOperationId:value.orphanPauseRecoveryOperationId;
   if(typeof id!=="string"||!/^[A-Za-z0-9_-]{1,128}$/.test(id))throw new Error("Invalid queue operation ID");
   return {kind,id};
 }
@@ -183,7 +186,15 @@ export const handler:SQSHandler=async event=>{
   for(const record of event.Records){
     try {
       const command=parseErasureQueueCommand(record);
-      if(command.kind==="orphan_manifest_stage") {
+      if(command.kind==="orphan_pause_recovery") {
+        // Read-only operator recovery inspection. This report can NEVER
+        // authorise a mapping pause, release a fence, or delete providers.
+        const report=await inspectOrphanPauseRecovery(command.id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"orphan_pause_recovery",operationId:command.id,
+          status:report.status,blockers:report.blockers,
+          mappingChangesAuthorized:false,fenceAuthorized:false,deletionAuthorized:false}));
+      } else if(command.kind==="orphan_manifest_stage") {
         // Independent, default-denied, single DynamoDB manifest create only.
         // No fence or mapping mutation; never dispatch another SQS message.
         const staged=await processOrphanManifestStage(command.id);
