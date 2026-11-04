@@ -4,10 +4,16 @@ This is a source+deployment audit aid, NOT erasure recovery authorisation. It re
 all published Lambda versions, aliases and weighted targets, event-source
 mappings in the selected region, resource invocation policies and Function URLs.
 It does not call any AWS mutation or invoke providers.
+Resource-policy summaries include bounded wildcard-action/Function-URL booleans
+and per-qualifier principal counts (same-account, external AWS, unknown AWS,
+service, federated, wildcard, and unknown principal statements). They omit
+policy text and principal values. Counts are classification aids, not an
+effective-permissions calculation; conditions, `NotPrincipal`, IAM identity
+policies, Organizations policies and service trust still require review.
 
 ## Run
 
-node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=eu-west-2 > lambda-inventory.json
+node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=eu-west-2 --profile=<profile> --expected-account=<12-digit-account> > lambda-inventory.json
 
 The region here is only an example. Run for the actual region, each account,
 stage and legacy prefix where these functions might have been deployed. Use an
@@ -108,6 +114,16 @@ independent review. The exact account inventory, principals, alias targets,
 version counts and configuration values are intentionally kept out of this
 public report. No AWS resource or IAM policy was changed during inspection.
 
+The 4 Nov 2026 profile-bound package audit verified every returned ZIP digest.
+The static marker scan found historical packages without replay-barrier marker
+strings, while current alias targets contain them. Marker presence is only a
+triage signal and does not prove that a guard dominates every mutation path;
+historical direct invocation and IAM access therefore remain unapproved.
+The matching private CodeDeploy capture includes rollback endpoints across
+deployment history, so the offline planner retained every published version
+and produced no version-retirement candidates. The report does not authorize
+deleting deployments, Lambda versions or invocation permissions.
+
 The audit is incomplete: it has not established all permission boundaries,
 organization policies and role trust/session paths; CloudTrail data-event
 coverage and qualified invocation metrics; all historical writer paths;
@@ -124,18 +140,107 @@ operational details. No generated live-inventory report is committed here.
 
 Run the code package audit:
 
-    AWS_PROFILE=windsor node scripts/audit-erasure-lambda-code.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production > deployed-code-audit.json
+    node scripts/audit-erasure-lambda-code.mjs --profile=windsor --expected-account=243857182133 --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production > deployed-code-audit.json
 
 Run the redacted configuration audit:
 
-    AWS_PROFILE=windsor node scripts/audit-erasure-lambda-config.mjs --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production --function=todoist-calendar-sync-watch-production --function=todoist-calendar-sync-worker-production --function=todoist-calendar-sync-reconciler-production --function=todoist-calendar-sync-erasure-worker-production --function=todoist-calendar-sync-completed-cleanup-production > deployed-config-audit.json
+    node scripts/audit-erasure-lambda-config.mjs --profile=windsor --expected-account=243857182133 --region=eu-west-2 --function=todoist-calendar-sync-ingress-production --function=todoist-calendar-sync-review-api-production --function=todoist-calendar-sync-watch-production --function=todoist-calendar-sync-worker-production --function=todoist-calendar-sync-reconciler-production --function=todoist-calendar-sync-erasure-worker-production --function=todoist-calendar-sync-completed-cleanup-production > deployed-config-audit.json
 
 Both commands deliberately exit with status 2 because inventory is not release
-approval. The code scanner omits presigned URLs; the configuration scanner
-omits environment values and fails on incomplete pages, alias drift or
-configuration drift. These commands do not clear the all-account/region,
+approval. The code scanner verifies the selected profile's STS account before
+reading Lambda packages, binds the SDK to that profile, and includes the
+verified account in its report. The configuration scanner also verifies STS
+against an explicit profile and expected account, then binds Lambda reads to
+that profile. It omits environment values and fails on incomplete pages, alias
+drift or configuration drift. These commands do not clear the all-account/region,
 legacy-name, identity-IAM, CodeDeploy rollback or independent approval
 blockers above.
+
+### Windsor configuration snapshot (4 Nov 2026)
+
+A fresh read-only run of the configuration audit verified account
+`243857182133` in `eu-west-2` and inspected 173 configurations across the seven
+named functions, including all published versions, aliases and `$LATEST`.
+`ERASURE_REPLAY_BARRIER_VERSION`, `ERASURE_REPLAY_HMAC_KEYS` and
+`ERASURE_REPLAY_HMAC_CURRENT_KEY` were absent from every inspected
+configuration. The audit now reports HMAC variable presence only; it never
+returns environment values. Thirty-five configurations had the existing
+erasure-execution and protocol flags set, but this is not post-write recovery
+readiness: the key ring and replay barrier are absent, and the report keeps
+`executableRecoveryMayBeEnabled=false`. No AWS mutations were performed.
+
+The same read-only Windsor session verified `AWS_PROFILE=windsor` as account
+`243857182133` and paginated `organizations:ListAccounts` to completion. The
+organization returned only that active account, which is its management
+account. There is currently no member account to carry this workload under an
+SCP guardrail. AWS Organizations SCPs do not affect the management account
+([AWS documentation](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)).
+This confirms that an SCP-based deployment boundary requires a separate
+member-account provisioning and workload migration decision. No account or
+workload was created or moved.
+
+### Windsor qualified-code and invoker snapshot (4 Nov 2026, 14:12 UTC)
+
+Fresh read-only invoker and package audits verified the same Windsor account
+and region. The complete seven-function inventory had no missing expected
+functions. Ingress had 71 published numeric versions and `live` pointed to
+version 72; review-api had 95 and `live` pointed to version 96. The two SQS
+event-source mappings remained Enabled and targeted the unqualified worker and
+erasure-worker functions.
+
+All unique deployed ingress and review-api packages passed the AWS
+`CodeSha256` download check: 66 digests for ingress and 94 for review-api.
+Static marker-string inspection found replay-barrier strings only in ingress
+versions 70–72 and review-api versions 84–96. The `reviewed_fenced` string was
+present in review-api versions 89–96. These strings do not establish that
+checks dominate every write, but the other published versions do not even
+contain the recognizable barrier strings. This is direct evidence that old
+published versions cannot be accepted as barrier-protected from the current
+source alone.
+
+The read-only identity scan examined 55 users, roles and groups and found five
+candidate policy grants across four principals. The AWS policy simulator
+evaluated eight direct/legacy invocation cases; each allowed all 175 inventoried
+function targets, including all 168 qualified targets, with no permission
+boundary reported. This remains simulation evidence: trust/session policies,
+resource policies, external credentials and a combined effective-permission
+decision were not proven. The verified account is the organization management
+account, so SCPs do not constrain these principals.
+
+The same invocation inventory found `AuthType=NONE` Function URLs on ingress
+and review-api, with wildcard URL/invoke statements on the unqualified and
+`live` resource-policy summaries. AWS documents that `AuthType=NONE` means
+Lambda itself does not authenticate URL requests; the resource policy permits
+public invocation. The application checks are a separate layer:
+
+- Ingress requires the shared proxy secret, and then validates the Calendar
+  channel token or Todoist webhook signature. This protects the current
+  ingress handler path when its deployed code and secret are correct, but does
+  not restrict who can reach the public URL or invoke other published versions.
+- Review API validates the Cloudflare Access JWT, audience, issuer and operator
+  email, plus same-origin on applicable routes. A direct request to its public
+  Lambda URL bypasses Cloudflare's network perimeter and relies on those
+  handler checks. Deployed historical versions still require independent
+  review for equivalent checks.
+
+This URL exposure is intentional in the current template. Both Cloudflare
+Worker routes call the Lambda URLs using ordinary HTTPS fetch; they do not sign
+AWS requests. Changing Function URLs to `AWS_IAM` therefore requires a reviewed
+architecture change (for example, a signing/authenticated intermediary) and
+coordinated Cloudflare configuration. It is not a standalone IAM toggle.
+Likewise, an IAM allowlist in the Windsor management account would not constrain
+all possible callers, and an SCP does not apply to that account. A durable
+historical-version boundary therefore needs a separately approved account
+boundary and migration design, or an explicitly temporary reviewed set of
+account-local denies with a maintained update procedure and proved principal
+coverage. Neither plan has been authorized or applied.
+
+No policy, URL, alias, version, queue, environment, fence or replay setting was
+changed. The replay barrier and executable recovery remain prohibited.
+
+AWS references: [Function URL authentication](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html),
+[Lambda service authorization condition keys](https://docs.aws.amazon.com/service-authorization/latest/reference/list_lambda.html),
+[SCP effects and limitations](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html).
 
 For a local candidate scan of attached identity policies, first save a fresh
 Lambda invoker inventory to a private local file, then run:
@@ -152,15 +257,28 @@ Organizations policies, cross-account principals or resource policies. It
 always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
 an IAM change or enable replay/recovery.
 
-To simulate candidate identity grants against the inventoried Lambda resource
-ARNs, with only the region request context supplied, run:
+To simulate candidate identity grants for `InvokeFunction`, deprecated
+`InvokeAsync`, and configured AWS_IAM Function URLs, with the region and
+Function URL context supplied where relevant, run:
 
     node scripts/simulate-erasure-lambda-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> --candidates=<private-identity-candidates.json> > <private-policy-simulation.json>
 
 The IAM simulator does not prove role assumption or STS session policies, and
-role simulations do not include Lambda resource policies. Other context values,
-resource controls and unscanned regions/accounts remain separate gates. The
-report is a simulation, not a live invocation or approval; keep it private.
+role simulations do not include Lambda resource policies. Function URLs using
+`AuthType=NONE` are reported separately for resource-policy review; they do not
+require an identity-policy simulation. A missing Function URL inventory is not
+evidence that no URL exists. Other context values, resource controls and
+unscanned regions/accounts remain separate gates. The report is a simulation,
+not a live invocation or approval; keep it private.
+
+The identity-candidate audit also needs `organizations:DescribeOrganization`.
+Its redacted `organizationContext` says whether the verified target account is
+the organization management account and whether SCPs can apply there; it does
+not return organization IDs or policy documents and does not prove a specific
+effective deny. AWS Organizations SCPs do not affect management-account roles
+([AWS documentation](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html)).
+An unavailable organization read remains `UNAVAILABLE` and cannot be treated as
+evidence that a guardrail applies.
 
 To query invocation metrics for each inventoried published version, alias,
 alias-executed version and unqualified function over the CloudWatch retention
@@ -183,3 +301,87 @@ and can break deployment rollback.
 This report does not authorize production mutation, nor complete the first
 issue #307 acceptance box. Keep ERASURE_REPLAY_BARRIER_VERSION OFF,
 post-write recovery blocked and all active fences preserved.
+
+### All opted-in Windsor region Lambda names (4 Nov 2026)
+
+A fresh read-only scan verified Windsor with STS, listed all 17 opted-in
+regions, and let the AWS CLI paginate `ListFunctions` in each region. It found
+21 functions across `eu-west-1` and `eu-west-2`. The seven deployed
+`todoist-calendar-sync-*` functions were all in `eu-west-2`; no function name
+matching `todoist` or `calendar-sync` appeared in the other 16 regions. The
+two `eu-west-1` functions and twelve other `eu-west-2` functions have not been
+code-audited for indirect identity writes, so this name-only scan does not
+prove there are no nonstandard writers. The AWS Organizations inventory
+returned only the Windsor management account, so this scan covers no
+out-of-organization credentials or external accounts. No AWS mutation was
+performed.
+
+### Non-sync deployed Lambda package screening (4 Nov 2026)
+
+After verifying the Windsor caller with STS, a read-only screen downloaded the
+14 non-`todoist-calendar-sync-*` Lambda function packages currently returned in
+`eu-west-1` and `eu-west-2`. Each downloaded ZIP's SHA-256 matched the
+`GetFunction` `CodeSha256`. The screen also read and verified the digests of all
+three attached non-sync layer archives. It searched package bytes for Todoist
+API, Google Calendar API, and common task/event mutation markers; package
+contents were not dumped, and environment values were not read. Manual
+verification displayed only selected endpoint and HTTP-method source lines.
+
+No such markers appeared in the unrelated function packages or layer archives.
+The shared `led-publisher` / `led-control-api` Python package contains a
+Todoist task-filter GET and Google Calendar event-list GET. Its only Todoist
+POST is to the OAuth access-token endpoint for refresh; source inspection found
+no Todoist task or Calendar event identity-write request. This package has no
+Calendar event mutation call. Identical shared package matches explain why the
+same static scan result appears for both functions.
+
+This narrows the unreviewed non-sync code surface in the two regions observed,
+but it is not proof that every route is safe: string scans do not establish
+control flow, dynamically assembled requests, indirect calls, IAM
+authorization, other principals/accounts, historical versions, or resources
+outside those two regions. The earlier 17-region scan was name-only; this
+package screen audited code only in the two regions where that scan found
+functions, and does not classify non-Lambda writer routes or historical
+versions. The complete writer-audit checklist therefore remains unchecked. No
+AWS or provider mutation was performed.
+
+### Configured Calendar inventory baseline (4 Nov 2026)
+
+Using the verified Windsor account and the three deployed Google Calendar
+credentials, read-only CalendarList calls returned one listed calendar for
+each profile. The configured Work calendar was not listed by CalendarList, but
+the explicit full event-list query against its configured calendar ID
+succeeded. Full paginated event inventories completed for all three configured
+calendars: 745 Home, 986 Antonio and 413 Work events. No restricted CalendarList
+access roles were observed.
+
+The inventory found cross-profile value overlaps in 26 Calendar event IDs, 4
+Todoist task tags, 19 iCalUIDs and 6 recurrence-parent IDs. These counts show
+that the configured provider identities are not disjoint. They do not identify
+whether any overlap belongs to a selected erasure, nor establish the associated
+Todoist, comment, recurrence, DynamoDB or delivery provenance. Keep full
+identity closure and all-profile alias proof open; the counts are a
+point-in-time baseline, not recovery evidence. Only counts and profile labels
+were recorded; provider IDs, titles, comments and credentials were not
+persisted. No AWS or provider mutation was performed.
+
+### Qualified invocation metric snapshot (4 Nov 2026)
+
+The read-only metric collector queried 341 daily `AWS/Lambda Invocations`
+series for all seven inventoried functions, published versions, aliases and
+alias-executed versions over the preceding 455 days
+(`2025-08-06T16:12:33Z` through `2026-11-04T16:12:33Z`). All metric queries
+completed. The 166 direct published-version series had no datapoints. This is
+inconclusive for direct invocation: CloudWatch metric absence is not evidence
+that a version was never invoked.
+
+Alias-executed-version metrics had datapoints for 95 published version series;
+94 were not a primary or weighted target of their alias at capture time. This
+proves those versions received alias-routed invocations during the metric
+window, not that they were directly invoked or that their code enforced the
+replay barrier. The two alias totals summed to 10,176 invocations. These
+metrics identify neither callers nor the full history beyond CloudWatch
+retention, and do not replace code-digest, IAM, CloudTrail or rollback review.
+They strengthen the reason to retain and audit historical versions; they do
+not authorize retirement, denial, barrier activation or recovery execution.
+No AWS or provider mutation was performed.

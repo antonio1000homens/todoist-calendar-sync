@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
+import { documentClient } from "../dist/dynamodb-capacity.js";
 import { serializeMappingComment } from "../dist/mapping-comments.js";
 import { migrateProjectComments } from "../dist/project-comment-migration.js";
 
@@ -325,4 +326,48 @@ test("cleanup report rejects a mismatched ID without writing any audit record", 
   assert.deepEqual(state.audits, []);
   assert.deepEqual(state.saved, []);
   assert.deepEqual(fake.deletes, []);
+});
+
+test("apply migration holds a writer lease and checks replay markers before provider mutation", async (t) => {
+  const env = Object.fromEntries(["ERASURE_PROTOCOL_VERSION", "ERASURE_REPLAY_BARRIER_VERSION",
+    "ERASURE_REPLAY_HMAC_KEYS", "ERASURE_REPLAY_HMAC_CURRENT_KEY"].map(key => [key, process.env[key]]));
+  t.after(() => {
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  process.env.ERASURE_PROTOCOL_VERSION = "1";
+  process.env.ERASURE_REPLAY_BARRIER_VERSION = "1";
+  process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: Buffer.alloc(32, 9).toString("base64") });
+  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
+  const sends = [];
+  t.mock.method(documentClient, "send", async command => {
+    sends.push(command.constructor.name);
+    if (command.constructor.name === "GetCommand"
+      && String(command.input.Key?.pk).startsWith("ERASURE_REPLAY#")) return { Item: { markerVersion: 1 } };
+    if (["GetCommand", "TransactWriteCommand", "DeleteCommand"].includes(command.constructor.name)) return {};
+    throw new Error(`Unexpected DynamoDB command ${command.constructor.name}`);
+  });
+
+  const state = new FakeState();
+  const fake = fakeClients();
+  const summary = await migrateProjectComments("home", [mapping()], state, fake.clients, true);
+  assert.equal(summary.failures, 1);
+  assert.equal(fake.creates, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.deepEqual(state.saved, []);
+  assert.ok(sends.includes("TransactWriteCommand"), "writer lease was acquired");
+  assert.ok(sends.includes("DeleteCommand"), "writer lease was released");
+  assert.ok(sends.includes("GetCommand"), "replay marker was read");
+  assert.ok(state.audits.some(entry => String(entry.detail?.error || "").includes("Erasure replay admission refused")));
+});
+
+test("project-comment migration refuses mappings from another profile", async () => {
+  const state = new FakeState();
+  const fake = fakeClients();
+  const summary = await migrateProjectComments("home", [mapping({ profile: "work" })], state, fake.clients, true);
+  assert.equal(summary.failures, 1);
+  assert.equal(fake.creates, 0);
+  assert.deepEqual(fake.deletes, []);
+  assert.deepEqual(state.saved, []);
 });

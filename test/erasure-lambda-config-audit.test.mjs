@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {collectRuntimeConfigAudit} from "../scripts/audit-erasure-lambda-config.mjs";
+import {readFile} from "node:fs/promises";
+import {collectRuntimeConfigAudit,verifyExpectedAccount} from "../scripts/audit-erasure-lambda-config.mjs";
+
+test("Lambda config audit binds its STS identity and SDK credentials to an explicit account/profile",async()=>{
+  assert.equal(verifyExpectedAccount({Account:"243857182133"},"243857182133"),"243857182133");
+  assert.throws(()=>verifyExpectedAccount({Account:"553490163883"},"243857182133"),/did not match/);
+  assert.throws(()=>verifyExpectedAccount({Account:"243857182133"},"invalid"),/did not match/);
+  const source=await readFile(new URL("../scripts/audit-erasure-lambda-config.mjs",import.meta.url),"utf8");
+  assert.match(source,/\["sts","get-caller-identity","--profile",profile/);
+  assert.match(source,/credentials:fromIni\(\{profile\}\)/);
+});
 
 test("Lambda config audit reads every published version and alias target but omits environment values",async()=>{
   const sha1="a".repeat(44),sha2="b".repeat(44),seen=[];
@@ -17,6 +27,8 @@ test("Lambda config audit reads every published version and alias target but omi
       const codeSha256=version==="1"?sha1:sha2;
       return {FunctionName:command.input.FunctionName,Version:version,CodeSha256:codeSha256,
         Environment:{Variables:{ERASURE_REPLAY_BARRIER_VERSION:version==="2"?"1":"0",
+          ERASURE_REPLAY_HMAC_KEYS:"{"+"key-1:private-secret"+"}",
+          ERASURE_REPLAY_HMAC_CURRENT_KEY:"key-1",
           ERASURE_EXECUTION_ENABLED:version==="1"?"true":"false",
           ERASURE_PROTOCOL_VERSION:version==="1"?"0":"1",TODOIST_API_TOKEN:"private-token"}}};
     }
@@ -28,6 +40,8 @@ test("Lambda config audit reads every published version and alias target but omi
   assert.deepEqual(fn.aliases,[{name:"live",version:"2",revisionId:null,weightedTargets:{"1":0.25}}]);
   assert.deepEqual(fn.configs.map(item=>item.version),["1","2","$LATEST"]);
   assert.equal(fn.replayBarrierEnabledCount,1);assert.equal(fn.replayBarrierPresentCount,3);
+  assert.equal(fn.replayHmacKeyRingPresentCount,3);assert.equal(fn.replayHmacCurrentKeyPresentCount,3);
+  assert.ok(fn.configs.every(item=>item.replayHmacKeyRing==="present"&&item.replayHmacCurrentKey==="present"));
   assert.ok(fn.configs.every(item=>item.postwriteReview==="absent"));
   assert.equal(fn.erasureExecutionEnabledCount,1);
   assert.equal(fn.erasureExecutionReadyCount,0,"execution flag alone is not the runtime readiness predicate");
@@ -35,6 +49,8 @@ test("Lambda config audit reads every published version and alias target but omi
   assert.equal(report.replayBarrierMayBeEnabled,false);
   assert.equal(report.executableRecoveryMayBeEnabled,false);
   assert.equal(JSON.stringify(report).includes("private-token"),false);
+  assert.equal(JSON.stringify(report).includes("private-secret"),false);
+  assert.equal(JSON.stringify(report).includes("key-1"),false);
   assert.equal(seen.filter(value=>value.startsWith("GetFunctionConfigurationCommand:")).length,4);
 });
 

@@ -17,7 +17,8 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
     updatedAt:"2026-11-03T20:00:00.000Z"},"project-antonio",undefined,1);
   const homeMaster=linked(master,taskOne,{recurrence:["RRULE:FREQ=DAILY"]});
   const homeEvent=linked(eventOne,taskOne,{recurringEventId:master});
-  const homeInstance=linked(instance,taskOne,{recurringEventId:master,originalStartTime:{date:"2026-11-03"}});
+  const homeInstance=linked(instance,taskOne,{status:"cancelled",recurringEventId:master,
+    originalStartTime:{date:"2026-11-03"}});
   const workEvent=linked(eventTwo,taskTwo);
   const calendarByProfile={home:[homeMaster,homeEvent],antonio:[],work:[workEvent]};
   const calls=[],calendarDirectReads=[];
@@ -100,6 +101,8 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.ok(report.identities.eventCount>=5,"selected, mapped, recurring and legacy event aliases are retained");
   assert.equal(report.profiles.home.recurringMasters,1);
   assert.equal(report.profiles.home.recurrenceInstances,1);
+  assert.equal(report.profiles.home.cancelledDirectEventReads,1);
+  assert.equal(report.profiles.home.cancelledInventoryMatches,1);
   assert.equal(report.profiles.antonio.relatedProjectComments,1);
   assert.ok(report.profiles.work.relatedLegacyComments>0);
   assert.ok(report.profiles.work.taskCommentInventoryMatches>0);
@@ -229,6 +232,34 @@ test("Google audit inventory covers every page without time or task filters and 
     const instances=await calendar.listEventInstances(master);
     assert.deepEqual(instances.map(event=>event.id),[instance]);
     assert.equal(calls.at(-1).searchParams.get("showDeleted"),"true");
+  } finally { globalThis.fetch=previous; }
+});
+
+test("Google recurrence audit paginates an oversized series before returning only its safe count",async()=>{
+  const previous=globalThis.fetch,calls=[];
+  globalThis.fetch=async raw=>{
+    const url=new URL(String(raw));
+    if(url.origin==="https://oauth2.googleapis.com")return new Response(JSON.stringify({access_token:"token"}));
+    calls.push(url);
+    assert.equal(url.pathname.endsWith("/events/oversized-master/instances"),true);
+    const start=url.searchParams.has("pageToken")?32:0;
+    const items=Array.from({length:start?1:32},(_,offset)=>{
+      const index=start+offset;
+      return {id:`instance-${index}`,recurringEventId:"oversized-master",status:"confirmed"};
+    });
+    return new Response(JSON.stringify(start?{items}:{items,nextPageToken:"second-page"}));
+  };
+  try {
+    const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"audit@example.test");
+    await assert.rejects(calendar.listEventInstances("oversized-master"),error=>{
+      assert.equal(error.message,"Calendar recurring series exceeds replay marker bound");
+      assert.equal(error.auditAliasCount,33);
+      assert.equal(error.message.includes("instance-"),false);
+      return true;
+    });
+    assert.equal(calls.length,2);
+    assert.equal(calls[1].searchParams.get("pageToken"),"second-page");
+    assert.equal(calls.every(url=>url.searchParams.get("showDeleted")==="true"),true);
   } finally { globalThis.fetch=previous; }
 });
 

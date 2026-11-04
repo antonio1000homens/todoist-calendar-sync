@@ -6,6 +6,7 @@ import type { Profile, RecurrenceLink } from "./types.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
+import { assertReplayAdmissionIfEnabled, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -15,12 +16,92 @@ export function reviewHash(value: unknown): string {
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 const dismissalResolutions = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
+async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: string): Promise<void> {
+  if (taskId || eventId) await assertReplayAdmissionIfEnabled({ profile,
+    ...(taskId ? { taskId } : {}), ...(eventId ? { eventIds: [eventId] } : {}) });
+}
+async function admitEntityRef(ref: EntityRef): Promise<void> {
+  await admitReviewIdentity(ref.profile,
+    ref.side === "todoist" ? ref.id : undefined,
+    ref.side === "calendar" ? ref.id : undefined);
+}
+async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
+  const refs = new Map<string, EntityRef>();
+  const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
+  const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId",
+    "activeInstanceId","occurrenceId","selectedEventId","seriesId","calendarProjectionId",
+    "oldMasterId","newMasterId","lastEventId","previousEventId","cancelledEventId",
+    "syncHistoryMasterId","recurringEventId","originalEventId","activeCalendarId","afterEventId",
+    "consolidationCancelledEventId","consolidationMasterEventId","contextEventId","existingActiveInstanceId",
+    "existingMasterId","metadataEventId","masterSeriesId","preferredEventId","providerSeriesId",
+    "reconcileAfterEventId","recoveredEventId","sourceEventId","splitHistoryMasterId",
+    "syncFlattenOccurrenceId"]);
+  const taskArrayFields = new Set(["taskIds","candidateTaskIds"]);
+  const eventArrayFields = new Set(["eventIds","candidateEventIds"]);
+  const add = (profile: Profile, side: EntityRef["side"], id: string) => {
+    const ref = {profile,side,id}; refs.set(entityKey(ref),ref);
+  };
+  const collect = (item: unknown, profile: Profile, field = ""): void => {
+    if (Array.isArray(item)) {
+      if (taskArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"todoist",id);
+      if (eventArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"calendar",id);
+      // ManualDecision.context.candidates is a Todoist-task candidate list
+      // whose provider IDs are stored as `id`, unlike named identity fields.
+      if (field === "candidates") for (const candidate of item) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const candidateObject = candidate as Record<string,unknown>;
+        if (typeof candidateObject.id === "string" && candidateObject.id) add(profile,"todoist",candidateObject.id);
+      }
+      for (const child of item) collect(child,profile,field);
+      return;
+    }
+    if (!item || typeof item !== "object") return;
+    const object = item as Record<string,unknown>;
+    const selectedProfile = typeof object.profile === "string" && REPLAY_PROFILES.includes(object.profile as Profile)
+      ? object.profile as Profile : profile;
+    for (const [name,child] of Object.entries(object)) {
+      if (typeof child === "string" && child && taskFields.has(name)) add(selectedProfile,"todoist",child);
+      if (typeof child === "string" && child && eventFields.has(name)) add(selectedProfile,"calendar",child);
+      collect(child,selectedProfile,name);
+    }
+  };
+  collect(value,defaultProfile);
+  for (const ref of refs.values()) await admitEntityRef(ref);
+}
+export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
+  const refs = new Map<string, EntityRef>();
+  await admitNestedReviewIdentities(preview,preview.intent.profile);
+  for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
+  for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
+  for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
+    const mapping = snapshot.mapping;
+    refs.set(entityKey({profile:mapping.profile,side:"todoist",id:mapping.taskId}),
+      {profile:mapping.profile,side:"todoist",id:mapping.taskId});
+    refs.set(entityKey({profile:mapping.profile,side:"calendar",id:mapping.eventId}),
+      {profile:mapping.profile,side:"calendar",id:mapping.eventId});
+    for (const id of [mapping.masterEventId,mapping.activeInstanceId]) if (id)
+      refs.set(entityKey({profile:mapping.profile,side:"calendar",id}),
+        {profile:mapping.profile,side:"calendar",id});
+  }
+  const intent: EntityRef[] = [
+    ...(preview.intent.taskId ? [{ profile: preview.intent.profile, side: "todoist" as const, id: preview.intent.taskId }] : []),
+    ...(preview.intent.eventId ? [{ profile: preview.intent.profile, side: "calendar" as const, id: preview.intent.eventId }] : []),
+    ...(preview.intent.action === "move" && preview.intent.targetProfile && preview.intent.taskId
+      ? [{profile:preview.intent.targetProfile,side:"todoist" as const,id:preview.intent.taskId}] : []),
+  ];
+  for (const ref of [...refs.values(), ...intent]) await admitReviewIdentity(ref.profile,
+    ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
+}
 export class ReviewStore {
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
     return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
+    const context = decision.context || {};
+    await admitNestedReviewIdentities(decision,decision.profile);
+    const taskId = decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined);
+    const eventId = decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined);
     const id = decision.decisionId, existing = await this.getCase(id);
     const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
     if (existing) {
@@ -29,7 +110,6 @@ export class ReviewStore {
       }
       return;
     }
-    const context = decision.context || {};
     const item: ReviewCase = {
       id, profile: decision.profile, title: decision.type.replaceAll("_", " "), reason: decision.sourceAuditAction || decision.type,
       status: decision.status === "resolved"
@@ -60,9 +140,10 @@ export class ReviewStore {
     }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
+    const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
+    await admitNestedReviewIdentities(detail,profile);
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
     const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
-    const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
     const action = typeof audit.action === "string" ? audit.action : "active conflict";
     const createdAt = typeof audit.createdAt === "string" ? audit.createdAt : new Date().toISOString();
     const item: ReviewCase = {
@@ -120,10 +201,14 @@ export class ReviewStore {
         const detail = audit?.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : undefined;
         const action = typeof audit?.action === "string" ? audit.action : undefined;
         const identity = action && detail ? retainedConflictIdentity(action, detail) : undefined;
-        if (identity && reviewHash(identity) === conflictKey) incidents.push(candidate);
+        if (identity && reviewHash(identity) === conflictKey) {
+          await admitNestedReviewIdentities(detail!,profile);
+          incidents.push(candidate);
+        }
       }
     }
     for (const candidate of incidents) {
+      await admitNestedReviewIdentities(candidate,profile);
       try {
         const condition = candidate.sourceAuditKey
           ? "#s = :open AND (conflictKey = :conflictKey OR attribute_not_exists(conflictKey)) AND sourceAuditKey = :sourceAuditKey"
@@ -162,6 +247,8 @@ export class ReviewStore {
       ...evidence.taskIds.map(id => ({ side: "todoist", id })),
       ...evidence.eventIds.map(id => ({ side: "calendar", id })),
     ];
+    for (const ref of refs) await admitReviewIdentity(item.profile,
+      ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
     for (const ref of refs) {
       await this.db.send(new PutCommand({ TableName: reviewTable(),
         Item: { pk: `DELETION_REVIEW#${item.profile}#${ref.side}#${ref.id}`,
@@ -183,6 +270,9 @@ export class ReviewStore {
   ): Promise<Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }>> {
     const marked: Array<{ profile: Profile; side: "todoist" | "calendar"; id: string; pendingRefreshAt: string }> = [];
     for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) {
+      await admitReviewIdentity(ref.profile,
+        ref.side === "todoist" ? ref.id : undefined,
+        ref.side === "calendar" ? ref.id : undefined);
       const pendingRefreshAt = randomUUID();
       await this.db.send(new UpdateCommand({ TableName: reviewTable(),
         Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
@@ -251,6 +341,7 @@ export class ReviewStore {
     const current = await this.getCase(id);
     if (!current) throw Object.assign(new Error("Conflict no longer exists"), {status:404});
     if (current.status === "dismissed") return current;
+    await admitNestedReviewIdentities(current,current.profile);
     if (current.status !== "open") throw conflict();
     const operation = current.operationId ? await this.getOperation(current.operationId) : undefined;
     if (current.operationId && (!operation || operation.status !== "failed" || operationHasWriteEvidence(operation))) throw conflict();
@@ -311,6 +402,7 @@ export class ReviewStore {
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
       || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
+    await admitNestedReviewIdentities(current,current.profile);
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
@@ -593,6 +685,9 @@ export class ReviewStore {
   }
 
   async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string): Promise<void> {
+    const current = await this.getCase(caseId);
+    if (!current) return;
+    await admitNestedReviewIdentities(current,current.profile);
     try {
       await this.db.send(new UpdateCommand({ TableName: reviewTable(),
         Key: key(`REVIEW_CASE#${caseId}`),
@@ -611,6 +706,7 @@ export class ReviewStore {
 
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
+    await admitNestedReviewIdentities(current,current.profile);
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
     const condition = status === "repairing"
       ? "#s = :open OR (#s = :dismissed AND (attribute_not_exists(operationId) OR operationId = :empty)) OR (#s = :repairing AND operationId = :op)"
@@ -628,11 +724,13 @@ export class ReviewStore {
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: values }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
+    await assertRepairPreviewReplayAdmission(preview);
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
   }
   getPreview(id: string): Promise<RepairPreview | undefined> { return this.get(`REPAIR_PREVIEW#${id}`); }
   getOperation(id: string): Promise<RepairOperation | undefined> { return this.get(`REPAIR#${id}`); }
   async submit(preview: RepairPreview, actor: ReviewActor, idempotencyKey: string): Promise<RepairOperation> {
+    await assertRepairPreviewReplayAdmission(preview);
     if (preview.actor.subject !== actor.subject || preview.expiresAt * 1000 <= Date.now()) throw new Error("Preview expired or belongs to another operator");
     const id = reviewHash([actor.subject, preview.id, idempotencyKey]).slice(0, 32);
     const old = await this.getOperation(id); if (old) return old;
@@ -690,6 +788,7 @@ export class ReviewStore {
     return operation;
   }
   async saveOperation(operation: RepairOperation): Promise<void> {
+    await assertRepairPreviewReplayAdmission(operation.preview);
     operation.updatedAt = new Date().toISOString();
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
@@ -708,6 +807,10 @@ export class ReviewStore {
       ExpressionAttributeValues:{":false":false,":now":new Date().toISOString(),":lookup":"REPAIR#HISTORY#"+operationId,":succeeded":"succeeded",":needsReview":"needs_review",":failed":"failed",...(replyTs?{":reply":replyTs}:{})} }));
   }
   async finalizeOperation(operation: RepairOperation, releases: RepairRelease[]): Promise<RepairOperation> {
+    await assertRepairPreviewReplayAdmission(operation.preview);
+    for (const release of releases) await admitReviewIdentity(release.ref.profile,
+      release.ref.side === "todoist" ? release.ref.id : undefined,
+      release.ref.side === "calendar" ? release.ref.id : undefined);
     const current = await this.getCase(operation.preview.intent.caseId);
     if (!current) throw new Error("Conflict no longer exists");
     const now = new Date().toISOString();
@@ -765,13 +868,16 @@ export class SyncControls {
     return Boolean(await new ReviewStore().get(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`));
   }
   async reject(profile: Profile, taskId: string, eventId: string, operationId: string): Promise<void> {
+    await admitReviewIdentity(profile, taskId, eventId);
     await client.send(new PutCommand({ TableName: reviewTable(), Item: { ...key(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`), operationId, createdAt: new Date().toISOString() } }));
   }
   async allow(profile: Profile, taskId: string, eventId: string): Promise<void> {
+    await admitReviewIdentity(profile, taskId, eventId);
     const { DeleteCommand } = await import("@aws-sdk/lib-dynamodb");
     await client.send(new DeleteCommand({ TableName: reviewTable(), Key: key(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`) }));
   }
   async blocked(profile: Profile, ids: { taskId?: string; eventId?: string }, operationId?: string): Promise<boolean> {
+    await admitReviewIdentity(profile, ids.taskId, ids.eventId);
     for (const side of ["todoist", "calendar"] as const) {
       const id = side === "todoist" ? ids.taskId : ids.eventId; if (!id) continue;
       const ref = { profile, side, id }, control = await this.control(ref);
@@ -789,6 +895,7 @@ export class SyncControls {
   }
   async claim(refs: EntityRef[], operationId: string): Promise<void> {
     if (!refs.length) return;
+    for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) await admitEntityRef(ref);
     await client.send(new TransactWriteCommand({ TransactItems: [...new Map(refs.map(ref => [entityKey(ref), ref])).values()].map(ref => ({ Update: {
       TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET activeRepair = :id",
       ConditionExpression: "attribute_not_exists(activeRepair) OR activeRepair = :id", ExpressionAttributeValues: { ":id": operationId },
@@ -803,6 +910,7 @@ export class SyncControls {
     const queued = new Map(queuedRefresh.map(ref => [entityKey(ref), ref.pendingRefreshAt]));
     const unique = [...new Map(refs.map(ref => [entityKey(ref), ref])).values()];
     if (!unique.length) return;
+    for (const ref of unique) await admitEntityRef(ref);
     const items = unique.map(ref => {
       const before = previous.get(entityKey(ref));
       if (!before) throw new Error(`No preview control snapshot for ${entityKey(ref)}; cannot release its repair barrier`);
@@ -843,10 +951,12 @@ export class SyncControls {
     await client.send(new TransactWriteCommand({ TransactItems: [...items, operationMarker] }));
   }
   async exclude(ref: EntityRef, excluded: boolean, operationId: string): Promise<void> {
+    await admitEntityRef(ref);
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":excluded": excluded, ":id": operationId } }));
   }
   async release(ref: EntityRef, operationId: string, providerUpdatedAt?: string): Promise<void> {
+    await admitEntityRef(ref);
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
       UpdateExpression: "SET fencedAt = :now, providerUpdatedAt = :version REMOVE activeRepair",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":id": operationId, ":now": new Date().toISOString(), ":version": providerUpdatedAt || "" } }));
@@ -861,6 +971,7 @@ export class SyncControls {
   }
   async clearPendingRefresh(refs: Array<EntityRef & {pendingRefreshAt:string}>): Promise<void> {
     for (const ref of refs) {
+      await admitEntityRef(ref);
       try {
         await client.send(new UpdateCommand({TableName:reviewTable(),Key:key(`SYNC_CONTROL#${entityKey(ref)}`),
           UpdateExpression:"REMOVE pendingRefresh, pendingRefreshAt",

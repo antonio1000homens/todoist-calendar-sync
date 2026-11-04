@@ -54,6 +54,11 @@ This draft now includes an additional integration tranche:
   ingress, the SQS admission boundary and the worker enforce this paired
   configuration so a marker read is never treated as a substitute for a
   durable profile lease.
+- The project-comment migration apply path now holds the profile writer lease
+  and checks the mapping's task, event, master and active-instance markers
+  before changing Todoist comments or DynamoDB mappings, including when called
+  with injected clients. A marker hit prevents provider mutation; the report
+  mode remains read-only.
 
 **Rollout gate:** `ERASURE_REPLAY_BARRIER_VERSION` is **unset/off** in this
 draft. `0` or absent preserves current production behaviour; `1` requires
@@ -113,18 +118,22 @@ the following entrypoints **before** post-write recovery is allowed:
 | `src/reconciliation.ts`, `src/canonical-identity.ts`, `src/completed-history-cleanup.ts` | `upsertTask`, `upsertEvent`, comment/mapping/baseline/canonical identity save or cleanup, terminal history retirement | check both snapshot and action-time identities; DDB baseline/canonical/history rows check task/event replay markers at their write boundary; terminal history retirement holds a profile writer lease through its transaction |
 | `src/calendar-reconciliation.ts` | standalone and recurring Todoist creation/rebind, mapping creation | check event, series and linked task aliases |
 | `src/project-sync.ts` | source/destination projections, cross-profile moves, recurrence migration | check source AND destination before any provider or DynamoDB write |
-| `src/orphan-recovery.ts` | orphan reattachment and state re-mapping | check both sides before repair and putMapping |
-| `src/repair-provider-guard.ts`, `src/review-engine.ts`, `src/manual-intervention.ts` | approved repair creation and replay/DLQ resumes | check against newly fresh provider state; never trust an old preview |
+| `src/orphan-recovery.ts` | orphan reattachment and state re-mapping | mapped owner profile now gets a writer lease when it differs from delivery profile; injected provider factories are wrapped in replay guards; full source/destination alias provenance and deployed-credential coverage remain open |
+| `src/repair-provider-guard.ts`, `src/review-engine.ts`, `src/review-store.ts`, `src/manual-intervention.ts` | approved repair creation and replay/DLQ resumes | preview submission, checkpoint persistence, finalization and queued/resumed execution now check all reviewed snapshot, mapping and planned identities; fresh provider state is still re-collected before repair writes; manual ingress and all qualified worker versions remain in the independent audit |
 | `src/repository.ts` | `putMapping`, `putNewRecurrenceMappingIfUnowned`, `putRecurrenceLink`, mapping comment indexes | guard all mapping and recurrence write routes |
+| `src/project-comment-migration.ts` | project mapping comment backfill/normalization and legacy task-comment cleanup | apply mode now holds a profile writer lease and checks every known mapping alias before mutation |
 | `src/providers.ts`, `src/mutation-budget.ts`, `src/completed-project-comment-cleanup.ts` | `createTaskOnce`, `createRepairEventOnce`, `createFutureMasterOnce`, `upsertTask`, `upsertEvent`, metadata edits, operator-only project-comment cleanup | enforce in production client factories AND test alternate/mock factories; bare comment deletion must fail closed when owner identity is unavailable |
 | `src/erasure-deletion.ts`, `src/erasure-recovery.ts`, `src/erasure-worker.ts` | deletion steps, independent readback, mapping restore and final fence release | independent strongly consistent postflight and atomic release |
 | `src/erasure-preview.ts`, `src/erasure-recovery-adapters.ts` | full DynamoDB inventory plus direct provider/comments reads | verify every scan page; fail closed on unknown aliases and recurrence |
 
 This is a **remaining safety checklist**, not a claim of comprehensive coverage.
-Several normal provider/mapping entrypoints now check the staged barrier, but
-not every route in this table has complete identity propagation. The shared
-primitive must not be activated or relied on for post-write recovery until
-*all* routes, versions, project moves, and aliases are verified.
+The review-store checks are staged hooks and remain OFF unless the replay
+barrier is explicitly enabled; they do not replace provider-boundary checks or
+the writer lease. Several normal provider/mapping entrypoints now check the
+staged barrier, but not every route in this table has complete identity
+propagation. The shared primitive must not be activated or relied on for
+post-write recovery until *all* routes, versions, project moves, and aliases
+are verified.
 
 ## Remaining recovery implementation
 

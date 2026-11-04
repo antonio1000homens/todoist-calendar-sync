@@ -49,7 +49,13 @@ function fakeClient({loop=false,failOnPolicy=false}={}) {
         case "GetPolicyCommand":
           if(failOnPolicy)throw Object.assign(new Error("denied"),{name:"AccessDeniedException"});
           if(input.Qualifier==="3")return {Policy:JSON.stringify({
-            Statement:[{Effect:"Allow",Principal:"*",Action:"lambda:InvokeFunction"}],
+            Statement:[
+              {Effect:"Allow",Principal:"*",Action:"lambda:InvokeFunction"},
+              {Effect:"Allow",Principal:{AWS:"arn:aws:iam::111122223333:role/same-account"},Action:"lambda:InvokeFunction"},
+              {Effect:"Allow",Principal:{AWS:"arn:aws:iam::444455556666:root"},Action:["lambda:InvokeFunction","lambda:InvokeAsync"]},
+              {Effect:"Allow",Principal:{Service:"events.amazonaws.com"},Action:"lambda:InvokeFunction"},
+              {Effect:"Allow",Principal:{Federated:"arn:aws:iam::111122223333:saml-provider/example"},Action:"lambda:InvokeFunction"},
+            ],
           })};
           throw Object.assign(new Error("not found"),{name:"ResourceNotFoundException"});
         case "GetFunctionUrlConfigCommand":
@@ -62,7 +68,7 @@ function fakeClient({loop=false,failOnPolicy=false}={}) {
 
 test("collects ALL Lambda pages, published versions, aliases, qualified SQS triggers and policies; stays blocked",async()=>{
   const client=fakeClient();
-  const report=await collectLambdaInventory(client,{prefix,stage,expected:[ingress,worker]});
+  const report=await collectLambdaInventory(client,{prefix,stage,expected:[ingress,worker],accountId:"111122223333"});
   assert.equal(report.status,"BLOCKED_PENDING_INDEPENDENT_WRITER_AND_IAM_AUDIT");
   assert.equal(report.replayBarrierMayBeEnabled,false);
   assert.equal(report.executableRecoveryMayBeEnabled,false);
@@ -74,7 +80,14 @@ test("collects ALL Lambda pages, published versions, aliases, qualified SQS trig
   assert.deepEqual(w.eventSourceMappings,[{
     qualifier:"live",state:"Enabled",sourceService:"sqs",
   }]);
-  assert.deepEqual(w.policies["3"],{statementCount:1,wildcardPrincipalPresent:true});
+  assert.deepEqual(w.policies["3"],{statementCount:5,wildcardPrincipalPresent:true});
+  assert.deepEqual(w.resourcePolicyPrincipals["3"],{
+    wildcardPrincipalStatementCount:1,sameAccountAwsPrincipalCount:1,
+    externalAwsPrincipalCount:1,unknownAwsPrincipalCount:0,servicePrincipalCount:1,
+    federatedPrincipalCount:1,unknownPrincipalStatementCount:0,
+    externalInvokeFunctionAllowCount:1,externalInvokeFunctionUrlAllowCount:0,
+    externalInvokeAsyncAllowCount:1,
+  });
   assert.ok(client.seen.filter(x=>x.kind==="ListFunctionsCommand").length===2);
   assert.equal(client.seen.filter(x=>/Update|Delete|Invoke|Publish|Put/.test(x.kind)).length,0);
 });

@@ -10,12 +10,15 @@ import {createHash} from "node:crypto";
 import {mkdtemp,readFile,rm,writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
-import {spawnSync} from "node:child_process";
+import {execFileSync,spawnSync} from "node:child_process";
 import {pathToFileURL} from "node:url";
+import {fromIni} from "@aws-sdk/credential-provider-ini";
 import {GetFunctionCommand,LambdaClient,ListVersionsByFunctionCommand} from "@aws-sdk/client-lambda";
 
 const REGION=/^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/;
 const FUNCTION=/^[A-Za-z0-9_-]{2,64}$/;
+const PROFILE=/^[A-Za-z0-9+=,.@_-]{1,128}$/;
+const ACCOUNT=/^\d{12}$/;
 const MAX_PACKAGE_BYTES=50_000_000;
 const MAX_JS_BYTES=30_000_000;
 const MARKERS={
@@ -122,14 +125,28 @@ export async function collectCodeAudit(client,{functionNames,region}) {
 }
 
 export async function main(argv=process.argv.slice(2)) {
-  const allowed=/^--(?:region|function)=[A-Za-z0-9_-]+$/;
-  if(argv.some(arg=>!allowed.test(arg))||!argv.some(arg=>arg.startsWith("--region=")))
-    throw new Error("Usage: node scripts/audit-erasure-lambda-code.mjs --region=eu-west-2 --function=ingress-production --function=review-api-production");
-  const region=option(argv,"region"),functionNames=argv.filter(arg=>arg.startsWith("--function=")).map(arg=>arg.slice(11));
-  const client=new LambdaClient({region,maxAttempts:5});
+  const allowed=/^--(?:region|function|profile)=[A-Za-z0-9+=,.@_-]+$/;
+  if(argv.some(arg=>!allowed.test(arg)&&!/^--expected-account=\d{12}$/.test(arg))
+    ||!argv.some(arg=>arg.startsWith("--region="))
+    ||!argv.some(arg=>arg.startsWith("--profile="))
+    ||!argv.some(arg=>arg.startsWith("--expected-account="))
+    ||!argv.some(arg=>arg.startsWith("--function=")))
+    throw new Error("Usage: node scripts/audit-erasure-lambda-code.mjs --profile=<name> --expected-account=<12 digits> --region=eu-west-2 --function=<name> [--function=<name> ...]");
+  const region=option(argv,"region"),profile=option(argv,"profile"),expectedAccount=option(argv,"expected-account");
+  const functionNames=argv.filter(arg=>arg.startsWith("--function=")).map(arg=>arg.slice(11));
+  if(!REGION.test(region)||!PROFILE.test(profile)||!ACCOUNT.test(expectedAccount))
+    throw new Error("Invalid region, profile or expected account");
+  const identity=JSON.parse(execFileSync("aws",["sts","get-caller-identity","--profile",profile,"--no-cli-pager","--output","json"],{
+    encoding:"utf8",maxBuffer:1024*1024,
+    env:{...process.env,AWS_RETRY_MODE:"standard",AWS_MAX_ATTEMPTS:"8"},
+  }));
+  if(identity.Account!==expectedAccount)throw new Error("AWS profile account did not match --expected-account");
+  // Use the verified named profile directly; exported environment credentials
+  // must not override the SDK identity after the STS check.
+  const client=new LambdaClient({region,credentials:fromIni({profile}),maxAttempts:5});
   try {
     const report=await collectCodeAudit(client,{functionNames,region});
-    process.stdout.write(JSON.stringify(report,null,2)+"\n");
+    process.stdout.write(JSON.stringify({verifiedAccount:identity.Account,...report},null,2)+"\n");
     process.exitCode=2;
   } finally {client.destroy();}
 }

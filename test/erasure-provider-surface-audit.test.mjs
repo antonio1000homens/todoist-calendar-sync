@@ -83,6 +83,11 @@ test("production provider construction has only guarded identity routes or class
   assert.match(providerFactory,/calendarForProfile[\s\S]{0,240}guardReplayCalendarClient\(profile,\s*new GoogleCalendar/,
     "the exported single-provider factory must not return an unguarded Calendar client");
   const watch=await readFile(path.join(sourceRoot,"watch.ts"),"utf8");
+  const orphan=await readFile(path.join(sourceRoot,"orphan-recovery.ts"),"utf8");
+  assert.match(orphan,/private async clients\(profile: Profile\)[\s\S]{0,180}guardReplayProviderClients\(profile, await this\.clientFactory\(profile\)\)/,
+    "orphan recovery must guard injected as well as production provider factories");
+  assert.match(orphan,/const releaseTargetWriter = await acquireMoveWriterLeases\(\[targetProfile\], delivery\.profile\)/,
+    "cross-profile orphan recovery must acquire its mapped owner writer lease before writes");
   for(const side of ["calendar","todoist"])for(const method of REPLAY_GUARDED_PROVIDER_WRITES[side])
     assert.doesNotMatch(watch,new RegExp(`\\.${method}\\s*\\(`),"watch control code must not bypass item-write guard: "+method);
   assert.match(watch,/\.watch\(/);

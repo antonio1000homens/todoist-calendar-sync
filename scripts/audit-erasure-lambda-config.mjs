@@ -5,10 +5,14 @@
  * values, and a complete inventory is still not approval to release replay.
  */
 import {pathToFileURL} from "node:url";
+import {execFileSync} from "node:child_process";
+import {fromIni} from "@aws-sdk/credential-provider-ini";
 import {GetFunctionConfigurationCommand,LambdaClient,ListAliasesCommand,ListVersionsByFunctionCommand} from "@aws-sdk/client-lambda";
 
 const REGION=/^[a-z]{2}(?:-gov)?-[a-z]+-\d+$/;
 const FUNCTION=/^[A-Za-z0-9_-]{2,64}$/;
+const PROFILE=/^[A-Za-z0-9+=,.@_-]{1,128}$/;
+const ACCOUNT=/^\d{12}$/;
 const MAX_PAGES=1000;
 const MAX_CONCURRENCY=2;
 const MAX_RATE_RETRIES=3;
@@ -18,6 +22,11 @@ function requiredOption(argv,name) {
   const values=argv.filter(arg=>arg.startsWith(`--${name}=`));
   if(values.length!==1)throw new Error(`Exactly one --${name}=... is required`);
   return values[0].slice(name.length+3);
+}
+export function verifyExpectedAccount(identity,expectedAccount) {
+  if(!ACCOUNT.test(expectedAccount)||!identity||identity.Account!==expectedAccount)
+    throw new Error("AWS profile account did not match --expected-account");
+  return identity.Account;
 }
 async function sendRead(client,command,delay=sleep) {
   for(let attempt=0;;attempt++) {
@@ -61,6 +70,8 @@ function summarizeEnvironment(config) {
     return variables[name]==="true"?"enabled":"present_other";
   };
   return {replayBarrier:state("ERASURE_REPLAY_BARRIER_VERSION"),
+    replayHmacKeyRing:Object.hasOwn(variables,"ERASURE_REPLAY_HMAC_KEYS")?"present":"absent",
+    replayHmacCurrentKey:Object.hasOwn(variables,"ERASURE_REPLAY_HMAC_CURRENT_KEY")?"present":"absent",
     postwriteReview:state("ERASURE_POSTWRITE_REVIEW_VERSION"),
     erasureExecution:state("ERASURE_EXECUTION_ENABLED"),
     erasureProtocol:state("ERASURE_PROTOCOL_VERSION")};
@@ -121,6 +132,8 @@ export async function collectRuntimeConfigAudit(client,{functionNames,region,sle
       aliases:normalizedAliases(aliases),
       configs,replayBarrierEnabledCount:count("replayBarrier"),
       replayBarrierPresentCount:configs.filter(item=>item.replayBarrier!=="absent").length,
+      replayHmacKeyRingPresentCount:configs.filter(item=>item.replayHmacKeyRing==="present").length,
+      replayHmacCurrentKeyPresentCount:configs.filter(item=>item.replayHmacCurrentKey==="present").length,
       postwriteReviewEnabledCount:count("postwriteReview"),
       postwriteReviewPresentCount:configs.filter(item=>item.postwriteReview!=="absent").length,
       erasureExecutionEnabledCount:count("erasureExecution"),
@@ -135,15 +148,26 @@ export async function collectRuntimeConfigAudit(client,{functionNames,region,sle
 }
 
 export async function main(argv=process.argv.slice(2)) {
-  const allowed=/^--(?:region|function)=[A-Za-z0-9_-]+$/;
-  if(argv.some(arg=>!allowed.test(arg))||!argv.some(arg=>arg.startsWith("--region=")))
-    throw new Error("Usage: node scripts/audit-erasure-lambda-config.mjs --region=eu-west-2 --function=ingress-production --function=review-api-production");
-  const region=requiredOption(argv,"region");
+  const allowed=/^--(?:region|function|profile)=[A-Za-z0-9+=,.@_-]+$/;
+  if(argv.some(arg=>!allowed.test(arg)&&!/^--expected-account=\d{12}$/.test(arg))
+    ||!argv.some(arg=>arg.startsWith("--region="))
+    ||!argv.some(arg=>arg.startsWith("--profile="))
+    ||!argv.some(arg=>arg.startsWith("--expected-account=")))
+    throw new Error("Usage: node scripts/audit-erasure-lambda-config.mjs --profile=<name> --expected-account=<12 digits> --region=eu-west-2 --function=<name> [--function=<name> ...]");
+  const region=requiredOption(argv,"region"),profile=requiredOption(argv,"profile");
+  const expectedAccount=requiredOption(argv,"expected-account");
   const functionNames=argv.filter(arg=>arg.startsWith("--function=")).map(arg=>arg.slice(11));
-  const client=new LambdaClient({region,maxAttempts:5});
+  if(!REGION.test(region)||!PROFILE.test(profile)||!ACCOUNT.test(expectedAccount))
+    throw new Error("Invalid region, profile or expected account");
+  const identity=JSON.parse(execFileSync("aws",["sts","get-caller-identity","--profile",profile,
+    "--no-cli-pager","--output","json"],{encoding:"utf8",maxBuffer:1024*1024,
+    env:{...process.env,AWS_RETRY_MODE:"standard",AWS_MAX_ATTEMPTS:"8"}}));
+  const verifiedAccount=verifyExpectedAccount(identity,expectedAccount);
+  // Bind SDK reads to the verified profile; ambient environment credentials must not override STS.
+  const client=new LambdaClient({region,credentials:fromIni({profile}),maxAttempts:5});
   try {
     const report=await collectRuntimeConfigAudit(client,{functionNames,region});
-    process.stdout.write(JSON.stringify(report,null,2)+"\n");
+    process.stdout.write(JSON.stringify({verifiedAccount,...report},null,2)+"\n");
     process.exitCode=2;
   } finally {client.destroy();}
 }

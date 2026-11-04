@@ -8,6 +8,7 @@ import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
+import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
@@ -32,12 +33,14 @@ export interface ErasurePreviewResult {
   classificationCounts: Record<string, number>;
   blockers: string[];
   crossProfileEvidence?:CrossProfileErasureEvidence;
+  deliveryReceiptAudit?:ErasureDeliveryReceiptAudit;
   confirmation?: { confirmationId: string; expiresAt: number };
 }
 
 type Dependencies = {
   db?: Pick<DynamoDBDocumentClient, "send">;
   clients?: Awaited<ReturnType<typeof defaultProviderClientFactory>>;
+  providerFactory?: typeof defaultProviderClientFactory;
   inspectFence?: typeof inspectErasureFence;
   newOperationId?: () => string;
   ignoreOperationId?: string;
@@ -46,6 +49,7 @@ type Dependencies = {
   allowLeaseOwner?: string;
   scanDeadlineMs?: number;
   auditCrossProfileIdentity?:boolean;
+  auditDeliveryReceipts?:boolean;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -142,7 +146,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const target = validateTarget(input);
   const db = dependencies.db || documentClient;
   const [allRows, providerClients] = await Promise.all([
-    scanAll(db,dependencies), dependencies.clients ? Promise.resolve(dependencies.clients) : defaultProviderClientFactory(target.profile),
+    scanAll(db,dependencies), dependencies.clients ? Promise.resolve(dependencies.clients)
+      : (dependencies.providerFactory || defaultProviderClientFactory)(target.profile),
   ]);
   const rows = allRows.filter(row => row.pk !== `ERASURE#${target.profile}`
     && !(dependencies.ignoreOperationId && (row.pk===`ERASURE_OPERATION#${dependencies.ignoreOperationId}`
@@ -209,7 +214,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     digest: record.digest, classification: record.classification }));
   const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
     taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
-    readerForProfile:async profile=>profile===target.profile?providerClients:defaultProviderClientFactory(profile),
+    readerForProfile:async profile=>profile===target.profile?providerClients
+      :(dependencies.providerFactory || defaultProviderClientFactory)(profile),
   }):undefined;
   const providerSnapshotFingerprint = fingerprint(crossProfileEvidence
     ?{primary:providerData,crossProfileEvidence}:providerData);
@@ -221,6 +227,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     ].sort((a,b)=>a.id.localeCompare(b.id)) };
   const operationPreview = { operationId, profile: target.profile, target: { ...target, deleteCalendar: input.deleteCalendar },
     selectedActions, inventory, providerSnapshotFingerprint, actionPlan };
+  const deliveryReceiptAudit=dependencies.auditDeliveryReceipts
+    ?summarizeErasureDeliveryReceipts(allRows,target.profile):undefined;
   return {
     operationId, profile: target.profile, target: operationPreview.target, selectedActions,
     previewFingerprint: erasurePreviewFingerprint(operationPreview), providerSnapshotFingerprint, inventoryDigest: plan.inventoryDigest,
@@ -230,5 +238,6 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
     ...(crossProfileEvidence?{crossProfileEvidence}:{}),
+    ...(deliveryReceiptAudit?{deliveryReceiptAudit}:{}),
   };
 }
