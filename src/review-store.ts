@@ -6,6 +6,7 @@ import type { Profile, RecurrenceLink } from "./types.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
+import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -15,12 +16,28 @@ export function reviewHash(value: unknown): string {
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 const dismissalResolutions = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
+async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: string): Promise<void> {
+  if (taskId || eventId) await assertReplayAdmissionIfEnabled({ profile,
+    ...(taskId ? { taskId } : {}), ...(eventId ? { eventIds: [eventId] } : {}) });
+}
+async function admitPreviewIdentities(preview: RepairPreview): Promise<void> {
+  const refs = new Map<string, EntityRef>();
+  for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
+  for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
+  const intent: EntityRef[] = [
+    ...(preview.intent.taskId ? [{ profile: preview.intent.profile, side: "todoist" as const, id: preview.intent.taskId }] : []),
+    ...(preview.intent.eventId ? [{ profile: preview.intent.profile, side: "calendar" as const, id: preview.intent.eventId }] : []),
+  ];
+  for (const ref of [...refs.values(), ...intent]) await admitReviewIdentity(ref.profile,
+    ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
+}
 export class ReviewStore {
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
     return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
+    await admitReviewIdentity(decision.profile, decision.taskId, decision.eventId);
     const id = decision.decisionId, existing = await this.getCase(id);
     const conflictKey = typeof decision.context?.conflictKey === "string" ? decision.context.conflictKey : undefined;
     if (existing) {
@@ -60,6 +77,10 @@ export class ReviewStore {
     }
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
+    const incidentDetail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
+    await admitReviewIdentity(profile,
+      typeof incidentDetail.taskId === "string" ? incidentDetail.taskId : undefined,
+      typeof incidentDetail.eventId === "string" ? incidentDetail.eventId : undefined);
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
     const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
     const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
@@ -162,6 +183,8 @@ export class ReviewStore {
       ...evidence.taskIds.map(id => ({ side: "todoist", id })),
       ...evidence.eventIds.map(id => ({ side: "calendar", id })),
     ];
+    for (const ref of refs) await admitReviewIdentity(item.profile,
+      ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
     for (const ref of refs) {
       await this.db.send(new PutCommand({ TableName: reviewTable(),
         Item: { pk: `DELETION_REVIEW#${item.profile}#${ref.side}#${ref.id}`,
@@ -628,11 +651,13 @@ export class ReviewStore {
       ExpressionAttributeNames: { "#s": "status", "#r": "result" }, ExpressionAttributeValues: values }));
   }
   async putPreview(preview: RepairPreview): Promise<void> {
+    await admitPreviewIdentities(preview);
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...preview, ...key(`REPAIR_PREVIEW#${preview.id}`) }, ConditionExpression: "attribute_not_exists(pk)" }));
   }
   getPreview(id: string): Promise<RepairPreview | undefined> { return this.get(`REPAIR_PREVIEW#${id}`); }
   getOperation(id: string): Promise<RepairOperation | undefined> { return this.get(`REPAIR#${id}`); }
   async submit(preview: RepairPreview, actor: ReviewActor, idempotencyKey: string): Promise<RepairOperation> {
+    await admitPreviewIdentities(preview);
     if (preview.actor.subject !== actor.subject || preview.expiresAt * 1000 <= Date.now()) throw new Error("Preview expired or belongs to another operator");
     const id = reviewHash([actor.subject, preview.id, idempotencyKey]).slice(0, 32);
     const old = await this.getOperation(id); if (old) return old;
@@ -690,6 +715,7 @@ export class ReviewStore {
     return operation;
   }
   async saveOperation(operation: RepairOperation): Promise<void> {
+    await admitPreviewIdentities(operation.preview);
     operation.updatedAt = new Date().toISOString();
     await this.db.send(new PutCommand({ TableName: reviewTable(), Item: { ...operation, ...key(`REPAIR#${operation.id}`),
       lookupPk: `PROFILE#${operation.preview.intent.profile}`, lookupSk: `REPAIR#${operation.notificationPending ? "NOTIFY" : "HISTORY"}#${operation.id}` },
@@ -708,6 +734,10 @@ export class ReviewStore {
       ExpressionAttributeValues:{":false":false,":now":new Date().toISOString(),":lookup":"REPAIR#HISTORY#"+operationId,":succeeded":"succeeded",":needsReview":"needs_review",":failed":"failed",...(replyTs?{":reply":replyTs}:{})} }));
   }
   async finalizeOperation(operation: RepairOperation, releases: RepairRelease[]): Promise<RepairOperation> {
+    await admitPreviewIdentities(operation.preview);
+    for (const release of releases) await admitReviewIdentity(release.ref.profile,
+      release.ref.side === "todoist" ? release.ref.id : undefined,
+      release.ref.side === "calendar" ? release.ref.id : undefined);
     const current = await this.getCase(operation.preview.intent.caseId);
     if (!current) throw new Error("Conflict no longer exists");
     const now = new Date().toISOString();
