@@ -64,6 +64,36 @@ test("weighted alias, direct qualifier mapping and resource policy each protect 
     .reasons.includes("event-source:Disabled"));
 });
 
+function codedeployReport(target={functionName:BASE,functionAlias:"live",currentVersion:"2",targetVersion:"3"}) {
+  return {purpose:"issue-307-read-only-codedeploy-version-references",
+    status:"BLOCKED_NOT_APPROVAL_FOR_VERSION_REMOVAL",awsMutationsPerformed:false,
+    versionRemovalApproved:false,region:"eu-west-2",verifiedAccount:"123456789012",
+    deploymentGroups:["group"],deploymentCount:1,
+    deployments:[{deploymentId:"d-1",deploymentGroup:"group",status:"Succeeded",targets:[target]}]};
+}
+
+test("CodeDeploy current and target endpoints are protected as rollback references",()=>{
+  const source=inventory();source.region="eu-west-2";source.verifiedAccount="123456789012";
+  const plan=planHistoricalVersionRetirement(source,codedeployReport());
+  assert.equal(plan.codeDeployReferencesProvided,true);
+  assert.equal(plan.totalReviewCandidates,0);
+  assert.deepEqual(plan.functions[0].retained.map(v=>v.version),["2","3","4"]);
+  assert.ok(plan.functions[0].retained.find(v=>v.version==="2").reasons.includes("codedeploy:current"));
+  assert.ok(plan.functions[0].retained.find(v=>v.version==="3").reasons.includes("codedeploy:target"));
+});
+
+test("CodeDeploy report account, region, counts, groups, functions and versions fail closed",()=>{
+  const source=inventory();source.region="eu-west-2";source.verifiedAccount="123456789012";
+  const wrongAccount=codedeployReport();wrongAccount.verifiedAccount="999999999999";
+  const wrongRegion=codedeployReport();wrongRegion.region="us-east-1";
+  const badCount=codedeployReport();badCount.deploymentCount=2;
+  const badGroup=codedeployReport();badGroup.deployments[0].deploymentGroup="elsewhere";
+  const unknownFunction=codedeployReport({functionName:"unknown",functionAlias:"live",currentVersion:"2",targetVersion:"3"});
+  const unknownVersion=codedeployReport({functionName:BASE,functionAlias:"live",currentVersion:"2",targetVersion:"999"});
+  for(const report of [wrongAccount,wrongRegion,badCount,badGroup,unknownFunction,unknownVersion])
+    assert.throws(()=>planHistoricalVersionRetirement(source,report));
+});
+
 test("stale, truncated or inconsistent inventories abort rather than approving erasure",()=>{
   for(const mutate of [
     x=>{x.missingExpected=["missing"];},

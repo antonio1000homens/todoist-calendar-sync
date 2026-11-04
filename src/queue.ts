@@ -20,7 +20,8 @@ export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kin
 
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
   const protocolEnabled = process.env.ERASURE_PROTOCOL_VERSION === "1";
-  const checkTodoistReplay = delivery.kind === "todoist" && replayAdmissionEnabled();
+  const replayEnabled = replayAdmissionEnabled();
+  const checkTodoistReplay = delivery.kind === "todoist" && replayEnabled;
   // A replay lookup outside an admission lease cannot serialize with a fence
   // and must never be used to authorize an SQS write.
   if (checkTodoistReplay && !protocolEnabled) {

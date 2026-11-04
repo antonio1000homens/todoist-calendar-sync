@@ -9,15 +9,18 @@ import {
 
 const before={
   version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+  protocol:process.env.ERASURE_PROTOCOL_VERSION,
   keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
   current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
 };
 process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+process.env.ERASURE_PROTOCOL_VERSION="1";
 process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,3).toString("base64")});
 process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
 test.after(()=>{
   for(const [key,value] of [
     ["ERASURE_REPLAY_BARRIER_VERSION",before.version],
+    ["ERASURE_PROTOCOL_VERSION",before.protocol],
     ["ERASURE_REPLAY_HMAC_KEYS",before.keys],
     ["ERASURE_REPLAY_HMAC_CURRENT_KEY",before.current],
   ]) if(value===undefined)delete process.env[key];else process.env[key]=value;
@@ -94,4 +97,14 @@ test("rollout is explicitly gated and a bad version fails closed",async t=>{
   process.env.ERASURE_REPLAY_BARRIER_VERSION="unrecognised";
   assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
   await assert.rejects(assertReplayAdmissionIfEnabled({profile:"work",taskId:"task-203"}),ErasureReplayUnavailableError);
+});
+
+test("replay marker admission requires the profile lease protocol",()=>{
+  const old=process.env.ERASURE_PROTOCOL_VERSION;
+  try {
+    process.env.ERASURE_PROTOCOL_VERSION="0";
+    assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
+  } finally {
+    if(old===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=old;
+  }
 });

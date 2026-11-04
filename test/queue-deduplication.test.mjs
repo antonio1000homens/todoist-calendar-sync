@@ -3,6 +3,7 @@ import test from "node:test";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { enqueueDelivery, messageDeduplicationId } from "../dist/queue.js";
+import { ErasureReplayUnavailableError } from "../dist/erasure-replay-barrier.js";
 
 const reportedId = "136357225910187fbd02c4c321c241fa57494e8c036e01a168373ec3c8506a43:orphan:6tgjepj170rjeb9icgs68b9k6orjgbb1cksmcb9o68pm8c3161h3ep32cc:6hpX9fgPf652P79j";
 const identity = { profile: "home", kind: "orphan", id: reportedId };
@@ -124,5 +125,25 @@ test("admission does not restamp an in-flight payload after a complete fence win
     else process.env.QUEUE_URL = originalQueueUrl;
     if (originalProtocolVersion === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
     else process.env.ERASURE_PROTOCOL_VERSION = originalProtocolVersion;
+  }
+});
+
+test("replay-enabled queue refuses every delivery kind without profile leases",async()=>{
+  const prior={barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,protocol:process.env.ERASURE_PROTOCOL_VERSION};
+  let sends=0;
+  const originalSend=SQSClient.prototype.send;
+  SQSClient.prototype.send=async()=>{sends++;return {};};
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  process.env.ERASURE_PROTOCOL_VERSION="0";
+  try {
+    await assert.rejects(enqueueDelivery({...identity,kind:"calendar",mode:"aws",receivedAt:"2026-11-04T00:00:00Z",
+      headers:{},body:""}),ErasureReplayUnavailableError);
+    assert.equal(sends,0);
+  } finally {
+    SQSClient.prototype.send=originalSend;
+    if(prior.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=prior.barrier;
+    if(prior.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION=prior.protocol;
   }
 });

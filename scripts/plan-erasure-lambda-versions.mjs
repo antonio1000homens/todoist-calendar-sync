@@ -14,7 +14,7 @@ const POSITIVE=/^[1-9]\d*$/;
 const SHA=/^[A-Za-z0-9+/]{20,}={0,2}$/;
 const STATUS="BLOCKED_PENDING_INDEPENDENT_WRITER_AND_IAM_AUDIT";
 
-export function planHistoricalVersionRetirement(inventory) {
+export function planHistoricalVersionRetirement(inventory,codedeploy=null) {
   if(!inventory || typeof inventory!=="object" ||
     inventory.purpose!=="issue-307-read-only-qualified-lambda-inventory" ||
     inventory.status!==STATUS ||
@@ -32,6 +32,42 @@ export function planHistoricalVersionRetirement(inventory) {
   if(inventory.expectedFunctions.some(n=>!names.includes(n)) ||
     new Set(inventory.expectedFunctions).size!==inventory.expectedFunctions.length)
     throw new Error("Missing or duplicated expected Lambda names");
+
+  const deploymentReferences=new Map();
+  if(codedeploy!==null) {
+    if(codedeploy?.purpose!=="issue-307-read-only-codedeploy-version-references"||
+      codedeploy.status!=="BLOCKED_NOT_APPROVAL_FOR_VERSION_REMOVAL"||
+      codedeploy.awsMutationsPerformed!==false||codedeploy.versionRemovalApproved!==false||
+      !Array.isArray(codedeploy.deployments)||
+      codedeploy.deploymentCount!==codedeploy.deployments.length||
+      !Array.isArray(codedeploy.deploymentGroups)||!codedeploy.deploymentGroups.length)
+      throw new Error("Incomplete or non-gated CodeDeploy reference inventory");
+    if((inventory.verifiedAccount&&codedeploy.verifiedAccount!==inventory.verifiedAccount)||
+      (inventory.region&&codedeploy.region!==inventory.region))
+      throw new Error("CodeDeploy and Lambda inventories do not share account and region");
+    const deploymentIds=new Set();
+    for(const deployment of codedeploy.deployments) {
+      if(!Array.isArray(deployment?.targets)||!deployment.targets.length||
+        typeof deployment.deploymentId!=="string"||deploymentIds.has(deployment.deploymentId)||
+        !codedeploy.deploymentGroups.includes(deployment.deploymentGroup)||
+        typeof deployment.status!=="string")
+        throw new Error("Incomplete CodeDeploy deployment targets");
+      deploymentIds.add(deployment.deploymentId);
+      for(const target of deployment.targets) {
+        if(typeof target?.functionName!=="string"||typeof target.currentVersion!=="string"||
+          typeof target.targetVersion!=="string"||typeof target.functionAlias!=="string")
+          throw new Error("Incomplete CodeDeploy version reference");
+        const refs=deploymentReferences.get(target.functionName)||[];
+        refs.push({deploymentId:deployment.deploymentId,alias:target.functionAlias,
+          currentVersion:target.currentVersion,targetVersion:target.targetVersion});
+        deploymentReferences.set(target.functionName,refs);
+      }
+    }
+  }
+
+  const knownFunctionNames=new Set(inventory.functions.map(f=>f?.name));
+  if([...deploymentReferences.keys()].some(name=>!knownFunctionNames.has(name)))
+    throw new Error("CodeDeploy references a function absent from the Lambda inventory");
 
   const functions=[];
   for(const f of inventory.functions) {
@@ -68,6 +104,14 @@ export function planHistoricalVersionRetirement(inventory) {
       const reasons=protectedVersions.get(version)||new Set();
       reasons.add(reason);
       protectedVersions.set(version,reasons);
+    }
+    for(const ref of deploymentReferences.get(f.name)||[]) {
+      for(const [label,version] of [["current",ref.currentVersion],["target",ref.targetVersion]]) {
+        if(version==="$LATEST")continue;
+        if(!POSITIVE.test(version))
+          throw new Error("Malformed CodeDeploy version reference: "+f.name);
+        protect(version,`codedeploy:${label}`);
+      }
     }
     for(const a of f.aliases) {
       if(typeof a?.name!=="string"||!a.name||
@@ -131,6 +175,7 @@ export function planHistoricalVersionRetirement(inventory) {
     functions.push({name:f.name,published:allVersions.size-1,
       retained,reviewCandidates,
       mappingCount:f.eventSourceMappings.length,
+      codeDeployReferenceCount:(deploymentReferences.get(f.name)||[]).length,
       unknownDirectInvokers:true});
   }
 
@@ -144,12 +189,13 @@ export function planHistoricalVersionRetirement(inventory) {
     // No positive safety conclusion can be drawn from resource-policy absence.
     mustIndependentlyVerify:[
       "Identity-based IAM permissions including admin, users, roles and SSO permission sets",
-      "CloudFormation/SAM and CodeDeploy references, deployments in progress and rollback requirements",
+      "CloudFormation/SAM references, deployments in progress and rollback requirements",
       "EventBridge, Step Functions, direct/SDK invokes, cross-account permission and legacy naming",
       "CloudTrail Lambda data events and qualified invocation metrics, including logging coverage",
       "Every account/region and every historical bundle digest against replay admission code",
       "Read-only backup and operator/security signoff before any separate version removal",
     ],
+    codeDeployReferencesProvided:codedeploy!==null,
     action:"NO_LAMBDA_DELETIONS_OR_POLICY_CHANGES",
     replayBarrierMayBeEnabled:false,
     executableRecoveryMayBeEnabled:false,
@@ -157,12 +203,14 @@ export function planHistoricalVersionRetirement(inventory) {
 }
 
 export function main(argv=process.argv.slice(2)) {
-  if(argv.length!==1 || !argv[0].startsWith("--inventory=") ||
-    argv[0].length<13)
-    throw new Error("Usage: node scripts/plan-erasure-lambda-versions.mjs --inventory=<read-only-inventory.json>");
-  const file=argv[0].slice("--inventory=".length);
+  const inventoryArgs=argv.filter(arg=>arg.startsWith("--inventory="));
+  const deployArgs=argv.filter(arg=>arg.startsWith("--codedeploy="));
+  if(argv.length!==inventoryArgs.length+deployArgs.length||inventoryArgs.length!==1||deployArgs.length>1)
+    throw new Error("Usage: node scripts/plan-erasure-lambda-versions.mjs --inventory=<read-only-inventory.json> [--codedeploy=<read-only-target-inventory.json>]");
+  const file=inventoryArgs[0].slice("--inventory=".length);
   const source=JSON.parse(readFileSync(file,"utf8"));
-  const report=planHistoricalVersionRetirement(source);
+  const codedeploy=deployArgs.length?JSON.parse(readFileSync(deployArgs[0].slice("--codedeploy=".length),"utf8")):null;
+  const report=planHistoricalVersionRetirement(source,codedeploy);
   process.stdout.write(JSON.stringify(report,null,2)+"\n");
   // Fail closed on purpose: this is never CI acceptance of recovery.
   process.exitCode=2;

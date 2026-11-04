@@ -361,12 +361,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
     let releaseWriterLease: (() => Promise<void>) | undefined;
+    let replayAdmission = false;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
       delivery = JSON.parse(record.body) as Delivery;
       state = new StateRepository();
+      replayAdmission = replayAdmissionEnabled();
       if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
         for (let attempt = 0; attempt < 3 && !releaseWriterLease; attempt++) {
           const currentErasureEpoch = await getErasureEpoch(delivery.profile);
@@ -393,7 +395,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // provider identity, audit, repair, or state write. The profile writer
       // lease above remains held until the finally block releases it.
       // An unknown identity is never treated as proof of admission.
-      if(delivery.kind==="todoist"&&replayAdmissionEnabled()) {
+      if(delivery.kind==="todoist"&&replayAdmission) {
         let taskId:string|undefined;
         try {
           const parsed=JSON.parse(delivery.body) as TodoistWebhookPayload;
@@ -703,7 +705,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // Fence/lease acquisition failures happen before this invocation is an
       // authorized writer. Do not let generic error reporting mutate state
       // outside the profile fence.
-      const mayWriteFailureState = process.env.ERASURE_PROTOCOL_VERSION !== "1" || !!releaseWriterLease;
+      const replayVersion = process.env.ERASURE_REPLAY_BARRIER_VERSION;
+      const replayDisabled = replayVersion === undefined || replayVersion === "" || replayVersion === "0";
+      const mayWriteFailureState = (process.env.ERASURE_PROTOCOL_VERSION !== "1" && replayDisabled)
+        || !!releaseWriterLease;
       if (!mayWriteFailureState) {
         failures.push({ itemIdentifier: record.messageId });
         continue;

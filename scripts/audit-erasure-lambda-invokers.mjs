@@ -9,6 +9,7 @@
  * No update, invoke, publish, queue or provider write operation is imported.
  */
 import {readFileSync} from "node:fs";
+import {execFileSync} from "node:child_process";
 import {pathToFileURL} from "node:url";
 import {
   LambdaClient, ListFunctionsCommand, ListVersionsByFunctionCommand,
@@ -181,17 +182,24 @@ function option(argv,key) {
 }
 
 export async function main(argv=process.argv.slice(2)) {
-  if(argv.some(arg=>!/^--(?:prefix|stage|region)=[A-Za-z0-9-]+$/.test(arg))||
-    argv.length!==3)throw new Error("Usage: node scripts/audit-erasure-lambda-invokers.mjs --prefix=... --stage=... --region=...");
+  if(argv.some(arg=>!/^--(?:prefix|stage|region|profile)=[A-Za-z0-9-]+$/.test(arg)
+    &&!/^--expected-account=\d{12}$/.test(arg))||argv.length!==5)
+    throw new Error("Usage: node scripts/audit-erasure-lambda-invokers.mjs --prefix=... --stage=... --region=... --profile=... --expected-account=<12 digits>");
   const prefix=option(argv,"prefix"),stage=option(argv,"stage"),region=option(argv,"region");
-  if(!NAME.test(prefix)||!NAME.test(stage)||!REGION.test(region))
-    throw new Error("Invalid region/prefix/stage");
+  const profile=option(argv,"profile"),expectedAccount=option(argv,"expected-account");
+  if(!NAME.test(prefix)||!NAME.test(stage)||!NAME.test(profile)||!REGION.test(region))
+    throw new Error("Invalid region, prefix, stage or profile");
+  const identity=JSON.parse(execFileSync("aws",["sts","get-caller-identity","--profile",profile,"--no-cli-pager","--output","json"],{
+    encoding:"utf8",maxBuffer:1024*1024,
+    env:{...process.env,AWS_RETRY_MODE:"standard",AWS_MAX_ATTEMPTS:"8"},
+  }));
+  if(identity.Account!==expectedAccount)throw new Error("AWS profile account did not match --expected-account");
   const template=readFileSync(new URL("../template.yaml",import.meta.url),"utf8");
   const expected=expectedTemplateFunctions(template,prefix,stage);
-  const client=new LambdaClient({region,maxAttempts:5});
+  const client=new LambdaClient({region,profile,maxAttempts:5});
   try {
     const report=await collectLambdaInventory(client,{prefix,stage,expected});
-    process.stdout.write(JSON.stringify({region,...report},null,2)+"\n");
+    process.stdout.write(JSON.stringify({region,verifiedAccount:identity.Account,...report},null,2)+"\n");
     // Inventory is never proof of safe erasure or authorisation to release.
     // Non-zero by design: fail closed for automation/CI consumers.
     process.exitCode=2;

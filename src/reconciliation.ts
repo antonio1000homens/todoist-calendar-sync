@@ -282,6 +282,7 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined,allowAbsentAfterCheckpoint=false):Promise<boolean> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     if(!tableName) throw new Error("STATE_TABLE_NAME is not configured");
     const key= {pk:`BASELINE#${profile}#TASK#${taskId}`,sk:"RECONCILE"};
     const current=await documentClient.send(new GetCommand({TableName:tableName,Key:key,ConsistentRead:true}));
