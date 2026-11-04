@@ -4,10 +4,12 @@ import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
 import {StateRepository} from "../dist/repository.js";
+import {DynamoReconciliationStore} from "../dist/reconciliation.js";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {ErasureReplayBlockedError} from "../dist/erasure-replay-barrier.js";
 
 const repositorySource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/repository.ts"),"utf8");
+const reconciliationSource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/reconciliation.ts"),"utf8");
 const guardedIdentityMutators=[
   "commitFlattenMapping",
   "putMapping",
@@ -52,6 +54,20 @@ test("identity-bearing DynamoDB mutators check replay admission before their fir
   }
 });
 
+test("reconciliation baseline mutators check replay admission before state access or writes",()=>{
+  for(const name of ["putBaseline","deleteBaseline","deleteBaselineIfUnchanged"]){
+    const start=reconciliationSource.indexOf(`async ${name}(`);
+    assert.notEqual(start,-1,`reconciliation method ${name} is missing`);
+    const next=reconciliationSource.indexOf("\n  async ",start+1);
+    const body=reconciliationSource.slice(start,next<0?reconciliationSource.length:next);
+    const guard=body.indexOf("assertReplayAdmissionIfEnabled(");
+    const firstStateAccess=body.search(/new (?:Get|Put|Delete)Command\s*\(/);
+    assert.notEqual(guard,-1,`${name} must check erasure replay markers`);
+    assert.notEqual(firstStateAccess,-1,`${name} must retain its state boundary`);
+    assert.ok(guard<firstStateAccess,`${name} must check replay markers before accessing reconciliation state`);
+  }
+});
+
 async function withReplayBarrier(t,send){
   const prior={
     version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
@@ -86,6 +102,16 @@ test("deleted mapping refuses marker and sends no state mutation",async t=>{
     eventId:"blocked-event",updatedAt:"2026-11-04T00:00:00.000Z"}),ErasureReplayBlockedError);
   assert.ok(calls.length>=1);
   assert.equal(calls.some(command=>command.constructor.name!=="GetCommand"),false);
+});
+
+test("conditional reconciliation baseline deletion refuses a replay marker",async t=>{
+  const calls=await withReplayBarrier(t,command=>{
+    assert.equal(command.constructor.name,"GetCommand");
+    return {Item:{markerVersion:1}};
+  });
+  await assert.rejects(new DynamoReconciliationStore().deleteBaselineIfUnchanged("work","blocked-task",null),
+    ErasureReplayBlockedError);
+  assert.equal(calls.length,1);
 });
 
 test("recurrence deletion reads then checks every known alias before deleting",async t=>{
