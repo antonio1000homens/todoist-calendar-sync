@@ -248,14 +248,18 @@ Lambda invoker inventory to a private local file, then run:
     node scripts/audit-erasure-lambda-identity-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> > <private-identity-candidates.json>
 
 This collects IAM users, roles, groups and attached policy documents, then
-reports statements that could match the inventoried function qualifiers. The
+reports statements that could match the inventoried function qualifiers. For
+candidate roles it also summarizes trust-policy principal types and selected
+condition-key presence without returning trust-policy values. This is
+structural evidence only: it does not prove a caller can assume a role. The
 report deliberately omits policy document bodies and environment values. Keep
 the output private: principal and policy names, grants and function inventory
 are operational details. The scan does not evaluate combined effective
-permissions, trust/session policies, permission boundaries, explicit denies,
-Organizations policies, cross-account principals or resource policies. It
-always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
-an IAM change or enable replay/recovery.
+permissions, trust conditions, session policies, permission boundaries,
+explicit denies, Organizations policies, cross-account resource policies or
+principal access paths as one decision. It always returns
+`BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize an IAM change or
+enable replay/recovery.
 
 To simulate candidate identity grants for `InvokeFunction`, deprecated
 `InvokeAsync`, and configured AWS_IAM Function URLs, with the region and
@@ -540,3 +544,30 @@ Workers currently call those URLs without SigV4. No IAM, Function URL,
 Lambda, alias, queue or application setting was changed. The first #307
 writer/IAM acceptance remains unchecked; no denial or version-retirement
 change is authorized by these read-only results.
+
+### Windsor trust-path structural refresh (4 Nov 2026, 21:42 UTC)
+
+A fresh read-only run verified the Windsor account with STS and inventoried all
+seven expected production functions in `eu-west-2`, with no missing functions.
+The inventory had 174 published versions, two aliases, two event-source
+mappings and two Function URLs, both `AuthType=NONE` with wildcard URL and
+invoke-via-URL policy summaries. The identity candidate audit covered 58 IAM
+users, roles and groups, had no missing attached managed-policy documents, and
+reported five candidate invocation grants across four principals.
+
+The audit now includes a structural summary of role trust policies without
+publishing principal values or policy documents. It observed 52 roles, all with
+trust documents, and counted no wildcard or external AWS principals in their
+allow statements. The three candidate invocation roles also had trust
+documents, with no wildcard or external AWS principal counted. The organization
+remains the management account; its SCP policy type is enabled but SCPs do not
+apply to that account.
+
+A fresh IAM policy simulation evaluated eight direct/legacy cases against 183
+targets. All four candidate principals were allowed all 183 targets, including
+all 176 qualified targets, with zero denied targets and no permission
+boundary decision. This is still not an effective-permission result: the
+simulator does not prove role assumption or STS session context, does not
+include Lambda resource policies, and cannot rule out callers or routes outside
+the inventory. The trust summary is structural evidence only. No AWS mutation
+was performed; replay and executable recovery remain disabled.
