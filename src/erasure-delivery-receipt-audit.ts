@@ -13,7 +13,7 @@ export interface ErasureDeliveryReceiptAudit {
   observedAt:string;
   profile:Profile;
   completedReceiptCount:number;
-  byKind:Record<string,{withIdentityRefs:DeliveryReceiptExpirySummary;withoutIdentityRefs:DeliveryReceiptExpirySummary}>;
+  byKind:Record<string,{withIdentityRefArrays:DeliveryReceiptExpirySummary;withoutIdentityRefArrays:DeliveryReceiptExpirySummary}>;
 }
 
 function emptySummary():DeliveryReceiptExpirySummary {
@@ -32,10 +32,10 @@ export function summarizeErasureDeliveryReceipts(
     if(!row||typeof row.pk!=="string"||!row.pk.startsWith("DELIVERY#")||row.sk!=="COMPLETED"||row.profile!==profile)continue;
     completedReceiptCount++;
     const rawKind=typeof row.kind==="string"&&/^[a-z][a-z0-9_-]{0,31}$/.test(row.kind)?row.kind:"other";
-    const item=byKind[rawKind]||(byKind[rawKind]={withIdentityRefs:emptySummary(),withoutIdentityRefs:emptySummary()});
+    const item=byKind[rawKind]||(byKind[rawKind]={withIdentityRefArrays:emptySummary(),withoutIdentityRefArrays:emptySummary()});
     const hasIdentityRefs=Array.isArray((row.identityRefs as Record<string,unknown>|undefined)?.taskIds)
       ||Array.isArray((row.identityRefs as Record<string,unknown>|undefined)?.eventIds);
-    const summary=hasIdentityRefs?item.withIdentityRefs:item.withoutIdentityRefs;
+    const summary=hasIdentityRefs?item.withIdentityRefArrays:item.withoutIdentityRefArrays;
     summary.count++;
     const expiresAt=row.expiresAt;
     if(typeof expiresAt!=="number"||!Number.isSafeInteger(expiresAt)||expiresAt<=0) {

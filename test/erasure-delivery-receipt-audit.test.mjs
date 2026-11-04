@@ -8,6 +8,8 @@ test("delivery receipt audit aggregates profile, identity-reference and TTL stat
   const rows=[
     {pk:"DELIVERY#selected-secret-id",sk:"COMPLETED",profile:"work",kind:"todoist",
       identityRefs:{taskIds:["private-task-id"],eventIds:[]},expiresAt:nowSeconds-1},
+    {pk:"DELIVERY#empty-arrays",sk:"COMPLETED",profile:"work",kind:"todoist",
+      identityRefs:{taskIds:[],eventIds:[]},expiresAt:nowSeconds+30},
     {pk:"DELIVERY#legacy-secret-id",sk:"COMPLETED",profile:"work",kind:"calendar",expiresAt:nowSeconds+86_400},
     {pk:"DELIVERY#bad-ttl",sk:"COMPLETED",profile:"work",kind:"calendar",expiresAt:"invalid"},
     {pk:"DELIVERY#string-ttl",sk:"COMPLETED",profile:"work",kind:"calendar",expiresAt:String(nowSeconds+10)},
@@ -16,11 +18,11 @@ test("delivery receipt audit aggregates profile, identity-reference and TTL stat
   ];
   const report=summarizeErasureDeliveryReceipts(rows,"work",nowMs);
   assert.equal(report.observedAt,new Date(nowMs).toISOString());
-  assert.equal(report.completedReceiptCount,4);
-  assert.deepEqual(report.byKind.todoist.withIdentityRefs,{
-    count:1,expired:1,expiresWithin1d:0,expiresWithin7d:0,expiresWithin14d:0,missingOrInvalidExpiry:0,
+  assert.equal(report.completedReceiptCount,5);
+  assert.deepEqual(report.byKind.todoist.withIdentityRefArrays,{
+    count:2,expired:1,expiresWithin1d:1,expiresWithin7d:1,expiresWithin14d:1,missingOrInvalidExpiry:0,
   });
-  assert.deepEqual(report.byKind.calendar.withoutIdentityRefs,{
+  assert.deepEqual(report.byKind.calendar.withoutIdentityRefArrays,{
     count:3,expired:0,expiresWithin1d:1,expiresWithin7d:1,expiresWithin14d:1,missingOrInvalidExpiry:2,
   });
   const serialized=JSON.stringify(report);
