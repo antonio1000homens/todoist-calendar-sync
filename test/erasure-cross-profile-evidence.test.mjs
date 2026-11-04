@@ -129,9 +129,9 @@ test("profile read failures and bounded identity overflow fail closed",async()=>
   }}));
   const overflow=await observeCrossProfileErasureEvidence({taskId:"task-one",
     rows:[{pk:"TASKOWNER#task-one",sk:"MAP",taskId:"task-one",
-      candidateTaskIds:Array.from({length:40},(_,index)=>"task-alias-"+index)}],
+      candidateTaskIds:Array.from({length:520},(_,index)=>"task-alias-"+index)}],
     fullRows:[{pk:"TASKOWNER#task-one",sk:"MAP",taskId:"task-one",
-      candidateTaskIds:Array.from({length:40},(_,index)=>"task-alias-"+index)}],
+      candidateTaskIds:Array.from({length:520},(_,index)=>"task-alias-"+index)}],
     readerForProfile:emptyReader});
   assert.equal(overflow.eligibleForPostWriteRelease,false);
   assert.equal(overflow.closureComplete,false);
