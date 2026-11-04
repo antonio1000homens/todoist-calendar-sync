@@ -224,7 +224,7 @@ export async function observeCrossProfileErasureEvidence(input:{
   const unparsedTaskComments=new Set<string>();
   const processedTaskReads=new Set<string>(),processedTags=new Set<string>(),processedTaskComments=new Set<string>();
   const processedEventReads=new Set<string>(),processedInstances=new Set<string>();
-  let provider404s=0,passes=0;
+  let provider404s=0,provider410s=0,passes=0;
   const malformedComments=new Set<string>();
   const taskReadConflicts=new Set<string>(),eventReadConflicts=new Set<string>(),missingEtags=new Set<string>();
   const taskCommentReadConflicts=new Set<string>();
@@ -592,8 +592,9 @@ export async function observeCrossProfileErasureEvidence(input:{
         inventoryCandidates.set(item.calendarId,item);
       for(const item of calendarByHistoryMaster[profile].get(eventId)||[])
         inventoryCandidates.set(item.calendarId,item);
-      const targets=inventoryCandidates.size?[...inventoryCandidates.keys()]:
-        (configuredCalendarByProfile[profile]?[configuredCalendarByProfile[profile]!]:["configured-calendar-unverified"]);
+      // Direct-ID reads must address *every* declared and listed calendar, not
+      // only calendars where a matching inventory record was already found.
+      const targets=[...calendarIdsByProfile[profile]];
       for(const calendarId of targets) {
         const eventKey=profile+"/"+calendarEventKey(calendarId,eventId);
         if(processedEventReads.has(eventKey))continue;
@@ -702,6 +703,7 @@ export async function observeCrossProfileErasureEvidence(input:{
         } catch(error) {
           if(statusOf(error)!==404&&statusOf(error)!==410)throw error;
           stats[profile].event404Responses++;provider404s++;
+          if(statusOf(error)===410)provider410s++;
         }
       }
     }
@@ -785,14 +787,14 @@ export async function observeCrossProfileErasureEvidence(input:{
   const fullTaskCommentInventoryComplete=PROFILES.every(profile=>stats[profile].taskCommentInventoryFresh);
   const fullCalendarInventoryComplete=PROFILES.every(profile=>calendarInventoryCompleteByProfile[profile]);
   const allProfilesQueried=PROFILES.every(profile=>Boolean(profileReaders[profile]));
-  // CalendarList covers only calendars on each user's list. Direct-ID calendar
-  // ACLs have no independent complete inventory in this observer, so this
-  // remains false until that provenance is supplied by an authoritative source.
-  const allAccessibleCalendarCoverageProven=false as const;
+  // Signed, independently reviewed ACL registry + fresh provider inventory are
+  // independent evidence. Neither can establish complete coverage alone.
+  const allAccessibleCalendarCoverageProven=fullCalendarInventoryComplete
+    &&PROFILES.every(profile=>calendarProvenanceCompleteByProfile[profile]);
   const knownIdentitiesAbsentFromCurrentProviders=allAccessibleCalendarCoverageProven
     &&closureComplete&&allProfilesQueried&&fullTaskCommentInventoryComplete
     &&fullCalendarInventoryComplete&&PROFILES.every(profile=>projectCommentInventoryComplete[profile])
-    &&provider404s===0&&PROFILES.every(profile=>
+    &&provider410s===0&&PROFILES.every(profile=>
     stats[profile].taskReadsFound===0&&stats[profile].taskInventoryMatches===0
       &&stats[profile].taggedEvents===0&&stats[profile].directEventReadsFound===0
       &&inventoryMatchedIds[profile].size===0&&matchedComments.get(profile)?.size===0);
@@ -802,7 +804,12 @@ export async function observeCrossProfileErasureEvidence(input:{
       ?["One or more calendars grant only free/busy access, so their event identities cannot be inventoried"]:[]),
     ...(PROFILES.some(profile=>stats[profile].restrictedCalendarCount>calendarAccessCounts[profile].freeBusyOnly)
       ?["One or more calendars hide private event details, so their full identity inventory is incomplete"]:[]),
-    "Google CalendarList enumerates calendars on each user's list; direct-ID calendars outside that list still need independent provenance",
+    ...(!allAccessibleCalendarCoverageProven
+      ?["Calendar direct-ID scope lacks a fresh independently signed, complete ACL registry and verified provider inventories"]:[]),
+    ...(PROFILES.some(profile=>stats[profile].unregisteredListedCalendarCount>0)
+      ?["One or more listed calendars are absent from the independent ACL registry"]:[]),
+    ...(PROFILES.some(profile=>stats[profile].inaccessibleCalendarCount>0)
+      ?["One or more declared calendars cannot be read through direct ID"]:[]),
     "Unlinked or untagged Calendar events still require explicit identity provenance; title or date matching is not accepted",
     ...(!fullTaskCommentInventoryComplete?["Todoist full Sync task-comment inventory is missing, incomplete, or older than five minutes for one or more profiles"]:[]),
     ...(!PROFILES.every(profile=>projectCommentInventoryComplete[profile])
@@ -819,7 +826,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     ...(taskCommentReadConflicts.size?["Todoist direct task-comment reads disagreed with the full Sync task-comment inventories"]:[]),
     ...(taskCommentReadFailures.size?["One or more exact Todoist task-comment reads returned 404; comment provenance remains incomplete"]:[]),
     ...(missingEtags.size?["One or more direct Calendar events have no ETag for independent version checks"]:[]),
-    ...(provider404s?["One or more direct provider reads returned 404/410; keep absence unverified"]:[]),
+    ...(provider404s?["Provider 404/410 results alone never establish absence; require complete current inventories"]:[]),
+    ...(provider410s?["One or more Calendar direct reads returned 410 and remain inconclusive"]:[]),
     ...(overflow.count?["Identity closure exceeded the bounded observer capacity"]:[]),
     ...(!closureComplete?["Identity reference closure did not converge within its bounded passes"]:[]),
   ];
@@ -832,7 +840,8 @@ export async function observeCrossProfileErasureEvidence(input:{
     identities:{taskCount:taskIds.size,eventCount:eventIds.size,seriesCount:seriesIds.size,overflowCount:overflow.count,
       fingerprint:fingerprint(aliases)},
     profiles:profileEvidence,
-    evidenceFingerprint:fingerprint({stateFingerprint,aliases,profileEvidence,closureComplete}),
+    evidenceFingerprint:fingerprint({stateFingerprint,aliases,profileEvidence,closureComplete,
+      allAccessibleCalendarCoverageProven}),
     missingProof,
   };
 }
