@@ -64,6 +64,8 @@ export function validateRoutingConfig(value) {
 export function redactedFailureCode(error) {
   if(error instanceof Error&&error.name==="CrossProfileAuditDeadlineError")
     return "CROSS_PROFILE_AUDIT_DEADLINE";
+  if(error instanceof Error&&error.name==="CrossProfileProviderRequestTimeoutError")
+    return "CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT";
   const message=typeof error?.message==="string"?error.message:"";
   if(error?.name==="CalendarRecurrenceLimitAuditError"
     &&typeof error.matchesSelectedEvent==="boolean") {
@@ -293,14 +295,20 @@ export async function collectLiveCrossProfileEvidence(options) {
       error.name="CrossProfileAuditDeadlineError";
       throw error;
     }
-    const signals=[providerDeadline.signal,...(init.signal?[init.signal]:[])];
+    const requestDeadline=AbortSignal.timeout(120_000);
+    const signals=[providerDeadline.signal,requestDeadline,...(init.signal?[init.signal]:[])];
     try {
-      return await originalFetch(input,{...init,signal:signals.length===1?signals[0]:AbortSignal.any(signals)});
+      return await originalFetch(input,{...init,signal:AbortSignal.any(signals)});
     } catch(error) {
       if(providerDeadline.signal.aborted) {
         const deadlineError=new Error("Cross-profile provider audit deadline exceeded");
         deadlineError.name="CrossProfileAuditDeadlineError";
         throw deadlineError;
+      }
+      if(requestDeadline.aborted) {
+        const timeoutError=new Error("Cross-profile provider request timed out");
+        timeoutError.name="CrossProfileProviderRequestTimeoutError";
+        throw timeoutError;
       }
       throw error;
     }

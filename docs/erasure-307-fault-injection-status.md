@@ -242,6 +242,8 @@ node scripts/audit-erasure-cross-profile-live.mjs \
 and Todoist provider reads (default 300000 ms; maximum 900000 ms). A provider
 deadline returns `CROSS_PROFILE_AUDIT_DEADLINE` with redacted details and
 incomplete evidence; it is not evidence that an identity or alias is absent.
+Each individual provider request also has a 120-second limit and reports
+`CROSS_PROFILE_PROVIDER_REQUEST_TIMEOUT` if it does not finish in time.
 
 The report is redacted and always exits with status 2 because this capture is
 not release-authoritative and cannot issue an erasure confirmation. A complete
