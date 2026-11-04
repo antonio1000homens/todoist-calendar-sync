@@ -42,3 +42,25 @@ strong DynamoDB absence proof, or a full fresh reconciliation. No unrelated
 provider inventory or DLQ state was collected, so those acceptance checks
 remain open. The provider IDs and title are intentionally omitted from this
 public report.
+
+## Connector-only cross-profile fixture probe (4 Nov 2026)
+
+The configured calendar and Todoist project identifiers were read from the
+deployed routing configuration and matched the resources visible to the
+connected provider account. A new disposable event on the configured Work
+calendar produced one task in the Work project and none in the `home` or
+`antonio` projects. Calendar search and direct read returned the same event ID
+through both the Work and `antonio` calendar resources, but not through `home`.
+The Antonio-calendar read identified the Work calendar as organizer and the
+connected account owner as attendee. This is an observed cross-calendar alias
+case; it does not prove that each deployed profile credential has the same
+visibility as the connected account.
+
+Strongly consistent reads of the exact task, event and task-owner mapping keys
+found only the Work mapping. After deleting the disposable Calendar event,
+fresh searches returned no matching event across the three calendars or task
+across the three projects, and strongly consistent reads found none of those
+exact mapping keys. The fixture was removed. These bounded reads do not replace
+the complete related-row scan, comment/recurrence provenance, or fresh full
+reconciliation required before recovery. The probe did not stage post-write
+recovery, markers, mapping restoration, fences, or SQS replay.
