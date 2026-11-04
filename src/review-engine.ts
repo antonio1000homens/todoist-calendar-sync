@@ -1,11 +1,13 @@
 import { planRecurrenceFlatten, flattenStandaloneId, flattenStandalone, flattenMasterProjection, assertFlattenedMaster, assertFlattenInstances } from "./recurrence-flatten.js";
+import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { randomUUID } from "node:crypto";
 import { profiles } from "./config.js";
 import { CanonicalIdentityStore, calendarCanonicalIdentity, todoistCanonicalIdentity } from "./canonical-identity.js";
 import { defaultProviderClientFactory, ReconciliationMutationBudget, createBudgetedClientFactory, type ProviderClientFactory } from "./mutation-budget.js";
 import { StateRepository } from "./repository.js";
 import { DynamoReconciliationStore } from "./reconciliation.js";
-import { ReviewStore, SyncControls, reviewHash } from "./review-store.js";
+import { assertRepairPreviewReplayAdmission, ReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairIntent, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewSnapshot } from "./review-types.js";
 import { calendarEventHasElapsed, hasCanonicalState, occurrenceStateMatches, selectCalendarRecurrenceInstance, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { upsertProjectMappingComment, deleteMappingComments, mappingCommentIds, parseMappingComment, isOwnedLegacyTaskMappingComment } from "./mapping-comments.js";
@@ -14,7 +16,7 @@ import { planFutureSeriesSplit } from "./recurrence-split.js";
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { planStandaloneAnnualRepair, verifyStandaloneAnnualOwnership, applyStandaloneAnnualRepair, assertStandaloneHistory } from "./standalone-annual-repair.js";
 import { ManualDecisionStore, ManualInterventionService, type ManualDecision } from "./manual-intervention.js";
-import { ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
+import { acquireMoveWriterLeases, ProjectAwareSynchronizer, todoistOccurrenceProjection } from "./project-sync.js";
 import { guardRepairProviders } from "./repair-provider-guard.js";
 import { finiteWeeklyCalendarRuleCandidate, resolveCalendarTimeZone } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedText } from "./security.js";
@@ -1222,6 +1224,16 @@ export class ReviewEngine {
   async execute(id: string): Promise<RepairOperation> {
     const operation = await this.store.getOperation(id); if (!operation) throw new Error("Repair not found");
     if (operation.status === "succeeded") return operation;
+    // Queued and resumed repairs are a separate ingress path from fresh sync
+    // deliveries. Recheck their complete reviewed identities immediately
+    // before any lock claim, checkpoint write, or provider mutation.
+    await assertRepairPreviewReplayAdmission(operation.preview);
+    if (operation.preview.intent.action === "move" && operation.preview.intent.targetProfile
+      && operation.preview.intent.taskId) {
+      const intent = operation.preview.intent;
+      const target = intent.targetProfile;
+      await assertReplayAdmissionIfEnabled({profile:target!,taskId:intent.taskId});
+    }
     // Already-abandoned deliveries are terminal: complete the FIFO receipt rather than
     // throwing a 409 into the dead-letter queue on retry/redelivery.
     if (operation.abandoned || operation.nonResumable) return operation;
@@ -1234,6 +1246,7 @@ export class ReviewEngine {
       await this.store.saveOperation(operation);
     });
     let claimed = false;
+    let releaseDestinationWriter: (() => Promise<void>) | undefined;
     const queueDeferredRefresh = async (refs:EntityRef[]) => this.queueDeferredRefresh(refs,state);
     // Legacy failed operations can predate the durable abandoned marker. Do not
     // replay them unless persisted execution state proves a write may have begun.
@@ -1262,6 +1275,7 @@ export class ReviewEngine {
       intent = decisionRepairIntent(intent, operation.preview.case.decision);
       const targetTaskRef: EntityRef | undefined = intent.action === "move" && intent.targetProfile && intent.taskId
         ? { profile:intent.targetProfile, side:"todoist", id:intent.taskId } : undefined;
+      if (targetTaskRef) releaseDestinationWriter = await acquireMoveWriterLeases([targetTaskRef.profile], intent.profile);
       // Move claims a destination-profile task barrier not included in the
       // source profile preview. Save its original control state before claiming,
       // so even a no-write validation failure can release the entire lock set.
@@ -1960,7 +1974,7 @@ export class ReviewEngine {
             } else {
               const source = await clients.calendar.getEvent(snapshot.ref.id);
               const created = await step(`transfer-create-task:${source.id}`, () => trackedWrite(snapshot.ref.profile,
-                () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+source.id)));
+                () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+source.id,calendarReplaySourceIds(source))));
               await bind(snapshot.ref.profile,created,source,undefined);
             }
           }
@@ -2104,7 +2118,7 @@ export class ReviewEngine {
             } else {
               const event=await clients.calendar.getEvent(snapshot.ref.id);let source=event;
               if(event.recurrence?.length){const instances=await clients.calendar.listInstances(event.id);const needsVerifiedZone=finiteWeeklyCalendarRuleCandidate(event)||instances.some((instance)=>instance.end?.date&&!instance.end.dateTime);const timeZone=needsVerifiedZone?await resolveCalendarTimeZone(event,clients.calendar.getTimeZone.bind(clients.calendar)):event.start?.timeZone;if(needsVerifiedZone&&await clients.todoist.getTimeZone()!==timeZone)throw new Error("Todoist and Calendar timezones differ; refresh the recurrence before repairing it");source=selectCalendarRecurrenceInstance(instances,undefined,Date.now(),timeZone)!;if(!source)throw new Error("No active occurrence to mirror");}
-              const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id)));
+              const task=await step(`create-task:${event.id}`,async()=> trackedWrite(snapshot.ref.profile, () => clients.todoist.createTaskOnce(toTodoistTask(source),id+":"+event.id,calendarReplaySourceIds(source,event.id))));
               await bind(snapshot.ref.profile,task,event,event.recurrence?.length || event.recurringEventId ? "calendar":undefined);
             }
           }
@@ -2415,6 +2429,7 @@ export class ReviewEngine {
       }
     }
     operation.notificationPending=true;operation.notificationText=`${operation.status === "needs_review"?"Needs review":"Failed"}: ${operation.error}`;
-    await this.store.saveOperation(operation);return operation;
+    try { await this.store.saveOperation(operation); return operation; }
+    finally { await releaseDestinationWriter?.(); }
   }
 }

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
 import {
   GetCommand,
   PutCommand,
@@ -1093,6 +1094,40 @@ export class SlackManualNotifier {
     }
   }
 
+  async cancelLegacyConfirmation(channel: string | undefined, messageTs: string | undefined, decisionId: string): Promise<void> {
+    const text = `Confirmation cancelled for ${decisionId}. The decision remains pending; use /sync conflicts to reopen it.`;
+    if (!slackEnabled()) return;
+    if (channel && messageTs) {
+      await slackApi("chat.update", { channel, ts: messageTs, text, blocks: [] });
+      return;
+    }
+    await this.postText(text, channel);
+  }
+
+  async requestLegacyConfirmation(
+    profile: Profile,
+    channel: string | undefined,
+    messageTs: string | undefined,
+    decisionId: string,
+    action: string,
+  ): Promise<void> {
+    if (!channel || !messageTs) throw new Error("Legacy confirmation requires its original Slack message location");
+    const text = `Confirm sync action ${action} for ${decisionId}`;
+    if (!slackEnabled()) return;
+    await slackApi("chat.update", {
+      channel,
+      ts: messageTs,
+      text,
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: `⚠️ *Confirm sync action*\n\`${action}\`\nDecision: \`${decisionId}\`` } },
+        { type: "actions", elements: [
+          { type: "button", action_id: "gcp_sync_decision_confirm", style: "danger", text: { type: "plain_text", text: "Confirm" }, value: JSON.stringify({ profile, decisionId, action, confirmed: true }) },
+          { type: "button", action_id: "gcp_sync_confirmation_cancel", text: { type: "plain_text", text: "Cancel" }, value: JSON.stringify({ profile, decisionId }) },
+        ] },
+      ],
+    });
+  }
+
   async reconciliationOutcome(channel: string | undefined, threadTs: string | undefined, text: string): Promise<string | undefined> {
     return this.postText(text, channel, threadTs);
   }
@@ -1357,6 +1392,15 @@ export class ManualInterventionService {
       mode = "prompt";
     }
 
+    if (catalog.defaultMode === "auto" && mode !== "auto") {
+      console.warn(JSON.stringify({
+        service: "todoist-calendar-sync-manual", event: "intervention_policy_auto_overridden",
+        profile, type, catalogMode: catalog.defaultMode, catalogAction: catalog.defaultAction,
+        resolvedMode: resolvedPolicy.mode, policySource: resolvedPolicy.source,
+        effectiveMode: mode, effectiveAction: defaultAction,
+        reason: resolvedPolicy.mode !== "auto" ? "effective_policy_override" : "invalid_or_unsafe_auto_action",
+      }));
+    }
     const key = decisionKey(profile, type, identity);
     let decisionContext = context;
     if (mode === "prompt" && contextEnricher) {
@@ -2394,7 +2438,7 @@ export class ManualInterventionService {
   private async restoreTodoistFromEvent(decision: ManualDecision, mapping: Mapping, state: StateRepository): Promise<void> {
     const pair = await this.providerClients(decision.profile);
     const event = await pair.calendar.getEvent(mapping.eventId);
-    const task = await pair.todoist.upsertTask(toTodoistTask(event));
+    const task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     await state.deleteMapping(mapping);
     const next: Mapping = { ...mapping, taskId: task.id, updatedAt: isoNow() };
     await state.putMapping(next);
@@ -2544,7 +2588,7 @@ export class ManualInterventionService {
           })
           .sort((a, b) => String(eventStart(a)).localeCompare(String(eventStart(b))))[0];
         if (next) {
-          const nextTask = await pair.todoist.upsertTask(toTodoistTask(next));
+          const nextTask = await pair.todoist.upsertTask(toTodoistTask(next), undefined, calendarReplaySourceIds(next));
           const nextMapping: Mapping = {
             ...mapping,
             eventId: next.id,
@@ -2588,7 +2632,7 @@ export class ManualInterventionService {
       if (!hasCanonicalState(event, task)) return this.markStale(decision, "The selected Todoist task no longer matches the Calendar event.", slackUserId);
       if (await state.getMappingByTaskAnyProfile(taskId)) return this.markStale(decision, "The selected Todoist task is now owned by another mapping.", slackUserId);
     } else if (action === "create_new_task") {
-      task = await pair.todoist.upsertTask(toTodoistTask(event));
+      task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     } else {
       throw new Error(`Unsupported snapshot conflict action ${action}`);
     }
@@ -2634,7 +2678,7 @@ export class ManualInterventionService {
       if (task) {
         await pair.todoist.upsertTask(toTodoistTask(event), task.id);
       } else {
-        const recreated = await pair.todoist.upsertTask(toTodoistTask(event));
+        const recreated = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
         await state.deleteMapping(mapping);
         await state.putMapping({ ...mapping, taskId: recreated.id, updatedAt: isoNow() });
       }
@@ -2657,6 +2701,24 @@ export class ManualInterventionService {
 
     if (manual.command) {
       const channel = manual.slackChannelId;
+      if (manual.command === "help") {
+        await this.notifier.postText(manual.message || "Use /sync status, reconcile, conflicts, inspect, resume, policies or policy.", channel);
+        return;
+      }
+      if (manual.command === "invalid_request") {
+        await this.notifier.postText("That /sync request or button is unsupported or incomplete. No sync changes were made; use /sync help for supported controls.", channel);
+        return;
+      }
+      if (manual.command === "confirm_legacy_action") {
+        if (!manual.targetId || !manual.action) throw new Error("Legacy confirmation requires decision ID and action");
+        await this.notifier.requestLegacyConfirmation(delivery.profile, channel, manual.slackMessageTs, manual.targetId, manual.action);
+        return;
+      }
+      if (manual.command === "cancel_confirmation") {
+        if (!manual.targetId) throw new Error("cancel_confirmation requires a decision ID");
+        await this.notifier.cancelLegacyConfirmation(channel, manual.slackMessageTs, manual.targetId);
+        return;
+      }
       if (manual.command === "reconcile_now" || manual.command === "resume_pending_reconciliation") {
         if (manual.slackUserId === "AUTO_POLICY") {
           await this.notifier.postText("Reconciliation requires an explicit request in Slack.", channel);

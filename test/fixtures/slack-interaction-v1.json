@@ -1,0 +1,17 @@
+{
+  "id": "slack-interaction:v1:fixture",
+  "kind": "manual",
+  "profile": "home",
+  "mode": "aws",
+  "receivedAt": "2026-11-03T00:00:00.000Z",
+  "headers": { "source": "slack" },
+  "body": "",
+  "slackInteraction": {
+    "schemaVersion": 1,
+    "type": "slash_command",
+    "command": "/sync",
+    "commandText": "status home",
+    "userId": "U123456",
+    "requestTimestamp": "1793664000"
+  }
+}

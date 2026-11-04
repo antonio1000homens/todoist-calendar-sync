@@ -12,6 +12,7 @@ export interface TodoistCommentRecord {
   content?: string;
   project_id?: string;
   task_id?: string;
+  is_deleted?: boolean;
   posted_at?: string;
 }
 

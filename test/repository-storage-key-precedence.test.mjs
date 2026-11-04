@@ -49,7 +49,7 @@ test("recurrence-link storage key also overrides stale pk/sk fields", () => {
 
 test("deletes remove canonical rows and let DynamoDB remove derived GSI entries", () => {
   const deleteMapping = repositorySource.match(/async deleteMapping\(mapping: Mapping\): Promise<void>[\s\S]*?\n  async acceptTaskVersion/)?.[0] || "";
-  const deleteRecurrence = repositorySource.match(/async deleteRecurrenceLink\(profile: Profile, seriesId: string\): Promise<void>\s*\{[\s\S]*?\n\s*\}/)?.[0] || "";
+  const deleteRecurrence = repositorySource.match(/async deleteRecurrenceLink\(profile: Profile, seriesId: string\): Promise<void>[\s\S]*?\n  async listRecurrenceLinks/)?.[0] || "";
   assert.match(deleteMapping, /Key: key\(`EVENT#/);
   assert.match(deleteMapping, /Key: key\(`TASK#/);
   assert.match(deleteRecurrence, /Key: key\(`RECURRENCE#/);

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {parseErasureQueueCommand,parseErasureQueueRecord} from "../dist/erasure-worker.js";
-import {canApplyRecovery,recoveryNeedsDispatch} from "../review-ui/erasure-recovery-policy.mjs";
+import {canAcknowledgeFencedPostWrite,canApplyRecovery,recoveryNeedsDispatch} from "../review-ui/erasure-recovery-policy.mjs";
 
 test("recovery command is disjoint from erasure deletion, rejects extra fields and invalid identity",()=>{
   assert.deepEqual(parseErasureQueueCommand({body:JSON.stringify({version:1,recoveryOperationId:"safe-op"})}),
@@ -33,4 +33,23 @@ test("recovery UI refuses blocked, stale, changed or untyped actions",()=>{
   assert.equal(recoveryNeedsDispatch("queued"),true);
   assert.equal(recoveryNeedsDispatch("completed"),false);
   assert.equal(recoveryNeedsDispatch("blocked"),false);
+});
+
+test("post-write review UI cannot reuse pre-write RESTORE SYNC or authorize release",()=>{
+  const operation={operationId:"op-1",profile:"work"};
+  const assessment={operationId:"op-1",profile:"work",reviewEnabled:true,classification:"fully_deleted_candidate",
+    releaseAllowed:false,onlyAvailableAction:"keep_fenced"};
+  const token={confirmationId:"postwrite-token",operationId:"op-1",profile:"work",
+    releaseAllowed:false,expiresAt:Date.now()+60000};
+  const typed={operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED"};
+  assert.equal(canAcknowledgeFencedPostWrite(assessment,token,typed,operation),true);
+  assert.equal(canAcknowledgeFencedPostWrite({...assessment,reviewEnabled:false},token,typed,operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite({...assessment,classification:"partial_or_ambiguous"},token,typed,operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite({...assessment,releaseAllowed:true},token,typed,operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite({...assessment,reviewStatus:"reviewed_fenced"},token,typed,operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite(assessment,token,{...typed,phrase:"RESTORE SYNC"},operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite(assessment,{...token,expiresAt:Date.now()-1},typed,operation),false);
+  assert.equal(canAcknowledgeFencedPostWrite(assessment,token,{...typed,profile:"home"},operation),false);
+  assert.equal(canApplyRecovery(assessment,token,typed,operation),false,
+    "legacy RESTORE SYNC can never accept a post-write review token");
 });

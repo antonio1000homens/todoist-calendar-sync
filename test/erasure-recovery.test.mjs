@@ -8,6 +8,18 @@ const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
 
+function verifiedCurrentProviderAbsence(){
+  return {
+    phase:"read_only_cross_profile_observation",eligibleForPostWriteRelease:false,
+    allProfilesQueried:true,closureComplete:true,knownIdentitiesAbsentFromCurrentProviders:true,
+    stateScan:{stronglyConsistent:true,allPagesReceived:true,rowCount:0,relatedRowCount:0,
+      fingerprint:"a".repeat(64),tableFingerprint:"b".repeat(64)},
+    identities:{taskCount:1,eventCount:1,seriesCount:0,overflowCount:0,fingerprint:"c".repeat(64)},
+    profiles:{},evidenceFingerprint:"d".repeat(64),
+    missingProof:["Unknown historical aliases and required independent review remain"],
+  };
+}
+
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},
@@ -31,7 +43,7 @@ function fixture(options={}) {
   Object.assign(operation,options.operation||{});
   Object.assign(external,options.external||{});
   const opKey="ERASURE_OPERATION#op-recovery";
-  let confirmation;
+  let confirmation,postwriteToken;
   const db={
     async send(command) {
       const kind=command.constructor.name;
@@ -39,6 +51,7 @@ function fixture(options={}) {
       if(kind==="GetCommand") {
         if(input.Key.pk===opKey)return {Item:operation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
+        if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         return {Item:undefined};
       }
       if(kind==="QueryCommand") {
@@ -48,6 +61,10 @@ function fixture(options={}) {
       }
       if(kind==="PutCommand") {
         external.writes.push(input);
+        if(input.Item.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery"){
+          if(postwriteToken&&postwriteToken.status==="consumed")throw new Error("Reviewed token is already consumed");
+          postwriteToken={...input.Item};return {};
+        }
         confirmation={...input.Item};
         return {};
       }
@@ -61,6 +78,22 @@ function fixture(options={}) {
       }
       if(kind==="TransactWriteCommand") {
         external.writes.push(input);
+        if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET postwriteReview=:review"))){
+          if(options.failPostwriteTransaction)throw Object.assign(new Error("Transaction conflict"),{name:"TransactionCanceledException"});
+          assert.equal(operation.postwriteReview,undefined);
+          assert.equal(operation.recovery,undefined);
+          assert.equal(postwriteToken.status,"issued");
+          assert.equal(input.TransactItems.filter(x=>x.Delete||x.Put).length,0,
+            "post-write acknowledgement cannot delete or write any provider/replay/fence item");
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="FENCE"));
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
+          operation.postwriteReview=input.TransactItems[0].Update.ExpressionAttributeValues[":review"];
+          postwriteToken.status="consumed";
+          delete postwriteToken.operator;
+          delete postwriteToken.expiresAt;
+          delete postwriteToken.expiresAtMs;
+          return {};
+        }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET recovery=:recovery"))) {
           assert.equal(operation.status,"review_required");
           assert.equal(operation.recovery,undefined,"confirmation must not be reused");
@@ -97,8 +130,9 @@ function fixture(options={}) {
     async readSnapshot(){external.providerCalls++;return external.snapshot;},
   };
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
-  const service=new ErasureRecoveryService(adapters,db,store,()=>"fresh-recovery-token");
-  return {service,operation,external,db,get confirmation(){return confirmation;}};
+  const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
+  return {service,operation,external,db,get confirmation(){return confirmation;},
+    get postwriteToken(){return postwriteToken;}};
 }
 
 test("read-only preview paginates controls and checks original mappings and immutable provider inventory",async()=>{
@@ -109,6 +143,67 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(a.preview.epoch,7);
   assert.equal(a.preview.leaseCount,0);
   assert.deepEqual(a.preview.mappingStates.map(x=>x.originallyEnabled),[true,false]);
+  assert.equal(external.writes.length,0);
+});
+
+test("independent post-write preview never issues a confirmation, writes state, or releases a fence",async()=>{
+  const {service,external}=fixture({paginated:true});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"not_post_write");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.onlyAvailableAction,"keep_fenced");
+  assert.equal(assessment.evidence.originalProviderWriteIndicated,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(external.providerCalls,1);
+  assert.equal(external.writes.length,0);
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("strong exact postflight is a read-only candidate only with an original deletion receipt",async()=>{
+  const f=fixture();
+  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
+    comments:[],
+  };
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.lifecycle.phase="verify_deletion";
+  f.operation.lifecycle.evidence.deletionStarted={
+    operationId:"op-recovery",phase:"deletionStarted",
+    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
+  };
+  const snapshot={
+    operationId:"op-recovery",profile:"work",target:f.operation.target,
+    selectedActions:f.operation.selectedActions,inventory:[],
+    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    crossProfileEvidence:verifiedCurrentProviderAbsence(),
+  };
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  const assessment=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"fully_deleted_candidate");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(f.external.writes.length,0);
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  // A stale or malformed fingerprint must not count as fully verified absence.
+  snapshot.previewFingerprint="0".repeat(64);
+  const unsafe=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(unsafe.classification,"partial_or_ambiguous");
+  assert.equal(unsafe.releaseAllowed,false);
+  assert.equal(f.external.writes.length,0);
+});
+
+test("post-write inspection with an active lease exposes a blocker but never changes controls",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"ADMISSION#stale",owner:"stale"});
+  const assessment=await service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.evidence.leasesDrained,false);
+  assert.equal(assessment.evidence.matchingFence,true);
   assert.equal(external.writes.length,0);
 });
 
@@ -280,4 +375,146 @@ test("phase escalation cannot bypass durable timeout and lease-drain receipts",a
     assert.match(inspected.preview.blockers.join(" "),/durable receipt/i);
     assert.equal(f.external.writes.length,0);
   }
+});
+
+const postwriteReviewToken="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+function fullyDeletedPostWriteFixture(options={}) {
+  const f=fixture({...options,token:postwriteReviewToken});
+  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
+    comments:[],
+  };
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.lifecycle.phase="verify_deletion";
+  f.operation.lifecycle.evidence.deletionStarted={
+    operationId:"op-recovery",phase:"deletionStarted",
+    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
+  };
+  f.external.mappingStates.set(enabledId,"Enabled");
+  const snapshot={operationId:"op-recovery",profile:"work",target:f.operation.target,
+    selectedActions:f.operation.selectedActions,inventory:[],actionPlan:{comments:[]},
+    providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    crossProfileEvidence:verifiedCurrentProviderAbsence()};
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  return f;
+}
+function enablePostwriteReview(t){
+  const previous=process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
+  process.env.ERASURE_POSTWRITE_REVIEW_VERSION="1";
+  t.after(()=>{if(previous===undefined)delete process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
+    else process.env.ERASURE_POSTWRITE_REVIEW_VERSION=previous;});
+}
+const typedReview={operationId:"op-recovery",profile:"work",phrase:"REVIEW AND KEEP FENCED"};
+
+test("post-write review token is disabled without explicit rollout and never changes the fence",async()=>{
+  const previous=process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
+  delete process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
+  const f=fullyDeletedPostWriteFixture();
+  try {
+    await assert.rejects(f.service.issuePostWriteReviewToken("op-recovery","operator"),/disabled/);
+    assert.equal(f.external.writes.length,0);
+    assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  } finally {
+    if(previous!==undefined)process.env.ERASURE_POSTWRITE_REVIEW_VERSION=previous;
+  }
+});
+
+test("single-use post-write review token binds fresh evidence and records only a still-fenced disposition",async t=>{
+  enablePostwriteReview(t);
+  const f=fullyDeletedPostWriteFixture();
+  const issued=await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
+  assert.equal(issued.confirmationId,postwriteReviewToken);
+  assert.equal(issued.releaseAllowed,false);
+  assert.ok(issued.expiresAt>Date.now());
+  assert.equal(f.postwriteToken.status,"issued");
+  assert.equal(f.external.writes.length,1,"issue only an expiring confirmation");
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"wrong-operator",typedReview),
+    /expired, consumed or changed/);
+  for(const invalid of [
+    {...typedReview,phrase:"RESTORE SYNC"},
+    {...typedReview,operationId:"different"},
+  ]) await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",invalid),
+    /Exact typed/);
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",
+      {...typedReview,profile:"home"}),/expired, consumed or changed/);
+  assert.equal(f.operation.postwriteReview,undefined);
+  const result=await f.service.acknowledgePostWriteReview(
+    "op-recovery",postwriteReviewToken,"operator-1",typedReview);
+  assert.deepEqual(result,{status:"reviewed_fenced",releaseAllowed:false});
+  assert.equal(f.operation.postwriteReview.status,"reviewed_fenced");
+  assert.equal(f.operation.postwriteReview.mode,"post_write");
+  assert.equal(f.operation.postwriteReview.epoch,7);
+  assert.equal(f.operation.recovery,undefined,"recovery worker is never started");
+  assert.equal(f.postwriteToken.status,"consumed");
+  assert.equal(f.postwriteToken.operator,undefined,"do not retain operator PII after token consumption");
+  assert.equal(f.postwriteToken.expiresAt,undefined,"consumed proof survives TTL until atomic future release");
+  assert.equal(f.external.restored.length,0);
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"),"fence must remain active");
+  const receipt=f.external.writes.at(-1);
+  assert.ok(receipt.TransactItems.every(x=>x.Update||x.ConditionCheck));
+  assert.ok(receipt.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="JOURNAL"));
+  const assessment=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.reviewStatus,"reviewed_fenced");
+  assert.equal(assessment.releaseAllowed,false);
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
+    /expired, consumed or changed/);
+  await assert.rejects(f.service.issuePostWriteReviewToken("op-recovery","operator-1"),/fresh, fully deleted/);
+});
+
+test("expired token and provider snapshot drift are rejected without consuming the token",async t=>{
+  enablePostwriteReview(t);
+  const f=fullyDeletedPostWriteFixture();
+  await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
+  f.postwriteToken.expiresAtMs=Date.now()-1000;
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),/expired/);
+  assert.equal(f.operation.postwriteReview,undefined);
+  f.postwriteToken.expiresAtMs=Date.now()+60000;
+  f.external.snapshot.previewFingerprint="0".repeat(64);
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),/fresh, fully deleted/);
+  assert.equal(f.operation.postwriteReview,undefined);
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+});
+
+test("fence, epoch, lease, mapping, and original selection drift reject token use",async t=>{
+  enablePostwriteReview(t);
+  for(const change of [
+    f=>{f.external.control.find(x=>x.sk==="FENCE").operationId="another-operation";},
+    f=>{f.external.control.find(x=>x.sk==="EPOCH").epoch=8;},
+    f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#late",owner:"late"});},
+    f=>{f.external.mappingStates.set(enabledId,"Disabled");},
+    f=>{f.operation.selectedActions.deleteCalendar=false;},
+    f=>{f.operation.updatedAt="2026-11-03T00:00:00Z";},
+  ]) {
+    const f=fullyDeletedPostWriteFixture();
+    await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
+    change(f);
+    await assert.rejects(
+      f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
+      /fresh, fully deleted|drifted/);
+    assert.equal(f.operation.postwriteReview,undefined);
+    assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  }
+});
+
+test("conditional review transaction failure leaves token issued and fence untouched",async t=>{
+  enablePostwriteReview(t);
+  const f=fullyDeletedPostWriteFixture({failPostwriteTransaction:true});
+  await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
+  await assert.rejects(
+    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
+    /state changed/);
+  assert.equal(f.operation.postwriteReview,undefined);
+  assert.equal(f.postwriteToken.status,"issued");
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
 });

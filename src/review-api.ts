@@ -2,6 +2,10 @@ import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
+import { deletedRecurrenceStatus } from "./deletion-review-state.js";
+import { assessOrphanReadiness } from "./orphan-readiness.js";
+import { OrphanApprovalService } from "./orphan-approval.js";
 import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
@@ -13,7 +17,7 @@ import { buildErasurePreview } from "./erasure-preview.js";
 import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
 import type { Delivery, Profile } from "./types.js";
 import type { ReconciliationState } from "./repository.js";
-import { REVIEW_PROFILES, operationHasWriteEvidence, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
+import { REVIEW_PROFILES, operationHasWriteEvidence, entityKey, type EntityRef, type ReviewCase, type ReviewSnapshot, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 import { randomUUID } from "node:crypto";
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
 
@@ -114,6 +118,40 @@ function selectedIntent(body: Record<string, unknown>, caseId: string, selectedP
 function assertOwned(subject: string, owner: string): void {
   if (subject !== owner) fail(403, "This record belongs to another review operator");
 }
+/** Enrich read-only case snapshots with *only* identities recorded by this
+ * immutable alert, never arbitrary repair-search IDs or `includedBy` links.
+ * A failed candidate lookup is reported as unverified, not an absent item.
+ * This helper grants no deletion eligibility or provider-write authority. */
+export async function hydrateCaseOrphanEvidence(
+  item: ReviewCase,
+  snapshots: ReviewSnapshot[],
+  readSnapshot: (ref: EntityRef) => Promise<ReviewSnapshot>,
+): Promise<ReviewSnapshot[]> {
+  const ids=reviewCaseEvidenceIds(item);
+  const refs:EntityRef[]=[
+    ...ids.taskIds.map(id=>({profile:item.profile,side:"todoist" as const,id})),
+    ...ids.eventIds.map(id=>({profile:item.profile,side:"calendar" as const,id})),
+  ];
+  if(refs.length>20) fail(409,"The review alert references more than 20 provider identities; narrow the case before verifying an orphan");
+  const found=new Map(snapshots.map(snapshot=>[entityKey(snapshot.ref),snapshot]));
+  for(const ref of refs){
+    const key=entityKey(ref);
+    if(found.has(key))continue;
+    let snapshot:ReviewSnapshot;
+    try {
+      snapshot=await readSnapshot(ref);
+      if(snapshot.ref.profile!==item.profile||snapshot.ref.side!==ref.side||snapshot.ref.id!==ref.id)
+        throw new Error("Provider snapshot identity mismatch");
+    } catch {
+      // An API outage, foreign ownership, or failed lookup is not a 404/410.
+      snapshot={ref,object:null,lookupError:"The direct provider lookup or ownership verification failed",checkedAt:new Date().toISOString()};
+    }
+    found.set(key,{...snapshot,includedBy:[...(snapshot.includedBy||[]),"Exact identity recorded on selected review alert"]});
+  }
+  // Preserve the pre-existing affected-item ordering; append extra case
+  // evidence without reshuffling repair selections or their test fixtures.
+  return [...found.values()];
+}
 export function reconciliationAlertRelation(
   alertedGeneration: unknown, observedAt: unknown, current?: ReconciliationState,
 ): "unavailable" | "different_generation" | "completed_since_alert" | "failed_since_alert" | "progressed_since_alert" | "same_generation" {
@@ -139,6 +177,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   enqueueErasureRecovery?: typeof enqueueErasureRecovery;
   acquireWriteLease?: (selectedProfile:Profile,owner:string)=>Promise<()=>Promise<void>>;
   createReviewStore?:()=>ReviewStore;
+  createOrphanApprovalService?:(store:ReviewStore)=>OrphanApprovalService;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
   createStateRepository?:()=>StateRepository;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
@@ -158,7 +197,19 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     const segments = path.slice("/review/api/".length).split("/").filter(Boolean).map(decodeURIComponent);
     const body = method === "POST" ? bodyJson(event) : undefined;
     const actor = await authenticate(event, method === "POST");
+    // #287: the old global task-ID erasure flow is not a valid orphan deletion
+    // workflow. Its preview/confirmation creation must be explicitly opted in
+    // for legacy operator tooling; the review page can no longer reach it.
+    // Keep already recorded operation status, queue handoff and break-glass
+    // recovery available so an interrupted durable erasure is not stranded.
+    if (method === "POST" && ((segments[0] === "erasure-previews" && segments.length === 1)
+      || (segments[0] === "erasure-operations" && segments.length === 1))
+      && process.env.ERASURE_LEGACY_UNSCOPED_API_ENABLED !== "true") {
+      fail(410, "Unscoped item erasure is retired from review. Use the selected alert's verified-orphan workflow; existing operation status and recovery remain available.");
+    }
     const store = dependencies.createReviewStore?.() || new ReviewStore();
+    const orphanApproval = () => dependencies.createOrphanApprovalService?.(store)
+      || new OrphanApprovalService({cases:store});
     const reviewEngine=dependencies.createReviewEngine?.(store) || new ReviewEngine(store);
     const enqueueRepairFn=dependencies.enqueueRepair || enqueueRepair;
     const admissionOwner=randomUUID();
@@ -199,6 +250,38 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if(method==="POST"&&process.env.ERASURE_PROTOCOL_VERSION==="1"&&!writeProfiles.includes(selectedProfile))
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
+
+    // Rollout-gated, state-only review: never queues recovery or releases a fence.
+    if(segments[0]==="erasure-postwrite-recoveries"&&segments[1]) {
+      const id=segments[1],action=segments[2];
+      const recovery=recoveryService();
+      if(method==="GET"&&segments.length===2) {
+        const assessment=await recovery.inspectPostWrite(id);
+        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
+          event:"postwrite_recovery_evidence_inspected",operationId:id,
+          classification:assessment.classification,blockerCount:assessment.blockers.length}));
+        return response(200,{assessment});
+      }
+      if(method==="POST"&&segments.length===3&&action==="review-token") {
+        if(Object.keys(body||{}).length)fail(400,"Post-write review token accepts no request fields");
+        const issued=await recovery.issuePostWriteReviewToken(id,actor.subject);
+        return response(200,{...issued});
+      }
+      if(method==="POST"&&segments.length===3&&action==="acknowledge") {
+        if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
+          ||typeof body?.confirmationId!=="string"||body.operationId!==id
+          ||body.phrase!=="REVIEW AND KEEP FENCED"
+          ||!REVIEW_PROFILES.includes(body.profile as Profile))
+          fail(400,"Post-write review requires exact operation, profile and REVIEW AND KEEP FENCED phrase");
+        const reviewed=await recovery.acknowledgePostWriteReview(id,body.confirmationId,actor.subject,{
+          operationId:body.operationId,profile:body.profile as Profile,phrase:body.phrase,
+        });
+        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
+          event:"postwrite_review_recorded_fenced",operationId:id}));
+        return response(200,{review:reviewed});
+      }
+      return response(404,{error:"not_found"});
+    }
 
     // Break-glass recovery is intentionally disjoint from erasure submission:
     // it cannot acquire a profile write lease while the erasure fence is active.
@@ -366,6 +449,68 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const items = results.flatMap(result=>result.items).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
       return response(200,{items});
     }
+    // #287: explicit on-demand server diagnostic. Never returns a deletion token,
+    // never accepts arbitrary IDs, and makes no provider or DynamoDB writes.
+    if (method === "GET" && segments[0] === "cases" && segments[2] === "orphan-readiness" && segments.length === 3) {
+      if (Object.keys(event.queryStringParameters || {}).length) fail(400,"Orphan readiness accepts no IDs or other query parameters");
+      const item = await store.getCase(segments[1]);
+      if (!item) return response(404,{error:"conflict_not_found"});
+      if (item.status !== "open" || item.operationId)
+        return response(200,{readiness:assessOrphanReadiness(item,[])});
+      const intent:RepairIntent = {caseId:item.id,profile:item.profile,action:item.decision?"decision":"link",
+        taskId:item.taskId || (typeof item.decision?.context?.providerTaskId==="string" ? item.decision.context.providerTaskId : undefined),
+        eventId:item.eventId || (typeof item.decision?.context?.providerEventId==="string" ? item.decision.context.providerEventId : undefined),
+        winner:"none",scope:"occurrence",leftovers:{}};
+      let snapshots:ReviewSnapshot[];
+      try {
+        snapshots = await hydrateCaseOrphanEvidence(item,
+          await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
+      } catch {
+        // A failed provider or state read must never be treated as an absent
+        // counterpart. Fail the diagnostic rather than returning eligibility.
+        fail(503,"A direct provider or ownership lookup failed; orphan readiness cannot be established");
+      }
+      return response(200,{readiness:assessOrphanReadiness(item,snapshots)});
+    }
+    // #287: isolated, selected-alert approval path. No provider DELETE, worker
+    // dispatch or deletion-capable token is exposed by either POST endpoint.
+    // Confirmation is separately default-deny until the full worker/replay
+    // barrier integration has passed destructive acceptance.
+    if (segments[0] === "cases" && segments.length === 3
+      && ["orphan-previews","orphan-confirmations"].includes(segments[2]) && method === "POST") {
+      if(Object.keys(event.queryStringParameters || {}).length)
+        fail(400,"Orphan approval does not accept query parameters");
+      const item=await store.getCase(segments[1]);
+      if(!item)return response(404,{error:"conflict_not_found"});
+      requireAdmissionProfile(item.profile);
+      if(segments[2]==="orphan-previews") {
+        if(Object.keys(body||{}).sort().join(",")!=="id,side"
+          || !["todoist","calendar"].includes(String(body?.side))
+          || typeof body?.id!=="string")
+          fail(400,"Preview requires exactly one recorded provider side and ID");
+        const preview=await orphanApproval().issue(item.id,body!.side as Side,body!.id as string,actor);
+        return response(200,{preview});
+      }
+      if(Object.keys(body||{}).sort().join(",")!=="confirmationId,exactId,phrase,previewId"
+        || ["confirmationId","exactId","phrase","previewId"].some(key=>typeof body?.[key]!=="string"))
+        fail(400,"Confirmation requires the exact preview, nonce, ID and typed phrase");
+      if(process.env.ORPHAN_APPROVAL_CONFIRMATION_ENABLED!=="true")
+        fail(409,"Orphan confirmation recording is disabled until production safety integration has passed review");
+      const operation=await orphanApproval().confirm(item.id,{
+        previewId:body!.previewId as string,confirmationId:body!.confirmationId as string,
+        exactId:body!.exactId as string,phrase:body!.phrase as string,
+      },actor);
+      return response(201,{operation});
+    }
+    // Operator-scoped, read-only status for a confirmed but un-dispatched
+    // operation. An operation ID from another case is never sufficient.
+    if (segments[0]==="cases" && segments[2]==="orphan-operations"
+      && segments.length===4 && method==="GET") {
+      if(Object.keys(event.queryStringParameters || {}).length)
+        fail(400,"Orphan operation status accepts no query parameters");
+      const operation=await orphanApproval().status(segments[1],segments[3],actor);
+      return response(200,{operation});
+    }
     if (method === "GET" && segments[0] === "cases" && segments.length === 2) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
@@ -380,7 +525,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           || (operation.status !== "failed" && operation.status !== "needs_review")) {
           fail(409,"Repair operation does not match this incident; provider items cannot be safely hydrated");
         }
-        const snapshots = await reviewEngine.collect(preview.intent,item.decision);
+        const snapshots = await hydrateCaseOrphanEvidence(item,
+          await reviewEngine.collect(preview.intent,item.decision),ref=>reviewEngine.snapshot(ref));
         return response(200,{item:{...item,taskId:preview.intent.taskId,eventId:preview.intent.eventId,
           repairContext:{operationId:operation.id,status:operation.status,itemPlan:preview.itemPlan}},snapshots});
       }
@@ -388,7 +534,10 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         taskId:item.taskId || (typeof item.decision?.context?.providerTaskId === "string" ? item.decision.context.providerTaskId : undefined),
         eventId:item.eventId || (typeof item.decision?.context?.providerEventId === "string" ? item.decision.context.providerEventId : undefined),
         winner:"none", scope:"occurrence", leftovers:{} };
-      const snapshots = await reviewEngine.collect(intent,item.decision);
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
+      const deletionCleanup = await deletedRecurrenceStatus(item, snapshots,
+        (profile, seriesId) => reviewEngine.state.getRecurrenceLink(profile, seriesId));
       const reconciliation = item.decision?.type === "operational_reconciliation_stuck"
         ? await new StateRepository().getReconciliationState(item.profile) : undefined;
       const alertedGeneration = item.reconciliationGeneration || item.decision?.context?.reconciliationGeneration;
@@ -404,7 +553,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         progressCheckpoint: reconciliation.progressCheckpoint, nextContinuation: reconciliation.nextContinuation,
         result: reconciliation.result, failureContext: reconciliation.failureContext,
       } : undefined;
-      return response(200,{item,snapshots,...(item.decision?.type === "operational_reconciliation_stuck"
+      return response(200,{item,snapshots,deletionCleanup,...(item.decision?.type === "operational_reconciliation_stuck"
         ? { reconciliation: { run: liveRun, relationToAlert: liveRelation, observedAt: new Date().toISOString() } } : {})});
     }
     if (method === "GET" && segments[0] === "search" && segments.length === 1) {
@@ -430,11 +579,36 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const preview = await reviewEngine.preview(actor,intent);
       return response(200,{preview});
     }
+    // Read-only recheck for an unselected repair action. Do not manufacture
+    // a mutating intent or call the preview/apply pipeline.
+    if (method === "GET" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
+      const item = await store.getCase(segments[1]);
+      if (!item) return response(404,{error:"conflict_not_found"});
+      const query = event.queryStringParameters || {};
+      if (Object.keys(query).some(key => !["taskId","eventId"].includes(key)))
+        fail(400,"Unsupported recheck parameters");
+      const checkedId = (value: string | undefined): string | undefined => {
+        if (!value) return undefined;
+        if (value.length > 1024 || [...value].some(char => char.charCodeAt(0) < 32))
+          fail(400,"Invalid provider item ID");
+        return value;
+      };
+      const selectedTaskId = checkedId(query.taskId) || undefined;
+      const selectedEventId = checkedId(query.eventId) || undefined;
+      const intent: RepairIntent = {caseId:item.id,profile:item.profile,action:"link",
+        taskId:selectedTaskId,eventId:selectedEventId,winner:"none",scope:"occurrence",leftovers:{}};
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
+      const deletionCleanup = await deletedRecurrenceStatus(item, snapshots,
+        (profile, seriesId) => reviewEngine.state.getRecurrenceLink(profile, seriesId));
+      return response(200,{item,snapshots,deletionCleanup});
+    }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "affected" && segments.length === 3) {
       const item = await store.getCase(segments[1]);
       if (!item) return response(404,{error:"conflict_not_found"});
       const intent = selectedIntent(body!,item.id,item.profile);
-      const snapshots = await reviewEngine.collect(intent,item.decision);
+      const snapshots = await hydrateCaseOrphanEvidence(item,
+        await reviewEngine.collect(intent,item.decision),ref=>reviewEngine.snapshot(ref));
       return response(200,{snapshots});
     }
     if (method === "POST" && segments[0] === "cases" && segments[2] === "dismiss" && segments.length === 3) {

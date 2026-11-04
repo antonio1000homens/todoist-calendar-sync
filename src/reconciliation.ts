@@ -1,11 +1,16 @@
+import {defaultProviderClientFactory} from "./mutation-budget.js";
+import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
-import { reviewHash } from "./review-store.js";
+import { ReviewStore, reviewHash } from "./review-store.js";
+import { classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
+import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { isMutationBudgetExhausted } from "./mutation-budget.js";
 import { ReconciliationItemError, reconciliationFailureDetails, type ReconciliationFailureContext } from "./reconciliation-diagnostics.js";
 import { normalizedText } from "./security.js";
@@ -66,7 +71,8 @@ type ReconcileOutcome =
   | "blocked"
   | "conflict"
   | "recurring_deferred"
-  | "completed_retained";
+  | "completed_retained"
+  | "deleted_retired";
 
 export interface SnapshotReconciliationResult {
   continuation?: ReconciliationContinuation;
@@ -218,6 +224,7 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
     conflict: 0,
     recurring_deferred: 0,
     completed_retained: 0,
+    deleted_retired: 0,
   };
 }
 
@@ -247,6 +254,9 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async putBaseline(profile: Profile, taskId: string, task: TodoistTask, event: CalendarEvent): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[
+      event.id,event.recurringEventId,event.extendedProperties?.shared?.syncHistoryMasterId,
+    ].filter((value):value is string=>typeof value==="string"&&value.length>0)});
     const baseline: ReconciliationBaseline = {
       todoist: canonicalTodoist(task),
       calendar: canonicalCalendar(event),
@@ -264,6 +274,7 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaseline(profile: Profile, taskId: string): Promise<void> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     await documentClient.send(new DeleteCommand({
       TableName: this.ensureTable(),
       Key: key(`BASELINE#${profile}#TASK#${taskId}`, "RECONCILE"),
@@ -271,6 +282,7 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined,allowAbsentAfterCheckpoint=false):Promise<boolean> {
+    await assertReplayAdmissionIfEnabled({profile,taskId});
     if(!tableName) throw new Error("STATE_TABLE_NAME is not configured");
     const key= {pk:`BASELINE#${profile}#TASK#${taskId}`,sk:"RECONCILE"};
     const current=await documentClient.send(new GetCommand({TableName:tableName,Key:key,ConsistentRead:true}));
@@ -299,11 +311,8 @@ export class SnapshotReconciler {
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return {
-      calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
-      todoist: new Todoist(await todoistToken(profile)),
-    };
+    if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
+    return defaultProviderClientFactory(profile);
   }
 
   private async completedProjection(profile: Profile, eventId: string) {
@@ -314,8 +323,9 @@ export class SnapshotReconciler {
   private async retainCompletedProjectionIfMarked(profile: Profile, mapping: Mapping): Promise<ReconcileOutcome | undefined> {
     const completedProjection = await this.completedProjection(profile, mapping.eventId);
     if (completedProjection?.taskId !== mapping.taskId) return undefined;
-    await this.state.deleteMapping(mapping);
-    await this.store.deleteBaseline(profile, mapping.taskId);
+    // The mapping is kept throughout the seven-day completion grace.
+    // The maintenance worker retires all three indexes transactionally.
+    // Reconciliation must not delete these rows early or mutate providers.
     await this.state.audit(profile, "todoist_snapshot_completed_projection_retained", {
       taskId: mapping.taskId,
       eventId: mapping.eventId,
@@ -382,7 +392,7 @@ export class SnapshotReconciler {
     try {
       return await todoist.getTask(taskId);
     } catch (error) {
-      if (Number((error as { status?: number }).status) === 404) return undefined;
+      if ([404, 410].includes(Number((error as { status?: number }).status))) return undefined;
       throw error;
     }
   }
@@ -523,6 +533,142 @@ export class SnapshotReconciler {
     return "calendar_to_todoist";
   }
 
+  /**
+   * The recurrence reconciler deliberately defers Todoist-owned series. Before
+   * deferring, however, verify whether their exact task and Calendar resources
+   * were both deleted. A cancelled master is not a live Calendar event.
+   */
+  private async retireDeletedTodoistRecurrence(
+    profile: Profile, mapping: Mapping, clients: ClientPair,
+  ): Promise<ReconcileOutcome | undefined> {
+    if (mapping.recurrenceOwner !== "todoist" || !mapping.seriesId) return undefined;
+    const task = await this.currentTask(clients.todoist, mapping.taskId);
+    if (task) return undefined;
+    const eventIds = [...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId]
+      .filter((id): id is string => Boolean(id)))];
+    if (!eventIds.length) return undefined;
+    for (const eventId of eventIds) {
+      const current = await this.currentEvent(clients.calendar, eventId);
+      if (current && current.status !== "cancelled") return undefined;
+      if (await this.completedProjection(profile, eventId)) return undefined;
+      if (await this.state.syncBlocked(profile, { eventId })) return undefined;
+    }
+    const link = await this.state.getRecurrenceLink(profile, mapping.seriesId);
+    if (!link || link.owner !== "todoist" || link.taskId !== mapping.taskId
+      || link.eventId !== mapping.eventId || link.masterEventId !== mapping.masterEventId
+      || link.activeInstanceId !== mapping.activeInstanceId) return undefined;
+    const retired = await this.state.retireDeletedTodoistRecurrenceIfUnchanged(mapping, link);
+    if (!retired) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_deleted_recurrence_retirement_blocked", {
+        taskId: mapping.taskId, eventId: mapping.eventId,
+        reason: "mapping_repair_or_recurrence_changed_during_verified_deletion",
+      });
+      return "blocked";
+    }
+    await this.store.deleteBaseline(profile, mapping.taskId);
+    await this.state.audit(profile, "todoist_snapshot_reconcile_verified_deletion_retired", {
+      taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
+      reason: "todoist_task_absent_calendar_projection_cancelled_or_missing",
+    });
+    return "deleted_retired";
+  }
+
+  /** Remove stale review identities only when every exact provider ID is gone.
+   * This is intentionally bounded and never infers an ID from title/date.
+   * A one-sided deletion remains actionable, including recurring masters.
+   */
+  private async retireVerifiedDeletedCases(profile: Profile, clients: ClientPair, includeHistory = false): Promise<void> {
+    if (!(this.state instanceof StateRepository)) return;
+    const review = new ReviewStore();
+    let cursor = await review.deletionSweepCursor(profile, includeHistory);
+    let examined = 0;
+    do {
+      const page = await review.listCases(profile, cursor, includeHistory, 10);
+      for (const item of page.items) {
+        examined += 1;
+        if (item.status !== (includeHistory ? "dismissed" : "open") || item.operationId
+          || item.reason.startsWith("operational_")) continue;
+        const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
+        if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
+        const recurring = item.decision?.type?.includes("recurrence_task_deleted") === true;
+        const masterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
+        const activeInstanceId = item.decision?.activeInstanceId || item.decision?.mappingSnapshot?.activeInstanceId;
+        if (recurring && (!masterId || !activeInstanceId
+          || !eventIds.includes(masterId) || !eventIds.includes(activeInstanceId))) continue;
+
+        const readProviders = async (): Promise<{
+          absent: boolean; masterSeriesId?: string; reason?: string;
+        }> => {
+          for (const taskId of taskIds) {
+            if (await this.currentTask(clients.todoist, taskId)
+              || await this.state.getMappingByTaskAnyProfile(taskId)
+              || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
+          }
+          const events = new Map<string, CalendarEvent | undefined>();
+          for (const eventId of eventIds) {
+            const event = await this.currentEvent(clients.calendar, eventId);
+            events.set(eventId, event);
+            if (event && event.status !== "cancelled") return { absent: false };
+            if ((await Promise.all((["home", "antonio", "work"] as const)
+              .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
+              || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
+          }
+          if (!recurring) return { absent: true };
+          const relationship = verifyCancelledSeries(masterId, activeInstanceId, eventIds, events);
+          return { absent: relationship.valid, masterSeriesId: relationship.masterSeriesId,
+            reason: relationship.reason };
+        };
+        const first = await readProviders();
+        if (!first.absent || recurring && !first.masterSeriesId) continue;
+        const seriesKeys = recurring
+          ? deletedSeriesKeys(taskIds, eventIds, first.masterSeriesId!,
+            [item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId])
+          : [...new Set([...taskIds, ...eventIds])];
+        if (seriesKeys.length > 20) continue;
+
+        // The profile lookup GSI is eventually consistent and cannot prove
+        // absence. The exact task-, master-, occurrence- and iCalUID-keyed
+        // recurrence records are read strongly across all profiles instead.
+        // Their absences are fenced again INSIDE the terminal transaction.
+        const links = await readExactRecurrenceLinks(seriesKeys,
+          (owner, seriesId) => this.state.getRecurrenceLink(owner, seriesId));
+        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links, seriesKeys,
+          recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId! } : undefined);
+        if (classification.blocked.length) {
+          await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            reason: "live_or_ambiguous_recurrence_owner", blockers: classification.blocked.slice(0, 5),
+          });
+          continue;
+        }
+        // Re-read all provider identities after the state inventory. A changed
+        // master UID invalidates the series-key set rather than using old data.
+        const final = await readProviders();
+        if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId) continue;
+        const closed = await review.resolveVerifiedDeletedCase(item.id, {
+          profile, taskIds, eventIds, staleLinks: classification.stale,
+          seriesKeys, ...(recurring ? {
+            masterId, activeInstanceId, masterSeriesId: first.masterSeriesId,
+          } : {}),
+        });
+        if (closed) {
+          await this.state.audit(profile, "verified_deletion_cleanup_completed", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            retiredRecurrenceLinks: classification.stale.map(link => link.seriesId),
+          });
+        } else {
+          await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt);
+          await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
+            taskId: taskIds[0], eventId: eventIds[0],
+            reason: "case_state_mapping_repair_or_recurrence_changed_during_verified_deletion",
+          });
+        }
+      }
+      cursor = page.cursor as Record<string, unknown> | undefined;
+    } while (cursor && examined < 40);
+    await review.saveDeletionSweepCursor(profile, includeHistory, cursor);
+  }
+
   private async reconcileMapping(
     profile: Profile,
     mapping: Mapping,
@@ -538,6 +684,10 @@ export class SnapshotReconciler {
     }
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
+    if (mapping.recurrenceOwner === "todoist") {
+      const retired = await this.retireDeletedTodoistRecurrence(profile, mapping, clients);
+      if (retired) return retired;
+    }
     if (mapping.recurrenceOwner) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_recurring_deferred", {
         taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
@@ -639,7 +789,7 @@ export class SnapshotReconciler {
   }
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
-    if (await this.state.syncBlocked(profile, { taskId: task.id })) {
+    if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: task.id, reason: "active_review_control",
       });
@@ -813,6 +963,23 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
+    if (!continuation && tableName && this.state instanceof StateRepository) {
+      // A missed deletion webhook must not let recurring recovery re-create
+      // a surviving side before the terminal review pass. Prime exact-ID
+      // guards from already-open cases before any recurrence/provider writes.
+      const reviews = new ReviewStore();
+      let reviewCursor: Record<string, unknown> | undefined;
+      let indexed = 0;
+      do {
+        const page = await reviews.listCases(profile, reviewCursor, false);
+        for (const item of page.items) {
+          if (item.status !== "open") continue;
+          if (++indexed > 100) throw new Error("Too many active conflict identities to fence safely; reconciliation deferred");
+          await reviews.indexDeletedConflictCase(item);
+        }
+        reviewCursor = page.cursor as Record<string, unknown> | undefined;
+      } while (reviewCursor);
+    }
     if (!continuation) await this.reconcileExistingRecurrence(profile);
 
     const clients = await this.clients(profile);
@@ -888,6 +1055,8 @@ export class SnapshotReconciler {
       continuationSequence: continuation?.sequence || 0,
       counts,
     });
+    await this.retireVerifiedDeletedCases(profile, clients);
+    await this.retireVerifiedDeletedCases(profile, clients, true);
     return { processedCandidates, counts };
   }
 }

@@ -58,13 +58,20 @@ are not a substitute for strongly consistent checks before history deletion.
    `calendar_elapsed_standalone_event_ignored` and
    `calendar_archived_series_delta_ignored`. Other unknown or concerning
    `*_ignored` actions still produce significant `AUDIT#` records.
-5. The daily completed-task cleanup schedule is disabled **when
-   `CompletedHistoryCleanupApply=false`**. Manual dry-run remains available
-   through `npm run state:cleanup-completed`; setting the deployment flag to
-   `true` intentionally enables guarded daily retirement.
+5. The completed-task maintenance schedule is controlled by an explicit
+   EventBridge rule whose State reflects `CompletedHistoryCleanupApply`.
+   The production workflow reads the externally configurable
+   `vars.COMPLETED_HISTORY_CLEANUP_APPLY` (default `false`) and verifies
+   the deployed Lambda and rule. Manual dry-run remains available via
+   `npm run state:cleanup-completed`. Once #277 is deployed, a terminal
+   standalone completion holds its mapping for seven full days; the worker
+   then retires the unchanged mapping triplet together with the
+   `COMPLETED_TASK#` lookup. `COMPLETED_EVENT#` guards remain permanent.
 
-**No production records are purged or reindexed by these changes.** In
-particular, active review cases/repairs and all completed Calendar history
+**The earlier read-optimisation changes (#259/#260) do not purge records.**
+When this cleanup feature is explicitly enabled, it **does** retire eligible
+seven-day-old task indexes and matching standalone mapping rows in guarded
+transactions. Active review cases/repairs and all completed Calendar history
 guards are retained.
 
 ### Why we are not adding TTLs or a cleanup index
@@ -142,21 +149,66 @@ sam validate --template-file template.yaml --lint
 
 ## Staged deployment and rollback
 
-1. Review #255–#258 for concurrent edits to `template.yaml`; do not overwrite
-   capacity, SQS redrive, alarm or AWS Budget changes.
-2. Confirm `CompletedHistoryCleanupApply=false` in the *deployment parameter*
-   and the CloudFormation change set. No table/GSI replacement, TTL change,
-   retention purge, or enabling of automatic cleanup.
-3. Deploy, verify the EventBridge completed-cleanup schedule is disabled, and
-   replay historical one-off, archived master, overdue one-off, future-moved
-   one-off, cancelled event, recurring master/instance and completed-history
-   test cases.
-4. Check worker failure, SQS DLQ, sync-cursor progress, mutation safety and
-   all three profiles. Monitor 1-minute throttle spikes, not just averages.
-5. Roll back the application code and schedule config if any recurrence
-   progression, mapping ownership, sync cursor or review/erasure safety
-   regresses. **Do not** delete historical records to roll back.
+1. **Merge and deploy #277 first**, with the production environment variable
+   `COMPLETED_HISTORY_CLEANUP_APPLY` unset or `false`. Verify that completion
+   retains its `EVENT#`/`TASK#`/`TASKOWNER#` mapping until the guarded
+   seven-day retirement, and that uncompletion does not mutate Calendar.
+2. Review #255–#258 for concurrent edits to `template.yaml` (capacity, SQS,
+   alarms and Budgets). Inspect the CloudFormation change set before deploy:
+   there must be no table/GSI replacement, TTL change, unapproved data purge
+   or surprise enabling of cleanup.
+3. Merge the schedule-control PR (#275) with the toggle still `false`.
+   Confirm `CompletedHistoryCleanupApply=false`, Lambda apply=false,
+   and the deployed EventBridge rule **DISABLED**. Manual dry-run continues
+   to be available.
+4. Only after #277 is in the *exact deployed revision* and its CI/retirement
+   behaviour is verified, set the **production environment variable**
+   `COMPLETED_HISTORY_CLEANUP_APPLY=true` in GitHub and trigger a new
+   deployment (manual `workflow_dispatch` is supported). The workflow
+   performs an additional prerequisite-source gate and verifies that stack
+   parameter, Lambda apply flag and EventBridge rule all reflect `true`.
+5. Observe the first scheduled maintenance report, terminal/ambiguous/active
+   skip counts, completion guards, mapping transitions, DynamoDB throttles,
+   and all three profiles. Historical Calendar events must remain unchanged.
+6. **Rollback without changing application code:** set the production
+   environment variable to `false`, trigger the deployment again and
+   verify that the rule is `DISABLED` and Lambda apply=false. Previously
+   retired indexes are not automatically resurrected. Never delete
+   historical Calendar events or completion guards as a rollback.
 
 Reduced reads/writes improve capacity headroom; with DynamoDB
 **provisioned billing**, charges fall only if provisioned RCU/WCU is
 subsequently reduced (#255). This patch alone is not a guaranteed bill saving.
+
+## Production activation control (November 2026)
+
+`.github/workflows/deploy.yml` reads the production environment variable
+`vars.COMPLETED_HISTORY_CLEANUP_APPLY`, defaulting to **`false`**.
+`deploy.sh` passes it to CloudFormation's `CompletedHistoryCleanupApply`
+parameter. This is deliberately not hard-coded to `true`: merging #275
+before #277 or a routine automatic deployment cannot activate destructive
+cleanup unexpectedly.
+
+The EventBridge schedule is an explicit `AWS::Events::Rule` with
+`State: !If [RunCompletedHistoryCleanup, ENABLED, DISABLED]`; the old SAM
+`Schedule.Enabled` expression was flattened to enabled in the processed
+CloudFormation template. The explicit rule and Lambda permission reuse the
+previous generated logical IDs, avoiding a duplicate schedule.
+
+**#277 retained-mapping lifecycle:** completing a standalone Todoist task
+preserves its exact active mapping for seven days, without changing Calendar.
+Explicit uncompletion during that grace can cancel pending retirement after
+authoritative provider/transaction checks, also without touching Calendar.
+After seven full days of continuous terminal completion, the worker retires
+the exact unchanged mapping triplet and the task-facing completion lookup,
+while permanently retaining the event-side completion guard and Calendar
+history. A newly created task has a new ID and must create a *new* Calendar
+event, never reuse a historical event by title/date. Recurring tasks retain
+their separately guarded terminality policy.
+
+For activation, first deploy and verify #277, then set the external production
+variable to `true` and re-deploy. The workflow refuses to activate when
+the required source-level retained-mapping implementation and regression
+tests are missing. Verify stack parameter, Lambda variable and EventBridge
+rule state after deployment; set the variable back to `false` and redeploy
+for immediate scheduled-retirement rollback.

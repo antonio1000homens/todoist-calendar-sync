@@ -1,0 +1,116 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {readFile} from "node:fs/promises";
+import {collectRuntimeConfigAudit,verifyExpectedAccount} from "../scripts/audit-erasure-lambda-config.mjs";
+
+test("Lambda config audit binds its STS identity and SDK credentials to an explicit account/profile",async()=>{
+  assert.equal(verifyExpectedAccount({Account:"243857182133"},"243857182133"),"243857182133");
+  assert.throws(()=>verifyExpectedAccount({Account:"553490163883"},"243857182133"),/did not match/);
+  assert.throws(()=>verifyExpectedAccount({Account:"243857182133"},"invalid"),/did not match/);
+  const source=await readFile(new URL("../scripts/audit-erasure-lambda-config.mjs",import.meta.url),"utf8");
+  assert.match(source,/\["sts","get-caller-identity","--profile",profile/);
+  assert.match(source,/credentials:fromIni\(\{profile\}\)/);
+});
+
+test("Lambda config audit reads every published version and alias target but omits environment values",async()=>{
+  const sha1="a".repeat(44),sha2="b".repeat(44),seen=[];
+  const client={async send(command){
+    seen.push(command.constructor.name+":"+(command.input.Qualifier||command.input.FunctionName));
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[
+      {Version:"$LATEST",CodeSha256:sha2},{Version:"1",CodeSha256:sha1},{Version:"2",CodeSha256:sha2},
+    ]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[
+      {Name:"live",FunctionVersion:"2",RoutingConfig:{AdditionalVersionWeights:{"1":0.25}}},
+    ]};
+    if(command.constructor.name==="GetFunctionConfigurationCommand") {
+      const version=command.input.Qualifier;
+      const codeSha256=version==="1"?sha1:sha2;
+      return {FunctionName:command.input.FunctionName,Version:version,CodeSha256:codeSha256,
+        Environment:{Variables:{ERASURE_REPLAY_BARRIER_VERSION:version==="2"?"1":"0",
+          ERASURE_REPLAY_HMAC_KEYS:"{"+"key-1:private-secret"+"}",
+          ERASURE_REPLAY_HMAC_CURRENT_KEY:"key-1",
+          ERASURE_EXECUTION_ENABLED:version==="1"?"true":"false",
+          ERASURE_PROTOCOL_VERSION:version==="1"?"0":"1",TODOIST_API_TOKEN:"private-token"}}};
+    }
+    throw new Error("Unexpected AWS command");
+  }};
+  const report=await collectRuntimeConfigAudit(client,{functionNames:["todoist-calendar-sync-review-api-production"],region:"eu-west-2"});
+  const fn=report.functions[0];
+  assert.equal(fn.versionCount,3);assert.equal(fn.publishedVersionCount,2);
+  assert.deepEqual(fn.aliases,[{name:"live",version:"2",revisionId:null,weightedTargets:{"1":0.25}}]);
+  assert.deepEqual(fn.configs.map(item=>item.version),["1","2","$LATEST"]);
+  assert.equal(fn.replayBarrierEnabledCount,1);assert.equal(fn.replayBarrierPresentCount,3);
+  assert.equal(fn.replayHmacKeyRingPresentCount,3);assert.equal(fn.replayHmacCurrentKeyPresentCount,3);
+  assert.ok(fn.configs.every(item=>item.replayHmacKeyRing==="present"&&item.replayHmacCurrentKey==="present"));
+  assert.ok(fn.configs.every(item=>item.postwriteReview==="absent"));
+  assert.equal(fn.erasureExecutionEnabledCount,1);
+  assert.equal(fn.erasureExecutionReadyCount,0,"execution flag alone is not the runtime readiness predicate");
+  assert.equal(report.erasureExecutionReadyCount,0);
+  assert.equal(report.replayBarrierMayBeEnabled,false);
+  assert.equal(report.executableRecoveryMayBeEnabled,false);
+  assert.equal(JSON.stringify(report).includes("private-token"),false);
+  assert.equal(JSON.stringify(report).includes("private-secret"),false);
+  assert.equal(JSON.stringify(report).includes("key-1"),false);
+  assert.equal(seen.filter(value=>value.startsWith("GetFunctionConfigurationCommand:")).length,4);
+});
+
+test("Lambda config audit fails closed on pagination loops and alias targets missing from the version inventory",async()=>{
+  const loop={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"a"}],NextMarker:"same"};
+    throw new Error("Unexpected AWS command");
+  }};
+  await assert.rejects(collectRuntimeConfigAudit(loop,{functionNames:["sync-worker"],region:"eu-west-2"}),/Repeated or invalid/);
+  const badAlias={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"a"}]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[{Name:"live",FunctionVersion:"77"}]};
+    throw new Error("Unexpected AWS command");
+  }};
+  await assert.rejects(collectRuntimeConfigAudit(badAlias,{functionNames:["sync-worker"],region:"eu-west-2"}),/Alias target is absent/);
+});
+
+test("Lambda config audit counts executable readiness only when both exact deployment gates are enabled",async()=>{
+  const client={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"latest"}]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[]};
+    if(command.constructor.name==="GetFunctionConfigurationCommand")return {FunctionName:"sync-worker",Version:"$LATEST",
+      CodeSha256:"latest",Environment:{Variables:{ERASURE_EXECUTION_ENABLED:"true",ERASURE_PROTOCOL_VERSION:"1"}}};
+    throw new Error("Unexpected AWS command");
+  }};
+  const report=await collectRuntimeConfigAudit(client,{functionNames:["sync-worker"],region:"eu-west-2"});
+  assert.equal(report.functions[0].erasureExecutionEnabledCount,1);
+  assert.equal(report.functions[0].erasureExecutionReadyCount,1);
+  assert.equal(report.erasureExecutionReadyCount,1);
+});
+
+test("Lambda config audit fails closed when $LATEST environment flags change during the read",async()=>{
+  let latestReads=0;
+  const client={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"a"}]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[]};
+    if(command.constructor.name==="GetFunctionConfigurationCommand") {
+      const latest=command.input.Qualifier==="$LATEST";
+      if(latest&&++latestReads===2)return {FunctionName:"sync-worker",Version:"$LATEST",CodeSha256:"a",
+        Environment:{Variables:{ERASURE_REPLAY_BARRIER_VERSION:"1"}}};
+      return {FunctionName:"sync-worker",Version:"$LATEST",CodeSha256:"a",Environment:{Variables:{}}};
+    }
+    throw new Error("Unexpected AWS command");
+  }};
+  await assert.rejects(collectRuntimeConfigAudit(client,{functionNames:["sync-worker"],region:"eu-west-2"}),/\$LATEST configuration changed/);
+});
+
+test("Lambda config audit backs off and retries transient AWS read throttling",async()=>{
+  let latestReads=0;const delays=[];
+  const client={async send(command){
+    if(command.constructor.name==="ListVersionsByFunctionCommand")return {Versions:[{Version:"$LATEST",CodeSha256:"a"}]};
+    if(command.constructor.name==="ListAliasesCommand")return {Aliases:[]};
+    if(command.constructor.name==="GetFunctionConfigurationCommand") {
+      if(command.input.Qualifier==="$LATEST"&&latestReads++===0)
+        throw Object.assign(new Error("rate exceeded"),{name:"TooManyRequestsException",$metadata:{httpStatusCode:429}});
+      return {FunctionName:"sync-worker",Version:"$LATEST",CodeSha256:"a",Environment:{Variables:{}}};
+    }
+    throw new Error("Unexpected AWS command");
+  }};
+  const report=await collectRuntimeConfigAudit(client,{functionNames:["sync-worker"],region:"eu-west-2",sleep:async ms=>delays.push(ms)});
+  assert.equal(report.functions[0].versionCount,1);
+  assert.deepEqual(delays,[250]);
+});

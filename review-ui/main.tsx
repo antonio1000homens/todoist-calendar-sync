@@ -1,17 +1,20 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createReviewApiClient, createRetryingTask, isAbortError, reconciliationPollDelayMs } from "./api-client.mjs";
-import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility } from "./repair-selection.mjs";
+import { SYNC_PROFILES, reviewScopeLabel, reconciliationScopes, manualReconciliationTarget, createScopedRequestGate } from "./reconciliation-scope.mjs";
+import { emptyRepairSelection, reconcileRepairSelection, editRepairSelection, repairPreviewAllowed, repairRecurrenceOwnerRequirement, repairValidationField, missingDispositionReference, operationResumeEligibility, revalidateRepairAction } from "./repair-selection.mjs";
 import { createRoot } from "react-dom/client";
-import { ErasurePanel } from "./erasure-panel";
-import { providerIdentity, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
-import { caseUrl, caseIdentityState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
+import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
+import { ErasureRecoveryPanel } from "./erasure-recovery-panel";
+import { OrphanDeletionPanel } from "./orphan-deletion-panel";
+import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
+import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
 type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:string; newRule:string; calendarTimeZone?:string; expiredUntil?:string; previousOccurrence?:string; historicalLastOccurrence?:string };
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
-const profiles = ["all","home","antonio","work"];
+const profiles = ["all",...SYNC_PROFILES];
 const api = createReviewApiClient();
 function IdentityDetails({value,scope}:{value:any;scope?:string}) {
   const identity=providerIdentity(value);
@@ -24,7 +27,7 @@ function IdentityDetails({value,scope}:{value:any;scope?:string}) {
     {!identity.identified&&<span className="warning">Identity not verified. Refresh affected items before assigning a disposition.</span>}
   </div>;
 }
-function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,updateLeftover,choiceKey,requiredDispositionRef}:{item:any;action:string;taskId:string;eventId:string;scope:string;snapshots:any[];leftovers:Record<string,string>;updateLeftover:(key:string,value:string)=>void;choiceKey:(item:any)=>string;requiredDispositionRef?:string}) {
+function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,updateLeftover,choiceKey,requiredDispositionRef}:{item:any;action:string;taskId:string;eventId:string;scope?:string;snapshots:any[];leftovers:Record<string,string>;updateLeftover:(key:string,value:string)=>void;choiceKey:(item:any)=>string;requiredDispositionRef?:string}) {
   const key=choiceKey(item);
   const selectedItem=(item.ref.side==="todoist"?item.ref.id===taskId:item.ref.id===eventId);
   if(action==="calendar-history-only")return <div className="leftover" key={key}><div><IdentityDetails value={item} scope={scope}/><small className="relationship-reasons">Included because: {snapshotRelationship(item).join("; ")}</small></div><p>This item will be retained or detached only as described in the exact repair preview.</p></div>;
@@ -39,15 +42,19 @@ function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,upda
 }
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
+  const [inboxStatus,setInboxStatus]=useState<"loading"|"ready"|"error">("loading");
+  const requestGate=useRef(createScopedRequestGate("home")).current;
+  const navigationSequence=useRef(0);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
-  const [action,setAction] = useState("link"), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
+  const [action,setAction] = useState(""), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
   const [leftovers,setLeftovers] = useState<Record<string,string>>({}), [requiredDispositionRef,setRequiredDispositionRef] = useState<string>();
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
-  const [reconcileProfile,setReconcileProfile] = useState("home"), [reconciliation,setReconciliation] = useState<any>();
-  const [reconciliationDiagnostics,setReconciliationDiagnostics] = useState<any[]>([]), [diagnosticCursor,setDiagnosticCursor] = useState<string>();
+  const [reconcileProfile,setReconcileProfile] = useState("home");
+  type RunView={status:"loading"|"ready"|"error"; data?:any; diagnostics:any[]; cursor?:string; error?:string};
+  const [runViews,setRunViews]=useState<Record<string,RunView>>({});
   const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
   const selectionVersion = useRef(0);
   const [detailState,setDetailState] = useState<{key:string;status:"loading"|"retrying"|"ready"|"error";message?:string}>();
@@ -63,9 +70,16 @@ function App() {
     setDetailRetry(value=>value+1);
   };
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
+  const overviewProfiles=reconciliationScopes(profile);
+  const manualTarget=manualReconciliationTarget({filter:profile,selectedProfile:selected?.profile,chosenProfile:reconcileProfile});
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
+  const capabilities=availableRepairActions({caseItem:details?.item,snapshots:details?.snapshots||[],
+    selection:repairSelection,decision:details?.item?.decision,operation,profiles});
   const ownerRequirement=repairRecurrenceOwnerRequirement(repairSelection,details,action);
+  const formFields=actionFormFields(action,{hasRecurrence:capabilities.summary.hasRecurrence,ownerRequired:Boolean(ownerRequirement)});
+  const currentAction=capabilities.actions.find((item:any)=>item.id===action);
+  const capabilitySignature=capabilities.actions.map((item:any)=>item.id).join("|");
   const ownerExplanation=ownerRequirement === "calendar-occurrence"
     ? "This occurrence belongs to a recurring Calendar series. Choose which provider owns the recurrence."
     : ownerRequirement === "calendar-series"
@@ -73,7 +87,7 @@ function App() {
       : ownerRequirement === "todoist-task"
         ? "This Todoist task repeats. Select Todoist as recurrence owner unless repairing a Calendar-owned series."
         : undefined;
-  const canPreview=repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
+  const canPreview=Boolean(currentAction)&&repairPreviewAllowed(repairSelection,selected,details,action,decisionAction,owner)
     && Object.entries(leftovers).every(([key,disposition]) => (details?.snapshots||[]).some((s:any)=>
       `${s.ref.profile}:${s.ref.side}:${s.ref.id}`===key
       && dispositionOptions(s,action).length>0 && (!disposition || dispositionOptions(s,action).includes(disposition))));
@@ -81,60 +95,138 @@ function App() {
     && preview?.intent?.taskId===(taskId||undefined) && preview?.intent?.eventId===(eventId||undefined)
     && preview?.intent?.action===action ? preview : undefined;
   const invalidatePreview=()=>{selectionVersion.current++;setPreview(undefined);setSubmitKey("");setValidationError(undefined);};
+  // A newly missing, cancelled, completed, reassigned or unverified provider
+  // immediately revokes the chosen action. Never substitute another mutation.
+  useEffect(()=>{
+    if(!revalidateRepairAction(action,capabilities).revoked)return;
+    invalidatePreview();setAction("");setOwner("");setWinner("none");setScope("occurrence");
+    setLeftovers({});setRequiredDispositionRef(undefined);setDecisionAction("");setTargetProfile("");
+    setMessage("The selected repair action is no longer supported by current provider evidence. Recheck and choose an action again.");
+  },[action,capabilitySignature,selected?.id,selected?.profile,repairSelection.taskId,
+    repairSelection.eventId,repairSelection.verifiedTaskId,repairSelection.verifiedEventId,
+    details,operation?.status]);
+  const chooseRepairAction=(next:string)=>{
+    invalidatePreview();setAction(next);setOwner(next==="transfer"?"calendar":"");
+    setWinner("none");setScope(["flatten","transfer","todoist-only","todoist-only-delete-calendar","calendar-history-only"].includes(next)?"future":"occurrence");
+    setLeftovers({});setRequiredDispositionRef(undefined);setTargetProfile("");setDecisionAction("");
+  };
   const selectCase=(item?:Case,options:{syncUrl?:boolean}={})=>{
+    navigationSequence.current++;
     invalidatePreview();
-    if(item)setProfile(item.profile);
+    if(item){
+      requestGate.switchScope(item.profile);
+      if(item.profile!==profile){setProfile(item.profile);setCases([]);setInboxStatus("loading");setRunViews({});}
+      setReconcileProfile(item.profile);
+    }
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
-    setAction("link");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
+    setAction("");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
+  };
+  const changeReviewProfile=(next:string)=>{
+    if(!profiles.includes(next))return;
+    navigationSequence.current++;
+    requestGate.switchScope(next);
+    setProfile(next);setReconcileProfile(next==="all"?"":next);
+    setCases([]);setInboxStatus("loading");setRunViews({});
+    selectCase(undefined);
   };
   const editId=(side:"todoist"|"calendar",id:string,verified=false,searchedItem?:ProviderObject)=>{
     invalidatePreview();setRepairSelection(current=>editRepairSelection(current,side,id,verified,searchedItem));
   };
   const setTaskId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("todoist",id,verified,searchedItem);
   const setEventId=(id:string,verified=false,searchedItem?:ProviderObject)=>editId("calendar",id,verified,searchedItem);
-  const refresh = async () => { const data = await api(`cases?profile=${profile}&history=${history}`); setCases(data.items); };
-  const refreshReconciliation = async (forProfile:string) => {
-    const data=await api(`reconciliation?profile=${forProfile}`);
-    setReconciliation(data);
-    const generation=data.reconciliation?.generation;
-    if(generation){
-      const diagnostics=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}`);
-      setReconciliationDiagnostics(diagnostics.items||[]);setDiagnosticCursor(diagnostics.next);
-    } else {setReconciliationDiagnostics([]);setDiagnosticCursor(undefined);}
-    return data;
-  };
-  const loadMoreReconciliationDiagnostics = async () => {
-    const generation=reconciliation?.reconciliation?.generation;
-    if(!generation||!diagnosticCursor)return;
+  const refresh=async (signal?:AbortSignal)=>{
+    const ticket=requestGate.begin("inbox",profile);
+    if(!ticket)return;
+    setInboxStatus("loading");
     try {
-      const next=await api(`reconciliation/diagnostics?profile=${reconcileProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(diagnosticCursor)}`);
-      setReconciliationDiagnostics(current=>[...current,...(next.items||[])]);setDiagnosticCursor(next.next);
-    } catch(error:any) {setMessage(error.message);}
+      const data=await api(`cases?profile=${profile}&history=${history}`,signal?{signal}:undefined);
+      if(requestGate.current(ticket)){setCases(data.items||[]);setInboxStatus("ready");}
+    } catch(error:any) {
+      if(requestGate.current(ticket)&&!isAbortError(error)){setCases([]);setInboxStatus("error");}
+      throw error;
+    }
+  };
+  const refreshReconciliation=async(forProfile:string,options:{signal?:AbortSignal;quiet?:boolean}={})=>{
+    if(!SYNC_PROFILES.includes(forProfile))return undefined;
+    const ticket=requestGate.begin(`reconcile:${forProfile}`,profile);
+    if(!ticket)return undefined;
+    if(!options.quiet)setRunViews(current=>({...current,[forProfile]:{status:"loading",diagnostics:[]}}));
+    try {
+      const data=await api(`reconciliation?profile=${forProfile}`,options.signal?{signal:options.signal}:undefined);
+      if(!requestGate.current(ticket))return undefined;
+      const generation=data.reconciliation?.generation;
+      const diagnostics=generation?await api(
+        `reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}`,
+        options.signal?{signal:options.signal}:undefined):undefined;
+      if(requestGate.current(ticket)){
+        setRunViews(current=>({...current,[forProfile]:{
+          status:"ready",data,diagnostics:diagnostics?.items||[],cursor:diagnostics?.next,
+        }}));
+        return data;
+      }
+      return undefined;
+    } catch(error:any) {
+      if(!isAbortError(error)&&requestGate.current(ticket)){
+        setRunViews(current=>{
+          const previous=current[forProfile];
+          // A transient poll failure (including HTTP 429) must not erase a
+          // previously running generation: keep it visible and retry with
+          // backoff rather than silently stopping the polling effect.
+          if(options.quiet&&previous?.data)
+            return {...current,[forProfile]:{...previous,error:error.message}};
+          return {...current,[forProfile]:{status:"error",diagnostics:[],error:error.message}};
+        });
+      }
+      throw error;
+    }
+  };
+  const loadMoreReconciliationDiagnostics=async(forProfile:string)=>{
+    const view=runViews[forProfile],generation=view?.data?.reconciliation?.generation,cursor=view?.cursor;
+    if(!generation||!cursor)return;
+    const ticket=requestGate.begin(`more:${forProfile}`,profile);
+    if(!ticket)return;
+    try {
+      const next=await api(`reconciliation/diagnostics?profile=${forProfile}&generation=${encodeURIComponent(generation)}&after=${encodeURIComponent(cursor)}`);
+      if(!requestGate.current(ticket))return;
+      setRunViews(current=>{
+        const existing=current[forProfile];
+        if(existing?.data?.reconciliation?.generation!==generation||existing.cursor!==cursor)return current;
+        return {...current,[forProfile]:{...existing,diagnostics:[...existing.diagnostics,...(next.items||[])],cursor:next.next}};
+      });
+    } catch(error:any) {if(requestGate.current(ticket)&&!isAbortError(error))setMessage(error.message);}
   };
   useEffect(() => {
     const caseId = new URLSearchParams(location.search).get("case");
     if (!caseId) return;
     const controller=new AbortController();
+    const navigationId=++navigationSequence.current;
     api(`cases/${encodeURIComponent(caseId)}`,{signal:controller.signal})
-      .then(data=>{if(!controller.signal.aborted){setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});}})
-      .catch(e=>{if(!isAbortError(e))setMessage(e.message);});
+      .then(data=>{if(!controller.signal.aborted&&navigationId===navigationSequence.current)selectCase(data.item,{syncUrl:false});})
+      .catch(e=>{if(!controller.signal.aborted&&navigationId===navigationSequence.current&&!isAbortError(e))setMessage(e.message);});
     return ()=>controller.abort();
   },[]);
   useEffect(()=>{
     const onPopState=()=>{
       const caseId=new URLSearchParams(location.search).get("case");
       if(!caseId){selectionVersion.current++;selectCase(undefined,{syncUrl:false});return;}
+      const navigationId=++navigationSequence.current;
       api(`cases/${encodeURIComponent(caseId)}`).then(data=>{
-        selectionVersion.current++;setProfile(data.item.profile);selectCase(data.item,{syncUrl:false});
-      }).catch((error:any)=>setMessage(error.message));
+        if(navigationId!==navigationSequence.current)return;
+        selectionVersion.current++;selectCase(data.item,{syncUrl:false});
+      }).catch((error:any)=>{if(navigationId===navigationSequence.current)setMessage(error.message);});
     };
     window.addEventListener("popstate",onPopState);
     return()=>window.removeEventListener("popstate",onPopState);
   },[]);
-  useEffect(() => { refresh().catch(e=>setMessage(e.message)); },[profile,history]);
+  useEffect(()=>{
+    const controller=new AbortController();
+    setCases([]);setInboxStatus("loading");
+    refresh(controller.signal).catch(e=>{if(!controller.signal.aborted&&!isAbortError(e))setMessage(e.message);});
+    return ()=>controller.abort();
+  },[profile,history]);
   useEffect(() => {
     if (!selected) { setDetails(undefined); setPreview(undefined); setOperation(undefined); return; }
     const controller=new AbortController();
@@ -162,31 +254,51 @@ function App() {
     });
     return ()=>controller.abort();
   },[selected,detailRetry]);
-  useEffect(() => {
-    refreshReconciliation(reconcileProfile).catch(e=>setMessage(e.message));
-  },[reconcileProfile]);
-  useEffect(() => {
-    const currentRunStatus=reconciliation?.summary?.runStatus||reconciliation?.reconciliation?.status;
-    if (!reconciliation?.reconciliation?.pending||["succeeded","needs_review","failed"].includes(currentRunStatus||"")) return;
-    let cancelled=false;
-    let timer:number;
-    let pollFailures=0;
+  useEffect(()=>{
+    // Switching filters invalidates every older profile response, including
+    // the home -> work -> home race. Never render the previous scope as current.
+    requestGate.switchScope(profile);
+    setRunViews({});
+    const controller=new AbortController();
+    for(const target of reconciliationScopes(profile)) {
+      refreshReconciliation(target,{signal:controller.signal}).catch(e=>{
+        if(!controller.signal.aborted&&!isAbortError(e))setMessage(`Could not load reconciliation for ${target}: ${e.message}`);
+      });
+    }
+    return ()=>controller.abort();
+  },[profile]);
+  const pollingProfiles=overviewProfiles.filter(target=>{
+    const data=runViews[target]?.data;
+    const status=data?.summary?.runStatus||data?.reconciliation?.status;
+    return Boolean(data?.reconciliation?.pending&&!["succeeded","needs_review","failed"].includes(status||""));
+  });
+  const pollingKey=pollingProfiles.map(target=>`${target}:${runViews[target]?.data?.reconciliation?.generation}:${runViews[target]?.data?.reconciliation?.status}`).join("|");
+  useEffect(()=>{
+    if(!pollingKey)return;
+    let cancelled=false,timer:number,pollFailures=0;
+    const targets=[...pollingProfiles];
     const poll=async()=>{
-      try {
-        const data=await refreshReconciliation(reconcileProfile);
+      try{
+        const updates=await Promise.all(targets.map(target=>refreshReconciliation(target,{quiet:true})));
         if(cancelled)return;
         pollFailures=0;
-        const runStatus=data.summary?.runStatus||data.reconciliation?.status||"unknown";
-        const terminal=["succeeded","needs_review","failed"].includes(runStatus);
-        if(terminal||!data.reconciliation?.pending) {
-          setMessage(`Run ${runStatus}; ${data.summary?.actionableCaseCount??"some"} actionable review case(s) remain.`);
-          setTerminalInboxRefreshPending(true);
-        } else timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
-      } catch(e:any) { if(!cancelled){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));} }
+        let keepPolling=false;
+        updates.forEach((data,index)=>{
+          if(!data)return;
+          const status=data.summary?.runStatus||data.reconciliation?.status||"unknown";
+          if(["succeeded","needs_review","failed"].includes(status)||!data.reconciliation?.pending){
+            setMessage(`Run for ${targets[index]}: ${status}. ${data.summary?.actionableCaseCount??"Some"} actionable profile alerts remain.`);
+            setTerminalInboxRefreshPending(true);
+          }else keepPolling=true;
+        });
+        if(keepPolling)timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
+      }catch(e:any){
+        if(!cancelled&&!isAbortError(e)){pollFailures++;setMessage(e.message);timer=window.setTimeout(poll,reconciliationPollDelayMs(pollFailures));}
+      }
     };
     timer=window.setTimeout(poll,reconciliationPollDelayMs(0));
     return ()=>{cancelled=true;window.clearTimeout(timer);};
-  },[reconcileProfile,reconciliation?.reconciliation?.generation,reconciliation?.reconciliation?.pending,reconciliation?.summary?.runStatus,reconciliation?.reconciliation?.status]);
+  },[profile,pollingKey]);
   useEffect(() => {
     if (!terminalInboxRefreshPending) return;
     const refreshTask=createRetryingTask({
@@ -197,25 +309,33 @@ function App() {
     refreshTask.start();
     return ()=>refreshTask.stop();
   },[terminalInboxRefreshPending,profile,history]);
-  const providerLink=(item:ProviderObject|undefined) => {
-    const href=item?.url||item?.htmlLink;
-    if (!href) return undefined;
-    try { const parsed=new URL(href); return ["https:","http:"].includes(parsed.protocol)?parsed.href:undefined; } catch { return undefined; }
-  };
   const displaySnapshot=(sideName:"todoist"|"calendar") => {
     const matches=details?.snapshots?.filter((s:any)=>s.ref.profile===selected?.profile&&s.ref.side===sideName)||[];
-    const requestedId=sideName==="todoist"?taskId:eventId;
+    // Recorded evidence remains the primary identity even if there is no
+    // selectable live repair target.
+    const evidence=recordedPrimaryProviderIds(selected);
+    const requestedId=sideName==="todoist"?(taskId||evidence.taskId):(eventId||evidence.eventId);
     const current=matches.find((s:any)=>s.ref.id===requestedId)||(!requestedId&&matches.length===1?matches[0]:undefined);
     const item=current?.object as ProviderObject|undefined;
-    if (!item) return <p>{current?`The provider could not find ${sideName} item ${current.ref.id}.`:requestedId?`No live provider snapshot is available for recorded ${sideName} ID ${requestedId}.`:`No ${sideName} item ID is attached to this alert. Search for the item below to continue.`}</p>;
+    if (!item) return <div>
+      <p>{current?.lookupError?`The lookup for ${sideName} ${current.ref.id} could not be verified: ${current.lookupError}`:
+        current?`Recorded ${sideName} ${current.ref.id}: missing (404/410).`:
+        requestedId?`Recorded ${sideName} ID ${requestedId} has not been verified by a direct read.`:
+        `No ${sideName} ID is recorded on this alert.`}</p>
+      {matches.filter((candidate:any)=>candidate.ref.id!==current?.ref.id).map((candidate:any)=><p key={candidate.ref.id}>
+        {sideName==="calendar"&&candidate.ref.id===selected?.decision?.masterEventId?"Series master":
+          sideName==="calendar"&&candidate.ref.id===selected?.decision?.activeInstanceId?"Active instance":"Related identity"}:
+        <code>{candidate.ref.id}</code> — {recordedProviderState(sideName,candidate.ref.id,details?.snapshots,selected?.profile)}
+      </p>)}
+    </div>;
     const start=sideName==="todoist"?(item.due?.datetime||item.due?.date):(item.start?.dateTime||item.start?.date);
     const end=sideName==="calendar"?(item.end?.dateTime||item.end?.date):undefined;
     const recurrence=sideName==="todoist"?(item.due?.is_recurring?item.due.string||"Recurring":"None"):(item.recurrence?.join(" · ")||(item.recurringEventId?"Part of a recurring series":"None"));
-    const href=providerLink(item);
+    const href=providerLink(item,sideName);
     const seriesAssociation=current.recurrence
       ? `Todoist ${current.recurrence.taskId} ↔ Calendar occurrence ${current.recurrence.activeInstanceId||current.recurrence.eventId} · series master ${current.recurrence.masterEventId} (${current.recurrence.owner}-owned)`
       : undefined;
-    return <><IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
+    return <><IdentityDetails value={current} />{current.includedBy?.length>0&&<p className="relationship-reasons">Included because: {current.includedBy.join("; ")}</p>}{sideName==="calendar"&&item.status==="cancelled"&&<p className="warning">Cancelled / deleted in Google Calendar. Its retained URL is not an active event link.</p>}{href&&<p><a href={href} target="_blank" rel="noreferrer">Open in {sideName==="todoist"?"Todoist":"Google Calendar"}</a></p>}<dl><dt>Date</dt><dd>{start||"Not set"}{end?` → ${end}`:""}</dd><dt>Description</dt><dd>{item.description||"None"}</dd><dt>Recurrence</dt><dd>{recurrence}</dd><dt>Existing counterpart</dt><dd>{current.mapping?`${current.mapping.taskId} ↔ ${current.mapping.eventId}`:seriesAssociation||"No mapping recorded"}</dd></dl><small>Checked {current.checkedAt?new Date(current.checkedAt).toLocaleString():"just now"}</small><details><summary>Provider details</summary><pre>{JSON.stringify(item,null,2)}</pre></details></>;
   };
   const originalMapping=details?.item?.decision?.mappingSnapshot;
   const liveMapping=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.mapping?.profile===selected?.profile)?.mapping;
@@ -259,12 +379,23 @@ function App() {
     const requestVersion=selectionVersion.current;
     const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner:action==="transfer"?"none":winner,owner:owner||undefined,scope,leftovers,
       decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/affected`,{method:"POST",body:JSON.stringify(intent)});
+    try {
+      // Rechecking provider objects never needs a chosen mutation. Read-only
+      // GET can hydrate searched IDs and links without a fabricated action.
+      const query=new URLSearchParams({taskId:taskId||"",eventId:eventId||""});
+      const result=await api(`cases/${encodeURIComponent(selected.id)}/affected?${query}`);
       if(requestVersion!==selectionVersion.current)return;
-      setDetails((current:any)=>current?.item?.id===selected.id?{...current,snapshots:result.snapshots}:current);
-      setRepairSelection(current=>reconcileRepairSelection(selected,result.snapshots,current));setLeftovers({});
+      if(result.item?.id!==selected.id||result.item?.profile!==selected.profile)throw new Error("Case changed during recheck");
+      if (result.item?.status==="resolved" && result.item?.result?.startsWith("resolved_deleted")) {
+        selectCase(undefined);
+        await refresh();
+        setMessage("Verified deletion cleanup completed; the alert is no longer open. A terminal receipt is retained.");
+        return;
+      }
+      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots,deletionCleanup:result.deletionCleanup}:current);
+      setRepairSelection(current=>reconcileRepairSelection(result.item,result.snapshots,current));setLeftovers({});
       if(operationResumeEligibility(operation)==="fresh-preview") {
-        const refreshedSelection=reconcileRepairSelection(selected,result.snapshots,emptyRepairSelection(selected));
+        const refreshedSelection=reconcileRepairSelection(result.item,result.snapshots,emptyRepairSelection(result.item));
         setRepairSelection(refreshedSelection);
         setMessage(`Current provider items refreshed. The failed operation ${operation?.id} remains unchanged. Review the current Todoist and Calendar IDs, then create a new preview.`);
       }
@@ -318,91 +449,129 @@ function App() {
     }
     catch(e:any){if(e.data?.operation)setOperation(e.data.operation);setMessage(e.message);} finally{setBusy(false);}
   };
-  const runReconciliation=async () => {
-    const targetProfile=selected?.profile||reconcileProfile;
+  const runReconciliation=async()=>{
+    // The rendered target and the POST body are derived from one value. There
+    // is deliberately no "all" target or automatic multi-profile fan-out.
+    const target=manualTarget;
+    if(!target){setMessage("Choose one sync profile before requesting reconciliation.");return;}
     if(selected?.decision?.type==="operational_reconciliation_stuck"
-      && !window.confirm(`Request reconciliation for ${targetProfile}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
+      && !window.confirm(`Request reconciliation for ${target}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
+    const ticket=requestGate.begin(`manual:${target}`,profile);
+    if(!ticket)return;
     setBusy(true);setMessage("");
-    try { const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:targetProfile})});setReconciliation({reconciliation:result.run,summary:result.summary});const cleared=result.clearedDlq?.deleted||0;setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${targetProfile}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain; run outcome and inbox status are tracked separately.`); }
-    catch(e:any){setMessage(e.message);} finally{setBusy(false);}
+    try{
+      const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:target})});
+      if(!requestGate.current(ticket))return;
+      setRunViews(current=>({...current,[target]:{
+        status:"ready",data:{reconciliation:result.run,summary:result.summary},diagnostics:[],
+      }}));
+      const cleared=result.clearedDlq?.deleted||0;
+      setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${target}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain for this profile; run diagnostics and inbox counts are tracked separately.`);
+      refreshReconciliation(target,{quiet:true}).catch(e=>{
+        if(requestGate.current(ticket)&&!isAbortError(e))setMessage(`Reconciliation requested for ${target}, but status refresh failed: ${e.message}`);
+      });
+    }catch(error:any){
+      if(requestGate.current(ticket))setMessage(error.message);
+    }finally{if(requestGate.current(ticket))setBusy(false);}
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
-    if(!window.confirm("Dismiss this alert without changing Todoist, Calendar, or their mapping?"))return;
+    const dismissedCaseId=selected.id;
+    const selectedVersion=selectionVersion.current;
     setBusy(true);setMessage("");
-    try { const result=await api(`cases/${encodeURIComponent(selected.id)}/dismiss`,{method:"POST",body:"{}"});selectCase(result.item,{syncUrl:false});await refresh();setMessage("Alert dismissed. Its history remains available for later verification or exclusion."); }
+    try {
+      await api(`cases/${encodeURIComponent(dismissedCaseId)}/dismiss`,{method:"POST",body:"{}"});
+      // Do not discard another case that the operator selected while the request was pending.
+      if(selectedVersion===selectionVersion.current)selectCase(undefined);
+      await refresh();
+      setMessage("Alert dismissed. Select another alert, or show history to revisit it.");
+    }
     catch(e:any){setMessage(e.message);} finally{setBusy(false);}
   };
-  const decisionActions=(selected?.decision?.permittedActions||[]).filter((item:any)=>item.id!=="reconcile_now");
+  const decisionActions=capabilities.summary.decisionActions||[];
+  const recordedIds=recordedPrimaryProviderIds(selected);
+  const recordedTaskId=recordedIds.taskId, recordedEventId=recordedIds.eventId;
+  const verifiedRepairTarget=Boolean((taskId&&repairSelection.verifiedTaskId===taskId)
+    ||(eventId&&repairSelection.verifiedEventId===eventId));
   const snapshots=details?.snapshots||[];
   const affectedGroups=groupAffectedSnapshots(snapshots);
+  const showDispositions=Boolean(formFields.dispositions&&(action==="separate"||requiredDispositionRef
+    ||snapshots.some((item:any)=>item?.object
+      && (item.ref.side==="todoist"?item.ref.id!==taskId:item.ref.id!==eventId))));
   const choiceKey=(item:any)=>`${item.ref.profile}:${item.ref.side}:${item.ref.id}`;
   const availableSearchResults=searchResults.filter(item=>item._caseId===selected?.id&&item._profile===selected?.profile&&item._side===searchSide);
-  const identityEvidence=selected?caseIdentityState(selected,snapshots):undefined;
   const hasLiveIdentity=snapshots.some((snapshot:any)=>snapshot.ref?.profile===selected?.profile&&providerIdentity(snapshot).identified);
   const hasPrimaryProviderIds=Boolean(selected?.taskId||selected?.eventId||selected?.decision?.taskId||selected?.decision?.eventId
     ||alertContext.providerTaskId||alertContext.providerEventId);
   const showProviderPanels=Boolean(hasPrimaryProviderIds||hasLiveIdentity);
   const openCaseCount=cases.filter(item=>item.status==="open"||item.status==="repairing").length;
-  const latestRun=reconciliation?.reconciliation;
-  const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
-      <div className="header-actions"><label>Inbox <select value={profile} onChange={e=>{setProfile(e.target.value);selectCase(undefined);}}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All accounts":p}</option>)}</select></label>
+      <div className="header-actions"><label>Review alerts — profile <select aria-label="Review alerts — profile" value={profile} onChange={e=>changeReviewProfile(e.target.value)}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All profiles":p}</option>)}</select></label>
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
-    {message && <p className="notice" role="status">{message}</p>}
-    {reconciliation?.summary&&<section className="preview reconciliation-overview" aria-label="Latest reconciliation">
-      <h2>Latest reconciliation · {reconcileProfile}</h2>
-      <dl className="overview-grid"><dt>Run status</dt><dd>{reconciliation.summary.runStatus.replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
-        <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
-        <dt>Last run activity</dt><dd>{latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</dd>
-        <dt>Unresolved diagnostic counter</dt><dd>{reconciliation.summary.runUnresolved}</dd>
-        <dt>Items counted as blocked</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
-        <dt>Open review alerts</dt><dd>{openCaseCount} in this inbox · {reconciliation.summary.actionableCaseCount} actionable across the profile</dd></dl>
-      <p>Run diagnostics describe work deferred, blocked or in conflict during this generation. Open review alerts are persistent decisions in the review inbox; these counts measure different things. An intentional exclusion can still be counted as blocked, and an unchanged item can reappear if its inconsistency remains. Case status and a diagnostic's “review case” status show whether an alert is open, historic, or newly created.</p>
-    </section>}
-    {reconciliation?.reconciliation?.generation&&<section className="preview reconciliation-items"><h2>Items deferred or blocked during this run</h2>
-      <p>Generation {reconciliation.reconciliation.generation} · {latestRunAt?`run activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These are run diagnostics, not a count of open alerts. Provider objects are not changed by this report.</p>
-      {reconciliationDiagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
-        {reconciliationDiagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
-          <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
-          <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
-          {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
-          {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
-          {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
-          {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
-          {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
-          <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
-        </li>)}
-      </ul>}
-      {diagnosticCursor&&<button className="secondary" onClick={loadMoreReconciliationDiagnostics}>Load more run diagnostics</button>}
-    </section>}
-    <ErasurePanel api={api} />
-    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{openCaseCount} open/actionable case(s) shown in this inbox.</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
-      <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Reconciliation</h3><label>Account<select value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>{profiles.filter(p=>p!=="all").map(p=><option key={p}>{p}</option>)}</select></label><button onClick={runReconciliation} disabled={busy}>Run reconciliation</button>{reconciliation&&<details><summary>Current status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}</div></>:<>
+    {message&&<p className="notice" role="status">{message}</p>}
+    {profile==="all"&&<p className="notice">All profiles shows separate reconciliation runs for home, antonio and work. The combined review-alert list is not a reconciliation run and does not trigger any provider actions.</p>}
+    {overviewProfiles.map(runProfile=>{
+      const view=runViews[runProfile];
+      const reconciliation=view?.data;
+      const latestRun=reconciliation?.reconciliation;
+      const summary=reconciliation?.summary;
+      const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
+      return <React.Fragment key={runProfile}>
+        <section className="preview reconciliation-overview" aria-label={`Latest reconciliation for ${runProfile}`}>
+          <h2>Latest reconciliation · {runProfile}</h2>
+          {(!view||view.status==="loading")&&<p role="status">Loading reconciliation state for {runProfile}…</p>}
+          {view?.status==="error"&&<p className="warning" role="status">Could not load reconciliation for {runProfile}: {view.error}. This is not evidence of a successful or failed run.</p>}
+          {view?.status==="ready"&&!summary&&<p>No recorded reconciliation summary for {runProfile}.</p>}
+          {view?.status==="ready"&&summary&&<>
+            <dl className="overview-grid">
+              <dt>Run status</dt><dd>{(summary.runStatus||"unknown").replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
+              <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
+              <dt>Last run activity</dt><dd>{latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</dd>
+              <dt>Unresolved diagnostic counter for {runProfile}</dt><dd>{summary.runUnresolved??"Not recorded"}</dd>
+              <dt>Items counted as blocked in this run</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
+              <dt>Actionable review cases for {runProfile}</dt><dd>{summary.actionableCaseCount??"Not recorded"}</dd>
+            </dl>
+            <p>These are {runProfile}-only reconciliation results. The unresolved and blocked figures describe run diagnostics, not the number of open alerts in the review filter. Actionable cases are counted separately from run results and from the inbox list.</p>
+          </>}
+        </section>
+        {view?.status==="ready"&&latestRun?.generation&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
+          <h3>Run diagnostics · {runProfile}</h3>
+          <p>Generation {latestRun.generation} · {latestRunAt?`activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These per-run diagnostics are not open-alert counts and this report does not change provider data.</p>
+          {view.diagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
+            {view.diagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
+              <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
+              <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
+              {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
+              {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
+              {item.detail?.discardedTaskId&&<><span>Discarded task: {item.detail.discardedTaskId}</span><br/></>}
+              {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
+              {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
+              <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
+            </li>)}
+          </ul>}
+          {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
+        </section>}
+      </React.Fragment>;
+    })}
+    <ErasureRecoveryPanel api={api} />
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
+      <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Manual reconciliation · single profile</h3>
+          {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
+            <option value="">Select a profile — no reconciliation requested</option>
+            {SYNC_PROFILES.map(p=><option key={p} value={p}>{p}</option>)}
+          </select></label>}
+          <p>Target sync profile: <strong>{manualTarget||"Choose one profile above"}</strong>. This action runs only for the indicated profile; changing the review-alert filter never starts reconciliation.</p>
+          <button onClick={runReconciliation} disabled={busy||!manualTarget}>Run reconciliation {manualTarget?`for ${manualTarget}`:"(select profile)"}</button>
+          {manualTarget&&runViews[manualTarget]?.data&&<details><summary>Latest status for {manualTarget}</summary><pre>{JSON.stringify(runViews[manualTarget].data,null,2)}</pre></details>}
+        </div></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
-        <section className="preview alert-evidence"><h3>Why this alert is open</h3>
-          <p><strong>Recorded reason:</strong> {selected.reason.replaceAll("_"," ")}. {/(unmapped|identity_conflict|ambiguous)/i.test(`${selected.reason} ${selected.decision?.type||""}`)&&"Here, ‘unmapped’ means the sync identity or durable mapping is missing or ambiguous; it does not prove that the Calendar event is missing."}</p>
-          <dl><dt>First seen / opened</dt><dd>{selected.createdAt?new Date(selected.createdAt).toLocaleString():"Not recorded"}</dd>
-            <dt>Last recorded observation</dt><dd>{selected.decision?.context?.lastObservedAt||selected.decision?.context?.lastSeenAt||selected.decision?.context?.observedAt?new Date(selected.decision.context.lastObservedAt||selected.decision.context.lastSeenAt||selected.decision.context.observedAt).toLocaleString():"Not recorded; case update time is not treated as a provider observation"}</dd>
-            <dt>Case state</dt><dd>{selected.status}{selected.updatedAt?` · case record updated ${new Date(selected.updatedAt).toLocaleString()}`:""}</dd>
-            <dt>Earlier dismissal / reopen history</dt><dd>{selected.decision?.context?.reopenedAt||selected.decision?.context?.dismissedAt?`${selected.decision.context.dismissedAt?`dismissed ${new Date(selected.decision.context.dismissedAt).toLocaleString()}`:""}${selected.decision.context.reopenedAt?` · reopened ${new Date(selected.decision.context.reopenedAt).toLocaleString()}`:""}`:"Not recorded on this case"}</dd>
-            <dt>Reconciliation generation</dt><dd>{selected.reconciliationGeneration||selected.decision?.context?.reconciliationGeneration||"Not recorded"}</dd>
-            <dt>Detection evidence</dt><dd>{selected.decision?.sourceAuditAction||selected.decision?.context?.action||"No source audit action recorded"}{selected.decision?.context?.reason?` · ${String(selected.decision.context.reason).replaceAll("_"," ")}`:""}</dd>
-          </dl>
-          <p>Historical cause is not inferred from the current live items. The live provider panels below show what could be verified at this check.</p>
-          {identityEvidence?.hasAnyRecordedIdentity?<div><strong>Recorded provider identities</strong>
-            <p>Todoist IDs: {identityEvidence.taskIds.length?identityEvidence.taskIds.map((id:string)=><span key={`task-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedTaskIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
-            <p>Calendar IDs: {identityEvidence.eventIds.length?identityEvidence.eventIds.map((id:string)=><span key={`event-${id}`} className="identity-evidence">{id}{identityEvidence.verifiedEventIds.includes(id)?" · verified live":" · candidate / unverified"}</span>):"none"}</p>
-            {identityEvidence.seriesIds.length>0&&<p>Series identity (not a provider event ID): {identityEvidence.seriesIds.join(", ")}</p>}
-          </div>:<p className="warning">Unable to identify a provider item from the recorded alert. Search or refresh to establish a live identity; repair stays unavailable until a current item is verified.</p>}
-          {(selected.decision?.context?.candidateTaskIds?.length||selected.decision?.context?.candidateEventIds?.length||selected.decision?.context?.candidates?.length)&&<div className="candidate-search">
-            <p>Recorded candidate identities are not selected automatically. Search by a recorded title, then inspect the live provider identity before choosing one.</p>
-            <button className="secondary" onClick={()=>{setSearchSide("todoist");setSearchText(selected.decision?.context?.candidates?.[0]?.content||selected.decision?.context?.taskTitle||selected.title);}}>Search Todoist candidates</button>
-            <button className="secondary" onClick={()=>{setSearchSide("calendar");setSearchText(selected.decision?.context?.calendarTitle||selected.title);}}>Search Calendar candidates</button>
-          </div>}
-          <details><summary>Recorded alert evidence</summary><pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre></details>
+        <section className="preview alert-evidence">
+          <details><summary>Recorded alert evidence</summary>
+            <pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre>
+            {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p>}
+          </details>
         </section>
         {selected.decision?.type==="operational_reconciliation_stuck"&&<section className="preview"><h3>Reconciliation diagnostics</h3>
           <dl>
@@ -445,16 +614,6 @@ function App() {
           {details?.reconciliation?.run?.nextContinuation&&<p>Current expected continuation: {details.reconciliation.run.nextContinuation.deliveryId} · {details.reconciliation.run.nextContinuation.phase} sequence {details.reconciliation.run.nextContinuation.sequence}</p>}
           <p>These fields are diagnostics from persisted state. A monitor stall does not establish why progress stopped. A queue acceptance record does not confirm current queue or DLQ state.</p>
         </section>}
-        {selected.decision?.type?.startsWith("operational_")&&selected.decision?.type!=="operational_reconciliation_stuck"&&<details className="preview"><summary>Delivery failure details</summary><dl>
-          {selected.decision.context?.kind&&<><dt>Delivery type</dt><dd>{selected.decision.context.kind}</dd></>}
-          {selected.decision.context?.status&&<><dt>Provider response</dt><dd>HTTP {selected.decision.context.status}</dd></>}
-          {selected.decision.context?.failure&&<><dt>Failure</dt><dd>{selected.decision.context.failure}</dd></>}
-          {selected.decision.context?.deliveryId&&<><dt>Delivery ID</dt><dd>{selected.decision.context.deliveryId}</dd></>}
-          {selected.decision.context?.providerErrorTag&&<><dt>Provider error</dt><dd>{selected.decision.context.providerErrorTag}</dd></>}
-          {selected.decision.context?.reconcileStage&&<><dt>Reconciliation stage</dt><dd>{selected.decision.context.reconcileStage}</dd></>}
-          {selected.decision.context?.providerTaskId&&<><dt>Failing task ID</dt><dd>{selected.decision.context.providerTaskId}</dd></>}
-          {selected.decision.context?.providerEventId&&<><dt>Failing event ID</dt><dd>{selected.decision.context.providerEventId}</dd></>}
-        </dl><p>A failed delivery is not replayed. Search for current items and preview a guarded repair, or request a fresh reconciliation.</p></details>}
         {emptyOperationalExplanation&&<p className="notice">{emptyOperationalExplanation}</p>}
         {!details?<div className="notice detail-load" role="status">
           {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
@@ -464,15 +623,73 @@ function App() {
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
-        <div className="preview">
+        {details&&!details.deletionCleanup?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
+          item={details.item} snapshots={details.snapshots||[]} loading={busy}
+          recheck={refreshAffected} api={api}/>}
+        {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
+          <h3>Verified recurring deletion</h3>
+          <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
+          <p>Task: <code>{details.deletionCleanup.taskIds.join(", ")}</code> · Calendar master: <code>{details.deletionCleanup.masterId}</code>
+            {details.deletionCleanup.activeInstanceId&&<> · Active instance: <code>{details.deletionCleanup.activeInstanceId}</code></>}</p>
+          <ol>
+            <li>Provider items deleted — verified by direct reads</li>
+            <li>DynamoDB mappings/recurrence links — {details.deletionCleanup.state==="stale_recurrence"?
+              "obsolete recurrence link still present":details.deletionCleanup.state==="mapping_blocked"?
+              "mapping/ownership needs investigation":"no task-keyed recurrence link remains"}</li>
+            <li>Pending decisions/guards — {selected.decision?.status==="pending"?"pending automatic retirement":"checking persisted state"}</li>
+            <li>Verified conflict closure — {selected.status==="resolved"?"complete":"awaiting guarded cleanup"}</li>
+          </ol>
+          {details.deletionCleanup.state==="stale_recurrence"&&<p className="warning">Calendar and Todoist are deleted, but an obsolete recurrence link remains; automatic cleanup required.
+            {details.deletionCleanup.staleLinks.map((link:any)=><span key={link.seriesId}> <code>{link.seriesId}</code> (active <code>{link.activeInstanceId||link.eventId}</code>)</span>)}</p>}
+          {details.deletionCleanup.reason&&<p className="warning">{details.deletionCleanup.reason}</p>}
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck deletion state (read-only)</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Retry guarded cleanup via reconciliation</button>
+          <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
+        </section>}
+        {!details?.deletionCleanup?.bothGone&&<div className="preview">
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
-            <label>Action<select value={action} onChange={e=>{invalidatePreview();setAction(e.target.value);if(e.target.value==="flatten"||e.target.value==="todoist-only"||e.target.value==="todoist-only-delete-calendar"||e.target.value==="calendar-history-only"){setLeftovers({});setWinner("none");setOwner("");setScope("future");}if(e.target.value==="transfer"){setWinner("none");setOwner("calendar");setScope("future");}}}>{[
-              ["flatten","Flatten the selected recurring occurrence to a one-off pair"],["todoist-only","Make Todoist one-off; keep Calendar history without a counterpart"],["todoist-only-delete-calendar","Keep Todoist task; delete only its exact Calendar projection"],["calendar-history-only","Keep elapsed Calendar event; detach only its Todoist identity"],["link","Link or replace an association"],["transfer","Transfer an existing Calendar series to a recurring Todoist task"],["separate","Keep items separate (choose future syncing per item)"],["create","Create the missing counterpart"],["exclude","Keep selected items only in their current provider (exclude syncing)"],["decision","Apply an existing Slack decision"],["verify","Verify an existing association"],["move","Move task to another account"],
-            ].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-            <label>Todoist task ID<input value={taskId} onChange={e=>setTaskId(e.target.value)} placeholder="Select or search for a task" aria-invalid={validationError?.field==="taskId"} />{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
-            <label>Calendar event ID<input value={eventId} onChange={e=>setEventId(e.target.value)} placeholder="Select or search for an event" aria-invalid={validationError?.field==="eventId"} />{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>
+            {recordedTaskId&&<label>Todoist ID recorded on alert
+              <input value={recordedTaskId} readOnly aria-label="Recorded Todoist task ID" />
+              <small>Provider status: {recordedProviderState("todoist",recordedTaskId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            {recordedEventId&&<label>Calendar ID recorded on alert
+              <input value={recordedEventId} readOnly aria-label="Recorded Calendar event ID" />
+              <small>Provider status: {recordedProviderState("calendar",recordedEventId,snapshots,selected?.profile)}. Historical evidence; not automatically an actionable repair target.</small>
+            </label>}
+            <div className="item-identity" role="status" aria-live="polite">
+              <strong>Current repair context</strong>
+              <span>Todoist: {capabilities.summary.task}{capabilities.summary.verifiedTaskId&&` · ${capabilities.summary.verifiedTaskId}`}</span>
+              <span>Calendar: {capabilities.summary.event}{capabilities.summary.verifiedEventId&&` · ${capabilities.summary.verifiedEventId}`}</span>
+              <span>Association: {capabilities.summary.mapping} · recurrence: {capabilities.summary.recurrence}</span>
+              <small>{capabilities.summary.reason} Historical alert evidence is shown separately above.</small>
+            </div>
+            {!capabilities.actions.length&&<p className="notice" role="status">No currently eligible repair action. Recurrence cannot be inferred from a missing item. Recheck items (no changes), find an existing live item, run profile reconciliation, or dismiss the alert only.</p>}
+            {capabilities.actions.length>0&&<>
+              <label>What would you like to do?
+                <select aria-label="Recommended repair action" value={currentAction?.tier==="common"?action:""} onChange={e=>chooseRepairAction(e.target.value)}>
+                  <option value="">Choose an action (no changes)</option>
+                  {capabilities.actions.filter((item:any)=>item.tier==="common").map((item:any)=><option key={item.id} value={item.id}>{item.label}</option>)}
+                </select>
+              </label>
+              {currentAction&&<p className="action-explanation">{currentAction.explanation} A backend-validated preview and separate Apply step are still required.</p>}
+              {capabilities.actions.some((item:any)=>item.tier==="advanced")&&<details>
+                <summary>Advanced repairs — specialised operations</summary>
+                <label>Advanced repair action
+                  <select aria-label="Advanced repair action" value={currentAction?.tier==="advanced"?action:""} onChange={e=>chooseRepairAction(e.target.value)}>
+                    <option value="">Choose a specialised action</option>
+                    {capabilities.actions.filter((item:any)=>item.tier==="advanced").map((item:any)=><option key={item.id} value={item.id}>{item.label}</option>)}
+                  </select>
+                </label>
+              </details>}
+            </>}
+            <details><summary>Why aren't other actions shown?</summary>
+              <p>Only options with verified current provider evidence are selectable. Backend preview and apply checks still decide whether they are safe.</p>
+              <ul>{capabilities.unavailable.map((item:any)=><li key={item.id}><strong>{item.label}:</strong> {item.reason}</li>)}</ul>
+            </details>
+            {Boolean(action&&taskId)&&(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} readOnly placeholder="Find a verified Todoist task" aria-invalid={validationError?.field==="taskId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {Boolean(action&&eventId&&action!=="move")&&(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} readOnly placeholder="Find a verified Calendar event" aria-invalid={validationError?.field==="eventId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
             {action==="verify"&&liveMapping&&currentMappedEventId&&<button className="secondary" onClick={()=>{
               invalidatePreview();
@@ -484,25 +701,27 @@ function App() {
             {action==="todoist-only"&&<p className="notice">Choose the exact recurring Todoist task and a confirmed standalone Calendar item that is historical to it. The task keeps its due date as a one-off and is excluded from projection. The Calendar item is preserved byte-for-byte and excluded from future syncing.</p>}
             {action==="todoist-only-delete-calendar"&&<p className="warning">Choose the exact active one-off Todoist task and its mapped Calendar projection. Applying this repair deletes only that Calendar projection, keeps the Todoist task unchanged, removes the stale mapping, and excludes both exact IDs from future syncing. Closed cases may use a fresh preview against current IDs.</p>}
             {action==="calendar-history-only"&&<p className="warning">Choose one confirmed, elapsed standalone Calendar event. Preview will show its exact date range and mapping rows, along with any current/future counterpart that will remain linked. Applying changes only the selected event metadata and its exact event mapping.</p>}
-            {action==="create"&&<div className="source-choice"><span>Choose which item should get a new counterpart:</span><div><button className="secondary" onClick={()=>setEventId("")}>Create Calendar event from this Todoist task</button><button className="secondary" onClick={()=>setTaskId("")}>Create Todoist task from this Calendar event</button></div></div>}
-            {["link","transfer"].includes(action)&&<label>Fields to use<select value={action==="transfer"?"none":winner} disabled={action==="transfer"} onChange={e=>{invalidatePreview();setWinner(e.target.value);}} aria-invalid={validationError?.field==="winner"}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select>{action==="transfer"&&<small>The transfer preserves the Todoist task's existing recurrence and fields.</small>}{validationError?.field==="winner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
-            {["link","transfer","create"].includes(action)&&<label>Recurrence owner {ownerRequirement&&<strong>(required)</strong>}<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}} required={Boolean(ownerRequirement)} aria-invalid={validationError?.field==="owner" || Boolean(ownerRequirement&&!owner)} aria-describedby={ownerRequirement?"recurrence-owner-help":undefined}><option value="">{ownerRequirement?"Choose a recurrence owner":"No recurrence / leave unchanged"}</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select>{ownerExplanation&&<small id="recurrence-owner-help">{ownerExplanation}</small>}{validationError?.field==="owner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
-            {["flatten","todoist-only","todoist-only-delete-calendar","link","transfer","separate","create","exclude","verify"].includes(action)&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}} aria-invalid={validationError?.field==="scope"}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select>{validationError?.field==="scope"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {action==="create"&&<p className="notice">Verified source: {taskId?`Todoist task ${taskId}`:`Calendar event ${eventId}`}. The other side will be created only after an explicit preview and Apply repair.</p>}
+            {formFields.winner&&<label>Fields to use<select value={action==="transfer"?"none":winner} disabled={action==="transfer"} onChange={e=>{invalidatePreview();setWinner(e.target.value);}} aria-invalid={validationError?.field==="winner"}><option value="none">Keep current fields</option><option value="todoist">Use Todoist fields</option><option value="calendar">Use Calendar fields</option></select>{action==="transfer"&&<small>The transfer preserves the Todoist task's existing recurrence and fields.</small>}{validationError?.field==="winner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {formFields.owner&&<label>Recurrence owner {ownerRequirement&&<strong>(required)</strong>}<select value={owner} onChange={e=>{invalidatePreview();setOwner(e.target.value);}} required={Boolean(ownerRequirement)} aria-invalid={validationError?.field==="owner" || Boolean(ownerRequirement&&!owner)} aria-describedby={ownerRequirement?"recurrence-owner-help":undefined}><option value="">{ownerRequirement?"Choose a recurrence owner":"No recurrence / leave unchanged"}</option><option value="todoist">Todoist</option><option value="calendar">Calendar</option></select>{ownerExplanation&&<small id="recurrence-owner-help">{ownerExplanation}</small>}{validationError?.field==="owner"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
+            {formFields.scope&&<label>Recurrence scope<select value={scope} onChange={e=>{invalidatePreview();setScope(e.target.value);}} aria-invalid={validationError?.field==="scope"}><option value="occurrence">This occurrence</option><option value="series">Entire series</option><option value="future">Future occurrences (preserve history)</option></select>{validationError?.field==="scope"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {action==="move"&&<label>Destination account<select value={targetProfile} onChange={e=>{invalidatePreview();setTargetProfile(e.target.value);}}><option value="">Choose account</option>{profiles.filter(p=>p!=="all"&&p!==selected.profile).map(p=><option key={p}>{p}</option>)}</select></label>}
             {action==="decision"&&<label>Slack decision<select value={decisionAction} onChange={e=>{invalidatePreview();setDecisionAction(e.target.value);}}><option value="">Choose an allowed action</option>{decisionActions.map((item:any)=><option value={item.id} key={item.id}>{item.label}</option>)}</select></label>}
           </div>
+          {(!verifiedRepairTarget||!action||formFields.counterpartSearch)&&<details open={!verifiedRepairTarget}><summary>Find existing item / choose a different verified counterpart</summary>
           <div className="search"><label>Find counterpart<select value={searchSide} onChange={e=>{setSearchSide(e.target.value);setSearchResults([]);}}><option value="todoist">Todoist task</option><option value="calendar">Calendar event</option></select></label><input value={searchText} onChange={e=>setSearchText(e.target.value)} placeholder="Search titles or descriptions" onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();void search();}}} /><button className="secondary" onClick={search} disabled={busy||searchText.trim().length<2}>Search</button></div>
           {availableSearchResults.length>0&&<ul className="results">{availableSearchResults.map(item=><li key={item.id}><IdentityDetails value={item} scope={scope} /><button className="secondary" disabled={!providerIdentity(item).selectable} onClick={()=>searchSide==="todoist"?setTaskId(item.id,true,item):setEventId(item.id,true,item)}>Use this item</button></li>)}</ul>}
-          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Refresh affected items</button>
-          {snapshots.length>0&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object, the recorded relationship that included it, and whether a disposition is required for this repair.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{affectedGroups.map((group:any)=><section className="affected-group" key={group.key}>{group.seriesId||group.masterId?<h5>Recurring series group · {group.seriesId?`series ${group.seriesId}`:`master ${group.masterId}`}{group.masterId?` · Calendar master ${group.masterId}`:""}</h5>:null}{group.items.map((item:any)=><AffectedItem key={choiceKey(item)} item={item} action={action} taskId={taskId} eventId={eventId} scope={scope} snapshots={snapshots} leftovers={leftovers} updateLeftover={updateLeftover} choiceKey={choiceKey} requiredDispositionRef={requiredDispositionRef}/>)}</section>)}</div>}
-          {!canPreview&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: select the current provider item IDs or refresh affected items to verify edited IDs. Ambiguous or missing IDs are never carried over from another conflict."}</p>}
-          <button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair"}</button>
+          </details>}
+          <button className="secondary" onClick={refreshAffected} disabled={busy||!details}>Recheck items (no changes)</button>
+          {showDispositions&&<div><h4>{action==="separate"?"Separate these items":"Disposition for other affected items"}</h4><p>Each row identifies the exact provider object, the recorded relationship that included it, and whether a disposition is required for this repair.</p>{action==="transfer"&&<p className="warning">Delete is limited to exact standalone one-off duplicates with no retained completion history. Recurrences, occurrences, incomplete mappings, and historical items will be rejected by the preview.</p>}{affectedGroups.map((group:any)=><section className="affected-group" key={group.key}>{group.seriesId||group.masterId?<h5>Recurring series group · {group.seriesId?`series ${group.seriesId}`:`master ${group.masterId}`}{group.masterId?` · Calendar master ${group.masterId}`:""}</h5>:null}{group.items.map((item:any)=><AffectedItem key={choiceKey(item)} item={item} action={action} taskId={taskId} eventId={eventId} scope={formFields.scope?scope:undefined} snapshots={snapshots} leftovers={leftovers} updateLeftover={updateLeftover} choiceKey={choiceKey} requiredDispositionRef={requiredDispositionRef}/>)}</section>)}</div>}
+          {!canPreview&&Boolean(action)&&details&&<p className="warning" role="status">{ownerRequirement&&!owner?"Preview disabled: choose a recurrence owner above.":"Preview disabled: the selected live identities no longer satisfy this action. Recheck provider state and choose again."}</p>}
+          {Boolean(currentAction)&&<button onClick={createPreview} disabled={busy||!canPreview}>{busy?"Working…":"Preview repair (no changes)"}</button>}
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>{selected.decision?.type==="operational_reconciliation_stuck"?`Request fresh reconciliation for ${selected.profile}`:`Run reconciliation for ${selected.profile}`}</button>
           <p className="action-explanation">Run reconciliation scans the whole profile; it does not apply this one-case repair. Dismissing an alert hides the notification only and does not fix provider data or mappings.</p>
           {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
-          {reconciliation&&<details><summary>Reconciliation status</summary><pre>{JSON.stringify(reconciliation,null,2)}</pre></details>}
-        </div>
-        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p><p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p><h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={validPreview.intent.scope} />{item.includedBy?.length>0&&<p className="relationship-reasons">Included because: {item.includedBy.join("; ")}</p>}<div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
+          {selected&&runViews[selected.profile]?.data&&<details><summary>Reconciliation status · {selected.profile}</summary><pre>{JSON.stringify(runViews[selected.profile].data,null,2)}</pre></details>}
+        </div>}
+        {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p>{formFields.scope&&<p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p>}<h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={formFields.scope?validPreview.intent.scope:undefined} />{item.includedBy?.length>0&&<p className="relationship-reasons">Included because: {item.includedBy.join("; ")}</p>}<div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{operationResumeEligibility(operation)==="fresh-preview"?<><p>This failed operation has no recorded provider write. Refresh affected items and create a new preview; the old operation will remain available for audit.</p><button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh and create new preview</button></>:operationResumeEligibility(operation)==="resume"&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
     </div>

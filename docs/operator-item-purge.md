@@ -283,3 +283,86 @@ DynamoDB point-in-time recovery and external backups may retain erased values.
 This procedure only proves current table/provider state and does not delete
 backups. Historical repair and forensic evidence for the item is intentionally
 lost.
+
+
+## Post-write evidence inspection (issue #243; read-only staging)
+
+Following the staged replay-admission foundation (#251) and Calendar-source
+identity propagation (#299), an operator can inspect a *recorded*
+`review_required` erasure using the **Post-write evidence (read-only)** section
+of the review portal. The authenticated endpoint is
+`GET /review/api/erasure-postwrite-recoveries/{operationId}`.
+
+This endpoint reuses the strongly consistent, paginated provider/DynamoDB
+snapshot, owner-fence and epoch inspection, and original SQS worker mapping
+inventory used by pre-write inspection. It produces **only a redacted evidence
+assessment**: no Todoist/Calendar IDs, titles, timestamps, mapping UUIDs,
+comment bodies or underlying operation inventory are returned in the result.
+
+- **Not post-write:** no durable write stage was indicated. The existing,
+  independently verified *pre-write* procedure is the only possible recovery.
+- **Fully deleted candidate:** original selected actions and both exact
+  targets, a durable original deletion-start receipt, strong provider and
+  DynamoDB absence, an owned fence, epoch and drained leases have been
+  observed with no unexpected inspection blockers. This is a classification,
+  **not** authorisation for a recovery, mapping write or fence release.
+- **Partial or ambiguous:** an original deletion target, alias, worker
+  mapping, fence, snapshot integrity or another safety criterion is missing
+  or inconsistent. A future attempt to finish deletion will require a
+  **new**, independently reviewed deletion authorisation and action-time
+  provider version/digest checks. An old confirmation must not be reused.
+
+The endpoint does **not** have `POST /confirm`, `/apply`, or `/dispatch`
+routes. The assessment always returns `releaseAllowed: false` and
+`onlyAvailableAction: keep_fenced`. The legacy `RESTORE SYNC` flow
+continues to require `pre_write` classification and cannot act on a
+post-write assessment.
+
+**Still blocked:** source alias and cross-profile coverage, qualified old
+Lambda versions, privacy and IAM review, an independently verified
+postflight tied to an immutable new single-use typed confirmation, a fully
+conditional marker+fence release with no early admission, a newly authorised
+partial deletion flow, fault-injection matrix and disposable Work-profile
+staging. Do not enable `ERASURE_REPLAY_BARRIER_VERSION`, restore worker
+event-source mappings, remove fences, replay the DLQ, or run a live destructive
+test based solely on this preview.
+
+
+## Post-write fenced-review acknowledgement (issue #243, staged)
+
+An independently verified `fully_deleted_candidate` may now be bound to a
+**new, distinct, single-use review acknowledgement**, but this is NOT an
+authorisation to execute a post-write recovery.
+
+The authenticated review portal offers `POST
+/review/api/erasure-postwrite-recoveries/{operationId}/review-token` to issue
+a 5-minute token and `POST .../{operationId}/acknowledge` to consume it,
+after typing **REVIEW AND KEEP FENCED**, the exact original operation ID,
+and profile. The service checks full recovery evidence afresh before each
+action. The token is bound to operator, immutable original selections,
+provider action plan, exact target/alias inventory, operation revision,
+strong postflight snapshot, epoch and fenced worker state. Confirmation
+consumption is a conditional DynamoDB transaction, including the owned
+fence, epoch and journal, that persists only
+`postwriteReview.status=reviewed_fenced` and consumes a post-write-specific
+confirmation row. The operator identifier is removed when its token is consumed. The expired token can be replaced before consumption;
+a consumed token cannot be reissued or replayed.
+
+**Explicit rollout gate:** `ERASURE_POSTWRITE_REVIEW_VERSION` defaults to
+off. No deployment/template change enables it. Even if set to `1`,
+the API can only record an operator's review while preserving the original
+`review_required` operation, all provider data/absence evidence, the
+existing erasure fence, writer mappings and the monotonic epoch.
+
+No SQS dispatch, provider mutation, replay-marker installation or fence
+release is possible through this acknowledgement. The future privileged
+post-write executor will need **new independent verification and staged
+review** before any recovery. The pre-write `RESTORE SYNC` confirmation
+and the original erasure confirmation are not accepted.
+
+The partial/ambiguous cases do not qualify for this acknowledgement:
+they remain fenced until a separately reviewed, newly authorised
+action-time deletion/completion implementation exists. Keep #243 open
+until the full replay barrier, qualified Lambda/version audit, fault
+matrix, privacy/IAM approval and disposable Work-profile staging are
+complete. No production erasure or recovery is part of this increment.

@@ -20,7 +20,9 @@ import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
+import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
 import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
+import {assertReplayAdmission, ErasureReplayBlockedError, ErasureReplayUnavailableError, replayAdmissionEnabled} from "./erasure-replay-barrier.js";
 import { logEvent } from "./observability.js";
 import {
   MAX_SYNC_RECEIVES, failedDeliveryDisposition,
@@ -28,6 +30,7 @@ import {
 } from "./sqs-failure-policy.js";
 import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
+import { decodeSlackInteractionDelivery, isSlackControlUserAllowed } from "./slack-interaction.js";
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-worker", event, ...detail }));
@@ -358,12 +361,14 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
     let releaseWriterLease: (() => Promise<void>) | undefined;
+    let replayAdmission = false;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
       delivery = JSON.parse(record.body) as Delivery;
       state = new StateRepository();
+      replayAdmission = replayAdmissionEnabled();
       if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
         for (let attempt = 0; attempt < 3 && !releaseWriterLease; attempt++) {
           const currentErasureEpoch = await getErasureEpoch(delivery.profile);
@@ -383,6 +388,26 @@ export const handler: SQSHandler = async (event, context: Context) => {
           }
         }
         if (!releaseWriterLease) {
+          continue;
+        }
+      }
+      // Drop keyed erased-task webhooks before any delivery receipt, log with
+      // provider identity, audit, repair, or state write. The profile writer
+      // lease above remains held until the finally block releases it.
+      // An unknown identity is never treated as proof of admission.
+      if(delivery.kind==="todoist"&&replayAdmission) {
+        let taskId:string|undefined;
+        try {
+          const parsed=JSON.parse(delivery.body) as TodoistWebhookPayload;
+          taskId=parsed.event_data?.id;
+        } catch { throw new ErasureReplayUnavailableError("Malformed Todoist webhook under replay admission"); }
+        if(typeof taskId!=="string"||!taskId.length)
+          throw new ErasureReplayUnavailableError("Todoist webhook missing its task identity");
+        try {
+          await assertReplayAdmission({profile:delivery.profile,taskId});
+        } catch(error) {
+          if(!(error instanceof ErasureReplayBlockedError))throw error;
+          logEvent("erased_identity_delivery_suppressed",{profile:delivery.profile,kind:"todoist"});
           continue;
         }
       }
@@ -505,6 +530,28 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
 
+      if (delivery.slackInteraction) {
+        const interaction = delivery.slackInteraction;
+        delivery = decodeSlackInteractionDelivery(delivery);
+        const userId = delivery.manual?.slackUserId || "";
+        if (!isSlackControlUserAllowed(userId)) {
+          log("slack_interaction_rejected", {
+            awsRequestId: context.awsRequestId,
+            deliveryId: delivery.id,
+            reason: "user_not_allowlisted",
+            allowlistConfigured: String(process.env.SLACK_CONTROL_ALLOWED_USER_IDS || "").split(",").some((id) => Boolean(id.trim())),
+          });
+          continue;
+        }
+        log("slack_interaction_decoded", {
+          awsRequestId: context.awsRequestId,
+          deliveryId: delivery.id,
+          schemaVersion: interaction.schemaVersion,
+          interactionType: interaction.type,
+          profile: delivery.profile,
+        });
+      }
+
       if (delivery.kind === "manual") {
         if (delivery.manual?.command === "show_status") {
           await processStatusInbox(delivery, state);
@@ -575,6 +622,13 @@ export const handler: SQSHandler = async (event, context: Context) => {
       }
 
       if (delivery.kind === "todoist" && await manual.interceptTodoistDeletion(delivery, state)) {
+        const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
+        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
+          // This intercepted delivery never reaches Synchronizer.process.
+          // Index and schedule the same exact-ID deletion recheck before
+          // recording the original webhook as completed.
+          await requestDeletedConflictReview(state, delivery.profile, { taskIds: [payload.event_data.id] });
+        }
         await markCompleted();
         log("todoist_delete_deferred_for_manual_decision", {
           awsRequestId: context.awsRequestId,
@@ -651,7 +705,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // Fence/lease acquisition failures happen before this invocation is an
       // authorized writer. Do not let generic error reporting mutate state
       // outside the profile fence.
-      const mayWriteFailureState = process.env.ERASURE_PROTOCOL_VERSION !== "1" || !!releaseWriterLease;
+      const replayVersion = process.env.ERASURE_REPLAY_BARRIER_VERSION;
+      const replayDisabled = replayVersion === undefined || replayVersion === "" || replayVersion === "0";
+      const mayWriteFailureState = (process.env.ERASURE_PROTOCOL_VERSION !== "1" && replayDisabled)
+        || !!releaseWriterLease;
       if (!mayWriteFailureState) {
         failures.push({ itemIdentifier: record.messageId });
         continue;

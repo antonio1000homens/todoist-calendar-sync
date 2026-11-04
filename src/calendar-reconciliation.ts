@@ -1,4 +1,5 @@
 import { profiles } from "./config.js";
+import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference } from "./mapping-comments.js";
 import {
@@ -188,7 +189,7 @@ export async function reconcileUnmappedCalendar(
     return true;
   };
   const controlsBlockRecovery = async (eventIds: string[], taskId?: string): Promise<boolean> => {
-    for (const eventId of eventIds) if (await state.syncBlocked(profile,{eventId,taskId})) {
+    for (const eventId of eventIds) if (await state.syncBlocked(profile,{eventId,taskId}, true)) {
       summary.blocked += 1;
       await state.audit(profile,"calendar_snapshot_sync_control_blocked",{eventId,taskId});
       return true;
@@ -349,7 +350,7 @@ export async function reconcileUnmappedCalendar(
       if (!await canMutate(event.id)) return;
       if (await completionBlocksRecovery(event.id, true)) return;
       if (await controlsBlockRecovery([event.id])) return;
-      task = await pair.todoist.upsertTask(toTodoistTask(event));
+      task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
       tasks.push(task);
       await state.recordMutation(profile);
       created = true;
@@ -675,7 +676,7 @@ export async function reconcileUnmappedCalendar(
       if (!await canMutate(master.id)) return;
       if (await completionBlocksRecovery(active.id, true)) return;
       if (await controlsBlockRecovery([master.id,active.id])) return;
-      task = await pair.todoist.upsertTask(recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, seriesTimeZone) : toTodoistTask(active));
+      task = await pair.todoist.upsertTask(recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, seriesTimeZone) : toTodoistTask(active), undefined, calendarReplaySourceIds(active, master.id));
       tasks.push(task);
       await state.recordMutation(profile);
       created = true;

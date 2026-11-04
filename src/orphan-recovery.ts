@@ -8,7 +8,8 @@ import {
   type CanonicalIdentityRepository,
 } from "./canonical-identity.js";
 import { defaultProviderClientFactory, type ProviderClientFactory, type ProviderClients } from "./mutation-budget.js";
-import { ProjectAwareSynchronizer } from "./project-sync.js";
+import { acquireMoveWriterLeases, ProjectAwareSynchronizer } from "./project-sync.js";
+import { guardReplayProviderClients } from "./erasure-replay-providers.js";
 import { StateRepository } from "./repository.js";
 import { ignorableElapsedStandaloneCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
@@ -81,6 +82,10 @@ export class OrphanRecoveringSynchronizer {
     private readonly identities: CanonicalIdentityRepository = new CanonicalIdentityStore(),
   ) {}
 
+  private async clients(profile: Profile): Promise<ProviderClients> {
+    return guardReplayProviderClients(profile, await this.clientFactory(profile));
+  }
+
   async process(delivery: Delivery): Promise<void> {
     if (delivery.kind === "calendar") return this.processCalendar(delivery);
     if (delivery.kind === "todoist") return this.processTodoist(delivery);
@@ -104,7 +109,11 @@ export class OrphanRecoveringSynchronizer {
     for (const event of matching) {
       if (await this.state.syncBlocked(profile, { eventId: event.id })) continue;
       const existing = await this.state.getMappingByEvent(profile, event.id);
-      if (!existing) eligible.push(event);
+      // Completed events have no active mapping by design. An orphan identity
+      // match must never turn one into a mapping for a newly created task,
+      // including after the COMPLETED_TASK lookup has been retired.
+      const completed = await this.state.getCompletedCalendarProjectionByEvent?.(profile, event.id);
+      if (!existing && !completed) eligible.push(event);
     }
     return eligible;
   }
@@ -146,7 +155,7 @@ export class OrphanRecoveringSynchronizer {
       return;
     }
 
-    const clients = await this.clientFactory(delivery.profile);
+    const clients = await this.clients(delivery.profile);
     let delta: CalendarDelta;
     try {
       delta = await clients.calendar.listDelta(token);
@@ -184,6 +193,10 @@ export class OrphanRecoveringSynchronizer {
         continue;
       }
       if (!standaloneCalendarSource(event)) continue;
+      // No amount of title/date similarity can reassign a completed event.
+      // The permanent event-keyed completion guard survives cleanup of its
+      // task-keyed lookup after seven days.
+      if (await this.state.getCompletedCalendarProjectionByEvent?.(delivery.profile, event.id)) continue;
       const mapping = await this.state.getMappingByEvent(delivery.profile, event.id);
       if (mapping) {
         await this.seedCalendarIdentityFromMappedTask(delivery.profile, event, mapping, clients);
@@ -257,7 +270,7 @@ export class OrphanRecoveringSynchronizer {
     }
 
     const filteredClients: ProviderClientFactory = async (profile) => {
-      if (profile !== delivery.profile) return this.clientFactory(profile);
+      if (profile !== delivery.profile) return this.clients(profile);
       return {
         ...clients,
         calendar: proxiedCalendarWithDelta(clients, token, delta, blockedEventIds),
@@ -289,7 +302,7 @@ export class OrphanRecoveringSynchronizer {
   private async rememberTodoistResult(task: TodoistTask): Promise<void> {
     const mapping = await this.state.getMappingByTaskAnyProfile(task.id);
     if (!mapping || mapping.recurrenceOwner) return;
-    const clients = await this.clientFactory(mapping.profile);
+    const clients = await this.clients(mapping.profile);
     const taskIdentity = todoistCanonicalIdentity(task);
     if (taskIdentity) await this.identities.put(mapping.profile, "todoist", task.id, taskIdentity);
     try {
@@ -317,7 +330,7 @@ export class OrphanRecoveringSynchronizer {
     if (todoistCalendarLifecycle(payload)?.action === "upsert"
       && !await this.state.getMappingByTaskAnyProfile(task.id)) {
       const lookupProfile = profileForTodoistProject(task.project_id) || delivery.profile;
-      const { todoist } = await this.clientFactory(lookupProfile);
+      const { todoist } = await this.clients(lookupProfile);
       try {
         const currentTask = await todoist.getTask(task.id);
         if (currentTask.id !== task.id) throw new Error("Todoist returned a different task identity for an unmapped webhook");
@@ -335,13 +348,24 @@ export class OrphanRecoveringSynchronizer {
 
     let mapping = await this.state.getMappingByTaskAnyProfile(task.id);
     const targetProfile = mapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
-    const clients = await this.clientFactory(targetProfile);
+    const releaseTargetWriter = await acquireMoveWriterLeases([targetProfile], delivery.profile);
+    try {
+    const clients = await this.clients(targetProfile);
 
     if (mapping) {
       await this.seedTodoistIdentityFromMappedCalendar(targetProfile, task, mapping, clients);
     } else if (standaloneTodoistCandidate(task)) {
       const exact = await clients.calendar.findByTodoistTaskId(task.id);
       if (exact?.status !== "cancelled" && exact) {
+        // Provider breadcrumbs remain after a completion, but they do not
+        // authorise restoring its retired active mapping. Completion and
+        // uncompletion do not mutate Calendar, even for the same task ID.
+        if (await this.state.getCompletedCalendarProjectionByEvent?.(targetProfile, exact.id)) {
+          await this.state.audit(targetProfile, "todoist_completed_calendar_identity_not_rebound", {
+            taskId: task.id, eventId: exact.id,
+          });
+          return;
+        }
         if (await this.state.syncBlocked(targetProfile, { taskId: task.id, eventId: exact.id })) return;
         mapping = {
           profile: targetProfile,
@@ -355,7 +379,10 @@ export class OrphanRecoveringSynchronizer {
           taskId: task.id,
           eventId: exact.id,
         });
-      } else if (!exact) {
+      } else if (!exact && payload.event_name !== "item:added") {
+        // An explicitly newly created Todoist task gets a new Calendar event.
+        // Canonical title/date recovery is only a repair for an existing task;
+        // it cannot substitute an unrelated old event for this new task ID.
         const snapshot = await clients.calendar.listDelta();
         const currentIdentity = todoistCanonicalIdentity(task)!;
         const currentMatches = await this.eligibleCalendarMatches(targetProfile, snapshot.items, currentIdentity);
@@ -425,5 +452,8 @@ export class OrphanRecoveringSynchronizer {
 
     await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
     await this.rememberTodoistResult(task);
+    } finally {
+      await releaseTargetWriter();
+    }
   }
 }

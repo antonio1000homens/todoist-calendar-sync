@@ -1,4 +1,5 @@
 import { createSign, randomUUID } from "node:crypto";
+import {guardReplayCalendarClient} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
@@ -7,6 +8,45 @@ const CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3";
 const TODOIST_ROOT = "https://api.todoist.com/api/v1";
 const TODOIST_COMMENTS_ROOT = "https://api.todoist.com/api/v1/comments";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const MAX_ERASURE_AUDIT_PROJECTS=2048;
+const MAX_ERASURE_AUDIT_COMMENTS=100000;
+export type TodoistProjectCommentAudit={
+  projects:Array<{id:string;workspaceId?:number}>;
+  comments:TodoistCommentRecord[];
+};
+export type CalendarAuditDescriptor={id:string;accessRole:"freeBusyReader"|"reader"|"writer"|
+  "writerWithoutPrivateAccess"|"owner"|"configured-unlisted";configured:boolean};
+
+async function listTodoistCommentPages(
+  readPage:(cursor?:string)=>Promise<{results?:TodoistCommentRecord[];next_cursor?:unknown}>,
+  resource:string,
+):Promise<TodoistCommentRecord[]> {
+  const comments=new Map<string,TodoistCommentRecord>();
+  const seenCursors=new Set<string>();
+  let cursor:string|undefined;
+  for(let page=0;page<1000;page++) {
+    const result=await readPage(cursor);
+    if(!result||!Array.isArray(result.results))
+      throw new Error("Todoist "+resource+" comment inventory returned invalid results");
+    for(const comment of result.results) {
+      if(!comment||typeof comment.id!=="string"||!comment.id)
+        throw new Error("Todoist "+resource+" comment inventory returned an unidentified comment");
+      const previous=comments.get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist "+resource+" comment changed during pagination");
+      comments.set(comment.id,comment);
+      if(comments.size>50000)
+        throw new Error("Todoist "+resource+" comment inventory exceeded the result limit");
+    }
+    const next=result.next_cursor;
+    if(next===undefined||next===null||next==="")return [...comments.values()];
+    if(typeof next!=="string"||seenCursors.has(next))
+      throw new Error("Todoist "+resource+" comment inventory returned a repeated/invalid cursor");
+    seenCursors.add(next);
+    cursor=next;
+  }
+  throw new Error("Todoist "+resource+" comment inventory exceeded the page limit");
+}
 
 async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -110,30 +150,113 @@ export class GoogleCalendar {
     } while (true);
   }
 
-  async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
-    // The first Google result is not necessarily the active projection. Its
-    // ordering is unspecified, and showDeleted can return old cancelled copies.
-    // Never silently pick a candidate that could delete or overwrite another.
+  /**
+   * Return every Calendar event tagged with an exact Todoist task ID, including
+   * cancelled records and explicit recurrence overrides. This is OBSERVATION,
+   * not a comprehensive proof of identity or deletion: legacy untagged events,
+   * recurrence master/instance relationships and cross-profile provenance
+   * still require independent reads.
+   */
+  async listLinkedEventsByTodoistTaskId(taskId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
+    if (!/^[A-Za-z0-9_.-]{1,1024}$/.test(taskId))
+      throw new Error("Calendar alias inventory requires an exact Todoist task ID");
     const query = new URLSearchParams({
       showDeleted: "true",
+      singleEvents: "false",
       maxResults: "2500",
       sharedExtendedProperty: `taskId=${taskId}`,
     });
     const found = new Map<string, CalendarEvent>();
-    let pages = 0;
-    while (true) {
-      if (++pages > 20) throw new Error("Calendar task link lookup exceeded page limit");
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 20; page += 1) {
       const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
-        `/calendars/${encodeURIComponent(this.calendarId)}/events?${query}`,
+        `/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
       );
+      if (response.items !== undefined && !Array.isArray(response.items))
+        throw new Error("Calendar linked-event inventory returned invalid items");
       for (const event of response.items || []) {
-        found.set(event.id, event);
+        if (!event || typeof event.id !== "string" || !event.id)
+          throw new Error("Calendar linked-event inventory returned unidentified event");
+        const previous = found.get(event.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(event))
+          throw new Error("Calendar linked-event inventory changed during pagination");
+        found.set(event.id,event);
         if (found.size > 10000) throw new Error("Calendar task link lookup exceeded candidate limit");
       }
-      if (!response.nextPageToken) break;
-      query.set("pageToken", response.nextPageToken);
+      const next = response.nextPageToken;
+      if (next === undefined) return [...found.values()];
+      if (typeof next !== "string" || !next || seenTokens.has(next))
+        throw new Error("Calendar linked-event inventory returned repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken", next);
     }
-    return selectLinkedCalendarEvent(taskId, [...found.values()]);
+    throw new Error("Calendar task link lookup exceeded page limit");
+  }
+
+  /** Complete unfiltered Calendar event inventory for privileged read-only audits. */
+  async listCalendarListForErasureAudit():Promise<CalendarAuditDescriptor[]> {
+    const query=new URLSearchParams({maxResults:"250",showHidden:"true"});
+    const calendars=new Map<string,CalendarAuditDescriptor>();
+    const seenTokens=new Set<string>();
+    for(let page=0;page<100;page++) {
+      const response=await this.request<{items?:Array<{id?:unknown;accessRole?:unknown}>;nextPageToken?:string}>(
+        `/users/me/calendarList?${query}`);
+      if(response.items!==undefined&&!Array.isArray(response.items))
+        throw new Error("Calendar access inventory returned invalid items");
+      for(const item of response.items||[]) {
+        if(!item||typeof item.id!=="string"||!item.id||item.id.length>1024||/[\u0000-\u001f\u007f]/.test(item.id)
+          ||!(["freeBusyReader","reader","writer","writerWithoutPrivateAccess","owner"] as unknown[]).includes(item.accessRole))
+          throw new Error("Calendar access inventory returned an invalid calendar");
+        const descriptor={id:item.id,accessRole:item.accessRole as CalendarAuditDescriptor["accessRole"],configured:item.id===this.calendarId};
+        const previous=calendars.get(descriptor.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(descriptor))
+          throw new Error("Calendar access inventory changed during pagination");
+        calendars.set(descriptor.id,descriptor);
+        if(calendars.size>256)throw new Error("Calendar access inventory exceeded its safe calendar limit");
+      }
+      const next=response.nextPageToken;
+      if(next===undefined)break;
+      if(typeof next!=="string"||!next||seenTokens.has(next))
+        throw new Error("Calendar access inventory returned a repeated/invalid page token");
+      seenTokens.add(next);query.set("pageToken",next);
+      if(page===99)throw new Error("Calendar access inventory exceeded its page limit");
+    }
+    if(!calendars.has(this.calendarId))calendars.set(this.calendarId,{id:this.calendarId,accessRole:"configured-unlisted",configured:true});
+    return [...calendars.values()].sort((left,right)=>left.id.localeCompare(right.id));
+  }
+
+  async listAllEventsForErasureAudit(calendarId=this.calendarId): Promise<CalendarEvent[]> {
+    const query=new URLSearchParams({showDeleted:"true",singleEvents:"false",maxResults:"2500"});
+    const found=new Map<string,CalendarEvent>();
+    const seenTokens=new Set<string>();
+    for(let page=0;page<1000;page++) {
+      const response=await this.request<{items?:CalendarEvent[];nextPageToken?:string}>(
+        `/calendars/${encodeURIComponent(calendarId)}/events?${query}`,
+      );
+      if(response.items!==undefined&&!Array.isArray(response.items))
+        throw new Error("Calendar full inventory returned invalid items");
+      for(const event of response.items||[]) {
+        if(!event||typeof event.id!=="string"||!/^[A-Za-z0-9_.-]{1,1024}$/.test(event.id))
+          throw new Error("Calendar full inventory returned an unidentified event");
+        const previous=found.get(event.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(event))
+          throw new Error("Calendar event changed during full inventory pagination");
+        found.set(event.id,event);
+        if(found.size>100000)throw new Error("Calendar full inventory exceeded the audit result limit");
+      }
+      const next=response.nextPageToken;
+      if(next===undefined)return [...found.values()];
+      if(typeof next!=="string"||!next||seenTokens.has(next))
+        throw new Error("Calendar full inventory returned a repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken",next);
+    }
+    throw new Error("Calendar full inventory exceeded the page limit");
+  }
+
+  async findByTodoistTaskId(taskId: string): Promise<CalendarEvent | undefined> {
+    // Existing sync uses an exact UNIQUE candidate, never the first result.
+    return selectLinkedCalendarEvent(taskId, await this.listLinkedEventsByTodoistTaskId(taskId));
   }
 
   /**
@@ -200,8 +323,8 @@ export class GoogleCalendar {
     throw new Error("Calendar exception inventory exceeded page limit");
   }
 
-  async getEvent(eventId: string): Promise<CalendarEvent> {
-    return this.request(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`);
+  async getEvent(eventId: string, calendarId=this.calendarId): Promise<CalendarEvent> {
+    return this.request(`/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`);
   }
 
   async listInstances(masterEventId: string, after?: string): Promise<CalendarEvent[]> {
@@ -216,6 +339,50 @@ export class GoogleCalendar {
       if (response.nextPageToken) query.set("pageToken", response.nextPageToken);
       else return items;
     } while (true);
+  }
+
+  /**
+   * Bounded complete instance observation for the #307 recovery audit. Unlike
+   * date-windowed normal sync reads, this enumerates every page (including
+   * cancellations and exceptions). Oversized series fail closed after paging
+   * so the read-only audit can report a count without exposing any IDs.
+   */
+  async listEventInstances(masterId: string, calendarId=this.calendarId): Promise<CalendarEvent[]> {
+    if (typeof masterId !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(masterId))
+      throw new Error("Calendar instance inventory requires an exact master ID");
+    const query = new URLSearchParams({ showDeleted: "true", maxResults: "2500" });
+    const found = new Map<string, CalendarEvent>();
+    const seenTokens = new Set<string>();
+    for (let page = 0; page < 20; page += 1) {
+      const response = await this.request<{ items?: CalendarEvent[]; nextPageToken?: string }>(
+        `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(masterId)}/instances?${query}`,
+      );
+      if (response.items !== undefined && !Array.isArray(response.items))
+        throw new Error("Calendar instance inventory returned invalid items");
+      for (const event of response.items || []) {
+        if (!event || typeof event.id !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(event.id)
+          || event.recurringEventId !== masterId)
+          throw new Error("Calendar instance inventory returned an unattributable instance");
+        const previous = found.get(event.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(event))
+          throw new Error("Calendar instance inventory changed during pagination");
+        found.set(event.id, event);
+      }
+      const next = response.nextPageToken;
+      if (next === undefined) {
+        if(found.size>32) {
+          const error=new Error("Calendar recurring series exceeds replay marker bound");
+          Object.assign(error,{auditAliasCount:found.size});
+          throw error;
+        }
+        return [...found.values()];
+      }
+      if (typeof next !== "string" || !next || seenTokens.has(next))
+        throw new Error("Calendar instance inventory returned repeated/invalid pagination token");
+      seenTokens.add(next);
+      query.set("pageToken", next);
+    }
+    throw new Error("Calendar instance inventory exceeded page limit");
   }
 
   /** Bounded instance read: never expand an open-ended recurrence without limits. */
@@ -408,25 +575,94 @@ export class Todoist {
   }
 
   async listTasks(projectId = todoistProjectForToken(this.token)): Promise<TodoistTask[]> {
-    const tasks: TodoistTask[] = [];
-    let cursor: string | undefined;
-    do {
+    return this.readTasks(projectId);
+  }
+
+  /** Paginate the complete active-task collection for a read-only identity audit. */
+  async listAllTasksForErasureAudit(): Promise<TodoistTask[]> {
+    return this.readTasks(undefined);
+  }
+
+  /** Complete read-only task-comment inventory from Todoist's full Sync snapshot. */
+  async listAllTaskCommentsForErasureAudit(): Promise<{
+    comments:TodoistCommentRecord[];fullSyncDateUtc:string;
+  }> {
+    const headers=new Headers({authorization:`Bearer ${this.token}`});
+    headers.set("content-type","application/x-www-form-urlencoded");
+    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["notes"])});
+    let snapshot: {full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown};
+    for(let attempt=0;;attempt++) {
+      try {
+        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;sync_token?:unknown;full_sync_date_utc?:unknown}>(
+          await fetch(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body}));
+        break;
+      } catch(error) {
+        const status=Number((error as {status?:number}).status);
+        const transient=!status||status===408||status===429||status>=500;
+        if(!transient||attempt>=2)throw error;
+        await new Promise(resolve=>setTimeout(resolve,attempt===0?250:750));
+      }
+    }
+    if(snapshot.full_sync!==true||typeof snapshot.sync_token!=="string"||!snapshot.sync_token
+      ||!Array.isArray(snapshot.notes)||typeof snapshot.full_sync_date_utc!=="string"
+      ||!Number.isFinite(Date.parse(snapshot.full_sync_date_utc)))
+      throw new Error("Todoist task-comment full sync was incomplete");
+    const comments=new Map<string,TodoistCommentRecord>();
+    for(const value of snapshot.notes) {
+      if(!value||typeof value!=="object")throw new Error("Todoist task-comment full sync returned an invalid note");
+      const note=value as Record<string,unknown>;
+      if(typeof note.id!=="string"||!note.id||typeof note.item_id!=="string"||!note.item_id
+        ||typeof note.content!=="string"||(note.is_deleted!==undefined&&typeof note.is_deleted!=="boolean"))
+        throw new Error("Todoist task-comment full sync returned an unidentified note");
+      const comment:TodoistCommentRecord={id:note.id,task_id:note.item_id,content:note.content,
+        ...(note.is_deleted===undefined?{}:{is_deleted:note.is_deleted}),
+        ...(typeof note.posted_at==="string"?{posted_at:note.posted_at}:{})};
+      const previous=comments.get(comment.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(comment))
+        throw new Error("Todoist task comment changed within its full sync snapshot");
+      comments.set(comment.id,comment);
+      if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
+        throw new Error("Todoist task-comment full sync exceeded the audit result limit");
+    }
+    return {comments:[...comments.values()],fullSyncDateUtc:snapshot.full_sync_date_utc};
+  }
+
+  private async readTasks(projectId?:string): Promise<TodoistTask[]> {
+    const tasks=new Map<string,TodoistTask>();
+    const seenCursors=new Set<string>();
+    let cursor:string|undefined;
+    for(let pageNumber=0;pageNumber<1000;pageNumber++) {
       const query = new URLSearchParams();
       if (projectId) query.set("project_id", projectId);
       if (cursor) query.set("cursor", cursor);
       const suffix = query.size ? `?${query}` : "";
       const page = await this.request<{ results?: TodoistTask[]; next_cursor?: string }>(`/tasks${suffix}`);
-      tasks.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
-    return tasks;
+      if(!page||!Array.isArray(page.results))throw new Error("Todoist task inventory returned invalid results");
+      for(const task of page.results) {
+        if(!task||typeof task.id!=="string"||!task.id)
+          throw new Error("Todoist task inventory returned an unidentified task");
+        const previous=tasks.get(task.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(task))
+          throw new Error("Todoist task changed during inventory pagination");
+        tasks.set(task.id,task);
+        if(tasks.size>100000)throw new Error("Todoist task inventory exceeded the audit result limit");
+      }
+      const next=page.next_cursor;
+      if(next===undefined||next===null||next==="")return [...tasks.values()];
+      if(typeof next!=="string"||seenCursors.has(next))
+        throw new Error("Todoist task inventory returned a repeated/invalid cursor");
+      seenCursors.add(next);cursor=next;
+    }
+    throw new Error("Todoist task inventory exceeded the page limit");
   }
 
   async getTask(taskId: string): Promise<TodoistTask> {
     return this.request<TodoistTask>(`/tasks/${encodeURIComponent(taskId)}`);
   }
 
-  async upsertTask(task: Omit<TodoistTask, "id">, existingId?: string): Promise<TodoistTask> {
+  // sourceEventIds is a trusted, provider-read Calendar provenance hint for the
+  // replay-admission wrapper; it is never sent to Todoist's /tasks API.
+  async upsertTask(task: Omit<TodoistTask, "id">, existingId?: string, sourceEventIds?: readonly string[]): Promise<TodoistTask> {
     const path = existingId ? `/tasks/${encodeURIComponent(existingId)}` : "/tasks";
     const projectId = todoistProjectForToken(this.token);
     const payload = todoistTaskPayload(existingId ? task : { ...task, ...(task.project_id || !projectId ? {} : { project_id: projectId }) });
@@ -442,7 +678,9 @@ export class Todoist {
     return this.getTask(taskId);
   }
 
-  async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string): Promise<TodoistTask> {
+  // requestKey is an idempotency token, NOT an erasure identity. The replay
+  // wrapper admits creation only when sourceEventIds are supplied and checked.
+  async createTaskOnce(task: Omit<TodoistTask, "id">, requestKey: string, sourceEventIds?: readonly string[]): Promise<TodoistTask> {
     const { createHash } = await import("node:crypto");
     const h = createHash("sha256").update(requestKey).digest("hex");
     const uuid = `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
@@ -493,30 +731,101 @@ export class Todoist {
   async listProjectComments(projectId: string, refresh = false): Promise<TodoistCommentRecord[]> {
     const cached = this.projectCommentCache.get(projectId);
     if (cached && !refresh) return cached.slice();
-    const comments: TodoistCommentRecord[] = [];
-    let cursor: string | undefined;
-    do {
+    const comments=await listTodoistCommentPages(async cursor=>{
       const query = new URLSearchParams({ project_id: projectId });
       if (cursor) query.set("cursor", cursor);
-      const page = await this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
-      comments.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
+      return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
+    },"project");
     this.projectCommentCache.set(projectId, comments.slice());
     return comments;
   }
 
+  /**
+   * Read project comments across the complete accessible project inventory,
+   * including archived personal and workspace projects. Todoist's comments
+   * endpoint requires exactly one project_id or task_id, so querying only the
+   * configured sync project would miss provenance left after a project move.
+   * Inaccessible archived workspace inventories fail closed.
+   */
+  async listAllProjectCommentsForErasureAudit():Promise<TodoistProjectCommentAudit> {
+    const projects=new Map<string,number|null|undefined>();
+    const addProject=(value:unknown,workspaceId?:number)=>{
+      if(!value||typeof value!=="object")throw new Error("Todoist project audit returned an invalid project");
+      const project=value as {id?:unknown;workspace_id?:unknown};
+      if(typeof project.id!=="string"||!project.id)
+        throw new Error("Todoist project audit returned a project without an ID");
+      if(workspaceId!==undefined&&project.workspace_id!==undefined&&project.workspace_id!==workspaceId)
+        throw new Error("Todoist archived project disagrees with its workspace inventory");
+      const owner=workspaceId??(typeof project.workspace_id==="number"?project.workspace_id:
+        project.workspace_id===null?null:undefined);
+      const previous=projects.get(project.id);
+      if(projects.has(project.id)&&previous!==undefined&&owner!==undefined&&previous!==owner)
+        throw new Error("Todoist project audit found conflicting workspace ownership");
+      if(!projects.has(project.id)||previous===undefined)projects.set(project.id,owner);
+      if(projects.size>MAX_ERASURE_AUDIT_PROJECTS)
+        throw new Error("Todoist project audit exceeded its bounded project inventory");
+    };
+    const readPages=async(path:string,resultKey:"results"|"workspace_projects",workspaceId?:number)=>{
+      const seenCursors=new Set<string>();let cursor:string|undefined;
+      for(let pageNumber=0;pageNumber<1000;pageNumber++) {
+        const query=new URLSearchParams({limit:"200"});
+        if(cursor)query.set("cursor",cursor);
+        const page=await this.request<Record<string,unknown>>(`${path}?${query}`);
+        const items=page?.[resultKey];
+        if(!Array.isArray(items))throw new Error("Todoist project audit returned an invalid page");
+        for(const project of items)addProject(project,workspaceId);
+        const next=page.next_cursor;
+        if(next===undefined||next===null||next==="")return;
+        if(typeof next!=="string"||seenCursors.has(next))
+          throw new Error("Todoist project audit returned a repeated/invalid cursor");
+        seenCursors.add(next);cursor=next;
+      }
+      throw new Error("Todoist project audit exceeded its page limit");
+    };
+
+    await readPages("/projects","results");
+    await readPages("/projects/archived","results");
+    const workspaces=await this.request<unknown>("/workspaces");
+    if(!Array.isArray(workspaces))throw new Error("Todoist workspace audit returned an invalid inventory");
+    const workspaceIds=new Set<number>();
+    for(const workspace of workspaces) {
+      if(!workspace||typeof workspace!=="object"
+        ||!Number.isSafeInteger((workspace as {id?:unknown}).id)
+        ||Number((workspace as {id:number}).id)<=0)
+        throw new Error("Todoist workspace audit returned an invalid workspace ID");
+      workspaceIds.add(Number((workspace as {id:number}).id));
+    }
+    for(const workspaceId of workspaceIds)
+      await readPages(`/workspaces/${workspaceId}/projects/archived`,"workspace_projects",workspaceId);
+
+    const comments=new Map<string,TodoistCommentRecord>();
+    for(const projectId of projects.keys()) {
+      const projectComments=await this.listProjectComments(projectId,true);
+      for(const comment of projectComments) {
+        if(comment.project_id!==undefined&&comment.project_id!==projectId)
+          throw new Error("Todoist project comment audit returned a comment for another project");
+        const normalized={...comment,project_id:projectId};
+        const previous=comments.get(comment.id);
+        if(previous&&JSON.stringify(previous)!==JSON.stringify(normalized))
+          throw new Error("Todoist project comment changed across project inventories");
+        comments.set(comment.id,normalized);
+        if(comments.size>MAX_ERASURE_AUDIT_COMMENTS)
+          throw new Error("Todoist project comment audit exceeded its bounded result limit");
+      }
+    }
+    return {
+      projects:[...projects].map(([id,workspaceId])=>({id,...(typeof workspaceId==="number"?{workspaceId}:{})}))
+        .sort((left,right)=>left.id.localeCompare(right.id)),
+      comments:[...comments.values()],
+    };
+  }
+
   async listTaskComments(taskId: string): Promise<TodoistCommentRecord[]> {
-    const comments: TodoistCommentRecord[] = [];
-    let cursor: string | undefined;
-    do {
+    return listTodoistCommentPages(async cursor=>{
       const query = new URLSearchParams({ task_id: taskId });
       if (cursor) query.set("cursor", cursor);
-      const page = await this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
-      comments.push(...(page.results || []));
-      cursor = page.next_cursor || undefined;
-    } while (cursor);
-    return comments;
+      return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
+    },"task");
   }
 
   async createProjectComment(projectId: string, content: string): Promise<TodoistCommentRecord> {
@@ -674,6 +983,5 @@ export function todoistTaskPayload(task: Omit<TodoistTask, "id">): Record<string
 }
 
 export function calendarForProfile(credentials: GoogleCredentials, profile: Profile, calendarId: string): GoogleCalendar {
-  void profile;
-  return new GoogleCalendar(credentials, calendarId);
+  return guardReplayCalendarClient(profile,new GoogleCalendar(credentials, calendarId));
 }

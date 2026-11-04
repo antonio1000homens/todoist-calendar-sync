@@ -15,6 +15,7 @@ google_prefix="${GOOGLE_CREDENTIALS_PARAMETER_PREFIX:-${ssm_prefix%/}/google}"
 todoist_prefix="${TODOIST_TOKEN_PARAMETER_PREFIX:-${ssm_prefix%/}/todoist}"
 slack_bot_token_parameter="${SLACK_BOT_TOKEN_PARAMETER:-/lambdas/shared/slack-bot-token}"
 todoist_calendar_sync_slack_channel="${TODOIST_CALENDAR_SYNC_SLACK_CHANNEL:-}"
+slack_control_allowed_user_ids="${TODOIST_SLACK_ALLOWED_USER_IDS:-}"
 sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
 cloudflare_access_issuer="${CF_ACCESS_ISSUER:-}"
 cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
@@ -22,6 +23,12 @@ review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
 # A destructive production feature; deployments must explicitly opt in.
 erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
 capacity_reduction_approved="${DYNAMODB_CAPACITY_REDUCTION_APPROVED:-false}"
+# Explicit production opt-in; do not turn on retention cleanup for new stacks.
+completed_history_cleanup_apply="${COMPLETED_HISTORY_CLEANUP_APPLY:-false}"
+if [[ "$completed_history_cleanup_apply" != "true" && "$completed_history_cleanup_apply" != "false" ]]; then
+  echo "COMPLETED_HISTORY_CLEANUP_APPLY must be true or false" >&2
+  exit 2
+fi
 # Explicitly pass every provisioned table/index capacity. Otherwise a new
 # template default can silently override the existing 5/5 GSI stack parameter.
 state_table_read_capacity="${STATE_TABLE_READ_CAPACITY:-20}"
@@ -180,6 +187,34 @@ done
 
 echo "Validated required SSM parameter names without decrypting values."
 
+parameter_overrides=(
+  "ResourceNamePrefix=$resource_name_prefix"
+  "StateTableReadCapacity=$state_table_read_capacity"
+  "StateTableWriteCapacity=$state_table_write_capacity"
+  "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity"
+  "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity"
+  "CompletedHistoryCleanupApply=$completed_history_cleanup_apply"
+  "ErasureExecutionEnabled=$erasure_execution_enabled"
+  "CalendarWatchTokenParameter=$calendar_watch_token_parameter"
+  "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter"
+  "ProxySharedSecretParameter=$proxy_shared_secret_parameter"
+  "CalendarWatchCallbackUrl=$calendar_watch_callback_url"
+  "GoogleCredentialsParameterPrefix=$google_prefix"
+  "TodoistTokenParameterPrefix=$todoist_prefix"
+  "SlackBotTokenParameter=$slack_bot_token_parameter"
+  "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel"
+  "ProfileConfigJson=$sam_profile_config_json"
+  "CloudflareAccessIssuer=$cloudflare_access_issuer"
+  "CloudflareAccessAudience=$cloudflare_access_audience"
+  "ReviewOperatorEmails=$review_operator_emails"
+)
+if [[ -n "$slack_control_allowed_user_ids" ]]; then
+  parameter_overrides+=("SlackControlAllowedUserIds=$slack_control_allowed_user_ids")
+fi
+if [[ -n "${BILLING_ALARM_EMAIL:-}" ]]; then
+  parameter_overrides+=("BillingAlarmEmail=$BILLING_ALARM_EMAIL")
+fi
+
 sam deploy \
   --template-file .aws-sam/build/template.yaml \
   --stack-name "$stack_name" \
@@ -189,23 +224,4 @@ sam deploy \
   --capabilities CAPABILITY_IAM \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
-  --parameter-overrides \
-    "ResourceNamePrefix=$resource_name_prefix" \
-    "StateTableReadCapacity=$state_table_read_capacity" \
-    "StateTableWriteCapacity=$state_table_write_capacity" \
-    "ProfileLookupIndexReadCapacity=$profile_lookup_index_read_capacity" \
-    "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity" \
-    "ErasureExecutionEnabled=$erasure_execution_enabled" \
-    "CalendarWatchTokenParameter=$calendar_watch_token_parameter" \
-    "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter" \
-    "ProxySharedSecretParameter=$proxy_shared_secret_parameter" \
-    "CalendarWatchCallbackUrl=$calendar_watch_callback_url" \
-    "GoogleCredentialsParameterPrefix=$google_prefix" \
-    "TodoistTokenParameterPrefix=$todoist_prefix" \
-    "SlackBotTokenParameter=$slack_bot_token_parameter" \
-    "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel" \
-    "ProfileConfigJson=$sam_profile_config_json" \
-    "CloudflareAccessIssuer=$cloudflare_access_issuer" \
-    "CloudflareAccessAudience=$cloudflare_access_audience" \
-    "ReviewOperatorEmails=$review_operator_emails" \
-    ${BILLING_ALARM_EMAIL:+"BillingAlarmEmail=$BILLING_ALARM_EMAIL"}
+  --parameter-overrides "${parameter_overrides[@]}"

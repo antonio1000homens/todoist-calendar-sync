@@ -12,8 +12,22 @@ export function providerIdentity(value) {
   const end = side === "calendar" ? object?.end?.dateTime || object?.end?.date : undefined;
   const date = start ? end && end !== start ? `${start} → ${end}` : start
     : side === "todoist" ? "No due date" : "Start unavailable";
-  let recurrence = "One-off / not recurring";
-  if (side === "todoist" && object?.due?.is_recurring) {
+  // Missing providers and incomplete Calendar recurrence metadata must never
+  // be presented as proof that a historical item was standalone.
+  let recurrence = !object || object.id !== id || side === "calendar" && object.status !== "confirmed"
+    ? "Recurrence unknown — item unavailable / not verified"
+    : side === "calendar" && !object.recurringEventId && !Array.isArray(object.recurrence)
+      && (value?._side==="calendar" || !object.start || !object.end)
+      ? "Recurrence unknown — Calendar search/series metadata incomplete"
+      : object?.due?.is_recurring===undefined && side==="todoist" && object?.due
+        ? "Recurrence unknown — Todoist due rule unverified"
+        : "One-off / not recurring";
+  const current = Boolean(object?.id===id
+    && (side==="calendar" ? object.status==="confirmed"
+      : side==="todoist" ? !object.is_deleted&&!object.is_completed : false));
+  if (!current) {
+    recurrence = "Recurrence unknown — item unavailable / not verified";
+  } else if (side === "todoist" && object?.due?.is_recurring) {
     recurrence = `Recurring Todoist task (${object.due.string || "rule unavailable"})`;
   } else if (side === "calendar" && object?.recurringEventId) {
     const original = object.originalStartTime?.dateTime || object.originalStartTime?.date;
@@ -59,4 +73,18 @@ export function previewEffect(snapshot, intent, plan) {
   if (disposition === "retain-unlinked") return { operation:"Retain provider item and detach its old mapping", result:"Keep this exact provider object unchanged; detach only its obsolete mapping, ownership, comments, and baseline links" };
   if (disposition === "delete") return { operation:"Delete exact one-off and purge attributable state", result:"Apply only after the preview verifies this exact object has no recurrence or retained completion history" };
   return { operation:"Selected repair / contextual item", result:"See planned changes below" };
+}
+
+/** A retained Google htmlLink is not proof that an event still exists. */
+export function providerLink(item, side) {
+  if (!item || (side === "calendar" && item.status !== "confirmed")
+    || (side === "todoist" && item.is_deleted)) return undefined;
+  const href = item.url || item.htmlLink;
+  if (typeof href !== "string" || !href) return undefined;
+  try {
+    const parsed = new URL(href);
+    return ["https:", "http:"].includes(parsed.protocol) ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
 }

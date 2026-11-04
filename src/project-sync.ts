@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import {defaultProviderClientFactory} from "./mutation-budget.js";
+import {guardReplayProviderClients} from "./erasure-replay-providers.js";
+import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
@@ -18,6 +22,35 @@ export interface TodoistProjectTransition {
   action: TodoistProjectAction;
   fromProfile?: Profile;
   toProfile?: Profile;
+}
+
+/** Cross-profile transitions must be visible to each profile's erasure fence.
+ * The worker already holds the delivery-profile lease; acquire the other
+ * affected profile leases before any transition state/provider mutation. */
+export async function acquireMoveWriterLeases(profilesToWrite: Array<Profile | undefined>, deliveryProfile: Profile): Promise<() => Promise<void>> {
+  if (process.env.ERASURE_PROTOCOL_VERSION !== "1") return async () => {};
+  const profiles = [...new Set(profilesToWrite.filter((value): value is Profile => Boolean(value)))]
+    .filter(value => value !== deliveryProfile).sort();
+  const releases: Array<() => Promise<void>> = [];
+  try {
+    for (const profile of profiles) {
+      let release: (() => Promise<void>) | undefined;
+      for (let attempt = 0; attempt < 3 && !release; attempt++) {
+        const epoch = await getErasureEpoch(profile);
+        try {
+          release = await acquireErasureProtocolLease(profile, "writer", randomUUID(), epoch);
+        } catch (error) {
+          if (!(error instanceof ErasureEpochChangedError) || attempt === 2) throw error;
+        }
+      }
+      if (!release) throw new Error("Could not acquire cross-profile erasure writer lease");
+      releases.push(release);
+    }
+  } catch (error) {
+    for (const release of releases.reverse()) await release();
+    throw error;
+  }
+  return async () => { for (const release of releases.reverse()) await release(); };
 }
 
 export function todoistProjectTransition(
@@ -147,11 +180,8 @@ export class ProjectAwareSynchronizer {
   }
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return {
-      calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
-      todoist: new Todoist(await todoistToken(profile)),
-    };
+    if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
+    return defaultProviderClientFactory(profile);
   }
 
   private async completedProjectionsByTaskAnyProfile(taskId: string) {
@@ -355,20 +385,26 @@ export class ProjectAwareSynchronizer {
         const ownerProfiles = [...new Set(retained.map((projection) => projection.profile))];
         if (lifecycle.reason === "deleted") {
           for (const ownerProfile of ownerProfiles) {
+            const releaseOwnerWriter = await acquireMoveWriterLeases([ownerProfile], delivery.profile);
+            try {
             await this.delegate.process({
               ...delivery,
               profile: ownerProfile,
               body: JSON.stringify(payload),
             });
+            } finally { await releaseOwnerWriter(); }
           }
           return;
         }
         if (lifecycle.action === "complete_projection") {
-          return this.delegate.process({
+          const releaseOwnerWriter = await acquireMoveWriterLeases([retained[0].profile], delivery.profile);
+          try {
+          return await this.delegate.process({
             ...delivery,
             profile: retained[0].profile,
             body: JSON.stringify(payload),
           });
+          } finally { await releaseOwnerWriter(); }
         }
         return this.state.audit(retained[0].profile, "todoist_completed_projection_terminal_update_ignored", {
           taskId: task.id,
@@ -383,11 +419,14 @@ export class ProjectAwareSynchronizer {
     // the profile that currently owns it rather than interpreting a concurrent
     // project move as a reason to delete Calendar history.
     if (lifecycle.action === "complete_projection" && mapping?.profile) {
-      return this.delegate.process({
+      const releaseOwnerWriter = await acquireMoveWriterLeases([mapping.profile], delivery.profile);
+      try {
+      return await this.delegate.process({
         ...delivery,
         profile: mapping.profile,
         body: JSON.stringify(payload),
       });
+      } finally { await releaseOwnerWriter(); }
     }
 
     const oldProjectId = rawPayload.event_data_extra?.old_item?.project_id;
@@ -409,6 +448,9 @@ export class ProjectAwareSynchronizer {
     }
 
     if (transition.action === "move_projection" || transition.action === "delete_projection" || transition.action === "create_projection") {
+      const releaseMoveLeases = await acquireMoveWriterLeases(
+        [transition.fromProfile, transition.toProfile, mapping?.profile], delivery.profile);
+      try {
       const versionAccepted = await this.state.acceptTaskVersion(delivery.profile, task.id, task.updated_at, delivery.id);
       if (!versionAccepted && !explicitProjectChange) {
         return this.state.audit(delivery.profile, "todoist_stale_project_move_suppressed", {
@@ -433,10 +475,15 @@ export class ProjectAwareSynchronizer {
       }
       await this.applyProjectMove(delivery, task, lifecycle, transition, mapping);
       return;
+      } finally {
+        await releaseMoveLeases();
+      }
     }
 
     const destinationProfile = transition.toProfile || mapping?.profile;
     if (!destinationProfile) return;
+    const releaseDestinationWriter = await acquireMoveWriterLeases([destinationProfile], delivery.profile);
+    try {
     if (await this.applyActiveTodoistExceptionEdit(
       delivery,
       task,
@@ -451,7 +498,8 @@ export class ProjectAwareSynchronizer {
       profile: destinationProfile,
       body: JSON.stringify(payload),
     };
-    return this.delegate.process(routed);
+    return await this.delegate.process(routed);
+    } finally { await releaseDestinationWriter(); }
   }
 
   /**

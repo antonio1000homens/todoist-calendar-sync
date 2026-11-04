@@ -41,6 +41,24 @@ test("unsafe recurrence or active fence blocks confirmation-ready preview", asyn
   assert.ok(preview.blockers.some(value=>value.includes("fence is active")));
 });
 
+test("strong state scan rejects a repeated pagination cursor instead of accepting an incomplete inventory",async()=>{
+  const cursor={pk:"AUDIT#home#one",sk:"STATE"};
+  let scans=0;
+  const db={send:async command=>{
+    if(command.constructor.name!=="ScanCommand")return {};
+    scans++;
+    return {Items:[scans===1
+      ?{pk:"TASK#home#task-123",sk:"MAP",taskId:"task-123"}
+      :{pk:"AUDIT#home#second",sk:"STATE",detail:"new row"}],LastEvaluatedKey:cursor};
+  }};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>undefined,findByTodoistTaskId:async()=>undefined}};
+  await assert.rejects(buildErasurePreview({profile:"home",taskId:"task-123",deleteCalendar:false},
+    {db,clients,inspectFence:async()=>({leases:[]})}),/repeated a pagination cursor/);
+  assert.equal(scans,2);
+});
+
 test("malformed live provider responses cannot produce an exact preview", async t => {
   for (const [name, todoistTask, calendarEvent, target] of [
     ["empty Todoist response", {}, undefined, { profile:"home", taskId:"task-123", deleteCalendar:false }],

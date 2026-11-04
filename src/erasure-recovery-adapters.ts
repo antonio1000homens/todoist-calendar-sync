@@ -58,6 +58,7 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
         ...(operation.target.eventId?{eventId:operation.target.eventId}:{}),
         deleteCalendar:operation.selectedActions.deleteCalendar},
       {db:documentClient,clients:await defaultProviderClientFactory(operation.profile),
+        auditCrossProfileIdentity:true,
         inspectFence:async profile=>{
           const value=await inspectErasureFence(profile);
           return {fence:value.fence,leases:value.leases};
