@@ -5,6 +5,7 @@ import {findLambdaInvocationCandidates} from "../scripts/audit-erasure-lambda-id
 const accountId="123456789012";
 const inventory={purpose:"issue-307-read-only-qualified-lambda-inventory",
   status:"BLOCKED_PENDING_INDEPENDENT_WRITER_AND_IAM_AUDIT",region:"eu-west-2",
+  verifiedAccount:accountId,
   expectedFunctions:["todoist-calendar-sync-review-api-production"],missingExpected:[],
   functions:[{name:"todoist-calendar-sync-review-api-production",
     versions:[{qualifier:"$LATEST"},{qualifier:"8"},{qualifier:"9"}],
@@ -76,5 +77,6 @@ test("conditions and NotResource remain candidates, and policy variables are tre
 test("rejects incomplete inventories and invalid account identities",()=>{
   assert.throws(()=>findLambdaInvocationCandidates({inventory,accountId:"",authorization:authorization()}),/verified/);
   assert.throws(()=>findLambdaInvocationCandidates({inventory:{region:"eu-west-2",functions:[]},accountId,authorization:authorization()}),/complete Lambda/);
+  assert.throws(()=>findLambdaInvocationCandidates({inventory:{...inventory,verifiedAccount:"999999999999"},accountId,authorization:authorization()}),/complete Lambda/);
   assert.throws(()=>findLambdaInvocationCandidates({inventory,accountId,authorization:{Users:[],Roles:[]}}),/IAM authorization inventory/);
 });

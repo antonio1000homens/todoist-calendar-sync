@@ -63,7 +63,7 @@ inventory, and deliberately refuses to make any safety or deletion decision.
 
 Example capture (the audit command intentionally exits 2):
 
-    node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=eu-west-2 > lambda-inventory.json
+    node scripts/audit-erasure-lambda-invokers.mjs --prefix=todoist-calendar-sync --stage=production --region=<region> --profile=<profile> --expected-account=<12-digit-account> > lambda-inventory.json
 
 Then create a review report (also deliberately exits 2):
 

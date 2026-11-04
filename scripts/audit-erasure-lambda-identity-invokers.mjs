@@ -27,10 +27,13 @@ function targetArns(inventory,account,partition="aws") {
     ||!Array.isArray(inventory.expectedFunctions)||!inventory.expectedFunctions.length
     ||!Array.isArray(inventory.missingExpected)||inventory.missingExpected.length
     ||typeof inventory.region!=="string"||!/^([a-z]{2}(?:-gov)?-[a-z]+-\d+)$/.test(inventory.region)
+    ||inventory.verifiedAccount!==account
     ||!Array.isArray(inventory.functions)||!inventory.functions.length)
     throw new Error("A complete Lambda qualifier inventory is required");
   const names=new Set(inventory.functions.map(fn=>fn?.name));
-  if(names.size!==inventory.functions.length||inventory.expectedFunctions.some(name=>!names.has(name)))
+  if(names.size!==inventory.functions.length
+    ||new Set(inventory.expectedFunctions).size!==inventory.expectedFunctions.length
+    ||inventory.expectedFunctions.some(name=>!names.has(name)))
     throw new Error("Lambda qualifier inventory does not match expected function names");
   const targets=[];
   for(const fn of inventory.functions) {
@@ -47,14 +50,18 @@ function targetArns(inventory,account,partition="aws") {
       if(typeof version?.qualifier!=="string"||version.qualifier==="$LATEST")continue;
       targets.push({arn:`${base}:${version.qualifier}`,functionName:fn.name,qualifier:version.qualifier});
     }
+    const aliasNames=new Set();
     for(const alias of fn.aliases) {
       if(typeof alias?.name!=="string"||!alias.name||typeof alias.version!=="string"
         ||!versions.has(alias.version)||alias.version==="$LATEST"||!alias.additionalVersions
+        ||!NAME.test(alias.name)||aliasNames.has(alias.name)
         ||typeof alias.additionalVersions!=="object"||Array.isArray(alias.additionalVersions))
         throw new Error("Malformed Lambda alias inventory");
+      aliasNames.add(alias.name);
       targets.push({arn:`${base}:${alias.name}`,functionName:fn.name,qualifier:alias.name});
-      for(const version of Object.keys(alias.additionalVersions))if(!versions.has(version)||version==="$LATEST")
-        throw new Error("Weighted alias references an unknown published version");
+      for(const [version,weight] of Object.entries(alias.additionalVersions))
+        if(!versions.has(version)||version==="$LATEST"||typeof weight!=="number"||!Number.isFinite(weight)||weight<0||weight>1)
+          throw new Error("Weighted alias references an unknown version or has an invalid weight");
     }
   }
   return targets;
@@ -206,6 +213,7 @@ export function main(argv=process.argv.slice(2)) {
   const identity=runAws(profile,["sts","get-caller-identity"]);
   if(identity.Account!==expectedAccount)throw new Error("AWS profile account did not match --expected-account");
   const inventory=JSON.parse(readFileSync(inventoryPath,"utf8"));
+  if(inventory.verifiedAccount!==identity.Account)throw new Error("Lambda inventory belongs to a different AWS account");
   const rawAuthorization=runAws(profile,["iam","get-account-authorization-details"]);
   const authorization={Users:rawAuthorization.UserDetailList,Roles:rawAuthorization.RoleDetailList,
     Groups:rawAuthorization.GroupDetailList,Policies:rawAuthorization.Policies};
