@@ -289,7 +289,7 @@ export async function collectLiveCrossProfileEvidence(options) {
       throw new Error("Target Lambda identity or environment could not be verified");
     const variables=config.Environment?.Variables||{};
     verifiedRoutingConfig=validateRoutingConfig(variables.SYNC_PROFILE_CONFIG_JSON);
-    provenanceTrustKey=variables.ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_PEM;
+    provenanceTrustKey=variables.ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64;
     if(typeof variables.STATE_TABLE_NAME!=="string"||!variables.STATE_TABLE_NAME.trim())
       throw new Error("State table configuration is unavailable");
     prepareNamedProfile(options.profile,options.region,variables);
