@@ -103,6 +103,27 @@ manual, 1 repair). Four of those records were past TTL expiry but still
 visible, consistent with asynchronous DynamoDB TTL deletion. No recovery
 executor, marker install, fence release, or SQS replay was exercised.
 
+### Two-occurrence recurrence alias probe (4 Nov 2026)
+
+A private Work-calendar event with `RRULE:FREQ=DAILY;COUNT=2` asynchronously
+produced one Work Todoist task. The live cross-profile observer found the
+Calendar master and both occurrences through both Work and Antonio credentials
+(three event IDs per profile); Home had no matching items. The strong state
+scan included one recurrence row. The Todoist task itself reported
+`is_recurring=false`, so this probe proves discovery of the Calendar recurrence
+aliases but not a recurring Todoist mirror or complete release manifest.
+Accessible-calendar coverage remained unproven.
+
+After deleting the Calendar master, the task disappeared from all three
+Todoist profiles. The Calendar connector returned the master as `cancelled`,
+and the deployed Work and Antonio inventories still matched the master and two
+occurrences. A fresh strong scan received all pages (4,839 rows); the preview
+kept `knownIdentitiesAbsentFromCurrentProviders=false`, with 182 blockers,
+including 169 unattributable delivery records. No post-write transaction or
+fence release ran. The fixture was deleted through the provider connector; its
+cancelled Calendar records remain observable and must not be treated as proof
+of absence.
+
 ## Deployed-credential cross-profile capture
 
 `scripts/audit-erasure-cross-profile-live.mjs` runs the repository's full
