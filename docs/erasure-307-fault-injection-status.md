@@ -249,8 +249,10 @@ selected task still had one tagged event and no tagged recurring master. Three
 related delivery rows referenced neither selected ID. Provider IDs and
 credentials remain withheld.
 
-This is not a missing Calendar pagination page: the observer enumerates every
-instance page and refuses when a series exceeds the 32-alias marker bound.
+This is not an unimplemented pagination path: the observer follows Calendar
+page tokens, but stops as soon as the 33rd distinct instance exceeds the
+32-alias marker bound; it does not claim to finish reading that oversized
+series.
 Because the oversized series is reachable through unresolved identity edges,
 raising the cap or dropping those edges would not prove closure; either change
 would also need to preserve the one-transaction marker bound. No provider or
