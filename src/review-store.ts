@@ -25,33 +25,38 @@ async function admitEntityRef(ref: EntityRef): Promise<void> {
     ref.side === "todoist" ? ref.id : undefined,
     ref.side === "calendar" ? ref.id : undefined);
 }
-export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
+async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
   const refs = new Map<string, EntityRef>();
-  const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId"]);
+  const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
   const eventFields = new Set(["eventId","providerEventId","masterEventId","activeInstanceId","occurrenceId","selectedEventId","seriesId"]);
   const taskArrayFields = new Set(["taskIds","candidateTaskIds"]);
   const eventArrayFields = new Set(["eventIds","candidateEventIds"]);
   const add = (profile: Profile, side: EntityRef["side"], id: string) => {
     const ref = {profile,side,id}; refs.set(entityKey(ref),ref);
   };
-  const collect = (value: unknown, profile: Profile, field = ""): void => {
-    if (Array.isArray(value)) {
-      if (taskArrayFields.has(field)) for (const id of value) if (typeof id === "string" && id) add(profile,"todoist",id);
-      if (eventArrayFields.has(field)) for (const id of value) if (typeof id === "string" && id) add(profile,"calendar",id);
-      for (const item of value) collect(item,profile,field);
+  const collect = (item: unknown, profile: Profile, field = ""): void => {
+    if (Array.isArray(item)) {
+      if (taskArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"todoist",id);
+      if (eventArrayFields.has(field)) for (const id of item) if (typeof id === "string" && id) add(profile,"calendar",id);
+      for (const child of item) collect(child,profile,field);
       return;
     }
-    if (!value || typeof value !== "object") return;
-    const object = value as Record<string,unknown>;
+    if (!item || typeof item !== "object") return;
+    const object = item as Record<string,unknown>;
     const selectedProfile = typeof object.profile === "string" && REPLAY_PROFILES.includes(object.profile as Profile)
       ? object.profile as Profile : profile;
-    for (const [name,item] of Object.entries(object)) {
-      if (typeof item === "string" && item && taskFields.has(name)) add(selectedProfile,"todoist",item);
-      if (typeof item === "string" && item && eventFields.has(name)) add(selectedProfile,"calendar",item);
-      collect(item,selectedProfile,name);
+    for (const [name,child] of Object.entries(object)) {
+      if (typeof child === "string" && child && taskFields.has(name)) add(selectedProfile,"todoist",child);
+      if (typeof child === "string" && child && eventFields.has(name)) add(selectedProfile,"calendar",child);
+      collect(child,selectedProfile,name);
     }
   };
-  collect(preview,preview.intent.profile);
+  collect(value,defaultProfile);
+  for (const ref of refs.values()) await admitEntityRef(ref);
+}
+export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
+  const refs = new Map<string, EntityRef>();
+  await admitNestedReviewIdentities(preview,preview.intent.profile);
   for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
   for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
   for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
@@ -80,19 +85,7 @@ export class ReviewStore {
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const context = decision.context || {};
-    const contextIds = retainedAuditProviderIds(context);
-    const taskIds = new Set([...contextIds.taskIds,
-      ...(decision.taskId ? [decision.taskId] : []),
-      ...(decision.mappingSnapshot?.taskId ? [decision.mappingSnapshot.taskId] : []),
-    ]);
-    const eventIds = new Set([...contextIds.eventIds,
-      ...[decision.eventId, decision.masterEventId, decision.activeInstanceId, decision.seriesId,
-        decision.mappingSnapshot?.eventId, decision.mappingSnapshot?.masterEventId,
-        decision.mappingSnapshot?.activeInstanceId, decision.mappingSnapshot?.seriesId]
-        .filter((id): id is string => typeof id === "string" && id.length > 0),
-    ]);
-    for (const taskId of taskIds) await admitReviewIdentity(decision.profile, taskId);
-    for (const eventId of eventIds) await admitReviewIdentity(decision.profile, undefined, eventId);
+    await admitNestedReviewIdentities(decision,decision.profile);
     const taskId = decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined);
     const eventId = decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined);
     const id = decision.decisionId, existing = await this.getCase(id);
@@ -134,9 +127,7 @@ export class ReviewStore {
   }
   async observeConflictIncident(profile: Profile, fingerprint: string, incidentId: string, audit: Record<string, unknown>): Promise<void> {
     const detail = audit.detail && typeof audit.detail === "object" ? audit.detail as Record<string, unknown> : {};
-    const identities = retainedAuditProviderIds(detail);
-    for (const taskId of identities.taskIds) await admitReviewIdentity(profile, taskId);
-    for (const eventId of identities.eventIds) await admitReviewIdentity(profile, undefined, eventId);
+    await admitNestedReviewIdentities(detail,profile);
     const auditKey = typeof audit.pk === "string" ? audit.pk : `${profile}:${fingerprint}:${incidentId}`;
     const id = `incident-${reviewHash(auditKey).slice(0, 32)}`;
     const action = typeof audit.action === "string" ? audit.action : "active conflict";
@@ -197,15 +188,13 @@ export class ReviewStore {
         const action = typeof audit?.action === "string" ? audit.action : undefined;
         const identity = action && detail ? retainedConflictIdentity(action, detail) : undefined;
         if (identity && reviewHash(identity) === conflictKey) {
-          const providerIds = retainedAuditProviderIds(detail!);
-          for (const taskId of providerIds.taskIds) await admitReviewIdentity(profile, taskId);
-          for (const eventId of providerIds.eventIds) await admitReviewIdentity(profile, undefined, eventId);
+          await admitNestedReviewIdentities(detail!,profile);
           incidents.push(candidate);
         }
       }
     }
     for (const candidate of incidents) {
-      await admitReviewIdentity(profile, candidate.taskId, candidate.eventId);
+      await admitNestedReviewIdentities(candidate,profile);
       try {
         const condition = candidate.sourceAuditKey
           ? "#s = :open AND (conflictKey = :conflictKey OR attribute_not_exists(conflictKey)) AND sourceAuditKey = :sourceAuditKey"
@@ -338,6 +327,7 @@ export class ReviewStore {
     const current = await this.getCase(id);
     if (!current) throw Object.assign(new Error("Conflict no longer exists"), {status:404});
     if (current.status === "dismissed") return current;
+    await admitNestedReviewIdentities(current,current.profile);
     if (current.status !== "open") throw conflict();
     const operation = current.operationId ? await this.getOperation(current.operationId) : undefined;
     if (current.operationId && (!operation || operation.status !== "failed" || operationHasWriteEvidence(operation))) throw conflict();
@@ -398,6 +388,7 @@ export class ReviewStore {
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
       || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
+    await admitNestedReviewIdentities(current,current.profile);
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
@@ -680,6 +671,9 @@ export class ReviewStore {
   }
 
   async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string): Promise<void> {
+    const current = await this.getCase(caseId);
+    if (!current) return;
+    await admitNestedReviewIdentities(current,current.profile);
     try {
       await this.db.send(new UpdateCommand({ TableName: reviewTable(),
         Key: key(`REVIEW_CASE#${caseId}`),
@@ -698,6 +692,7 @@ export class ReviewStore {
 
   async updateCase(id: string, status: ReviewCase["status"], result: string, operationId?: string): Promise<void> {
     const current = await this.getCase(id); if (!current) throw new Error("Conflict no longer exists");
+    await admitNestedReviewIdentities(current,current.profile);
     const terminal = ["resolved", "excluded", "dismissed"].includes(status);
     const condition = status === "repairing"
       ? "#s = :open OR (#s = :dismissed AND (attribute_not_exists(operationId) OR operationId = :empty)) OR (#s = :repairing AND operationId = :op)"

@@ -105,6 +105,38 @@ test("candidate IDs in conflict audit arrays are checked before an incident case
   assert.equal(calls.length, 1, "no incident case or pointer may be written after the marker hit");
 });
 
+test("dismissal refuses to mutate a review case that references an erased identity", async t => {
+  enableBarrier(t);
+  const store = new ReviewStore();
+  store.getCase = async () => ({id:"case-1",profile:"home",status:"open",taskId:"erased-dismiss-task",
+    createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "TASK", "erased-dismiss-task")) return {Item:{markerVersion:1}};
+    return {};
+  });
+  await assert.rejects(store.dismissCase("case-1","acknowledged"),ErasureReplayBlockedError);
+  assert.equal(calls.length,1,"the case is not read or mutated after the marker hit");
+});
+
+test("case status transitions refuse to mutate a case that references an erased identity", async t => {
+  enableBarrier(t);
+  const store = new ReviewStore();
+  store.getCase = async () => ({id:"case-1",profile:"home",status:"open",eventId:"erased-update-event",
+    createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()});
+  const calls = [];
+  t.mock.method(documentClient, "send", async command => {
+    calls.push(command);
+    if (command.constructor.name === "GetCommand"
+      && command.input.Key.sk === markerKey("home", "EVENT", "erased-update-event")) return {Item:{markerVersion:1}};
+    return {};
+  });
+  await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
+  assert.equal(calls.length,1,"no case status write follows the marker hit");
+});
+
 test("coalescing refuses to close an open case that references an erased candidate", async t => {
   enableBarrier(t);
   const conflictKey = reviewHash("conflict");
