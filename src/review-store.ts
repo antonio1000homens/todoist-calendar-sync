@@ -68,6 +68,11 @@ async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profi
   collect(value,defaultProfile);
   for (const ref of refs.values()) await admitEntityRef(ref);
 }
+/** Check all provider identities retained by a manual decision before the
+ * decision itself is written or changed. */
+export async function assertManualDecisionReplayAdmission(decision: ManualDecision): Promise<void> {
+  await admitNestedReviewIdentities(decision, decision.profile);
+}
 export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
   const refs = new Map<string, EntityRef>();
   await admitNestedReviewIdentities(preview,preview.intent.profile);
@@ -99,7 +104,7 @@ export class ReviewStore {
   }
   async observeDecision(decision: ManualDecision): Promise<void> {
     const context = decision.context || {};
-    await admitNestedReviewIdentities(decision,decision.profile);
+    await assertManualDecisionReplayAdmission(decision);
     const taskId = decision.taskId || (typeof context.providerTaskId === "string" ? context.providerTaskId : undefined);
     const eventId = decision.eventId || (typeof context.providerEventId === "string" ? context.providerEventId : undefined);
     const id = decision.decisionId, existing = await this.getCase(id);

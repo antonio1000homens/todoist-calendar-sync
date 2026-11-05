@@ -198,14 +198,14 @@ contain the recognizable barrier strings. This is direct evidence that old
 published versions cannot be accepted as barrier-protected from the current
 source alone.
 
-The read-only identity scan examined 55 users, roles and groups and found five
-candidate policy grants across four principals. The AWS policy simulator
-evaluated eight direct/legacy invocation cases; each allowed all 175 inventoried
-function targets, including all 168 qualified targets, with no permission
-boundary reported. This remains simulation evidence: trust/session policies,
-resource policies, external credentials and a combined effective-permission
-decision were not proven. The verified account is the organization management
-account, so SCPs do not constrain these principals.
+The latest 4 November read-only identity scan examined 58 users, roles and
+groups and found five candidate policy grants across four principals. The
+associated AWS policy simulation evaluated four candidate-principal scenarios;
+each allowed all 183 inventoried function targets, including all 176 qualified
+targets. This remains simulation evidence: trust/session policies, resource
+policies, external credentials and a combined effective-permission decision
+were not proven. The verified account is the organization management account,
+so SCPs do not constrain these principals.
 
 The same invocation inventory found `AuthType=NONE` Function URLs on ingress
 and review-api, with wildcard URL/invoke statements on the unqualified and
@@ -248,14 +248,18 @@ Lambda invoker inventory to a private local file, then run:
     node scripts/audit-erasure-lambda-identity-invokers.mjs --profile=<profile> --expected-account=<12-digit-account> --inventory=<private-lambda-inventory.json> > <private-identity-candidates.json>
 
 This collects IAM users, roles, groups and attached policy documents, then
-reports statements that could match the inventoried function qualifiers. The
+reports statements that could match the inventoried function qualifiers. For
+candidate roles it also summarizes trust-policy principal types and selected
+condition-key presence without returning trust-policy values. This is
+structural evidence only: it does not prove a caller can assume a role. The
 report deliberately omits policy document bodies and environment values. Keep
 the output private: principal and policy names, grants and function inventory
 are operational details. The scan does not evaluate combined effective
-permissions, trust/session policies, permission boundaries, explicit denies,
-Organizations policies, cross-account principals or resource policies. It
-always returns `BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize
-an IAM change or enable replay/recovery.
+permissions, trust conditions, session policies, permission boundaries,
+explicit denies, Organizations policies, cross-account resource policies or
+principal access paths as one decision. It always returns
+`BLOCKED_NOT_EFFECTIVE_PERMISSION_PROOF` and cannot authorize an IAM change or
+enable replay/recovery.
 
 To simulate candidate identity grants for `InvokeFunction`, deprecated
 `InvokeAsync`, and configured AWS_IAM Function URLs, with the region and
@@ -540,3 +544,68 @@ Workers currently call those URLs without SigV4. No IAM, Function URL,
 Lambda, alias, queue or application setting was changed. The first #307
 writer/IAM acceptance remains unchecked; no denial or version-retirement
 change is authorized by these read-only results.
+
+### Windsor trust-path structural refresh (4 Nov 2026, 21:42 UTC)
+
+A fresh read-only run verified the Windsor account with STS and inventoried all
+seven expected production functions in `eu-west-2`, with no missing functions.
+The inventory had 174 published versions, two aliases, two event-source
+mappings and two Function URLs, both `AuthType=NONE` with wildcard URL and
+invoke-via-URL policy summaries. The identity candidate audit covered 58 IAM
+users, roles and groups, had no missing attached managed-policy documents, and
+reported five candidate invocation grants across four principals.
+
+The audit now includes a structural summary of role trust policies without
+publishing principal values or policy documents. It observed 52 roles, all with
+trust documents, and counted no wildcard or external AWS principals in their
+allow statements. The three candidate invocation roles also had trust
+documents, with no wildcard or external AWS principal counted. The organization
+remains the management account; its SCP policy type is enabled but SCPs do not
+apply to that account.
+
+A fresh IAM policy simulation evaluated eight direct/legacy cases against 183
+targets. All four candidate principals were allowed all 183 targets, including
+all 176 qualified targets, with zero denied targets and no permission
+boundary decision. This is still not an effective-permission result: the
+simulator does not prove role assumption or STS session context, does not
+include Lambda resource policies, and cannot rule out callers or routes outside
+the inventory. The trust summary is structural evidence only. No AWS mutation
+was performed; replay and executable recovery remain disabled.
+
+### Windsor all-function package digest refresh (4 Nov 2026, 21:50 UTC)
+
+A fresh read-only scan verified the seven expected production functions in
+`eu-west-2`. The version inventory and package audit were taken back to back;
+all seven function version counts and all version code digests matched between
+the two reads. The audit downloaded 173 unique deployment packages and verified
+each package against its AWS `CodeSha256`, covering 181 versions including
+`$LATEST` and 174 published versions.
+
+Across the 173 unique packages, recognizable strings appeared in 29 packages
+for each of the replay gate, marker key prefix and HMAC keyring; ingress
+unavailable/suppressed strings appeared in five packages each, and the fenced
+review marker appeared in 15. Marker presence is triage only; it does not prove
+that a guard dominates every provider or DynamoDB mutation. The scan did not
+establish safety in the 17 opt-in-disabled regions, legacy accounts/names,
+identity-based invoke paths, or resource policies. It remains
+`BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`; the replay and executor
+release flags remain false. No AWS mutation, Lambda invocation, queue operation
+or provider write was performed.
+
+### Windsor deployed erasure-gate configuration refresh (4 Nov 2026, 22:09 UTC)
+
+A fresh redacted configuration audit covered all 181 versions of the seven
+expected `eu-west-2` production functions. No version had
+`ERASURE_REPLAY_BARRIER_VERSION` enabled or configured, no version contained
+the HMAC keyring, and no version had post-write review enabled. Both replay
+release flags remain false.
+
+The separate paired pre-write readiness setting
+(`ERASURE_EXECUTION_ENABLED` plus `ERASURE_PROTOCOL_VERSION`) was present on
+41 configurations: 39 published versions and two `$LATEST` configurations.
+Forty are on review-api (including its `live` alias target version 102), and
+one is on the erasure worker. This is the existing pre-write recovery path; it
+does not establish post-write release authorization or replay-barrier
+admission. The audit omitted all environment values and made no AWS changes.
+Historical version invocation rights and the safety of every enabled pre-write
+path remain part of the unchecked writer/IAM review.

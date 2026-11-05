@@ -4,8 +4,8 @@
  * authorize recovery on its own. The existing recovery path must remain fenced
  * until every caller of provider/state mutations uses assertReplayAdmission.
  */
-import {createHmac} from "node:crypto";
-import {GetCommand, TransactWriteCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
+import {createHash,createHmac} from "node:crypto";
+import {GetCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import type {Profile} from "./types.js";
 import type {OrphanDeletionOperation} from "./orphan-deletion-executor.js";
@@ -22,6 +22,7 @@ type KeyRing = {current:string;keys:Map<string,Buffer>};
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
 const KEY_ID=/^[A-Za-z0-9_-]{1,32}$/;
 const MAX_EVENT_ALIASES=32;
+const MAX_POSTWRITE_WORKER_MAPPINGS=100;
 
 export class ErasureReplayBlockedError extends Error {
   constructor() {
@@ -160,11 +161,70 @@ export type PostWriteReleaseProof = {
    * future privileged worker. Empty arrays require proof of absence, not
    * merely missing keys. Aliases for the source profile must match eventIds. */
   calendarAliases:Record<Profile,readonly string[]>;
+  /** Complete action-time SQS mapping inventory rechecked by the future
+   * privileged worker. Only enabledMappingIds may be resumed; both lists are
+   * retained in a separate durable retry record. */
+  workerMappings:{mappingIds:readonly string[];enabledMappingIds:readonly string[]};
   journalPresent:boolean;
 };
 const SHA256=/^[a-f0-9]{64}$/;
 const OPERATION_ID=/^[A-Za-z0-9_-]{1,128}$/;
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function postWriteWorkerMappingManifest(value:PostWriteReleaseProof["workerMappings"]):{
+  mappingIds:string[];enabledMappingIds:string[];fingerprint:string;
+} {
+  if(!value||!Array.isArray(value.mappingIds)||!Array.isArray(value.enabledMappingIds)
+    ||value.mappingIds.length===0||value.mappingIds.length>MAX_POSTWRITE_WORKER_MAPPINGS
+    ||value.mappingIds.some(id=>typeof id!=="string"||!UUID.test(id))
+    ||value.enabledMappingIds.some(id=>typeof id!=="string"||!UUID.test(id))
+    ||new Set(value.mappingIds).size!==value.mappingIds.length
+    ||new Set(value.enabledMappingIds).size!==value.enabledMappingIds.length
+    ||value.enabledMappingIds.some(id=>!value.mappingIds.includes(id)))
+    throw new ErasureReplayUnavailableError("Complete original worker mapping inventory is required");
+  const mappingIds=[...value.mappingIds].sort();
+  const enabledMappingIds=[...value.enabledMappingIds].sort();
+  const fingerprint=createHash("sha256").update(JSON.stringify({mappingIds,enabledMappingIds})).digest("hex");
+  return {mappingIds,enabledMappingIds,fingerprint};
+}
+
+export type PostWriteMappingRestoreCompletionProof={
+  operationId:string;profile:Profile;epoch:number;mappingIds:readonly string[];
+  enabledMappingIds:readonly string[];observedStates:readonly {id:string;state:string}[];verifiedAt:string;
+};
+
+/**
+ * Build the durable completion receipt only after a fresh AWS read confirms
+ * every original mapping has its recorded state. A failed/partial restore
+ * leaves the atomic-release retry record in `pending` for a later attempt.
+ * This builder does not read or write AWS and is not connected to an executor.
+ */
+export function completePostWriteMappingRestore(proof:PostWriteMappingRestoreCompletionProof):UpdateCommand {
+  if(!proof||!OPERATION_ID.test(proof.operationId)||!REPLAY_PROFILES.includes(proof.profile)
+    ||!Number.isSafeInteger(proof.epoch)||proof.epoch<1
+    ||typeof proof.verifiedAt!=="string"||!Number.isFinite(Date.parse(proof.verifiedAt))
+    ||new Date(proof.verifiedAt).toISOString()!==proof.verifiedAt
+    ||!Array.isArray(proof.observedStates))
+    throw new ErasureReplayUnavailableError("Worker mapping restoration proof is incomplete");
+  const manifest=postWriteWorkerMappingManifest({mappingIds:proof.mappingIds,
+    enabledMappingIds:proof.enabledMappingIds});
+  if(proof.observedStates.length!==manifest.mappingIds.length
+    ||proof.observedStates.some(item=>!item||!manifest.mappingIds.includes(item.id)
+      ||!(["Enabled","Disabled"] as string[]).includes(item.state))
+    ||new Set(proof.observedStates.map(item=>item.id)).size!==proof.observedStates.length)
+    throw new ErasureReplayUnavailableError("Worker mapping verification is incomplete or transitional");
+  const enabled=new Set(manifest.enabledMappingIds);
+  if(manifest.mappingIds.some(id=>proof.observedStates.find(item=>item.id===id)?.state
+    !==(enabled.has(id)?"Enabled":"Disabled")))
+    throw new ErasureReplayUnavailableError("Worker mappings do not match their original enabled states");
+  return new UpdateCommand({TableName:tableName(),Key:{pk:`ERASURE_POSTWRITE_RESTORE#${proof.operationId}`,sk:"STATE"},
+    UpdateExpression:"SET #state=:complete,verifiedAt=:verifiedAt",
+    ConditionExpression:"#state=:pending AND operationId=:operationId AND profile=:profile AND epoch=:epoch AND mappingFingerprint=:fingerprint AND mappingIds=:mappingIds AND enabledMappingIds=:enabledMappingIds AND attribute_not_exists(verifiedAt)",
+    ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":complete":"complete",
+      ":pending":"pending",":verifiedAt":proof.verifiedAt,":operationId":proof.operationId,
+      ":profile":proof.profile,":epoch":proof.epoch,":fingerprint":manifest.fingerprint,
+      ":mappingIds":manifest.mappingIds,":enabledMappingIds":manifest.enabledMappingIds}});
+}
 
 function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:Profile;eventId:string}> {
   const aliases=proof.calendarAliases;
@@ -211,6 +271,7 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     ||!proof.identity.taskId||!proof.identity.eventIds.length)
     throw new ErasureReplayUnavailableError("Post-write release proof is incomplete");
   const aliases=validatedPostWriteAliases(proof);
+  const workerMappings=postWriteWorkerMappingManifest(proof.workerMappings);
   const ring=keyRing(),secret=ring.keys.get(ring.current)!;
   const keys:ReplayKey[]=[];
   // Todoist IDs are protected across all sync profiles. Calendar aliases are
@@ -246,6 +307,14 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     {Delete:{TableName:table,Key:{pk:"ERASURE_POSTWRITE_CONFIRMATION#"+proof.operationId,sk:"STATE"},
       ConditionExpression:"#status=:consumed AND mode=:mode AND operationId=:id AND profile=:profile AND confirmationId=:token AND inspectedFingerprint=:inspected AND postflightFingerprint=:postflight AND originalPreviewFingerprint=:original AND epoch=:epoch AND attribute_not_exists(expiresAtMs)",
       ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:tokenValues}},
+    // Marker installation, fence release and the durable mapping retry record
+    // commit atomically. After commit, only originally-enabled mappings may be
+    // restored. A failed restore leaves this item pending.
+    {Put:{TableName:table,Item:{pk:"ERASURE_POSTWRITE_RESTORE#"+proof.operationId,sk:"STATE",
+      schemaVersion:1,operationId:proof.operationId,profile:proof.identity.profile,epoch:proof.epoch,
+      state:"pending",mappingIds:workerMappings.mappingIds,
+      enabledMappingIds:workerMappings.enabledMappingIds,mappingFingerprint:workerMappings.fingerprint,
+      createdAt:proof.reviewedAt},ConditionExpression:"attribute_not_exists(pk)"}},
     {ConditionCheck:{TableName:table,Key:profileKey("EPOCH"),
       ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":proof.epoch}}},
     {Delete:{TableName:table,Key:profileKey("FENCE"),

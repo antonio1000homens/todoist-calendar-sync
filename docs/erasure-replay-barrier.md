@@ -72,15 +72,17 @@ and every live/qualified writer must run the enabled implementation. Do not
 turn on the gate yet: the remaining identity propagation, old Lambda-version
 retirement and fully verified post-write recovery are unfinished.
 
-**Known remaining gaps:** direct provider clients outside the guarded
-factories, unknown-ID creation and comment deletions, recurrence aliases not
-contained in the currently available mapping, some noncanonical DynamoDB
-writers (including repair/review history), coordinated source/destination
-leases for cross-profile moves, complete Calendar delta ingestion, and old
-qualified Lambda versions. A strongly consistent lookup is not a substitute
-for an atomic provider/API mutation plus marker condition under concurrent
-cross-profile erasure; deployment must prove the serialized lease protocol
-covers these races. There has been **no** production rollout or fault injection.
+The current source-level provider mutation inventory and its limits are
+recorded in [`erasure-writer-source-audit.md`](./erasure-writer-source-audit.md).
+Remaining source and deployment gaps include unknown-ID creation and comment
+deletions, recurrence aliases not contained in the currently available
+mapping, unclassified identity-bearing DynamoDB routes, coordinated
+source/destination leases for cross-profile moves, complete Calendar delta
+ingestion, and old qualified Lambda versions. A strongly consistent lookup is
+not a substitute for an atomic provider/API mutation plus marker condition
+under concurrent cross-profile erasure; deployment must prove the serialized
+lease protocol covers these races. There has been **no** production rollout or
+fault injection.
 
 ## Marker and key lifecycle
 
@@ -328,3 +330,33 @@ This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
 mappings, replay old queues or delete any historical Lambda version based
 on these results.
+
+## Staged post-write mapping restoration retry record
+
+The offline `atomicReplayRelease()` contract now requires the action-time
+inventory of every worker SQS mapping and the subset that was originally
+enabled. Its single DynamoDB transaction installs the replay markers, writes a
+separate `ERASURE_POSTWRITE_RESTORE#<operation>` record in `pending` state,
+and conditionally removes the reviewed operation, token, fence and journal.
+Those actions commit together; no mapping update is issued by the builder.
+
+After that transaction commits, a future privileged executor may restore only
+the IDs in `enabledMappingIds`. The record retains the complete mapping
+inventory and a manifest fingerprint, so an interrupted or failed restore has
+a durable retry point. `completePostWriteMappingRestore()` constructs a
+conditional completion update only when fresh observed mapping states exactly
+match the original enabled/disabled states and the pending record has the same
+manifest. Originally disabled mappings must remain disabled. Transitional,
+missing, extra or mismatched mappings cannot complete the record.
+
+`restorePostWriteWorkerMappings()` now implements the standalone runtime retry
+step. It requires both protocol flags enabled, strongly reads the pending item,
+checks its profile epoch, acquires a profile writer lease, re-reads the item,
+and compares the complete current SQS mapping inventory and ownership with the
+recorded manifest. It enables only originally enabled mappings, leaves
+originally disabled mappings untouched, and verifies the complete inventory
+and every final state before constructing the conditional completion update.
+Failures leave the durable item pending; retries are idempotent. The helper is
+not imported by an executor, API route or queue, and it was not invoked during
+implementation. No deployment or mapping change is authorized; the replay
+barrier remains OFF.
