@@ -7,6 +7,7 @@ import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping
 import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
+import type {VerifiedCalendarProvenance} from "./erasure-calendar-provenance.js";
 import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
 import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
@@ -51,6 +52,7 @@ type Dependencies = {
   scanAbortSignal?:AbortSignal;
   onInventoryProgress?:(progress:{pages:number;rowCount:number;consumedCapacityUnits:number;elapsedMs:number})=>void;
   auditCrossProfileIdentity?:boolean;
+  calendarProvenance?:VerifiedCalendarProvenance;
   auditDeliveryReceipts?:boolean;
   sleep?: (ms: number) => Promise<void>;
 };
@@ -221,6 +223,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     digest: record.digest, classification: record.classification }));
   const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
     taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
+    calendarProvenance:dependencies.calendarProvenance,
     readerForProfile:async profile=>profile===target.profile?providerClients
       :(dependencies.providerFactory || defaultProviderClientFactory)(profile),
   }):undefined;

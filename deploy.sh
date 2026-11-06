@@ -17,6 +17,7 @@ slack_bot_token_parameter="${SLACK_BOT_TOKEN_PARAMETER:-/lambdas/shared/slack-bo
 todoist_calendar_sync_slack_channel="${TODOIST_CALENDAR_SYNC_SLACK_CHANNEL:-}"
 slack_control_allowed_user_ids="${TODOIST_SLACK_ALLOWED_USER_IDS:-}"
 sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
+erasure_calendar_provenance_public_key="${ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64:-}"
 cloudflare_access_issuer="${CF_ACCESS_ISSUER:-}"
 cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
 review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
@@ -208,6 +209,9 @@ parameter_overrides=(
   "CloudflareAccessAudience=$cloudflare_access_audience"
   "ReviewOperatorEmails=$review_operator_emails"
 )
+if [[ -n "$erasure_calendar_provenance_public_key" ]]; then
+  parameter_overrides+=("ErasureCalendarProvenancePublicKeySpki=$erasure_calendar_provenance_public_key")
+fi
 if [[ -n "$slack_control_allowed_user_ids" ]]; then
   parameter_overrides+=("SlackControlAllowedUserIds=$slack_control_allowed_user_ids")
 fi

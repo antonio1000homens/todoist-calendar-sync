@@ -312,21 +312,19 @@ item/master/instance reads in every profile, old versions and new independent
 operator confirmation before calling
 `atomicReplayRelease()`. Any missing provenance keeps the fence in place.
 
-Calendar inventory now paginates each profile's CalendarList, including hidden
-entries, and scans event details for entries with sufficient access. A
-free/busy-only calendar or a calendar that hides private events blocks complete
-coverage. Google's CalendarList API returns calendars on the user's calendar
-list; it does not prove there are no other calendars reachable only by a known
-calendar ID. That direct-ID ACL scope still needs independent source/destination
-calendar provenance. The observer therefore hardcodes
-`allAccessibleCalendarCoverageProven=false`; follow-up [#333](https://github.com/antonio1000homens/todoist-calendar-sync/issues/333)
-tracks identifying an authoritative source for those direct-ID calendars.
-Untagged events still cannot be associated with an erased
-identity from title or date alone. Todoist's full Sync `notes` snapshot is
-generated separately from the project, task and DynamoDB reads, and large
-accounts may receive a delayed full-sync timestamp. Direct ETag and action-time
-checks are still required. These limitations prevent the observation from
-establishing complete cross-profile absence.
+Calendar inventory paginates each profile's CalendarList, including hidden
+entries, and independently queries source/destination IDs from a separately
+signed operator-reviewed direct-ID ACL registry when supplied. Event details,
+recurrence cancellations and direct ETags are verified for the registered
+scope; free/busy-only, private-event-restricted, stale, unknown, conflicting
+or inaccessible calendars prevent complete coverage. See
+[Calendar provenance #333](erasure-calendar-provenance.md) for the private
+registry, offline signing workflow and redacted completeness evidence.
+Without a trusted signed registry, CalendarList-only coverage remains
+incomplete. Untagged events remain identity-ambiguous without an exact ID
+link from state, comments or the inventory. Todoist's full Sync notes
+snapshot and project/DynamoDB reads are separately captured, not atomic.
+Do not interpret a complete coverage field as authorization for release.
 
 This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker
