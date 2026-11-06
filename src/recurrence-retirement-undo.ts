@@ -15,7 +15,7 @@ import {strongInventory,type InventoryRow} from "./recurrence-retirement-inspect
 import {defaultProviderClientFactory,type ProviderClientFactory} from "./mutation-budget.js";
 import {RetirementOperationService,type RetirementOperation} from "./recurrence-retirement-apply.js";
 import {reviewHash} from "./review-store.js";
-import type {Profile} from "./types.js";
+import type {CalendarEvent,Profile} from "./types.js";
 
 export const RETIREMENT_UNDO_PHRASE="RE-ENABLE ASSOCIATION SYNC WITHOUT RESTORING MAPPING";
 const UUID=/^[0-9a-f-]{36}$/i;
@@ -81,7 +81,7 @@ export function buildUndoTransaction(
       ExpressionAttributeNames:{"#status":"status","#profile":"profile"},
       ExpressionAttributeValues:{":id":op.operationId,":retired":"retired",
         ":profile":op.profile,":task":op.target.taskId,":series":op.target.seriesId,
-        ":master":op.providerVersions.masterEventId,":created":row.createdAt},
+        ":master":op.providerVersions!.masterEventId,":created":row.createdAt},
     }};
   });
   const id=op.target;
@@ -175,7 +175,7 @@ export class RetirementUndoService {
     const versions=op.providerVersions!;
     let master;
     let occurrence;
-    let instances=[];
+    let instances:CalendarEvent[]=[];
     try {
       master=await pair.calendar.getEvent(versions.masterEventId);
       occurrence=await pair.calendar.getEvent(op.target.eventId);
@@ -213,7 +213,8 @@ export class RetirementUndoService {
     const relevant=rows.filter(row=>markerKeys.some(k=>k.pk===row.pk&&k.sk===row.sk))
       .map(row=>({pk:row.pk,sk:row.sk,hash:reviewHash(row)}))
       .sort((a,b)=>String(a.pk).localeCompare(String(b.pk)));
-    const fingerprint=reviewHash({operationId,target:op.target,master,occurrence,instances,
+    const fingerprint=reviewHash({operationId,target:op.target,master,occurrence,
+      instances:instances.slice().sort((a,b)=>a.id.localeCompare(b.id)),
       completedTask,activeTask,relevant,
       ownerKeys:owners.map(row=>row.pk).sort()});
     return {operationId,profile:op.profile,scope:"operator_retirement_only",
