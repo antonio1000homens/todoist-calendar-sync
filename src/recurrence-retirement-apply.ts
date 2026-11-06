@@ -16,7 +16,7 @@
  * to have failed. Incident cleanup/Undo are separate follow-up phases.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { GetCommand, PutCommand, UpdateCommand, TransactWriteCommand,
+import { GetCommand, PutCommand, UpdateCommand, QueryCommand, TransactWriteCommand,
   type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
@@ -38,6 +38,15 @@ export type RetirementOperation={
   planFingerprint:string;inspectionFingerprint:string;
   confirmationHash:string;confirmationExpiresAt:string;
   createdAt:string;retiredAt?:string;updatedAt?:string;
+  lookupPk?:string;lookupSk?:string;
+  /** Provider identity/ETag proof held stable across future Undo checks. */
+  providerVersions?: {masterEventId:string;masterEtag:string;occurrenceEtag:string;
+    completedAt:string;rrule:string[]};
+  undoConfirmationHash?:string;
+  undoApprovedFingerprint?:string;
+  undoApprovalExpiresAt?:string;
+  undoStatus?:"approved"|"completed";
+  reenabledAt?:string;
   cleanupStatus?:"pending"|"completed";
   retainedEvidenceCount?:number;
 };
@@ -259,6 +268,20 @@ export class RetirementOperationService {
     }
     return state;
   }
+  async history(profile:Profile,limit=50):Promise<RetirementOperationStatus[]> {
+    if(!(["home","antonio","work"] as const).includes(profile))
+      error("Invalid history profile",400);
+    const page=await this.db.send(new QueryCommand({TableName:table(),
+      IndexName:"ProfileLookupIndex",
+      KeyConditionExpression:"lookupPk = :profile AND begins_with(lookupSk,:prefix)",
+      ExpressionAttributeValues:{":profile":"PROFILE#"+profile,
+        ":prefix":"RETIREMENT_OPERATION#"},
+      Limit:Math.min(50,Math.max(1,limit)),ScanIndexForward:false}));
+    return ((page.Items||[]) as RetirementOperation[])
+      .filter(item=>item.profile===profile&&["retired","re_enabled"].includes(item.status))
+      .map(exposed);
+  }
+
   async issue(
     target:RetirementDiagnosticTarget,expectedFingerprint:string,actorSubject:string,
   ):Promise<IssueRetirementApproval> {
@@ -270,13 +293,31 @@ export class RetirementOperationService {
       error("Retirement preview contains unresolved safety blockers");
     if(preview.planFingerprint!==expectedFingerprint)
       error("The preview changed; inspect the new version before requesting approval");
+    if(!inspection.mapping?.masterEventId||!inspection.calendar.master?.etag
+      ||!inspection.calendar.occurrence?.etag
+      ||inspection.task.status!=="completed_verified"||!inspection.task.value
+      ||!("completed_at" in inspection.task.value)
+      ||typeof inspection.task.value.completed_at!=="string"
+      ||!Number.isFinite(Date.parse(inspection.task.value.completed_at))
+      ||!Array.isArray(inspection.calendar.master.recurrence))
+      error("Verified Calendar and completed Todoist provider versions are required for an undoable retirement");
+    const providerVersions={
+      masterEventId:inspection.mapping.masterEventId,
+      masterEtag:inspection.calendar.master.etag,
+      occurrenceEtag:inspection.calendar.occurrence.etag,
+      completedAt:inspection.task.value.completed_at,
+      rrule:[...inspection.calendar.master.recurrence],
+    };
     const operationId=randomUUID(),confirmationId=randomUUID();
     const timestamp=new Date().toISOString();
     const operation:RetirementOperation={
       ...operationKey(operationId),operationId,profile:target.profile,target,actorSubject,
+      lookupPk:"PROFILE#"+target.profile,
+      lookupSk:"RETIREMENT_OPERATION#"+timestamp+"#"+operationId,
       planFingerprint:preview.planFingerprint,inspectionFingerprint:preview.inspectionFingerprint,
       confirmationHash:sha(confirmationId),confirmationExpiresAt:new Date(Date.now()+APPROVAL_MS).toISOString(),
       createdAt:timestamp,status:"previewed",
+      providerVersions,
     };
     await this.db.send(new PutCommand({TableName:table(),Item:operation,
       ConditionExpression:"attribute_not_exists(pk)"}));

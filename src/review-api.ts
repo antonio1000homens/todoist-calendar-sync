@@ -6,6 +6,8 @@ import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { inspectRecurrenceRetirement } from "./recurrence-retirement-inspection.js";
 import { previewRecurrenceRetirement } from "./recurrence-retirement-preview.js";
 import { RetirementOperationService, RETIREMENT_APPROVAL_PHRASE } from "./recurrence-retirement-apply.js";
+import { RetirementUndoService, RETIREMENT_UNDO_PHRASE } from "./recurrence-retirement-undo.js";
+import { RetirementIncidentCleanupService } from "./recurrence-retirement-cleanup.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { assessOrphanReadiness } from "./orphan-readiness.js";
 import { OrphanApprovalService } from "./orphan-approval.js";
@@ -186,6 +188,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   inspectRecurrenceRetirement?: typeof inspectRecurrenceRetirement;
   previewRecurrenceRetirement?: typeof previewRecurrenceRetirement;
   createRetirementOperationService?:()=>RetirementOperationService;
+  createRetirementUndoService?:()=>RetirementUndoService;
+  createRetirementIncidentCleanupService?:()=>RetirementIncidentCleanupService;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
   requestReconciliation?:typeof requestReconciliation;
   enqueueRepair?:typeof enqueueRepair;
@@ -245,7 +249,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         const operation=await store.getOperation(segments[1]);
         if(operation) writeProfiles.push(operation.preview.intent.profile);
       } else if(segments[0]==="reconciliation"&&typeof body?.profile==="string"
-        &&segments[1]!=="retirement-apply") {
+        &&!["retirement-apply","retirement-undo-apply"].includes(segments[1])) {
         // Retirement Apply installs its OWN exclusive profile fence and waits
         // for all admission/writer leases to drain. Holding one here would
         // deadlock the drain and make a safe commit impossible.
@@ -731,6 +735,66 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
       return response(200,{operation:await service.status(segments[2],actor.subject)});
     }
+    // Cleanup is independently authorized for the exact completed retirement.
+    // It never deletes or edits provider objects, completion history or unknown
+    // review evidence. Any ownership ambiguity remains visible for review.
+    if(method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-cleanup"
+      &&segments.length===2){
+      if(Object.keys(body||{}).sort().join(",")!=="operationId,profile")
+        fail(400,"Retirement cleanup requires exact operation ID and profile");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      requireAdmissionProfile(selected);
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const op=await service.get(String(body!.operationId||""));
+      if(!op||op.profile!==selected||op.actorSubject!==actor.subject)
+        fail(403,"Retirement cleanup operation or operator does not match");
+      const cleanup=dependencies.createRetirementIncidentCleanupService?.()
+        ||new RetirementIncidentCleanupService();
+      const result=await cleanup.cleanup(op.operationId,actor.subject);
+      return response(result.status==="completed"?200:409,{cleanup:result});
+    }
+    // Completed association retirements have a compact, non-actionable receipt
+    // history separate from the live case inbox.
+    if(method==="GET"&&segments[0]==="reconciliation"&&segments[1]==="retirement-history"
+      &&segments.length===2){
+      const query=event.queryStringParameters||{};
+      if(Object.keys(query).join(",")!=="profile")fail(400,"Exactly one profile is required for retirement history");
+      const selected=profile(query.profile||null);
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      return response(200,{profile:selected,operations:await service.history(selected)});
+    }
+    if(method==="GET"&&segments[0]==="reconciliation"&&segments[1]==="retirement-undo-inspection"
+      &&segments.length===2){
+      const query=event.queryStringParameters||{};
+      if(Object.keys(query).join(",")!=="operationId")fail(400,"Exact retirement operation ID required");
+      const service=dependencies.createRetirementUndoService?.()||new RetirementUndoService();
+      return response(200,{inspection:await service.inspect(query.operationId||"",actor.subject)});
+    }
+    if(method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-undo-approvals"
+      &&segments.length===2){
+      if(Object.keys(body||{}).sort().join(",")!=="fingerprint,operationId,profile")
+        fail(400,"Undo approval requires exact operation ID, profile and inspected fingerprint");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      requireAdmissionProfile(selected);
+      const service=dependencies.createRetirementUndoService?.()||new RetirementUndoService();
+      const opService=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const current=await opService.get(String(body!.operationId||""));
+      if(!current||current.profile!==selected)fail(409,"Undo operation profile changed");
+      return response(201,await service.approveUndo(current.operationId,String(body!.fingerprint||""),actor.subject));
+    }
+    if(method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-undo-apply"
+      &&segments.length===2){
+      if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile")
+        fail(400,"Undo Apply requires exact operation ID, profile, token and phrase");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      if(body!.phrase!==RETIREMENT_UNDO_PHRASE)fail(400,"Undo requires a typed re-enable confirmation");
+      const service=dependencies.createRetirementUndoService?.()||new RetirementUndoService();
+      const opService=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const current=await opService.get(String(body!.operationId||""));
+      if(!current||current.profile!==selected)fail(409,"Undo operation profile changed");
+      const result=await service.applyUndo(current.operationId,String(body!.confirmationId||""),actor.subject,String(body!.phrase));
+      return response(result.status==="fencing"?202:200,{operation:result});
+    }
     if (method === "GET" && segments[0] === "reconciliation" && segments[1] === "diagnostics" && segments.length === 2) {
       const selected = profile(event.queryStringParameters?.profile || null);
       const state = new StateRepository();
@@ -743,6 +807,9 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if (after && !/^ITEM#[a-f0-9]{64}$/.test(after)) fail(400,"Invalid reconciliation diagnostic cursor");
       const result = await state.listReconciliationDiagnostics(selected,generation,rawLimit,after);
       const items = await Promise.all(result.items.map(async item => {
+        if(item.taskId && item.eventId && item.seriesId && await state.isRetired({
+          profile:selected,taskId:item.taskId,eventIds:[item.eventId],seriesIds:[item.seriesId]}))
+          return {...item,caseStatus:"retired",reason:"association_retired_by_operator"};
         if (!item.caseId) return item;
         const currentCase = await store.getCase(item.caseId);
         return { ...item, caseStatus: currentCase?.status || item.caseStatus || "case_not_found" };

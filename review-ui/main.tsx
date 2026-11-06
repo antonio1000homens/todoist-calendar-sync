@@ -7,6 +7,7 @@ import { availableRepairActions, actionFormFields } from "./repair-action-capabi
 import { ErasureRecoveryPanel } from "./erasure-recovery-panel";
 import { OrphanDeletionPanel } from "./orphan-deletion-panel";
 import { RecurrenceRetirementInspector } from "./recurrence-retirement-inspector";
+import { RetirementHistory } from "./retirement-history";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
@@ -540,9 +541,10 @@ function App() {
         {view?.status==="ready"&&latestRun?.generation&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
           <h3>Run diagnostics · {runProfile}</h3>
           <p>Generation {latestRun.generation} · {latestRunAt?`activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These per-run diagnostics are not open-alert counts and this report does not change provider data.</p>
-          {view.diagnostics.length===0?<p>No per-item diagnostics were recorded for this generation.</p>:<ul>
-            {view.diagnostics.map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
-              <strong>{item.outcome.replaceAll("_"," ")} diagnostic</strong> · {item.reason.replaceAll("_"," ")}<br/>
+          {view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").length===0?
+             <p>No unresolved or non-actionable per-item diagnostics remain in this generation. Retired associations are available in history.</p>:<ul>
+            {view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
+              <strong>{item.caseStatus==="retired"?"Association retired by operator":item.outcome.replaceAll("_"," ")+" diagnostic"}</strong> · {item.reason.replaceAll("_"," ")}<br/>
               <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
               {item.detail?.candidateTaskIds?.length>0&&<><span>Candidate tasks: {item.detail.candidateTaskIds.join(", ")}</span><br/></>}
               {item.detail?.candidateEventIds?.length>0&&<><span>Candidate Calendar events: {item.detail.candidateEventIds.join(", ")}</span><br/></>}
@@ -555,6 +557,7 @@ function App() {
           </ul>}
           {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
         </section>}
+        <RetirementHistory api={api} profile={runProfile}/>
       </React.Fragment>;
     })}
     <ErasureRecoveryPanel api={api} />
