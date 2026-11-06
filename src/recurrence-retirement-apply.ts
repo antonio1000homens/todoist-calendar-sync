@@ -357,8 +357,8 @@ export class RetirementOperationService {
       // No DynamoDB retirement transaction has been sent. Releasing our
       // exclusive profile fence is safe; the stale approval remains unusable
       // because any retry must pass the same version check.
-      await this.noteRejectedPreflight(operationId,actorSubject);
       await this.finishFence(profile,operationId);
+      await this.noteRejectedPreflight(operationId,actorSubject);
       throw preflightError;
     }
     try{await this.db.send(command);}
@@ -368,8 +368,8 @@ export class RetirementOperationService {
       // For transport/unknown outcomes, keep the fence and require receipt
       // readback on retry before any release.
       if((writeError as {name?:string}).name==="TransactionCanceledException"){
-        await this.noteRejectedPreflight(operationId,actorSubject);
         await this.finishFence(profile,operationId);
+        await this.noteRejectedPreflight(operationId,actorSubject);
         error("A mapping, repair or owner changed before atomic retirement");
       }
       throw writeError;
