@@ -138,13 +138,15 @@ export class RetirementUndoService {
     if(op.actorSubject!==actorSubject)reject("Another operator owns this retirement",403);
     return op;
   }
-  async inspect(operationId:string,actorSubject:string):Promise<UndoInspection> {
+  async inspect(operationId:string,actorSubject:string,
+    onInventory?:(rows:readonly InventoryRow[])=>void):Promise<UndoInspection> {
     assertGate();
     const op=await this.owned(operationId,actorSubject);
     if(op.status!=="retired")reject("Only a retired association can be re-enabled");
     const nowMs=Date.now();
     const blockers:string[]=[];
     const rows=await this.inventory(); // complete; truncated scans throw
+    onInventory?.(rows);
     const markerKeys=retirementDispositionKeys(identities(op));
     for(const Key of markerKeys){
       const match=rows.find(row=>row.pk===Key.pk&&row.sk===Key.sk);
@@ -245,7 +247,12 @@ export class RetirementUndoService {
     const op=await this.owned(operationId,actorSubject);
     if(op.undoConfirmationHash!==sha(confirmationId))
       reject("Undo confirmation does not match",403);
-    if(op.status==="re_enabled")return {status:"re_enabled",operationId,providerWrites:false};
+    if(op.status==="re_enabled"){
+      const fence=await this.inspectFence(op.profile);
+      if(fence.fence?.operationId===operationId&&!fence.leases.length)
+        await this.finishFence(op.profile,operationId);
+      return {status:"re_enabled",operationId,providerWrites:false};
+    }
     if(op.status!=="retired")reject("Retirement cannot be undone in this state");
     const previousFence=await this.inspectFence(op.profile);
     if(Date.parse(op.undoApprovalExpiresAt||"")<=Date.now()
@@ -257,10 +264,10 @@ export class RetirementUndoService {
     if(fence.leases.length)return {status:"fencing",operationId,providerWrites:false};
     let command:TransactWriteCommand;
     try{
-      const inspected=await this.inspect(operationId,actorSubject);
-      if(!inspected.eligible||inspected.fingerprint!==op.undoApprovedFingerprint)
+      let rows:readonly InventoryRow[]|undefined;
+      const inspected=await this.inspect(operationId,actorSubject,items=>{rows=items;});
+      if(!inspected.eligible||inspected.fingerprint!==op.undoApprovedFingerprint||!rows)
         reject("Undo evidence changed since approval; provider objects were not touched");
-      const rows=await this.inventory();
       command=buildUndoTransaction(op,inspected,rows,new Date().toISOString(),table());
     }catch(error){await this.finishFence(op.profile,operationId);throw error;}
     try{await this.db.send(command);}
