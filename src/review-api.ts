@@ -7,6 +7,7 @@ import { inspectRecurrenceRetirement } from "./recurrence-retirement-inspection.
 import { previewRecurrenceRetirement } from "./recurrence-retirement-preview.js";
 import { RetirementOperationService, RETIREMENT_APPROVAL_PHRASE } from "./recurrence-retirement-apply.js";
 import { RetirementUndoService, RETIREMENT_UNDO_PHRASE } from "./recurrence-retirement-undo.js";
+import { RetirementIncidentCleanupService } from "./recurrence-retirement-cleanup.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { assessOrphanReadiness } from "./orphan-readiness.js";
 import { OrphanApprovalService } from "./orphan-approval.js";
@@ -188,6 +189,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   previewRecurrenceRetirement?: typeof previewRecurrenceRetirement;
   createRetirementOperationService?:()=>RetirementOperationService;
   createRetirementUndoService?:()=>RetirementUndoService;
+  createRetirementIncidentCleanupService?:()=>RetirementIncidentCleanupService;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
   requestReconciliation?:typeof requestReconciliation;
   enqueueRepair?:typeof enqueueRepair;
@@ -732,6 +734,24 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       &&segments.length===3) {
       const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
       return response(200,{operation:await service.status(segments[2],actor.subject)});
+    }
+    // Cleanup is independently authorized for the exact completed retirement.
+    // It never deletes or edits provider objects, completion history or unknown
+    // review evidence. Any ownership ambiguity remains visible for review.
+    if(method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-cleanup"
+      &&segments.length===2){
+      if(Object.keys(body||{}).sort().join(",")!=="operationId,profile")
+        fail(400,"Retirement cleanup requires exact operation ID and profile");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      requireAdmissionProfile(selected);
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const op=await service.get(String(body!.operationId||""));
+      if(!op||op.profile!==selected||op.actorSubject!==actor.subject)
+        fail(403,"Retirement cleanup operation or operator does not match");
+      const cleanup=dependencies.createRetirementIncidentCleanupService?.()
+        ||new RetirementIncidentCleanupService();
+      const result=await cleanup.cleanup(op.operationId,actor.subject);
+      return response(result.status==="completed"?200:409,{cleanup:result});
     }
     // Completed association retirements have a compact, non-actionable receipt
     // history separate from the live case inbox.
