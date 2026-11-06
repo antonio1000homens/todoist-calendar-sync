@@ -7,6 +7,8 @@
 import {execFileSync} from "node:child_process";
 import {GetFunctionConfigurationCommand,LambdaClient} from "@aws-sdk/client-lambda";
 import {pathToFileURL} from "node:url";
+import {readFileSync,statSync} from "node:fs";
+import {isAbsolute} from "node:path";
 
 const PROFILE=/^[A-Za-z0-9+=,.@_-]{1,128}$/;
 const ACCOUNT=/^\d{12}$/;
@@ -27,17 +29,20 @@ function option(argv,name) {
   return found[0].slice(name.length+3);
 }
 export function parseOptions(argv) {
-  const allowed=new Set(["profile","expected-account","region","function","qualifier","task-id","event-id","scan-deadline-ms"]);
+  const allowed=new Set(["profile","expected-account","region","function","qualifier","task-id","event-id","scan-deadline-ms","calendar-provenance-file"]);
   if(argv.some(value=>!/^--[a-z-]+=[^\s]+$/.test(value)||!allowed.has(value.slice(2,value.indexOf("=")))))
     throw new Error("Unexpected audit option");
   const result={profile:option(argv,"profile"),account:option(argv,"expected-account"),
     region:option(argv,"region"),functionName:option(argv,"function"),qualifier:option(argv,"qualifier"),
     taskId:option(argv,"task-id"),eventId:option(argv,"event-id"),
+    calendarProvenanceFile:argv.some(value=>value.startsWith("--calendar-provenance-file="))
+      ?option(argv,"calendar-provenance-file"):undefined,
     scanDeadlineMs:argv.some(value=>value.startsWith("--scan-deadline-ms="))
       ?Number(option(argv,"scan-deadline-ms")):300_000};
   if(!PROFILE.test(result.profile)||!ACCOUNT.test(result.account)||!REGION.test(result.region)
     ||!FUNCTION.test(result.functionName)||(result.qualifier!=="$LATEST"&&!ID.test(result.qualifier))
     ||!ID.test(result.taskId)||!ID.test(result.eventId)
+    ||(result.calendarProvenanceFile!==undefined&&!isAbsolute(result.calendarProvenanceFile))
     ||!Number.isSafeInteger(result.scanDeadlineMs)||result.scanDeadlineMs<60_000||result.scanDeadlineMs>900_000)
     throw new Error("Invalid audit option value");
   return result;
@@ -273,6 +278,7 @@ export async function collectLiveCrossProfileEvidence(options) {
   const identity=verifiedCliIdentity(options.profile);
   if(identity.Account!==options.account)throw new Error("AWS profile account did not match expected account");
   const credentials=await cliProfileCredentials(options.profile)();
+  let verifiedRoutingConfig,provenanceTrustKey;
   const lambda=new LambdaClient({region:options.region,credentials:async()=>credentials,maxAttempts:5});
   try {
     const config=await lambda.send(new GetFunctionConfigurationCommand({
@@ -283,7 +289,8 @@ export async function collectLiveCrossProfileEvidence(options) {
       ||config.Environment?.Error)
       throw new Error("Target Lambda identity or environment could not be verified");
     const variables=config.Environment?.Variables||{};
-    validateRoutingConfig(variables.SYNC_PROFILE_CONFIG_JSON);
+    verifiedRoutingConfig=validateRoutingConfig(variables.SYNC_PROFILE_CONFIG_JSON);
+    provenanceTrustKey=variables.ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64;
     if(typeof variables.STATE_TABLE_NAME!=="string"||!variables.STATE_TABLE_NAME.trim())
       throw new Error("State table configuration is unavailable");
     prepareNamedProfile(options.profile,options.region,variables);
@@ -351,6 +358,22 @@ export async function collectLiveCrossProfileEvidence(options) {
     import(new URL("../dist/erasure-preview.js",import.meta.url).href),
     import(new URL("../dist/mutation-budget.js",import.meta.url).href),
   ]);
+  let calendarProvenance;
+  if(options.calendarProvenanceFile) {
+    if(typeof provenanceTrustKey!=="string"||!provenanceTrustKey.trim())
+      throw new Error("Independent Calendar provenance trust key is not deployed");
+    if(statSync(options.calendarProvenanceFile).size>1024*1024)
+      throw new Error("Calendar provenance document exceeds audit limit");
+    const {verifyCalendarProvenance,calendarRoutingFingerprint}=await import(
+      new URL("../dist/erasure-calendar-provenance.js",import.meta.url).href);
+    let document;
+    try {document=JSON.parse(readFileSync(options.calendarProvenanceFile,"utf8"));}
+    catch {throw new Error("Calendar provenance document cannot be read or parsed");}
+    calendarProvenance=verifyCalendarProvenance(document,provenanceTrustKey,{
+      accountId:options.account,region:options.region,functionName:options.functionName,
+      qualifier:options.qualifier,routingFingerprint:calendarRoutingFingerprint(verifiedRoutingConfig),
+    });
+  }
   const providerFactory=async profile=>readOnlyProviderPair(
     await defaultProviderClientFactory(profile),options.eventId,profile);
   let preview;
@@ -364,6 +387,7 @@ export async function collectLiveCrossProfileEvidence(options) {
       progress.stateScanElapsedMs=value.elapsedMs;
     },
     auditCrossProfileIdentity:true,
+    calendarProvenance,
     auditDeliveryReceipts:true,
     clients:await providerFactory("work"),
     providerFactory,

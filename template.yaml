@@ -40,6 +40,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional comma-separated Slack user allowlist for typed /sync and decision-button deliveries; empty preserves the current authenticated-workspace access policy.
+  ErasureCalendarProvenancePublicKeySpki:
+    Type: String
+    Default: ""
+    Description: Optional Ed25519 public SPKI DER key in base64, trusted by the read-only #333 audit only.
   ProfileConfigJson:
     Type: String
     NoEcho: true
@@ -133,6 +137,7 @@ Globals:
         ERASURE_PROTOCOL_VERSION: "1"
         QUEUE_URL: !Ref SyncQueue
         SYNC_PROFILE_CONFIG_JSON: !Ref ProfileConfigJson
+        ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64: !Ref ErasureCalendarProvenancePublicKeySpki
         CALENDAR_WATCH_TOKEN_PARAMETER: !Ref CalendarWatchTokenParameter
         TODOIST_WEBHOOK_SECRET_PARAMETER: !Ref TodoistWebhookSecretParameter
         PROXY_SHARED_SECRET_PARAMETER: !Ref ProxySharedSecretParameter
