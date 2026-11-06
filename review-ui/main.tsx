@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
 import { ErasureRecoveryPanel } from "./erasure-recovery-panel";
 import { OrphanDeletionPanel } from "./orphan-deletion-panel";
+import { RecurrenceRetirementInspector } from "./recurrence-retirement-inspector";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 
@@ -549,6 +550,7 @@ function App() {
               {item.detail?.retainedTaskId&&<><span>Retained task: {item.detail.retainedTaskId}</span><br/></>}
               {item.detail?.decisionId&&<><span>Decision: {item.detail.decisionId}</span><br/></>}
               <span>Observed {item.observedAt?new Date(item.observedAt).toLocaleString():"at an unrecorded time"} · recurrence owner: {item.recurrenceOwner||"unknown"} · review case: {item.caseStatus||"not created"}{item.caseId?` (${item.caseId})`:""}</span>
+               <RecurrenceRetirementInspector api={api} item={item} profile={runProfile} generation={latestRun.generation} />
             </li>)}
           </ul>}
           {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
