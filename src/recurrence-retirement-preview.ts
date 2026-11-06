@@ -167,7 +167,7 @@ export function planRecurrenceRetirement(
     }
     const incidentPrefixes=["REVIEW_CASE#","REVIEW_CONFLICT#","CONFLICT_STATE#",
       "AUDIT_REF#","MANUAL#","REPAIR#","REPAIR_PREVIEW#","RECONCILE_DIAGNOSTIC#"];
-    if(incidentPrefixes.some(prefix=>row.pk.startsWith(prefix))){
+    if(incidentPrefixes.some(prefix=>row.pk?.startsWith(prefix))){
       if(exactReference(row,identities)
         || row.pk.startsWith("AUDIT_REF#"+target.profile+"#todoist#"+target.taskId)
         || row.pk.startsWith("AUDIT_REF#"+target.profile+"#calendar#"+target.eventId)) {
