@@ -855,6 +855,10 @@ export class Synchronizer {
     const { calendar, todoist } = await this.clients(profile);
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
+      if (await this.state.isRetired?.({profile,taskId:link.taskId,
+        eventIds:[...new Set([link.masterEventId,link.eventId,link.activeInstanceId]
+          .filter((id):id is string=>Boolean(id)))],
+        seriesIds:[link.seriesId]})) continue;
       if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: link.activeInstanceId || link.masterEventId }, true)) continue;
       let master: CalendarEvent;
       try { master = await calendar.getEvent(link.masterEventId); }
@@ -1032,6 +1036,14 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
+    // This must run BEFORE master readback or conflict/audit processing. A
+    // stale webhook for a retired series must not seed fresh review evidence.
+    if (await this.state.isRetired?.({profile:delivery.profile,
+      eventIds:[...new Set([event.id,event.recurringEventId]
+        .filter((id):id is string=>Boolean(id)))],
+      ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{}),
+      ...(event.extendedProperties?.shared?.taskId
+        ?{taskId:event.extendedProperties.shared.taskId}:{})})) return;
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any provider mutation.
@@ -1748,6 +1760,9 @@ export class Synchronizer {
     let task = payload.event_data;
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
+    // Exact retired Todoist IDs short-circuit stale webhook replay before
+    // version acceptance, active provider lookups and write-fence claims.
+    if (await this.state.isRetired?.({profile:delivery.profile,taskId:task.id})) return;
     // Every Todoist-origin Calendar update/delete holds this task's durable
     // write fence until provider and mapping writes finish. Completion retries
     // rather than committing its immutable marker mid-mutation.
