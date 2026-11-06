@@ -42,6 +42,11 @@ export type RetirementOperation={
   /** Provider identity/ETag proof held stable across future Undo checks. */
   providerVersions?: {masterEventId:string;masterEtag:string;occurrenceEtag:string;
     completedAt:string;rrule:string[]};
+  undoConfirmationHash?:string;
+  undoApprovedFingerprint?:string;
+  undoApprovalExpiresAt?:string;
+  undoStatus?:"approved"|"completed";
+  reenabledAt?:string;
   cleanupStatus?:"pending"|"completed";
   retainedEvidenceCount?:number;
 };
