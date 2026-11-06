@@ -293,6 +293,21 @@ export class RetirementOperationService {
       error("Retirement preview contains unresolved safety blockers");
     if(preview.planFingerprint!==expectedFingerprint)
       error("The preview changed; inspect the new version before requesting approval");
+    if(!inspection.mapping?.masterEventId||!inspection.calendar.master?.etag
+      ||!inspection.calendar.occurrence?.etag
+      ||inspection.task.status!=="completed_verified"||!inspection.task.value
+      ||!("completed_at" in inspection.task.value)
+      ||typeof inspection.task.value.completed_at!=="string"
+      ||!Number.isFinite(Date.parse(inspection.task.value.completed_at))
+      ||!Array.isArray(inspection.calendar.master.recurrence))
+      error("Verified Calendar and completed Todoist provider versions are required for an undoable retirement");
+    const providerVersions={
+      masterEventId:inspection.mapping.masterEventId,
+      masterEtag:inspection.calendar.master.etag,
+      occurrenceEtag:inspection.calendar.occurrence.etag,
+      completedAt:inspection.task.value.completed_at,
+      rrule:[...inspection.calendar.master.recurrence],
+    };
     const operationId=randomUUID(),confirmationId=randomUUID();
     const timestamp=new Date().toISOString();
     const operation:RetirementOperation={
@@ -302,17 +317,7 @@ export class RetirementOperationService {
       planFingerprint:preview.planFingerprint,inspectionFingerprint:preview.inspectionFingerprint,
       confirmationHash:sha(confirmationId),confirmationExpiresAt:new Date(Date.now()+APPROVAL_MS).toISOString(),
       createdAt:timestamp,status:"previewed",
-      ...(inspection.mapping?.masterEventId && inspection.calendar.master?.etag
-        && inspection.calendar.occurrence?.etag && inspection.task.status==="completed_verified"
-        && inspection.task.value && "completed_at" in inspection.task.value
-        && Array.isArray(inspection.calendar.master.recurrence)
-        ?{providerVersions:{
-          masterEventId:inspection.mapping.masterEventId,
-          masterEtag:inspection.calendar.master.etag,
-          occurrenceEtag:inspection.calendar.occurrence.etag,
-          completedAt:String(inspection.task.value.completed_at),
-          rrule:inspection.calendar.master.recurrence,
-        }}:{}),
+      providerVersions,
     };
     await this.db.send(new PutCommand({TableName:table(),Item:operation,
       ConditionExpression:"attribute_not_exists(pk)"}));
