@@ -87,6 +87,9 @@ export function planRecurrenceRetirement(
     ["CANONICAL#"+target.profile+"#todoist#"+target.taskId,{side:"todoist",providerId:target.taskId}],
     ["CANONICAL#"+target.profile+"#calendar#"+target.eventId,{side:"calendar",providerId:target.eventId}],
   ]);
+  const comparable = (value: Record<string,unknown>): Record<string,unknown> =>
+    Object.fromEntries(Object.entries(value).filter(([name]) =>
+      !["pk","sk","lookupPk","lookupSk"].includes(name)));
   const baselineKey="BASELINE#"+target.profile+"#TASK#"+target.taskId;
   const controls=[
     "SYNC_CONTROL#"+target.profile+":todoist:"+target.taskId,
@@ -122,11 +125,19 @@ export function planRecurrenceRetirement(
       if(expected.get(row.pk)!==row.sk)
         blockers.push("Unexpected index sort key for "+row.pk);
       else {
-        // Exact agreement of the mapping triplet/link was already established
-        // by the inspect safety policy, and is bound to inspectionFingerprint.
-        indexRemovalCandidates.push(record(row,
+        // The inventory may have changed between the strongly consistent Get
+        // operations and the complete scan. Both must agree on full revision.
+        const expectedPayload=row.pk.startsWith("RECURRENCE#") ? link : mapping;
+        if(!expectedPayload || reviewHash(comparable(row))
+          !==reviewHash(comparable(expectedPayload as unknown as Record<string,unknown>)))
+          blockers.push("Indexed mapping/link changed between direct read and state inventory: "+row.pk);
+        else indexRemovalCandidates.push(record(row,
           "Whole-series mapping/link: future Apply must conditionally remove this exact revision"));
       }
+      continue;
+    }
+    if(row.pk===baselineKey && row.sk!=="RECONCILE") {
+      blockers.push("Unexpected reconciliation baseline sort key: "+row.pk);
       continue;
     }
     if(row.pk===baselineKey && row.sk==="RECONCILE"){
@@ -137,6 +148,10 @@ export function planRecurrenceRetirement(
       continue;
     }
     const canonical=canonicalKeys.get(row.pk);
+    if(canonical && row.sk!=="STATE") {
+      blockers.push("Unexpected canonical identity sort key: "+row.pk);
+      continue;
+    }
     if(canonical && row.sk==="STATE"){
       if(row.profile!==target.profile || row.side!==canonical.side || row.providerId!==canonical.providerId
         || typeof row.updatedAt!=="string" || !row.identity || typeof row.identity!=="object")
