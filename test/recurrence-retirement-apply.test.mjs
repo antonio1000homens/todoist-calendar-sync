@@ -131,7 +131,7 @@ function harness(t,changes={}) {
       case "GetCommand":
         return {Item:saved.operation?{...saved.operation}:undefined};
       case "UpdateCommand":
-        saved.operation={...saved.operation,status:"fencing"};
+        saved.operation={...saved.operation,status:cmd.input.ExpressionAttributeValues[":review"]||"fencing"};
         return {};
       case "TransactWriteCommand":
         saved.writes++;
@@ -202,6 +202,6 @@ test("#351 refused Dynamo CAS never claims successful Apply",async t=>{
   await assert.rejects(()=>service.apply(issued.operation.operationId,issued.confirmationId,
     "work","operator-351",RETIREMENT_APPROVAL_PHRASE),/mapping, repair or owner changed/i);
   assert.equal(saved.commits.length,1);
-  assert.equal(saved.operation.status,"previewed");
+  assert.equal(saved.operation.status,"needs_review");
   assert.equal(saved.profileFence,null,"a rejected atomic transaction cannot hold the entire profile");
 });
