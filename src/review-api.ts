@@ -3,6 +3,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { reconciliationSummary, StateRepository } from "./repository.js";
 import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
+import { inspectRecurrenceRetirement } from "./recurrence-retirement-inspection.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { assessOrphanReadiness } from "./orphan-readiness.js";
 import { OrphanApprovalService } from "./orphan-approval.js";
@@ -180,6 +181,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   createOrphanApprovalService?:(store:ReviewStore)=>OrphanApprovalService;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
   createStateRepository?:()=>StateRepository;
+  inspectRecurrenceRetirement?: typeof inspectRecurrenceRetirement;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
   requestReconciliation?:typeof requestReconciliation;
   enqueueRepair?:typeof enqueueRepair;
@@ -660,6 +662,20 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
           queueDelivery:{enqueued:false,attempt:operation.attempt,error:message}});
       }
       return response(202,{operation,queueDelivery:{enqueued:true,attempt:operation.attempt}});
+    }
+    // #351: a non-actionable Run diagnostic is selectable without a ReviewCase.
+    // Inspection is diagnostic-bound and read-only. It does not issue an apply
+    // token or alter provider objects or state.
+    if (method === "GET" && segments[0] === "reconciliation"
+      && segments[1] === "retirement-inspection" && segments.length === 2) {
+      const query = event.queryStringParameters || {};
+      if (Object.keys(query).sort().join(",") !== "eventId,generation,profile,seriesId,taskId")
+        fail(400,"Inspect requires the exact recorded profile, generation, Todoist, occurrence and series identities");
+      const selected = profile(query.profile || null);
+      const target = {profile:selected,generation:query.generation || "",
+        taskId:query.taskId || "",eventId:query.eventId || "",seriesId:query.seriesId || ""};
+      const inspection = await (dependencies.inspectRecurrenceRetirement || inspectRecurrenceRetirement)(target);
+      return response(200,{inspection});
     }
     if (method === "GET" && segments[0] === "reconciliation" && segments[1] === "diagnostics" && segments.length === 2) {
       const selected = profile(event.queryStringParameters?.profile || null);
