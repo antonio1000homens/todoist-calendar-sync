@@ -7,6 +7,7 @@
  * do not make external HTTP mutations transactional with marker installation.
  */
 import {parseMappingComment} from "./mapping-comments.js";
+import { assertRetirementAdmissionIfEnabled, retirementDispositionEnabled } from "./recurrence-retirement-disposition.js";
 import {
   assertReplayAdmission, ErasureReplayUnavailableError, mappingReplayIdentity, replayAdmissionEnabled,
   type ReplayIdentity,
@@ -117,9 +118,10 @@ function guardClient<T extends object>(profile:Profile,side:Side,target:T):T {
       const method=String(property);
       if(!methods.has(method))return value.bind(current);
       return async (...args:unknown[])=>{
-        if(replayAdmissionEnabled()) {
+        if(replayAdmissionEnabled() || retirementDispositionEnabled()) {
           const identity=replayMutationIdentity(profile,side,method,args);
-          await assertReplayAdmission(identity);
+          await assertRetirementAdmissionIfEnabled(identity);
+          if(replayAdmissionEnabled())await assertReplayAdmission(identity);
         }
         return Reflect.apply(value,current,args);
       };
