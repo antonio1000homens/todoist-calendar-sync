@@ -267,10 +267,12 @@ export async function inspectRecurrenceRetirement(
     ]);
     if (expectedIndex.has(pk)) return row.sk !== expectedIndex.get(pk)
       || !exactSameMapping(mapping, row as Mapping);
-    if (pk === `RECURRENCE#${target.profile}#${target.seriesId}`)
+    if (pk === `RECURRENCE#${target.profile}#${target.seriesId}`) {
+      const withoutKeys = (value: Record<string, unknown>) => Object.fromEntries(
+        Object.entries(value).filter(([name]) => !["pk","sk","lookupPk","lookupSk"].includes(name)));
       return row.sk !== "STATE" || !link
-        || reviewHash(Object.fromEntries(Object.entries(row).filter(([name])=>
-          !["pk","sk","lookupPk","lookupSk"].includes(name)))) !== reviewHash(link);
+        || reviewHash(withoutKeys(row)) !== reviewHash(withoutKeys(link as unknown as Record<string, unknown>));
+    }
     const canonicalKeys = new Set([
       `CANONICAL#${target.profile}#todoist#${target.taskId}`,
       ...[target.eventId,mapping?.masterEventId,mapping?.activeInstanceId]
