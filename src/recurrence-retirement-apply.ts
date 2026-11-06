@@ -16,7 +16,7 @@
  * to have failed. Incident cleanup/Undo are separate follow-up phases.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { GetCommand, PutCommand, TransactWriteCommand,
+import { GetCommand, PutCommand, UpdateCommand, TransactWriteCommand,
   type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
@@ -305,36 +305,63 @@ export class RetirementOperationService {
     }
     if(!["previewed","fencing"].includes(operation.status))
       error("Retirement operation is not applicable");
-    if(Date.parse(operation.confirmationExpiresAt)<=Date.now())
+    // An existing fence owned by THIS operation remains resumable even if a
+    // 30-minute token expired while an earlier writer drained. The same
+    // confirmation token and the same authenticated operator are still needed.
+    const existingFence=await this.inspectFence(profile);
+    if(Date.parse(operation.confirmationExpiresAt)<=Date.now()
+      && existingFence.fence?.operationId!==operationId)
       error("Retirement approval expired; start a new preview");
     await this.beginFence(profile,operationId);
     const drain=await this.inspectFence(profile);
     if(drain.fence?.operationId!==operationId)
       error("Another operation owns the profile write fence");
+    if(operation.status==="previewed"){
+      // A durable "fencing" receipt makes an interrupted operation discoverable
+      // and preserves its original approval as the only resumable identity.
+      await this.db.send(new UpdateCommand({TableName:table(),Key:operationKey(operationId),
+        UpdateExpression:"SET #status = :fencing, updatedAt = :now",
+        ConditionExpression:"#status = :previewed AND actorSubject = :actor AND confirmationHash = :confirmation",
+        ExpressionAttributeNames:{"#status":"status"},
+        ExpressionAttributeValues:{":fencing":"fencing",":previewed":"previewed",
+          ":now":new Date().toISOString(),":actor":actorSubject,":confirmation":operation.confirmationHash}}));
+    }
     if(drain.leases.length){
-      // All writers are now barred from acquiring a new profile lease. Never
-      // inspect/commit while an earlier provider write is still in flight.
+      // All writers are barred from acquiring a NEW lease. Existing in-flight
+      // writes must drain before we run the exact read/transaction.
       return {...exposed(operation),status:"fencing",profileFenceActive:true};
     }
-    let inventory:readonly InventoryRow[]|undefined;
-    const {inspection,preview}=await this.preview(operation.target,{
-      ...this.deps.inspector,onInventory:rows=>{
-        inventory=rows;this.deps.inspector?.onInventory?.(rows);
-      },
-    });
-    if(!inventory||preview.status!=="reviewable"||!inspection.eligibleForFutureApproval
-      ||preview.planFingerprint!==operation.planFingerprint
-      ||preview.inspectionFingerprint!==operation.inspectionFingerprint)
-      error("Retirement changed after approval; profile remains fenced pending safe recovery");
-    const command=buildRetirementTransaction(operation,preview,inventory,new Date().toISOString(),table());
+    let command:TransactWriteCommand;
+    try {
+      let inventory:readonly InventoryRow[]|undefined;
+      const {inspection,preview}=await this.preview(operation.target,{
+        ...this.deps.inspector,onInventory:rows=>{
+          inventory=rows;this.deps.inspector?.onInventory?.(rows);
+        },
+      });
+      if(!inventory||preview.status!=="reviewable"||!inspection.eligibleForFutureApproval
+        ||preview.planFingerprint!==operation.planFingerprint
+        ||preview.inspectionFingerprint!==operation.inspectionFingerprint)
+        error("Retirement changed after approval; no state changes were applied");
+      command=buildRetirementTransaction(operation,preview,inventory,new Date().toISOString(),table());
+    } catch (preflightError) {
+      // No DynamoDB retirement transaction has been sent. Releasing our
+      // exclusive profile fence is safe; the stale approval remains unusable
+      // because any retry must pass the same version check.
+      await this.finishFence(profile,operationId);
+      throw preflightError;
+    }
     try{await this.db.send(command);}
-    catch(error) {
-      // DynamoDB TransactionCanceledException is atomic and has no partial
-      // writes, but an arbitrary transport error has UNKNOWN commit status.
-      // Do not auto-release the profile fence on an ambiguous response.
-      if((error as {name?:string}).name==="TransactionCanceledException")
-        return errorMsg("A mapping, repair or owner changed before atomic retirement; profile remains fenced for review");
-      throw error;
+    catch(writeError) {
+      // A rejected DynamoDB transaction is atomic and had no writes; release
+      // the temporary profile fence and let the operator re-inspect.
+      // For transport/unknown outcomes, keep the fence and require receipt
+      // readback on retry before any release.
+      if((writeError as {name?:string}).name==="TransactionCanceledException"){
+        await this.finishFence(profile,operationId);
+        error("A mapping, repair or owner changed before atomic retirement");
+      }
+      throw writeError;
     }
     await this.finishFence(profile,operationId);
     const updated=await this.get(operationId);
@@ -343,4 +370,3 @@ export class RetirementOperationService {
     return exposed(updated);
   }
 }
-function errorMsg(message:string):never{return error(message);}
