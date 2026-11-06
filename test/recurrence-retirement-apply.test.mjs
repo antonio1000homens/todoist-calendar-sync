@@ -130,6 +130,9 @@ function harness(t,changes={}) {
         return {};
       case "GetCommand":
         return {Item:saved.operation?{...saved.operation}:undefined};
+      case "UpdateCommand":
+        saved.operation={...saved.operation,status:"fencing"};
+        return {};
       case "TransactWriteCommand":
         saved.writes++;
         saved.commits.push(cmd);
@@ -184,14 +187,14 @@ test("#351 outstanding provider writer leases suspend Apply instead of mutating"
   assert.equal(recovered.status,"retired");
   assert.equal(saved.commits.length,1);
 });
-test("#351 stale approved fingerprint leaves a safe profile fence; no partial deletion",async t=>{
+test("#351 stale approved fingerprint releases exclusive profile fence with no partial deletion",async t=>{
   const {saved,row,service,setFingerprint}=harness(t);
   const issued=await service.issue(target,row.preview.planFingerprint,"operator-351");
   setFingerprint("b".repeat(64));
   await assert.rejects(()=>service.apply(issued.operation.operationId,issued.confirmationId,
     "work","operator-351",RETIREMENT_APPROVAL_PHRASE),/evidence changed|changed after approval|Retirement changed/i);
   assert.equal(saved.commits.length,0);
-  assert.ok(saved.profileFence,"unsafe unknown state must not silently unfence");
+  assert.equal(saved.profileFence,null,"no transaction was sent; profile must be available for re-approval");
 });
 test("#351 refused Dynamo CAS never claims successful Apply",async t=>{
   const {saved,row,service}=harness(t,{rejectTransaction:true});
@@ -200,5 +203,5 @@ test("#351 refused Dynamo CAS never claims successful Apply",async t=>{
     "work","operator-351",RETIREMENT_APPROVAL_PHRASE),/mapping, repair or owner changed/i);
   assert.equal(saved.commits.length,1);
   assert.equal(saved.operation.status,"previewed");
-  assert.ok(saved.profileFence);
+  assert.equal(saved.profileFence,null,"a rejected atomic transaction cannot hold the entire profile");
 });
