@@ -675,6 +675,12 @@ export class SnapshotReconciler {
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
   ): Promise<ReconcileOutcome> {
+    // Operator retirement is a terminal no-op, not another blocked or deferred
+    // diagnostic. The future Apply transaction will remove this mapping.
+    if (await this.state.isRetired?.({profile,taskId:mapping.taskId,
+      eventIds:[...new Set([mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
+        .filter((id):id is string=>Boolean(id)))],
+      ...(mapping.seriesId?{seriesIds:[mapping.seriesId]}:{})})) return "noop";
     if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: mapping.taskId, eventId: mapping.eventId, reason: "active_review_control",
@@ -789,6 +795,7 @@ export class SnapshotReconciler {
   }
 
   private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
+    if (await this.state.isRetired?.({profile,taskId:task.id})) return "noop";
     if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: task.id, reason: "active_review_control",
