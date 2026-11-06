@@ -202,7 +202,7 @@ export function buildRetirementTransaction(
   const receipt={Update:{
     TableName:tableName,Key:operationKey(operation.operationId),
     UpdateExpression:"SET #status = :retired, retiredAt = :at, updatedAt = :at, cleanupStatus = :pending, retainedEvidenceCount = :count",
-    ConditionExpression:"(#status = :previewed OR #status = :fencing) AND confirmationHash = :confirmation AND planFingerprint = :fingerprint AND actorSubject = :actor AND confirmationExpiresAt > :at",
+    ConditionExpression:"(#status = :previewed OR #status = :fencing) AND confirmationHash = :confirmation AND planFingerprint = :fingerprint AND actorSubject = :actor",
     ExpressionAttributeNames:{"#status":"status"},
     ExpressionAttributeValues:{
       ":retired":"retired",":previewed":"previewed",":fencing":"fencing",
