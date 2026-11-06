@@ -115,6 +115,10 @@ export function planRecurrenceRetirement(
       blockers.push("State inventory contains a row without both DynamoDB keys");
       continue;
     }
+    // Pending approval/operation receipts are protected outside this plan.
+    // Including them in planFingerprint would make every issued token stale
+    // immediately after the approval Put, so they are never cleanup targets.
+    if(row.pk.startsWith("RETIREMENT_OPERATION#"))continue;
     const rowKey=row.pk+"|"+row.sk;
     if(seen.has(rowKey)) {
       blockers.push("State inventory returned duplicate keys: "+row.pk);

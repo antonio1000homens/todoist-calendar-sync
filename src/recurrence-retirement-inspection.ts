@@ -252,8 +252,12 @@ export async function inspectRecurrenceRetirement(
     `TASK#${profile}#${target.taskId}`, `EVENT#${profile}#${target.eventId}`,
     `RECURRENCE#${profile}#${target.seriesId}`,
   ]));
-  const related = inventory.filter(row => rowReferences(row, identities)
-    || relevantControlKeys.has(String(row.pk)) || relevantMappingKeys.has(String(row.pk)));
+  // Approval receipts are operational credentials, not provider evidence.
+  // Issuing an approval must not change the evidence fingerprint which Apply
+  // uses to prove that the actual association stayed unchanged.
+  const related = inventory.filter(row => !String(row.pk||"").startsWith("RETIREMENT_OPERATION#")
+    && (rowReferences(row, identities)
+      || relevantControlKeys.has(String(row.pk)) || relevantMappingKeys.has(String(row.pk))));
 
   const relatedCounters: Record<string,number> = {};
   for (const row of related) {

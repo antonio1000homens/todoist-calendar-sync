@@ -135,6 +135,8 @@ Globals:
       Variables:
         STATE_TABLE_NAME: !Ref SyncState
         ERASURE_PROTOCOL_VERSION: "1"
+        # #351: every Lambda reader/writer must honour operator retirement tombstones.
+        RETIREMENT_DISPOSITION_VERSION: "1"
         QUEUE_URL: !Ref SyncQueue
         SYNC_PROFILE_CONFIG_JSON: !Ref ProfileConfigJson
         ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64: !Ref ErasureCalendarProvenancePublicKeySpki

@@ -5,6 +5,7 @@ import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { inspectRecurrenceRetirement } from "./recurrence-retirement-inspection.js";
 import { previewRecurrenceRetirement } from "./recurrence-retirement-preview.js";
+import { RetirementOperationService, RETIREMENT_APPROVAL_PHRASE } from "./recurrence-retirement-apply.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
 import { assessOrphanReadiness } from "./orphan-readiness.js";
 import { OrphanApprovalService } from "./orphan-approval.js";
@@ -184,6 +185,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   createStateRepository?:()=>StateRepository;
   inspectRecurrenceRetirement?: typeof inspectRecurrenceRetirement;
   previewRecurrenceRetirement?: typeof previewRecurrenceRetirement;
+  createRetirementOperationService?:()=>RetirementOperationService;
   clearDeadLetterMessagesForProfile?:typeof clearDeadLetterMessagesForProfile;
   requestReconciliation?:typeof requestReconciliation;
   enqueueRepair?:typeof enqueueRepair;
@@ -242,7 +244,11 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       } else if(segments[0]==="operations"&&segments[2]==="resume"&&segments[1]) {
         const operation=await store.getOperation(segments[1]);
         if(operation) writeProfiles.push(operation.preview.intent.profile);
-      } else if(segments[0]==="reconciliation"&&typeof body?.profile==="string") {
+      } else if(segments[0]==="reconciliation"&&typeof body?.profile==="string"
+        &&segments[1]!=="retirement-apply") {
+        // Retirement Apply installs its OWN exclusive profile fence and waits
+        // for all admission/writer leases to drain. Holding one here would
+        // deadlock the drain and make a safe commit impossible.
         writeProfiles.push(profile(body.profile));
       }
       for(const selectedProfile of [...new Set(writeProfiles)]) {
@@ -690,6 +696,40 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const target = {profile:selected,generation:query.generation || "",
         taskId:query.taskId || "",eventId:query.eventId || "",seriesId:query.seriesId || ""};
       return response(200,await (dependencies.previewRecurrenceRetirement || previewRecurrenceRetirement)(target));
+    }
+    // #351 conditional Apply is disjoint from erasure of provider objects.
+    // The operator approves an exact checked version, then independently
+    // confirms with a one-use secret and typed keep-provider phrase.
+    if (method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-approvals"
+      &&segments.length===2) {
+      if(Object.keys(body||{}).sort().join(",")
+        !=="eventId,generation,planFingerprint,profile,seriesId,taskId")
+        fail(400,"Retirement approval requires exact target identity and preview fingerprint");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      requireAdmissionProfile(selected);
+      const target={profile:selected,generation:String(body!.generation||""),
+        taskId:String(body!.taskId||""),eventId:String(body!.eventId||""),
+        seriesId:String(body!.seriesId||"")};
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const result=await service.issue(target,String(body!.planFingerprint||""),actor.subject);
+      return response(201,result);
+    }
+    if (method==="POST"&&segments[0]==="reconciliation"&&segments[1]==="retirement-apply"
+      &&segments.length===2) {
+      if(Object.keys(body||{}).sort().join(",")
+        !=="confirmationId,operationId,phrase,profile")
+        fail(400,"Apply requires exact operation, profile, token and confirmation phrase");
+      const selected=profile(typeof body?.profile==="string"?body.profile:null);
+      if(body!.phrase!==RETIREMENT_APPROVAL_PHRASE)fail(400,"Retirement requires typed KEEP PROVIDER ITEMS confirmation");
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      const result=await service.apply(String(body!.operationId||""),
+        String(body!.confirmationId||""),selected,actor.subject,String(body!.phrase));
+      return response(result.status==="fencing"?202:200,{operation:result});
+    }
+    if(method==="GET"&&segments[0]==="reconciliation"&&segments[1]==="retirement-operations"
+      &&segments.length===3) {
+      const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
+      return response(200,{operation:await service.status(segments[2],actor.subject)});
     }
     if (method === "GET" && segments[0] === "reconciliation" && segments[1] === "diagnostics" && segments.length === 2) {
       const selected = profile(event.queryStringParameters?.profile || null);
