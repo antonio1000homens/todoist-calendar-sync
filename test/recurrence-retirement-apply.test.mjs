@@ -205,3 +205,13 @@ test("#351 refused Dynamo CAS never claims successful Apply",async t=>{
   assert.equal(saved.operation.status,"needs_review");
   assert.equal(saved.profileFence,null,"a rejected atomic transaction cannot hold the entire profile");
 });
+
+test("#351 issuing a token must not alter the inspected mapping's version fingerprint",()=>{
+  const {rows,preview}=planned();
+  const approval={pk:"RETIREMENT_OPERATION#11111111-1111-4111-8111-111111111111",sk:"STATE",
+    status:"previewed",target,profile:"work",operationId:"11111111-1111-4111-8111-111111111111",
+    actorSubject:"operator-351",planFingerprint:preview.planFingerprint};
+  const after=planRecurrenceRetirement(inspection,[...rows,approval]);
+  assert.equal(after.planFingerprint,preview.planFingerprint);
+  assert.equal(after.status,"reviewable");
+});
