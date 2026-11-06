@@ -180,7 +180,7 @@ function inspectionFixture({
         async getEvent(id){
           calls.push(["getEvent",id]);
           if(id==="master") {
-            if(calendarMaster===undefined)throw Object.assign(new Error("master not found"),{status:404});
+            if(!calendarMaster)throw Object.assign(new Error("master not found"),{status:404});
             return calendarMaster;
           }
           if(id===target.eventId)return instance;
@@ -223,7 +223,7 @@ test("#351 diagnostic search is paginated without silently dropping the intended
   assert.equal(calls.filter(([name])=>name==="diagnostic").length,2);
 });
 test("#351 absence of Calendar master or completed lookup evidence never implies retirement",async()=>{
-  const {dependencies}=inspectionFixture({calendarMaster:undefined,completedStatus:429});
+  const {dependencies}=inspectionFixture({calendarMaster:null,completedStatus:429});
   const result=await inspectRecurrenceRetirement(target,dependencies);
   assert.equal(result.eligibleForFutureApproval,false);
   assert.equal(result.task.status,"unverified");
