@@ -60,6 +60,7 @@ export function RecurrenceRetirementInspector({
   const [undoInspection,setUndoInspection]=useState<UndoInspection>();
   const [undoApproval,setUndoApproval]=useState<UndoApproval>();
   const [undoPhrase,setUndoPhrase]=useState("");
+  const [cleanupStatus,setCleanupStatus]=useState("");
   const [error,setError]=useState("");
   const sequence=useRef(0);
   useEffect(()=>()=>{sequence.current++;},[]);
@@ -154,6 +155,18 @@ export function RecurrenceRetirementInspector({
       setRetirementStatus(current=>current?{...current,status:result.operation.status}:current);
       if(result.operation.status==="re_enabled")setUndoApproval(undefined);
     }catch(e:any){setError(e.message||"Re-enable Apply failed");}
+    finally{setBusy(false);}
+  };
+  const cleanupIncidents=async()=>{
+    if(!retirementStatus||retirementStatus.status!=="retired")return;
+    setBusy(true);setError("");
+    try{
+      const result=await api("reconciliation/retirement-cleanup",{method:"POST",
+        body:JSON.stringify({profile,operationId:retirementStatus.operationId})});
+      setCleanupStatus("Removed "+result.cleanup.deletedAudits+" exclusively attributable audit entries; "+
+        result.cleanup.protectedRecords+" protected rows retained.");
+      setRetirementStatus(current=>current?{...current,cleanupStatus:result.cleanup.status}:current);
+    }catch(e:any){setError(e.message||"Cleanup was blocked; no partial cleanup recorded");}
     finally{setBusy(false);}
   };
   const records=(title:string,items:PlannedRecord[])=> <details>
@@ -254,6 +267,11 @@ export function RecurrenceRetirementInspector({
           <p>Operation <code>{retirementStatus.operationId}</code>; provider items remain unchanged.</p>
           {retirementStatus.status==="fencing"&&<p className="notice">Waiting for prior profile workers to finish. Retry Apply using the same approval; no provider writes are performed.</p>}
           {retirementStatus.cleanupStatus==="pending"&&<p className="notice">Attributable incident cleanup is pending. Historical completion/replay evidence remains protected.</p>}
+          {retirementStatus.status==="retired"&&retirementStatus.cleanupStatus!=="completed"&&
+            <button type="button" className="secondary" disabled={busy} onClick={cleanupIncidents}>
+              Clean exclusively attributable incident evidence
+            </button>}
+          {cleanupStatus&&<p role="status">{cleanupStatus}</p>}
           {retirementStatus.status==="retired"&&<button className="secondary" disabled={busy} type="button" onClick={inspectUndo}>
             Inspect re-enable syncing
           </button>}
