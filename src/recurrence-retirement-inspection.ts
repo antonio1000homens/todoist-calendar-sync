@@ -71,7 +71,7 @@ function rowReferences(row: InventoryRow, identities: Set<string>): boolean {
 }
 
 /** Complete strongly consistent inventory; a truncated scan is NOT negative evidence. */
-async function strongInventory(): Promise<InventoryRow[]> {
+export async function strongInventory(): Promise<InventoryRow[]> {
   const table = process.env.STATE_TABLE_NAME;
   if (!table) reject("STATE_TABLE_NAME is not configured", 503);
   const result: InventoryRow[] = [];
