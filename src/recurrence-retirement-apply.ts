@@ -280,6 +280,17 @@ export class RetirementOperationService {
       planFingerprint:preview.planFingerprint,inspectionFingerprint:preview.inspectionFingerprint,
       confirmationHash:sha(confirmationId),confirmationExpiresAt:new Date(Date.now()+APPROVAL_MS).toISOString(),
       createdAt:timestamp,status:"previewed",
+      ...(inspection.mapping?.masterEventId && inspection.calendar.master?.etag
+        && inspection.calendar.occurrence?.etag && inspection.task.status==="completed_verified"
+        && inspection.task.value && "completed_at" in inspection.task.value
+        && Array.isArray(inspection.calendar.master.recurrence)
+        ?{providerVersions:{
+          masterEventId:inspection.mapping.masterEventId,
+          masterEtag:inspection.calendar.master.etag,
+          occurrenceEtag:inspection.calendar.occurrence.etag,
+          completedAt:String(inspection.task.value.completed_at),
+          rrule:inspection.calendar.master.recurrence,
+        }}:{}),
     };
     await this.db.send(new PutCommand({TableName:table(),Item:operation,
       ConditionExpression:"attribute_not_exists(pk)"}));
