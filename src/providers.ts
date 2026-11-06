@@ -699,6 +699,49 @@ export class Todoist {
     return this.request<TodoistTask>(`/tasks/${encodeURIComponent(taskId)}`);
   }
 
+  /**
+   * Read-only and completely paginated completed-task evidence for #351.
+   * GET /tasks/{id} only returns active tasks; a 404 is not proof of completion.
+   * The completion window is anchored in independently stored history. A
+   * missing/partial/invalid result fails closed in the retirement inspector.
+   */
+  async findCompletedTaskById(taskId: string, recordedCompletedAt: string): Promise<
+    (TodoistTask & { completed_at: string; is_deleted?: boolean }) | undefined
+  > {
+    const completedAt = Date.parse(recordedCompletedAt);
+    if (!Number.isFinite(completedAt)) throw new Error("Completed-task lookup needs a verified completion timestamp");
+    const since = new Date(completedAt - 3 * 86400_000).toISOString();
+    const until = new Date(completedAt + 3 * 86400_000).toISOString();
+    const cursorSet = new Set<string>();
+    let cursor: string | undefined;
+    let matched: (TodoistTask & { completed_at: string; is_deleted?: boolean }) | undefined;
+    for (let page = 0; page < 200; page += 1) {
+      const query = new URLSearchParams({ since, until, limit:"200" });
+      if (cursor) query.set("cursor",cursor);
+      const response = await this.request<{
+        items?: Array<TodoistTask & { completed_at: string; is_deleted?: boolean }>;
+        next_cursor?: string | null;
+      }>("/tasks/completed/by_completion_date?" + query);
+      if (!response || !Array.isArray(response.items))
+        throw new Error("Todoist completed-task evidence is not a complete page");
+      for (const item of response.items) {
+        if (!item || typeof item.id !== "string" || !item.id
+          || typeof item.completed_at !== "string" || !Number.isFinite(Date.parse(item.completed_at)))
+          throw new Error("Todoist completed-task inventory contains an unverified entry");
+        if (item.id !== taskId) continue;
+        if (matched && JSON.stringify(matched) !== JSON.stringify(item))
+          throw new Error("Todoist completed-task evidence changed between pages");
+        matched = item;
+      }
+      const next = response.next_cursor;
+      if (next === undefined || next === null || next === "") return matched;
+      if (typeof next !== "string" || cursorSet.has(next))
+        throw new Error("Todoist completed-task inventory repeated an invalid cursor");
+      cursorSet.add(next); cursor = next;
+    }
+    throw new Error("Todoist completed-task inventory exceeded the safe page limit");
+  }
+
   // sourceEventIds is a trusted, provider-read Calendar provenance hint for the
   // replay-admission wrapper; it is never sent to Todoist's /tasks API.
   async upsertTask(task: Omit<TodoistTask, "id">, existingId?: string, sourceEventIds?: readonly string[]): Promise<TodoistTask> {
