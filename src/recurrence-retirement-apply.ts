@@ -16,7 +16,7 @@
  * to have failed. Incident cleanup/Undo are separate follow-up phases.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { GetCommand, PutCommand, UpdateCommand, TransactWriteCommand,
+import { GetCommand, PutCommand, UpdateCommand, QueryCommand, TransactWriteCommand,
   type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
@@ -38,6 +38,7 @@ export type RetirementOperation={
   planFingerprint:string;inspectionFingerprint:string;
   confirmationHash:string;confirmationExpiresAt:string;
   createdAt:string;retiredAt?:string;updatedAt?:string;
+  lookupPk?:string;lookupSk?:string;
   /** Provider identity/ETag proof held stable across future Undo checks. */
   providerVersions?: {masterEventId:string;masterEtag:string;occurrenceEtag:string;
     completedAt:string;rrule:string[]};
@@ -262,6 +263,20 @@ export class RetirementOperationService {
     }
     return state;
   }
+  async history(profile:Profile,limit=50):Promise<RetirementOperationStatus[]> {
+    if(!(["home","antonio","work"] as const).includes(profile))
+      error("Invalid history profile",400);
+    const page=await this.db.send(new QueryCommand({TableName:table(),
+      IndexName:"ProfileLookupIndex",
+      KeyConditionExpression:"lookupPk = :profile AND begins_with(lookupSk,:prefix)",
+      ExpressionAttributeValues:{":profile":"PROFILE#"+profile,
+        ":prefix":"RETIREMENT_OPERATION#"},
+      Limit:Math.min(50,Math.max(1,limit)),ScanIndexForward:false}));
+    return ((page.Items||[]) as RetirementOperation[])
+      .filter(item=>item.profile===profile&&["retired","re_enabled"].includes(item.status))
+      .map(exposed);
+  }
+
   async issue(
     target:RetirementDiagnosticTarget,expectedFingerprint:string,actorSubject:string,
   ):Promise<IssueRetirementApproval> {
@@ -277,6 +292,8 @@ export class RetirementOperationService {
     const timestamp=new Date().toISOString();
     const operation:RetirementOperation={
       ...operationKey(operationId),operationId,profile:target.profile,target,actorSubject,
+      lookupPk:"PROFILE#"+target.profile,
+      lookupSk:"RETIREMENT_OPERATION#"+timestamp+"#"+operationId,
       planFingerprint:preview.planFingerprint,inspectionFingerprint:preview.inspectionFingerprint,
       confirmationHash:sha(confirmationId),confirmationExpiresAt:new Date(Date.now()+APPROVAL_MS).toISOString(),
       createdAt:timestamp,status:"previewed",
