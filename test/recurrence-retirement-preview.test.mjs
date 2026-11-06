@@ -147,3 +147,22 @@ test("#351 a preview fetch repeats full provider and state evidence readback wit
   assert.equal(calls.filter(x=>x==="inventory").length,2);
   assert.equal(repeated.preview.planFingerprint,result.preview.planFingerprint);
 });
+
+test("#351 direct mapping read and inventory scan must agree on complete recurrence progress",()=>{
+  const list=rows();
+  const row=list.find(x=>x.pk==="EVENT#work#"+target.eventId);
+  row.completedThroughOriginalStart="2026-10-23T08:30:00Z";
+  const result=planRecurrenceRetirement(inspection,list);
+  assert.equal(result.status,"blocked");
+  assert.match(result.blockers.join(" / "),/changed between direct read and state inventory/i);
+  assert.equal(result.indexRemovalCandidates.length,3);
+});
+test("#351 invalid canonical sort key or task baseline sort key fails closed",()=>{
+  const list=rows().map(row=>row.pk==="CANONICAL#work#calendar#"+target.eventId
+    ?{...row,sk:"OTHER"}:row.pk==="BASELINE#work#TASK#"+target.taskId
+      ?{...row,sk:"OTHER"}:row);
+  const result=planRecurrenceRetirement(inspection,list);
+  assert.equal(result.status,"blocked");
+  assert.match(result.blockers.join(" / "),/Unexpected canonical identity sort key/i);
+  assert.match(result.blockers.join(" / "),/Unexpected reconciliation baseline sort key/i);
+});
