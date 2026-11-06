@@ -4,7 +4,7 @@ import { assessRecurrenceRetirement } from "../dist/recurrence-retirement-inspec
 
 const target={profile:"work",generation:"1793982837494-t1u4ucsa",
   taskId:"6hjvhXv24HmhgFx7",eventId:"occ_20261021T083000Z",
-  seriesId:"series@google.com"};
+  seriesId:"series-uid-351"};
 const past="2026-10-21T08:30:00Z";
 const completed="2026-10-21T13:00:00Z";
 const mapping={profile:"work",taskId:target.taskId,eventId:target.eventId,
