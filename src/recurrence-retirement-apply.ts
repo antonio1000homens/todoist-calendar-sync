@@ -34,7 +34,7 @@ type Db=Pick<DynamoDBDocumentClient,"send">;
 export type RetirementOperation={
   pk:string;sk:"STATE";operationId:string;profile:Profile;
   target:RetirementDiagnosticTarget;actorSubject:string;
-  status:"previewed"|"fencing"|"retired"|"re_enabled";
+  status:"previewed"|"fencing"|"needs_review"|"retired"|"re_enabled";
   planFingerprint:string;inspectionFingerprint:string;
   confirmationHash:string;confirmationExpiresAt:string;
   createdAt:string;retiredAt?:string;updatedAt?:string;
@@ -253,7 +253,7 @@ export class RetirementOperationService {
     if(!op)error("Retirement operation not found",404);
     if(op.actorSubject!==actorSubject)error("Retirement operation belongs to another operator",403);
     const state=exposed(op);
-    if(op.status==="fencing"||op.status==="retired"){
+    if(op.status==="fencing"||op.status==="needs_review"||op.status==="retired"){
       const fence=await this.inspectFence(op.profile);
       state.profileFenceActive=fence.fence?.operationId===op.operationId;
     }
@@ -282,6 +282,15 @@ export class RetirementOperationService {
       ConditionExpression:"attribute_not_exists(pk)"}));
     return {operation:exposed(operation),confirmationId,phrase:RETIREMENT_APPROVAL_PHRASE,providerWrites:false};
   }
+  private async noteRejectedPreflight(operationId:string,actorSubject:string):Promise<void> {
+    await this.db.send(new UpdateCommand({TableName:table(),Key:operationKey(operationId),
+      UpdateExpression:"SET #status = :review, updatedAt = :now",
+      ConditionExpression:"#status = :fencing AND actorSubject = :actor",
+      ExpressionAttributeNames:{"#status":"status"},
+      ExpressionAttributeValues:{":review":"needs_review",":fencing":"fencing",
+        ":actor":actorSubject,":now":new Date().toISOString()}}));
+  }
+
   async apply(
     operationId:string,confirmationId:string,profile:Profile,actorSubject:string,phrase:string,
   ):Promise<RetirementOperationStatus> {
@@ -348,6 +357,7 @@ export class RetirementOperationService {
       // No DynamoDB retirement transaction has been sent. Releasing our
       // exclusive profile fence is safe; the stale approval remains unusable
       // because any retry must pass the same version check.
+      await this.noteRejectedPreflight(operationId,actorSubject);
       await this.finishFence(profile,operationId);
       throw preflightError;
     }
@@ -358,6 +368,7 @@ export class RetirementOperationService {
       // For transport/unknown outcomes, keep the fence and require receipt
       // readback on retry before any release.
       if((writeError as {name?:string}).name==="TransactionCanceledException"){
+        await this.noteRejectedPreflight(operationId,actorSubject);
         await this.finishFence(profile,operationId);
         error("A mapping, repair or owner changed before atomic retirement");
       }
