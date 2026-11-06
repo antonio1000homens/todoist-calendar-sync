@@ -266,7 +266,7 @@ export async function inspectRecurrenceRetirement(
       [`TASKOWNER#${target.taskId}`, "MAP"],
     ]);
     if (expectedIndex.has(pk)) return row.sk !== expectedIndex.get(pk)
-      || !exactSameMapping(mapping, row as Mapping);
+      || !exactSameMapping(mapping, row as unknown as Mapping);
     if (pk === `RECURRENCE#${target.profile}#${target.seriesId}`) {
       const withoutKeys = (value: Record<string, unknown>) => Object.fromEntries(
         Object.entries(value).filter(([name]) => !["pk","sk","lookupPk","lookupSk"].includes(name)));
