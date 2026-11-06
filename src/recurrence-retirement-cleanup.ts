@@ -82,23 +82,23 @@ export function planRetirementIncidentCleanup(op:RetirementOperation,rows:readon
       blockers.push("An open review case still references attributable audit "+row.pk);
       continue;
     }
-    safeAuditKeys.push(row.pk!);
     const indexed=rows.filter(ref=>ref.pk?.startsWith("AUDIT_REF#"+op.profile+"#")
       &&ref.auditKey===row.pk);
-    for(const ref of indexed){
-      const expectedPrefixes=[
-        "AUDIT_REF#"+op.profile+"#todoist#"+op.target.taskId,
-        "AUDIT_REF#"+op.profile+"#calendar#"+op.target.eventId,
-        "AUDIT_REF#"+op.profile+"#calendar#"+op.providerVersions.masterEventId,
-      ];
-      if(!expectedPrefixes.includes(ref.pk!)){
-        blockers.push("Attributable audit has a foreign provider reverse index: "+ref.pk);
-        protectedRecordCount++;
-        safeAuditKeys.pop();
-        break;
-      }
-      safeReferenceKeys.push({pk:ref.pk!,sk:ref.sk!});
+    const expectedPrefixes=[
+      "AUDIT_REF#"+op.profile+"#todoist#"+op.target.taskId,
+      "AUDIT_REF#"+op.profile+"#calendar#"+op.target.eventId,
+      "AUDIT_REF#"+op.profile+"#calendar#"+op.providerVersions.masterEventId,
+    ];
+    const foreign=indexed.filter(ref=>!expectedPrefixes.includes(ref.pk!));
+    if(foreign.length){
+      blockers.push("Attributable audit has a foreign provider reverse index: "+foreign[0].pk);
+      protectedRecordCount++;
+      continue;
     }
+    // Audit and reverse pointers are added as one unit, never an orphaned
+    // pointer deletion when the underlying audit is preserved.
+    safeAuditKeys.push(row.pk!);
+    safeReferenceKeys.push(...indexed.map(ref=>({pk:ref.pk!,sk:ref.sk!})));
   }
   const duplicatePointers=new Set(safeReferenceKeys.map(key));
   if(duplicatePointers.size!==safeReferenceKeys.length)
