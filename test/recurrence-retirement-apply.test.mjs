@@ -15,7 +15,15 @@ const link={profile:"work",taskId:target.taskId,eventId:target.eventId,
   activeInstanceId:target.eventId,updatedAt:mapping.updatedAt};
 const inspection={target,checkedAt:"2026-11-06T19:00:00Z",
   previewFingerprint:"f".repeat(64),mapping,recurrenceLink:link,
-  calendar:{},completionHistory:[],otherProfileReferences:[],blockers:[],
+  calendar:{
+    master:{id:"master351",etag:"master-etag-351",
+      recurrence:["RRULE:FREQ=DAILY;UNTIL=20261021T163000Z"]},
+    occurrence:{id:"occ_20261021",etag:"occurrence-etag-351"},
+  },
+  task:{status:"completed_verified",value:{
+    id:"task351",content:"Historical meeting",completed_at:"2026-10-22T19:27:00Z",
+  }},
+  completionHistory:[],otherProfileReferences:[],blockers:[],
   eligibleForFutureApproval:true};
 function records(){
   const r=(pk,sk,value={})=>({pk,sk,...value});
