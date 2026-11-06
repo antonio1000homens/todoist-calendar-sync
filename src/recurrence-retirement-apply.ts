@@ -38,6 +38,9 @@ export type RetirementOperation={
   planFingerprint:string;inspectionFingerprint:string;
   confirmationHash:string;confirmationExpiresAt:string;
   createdAt:string;retiredAt?:string;updatedAt?:string;
+  /** Provider identity/ETag proof held stable across future Undo checks. */
+  providerVersions?: {masterEventId:string;masterEtag:string;occurrenceEtag:string;
+    completedAt:string;rrule:string[]};
   cleanupStatus?:"pending"|"completed";
   retainedEvidenceCount?:number;
 };
