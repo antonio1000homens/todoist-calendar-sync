@@ -841,7 +841,8 @@ export class Synchronizer {
       // reconciliation performs fresh reads and version-fenced cleanup.
       if (this.state instanceof StateRepository) {
         const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
+        if (payload.event_name === "item:deleted" && payload.event_data?.id
+          && !await this.state.isRetired?.({profile:delivery.profile,taskId:payload.event_data.id})) {
           await requestDeletedConflictReview(this.state, delivery.profile, { taskIds: [payload.event_data.id] });
         }
       }
@@ -1025,8 +1026,16 @@ export class Synchronizer {
     for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist);
     if (this.state instanceof StateRepository) {
       const deleted = delta.items.filter(event => event.status === "cancelled");
-      if (deleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
-        eventIds: [...new Set(deleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
+      const eligibleDeleted: CalendarEvent[] = [];
+      for(const event of deleted){
+        if(await this.state.isRetired?.({profile:delivery.profile,
+          eventIds:[...new Set([event.id,event.recurringEventId]
+            .filter((id):id is string=>Boolean(id)))],
+          ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{})})) continue;
+        eligibleDeleted.push(event);
+      }
+      if (eligibleDeleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
+        eventIds: [...new Set(eligibleDeleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
       });
     }
     // Only advance after all deletion-review guards and follow-up scheduling
