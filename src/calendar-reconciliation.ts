@@ -412,8 +412,14 @@ export async function reconcileUnmappedCalendar(
   };
 
   const createOrBindSeries = async (master: CalendarEvent): Promise<void> => {
-    if (await controlsBlockRecovery([master.id])) return;
     const seriesId = master.iCalUID || master.id;
+    if (await state.isRetired?.({profile,eventIds:[master.id],seriesIds:[seriesId],
+      ...(master.extendedProperties?.shared?.taskId
+        ? {taskId:master.extendedProperties.shared.taskId}:{})})) {
+      summary.skipped += 1;
+      return;
+    }
+    if (await controlsBlockRecovery([master.id])) return;
     const existingLink = await state.getRecurrenceLink(profile, seriesId);
     const originProfile = otherProfileCalendarOrganizer(profile, master);
     if (originProfile) {
@@ -760,6 +766,15 @@ export async function reconcileUnmappedCalendar(
     const event = candidates[index];
     summary.scanned += 1;
     try {
+      if (await state.isRetired?.({profile,
+        eventIds:[...new Set([event.id,event.recurringEventId]
+          .filter((id):id is string=>Boolean(id)))],
+        ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{}),
+        ...(event.extendedProperties?.shared?.taskId
+          ?{taskId:event.extendedProperties.shared.taskId}:{})})) {
+        summary.skipped += 1;
+        continue;
+      }
       if (event.status === "cancelled" || (event.status && event.status !== "confirmed")) {
         summary.skipped += 1;
       } else if (isTodoistOwnedProjection(event) || event.recurringEventId) {

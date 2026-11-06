@@ -8,6 +8,7 @@ import {createHash,createHmac} from "node:crypto";
 import {GetCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import type {Profile} from "./types.js";
+import { assertRetirementAdmissionIfEnabled } from "./recurrence-retirement-disposition.js";
 import type {OrphanDeletionOperation} from "./orphan-deletion-executor.js";
 
 export const REPLAY_PROFILES = ["home","antonio","work"] as const satisfies readonly Profile[];
@@ -105,6 +106,9 @@ export function replayAdmissionEnabled():boolean {
  * Never swallow a marker or a missing-key error as a nonmatching identity.
  */
 export async function assertReplayAdmissionIfEnabled(identity:ReplayIdentity,db:Db=documentClient):Promise<void> {
+  // Retirement exclusions are independent of the staged erasure barrier.
+  // Enforce them on ALL state mutations even if erasure replay is disabled.
+  await assertRetirementAdmissionIfEnabled(identity,db);
   if(!replayAdmissionEnabled())return;
   await assertReplayAdmission(identity,db);
 }

@@ -10,6 +10,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client, pacedScan } from "./dynamodb-capacity.js";
 import {assertReplayAdmissionIfEnabled, mappingReplayIdentity} from "./erasure-replay-barrier.js";
+import { isRetiredIdentity, type RetiredIdentity } from "./recurrence-retirement-disposition.js";
 import {
   auditExpiresAt,
   classifyAuditAction,
@@ -167,6 +168,9 @@ function latestOriginalStart(...values: Array<string | undefined>): string | und
 
 export class StateRepository {
   constructor(readonly repairOperationId?: string) {}
+
+  /** Explicit operator retirement silently skips sync; do not report it as a repair conflict. */
+  async isRetired(identity: RetiredIdentity): Promise<boolean> { return isRetiredIdentity(identity); }
 
   async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, beforeProjection = false): Promise<boolean> {
     if (await new SyncControls().blocked(profile, ids, this.repairOperationId)) return true;

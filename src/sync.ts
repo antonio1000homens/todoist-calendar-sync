@@ -841,7 +841,8 @@ export class Synchronizer {
       // reconciliation performs fresh reads and version-fenced cleanup.
       if (this.state instanceof StateRepository) {
         const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
+        if (payload.event_name === "item:deleted" && payload.event_data?.id
+          && !await this.state.isRetired?.({profile:delivery.profile,taskId:payload.event_data.id})) {
           await requestDeletedConflictReview(this.state, delivery.profile, { taskIds: [payload.event_data.id] });
         }
       }
@@ -855,6 +856,10 @@ export class Synchronizer {
     const { calendar, todoist } = await this.clients(profile);
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
+      if (await this.state.isRetired?.({profile,taskId:link.taskId,
+        eventIds:[...new Set([link.masterEventId,link.eventId,link.activeInstanceId]
+          .filter((id):id is string=>Boolean(id)))],
+        seriesIds:[link.seriesId]})) continue;
       if (await this.state.syncBlocked(profile, { taskId: link.taskId, eventId: link.activeInstanceId || link.masterEventId }, true)) continue;
       let master: CalendarEvent;
       try { master = await calendar.getEvent(link.masterEventId); }
@@ -1021,8 +1026,16 @@ export class Synchronizer {
     for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist);
     if (this.state instanceof StateRepository) {
       const deleted = delta.items.filter(event => event.status === "cancelled");
-      if (deleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
-        eventIds: [...new Set(deleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
+      const eligibleDeleted: CalendarEvent[] = [];
+      for(const event of deleted){
+        if(await this.state.isRetired?.({profile:delivery.profile,
+          eventIds:[...new Set([event.id,event.recurringEventId]
+            .filter((id):id is string=>Boolean(id)))],
+          ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{})})) continue;
+        eligibleDeleted.push(event);
+      }
+      if (eligibleDeleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
+        eventIds: [...new Set(eligibleDeleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
       });
     }
     // Only advance after all deletion-review guards and follow-up scheduling
@@ -1032,6 +1045,14 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
+    // This must run BEFORE master readback or conflict/audit processing. A
+    // stale webhook for a retired series must not seed fresh review evidence.
+    if (await this.state.isRetired?.({profile:delivery.profile,
+      eventIds:[...new Set([event.id,event.recurringEventId]
+        .filter((id):id is string=>Boolean(id)))],
+      ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{}),
+      ...(event.extendedProperties?.shared?.taskId
+        ?{taskId:event.extendedProperties.shared.taskId}:{})})) return;
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any provider mutation.
@@ -1748,6 +1769,9 @@ export class Synchronizer {
     let task = payload.event_data;
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
+    // Exact retired Todoist IDs short-circuit stale webhook replay before
+    // version acceptance, active provider lookups and write-fence claims.
+    if (await this.state.isRetired?.({profile:delivery.profile,taskId:task.id})) return;
     // Every Todoist-origin Calendar update/delete holds this task's durable
     // write fence until provider and mapping writes finish. Completion retries
     // rather than committing its immutable marker mid-mutation.
