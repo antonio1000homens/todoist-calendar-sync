@@ -14,6 +14,19 @@ type Inspection = {
   blockers:string[]; eligibleForFutureApproval:boolean; previewFingerprint:string;
   providerWrites:false;
 };
+type PlannedRecord = {pk:string;sk:string;recordFingerprint:string;rationale:string};
+type Preview = {
+  scope:"whole_ended_calendar_series"; mode:"keep_provider_items";
+  inspectedAt:string;inspectionFingerprint:string;planFingerprint:string;
+  status:"reviewable"|"blocked";blockers:string[];
+  indexRemovalCandidates:PlannedRecord[];
+  conditionalCleanupCandidates:PlannedRecord[];
+  incidentEvidenceForSeparateReview:PlannedRecord[];
+  protectedRecords:PlannedRecord[];
+  futureSuppressionIdentityKeys:string[];
+  providerMetadataHazards:string[];
+  providerWrites:false;stateWrites:false;applyAvailable:false;
+};
 type Api = (path:string,options?:any)=>Promise<any>;
 
 /**
@@ -27,12 +40,13 @@ export function RecurrenceRetirementInspector({
   const [opened,setOpened]=useState(false);
   const [busy,setBusy]=useState(false);
   const [inspection,setInspection]=useState<Inspection>();
+  const [preview,setPreview]=useState<Preview>();
   const [error,setError]=useState("");
   const sequence=useRef(0);
   useEffect(()=>()=>{sequence.current++;},[]);
   const inspect=async()=>{
     const request=++sequence.current;
-    setOpened(true);setBusy(true);setError("");setInspection(undefined);
+    setOpened(true);setBusy(true);setError("");setInspection(undefined);setPreview(undefined);
     try {
       const query=new URLSearchParams({
         profile,generation,taskId:item.taskId||"",eventId:item.eventId||"",seriesId:item.seriesId||"",
@@ -43,6 +57,31 @@ export function RecurrenceRetirementInspector({
       if(request===sequence.current)setError(e?.message||"Inspection failed");
     } finally {if(request===sequence.current)setBusy(false);}
   };
+  const showPreview=async()=>{
+    const request=++sequence.current;
+    setBusy(true);setError("");setPreview(undefined);
+    try {
+      const query=new URLSearchParams({
+        profile,generation,taskId:item.taskId||"",eventId:item.eventId||"",seriesId:item.seriesId||"",
+      });
+      // Independent fresh readback: never re-use the earlier inspection as an
+      // approval, even when the same ID and unchanged timestamp are displayed.
+      const data=await api("reconciliation/retirement-preview?"+query.toString());
+      if(request===sequence.current) {
+        setInspection(data.inspection);
+        setPreview(data.preview);
+      }
+    } catch(e:any) {
+      if(request===sequence.current)setError(e?.message||"Retirement preview failed");
+    } finally {if(request===sequence.current)setBusy(false);}
+  };
+  const records=(title:string,items:PlannedRecord[])=> <details>
+    <summary>{title} ({items.length})</summary>
+    {items.length?<ul>{items.map(item=><li key={item.pk+"|"+item.sk}>
+      <code>{item.pk}/{item.sk}</code> — {item.rationale}
+      <small> · state revision <code>{item.recordFingerprint.slice(0,12)}…</code></small>
+    </li>)}</ul>:<p>No matching records found in this inventory.</p>}
+  </details>;
   if(item.action!=="todoist_snapshot_reconcile_recurring_deferred"
     ||item.reason!=="recurrence_owned_mapping_deferred"
     ||!item.taskId||!item.eventId||!item.seriesId)return null;
@@ -87,7 +126,30 @@ export function RecurrenceRetirementInspector({
           <p><strong>Related record categories (not a deletion plan)</strong></p><pre>{JSON.stringify(inspection.historicalRowCounts,null,2)}</pre>
           <p>Version fingerprint: <code>{inspection.previewFingerprint}</code></p>
         </details>
-        <p className="notice">The apply/undo controls remain unavailable in this draft until a conditional atomic retirement, durable future-sync suppression, audit scoping and recovery procedure have passed the worker and replay safety tests. No provider objects will be deleted, rescheduled or edited.</p>
+        <div className="actions">
+          <button type="button" className="secondary" onClick={showPreview} disabled={busy}>
+            {busy?"Rechecking full provider/state inventory…":"Preview retirement effect"}
+          </button>
+        </div>
+        {preview&&<section aria-label="Retirement effect preview">
+          <h4>Whole-series association retirement preview</h4>
+          <p>Action: <strong>Retire mapping, keep provider items</strong>. No Todoist or Calendar objects, content, due dates, recurrence rules or shared metadata are modified.</p>
+          <p>Fresh assessment: <strong>{preview.status==="reviewable"?"Reviewable (not approved)":"Blocked"}</strong> · {new Date(preview.inspectedAt).toLocaleString()}</p>
+          {preview.blockers.length>0&&<div className="warning" role="status">
+            <strong>Retirement blocked</strong><ul>{preview.blockers.map((value,i)=><li key={i}>{value}</li>)}</ul>
+          </div>}
+          {records("Mapping and recurrence link proposed for conditional retirement",preview.indexRemovalCandidates)}
+          {records("Task baseline and canonical rows that need exact revision checks",preview.conditionalCleanupCandidates)}
+          {records("Audit, conflict and repair evidence requiring separate ownership review",preview.incidentEvidenceForSeparateReview)}
+          {records("Protected history and other state that must be retained",preview.protectedRecords)}
+          <details><summary>Required future re-sync suppression and provider metadata hazards</summary>
+            <p>Future Apply must create durable scope-specific exclusion keys:</p>
+            <ul>{preview.futureSuppressionIdentityKeys.map(value=><li key={value}><code>{value}</code></li>)}</ul>
+            <ul>{preview.providerMetadataHazards.map((value,i)=><li key={i}>{value}</li>)}</ul>
+          </details>
+          <p>Preview version: <code>{preview.planFingerprint}</code></p>
+        </section>}
+        <p className="notice">This preview never changes state or providers and is not an approval token. Apply and Undo are unavailable until conditional atomic retirement, durable replay suppression and scoped cleanup are implemented and tested.</p>
       </>}
     </section>}
   </div>;

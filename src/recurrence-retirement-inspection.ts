@@ -38,7 +38,7 @@ export type RecurrenceRetirementInspection = {
   providerWrites: false;
 };
 
-type InventoryRow = Record<string, unknown> & {pk?: string; sk?: string};
+export type InventoryRow = Record<string, unknown> & {pk?: string; sk?: string};
 
 const PROFILES: Profile[] = ["home", "antonio", "work"];
 const idPattern = /^[A-Za-z0-9@_.:-]{1,1024}$/;
@@ -217,6 +217,8 @@ export interface RetirementInspectionDependencies {
   state?: InspectorState;
   clientFactory?: ProviderClientFactory;
   inventory?: () => Promise<InventoryRow[]>;
+  /** Receives the exact complete scan used for this read-only assessment. */
+  onInventory?: (rows: readonly InventoryRow[]) => void;
 }
 
 export async function inspectRecurrenceRetirement(
@@ -233,6 +235,7 @@ export async function inspectRecurrenceRetirement(
     state.listCompletedCalendarProjectionsByTask(target.profile,target.taskId),
     (dependencies.inventory || strongInventory)(),
   ]);
+  dependencies.onInventory?.(inventory);
   const mapping = taskIndex;
   const link = await state.getRecurrenceLink(target.profile,target.seriesId);
   const identities = new Set([target.taskId,target.eventId,target.seriesId,
