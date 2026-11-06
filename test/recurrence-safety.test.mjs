@@ -1260,7 +1260,11 @@ test("Calendar rename updates a native Todoist task without rewinding its automa
   assert.ok(state.audits.some(e => e.action === "calendar_owned_completion_advance_deferred"));
 });
 
-test("native Todoist completion already at next Calendar occurrence updates mapping without second advance", async () => {
+test("native Todoist completion already at next Calendar occurrence updates mapping without second advance", async (t) => {
+  // The fixture models a completion on 26 October 2026. Without a fixed
+  // clock, both occurrences become historical after 4 November and the
+  // current-occurrence selection changes independently of this regression.
+  t.mock.method(Date, "now", () => Date.parse("2026-10-26T15:11:12Z"));
   const current = instance("oct-28", "2026-10-28", "2026-10-29");
   const next = instance("nov-04", "2026-11-04", "2026-11-05");
   current.summary = "Weekly test";

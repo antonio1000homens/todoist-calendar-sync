@@ -37,7 +37,7 @@ const inventory={
       "updateComment","updateRecurringOccurrence","updateTaskMetadata","upsertComment",
       "upsertProjectComment","upsertTask"],
     controls:[],
-    reads:["findComment","findLegacyTaskComment","getComment","getTask","getTimeZone",
+    reads:["findComment","findCompletedTaskById","findLegacyTaskComment","getComment","getTask","getTimeZone",
       "listAllProjectCommentsForErasureAudit","listAllTaskCommentsForErasureAudit","listProjectComments",
       "listAllTasksForErasureAudit","listTaskComments","listTasks","readTasks"],
     internal:["request","syncCommand","legacyCommentFields"],
