@@ -5,11 +5,11 @@
  * permission to erase a mapping. Do not expose an apply endpoint until the
  * durable exclusion, write-fence, idempotency and undo protocols are complete.
  */
-import { GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { StateRepository, type ReconciliationDiagnostic } from "./repository.js";
-import { ReviewStore, reviewHash } from "./review-store.js";
-import { defaultProviderClientFactory } from "./mutation-budget.js";
+import { reviewHash } from "./review-store.js";
+import { defaultProviderClientFactory, type ProviderClientFactory } from "./mutation-budget.js";
 import { terminalCompletionDecision, type VerifiedTerminalSeries } from "./completed-history-policy.js";
 import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, RecurrenceLink, TodoistTask } from "./types.js";
 
@@ -50,10 +50,14 @@ function isoTime(value: unknown): number {
   return typeof value === "string" ? Date.parse(value) : Number.NaN;
 }
 function exactSameMapping(a?: Mapping, b?: Mapping): boolean {
-  return !!a && !!b && a.profile === b.profile && a.taskId === b.taskId
-    && a.eventId === b.eventId && a.seriesId === b.seriesId
-    && a.recurrenceOwner === b.recurrenceOwner && a.masterEventId === b.masterEventId
-    && a.activeInstanceId === b.activeInstanceId && a.updatedAt === b.updatedAt;
+  if (!a || !b) return false;
+  // Lookup keys differ between the three denormalized DynamoDB rows.
+  // Every other persisted mapping field, including all recurrence progress
+  // fields added in the future, must match before a retirement is eligible.
+  const payload = (row: Mapping): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(row).filter(([name]) =>
+      !["pk", "sk", "lookupPk", "lookupSk"].includes(name)));
+  return reviewHash(payload(a)) === reviewHash(payload(b));
 }
 function rowReferences(row: InventoryRow, identities: Set<string>): boolean {
   // Historical evidence is displayed for review, never trusted as provider state.
@@ -91,7 +95,7 @@ async function strongInventory(): Promise<InventoryRow[]> {
   return reject("State inventory pagination is incomplete", 503);
 }
 
-async function recordedDiagnostic(state: StateRepository, target: RetirementDiagnosticTarget): Promise<ReconciliationDiagnostic> {
+async function recordedDiagnostic(state: Pick<StateRepository, "listReconciliationDiagnostics">, target: RetirementDiagnosticTarget): Promise<ReconciliationDiagnostic> {
   let after: string | undefined;
   const cursors = new Set<string>();
   for (let page = 0; page < 200; page += 1) {
@@ -145,6 +149,8 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
       || mapping.eventId !== target.eventId || mapping.seriesId !== target.seriesId
       || mapping.recurrenceOwner !== "calendar" || !mapping.masterEventId
       || !mapping.updatedAt) b.push("The exact Calendar-owned mapping is absent, incomplete or has changed");
+  if (!mapping?.activeInstanceId || mapping.activeInstanceId !== target.eventId)
+    b.push("The mapping active instance does not match the selected diagnostic occurrence");
   if (!exactSameMapping(mapping, input.taskIndex) || !exactSameMapping(mapping, input.ownerIndex)
     || !exactSameMapping(mapping, input.eventIndex)) b.push("TASK, TASKOWNER and EVENT indexes do not agree on an exact revision");
   if (!link || link.profile !== target.profile || link.owner !== "calendar"
@@ -155,6 +161,12 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
   if (!master || master.id !== mapping?.masterEventId || master.status === "cancelled"
       || !master.etag || !master.recurrence?.length)
     b.push("An intact Calendar master with a provider ETag and RRULE was not verified");
+  if (master && (master.iCalUID || master.id) !== target.seriesId)
+    b.push("Calendar master series identity does not match the recorded diagnostic series");
+  if (master && occurrence && (occurrence.iCalUID || master.iCalUID || master.id) !== target.seriesId)
+    b.push("Calendar occurrence series identity does not match the recorded diagnostic series");
+  if (instances.some(item => item.iCalUID && item.iCalUID !== target.seriesId))
+    b.push("Calendar instance inventory includes another iCalUID/series identity");
   if (master?.recurrence?.some(rule => !rule.startsWith("RRULE:")))
     b.push("Additional RDATE/EXDATE rules require separate series review");
   if (master?.recurrence?.some(rule => !/(?:^|;)(COUNT|UNTIL)=/.test(rule)))
@@ -197,23 +209,49 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
  * Diagnostic-bound inspect. Does not issue confirmation tokens, change any
  * provider metadata, or delete/mutate DynamoDB records.
  */
-export async function inspectRecurrenceRetirement(target: RetirementDiagnosticTarget): Promise<RecurrenceRetirementInspection> {
+type InspectorState = Pick<StateRepository, "listReconciliationDiagnostics" | "getMappingByTask"
+  | "getTaskOwnerMapping" | "getMappingByEvent" | "getRecurrenceLink"
+  | "listCompletedCalendarProjectionsByTask">;
+
+export interface RetirementInspectionDependencies {
+  state?: InspectorState;
+  clientFactory?: ProviderClientFactory;
+  inventory?: () => Promise<InventoryRow[]>;
+}
+
+export async function inspectRecurrenceRetirement(
+  target: RetirementDiagnosticTarget, dependencies: RetirementInspectionDependencies = {},
+): Promise<RecurrenceRetirementInspection> {
   if (!PROFILES.includes(target.profile) || !diagPattern.test(target.generation)
     || ![target.taskId,target.eventId,target.seriesId].every(id => idPattern.test(id)))
     return reject("Exact profile, generation, Todoist ID, Calendar occurrence ID and series ID are required", 400);
-  const state = new StateRepository();
+  const state = dependencies.state || new StateRepository();
   const diagnostic = await recordedDiagnostic(state, target);
   const [taskIndex,ownerIndex,eventIndex,history,inventory] = await Promise.all([
     state.getMappingByTask(target.profile,target.taskId), state.getTaskOwnerMapping(target.taskId),
     state.getMappingByEvent(target.profile,target.eventId),
     state.listCompletedCalendarProjectionsByTask(target.profile,target.taskId),
-    strongInventory(),
+    (dependencies.inventory || strongInventory)(),
   ]);
   const mapping = taskIndex;
   const link = await state.getRecurrenceLink(target.profile,target.seriesId);
   const identities = new Set([target.taskId,target.eventId,target.seriesId,
     mapping?.masterEventId,mapping?.activeInstanceId].filter((id):id is string=>!!id));
-  const related = inventory.filter(row => rowReferences(row, identities));
+  // The SYNC_CONTROL pk embeds the identity in a compound key instead of
+  // storing an exact scalar ID, so ordinary rowReferences() misses its locks.
+  const relevantControlKeys = new Set([
+    `SYNC_CONTROL#${target.profile}:todoist:${target.taskId}`,
+    ...[target.eventId,mapping?.activeInstanceId,mapping?.masterEventId]
+      .filter((id):id is string=>!!id)
+      .map(id=>`SYNC_CONTROL#${target.profile}:calendar:${id}`),
+  ]);
+  const relevantMappingKeys = new Set(PROFILES.flatMap(profile => [
+    `TASK#${profile}#${target.taskId}`, `EVENT#${profile}#${target.eventId}`,
+    `RECURRENCE#${profile}#${target.seriesId}`,
+  ]));
+  const related = inventory.filter(row => rowReferences(row, identities)
+    || relevantControlKeys.has(String(row.pk)) || relevantMappingKeys.has(String(row.pk)));
+
   const relatedCounters: Record<string,number> = {};
   for (const row of related) {
     const kind = String(row.pk || "").split("#")[0] || "unknown";
@@ -222,11 +260,24 @@ export async function inspectRecurrenceRetirement(target: RetirementDiagnosticTa
   const otherOwners = related.filter(row => {
     const pk = String(row.pk || "");
     if (!/^(TASK#|EVENT#|TASKOWNER#|RECURRENCE#|CANONICAL#)/.test(pk)) return false;
-    if (pk === "TASK#" + target.profile + "#" + target.taskId
-      || pk === "EVENT#" + target.profile + "#" + target.eventId
-      || pk === "TASKOWNER#" + target.taskId
-      || pk === "RECURRENCE#" + target.profile + "#" + target.seriesId
-      || pk.startsWith("CANONICAL#" + target.profile + "#")) return false;
+    const expectedIndex = new Map([
+      [`TASK#${target.profile}#${target.taskId}`, "MAP"],
+      [`EVENT#${target.profile}#${target.eventId}`, "MAP"],
+      [`TASKOWNER#${target.taskId}`, "MAP"],
+    ]);
+    if (expectedIndex.has(pk)) return row.sk !== expectedIndex.get(pk)
+      || !exactSameMapping(mapping, row as Mapping);
+    if (pk === `RECURRENCE#${target.profile}#${target.seriesId}`)
+      return row.sk !== "STATE" || !link
+        || reviewHash(Object.fromEntries(Object.entries(row).filter(([name])=>
+          !["pk","sk","lookupPk","lookupSk"].includes(name)))) !== reviewHash(link);
+    const canonicalKeys = new Set([
+      `CANONICAL#${target.profile}#todoist#${target.taskId}`,
+      ...[target.eventId,mapping?.masterEventId,mapping?.activeInstanceId]
+        .filter((id):id is string=>!!id)
+        .map(id=>`CANONICAL#${target.profile}#calendar#${id}`),
+    ]);
+    if (canonicalKeys.has(pk) && row.sk === "STATE") return false;
     return true;
   });
   const activeReviews = related.filter(row => {
@@ -236,14 +287,16 @@ export async function inspectRecurrenceRetirement(target: RetirementDiagnosticTa
   });
   const inFlightControls = related.filter(row => {
     const pk = String(row.pk || "");
-    return pk.startsWith("SYNC_CONTROL#") && (row.activeRepair || row.excluded || row.pendingRefresh);
+    return pk.startsWith("SYNC_CONTROL#")
+      && (Boolean(row.activeRepair) || row.excluded === true
+        || row.pendingRefresh === true || Boolean(row.pendingRefreshAt));
   });
   const terminalRow = inventory.find(row => row.pk === "COMPLETED_SERIES#" + target.profile + "#" + target.seriesId
     && row.sk === "STATE");
   const terminal = terminalRow && typeof terminalRow.terminalCompletedAt === "string"
     ? terminalRow as unknown as VerifiedTerminalSeries : undefined;
 
-  const pair = await defaultProviderClientFactory(target.profile);
+  const pair = await (dependencies.clientFactory || defaultProviderClientFactory)(target.profile);
   let task: TodoistTask | undefined;
   let completedTask: CompletedTodoistEvidence | undefined;
   let completedLookupFailed = false;
@@ -280,7 +333,10 @@ export async function inspectRecurrenceRetirement(target: RetirementDiagnosticTa
   const fingerprint = reviewHash({
     target,diagnostic,task,completedTask,master,occurrence,instances,
     mapping,taskIndex,ownerIndex,eventIndex,link,history,terminal,
-    relevantState:related.map(row=>({pk:row.pk,sk:row.sk,row})).sort((a,b)=>(a.pk||"").localeCompare(b.pk||"")),
+    relevantState:related.map(row=>({pk:row.pk,sk:row.sk,row})).sort((a,b)=>
+      String(a.pk||"").localeCompare(String(b.pk||""))
+      || String(a.sk||"").localeCompare(String(b.sk||""))
+      || reviewHash(a.row).localeCompare(reviewHash(b.row))),
   });
   return {
     target,checkedAt:new Date().toISOString(),diagnostic,
