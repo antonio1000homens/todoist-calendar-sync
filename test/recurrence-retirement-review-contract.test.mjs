@@ -8,6 +8,7 @@ const origin="https://calendar-sync.alf-broadcast.co.uk";
 const issuer="https://retirement-351-access.example";
 const audience="retirement-audience-351";
 const phrase="RETIRE ASSOCIATION KEEP PROVIDER ITEMS WITHOUT SERIES CERTIFICATE";
+const pastDueActivePhrase="RETIRE PAST-DUE ACTIVE TASK ASSOCIATION KEEP PROVIDER ITEMS";
 const undoPhrase="RE-ENABLE ASSOCIATION SYNC WITHOUT RESTORING MAPPING";
 const target={profile:"work",generation:"historical-351",
   taskId:"completed-task-351",eventId:"historical-occurrence-351",
@@ -99,6 +100,12 @@ test("#351 scoped review API requires Access JWT, operator ownership, and indepe
     "POST",headers,{profile:"work",operationId:"op-351",confirmationId:"secret-351",phrase:"delete both"}),deps));
   assert.equal(badPhrase.code,400);
   assert.equal(trace.filter(x=>x[0]==="apply").length,0);
+  const activeApplied=await json(await handler(event(url("reconciliation/retirement-apply"),
+    "POST",headers,{profile:"work",operationId:"op-351",confirmationId:"secret-351",
+      phrase:pastDueActivePhrase}),deps));
+  assert.equal(activeApplied.code,200);
+  assert.equal(trace.filter(x=>x[0]==="apply").at(-1)[5],pastDueActivePhrase,
+    "the API must pass the explicit active-task phrase through to operation-level evidence checks");
   const applied=await json(await handler(event(url("reconciliation/retirement-apply"),
     "POST",headers,{profile:"work",operationId:"op-351",confirmationId:"secret-351",phrase}),deps));
   assert.equal(applied.code,200);assert.equal(applied.operation.status,"retired");
@@ -119,7 +126,7 @@ test("#351 scoped review API requires Access JWT, operator ownership, and indepe
   assert.equal(doneUndo.code,200);assert.equal(doneUndo.operation.status,"re_enabled");
   assert.equal(leaseCount,0,"all review admission leases must be released");
   assert.equal(trace.filter(x=>x[0]==="issue").length,1);
-  assert.equal(trace.filter(x=>x[0]==="apply").length,1);
+  assert.equal(trace.filter(x=>x[0]==="apply").length,2);
   assert.equal(trace.filter(x=>x[0]==="applyUndo").length,1);
   assert.equal(trace.find(x=>x[0]==="issue")[3],"operator-351");
 });
