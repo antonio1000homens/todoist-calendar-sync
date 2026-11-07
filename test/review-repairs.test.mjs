@@ -2613,6 +2613,7 @@ test("an explicit Todoist-only disposition survives repeat snapshot and webhook 
   // Deletion-hook reconciliation is externally queued only for an existing
   // matching open review case. This harness has none.
   t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
+  t.mock.method(ReviewStore.prototype,"listDeletedConflictCaseIds",async()=>[]);
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(), reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
@@ -2649,6 +2650,7 @@ test("Todoist-only flatten keeps the selected due date, excludes projection, and
   // Deletion-hook reconciliation is externally queued only for an existing
   // matching open review case. This harness has none.
   t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
+  t.mock.method(ReviewStore.prototype,"listDeletedConflictCaseIds",async()=>[]);
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
@@ -2693,6 +2695,7 @@ test("explicit Calendar projection deletion retains the exact Todoist task and f
   // Deletion-hook reconciliation is externally queued only for an existing
   // matching open review case. This harness has none.
   t.mock.method(ReviewStore.prototype,"listCases",async()=>({items:[],cursor:undefined}));
+  t.mock.method(ReviewStore.prototype,"listDeletedConflictCaseIds",async()=>[]);
   t.mock.method(StateRepository.prototype,"syncBlocked",(profile,ids)=>controls.blocked(profile,ids));
   const state=new StateRepository(),reconciler=new SnapshotReconciler(state,async()=>h.clients);
   const synchronizer=new Synchronizer(state,undefined,async()=>h.clients);
