@@ -8,7 +8,8 @@
 import { createHash } from "node:crypto";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import {
@@ -47,9 +48,9 @@ export async function inventory({
   const scope = validateResidueScope(options);
   const digest = scopeDigest(scope, table);
   let saved = await cursorStore.load();
-  if (saved && (saved.digest !== digest || !saved.report || !saved.cursor))
-    throw new Error("Cursor scope differs from this exact table, case and provider-ID set; use --restart");
   if (options.restart) { saved = null; await cursorStore.clear(); }
+  else if (saved && (saved.digest !== digest || !saved.report || !saved.cursor))
+    throw new Error("Cursor scope differs from this exact table, case and provider-ID set; use --restart");
 
   // Immutable terminal receipts are necessary for the *inventory scope*.
   // They are NOT proof of provider absence or exclusive audit attribution.
@@ -156,5 +157,5 @@ export async function main(args = process.argv.slice(2), env = process.env) {
   if (!report.scanComplete) process.exitCode = 2; // Explicit partial audit, safe to resume.
 }
 
-if (process.argv[1] && import.meta.url === new URL("file://" + process.argv[1]).href)
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
   main().catch(e => { console.error("Read-only inventory failed: " + String(e?.message || e)); process.exitCode = 1; });
