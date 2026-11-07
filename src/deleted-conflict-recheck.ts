@@ -18,6 +18,10 @@ export async function requestDeletedConflictReview(
   const tasks = new Set(removed.taskIds || []);
   const events = new Set(removed.eventIds || []);
   if (!tasks.size && !events.size) return false;
+  // A Calendar delta can contain thousands of cancellations. Never issue a
+  // DynamoDB partition lookup per event. One coalesced full reconciliation
+  // already sweeps dismissed review history; it is both cheaper and safer.
+  const needsBulkSweep=tasks.size+events.size>40;
   let cursor: Record<string, unknown> | undefined;
   let examined = 0;
   const matching = [];
@@ -45,7 +49,7 @@ export async function requestDeletedConflictReview(
   for(const [side,ids] of [
     ["todoist",tasks],["calendar",events],
   ] as const){
-    for(const id of ids){
+    for(const id of needsBulkSweep?[]:ids){
       const pointers=await review.listDeletedConflictCaseIds(profile,side,id);
       for(const caseId of pointers){
         if(matchedIds.has(caseId))continue;
@@ -71,7 +75,7 @@ export async function requestDeletedConflictReview(
       }
     }
   }
-  if (!matching.length) return false;
+  if (!matching.length&&!needsBulkSweep) return false;
 
   // Only actionable cases receive active deletion fences. Dismissed cases
   // stay dismissed while their exact-ID refresh is coalesced.
