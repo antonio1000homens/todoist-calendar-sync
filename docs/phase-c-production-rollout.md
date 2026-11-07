@@ -45,3 +45,15 @@ The flag can be rolled back with production GitHub variable
 `Deploy production`, **after verifying the deployed Lambda flag**. Existing
 native mappings must be reviewed before rollback; switching off new
 creation is not permission to flatten an already-native recurrence.
+
+### Observed provider divergence — excluded from native rollout
+
+A separate Todoist test `every 29, 30, 31` started 29 January 2027
+and advanced **29→30→31 January→28 February** on three real completions.
+RFC 5545 `BYMONTHDAY=29,30,31` skips February 2027. Consequently native
+production admission refuses any monthly multiple-day list containing
+29/30/31 and any fixed monthly interval anchored on day >28. This is not
+an API failure: it is a genuine semantic mismatch that must remain on
+the rolling/manual-review path pending a separate strategy. The original
+read-only classifier may still describe such a candidate; it is not an
+authorization to create a native representation.
