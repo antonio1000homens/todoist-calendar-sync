@@ -591,9 +591,21 @@ export class SnapshotReconciler {
         const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
         if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
         const recurring = item.decision?.type?.includes("recurrence_task_deleted") === true;
-        const recordedMasterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
-        const activeInstanceId = item.decision?.activeInstanceId || item.decision?.mappingSnapshot?.activeInstanceId;
-        if (recurring && (!activeInstanceId || !eventIds.includes(activeInstanceId))) continue;
+        const contextMaster = typeof item.decision?.context?.masterEventId === "string"
+          ? item.decision.context.masterEventId : undefined;
+        const unmappedRecurring = !recurring
+          && (item.decision?.type === "todoist_unmapped_conflict"
+            || item.reason === "calendar_snapshot_recurring_identity_conflict")
+          && Boolean(item.decision?.masterEventId || contextMaster);
+        const recordedMasterId = item.decision?.masterEventId
+          || item.decision?.mappingSnapshot?.masterEventId
+          || (unmappedRecurring ? contextMaster : undefined);
+        const activeInstanceId = item.decision?.activeInstanceId
+          || item.decision?.mappingSnapshot?.activeInstanceId
+          || (unmappedRecurring ? item.decision?.eventId || item.eventId : undefined);
+        if ((recurring || unmappedRecurring)
+          && (!activeInstanceId || !eventIds.includes(activeInstanceId)
+            || !recordedMasterId && unmappedRecurring)) continue;
         // Legacy Todoist-owned recurrence mappings did not persist masterEventId.
         // Recover only from the cancelled active occurrence's direct provider
         // recurringEventId; independently verify the cancelled master below.
@@ -602,8 +614,9 @@ export class SnapshotReconciler {
           ? cancelledOccurrenceMasterId(activeInstanceId,
             await this.currentEvent(clients.calendar, activeInstanceId!))
           : recordedMasterId;
-        if (recurring && (!masterId || masterId === activeInstanceId)) continue;
-        const verifiedEventIds = recurring
+        const recurringIdentity = recurring || unmappedRecurring;
+        if (recurringIdentity && (!masterId || masterId === activeInstanceId)) continue;
+        const verifiedEventIds = recurringIdentity
           ? [...new Set([...eventIds,masterId!])]
           : eventIds;
         if (taskIds.length + verifiedEventIds.length > 20) continue;
@@ -627,7 +640,11 @@ export class SnapshotReconciler {
               .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
               || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
           }
-          if (!recurring) return { absent: true };
+          if (!recurringIdentity) return { absent: true };
+          // An unmapped conflict is not a recurrence-deletion decision, but a
+          // recorded Calendar master and active instance still represent a
+          // whole series. A cancelled master/child alone cannot justify purging
+          // its audit history if another instance or exception survives.
           const relationship = verifyCancelledSeries(masterId, activeInstanceId, verifiedEventIds, events);
           const active = events.get(activeInstanceId!);
           // A recovered master must remain the one independently named by
@@ -635,7 +652,7 @@ export class SnapshotReconciler {
           const legacyVerified = legacyMaster && relationship.valid
             && cancelledOccurrenceMasterId(activeInstanceId,active) === masterId;
           let legacyInstanceFingerprint: string | undefined;
-          if(legacyVerified){
+          if(legacyVerified || unmappedRecurring && relationship.valid){
             // A cancelled master with a surviving live/exception occurrence is
             // not a fully deleted series. Inventory every page; a historical
             // confirmed child is allowed only with an immutable completion
@@ -654,13 +671,14 @@ export class SnapshotReconciler {
             masterSeriesId: relationship.masterSeriesId,
             ...(legacyVerified ? {legacyMasterProof: {
               master: events.get(masterId!)!, occurrence: active!,
-            },legacyInstanceFingerprint} : {}),
+            }} : {}),
+            ...(legacyVerified || unmappedRecurring ? {legacyInstanceFingerprint} : {}),
             reason: relationship.reason };
         };
         const first = await readProviders();
-        if (!first.absent || recurring && !first.masterSeriesId
+        if (!first.absent || recurringIdentity && !first.masterSeriesId
           || legacyMaster && !first.legacyMasterProof) continue;
-        const seriesKeys = recurring
+        const seriesKeys = recurringIdentity
           ? deletedSeriesKeys(taskIds, verifiedEventIds, first.masterSeriesId!,
             [item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId])
           : [...new Set([...taskIds, ...verifiedEventIds])];
@@ -686,9 +704,10 @@ export class SnapshotReconciler {
         // Re-read all provider identities after the state inventory. A changed
         // master UID invalidates the series-key set rather than using old data.
         const final = await readProviders();
-        if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId
-          || legacyMaster && (!final.legacyMasterProof
-            || final.legacyInstanceFingerprint!==first.legacyInstanceFingerprint)) continue;
+        if (!final.absent || recurringIdentity && final.masterSeriesId !== first.masterSeriesId
+          || (legacyMaster && !final.legacyMasterProof)
+          || (legacyMaster || unmappedRecurring)
+            && final.legacyInstanceFingerprint!==first.legacyInstanceFingerprint) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, {
           profile, taskIds, eventIds: verifiedEventIds, staleLinks: classification.stale,
           seriesKeys, ...(recurring ? {
