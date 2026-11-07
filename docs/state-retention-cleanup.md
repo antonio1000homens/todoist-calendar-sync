@@ -242,3 +242,11 @@ has been removed, the event-side guard continues to block destructive delete
 and stale update recovery. Explicit deletion of an active mapped task remains
 on the existing path; younger one-off completion deletion retains its prior
 semantics.
+
+## Verified-deletion residue and repair-operation retention (#367)
+
+The verified-deletion follow-up is **read-only by default** and does not broaden the normal seven-day significant-audit policy. See [verified-deletion residue inventory](./verified-deletion-residue-inventory.md) for a bounded, explicit-case exact-ID report and [repair-operation retention decision](./repair-retention-decision.md) for the complete dependency assessment.
+
+`npm run state:inspect-repair-retention -- --profile=all --max-pages=60` produces an aggregate, fully paginated, strongly consistent dependency report for `REPAIR#` history; it has no `--apply` mode. A partial scan refuses to classify missing references. Retained `REPAIR#` rows intentionally have **no general TTL** because delayed queued work, deterministic submission idempotency, notifications, case references, recovery and lost-ack protection still read them. Do not add TTL to terminal/failed/abandoned rows without a separately proved replay-safe compact receipt migration.
+
+On 7 November 2026, 3,425 production state rows were read. The 9 exact-known-identity legacy conflict audits for resolved #278 fixtures were within their existing TTL. All 8 submitted repair operations had no TTL; two pending notifications, six with stored write/progress evidence, and one failed Home operation still referenced by four `activeRepair` controls. The anomalous Home locks are tracked separately in #369; **do not silently clear or delete them during audit cleanup**. No provider, state or AWS retention changes resulted from these inspections.

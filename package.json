@@ -18,6 +18,7 @@
     "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",
     "state:inspect": "npm run build --silent && node scripts/audit-state-retention.mjs",
     "state:inspect-verified-deletion-residue": "node scripts/inspect-verified-deletion-residue.mjs",
+    "state:inspect-repair-retention": "npm run build --silent && node scripts/inspect-repair-retention.mjs",
     "state:audit-deleted-recurrences": "npm run build --silent && node scripts/audit-deleted-recurrences.mjs",
     "state:cleanup-completed": "npm run build --silent && node scripts/cleanup-terminal-completions.mjs",
     "state:cleanup-completed-comment": "npm run build --silent && node scripts/cleanup-completed-project-comment.mjs",
