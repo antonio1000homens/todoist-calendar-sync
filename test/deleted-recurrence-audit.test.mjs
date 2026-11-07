@@ -57,7 +57,7 @@ test("#292 one-sided deletion, foreign owner and unverified provider never produ
     fixture({eventActive:{...active,status:"confirmed"}}),
     fixture({foreign:true}),
     fixture({eventActive:{...active,recurringEventId:"different-master"}}),
-    fixture({eventMaster:undefined}),
+    fixture({eventMaster:null}),
     fixture({task:async()=>{throw Object.assign(new Error("throttled"),{status:429});}}),
   ];
   for(const f of cases){
@@ -69,7 +69,7 @@ test("#292 one-sided deletion, foreign owner and unverified provider never produ
 });
 
 test("#292 unrecorded master cannot be inferred from an occurrence ID or missing direct child",async()=>{
-  const f=fixture({eventActive:undefined});
+  const f=fixture({eventActive:null});
   const result=await auditDeletedRecurrenceCase(item,f.provider,f.state);
   assert.equal(result.action,"retain_for_manual_review");
   assert.equal(result.deletion.bothGone,false);
