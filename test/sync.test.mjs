@@ -613,3 +613,98 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
     assert.equal(Object.hasOwn(audit.detail, "deliveryId"), false);
   }
 });
+
+test("pending cancelled annual reset creates a NEW yearly master without reusing deleted Calendar aliases",async()=>{
+  const task={
+    id:"task-annual-after-reset",content:"Annual celebration",description:"",
+    project_id:profiles.home.todoistProjectId,is_completed:false,is_deleted:false,
+    updated_at:"2026-11-07T16:00:00Z",
+    due:{date:"2027-08-16",is_recurring:true,string:"every year"},
+  };
+  let lease=false, mapping, link, completion=0, created=0;
+  let receipt={profile:"home",taskId:task.id,oldEventId:"old-cancelled",
+    operationId:"failed-repair",sourceUpdatedAt:task.updated_at,sourceDueDate:task.due.date,status:"pending"};
+  const logs=[];
+  const state={
+    async beginTodoistCalendarWrite(){lease=true;return "owned-writer";},
+    async endTodoistCalendarWrite(_,token){assert.equal(token,"owned-writer");lease=false;},
+    async getMappingByTaskAnyProfile(){return mapping;},
+    async getMappingByTask(){return mapping;},
+    async getCancelledAnnualRecoveryReceipt(){return receipt;},
+    async getCalendarProjectionTombstone(){return undefined;},
+    async acceptTaskVersion(){return true;},
+    async syncBlocked(){return false;},
+    async mutationAllowed(){return true;},
+    async putMapping(v){assert.equal(lease,true);mapping=structuredClone(v);},
+    async putRecurrenceLink(v){assert.equal(lease,true);link=structuredClone(v);},
+    async completeCancelledAnnualRecovery(){assert.ok(mapping&&link);receipt=undefined;completion++;return true;},
+    async recordRecurrence(){},async recordMutation(){},
+    async audit(_profile,action,details){logs.push({action,details});},
+  };
+  let master;
+  const calendar={
+    async listLinkedEventsByTodoistTaskId(){
+      return master?[{id:"old-cancelled",status:"cancelled"},master]
+        :[{id:"old-cancelled",status:"cancelled"}];
+    },
+    async findByTodoistTaskId(){throw new Error("must not resurrect a cancelled link");},
+    async upsertEvent(value,existingId){
+      assert.equal(existingId,undefined);
+      assert.deepEqual(value.recurrence,["RRULE:FREQ=YEARLY"]);
+      created++;
+      master={...structuredClone(value),id:"new-yearly-master",status:"confirmed"};
+      return structuredClone(master);
+    },
+    async listInstances(id){
+      assert.equal(id,"new-yearly-master");
+      return [{
+        id:"new-yearly-master_20270816",status:"confirmed",recurringEventId:id,
+        summary:task.content,description:"",start:{date:task.due.date},
+        end:{date:"2027-08-17"},originalStartTime:{date:task.due.date},
+      }];
+    },
+  };
+  const todoist={async getTask(id){assert.equal(id,task.id);return structuredClone(task);}};
+  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
+  await sync.process({id:"annual-update",kind:"todoist",profile:"home",mode:"aws",
+    headers:{},receivedAt:"2026-11-07T16:00:01Z",
+    body:JSON.stringify({event_name:"item:updated",event_data:task,
+      event_data_extra:{old_item:{...task,due:{...task.due,is_recurring:false}}}})});
+  assert.equal(created,1);
+  assert.equal(completion,1);
+  assert.equal(receipt,undefined);
+  assert.equal(mapping.eventId,"new-yearly-master");
+  assert.equal(mapping.recurrenceOwner,"todoist");
+  assert.equal(mapping.taskId,task.id);
+  assert.equal(link.masterEventId,"new-yearly-master");
+  assert.equal(lease,false);
+  assert.ok(logs.some(x=>x.action==="todoist_created_calendar"));
+});
+
+test("pending annual recovery refuses to recreate a Calendar event if the user changes its due date",async()=>{
+  const task={id:"task-source-shift",content:"Annual celebration",project_id:profiles.home.todoistProjectId,
+    is_completed:false,is_deleted:false,updated_at:"2026-11-07T17:00:00Z",
+    due:{date:"2027-08-17",string:"every year",is_recurring:true}};
+  let created=0,held=false;
+  const logs=[];
+  const state={
+    async beginTodoistCalendarWrite(){held=true;return "token";},
+    async endTodoistCalendarWrite(){held=false;},
+    async getMappingByTaskAnyProfile(){return undefined;},
+    async getMappingByTask(){return undefined;},
+    async getCancelledAnnualRecoveryReceipt(){return {profile:"home",taskId:task.id,
+      oldEventId:"cancelled",sourceDueDate:"2027-08-16",sourceUpdatedAt:"2026-11-07T16:00:00Z"};},
+    async getCalendarProjectionTombstone(){return undefined;},
+    async acceptTaskVersion(){return true;},
+    async syncBlocked(){return false;},
+    async audit(_profile,action){logs.push(action);},
+  };
+  const calendar={async listLinkedEventsByTodoistTaskId(){created++;return [];}};
+  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist:{async getTask(){return task;}}}));
+  await sync.process({id:"annual-edited",kind:"todoist",profile:"home",mode:"aws",
+    headers:{},receivedAt:"2026-11-07T17:00:01Z",
+    body:JSON.stringify({event_name:"item:updated",event_data:task})});
+  assert.equal(created,0);
+  assert.equal(held,false);
+  assert.ok(logs.includes("todoist_cancelled_annual_projection_source_changed"));
+});
