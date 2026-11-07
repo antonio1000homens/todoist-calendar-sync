@@ -16,18 +16,23 @@ const caseId="antonio-todoist_owned_recurrence_task_deleted-1227dad2ad8dd7071bdb
 const k=(pk,sk="STATE")=>pk+"|"+sk;
 const clone=v=>v===undefined?undefined:structuredClone(v);
 
-function fixture({masterStatus="cancelled",raceOwner=false,dismissed=false}={}){
+function fixture({masterStatus="cancelled",raceOwner=false,dismissed=false,
+  unmapped=false,liveException=false}={}){
   const now="2026-10-25T19:10:24.379Z";
   const recurring={profile,taskId,owner:"todoist",seriesId:taskId,
     eventId:activeId,activeInstanceId:activeId,updatedAt:"2026-10-25T19:09:07.680Z"};
   const initialCase={id:caseId,profile,status:dismissed?"dismissed":"open",
-    reason:"todoist_owned_recurrence_task_deleted",title:"Legacy deleted recurrence",
+    reason:unmapped?"calendar_snapshot_recurring_identity_conflict"
+      :"todoist_owned_recurrence_task_deleted",title:"Legacy deleted recurrence",
     taskId,eventId:activeId,createdAt:now,updatedAt:now,
     lookupPk:"PROFILE#"+profile,
     lookupSk:(dismissed?"REVIEW#CLOSED#":"REVIEW#OPEN#")+now+"#"+caseId,
-    decision:{type:"todoist_owned_recurrence_task_deleted",status:dismissed?"resolved":"pending",
-      taskId,eventId:activeId,activeInstanceId:activeId,seriesId:taskId,
-      mappingSnapshot:{...recurring,recurrenceOwner:"todoist"}}};
+    decision:unmapped
+      ?{type:"todoist_unmapped_conflict",status:dismissed?"resolved":"pending",
+        taskId,eventId:activeId,context:{masterEventId:masterId,candidateTaskIds:[taskId]}}
+      :{type:"todoist_owned_recurrence_task_deleted",status:dismissed?"resolved":"pending",
+        taskId,eventId:activeId,activeInstanceId:activeId,seriesId:taskId,
+        mappingSnapshot:{...recurring,recurrenceOwner:"todoist"}}};
   const manual={profile,decisionId:caseId,status:dismissed?"resolved":"pending",
     taskId,eventId:activeId,activeInstanceId:activeId,seriesId:taskId,
     createdAt:now,policyMode:"prompt",lookupPk:"PROFILE#"+profile,
@@ -37,7 +42,7 @@ function fixture({masterStatus="cancelled",raceOwner=false,dismissed=false}={}){
   const rows=new Map([
     [k("REVIEW_CASE#"+caseId),clone(initialCase)],
     [k("MANUAL#"+caseId),clone(manual)],
-    [k("RECURRENCE#"+profile+"#"+taskId),clone(recurring)],
+    ...(!unmapped?[[k("RECURRENCE#"+profile+"#"+taskId),clone(recurring)]]:[]),
     [k("COMPLETED_EVENT#"+profile+"#"+completedId),clone(history)],
     [k("COMPLETED_TASK#"+profile+"#"+taskId,"EVENT#"+completedId),clone(history)],
   ]);
@@ -64,7 +69,9 @@ function fixture({masterStatus="cancelled",raceOwner=false,dismissed=false}={}){
       },
       async listEventInstances(id){
         assert.equal(id,masterId);
-        return [clone(active),clone(historical)];
+        return [clone(active),clone(historical),
+          ...(liveException?[{id:masterId+"_future",status:"confirmed",
+            recurringEventId:masterId,iCalUID:seriesUid,start:{date:"2027-11-01"}}]:[])];
       },
       async upsertEvent(){providerWrites.push("calendar upsert");throw Error("provider mutation forbidden")},
       async deleteEvent(){providerWrites.push("calendar delete");throw Error("provider mutation forbidden")},
@@ -268,4 +275,50 @@ test("#292 dismissed legacy alert can retire the exact stale link without reopen
     assert.equal(f.rows.has(k("RECURRENCE#"+profile+"#"+taskId)),false);
     assert.equal(f.providerWrites.length,0);
   }finally{documentClient.send=old;}
+});
+
+test("#278 cancelled unmapped series with a surviving future exception never closes its case",async()=>{
+  const f=fixture({unmapped:true,liveException:true});
+  const old=documentClient.send;documentClient.send=f.send;
+  try {
+    await f.reconcile().reconcile(profile);
+    assert.equal(f.transactions.length,0);
+    assert.equal(f.rows.get(k("REVIEW_CASE#"+caseId)).status,"open");
+    assert.equal(f.rows.get(k("MANUAL#"+caseId)).status,"pending");
+    assert.ok(f.rows.has(k("COMPLETED_EVENT#"+profile+"#"+completedId)));
+    assert.deepEqual(f.providerWrites,[]);
+  } finally {documentClient.send=old;}
+});
+
+test("#278 fully cancelled unmapped recurring master and occurrence safely close without deleting completed history",async()=>{
+  const f=fixture({unmapped:true});
+  const original=f.rows.get(k("COMPLETED_EVENT#"+profile+"#"+completedId));
+  const old=documentClient.send;documentClient.send=f.send;
+  try {
+    await f.reconcile().reconcile(profile);
+    assert.equal(f.transactions.length,1);
+    const tx=f.transactions[0];
+    assert.ok(tx.some(op=>op.ConditionCheck?.Key.pk==="RECURRENCE#work#"+seriesUid),
+      "the independently verified Calendar UID must be fenced in all profiles");
+    assert.equal(f.rows.get(k("REVIEW_CASE#"+caseId)).status,"resolved");
+    assert.equal(f.rows.get(k("MANUAL#"+caseId)).status,"resolved");
+    assert.deepEqual(f.rows.get(k("COMPLETED_EVENT#"+profile+"#"+completedId)),original);
+    assert.deepEqual(f.providerWrites,[]);
+    await f.reconcile().reconcile(profile);
+    assert.equal(f.transactions.length,1,"repeat reconciliation must not create duplicate cleanup");
+  } finally {documentClient.send=old;}
+});
+
+test("#278 cancelled unmapped master but a verified historical instance with changed completion metadata fails closed",async()=>{
+  const f=fixture({unmapped:true});
+  const original=f.rows.get(k("COMPLETED_EVENT#"+profile+"#"+completedId));
+  f.rows.set(k("COMPLETED_EVENT#"+profile+"#"+completedId),
+    {...original,seriesId:"unrelated-series"});
+  const old=documentClient.send;documentClient.send=f.send;
+  try {
+    await f.reconcile().reconcile(profile);
+    assert.equal(f.transactions.length,0);
+    assert.equal(f.rows.get(k("REVIEW_CASE#"+caseId)).status,"open");
+    assert.deepEqual(f.providerWrites,[]);
+  } finally {documentClient.send=old;}
 });
