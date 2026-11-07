@@ -185,7 +185,8 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
       || item.originalStartTime?.dateTime || item.originalStartTime?.date);
     return !Number.isFinite(time) || time >= nowMs;
   })) b.push("A future or unverified Calendar occurrence exists; active series cannot be retired");
-  if (input.activeTask) b.push("Todoist still has an active task; completion cannot be inferred");
+  if (input.activeTask && input.activeTask.is_completed !== true)
+    b.push("Todoist still has an active task; completion cannot be inferred");
   if (!input.completedTask || input.completedTask.id !== target.taskId
     || input.completedTask.is_deleted === true
     || !Number.isFinite(isoTime(input.completedTask.completed_at))
@@ -193,9 +194,36 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
     b.push("Todoist did not independently prove this exact task completed more than seven days ago");
   if (input.completedLookupFailed) b.push("Todoist completed-task inventory is unavailable or incomplete");
   const completion = terminalCompletionDecision(input.history, nowMs, input.terminal);
-  if (completion !== "eligible") b.push(completion === "too_recent"
+  const exactOldProviderCompletion = !!input.completedTask
+    && input.completedTask.id === target.taskId
+    && input.completedTask.is_deleted !== true
+    && Number.isFinite(isoTime(input.completedTask.completed_at))
+    && isoTime(input.completedTask.completed_at) < nowMs - 7 * 86400_000
+    && input.history.some(item => item.profile === target.profile
+      && item.taskId === target.taskId && item.eventId === target.eventId
+      && item.seriesId === target.seriesId && item.masterEventId === mapping?.masterEventId
+      && item.recurrenceOwner === "calendar"
+      && Number.isFinite(isoTime(item.completedAt))
+      && isoTime(item.completedAt) < nowMs - 7 * 86400_000
+      && Math.abs(isoTime(item.completedAt) - isoTime(input.completedTask!.completed_at)) <= 3 * 86400_000);
+  // Some legacy completions predate COMPLETED_SERIES certificates. A scoped
+  // operator approval may use independent current provider proof instead:
+  // exact completed Todoist task + matching immutable occurrence history + a
+  // complete, finite Calendar series whose every instance is in the past.
+  // The existing ETag/version-fenced whole-series Apply remains mandatory.
+  const providerProvesEndedSeries = exactOldProviderCompletion && !input.activeTask
+    && !!master?.etag && !!occurrence?.etag && instances.length > 0
+    && master.recurrence?.some(rule => rule.startsWith("RRULE:")
+      && /(?:^|;)(COUNT|UNTIL)=/.test(rule)) === true
+    && instances.every(item => {
+      const time = isoTime(item.start?.dateTime || item.start?.date
+        || item.originalStartTime?.dateTime || item.originalStartTime?.date);
+      return Number.isFinite(time) && time < nowMs
+        && (item.status === "cancelled" || item.status === "confirmed");
+    });
+  if (completion !== "eligible" && !providerProvesEndedSeries) b.push(completion === "too_recent"
     ? "The immutable terminal completion is within the seven-day retention window"
-    : "No matching immutable terminal-series completion evidence exists");
+    : "No matching immutable terminal-series completion evidence exists; operator retirement also requires exact completed-task, matching history and fully ended Calendar-series proof");
   if (input.history.some(item => item.seriesId !== target.seriesId
     || item.recurrenceOwner !== "calendar" || item.masterEventId !== mapping?.masterEventId))
     b.push("Completed history references another recurrence relationship");
@@ -311,9 +339,10 @@ export async function inspectRecurrenceRetirement(
   let completedLookupFailed = false;
   try { task = await pair.todoist.getTask(target.taskId); }
   catch (error) { if (Number((error as {status?:number}).status) !== 404) throw error; }
-  // The active getTask endpoint does not return completed tasks. A 404 is not
-  // a completion marker: require a separate paginated direct completed lookup.
-  if (!task && history.length) {
+  // Independently read the completed endpoint even when GET returns the task:
+  // retained completed records and reopened tasks must be distinguished from
+  // mere task existence using matching status and completion timestamps.
+  if (history.length) {
     const latest = history.slice().sort((a,b)=>b.completedAt.localeCompare(a.completedAt))[0];
     try {
       completedTask = await pair.todoist.findCompletedTaskById(target.taskId,latest.completedAt);
@@ -332,9 +361,17 @@ export async function inspectRecurrenceRetirement(
   }
   try { occurrence = await pair.calendar.getEvent(target.eventId); }
   catch (error) { if (![404,410].includes(Number((error as {status?:number}).status))) throw error; }
+  const completedAtMatches = !!task?.completed_at && !!completedTask
+    && task.completed_at === completedTask.completed_at;
+  // Todoist reads may retain a completed object with a completion timestamp.
+  // Successful GET alone is not proof of activity. An explicit false status
+  // still wins because it can mean the task was reopened after completion.
+  const taskVerifiedCompleted = task?.is_completed === true
+    || (task?.is_completed === undefined && completedAtMatches);
+  const activeTask = task && !taskVerifiedCompleted ? task : undefined;
   const blockers = assessRecurrenceRetirement({
     nowMs:Date.now(),target,mapping,taskIndex,ownerIndex,eventIndex,link,master,occurrence,
-    instances,completedTask,activeTask:task,completedLookupFailed,history,terminal,
+    instances,completedTask,activeTask,completedLookupFailed,history,terminal,
     otherOwners:otherOwners.map(row=>String(row.pk)),
     activeReviews:activeReviews.map(row=>String(row.pk)),
     inFlightControls:inFlightControls.map(row=>String(row.pk)),
@@ -349,9 +386,9 @@ export async function inspectRecurrenceRetirement(
   });
   return {
     target,checkedAt:new Date().toISOString(),diagnostic,
-    task:{status:task?"active":completedTask?"completed_verified":"unverified",
-      ...(task||completedTask ? {value:task||completedTask}:{}),
-      source:task?"Todoist active task direct GET":completedTask?"Todoist completed-by-completion-date paginated API":"No direct Todoist completion verification"},
+    task:{status:activeTask?"active":completedTask?"completed_verified":"unverified",
+      ...(activeTask||completedTask||task ? {value:completedTask||task}:{}),
+      source:activeTask?"Todoist active task direct GET":completedTask?"Todoist completed-by-completion-date paginated API":"No direct Todoist completion verification"},
     calendar:{...(master?{master}:{}),...(occurrence?{occurrence}:{}),
       instances,source:"Calendar direct master/occurrence GET plus bounded complete instance inventory"},
     ...(mapping?{mapping}:{}),...(link?{recurrenceLink:link}:{}),

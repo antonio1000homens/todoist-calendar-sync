@@ -56,6 +56,13 @@ test("#351 missing terminal history or active recurrence fails closed",()=>{
   assert.match(assessRecurrenceRetirement(input({master:{...master,recurrence:["RRULE:FREQ=DAILY"]}})).join(" / "),/unbounded/i);
 });
 
+test("#358 legacy recurrence without a series certificate can use complete provider proof after explicit operator approval",()=>{
+  assert.deepEqual(assessRecurrenceRetirement(input({terminal:undefined})),[]);
+  assert.match(assessRecurrenceRetirement(input({terminal:undefined,completedTask:undefined})).join(" / "),/independently prove this exact task completed/i);
+  const future={...instance,id:"future-instance",start:{dateTime:"2026-12-03T10:00:00Z"}};
+  assert.match(assessRecurrenceRetirement(input({terminal:undefined,instances:[instance,future]})).join(" / "),/future/i);
+});
+
 test("#351 version mismatch, shared ownership, active review and pending repair are blockers",()=>{
   const errors=assessRecurrenceRetirement(input({
     eventIndex:{...mapping,updatedAt:"2026-11-06T10:00:00Z"},
@@ -136,7 +143,7 @@ const diagnostic={
 function inspectionFixture({
   recorded=diagnostic, rows=[],calendarMaster=master,
   getTaskStatus=404,completedStatus=200,inventoryError,historyOverride=history,
-  instanceOverride=[instance],
+  instanceOverride=[instance],taskValue,
   diagnosticsPages,
 }={}) {
   const calls=[];
@@ -168,7 +175,7 @@ function inspectionFixture({
         async getTask(id) {
           calls.push(["getTask",id]);
           if(getTaskStatus!==200)throw Object.assign(new Error("task unavailable"),{status:getTaskStatus});
-          return {id:target.taskId,content:"Active task",due:{date:"2026-12-03"}};
+          return taskValue||{id:target.taskId,content:"Active task",due:{date:"2026-12-03"},is_completed:false};
         },
         async findCompletedTaskById(id,at){
           calls.push(["completed",id,at]);
@@ -208,6 +215,33 @@ test("#351 inspector orchestration binds exact recorded generation and does not 
   assert.ok(calls.some(([name])=>name==="listEventInstances"));
   assert.ok(calls.every(([name])=>!/(delete|update|put|write|patch|save)/i.test(name)));
   assert.equal(result.previewFingerprint.length,64);
+});
+
+test("#358 a direct Todoist task read marked completed is not misclassified as active, and completed history is rechecked",async()=>{
+  const {calls,dependencies}=inspectionFixture({getTaskStatus:200,
+    taskValue:{id:target.taskId,content:"Threat modelling",is_completed:true}});
+  const result=await inspectRecurrenceRetirement(target,dependencies);
+  assert.equal(result.task.status,"completed_verified");
+  assert.equal(result.task.value.completed_at,completed);
+  assert.ok(calls.some(([name])=>name==="completed"),"completed-task endpoint is checked even when direct GET returns an item");
+  assert.ok(!result.blockers.some(reason=>/active task/i.test(reason)));
+});
+
+test("#358 a retained direct completion timestamp corroborated by Todoist completed history is verified",async()=>{
+  const {dependencies}=inspectionFixture({getTaskStatus:200,
+    taskValue:{id:target.taskId,content:"Threat modelling",completed_at:completed}});
+  const result=await inspectRecurrenceRetirement(target,dependencies);
+  assert.equal(result.task.status,"completed_verified");
+  assert.equal(result.task.value.completed_at,completed);
+  assert.ok(!result.blockers.some(reason=>/active task/i.test(reason)));
+});
+
+test("#358 a re-opened Todoist task remains an active-task blocker despite older completion history",async()=>{
+  const {dependencies}=inspectionFixture({getTaskStatus:200,
+    taskValue:{id:target.taskId,content:"Threat modelling",is_completed:false}});
+  const result=await inspectRecurrenceRetirement(target,dependencies);
+  assert.equal(result.task.status,"active");
+  assert.ok(result.blockers.some(reason=>/active task/i.test(reason)));
 });
 test("#351 wrong diagnostic IDs or reason fail before provider reads",async()=>{
   const {calls,dependencies}=inspectionFixture({recorded:{...diagnostic,taskId:"unrelated-task"}});
