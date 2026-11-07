@@ -1435,7 +1435,8 @@ export class Synchronizer {
       const newerAnnual = Boolean(currentTask && !currentTask.is_completed && !currentTask.is_deleted
         && currentTask.due?.is_recurring && todoistRecurrenceToRrule(currentTask)==="RRULE:FREQ=YEARLY"
         && currentTask.updated_at && mapping.updatedAt
-        && Date.parse(currentTask.updated_at)>Date.parse(mapping.updatedAt));
+        && Date.parse(currentTask.updated_at)>Date.parse(mapping.updatedAt)
+        && (!event.updated || Date.parse(currentTask.updated_at)>Date.parse(event.updated)));
       if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual || newerSourceWithProof) {
         return this.state.audit(delivery.profile,"calendar_cancelled_annual_todoist_protected",{
           taskId:mapping.taskId,eventId:mapping.eventId,pendingReset:Boolean(pending),
