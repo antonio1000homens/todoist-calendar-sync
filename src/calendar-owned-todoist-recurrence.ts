@@ -1,4 +1,17 @@
 import type { CalendarEvent, TodoistTask } from "./types.js";
+import {
+  calendarPhaseCCandidate, calendarPhaseCInstancesConform,
+  matchesCalendarPhaseCTask, type CalendarPhaseCCandidate,
+} from "./calendar-todoist-phase-c.js";
+
+export function phaseCNativeEnabled(): boolean {
+  return process.env.TODOIST_CALENDAR_SYNC_PHASE_C_NATIVE_ENABLED === "true";
+}
+
+export function isPhaseCNativeCandidate(master: CalendarEvent, timeZone = master.start?.timeZone): boolean {
+  return phaseCNativeEnabled()
+    && calendarPhaseCCandidate(master, timeZone).reason === "provider_readback_required";
+}
 
 export interface CalendarOwnedTodoistRecurrence {
   dueString: string;
@@ -12,6 +25,8 @@ export interface CalendarOwnedTodoistRecurrence {
   month?: number;
   time?: string;
   startDate?: string;
+  /** Phase C verified provider candidate; never a recurrence-owner transfer. */
+  phaseCCandidate?: CalendarPhaseCCandidate;
 }
 
 export interface CalendarOwnedRecurringTaskReadback {
@@ -302,6 +317,7 @@ function ruleFields(rule: string): Record<string, string> | undefined {
  * rules deliberately stay on the Calendar-owned rolling mirror path. */
 export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolean {
   if (master.recurrence?.length !== 1) return false;
+  if (isPhaseCNativeCandidate(master)) return true;
   const fields = ruleFields(master.recurrence[0]);
   return Boolean(fields && ["WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
     && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || fields.INTERVAL === "1")
@@ -314,6 +330,20 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const fields = ruleFields(rule)!;
   const start = master.start?.dateTime || master.start?.date;
   if (!start) return undefined;
+  // Newly whitelisted Phase C families use exact two-provider-verified phrases.
+  // They never bypass the complete exception inventory performed by
+  // verifiedCalendarOwnedRecurrence().
+  const phaseC = phaseCNativeEnabled() ? calendarPhaseCCandidate(master, timeZone) : undefined;
+  if (phaseC?.reason === "provider_readback_required" && phaseC.semantic && phaseC.todoistPhrase) {
+    if (!calendarPhaseCInstancesConform(master, instances, phaseC, timeZone)) return undefined;
+    return {
+      rule, startDate: phaseC.semantic.startDate,
+      ...(phaseC.semantic.localTime ? { time: phaseC.semantic.localTime } : {}),
+      frequency: phaseC.semantic.frequency === "WEEKLY" ? "weekly" : "monthly",
+      dueString: phaseC.todoistPhrase + " starting " + localDate(start, timeZone),
+      phaseCCandidate: phaseC,
+    };
+  }
   let parts: Record<string, string>;
   try { parts = localParts(start, timeZone); } catch { return undefined; }
   const weekday = weekdayNames.find((name) => name.toLowerCase().startsWith(parts.weekday.toLowerCase()));
@@ -622,6 +652,8 @@ export function matchesCalendarOwnedRecurringRule(
   recurrence: CalendarOwnedTodoistRecurrence,
   verifiedTimeZone?: string,
 ): boolean {
+  if (recurrence.phaseCCandidate)
+    return matchesCalendarPhaseCTask(task, recurrence.phaseCCandidate, recurrence.startDate!, verifiedTimeZone);
   if (recurrence.frequency) return openRuleMatches(task, recurrence, verifiedTimeZone).matches;
   const expected = parseWeeklySchedule(recurrence.dueString);
   const observedParse = parseWeeklyScheduleDetailed(task.due?.string, task.due?.date || task.due?.datetime, verifiedTimeZone);
@@ -648,6 +680,21 @@ export function calendarOwnedRecurringTaskReadback(
   recurrence: CalendarOwnedTodoistRecurrence,
   verifiedTimeZone?: string,
 ): CalendarOwnedRecurringTaskReadback {
+  if (recurrence.phaseCCandidate) {
+    const candidate = recurrence.phaseCCandidate;
+    const matches = matchesCalendarPhaseCTask(task, candidate, recurrence.startDate!, verifiedTimeZone)
+      && startsMatchCalendarEvent(event, task, verifiedTimeZone);
+    const frequency = recurrence.frequency!;
+    return {
+      matches,
+      expected: { frequency, ...(recurrence.startDate ? { startDate: recurrence.startDate } : {}),
+        ...(recurrence.time ? { time: recurrence.time } : {}) },
+      observed: { recurring: Boolean(task.due?.is_recurring),
+        ...(task.due?.date || task.due?.datetime ? { dueDate: task.due?.date || task.due?.datetime } : {}),
+        recurrenceParsed: matchesCalendarPhaseCTask(task, candidate, recurrence.startDate!, verifiedTimeZone),
+      },
+    };
+  }
   if (recurrence.frequency) {
     const { parsed, matches } = openRuleMatches(task, recurrence, verifiedTimeZone);
     return {
