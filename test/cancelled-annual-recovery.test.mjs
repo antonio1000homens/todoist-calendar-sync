@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {GetCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
 import {annualRecoveryCandidate,attemptCancelledAnnualRecovery} from "../dist/cancelled-annual-recovery.js";
+import {SnapshotReconciler} from "../dist/reconciliation.js";
 
 const now="2026-11-07T17:00:00.000Z", profile="home";
 const task={id:"task-annual",project_id:"home-project",content:"Annual event",
@@ -176,4 +177,51 @@ test("open competing case blocks recovery without modifying any provider or stat
   const h=harness({openCases:[{id:"unrelated",profile:"home",status:"open",taskId:task.id}]});
   assert.equal(await run(h),false);
   assert.equal(h.transactions.length,0);
+});
+
+test("snapshot reconciliation resumes a persisted annual reset without adopting old cancelled aliases",async()=>{
+  let mapping,repairs=0,baselines=0;
+  const state={
+    async syncBlocked(){return false;},
+    async getCancelledAnnualRecoveryReceipt(){return {sourceDueDate:task.due.date,oldEventId:"event-mapped"};},
+    async getMappingByTask(){return mapping;},
+    async audit(){},
+  };
+  const store={
+    async putBaseline(){baselines++;},
+  };
+  const confirmed={
+    id:"fresh-master",status:"confirmed",summary:task.content,description:"",
+    start:{date:task.due.date},end:{date:"2027-08-17"},recurrence:["RRULE:FREQ=YEARLY"],
+    extendedProperties:{shared:{taskId:task.id,syncSource:"todoist-calendar-sync",
+      syncRecurrenceOwner:"todoist",todoistAnchorStart:task.due.date,todoistAnchorEnd:"2027-08-17",
+      todoistAnchorAllDay:"true",todoistRecurrence:"every year"}},
+  };
+  const calendar={
+    async getEvent(id){assert.equal(id,"fresh-master");return confirmed;},
+    async findByTodoistTaskId(){throw new Error("must not rediscover old cancelled alias");},
+  };
+  const reconciler=new SnapshotReconciler(state,undefined,store,async(delivery)=>{
+    assert.equal(delivery.kind,"todoist");
+    repairs++;
+    mapping={profile:"home",taskId:task.id,eventId:"fresh-master",masterEventId:"fresh-master",
+      seriesId:task.id,recurrenceOwner:"todoist"};
+  });
+  const outcome=await reconciler.reconcileUnmappedTask(profile,task,{calendar,todoist:{}});
+  assert.equal(outcome,"created");
+  assert.equal(repairs,1);
+  assert.equal(baselines,1);
+});
+
+test("snapshot reconciliation keeps a changed reset source blocked",async()=>{
+  let called=0;
+  const state={
+    async syncBlocked(){return false;},
+    async getCancelledAnnualRecoveryReceipt(){return {sourceDueDate:"2027-08-15",oldEventId:"event-mapped"};},
+    async audit(){},
+  };
+  const reconciler=new SnapshotReconciler(state,undefined,{},async()=>{called++;});
+  const outcome=await reconciler.reconcileUnmappedTask(profile,task,{calendar:{},todoist:{}});
+  assert.equal(outcome,"blocked");
+  assert.equal(called,0);
 });
