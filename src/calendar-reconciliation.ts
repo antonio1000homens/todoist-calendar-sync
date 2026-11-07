@@ -27,6 +27,7 @@ import {
   verifiedCalendarOwnedRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   nativeCalendarRecurrenceCandidate,
+  isPhaseCNativeCandidate,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedDescription, normalizedText } from "./security.js";
@@ -430,7 +431,10 @@ export async function reconcileUnmappedCalendar(
       return;
     }
     const boundedFiniteWeekly = finiteWeeklyCalendarRuleCandidate(master);
-    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master);
+    // New Phase C families are enabled for NEW Calendar-owned series only.
+    // Existing rolling mappings must never be bulk-migrated implicitly.
+    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master)
+      && !(existingLink && isPhaseCNativeCandidate(master) && !existingLink.calendarNativeRecurring);
     // Only explicitly Calendar-owned existing mappings can be upgraded.
     if (existingLink && !nativeRecurrence && !boundedFiniteWeekly) {
       summary.skipped += 1;
