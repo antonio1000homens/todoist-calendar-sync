@@ -1,4 +1,5 @@
 import { ReviewStore as SyncReviewStore, SyncControls, reviewHash } from "./review-store.js";
+import { dismissResolvedPrewriteRecoveryIncidents } from "./guarded-recovery-incidents.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   DeleteCommand,
@@ -770,6 +771,20 @@ export class StateRepository {
           ExpressionAttributeValues:{":profile":profile,":task":taskId,":old":receipt.oldEventId,
             ":version":receipt.sourceUpdatedAt,":pending":"pending"}}},
       ]}));
+      // At this point a single fresh Calendar master and its three mapping
+      // views/recurrence link are verified, and the pending reset receipt was
+      // conditionally removed. This is the first safe point to acknowledge
+      // the *known pre-write* recovery validation alert. Other open cases
+      // remain untouched. Alert cleanup failure must not turn the successful
+      // provider write into a duplicate-create retry.
+      try {
+        const resolved=await dismissResolvedPrewriteRecoveryIncidents(profile,taskId,new SyncReviewStore());
+        if(resolved) logEvent("annual_recovery_prewrite_dlq_incidents_resolved",
+          {profile,taskId,resolved},"state-repository");
+      } catch (error) {
+        logEvent("annual_recovery_prewrite_dlq_incident_resolution_deferred",
+          {profile,taskId,errorType:(error as {name?:string})?.name||"unknown"},"state-repository");
+      }
       return true;
     }catch(e){if((e as {name?:string}).name==="TransactionCanceledException")return false;throw e;}
   }
