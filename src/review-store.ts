@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { Profile, RecurrenceLink } from "./types.js";
+import type { CalendarEvent, Profile, RecurrenceLink } from "./types.js";
+import { verifyCancelledSeries } from "./verified-deletion.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
@@ -402,6 +403,8 @@ export class ReviewStore {
       profile: Profile; taskIds: string[]; eventIds: string[];
       staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
       masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
+      /** Direct provider readbacks for legacy decisions without masterEventId. */
+      legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
     },
   ): Promise<boolean> {
     const current = await this.getCase(caseId);
@@ -436,11 +439,25 @@ export class ReviewStore {
     const recurring = current.decision?.type?.includes("recurrence_task_deleted") === true;
     const recordedMaster = current.decision?.masterEventId || current.decision?.mappingSnapshot?.masterEventId;
     const recordedActive = current.decision?.activeInstanceId || current.decision?.mappingSnapshot?.activeInstanceId;
+    // Legacy todoist-owned mappings can have no masterEventId even though
+    // the cancelled active occurrence directly names its cancelled master.
+    // Never accept the caller's boolean or an inferred ID as this proof:
+    // independently verify both supplied direct provider readback objects.
+    const proof=expected.legacyMasterProof;
+    const verifiedLegacyMaster=Boolean(!recordedMaster && proof && expected.masterId
+      && expected.activeInstanceId && expected.masterSeriesId
+      && proof.master.id===expected.masterId
+      && proof.occurrence.id===expected.activeInstanceId
+      && verifyCancelledSeries(expected.masterId,expected.activeInstanceId,
+        [expected.masterId,expected.activeInstanceId],
+        new Map([[expected.masterId,proof.master],[expected.activeInstanceId,proof.occurrence]])).masterSeriesId
+          ===expected.masterSeriesId);
     const seriesKeys = [...new Set(expected.seriesKeys || [...expected.taskIds, ...expected.eventIds])];
     if (!seriesKeys.length || seriesKeys.length > 20
       || [...expected.taskIds, ...expected.eventIds].some(id => !seriesKeys.includes(id))) return false;
     if (recurring && (!expected.masterId || !expected.activeInstanceId || !expected.masterSeriesId
-      || recordedMaster !== expected.masterId || recordedActive !== expected.activeInstanceId
+      || (recordedMaster ? recordedMaster !== expected.masterId : !verifiedLegacyMaster)
+      || recordedActive !== expected.activeInstanceId
       || expected.masterId === expected.activeInstanceId
       || !expected.eventIds.includes(expected.masterId)
       || !expected.eventIds.includes(expected.activeInstanceId)
@@ -457,10 +474,14 @@ export class ReviewStore {
       if (seenLinks.has(identity) || link.profile !== expected.profile || link.owner !== "todoist"
         || link.seriesId !== link.taskId || !expected.taskIds.includes(link.taskId)
         || !expected.eventIds.includes(link.eventId)
-        || !link.masterEventId || !expected.eventIds.includes(link.masterEventId)
+        || (!link.masterEventId && !(recurring && verifiedLegacyMaster
+          && link.eventId===expected.activeInstanceId))
+        || (link.masterEventId && !expected.eventIds.includes(link.masterEventId))
         || !link.activeInstanceId || !expected.eventIds.includes(link.activeInstanceId)
         || link.activeInstanceId === link.masterEventId
         || recurring && (link.masterEventId !== expected.masterId
+          && !(verifiedLegacyMaster && !link.masterEventId
+            && link.eventId===expected.activeInstanceId)
           || link.activeInstanceId !== expected.activeInstanceId)
         || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return false;
       seenLinks.add(identity);
