@@ -1832,7 +1832,10 @@ export class Synchronizer {
     // This is one atomic state transaction; provider tasks/events are never
     // deleted. A blocked/unverified candidate keeps all existing safeguards.
     if (lifecycle.action==="upsert" && writeFence && existingMapping?.profile===delivery.profile
-      && !existingMapping.recurrenceOwner && recoveryPolicyForTask(task)
+      && !existingMapping.recurrenceOwner && !existingMapping.seriesId
+      && !existingMapping.masterEventId && !existingMapping.activeInstanceId
+      && recoveryPolicyForTask(task) && task.updated_at && existingMapping.updatedAt
+      && Date.parse(task.updated_at)>Date.parse(existingMapping.updatedAt)
       && profileForTodoistProject(task.project_id)===delivery.profile
       && await this.state.mutationAllowed(delivery.profile)
       && modeAllowsMutations(delivery,true)) {
