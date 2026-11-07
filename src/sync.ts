@@ -2408,7 +2408,7 @@ export class Synchronizer {
     }
 
     let cancelledCalendarLink = false;
-    if (pendingAnnualRecovery && pendingAnnualRecovery.sourcePolicy
+    if (task && pendingAnnualRecovery && pendingAnnualRecovery.sourcePolicy
       && pendingAnnualRecovery.sourcePolicy!=="yearly") {
       for (const other of profiles) {
         if (other===delivery.profile) continue;
