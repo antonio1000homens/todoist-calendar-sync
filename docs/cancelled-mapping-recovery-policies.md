@@ -46,15 +46,22 @@ mapping views and baseline, marks **that** failed repair abandoned, releases
 exact owned controls (preserving queued refreshes) and stores an
 `ANNUAL_RECOVERY#profile#taskId` pending receipt. The historical key name is
 retained for rollout/legacy compatibility. New receipts carry policy,
-source version and a SHA-256 fingerprint of projection-sensitive Todoist
-fields; old annual receipts remain readable.
+source version, a SHA-256 fingerprint of projection-sensitive Todoist
+fields and a deterministic Google Calendar event ID. This ID is derived from the
+profile, task, original cancelled event and source version, not from the title.
+Old annual receipts remain readable.
 
 ## Provider write and retry
 
 After the reset, only cancelled provider aliases are ignored. A retry must
-find **zero** or **one** confirmed canonical same-task counterpart. If exactly
-one is present, it can be adopted with its original provider ID; otherwise
-the normal provider projection may POST once. Recurring policies require a
+find **zero** or **one** confirmed canonical same-task counterpart. New
+receipts require that the counterpart carry the receipt's exact deterministic
+Google ID and recovery fingerprint; a direct ID GET handles lag in shared-ID
+search. If the provider POST succeeds but its response is lost, retrying the
+same client-assigned ID produces a 409, which can only adopt the verified
+same-ID, same-fingerprint, confirmed canonical object. It never chooses a
+same-title object or sends another distinct POST. Old annual receipts retain
+their original compatibility path. Recurring policies require a
 matching native RRULE and a valid active instance; standalone must have no
 recurrence/instance. Mapping/index acknowledgement is conditional, and the
 pending receipt is cleared only after the three mapping views and appropriate
