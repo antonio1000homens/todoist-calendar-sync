@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {parseCliExportedCredentials,readOnlyProviderPair,redactedFailureCode,redactedFailureDetails} from "../scripts/audit-erasure-cross-profile-live.mjs";
+import {classifyProviderRequest,parseCliExportedCredentials,readOnlyProviderPair,redactedFailureCode,redactedFailureDetails} from "../scripts/audit-erasure-cross-profile-live.mjs";
 
 test("AWS CLI SSO credential export is validated and mapped without exposing secrets",()=>{
   const input={Version:1,AccessKeyId:"AKIA_TEST_SECRET",SecretAccessKey:"secret-value",
@@ -112,4 +112,58 @@ test("read-only provider facade tags an oversized recurrence relative to selecte
     assert.deepEqual(redactedFailureDetails(error).relationOrigins,["calendar-task-tag"]);
     return true;
   });
+});
+
+test("#335 progress classification matches exact provider DNS labels and valid subdomains",()=>{
+  const examples=[
+    ["https://todoist.com/", "todoist"],
+    ["https://api.todoist.com/rest/v2/tasks", "todoist"],
+    ["https://nested.api.todoist.com/anything", "todoist"],
+    ["https://API.TODOIST.COM./rest/v2/tasks", "todoist"],
+    ["https://googleapis.com/", "google"],
+    ["https://www.googleapis.com/calendar/v3", "google"],
+    ["https://calendar.googleapis.com/calendar/v3", "google"],
+    ["https://NESTED.Calendar.GoogleAPIs.Com./calendar/v3", "google"],
+    ["https://example.com/", "other"],
+  ];
+  for(const [url,expected] of examples)
+    assert.equal(classifyProviderRequest(url),expected,url);
+});
+
+test("#335 lookalike hosts, suffix tricks and empty DNS labels are always other",()=>{
+  const examples=[
+    "https://eviltodoist.com/",
+    "https://api.eviltodoist.com/",
+    "https://todoist.com.evil.example/",
+    "https://api.todoist.com.attacker.example/",
+    "https://not-googleapis.com/",
+    "https://evilgoogleapis.com/",
+    "https://calendar.googleapis.com.evil.example/",
+    "https://googleapis.com.attacker.example/",
+    "https://todoist.com"+String.fromCharCode(64)+"evil.example/rest/v2/tasks",
+    "https://googleapis.com"+String.fromCharCode(64)+"evil.example/calendar",
+    "https://.todoist.com/",
+    "https://api..todoist.com/",
+    "https://.googleapis.com/",
+    "https://calendar..googleapis.com/",
+  ];
+  for(const url of examples)
+    assert.equal(classifyProviderRequest(url),"other",url);
+});
+
+test("#335 malformed, non-web and unknown inputs cannot be classified as providers",()=>{
+  for(const input of [
+    "", "api.todoist.com", "not-a-url", "http://", "https://%ZZ/",
+    "mailto:user"+String.fromCharCode(64)+"api.todoist.com", "ftp://api.todoist.com/path",
+    "file:///tmp/calendar.googleapis.com", "/api.todoist.com", null,
+    undefined, {}, 123, {url:"not-a-url"},
+  ])
+    assert.equal(classifyProviderRequest(input),"other",String(input));
+});
+
+test("#335 telemetry classification handles fetch Request, URL and URL-bearing objects",()=>{
+  assert.equal(classifyProviderRequest(new URL("https://api.todoist.com/rest/v2/tasks")),"todoist");
+  assert.equal(classifyProviderRequest(new Request("https://calendar.googleapis.com/calendar/v3")),"google");
+  assert.equal(classifyProviderRequest({url:"https://api.todoist.com/rest/v2/tasks"}),"todoist");
+  assert.equal(classifyProviderRequest({url:"https://other.example/path"}),"other");
 });

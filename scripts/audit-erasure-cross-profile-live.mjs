@@ -23,6 +23,27 @@ const AMBIENT_CREDENTIALS=["AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","AWS_SESS
   "AWS_SECURITY_TOKEN","AWS_WEB_IDENTITY_TOKEN_FILE","AWS_ROLE_ARN",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI","AWS_CONTAINER_CREDENTIALS_FULL_URI"];
 
+/**
+ * Classifies request origins for redacted progress counters only. It must NOT
+ * be used to authorize requests or decide where credentials are sent.
+ * Compare whole DNS labels: a string suffix such as "eviltodoist.com" is not
+ * a Todoist host, even though it ends with "todoist.com".
+ */
+export function classifyProviderRequest(input) {
+  let host;
+  try {
+    const address=typeof input==="string"||input instanceof URL?input:input?.url;
+    const url=new URL(address);
+    if(url.protocol!=="https:"&&url.protocol!=="http:")return "other";
+    host=url.hostname.toLowerCase().replace(/\.$/,"");
+  } catch {return "other";}
+  // Empty labels are not valid DNS subdomains, even if the suffix matches.
+  if(!host||host.startsWith(".")||host.includes(".."))return "other";
+  if(host==="todoist.com"||host.endsWith(".todoist.com"))return "todoist";
+  if(host==="googleapis.com"||host.endsWith(".googleapis.com"))return "google";
+  return "other";
+}
+
 function option(argv,name) {
   const found=argv.filter(value=>value.startsWith("--"+name+"="));
   if(found.length!==1)throw new Error("Invalid or missing required option");
@@ -331,10 +352,11 @@ export async function collectLiveCrossProfileEvidence(options) {
     const signals=[providerDeadline.signal,requestDeadline,...(init.signal?[init.signal]:[])];
     progress.providerRequestsStarted++;
     progress.providerRequestsInFlight++;
-    let host="";
-    try {host=new URL(typeof input==="string"?input:input.url).hostname;} catch {}
-    if(host==="todoist.com"||host.endsWith(".todoist.com"))progress.todoistRequestsStarted++;
-    else if(host==="googleapis.com"||host.endsWith(".googleapis.com"))progress.googleRequestsStarted++;
+    // Classification is telemetry only: it never affects originalFetch,
+    // request authorization, routing, headers or credential selection.
+    const provider=classifyProviderRequest(input);
+    if(provider==="todoist")progress.todoistRequestsStarted++;
+    else if(provider==="google")progress.googleRequestsStarted++;
     else progress.otherProviderRequestsStarted++;
     try {
       return await originalFetch(input,{...init,signal:AbortSignal.any(signals)});
