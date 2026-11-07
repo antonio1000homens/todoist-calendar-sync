@@ -4,7 +4,7 @@ import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
-import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
+import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries, verifyCancelledSeriesInstances } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -611,6 +611,7 @@ export class SnapshotReconciler {
         const readProviders = async (): Promise<{
           absent: boolean; masterSeriesId?: string; reason?: string;
           legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
+          legacyInstanceFingerprint?: string;
         }> => {
           for (const taskId of taskIds) {
             if (await this.currentTask(clients.todoist, taskId)
@@ -633,11 +634,27 @@ export class SnapshotReconciler {
           // the cancelled occurrence at BOTH preflight reads.
           const legacyVerified = legacyMaster && relationship.valid
             && cancelledOccurrenceMasterId(activeInstanceId,active) === masterId;
+          let legacyInstanceFingerprint: string | undefined;
+          if(legacyVerified){
+            // A cancelled master with a surviving live/exception occurrence is
+            // not a fully deleted series. Inventory every page; a historical
+            // confirmed child is allowed only with an immutable completion
+            // marker, and that marker is never deleted by this operation.
+            let instances: CalendarEvent[];
+            try {instances=await clients.calendar.listEventInstances(masterId!);}
+            catch {return {absent:false,reason:"Complete cancelled-series instance inventory unavailable"};}
+            const checked=await verifyCancelledSeriesInstances({
+              profile,taskIds,masterId:masterId!,masterSeriesId:relationship.masterSeriesId!,
+              activeInstanceId:activeInstanceId!,instances,nowMs:Date.now(),
+            },id=>this.state.getCompletedCalendarProjectionByEvent(profile,id));
+            if(!checked.valid)return {absent:false,reason:checked.reason};
+            legacyInstanceFingerprint=checked.fingerprint;
+          }
           return { absent: relationship.valid && (!legacyMaster || legacyVerified),
             masterSeriesId: relationship.masterSeriesId,
             ...(legacyVerified ? {legacyMasterProof: {
               master: events.get(masterId!)!, occurrence: active!,
-            }} : {}),
+            },legacyInstanceFingerprint} : {}),
             reason: relationship.reason };
         };
         const first = await readProviders();
@@ -670,7 +687,8 @@ export class SnapshotReconciler {
         // master UID invalidates the series-key set rather than using old data.
         const final = await readProviders();
         if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId
-          || legacyMaster && !final.legacyMasterProof) continue;
+          || legacyMaster && (!final.legacyMasterProof
+            || final.legacyInstanceFingerprint!==first.legacyInstanceFingerprint)) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, {
           profile, taskIds, eventIds: verifiedEventIds, staleLinks: classification.stale,
           seriesKeys, ...(recurring ? {
