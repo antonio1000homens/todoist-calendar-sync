@@ -28,13 +28,15 @@ function failedCondition(){
  */
 async function memory(t,seed=[]){
   const previousSend=documentClient.send;
+  const previousTable=process.env.STATE_TABLE_NAME;
+  process.env.STATE_TABLE_NAME="terminal-lifecycle-test";
   const rows=new Map(seed.map(item=>[storageKey(item),structuredClone(item)]));
   const transactions=[];
   let writes=0;
   t.after(()=>{
     documentClient.send=previousSend;
-    if(priorTable===undefined)delete process.env.STATE_TABLE_NAME;
-    else process.env.STATE_TABLE_NAME=priorTable;
+    if(previousTable===undefined)delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME=previousTable;
   });
   documentClient.send=async command=>{
     const req=command.input;
@@ -49,12 +51,12 @@ async function memory(t,seed=[]){
       const matches=[...rows.values()].filter(row=>row.pk===pk && row.sk.startsWith(prefix))
         .sort((a,b)=>a.sk.localeCompare(b.sk));
       const items=matches.slice(0,req.Limit);
-      return {Items:items.map(structuredClone),
+      return {Items:items.map(value=>structuredClone(value)),
         ...(matches.length>req.Limit?{LastEvaluatedKey:{pk,sk:items.at(-1).sk}}:{})};
     }
     if(command instanceof ScanCommand){
       const all=[...rows.values()].filter(x=>x.pk.startsWith("COMPLETED_TASK#"));
-      return {Items:all.slice(0,1).map(structuredClone),ScannedCount:all.length};
+      return {Items:all.slice(0,1).map(value=>structuredClone(value)),ScannedCount:all.length};
     }
     if(command instanceof TransactWriteCommand){
       transactions.push(req.TransactItems);
