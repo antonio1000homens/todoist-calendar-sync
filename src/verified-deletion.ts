@@ -53,9 +53,10 @@ export async function verifyCancelledSeriesInstances(
   completedHistory: (eventId: string) => Promise<CompletedCalendarProjection | undefined>,
 ): Promise<{valid:boolean;fingerprint?:string;reason?:string}> {
   const {instances,masterId,masterSeriesId,activeInstanceId,taskIds,profile,nowMs}=input;
-  if(!Array.isArray(instances)||instances.length>100)
+  if(!Array.isArray(instances)||!instances.length||instances.length>100)
     return {valid:false,reason:"Cancelled Calendar series instance inventory is missing or excessive"};
   const unique=new Set<string>();
+  const completions:Array<{id:string;history:CompletedCalendarProjection}>=[];
   for(const instance of instances){
     if(!instance||typeof instance.id!=="string"||!instance.id
       ||unique.has(instance.id)||instance.recurringEventId!==masterId
@@ -75,13 +76,18 @@ export async function verifyCancelledSeriesInstances(
       ||marker.seriesId!==masterSeriesId||marker.recurrenceOwner!=="calendar"
       ||!Number.isFinite(Date.parse(marker.completedAt))||Date.parse(marker.completedAt)>nowMs)
       return {valid:false,reason:"A surviving Calendar occurrence has no matching immutable completed-history guard"};
+    completions.push({id:instance.id,history:marker});
   }
+  if(!unique.has(activeInstanceId))
+    return {valid:false,reason:"Verified active cancelled occurrence is missing from complete series inventory"};
   const stable=instances.map(instance=>({
     id:instance.id,status:instance.status,etag:instance.etag,updated:instance.updated,
     recurringEventId:instance.recurringEventId,iCalUID:instance.iCalUID,
     start:instance.start,originalStartTime:instance.originalStartTime,
   })).sort((a,b)=>a.id.localeCompare(b.id));
-  return {valid:true,fingerprint:JSON.stringify(stable)};
+  return {valid:true,fingerprint:JSON.stringify({
+    instances:stable,completions:completions.sort((a,b)=>a.id.localeCompare(b.id)),
+  })};
 }
 
 /** All supported recurrence keys are task IDs (Todoist-owned) or the
