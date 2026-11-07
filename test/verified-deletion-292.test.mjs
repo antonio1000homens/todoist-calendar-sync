@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyDeletedRecurrenceLinks, readExactRecurrenceLinks } from "../dist/verified-deletion.js";
+import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, readExactRecurrenceLinks, verifyCancelledSeries } from "../dist/verified-deletion.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
 
 const taskId="6hqp4fFR45WvJ5VV";
@@ -108,4 +108,68 @@ test("cross-matched master/active IDs are blocked even though both IDs are cance
     async(profile,key)=>profile==="antonio"&&key===taskId?swapped:undefined);
   assert.equal(status.bothGone,false);
   assert.equal(status.state,"mapping_blocked");
+});
+
+const legacyLink={...linked,eventId:active,masterEventId:undefined};
+const legacyCase={...deletedCase,eventId:active,
+  decision:{...deletedCase.decision,eventId:active,masterEventId:undefined,
+    mappingSnapshot:{...linked,eventId:active,masterEventId:undefined,activeInstanceId:active,
+      recurrenceOwner:"todoist"}}};
+const cancelledMaster={id:master,status:"cancelled",iCalUID:masterSeriesId,
+  recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]};
+const cancelledActive={id:active,status:"cancelled",recurringEventId:master,iCalUID:masterSeriesId};
+const legacySnapshots=[
+  {ref:{profile:"antonio",side:"todoist",id:taskId},object:null},
+  {ref:{profile:"antonio",side:"calendar",id:active},object:cancelledActive},
+  {ref:{profile:"antonio",side:"calendar",id:master},object:cancelledMaster},
+];
+test("#292 historical decision without masterEventId discovers master only by direct cancelled occurrence",async()=>{
+  assert.equal(cancelledOccurrenceMasterId(active,cancelledActive),master);
+  assert.equal(cancelledOccurrenceMasterId(active,{...cancelledActive,status:"confirmed"}),undefined);
+  assert.equal(cancelledOccurrenceMasterId(active,{...cancelledActive,recurringEventId:""}),undefined);
+  assert.equal(cancelledOccurrenceMasterId(active,{...cancelledActive,id:"other"}),undefined);
+  const result=await deletedRecurrenceStatus(legacyCase,legacySnapshots,
+    async(profile,key)=>profile==="antonio"&&key===taskId?legacyLink:undefined);
+  assert.equal(result.bothGone,true);
+  assert.equal(result.state,"stale_recurrence");
+  assert.equal(result.masterId,master);
+  assert.deepEqual(result.eventIds.slice().sort(),[master,active].sort());
+  assert.deepEqual(result.staleLinks.map(link=>link.seriesId),[taskId]);
+});
+test("#292 masterless active link is blocked unless a verified legacy master proof is supplied",()=>{
+  const ids=[master,active];
+  const keys=[taskId,master,active,masterSeriesId];
+  const ordinary={masterId:master,activeInstanceId:active};
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],ids,[legacyLink],keys,ordinary).stale.length,0);
+  assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],ids,[legacyLink],keys,ordinary).blocked.length,1);
+  const verified={...ordinary,legacyMasterVerified:true};
+  assert.deepEqual(classifyDeletedRecurrenceLinks("antonio",[taskId],ids,[legacyLink],keys,verified).stale,[legacyLink]);
+  for(const bad of [
+    {...legacyLink,profile:"work"},
+    {...legacyLink,eventId:master},
+    {...legacyLink,activeInstanceId:"new-instance"},
+    {...legacyLink,masterEventId:"different-master"},
+    {...legacyLink,owner:"calendar"},
+    {...legacyLink,updatedAt:undefined},
+  ]) assert.equal(classifyDeletedRecurrenceLinks("antonio",[taskId],ids,[bad],keys,verified).stale.length,0);
+});
+test("#292 cancelled child never proves deleted master with different UID or still-live master",async()=>{
+  const lookup=async(profile,key)=>profile==="antonio"&&key===taskId?legacyLink:undefined;
+  for(const modified of [
+    {...cancelledMaster,status:"confirmed"},
+    {...cancelledMaster,iCalUID:"unrelated-uid"},
+    {...cancelledMaster,recurrence:[]},
+  ]) {
+    const altered=legacySnapshots.map(row=>row.ref.id===master?{...row,object:modified}:row);
+    assert.equal((await deletedRecurrenceStatus(legacyCase,altered,lookup)).bothGone,false);
+  }
+  const changedChild=legacySnapshots.map(row=>row.ref.id===active
+    ?{...row,object:{...cancelledActive,recurringEventId:"different-master"}}:row);
+  assert.equal((await deletedRecurrenceStatus(legacyCase,changedChild,lookup)).bothGone,false);
+  const errorChild=legacySnapshots.map(row=>row.ref.id===active?{...row,lookupError:"HTTP 429"}:row);
+  assert.equal((await deletedRecurrenceStatus(legacyCase,errorChild,lookup)).state,"unverified");
+  const missingMaster=legacySnapshots.filter(row=>row.ref.id!==master);
+  assert.equal((await deletedRecurrenceStatus(legacyCase,missingMaster,lookup)).state,"unverified");
+  assert.equal(verifyCancelledSeries(master,active,[master,active],
+    new Map([[master,cancelledMaster],[active,{...cancelledActive,iCalUID:"another-uid"}]])).valid,false);
 });
