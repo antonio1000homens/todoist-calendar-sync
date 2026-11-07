@@ -252,3 +252,26 @@ test("all recovery DynamoDB expressions alias reserved names at the AWS boundary
     }
   }
 });
+
+test("known prewrite validation DLQ cannot self-deadlock exact guarded annual recovery",async()=>{
+  const dlqId="home-operational_dlq-prewrite";
+  const dlq={
+    id:dlqId,profile:"home",status:"open",reason:"operational_dlq",
+    taskId:task.id,
+    decision:{decisionId:dlqId,profile:"home",type:"operational_dlq",status:"pending",
+      sourceDeliveryId:"delivery-prewrite",
+      context:{deliveryId:"delivery-prewrite",kind:"todoist",providerTaskId:task.id,
+        failure:"Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: token"}},
+  };
+  const h=harness({openCases:[dlq]});
+  assert.equal(await run(h),true);
+  assert.equal(h.transactions.length,1,"only the ordinary guarded version-fenced reset may proceed");
+  assert.ok(h.transactions[0].TransactItems.some(x=>x.Put?.Item.pk==="ANNUAL_RECOVERY#home#task-annual"));
+
+  // A superficially similar DLQ after a provider write MUST remain a blocker.
+  const unsafe={...dlq,decision:{...dlq.decision,
+    context:{...dlq.decision.context,failure:"Provider write succeeded, update failed"}}};
+  const blocked=harness({openCases:[unsafe]});
+  assert.equal(await run(blocked),false);
+  assert.equal(blocked.transactions.length,0);
+});
