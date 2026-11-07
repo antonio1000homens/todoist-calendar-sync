@@ -2,6 +2,18 @@ import type { CalendarEvent, Profile, RecurrenceLink } from "./types.js";
 
 const profiles: readonly Profile[] = ["home", "antonio", "work"];
 
+/** Legacy decisions may omit masterEventId. Recover it ONLY from a direct
+ * cancelled occurrence read, never by stripping an ID suffix or trusting an
+ * old mapping/comment. The caller must then independently verify the master. */
+export function cancelledOccurrenceMasterId(
+  activeInstanceId: string | undefined, occurrence: CalendarEvent | undefined,
+): string | undefined {
+  if (!activeInstanceId || !occurrence || occurrence.id !== activeInstanceId
+    || occurrence.status !== "cancelled" || !occurrence.recurringEventId
+    || occurrence.recurringEventId === activeInstanceId) return undefined;
+  return occurrence.recurringEventId;
+}
+
 /** Provider reads, not a date/title or a cancelled occurrence alone, must
  * establish the exact master and active occurrence. Missing master metadata
  * cannot establish Calendar-owned iCalUID key absence and fails closed. */
@@ -21,7 +33,8 @@ export function verifyCancelledSeries(
     if (id === masterId) continue;
     const occurrence = events.get(id);
     if (!occurrence || occurrence.id !== id || occurrence.status !== "cancelled"
-      || occurrence.recurringEventId !== masterId || occurrence.recurrence?.length)
+      || occurrence.recurringEventId !== masterId || occurrence.recurrence?.length
+      || occurrence.iCalUID && occurrence.iCalUID !== master.iCalUID)
       return { valid: false, reason: "Recorded occurrence is absent, live or not linked to the exact recurring master" };
   }
   return { valid: true, masterSeriesId: master.iCalUID };
@@ -59,7 +72,7 @@ export async function readExactRecurrenceLinks(
 export function classifyDeletedRecurrenceLinks(
   profile: Profile, taskIds: string[], eventIds: string[], links: RecurrenceLink[],
   seriesKeys: string[] = [...taskIds, ...eventIds],
-  identity?: { masterId: string; activeInstanceId: string },
+  identity?: { masterId: string; activeInstanceId: string; legacyMasterVerified?: boolean },
 ): { stale: RecurrenceLink[]; blocked: string[] } {
   const tasks = new Set(taskIds), events = new Set(eventIds), keys = new Set(seriesKeys);
   const stale: RecurrenceLink[] = [], blocked: string[] = [];
@@ -70,10 +83,16 @@ export function classifyDeletedRecurrenceLinks(
     if (!touches) continue;
     if (link.profile === profile && link.owner === "todoist"
       && tasks.has(link.taskId) && link.seriesId === link.taskId
-      && events.has(link.eventId) && Boolean(link.masterEventId && events.has(link.masterEventId))
+      && events.has(link.eventId)
+      && (Boolean(link.masterEventId && events.has(link.masterEventId))
+        || Boolean(identity?.legacyMasterVerified && !link.masterEventId
+          && link.eventId === identity.activeInstanceId
+          && events.has(identity.masterId)))
       && Boolean(link.activeInstanceId && events.has(link.activeInstanceId))
       && link.activeInstanceId !== link.masterEventId
-      && (!identity || link.masterEventId === identity.masterId
+      && (!identity || (link.masterEventId === identity.masterId
+          || identity.legacyMasterVerified && !link.masterEventId
+            && link.eventId === identity.activeInstanceId)
         && link.activeInstanceId === identity.activeInstanceId)
       && typeof link.updatedAt === "string" && Boolean(link.updatedAt)) {
       stale.push(link);
