@@ -708,3 +708,74 @@ test("pending annual recovery refuses to recreate a Calendar event if the user c
   assert.equal(held,false);
   assert.ok(logs.includes("todoist_cancelled_annual_projection_source_changed"));
 });
+
+test("pending standalone reset reuses exact Calendar ID after POST succeeded but acknowledgement was lost",async()=>{
+  const {recoverySourceFingerprint,recoveryCounterpartEventId}=await import("../dist/cancelled-mapping-recovery-policy.js");
+  const source={id:"task-378-post-lost",content:"One-off reminder",description:"",
+    project_id:profiles.home.todoistProjectId,
+    updated_at:"2026-11-07T17:00:00Z",is_completed:false,is_deleted:false,
+    due:{date:"2027-08-16",is_recurring:false,string:"2027-08-16"}};
+  const candidate=recoveryCounterpartEventId("home",source.id,"old-cancelled",source.updated_at);
+  let receipt={profile:"home",taskId:source.id,oldEventId:"old-cancelled",
+    sourceDueDate:source.due.date,sourceUpdatedAt:source.updated_at,status:"pending",
+    sourcePolicy:"standalone",sourceFingerprint:recoverySourceFingerprint(source),
+    candidateEventId:candidate};
+  let mapping,providerPost=0,completion=0,lease=false,master;
+  const state={
+    async beginTodoistCalendarWrite(){assert.equal(lease,false);lease=true;return "writer-378";},
+    async endTodoistCalendarWrite(_,token){assert.equal(token,"writer-378");lease=false;},
+    async getMappingByTaskAnyProfile(){return mapping;},
+    async getMappingByTask(){return mapping;},
+    async getCancelledAnnualRecoveryReceipt(){return receipt;},
+    async getCalendarProjectionTombstone(){return undefined;},
+    async acceptTaskVersion(){return true;},
+    async syncBlocked(){return false;},
+    async mutationAllowed(){return true;},
+    async putMapping(value){assert.equal(lease,true);mapping=structuredClone(value);},
+    async completeCancelledAnnualRecovery(){
+      assert.equal(mapping.eventId,candidate);
+      assert.equal(mapping.recurrenceOwner,undefined);
+      assert.equal(mapping.masterEventId,undefined);
+      receipt=undefined;completion++;return true;
+    },
+    async recordMutation(){},async recordRecurrence(){},async audit(){},
+  };
+  const calendar={
+    async listLinkedEventsByTodoistTaskId(){
+      // Force stale shared-ID index: the new event is only visible by direct ID.
+      return [{id:"old-cancelled",status:"cancelled"}];
+    },
+    async findByTodoistTaskId(){throw new Error("cancelled alias must never be adopted");},
+    async getEvent(id){
+      assert.equal(id,candidate);
+      if(master)return structuredClone(master);
+      const error=new Error("not found");error.status=404;throw error;
+    },
+    async upsertEvent(value,existingId){
+      assert.equal(existingId,undefined);
+      assert.equal(value.id,candidate);
+      assert.equal(value.extendedProperties.shared.syncRecoveryFingerprint,receipt.sourceFingerprint);
+      providerPost++;
+      master={...structuredClone(value),status:"confirmed"};
+      const error=new Error("response lost after Google created the event");
+      error.status=503;throw error;
+    },
+  };
+  const todoist={async getTask(id){assert.equal(id,source.id);return structuredClone(source);}};
+  const foreign={calendar:{async listLinkedEventsByTodoistTaskId(){return [];}},todoist};
+  const synchronizer=new Synchronizer(state,undefined,async p=>p==="home"?{calendar,todoist}:foreign);
+  const delivery=id=>({id,kind:"todoist",profile:"home",mode:"aws",
+    headers:{},receivedAt:"2026-11-07T17:00:01Z",
+    body:JSON.stringify({event_name:"item:updated",event_data:source})});
+  await assert.rejects(synchronizer.process(delivery("lost-post-ack")),/response lost/);
+  assert.equal(lease,false);
+  assert.equal(providerPost,1);
+  assert.equal(mapping,undefined);
+  assert.ok(receipt,"pending receipt must survive a lost Calendar response");
+  await synchronizer.process(delivery("retry-lost-post-ack"));
+  assert.equal(providerPost,1,"replay must adopt the exact identity rather than creating another event");
+  assert.equal(mapping.eventId,candidate);
+  assert.equal(completion,1);
+  assert.equal(receipt,undefined);
+  assert.equal(lease,false);
+});
