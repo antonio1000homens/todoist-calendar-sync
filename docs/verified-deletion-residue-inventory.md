@@ -81,3 +81,7 @@ Across the **entire** table (not just these two fixtures): `AUDIT#=212`, `AUDIT_
 **Decision from Phase A:** The nine matched conflict audits are inside the established seven-day forensic window; do **not** add an early-deletion writer on this evidence. The eight unexpiring `REPAIR#` rows justify a **separate, read-only lifecycle dependency audit** before considering any retention policy or conditional cleanup. No orphaned repair for the two #278 fixtures was found in this exact-ID scan.
 
 This was a distinct administrative read-only scan, not an execution of the branch CLI. The script added by this PR should be run after deployment/review in the authorised environment for repeatable scoped reporting. Strong scans are not an atomic snapshot if concurrent writers update the table.
+
+## Lifecycle decision and follow-up
+
+Phase C completed the independent submitted repair-operation dependency review. The current protocol preserves `REPAIR#` operations without a blanket TTL to maintain operation-ID idempotency, SQS replay handling, notification delivery and operator recovery. A targeted, read-only full-table checker is available as `state:inspect-repair-retention`; see the [repair-operation retention decision](./repair-retention-decision.md). No existing #278 case was associated with those operations. The distinct failed Home repair retaining four `activeRepair` controls is tracked in #369. It is **not** safe to remove via the audit cleanup workflow.
