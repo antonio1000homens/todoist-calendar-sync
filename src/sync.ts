@@ -22,6 +22,7 @@ import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import { attemptCancelledAnnualRecovery } from "./cancelled-annual-recovery.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFingerprint } from "./cancelled-mapping-recovery-policy.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
+import { calendarPhaseCCandidate, matchesCalendarPhaseCTask } from "./calendar-todoist-phase-c.js";
 import {
   calendarOwnedRecurringTaskPayload,
   calendarOwnedRecurringTaskReadback,
@@ -880,7 +881,8 @@ export class Synchronizer {
       });
       if (!timeZone) continue;
       const now = Date.now();
-      const native = nativeCalendarRecurrenceCandidate(master);
+      const native = nativeCalendarRecurrenceCandidate(master)
+        && !(link && isPhaseCNativeCandidate(master) && !link.calendarNativeRecurring);
       // Open-ended Google series must never be expanded without an upper bound.
       if (native && !calendar.listInstancesInWindow) {
         await this.state.audit(profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
@@ -1333,7 +1335,8 @@ export class Synchronizer {
           if (!timeZone) return;
           verifiedTimeZone = timeZone;
           const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
-          const native = nativeCalendarRecurrenceCandidate(master);
+          const native = nativeCalendarRecurrenceCandidate(master)
+            && !(isPhaseCNativeCandidate(master) && !existingRecurrence.calendarNativeRecurring);
           const anchor = existingRecurrence.activeEffectiveStart || existingRecurrence.originalStart;
           const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
           const fromMs = Number.isFinite(anchorMs) ? Math.min(anchorMs, Date.now()) : Date.now();
@@ -1986,8 +1989,13 @@ export class Synchronizer {
             taskId: task.id, masterEventId: mapping.masterEventId, reason: "calendar_timezone_unverified",
           });
         }
-        const expectedRule = calendarOwnedTodoistRecurrence(master, [], zone);
-        if (!expectedRule || !matchesCalendarOwnedRecurringRule(task, expectedRule, zone)) {
+        const phaseC = mapping.calendarNativeRecurring && isPhaseCNativeCandidate(master)
+          ? calendarPhaseCCandidate(master, zone) : undefined;
+        const expectedRule = phaseC ? undefined : calendarOwnedTodoistRecurrence(master, [], zone);
+        const matches = phaseC
+          ? matchesCalendarPhaseCTask(task, phaseC, master.start?.dateTime || master.start?.date || "", zone)
+          : Boolean(expectedRule && matchesCalendarOwnedRecurringRule(task, expectedRule, zone));
+        if (!matches) {
           return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
             taskId: task.id, masterEventId: mapping.masterEventId, reason: "native_rule_changed_or_unsupported",
           });
@@ -2055,7 +2063,8 @@ export class Synchronizer {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: mapping.masterEventId,
         });
       }
-      const nativeCompletion = nativeCalendarRecurrenceCandidate(completionMaster);
+      const nativeCompletion = nativeCalendarRecurrenceCandidate(completionMaster)
+        && !(isPhaseCNativeCandidate(completionMaster) && !mapping.calendarNativeRecurring);
       if (nativeCompletion && !calendar.listInstancesInWindow) {
         return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: mapping.masterEventId,
