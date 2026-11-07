@@ -1,5 +1,6 @@
 import { ReviewStore as SyncReviewStore, SyncControls, reviewHash } from "./review-store.js";
 import { dismissResolvedPrewriteRecoveryIncidents } from "./guarded-recovery-incidents.js";
+import { recoveryCounterpartEventId, type RecoveryPolicy } from "./cancelled-mapping-recovery-policy.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   DeleteCommand,
@@ -727,7 +728,7 @@ export class StateRepository {
 
   async getCancelledAnnualRecoveryReceipt(profile: Profile, taskId: string): Promise<{
     profile:Profile; taskId:string; oldEventId:string; operationId:string; sourceUpdatedAt:string;
-    sourceDueDate:string; status:"pending"; createdAt:string;
+    sourceDueDate:string; sourcePolicy?:RecoveryPolicy; sourceFingerprint?:string; candidateEventId?:string; status:"pending"; createdAt:string;
   } | undefined> {
     const item=await client.send(new GetCommand({
       TableName:this.ensureTable(),Key:key(`ANNUAL_RECOVERY#${profile}#${taskId}`),ConsistentRead:true,
@@ -736,9 +737,14 @@ export class StateRepository {
     if(!row)return undefined;
     if(row.profile!==profile || row.taskId!==taskId || row.status!=="pending"
       || typeof row.oldEventId!=="string" || typeof row.sourceUpdatedAt!=="string"
-      || typeof row.sourceDueDate!=="string" || typeof row.operationId!=="string")
+      || typeof row.sourceDueDate!=="string" || typeof row.operationId!=="string"
+      || (row.sourcePolicy !== undefined && !["standalone","weekly","monthly","yearly"].includes(row.sourcePolicy))
+      || (row.sourceFingerprint !== undefined && (typeof row.sourceFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(row.sourceFingerprint)))
+      || (row.sourceFingerprint !== undefined && row.sourcePolicy === undefined)
+      || (row.sourceFingerprint !== undefined && row.candidateEventId !==
+        recoveryCounterpartEventId(profile,taskId,row.oldEventId,row.sourceUpdatedAt)))
       throw new Error("Annual Calendar recovery receipt is inconsistent; manual review required");
-    return row as {profile:Profile;taskId:string;oldEventId:string;operationId:string;sourceUpdatedAt:string;sourceDueDate:string;status:"pending";createdAt:string};
+    return row as {profile:Profile;taskId:string;oldEventId:string;operationId:string;sourceUpdatedAt:string;sourceDueDate:string;sourcePolicy?:RecoveryPolicy;sourceFingerprint?:string;candidateEventId?:string;status:"pending";createdAt:string};
   }
 
   /** Only clear a pending reset after the new series, its three index views
@@ -746,15 +752,25 @@ export class StateRepository {
   async completeCancelledAnnualRecovery(profile:Profile,taskId:string,newEventId:string):Promise<boolean> {
     const receipt=await this.getCancelledAnnualRecoveryReceipt(profile,taskId);
     if(!receipt)return false;
-    if(!newEventId || newEventId===receipt.oldEventId)throw new Error("Cannot complete annual reset against its cancelled Calendar event");
+    if(!newEventId || newEventId===receipt.oldEventId
+      || (receipt.candidateEventId && receipt.candidateEventId!==newEventId))
+      throw new Error("Cannot acknowledge recovery against an unapproved Calendar event ID");
     const mapping=await this.getMappingByTask(profile,taskId);
-    if(!mapping || mapping.eventId!==newEventId || mapping.recurrenceOwner!=="todoist"
-      || mapping.seriesId!==taskId || mapping.masterEventId!==newEventId) return false;
+    const standalone=receipt.sourcePolicy==="standalone";
+    if(!mapping || mapping.eventId!==newEventId || mapping.profile!==profile
+      || (standalone
+        ? Boolean(mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId)
+        : mapping.recurrenceOwner!=="todoist" || mapping.seriesId!==taskId || mapping.masterEventId!==newEventId))
+      return false;
     const table=this.ensureTable();
     const mapCheck=(pk:string,sk:string)=>({ConditionCheck:{
       TableName:table,Key:key(pk,sk),
-      ConditionExpression:"profile = :profile AND taskId = :task AND eventId = :event AND recurrenceOwner = :owner AND seriesId = :series",
-      ExpressionAttributeValues:{":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist",":series":taskId},
+      ConditionExpression:standalone
+        ? "profile = :profile AND taskId = :task AND eventId = :event AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(seriesId) AND attribute_not_exists(masterEventId)"
+        : "profile = :profile AND taskId = :task AND eventId = :event AND recurrenceOwner = :owner AND seriesId = :series",
+      ExpressionAttributeValues:standalone
+        ? {":profile":profile,":task":taskId,":event":newEventId}
+        : {":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist",":series":taskId},
     }});
     try {
       await client.send(new TransactWriteCommand({TransactItems:[
@@ -762,14 +778,20 @@ export class StateRepository {
         mapCheck(`TASKOWNER#${taskId}`,"MAP"),
         mapCheck(`EVENT#${profile}#${newEventId}`,"MAP"),
         {ConditionCheck:{TableName:table,Key:key(`RECURRENCE#${profile}#${taskId}`),
-          ConditionExpression:"profile = :profile AND taskId = :task AND masterEventId = :event AND #owner = :owner",
-          ExpressionAttributeNames:{"#owner":"owner"},
-          ExpressionAttributeValues:{":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist"}}},
+          ConditionExpression:standalone
+            ? "attribute_not_exists(pk)"
+            : "profile = :profile AND taskId = :task AND masterEventId = :event AND #owner = :owner",
+          ...(standalone ? {} : {
+            ExpressionAttributeNames:{"#owner":"owner"},
+            ExpressionAttributeValues:{":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist"},
+          })}},
         {Delete:{TableName:table,Key:key(`ANNUAL_RECOVERY#${profile}#${taskId}`),
-          ConditionExpression:"profile = :profile AND taskId = :task AND oldEventId = :old AND sourceUpdatedAt = :version AND #status = :pending",
+          ConditionExpression:"profile = :profile AND taskId = :task AND oldEventId = :old AND sourceUpdatedAt = :version AND #status = :pending"
+            + (receipt.candidateEventId ? " AND candidateEventId = :candidate" : ""),
           ExpressionAttributeNames:{"#status":"status"},
           ExpressionAttributeValues:{":profile":profile,":task":taskId,":old":receipt.oldEventId,
-            ":version":receipt.sourceUpdatedAt,":pending":"pending"}}},
+            ":version":receipt.sourceUpdatedAt,":pending":"pending",
+            ...(receipt.candidateEventId ? {":candidate":receipt.candidateEventId} : {})}}},
       ]}));
       // At this point a single fresh Calendar master and its three mapping
       // views/recurrence link are verified, and the pending reset receipt was

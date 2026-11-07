@@ -16,6 +16,7 @@ import { ReconciliationItemError, reconciliationFailureDetails, type Reconciliat
 import { normalizedText } from "./security.js";
 import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { recoveryPolicyForTask, recoveryReceiptMatchesTask } from "./cancelled-mapping-recovery-policy.js";
 import { logEvent } from "./observability.js";
 import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
@@ -481,11 +482,18 @@ export class SnapshotReconciler {
       // The guarded reset may have already retired the old mapping in a
       // transaction while this reconciliation held an older snapshot.
       const pending = await this.state.getCancelledAnnualRecoveryReceipt?.(profile,mapping.taskId);
+      const recoveryLock=task && await this.state.getCancelledAnnualRecoveryLock?.(profile,mapping.taskId);
+      const newerSourceWithProof=Boolean(recoveryLock && task && !task.is_deleted
+        && !task.is_completed && !task.completed_at && recoveryPolicyForTask(task)
+        && task.updated_at && event?.updated
+        && Date.parse(task.updated_at)>Date.parse(event.updated)
+        && profileForTodoistProject(task.project_id)===profile);
       const newerAnnual = Boolean(task && !task.is_deleted && !task.is_completed
         && task.due?.is_recurring && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
         && task.updated_at && mapping.updatedAt
-        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt));
-      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual) {
+        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt)
+        && (!event?.updated || Date.parse(task.updated_at)>Date.parse(event.updated)));
+      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual || newerSourceWithProof) {
         await this.state.audit(profile,"calendar_cancelled_annual_todoist_protected",{
           taskId:mapping.taskId,eventId:mapping.eventId,
           pendingReset:Boolean(pending),
@@ -905,8 +913,8 @@ export class SnapshotReconciler {
     // interpret preserved cancelled provider aliases as a new conflict.
     const pendingAnnual = await this.state.getCancelledAnnualRecoveryReceipt?.(profile,task.id);
     if (pendingAnnual) {
-      if (task.is_deleted || task.is_completed || task.due?.date!==pendingAnnual.sourceDueDate
-        || !task.due?.is_recurring || todoistRecurrenceToRrule(task)!=="RRULE:FREQ=YEARLY") {
+      if (task.is_deleted || task.is_completed || task.completed_at
+        || !recoveryReceiptMatchesTask(pendingAnnual,task)) {
         await this.state.audit(profile,"todoist_snapshot_annual_reset_source_changed",{
           taskId:task.id,
         });
@@ -914,13 +922,19 @@ export class SnapshotReconciler {
       }
       await this.repair(this.reconcileDelivery(profile,task,"reconcile-unmapped","projection-create"));
       const next=await this.state.getMappingByTask(profile,task.id);
-      if (!next || next.recurrenceOwner!=="todoist" || !next.masterEventId
-        || next.masterEventId!==next.eventId) {
+      const standalone=pendingAnnual.sourcePolicy==="standalone";
+      if (!next || (standalone
+        ? Boolean(next.recurrenceOwner || next.masterEventId || next.seriesId || next.activeInstanceId)
+        : next.recurrenceOwner!=="todoist" || !next.masterEventId
+          || next.masterEventId!==next.eventId)) {
         await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
         return "blocked";
       }
       const event=await this.currentEvent(clients.calendar,next.eventId);
-      if (!event || event.status!=="confirmed" || !calendarRecurrenceMatchesTodoist(event,task)) {
+      if (!event || event.status!=="confirmed"
+        || (standalone
+          ? Boolean(event.recurrence?.length || event.recurringEventId) || !hasCanonicalState(event,task)
+          : !calendarRecurrenceMatchesTodoist(event,task) || !hasCanonicalState(event,task))) {
         await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
         return "blocked";
       }

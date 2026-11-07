@@ -17,8 +17,8 @@ const refs=[
 ];
 const oldCalendar={id:"event-historical",status:"confirmed",start:{date:"2027-08-16"},
   end:{date:"2027-08-17"},extendedProperties:{shared:{taskId:task.id}}};
-const deletedCalendar=(id)=>({id,status:"cancelled",start:{date:"2027-08-16"},
-  end:{date:"2027-08-17"}});
+const deletedCalendar=(id)=>({id,status:"cancelled",updated:"2026-11-05T12:00:00Z",
+  start:{date:"2027-08-16"},end:{date:"2027-08-17"}});
 const reviewCase={id:"case-annual",profile,status:"dismissed",operationId:"repair-annual",updatedAt:"2026-11-01T15:00:00Z"};
 const operation={
   id:"repair-annual",status:"failed",attempt:2,updatedAt:"2026-10-26T11:00:00Z",
@@ -92,7 +92,8 @@ function harness(overrides={}){
     async listExplicitSeriesExceptions(){return overrides.exceptions??[];},
   };
   const todoist={async getTask(){return overrides.current??task;}};
-  return {rows,transactions,db,review,state,calendar,todoist};
+  return {rows,transactions,db,review,state,calendar,todoist,
+    crossProfileAliases:overrides.crossProfileAliases};
 }
 async function run(h,source=task){
   const prev=process.env.STATE_TABLE_NAME;
@@ -100,7 +101,8 @@ async function run(h,source=task){
   try {
     return await attemptCancelledAnnualRecovery({profile,task:source,mapping,
       operationId:operation.id,writeToken:"writer-token",state:h.state,
-      calendar:h.calendar,todoist:h.todoist},
+      calendar:h.calendar,todoist:h.todoist,
+      calendarForProfile:async()=>({listLinkedEventsByTodoistTaskId:async()=>h.crossProfileAliases??[]})},
       {db:h.db,review:h.review,now:()=>new Date(now)});
   }finally{
     if(prev===undefined)delete process.env.STATE_TABLE_NAME;
@@ -274,4 +276,94 @@ test("known prewrite validation DLQ cannot self-deadlock exact guarded annual re
   const blocked=harness({openCases:[unsafe]});
   assert.equal(await run(blocked),false);
   assert.equal(blocked.transactions.length,0);
+});
+
+
+test("guarded reset accepts exact standalone due, metadata and timed edits with newer cancellation",async()=>{
+  const sources=[
+    {...task,content:"Changed metadata",due:{date:"2027-08-16",is_recurring:false,string:"2027-08-16"}},
+    {...task,due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}},
+    {...task,due:{date:"2027-08-17",datetime:"2027-08-17T10:30:00+01:00",
+      timezone:"Europe/London",is_recurring:false,string:"2027-08-17 10:30"}},
+  ];
+  for(const source of sources){
+    const h=harness({current:source,liveCalendar:(id)=>({
+      ...deletedCalendar(id),updated:"2026-11-05T12:00:00Z",
+    })});
+    assert.equal(await run(h,source),true,JSON.stringify(source.due));
+    assert.equal(h.transactions.length,1);
+    const receipt=h.transactions[0].TransactItems.find(x=>x.Put?.Item.pk.startsWith("ANNUAL_RECOVERY#"))?.Put.Item;
+    assert.equal(receipt.sourcePolicy,"standalone");
+    assert.match(receipt.sourceFingerprint,/^[0-9a-f]{64}$/);
+    assert.equal(receipt.sourceUpdatedAt,source.updated_at);
+    assert.ok(!h.transactions[0].TransactItems.some(x=>x.Delete?.Key.pk.startsWith("REPAIR#")));
+  }
+});
+
+test("guarded reset supports weekly/monthly/yearly Todoist source recurrence with exact policy receipt",async()=>{
+  for (const [rule,policy] of [["every week","weekly"],["every month","monthly"],["every year","yearly"]]){
+    const source={...task,due:{date:"2027-08-16",is_recurring:true,string:rule}};
+    const h=harness({current:source,liveCalendar:id=>({...deletedCalendar(id),updated:"2026-11-05T12:00:00Z"})});
+    assert.equal(await run(h,source),true,rule);
+    const receipt=h.transactions[0].TransactItems.find(x=>x.Put)?.Put.Item;
+    assert.equal(receipt.sourcePolicy,policy);
+  }
+});
+
+test("new source policies require a real cancelled provider version newer than repair and older than edit",async()=>{
+  const source={...task,due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}};
+  for(const updated of [undefined,"2026-11-07T19:00:00Z","invalid"]){
+    const h=harness({current:source,liveCalendar:id=>({...deletedCalendar(id),updated})});
+    assert.equal(await run(h,source),false,String(updated));
+    assert.equal(h.transactions.length,0);
+  }
+  const oldAlias=harness({current:source,liveCalendar:id=>({
+    ...deletedCalendar(id),updated:id==="event-historical" ? undefined : "2026-11-05T12:00:00Z",
+  })});
+  assert.equal(await run(oldAlias,source),false,"every exact Calendar ref needs version proof");
+});
+
+test("replayed, identical, unsupported, completed, moved or wrong-profile source edits never retire mapping",async()=>{
+  const variants=[
+    {...task,updated_at:"2026-10-26T10:00:00Z",due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}},
+    {...originalTask,updated_at:task.updated_at},
+    {...task,due:{date:"2027-08-16",is_recurring:true,string:"every! week"}},
+    {...task,is_completed:true},
+    {...task,completed_at:"2026-10-01T00:00:00Z"},
+    {...task,is_deleted:true},
+  ];
+  for(const source of variants){
+    const h=harness({current:source,liveCalendar:id=>({...deletedCalendar(id),updated:"2026-11-05T12:00:00Z"})});
+    assert.equal(await run(h,source),false,JSON.stringify(source));
+    assert.equal(h.transactions.length,0);
+  }
+});
+
+test("old master exceptions, other-profile mappings and concurrent repairs continue to fail closed",async()=>{
+  const source={...task,due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}};
+  const crossed=harness({current:source,liveCalendar:id=>({...deletedCalendar(id),updated:"2026-11-05T12:00:00Z"})});
+  crossed.state.getMappingByTask=async p=>p==="work"?{...mapping,profile:"work"}:mapping;
+  assert.equal(await run(crossed,source),false);
+  const writes=harness({current:source,operation:{...operation,writeStarted:true}});
+  assert.equal(await run(writes,source),false);
+  const oldRecurring={...oldCalendar,recurrence:["RRULE:FREQ=WEEKLY"]};
+  const recurringOp={...operation,preview:{...operation.preview,
+    snapshots:[{ref:refs[0],object:oldRecurring},{ref:refs[1],object:originalTask}]}};
+  const exceptions=harness({current:source,operation:recurringOp,
+    liveCalendar:id=>({...deletedCalendar(id),updated:"2026-11-05T12:00:00Z"}),
+    exceptions:[{id:"active-exception",status:"confirmed",
+      originalStartTime:{date:"2028-08-16"}}]});
+  assert.equal(await run(exceptions,source),false);
+  for(const h of [crossed,writes,exceptions])assert.equal(h.transactions.length,0);
+});
+
+test("cross-profile cancelled or confirmed task-linked aliases block all new policies",async()=>{
+  const source={...task,due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}};
+  for(const status of ["cancelled","confirmed"]){
+    const h=harness({current:source,crossProfileAliases:[{
+      id:"foreign-alias",status,extendedProperties:{shared:{taskId:task.id}},
+    }]});
+    assert.equal(await run(h,source),false,status);
+    assert.equal(h.transactions.length,0);
+  }
 });
