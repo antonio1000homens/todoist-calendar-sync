@@ -78,17 +78,20 @@ function localOccurrence(value: {date?: string; dateTime?: string; timeZone?: st
 }
 function taskOccurrence(task: TodoistTask, semantic: RecurrenceSemantics) {
   if (semantic.localTime && task.due?.timezone && task.due.timezone !== semantic.timeZone) return undefined;
+  // Todoist REST API may store a timed due as due.date rather than the
+  // optional due.datetime. Provider shape must not affect civil-date meaning.
   const due = task.due;
-  // Todoist can persist floating local due.datetime when its project/account
-  // timezone was verified separately. Never feed this through Date.parse().
-  const floating = due?.datetime?.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/);
+  const value = due?.datetime || due?.date;
+  if (!value) return undefined;
+  // Floating due times use the independently verified profile timezone.
+  // Never interpret a floating value with the Lambda host's timezone.
+  const floating = value.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/);
   if (floating && semantic.timeZone)
     return { date: floating[1], time: floating[2] + ":" + floating[3] };
-  return localOccurrence(due ? {
-    date: due.datetime ? undefined : due.date,
-    dateTime: due.datetime,
-    timeZone: due.timezone,
-  } : undefined, semantic.timeZone);
+  return localOccurrence({
+    ...(value.includes("T") ? { dateTime: value } : { date: value }),
+    timeZone: due?.timezone,
+  }, semantic.timeZone);
 }
 function sameOccurrence(actual: { date: string; time?: string } | undefined,
   expectedDate: string, semantic: RecurrenceSemantics): boolean {
