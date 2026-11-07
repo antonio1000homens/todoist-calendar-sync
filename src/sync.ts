@@ -2428,11 +2428,24 @@ export class Synchronizer {
       // remain with the provider. The durable receipt allows a brand-new
       // projection, or recovery of a POST that succeeded before mapping ACK.
       const aliases=await calendar.listLinkedEventsByTodoistTaskId(task.id);
-      const active=aliases.filter(item=>item.status!=="cancelled");
+      // The shared-attribute search may lag a successful POST. Read the
+      // receipt's immutable client-generated ID directly before any retry.
+      let exactCounterpart:CalendarEvent|undefined;
+      if (pendingAnnualRecovery.candidateEventId) {
+        try {exactCounterpart=await calendar.getEvent(pendingAnnualRecovery.candidateEventId);}
+        catch (error) {if (Number((error as {status?:number}).status)!==404) throw error;}
+      }
+      const active=[...new Map([
+        ...aliases.filter(item=>item.status!=="cancelled"),
+        ...(exactCounterpart ? [exactCounterpart] : []),
+      ].map(item=>[item.id,item] as const)).values()];
       const standalone = pendingAnnualRecovery.sourcePolicy==="standalone";
       if (active.length>1 || active.some(item=>item.status!=="confirmed"
         || item.extendedProperties?.shared?.syncSource!=="todoist-calendar-sync"
         || item.extendedProperties?.shared?.taskId!==task!.id
+        || (pendingAnnualRecovery.candidateEventId && (
+          item.id!==pendingAnnualRecovery.candidateEventId
+          || item.extendedProperties?.shared?.syncRecoveryFingerprint!==pendingAnnualRecovery.sourceFingerprint))
         || (standalone
           ? Boolean(item.recurrence?.length || item.recurringEventId
             || item.extendedProperties?.shared?.syncRecurrenceOwner)
@@ -2648,7 +2661,34 @@ export class Synchronizer {
       }
     }
     const event = toCalendarEvent(task, existingEvent, !recurringDateEdit);
-    const stored = await calendar.upsertEvent(event, existingEvent?.id || mapping?.eventId);
+    if (pendingAnnualRecovery?.candidateEventId) {
+      if (mapping?.eventId && mapping.eventId!==pendingAnnualRecovery.candidateEventId) {
+        return this.state.audit(delivery.profile,"todoist_cancelled_recovery_unapproved_counterpart",{
+          taskId:task.id,
+        });
+      }
+      event.id=pendingAnnualRecovery.candidateEventId;
+      event.extendedProperties ||= {};
+      event.extendedProperties.shared ||= {};
+      event.extendedProperties.shared.syncRecoveryFingerprint=pendingAnnualRecovery.sourceFingerprint!;
+    }
+    let stored:CalendarEvent;
+    try {
+      stored=await calendar.upsertEvent(event, existingEvent?.id || mapping?.eventId);
+    } catch (error) {
+      if (!pendingAnnualRecovery?.candidateEventId || Number((error as {status?:number}).status)!==409)
+        throw error;
+      // A lost response cannot justify a second provider identity. A 409
+      // can only adopt the exact receipt-owned, confirmed canonical object.
+      const found=await calendar.getEvent(pendingAnnualRecovery.candidateEventId);
+      if (found.id!==pendingAnnualRecovery.candidateEventId || found.status!=="confirmed"
+        || found.extendedProperties?.shared?.taskId!==task.id
+        || found.extendedProperties?.shared?.syncRecoveryFingerprint!==pendingAnnualRecovery.sourceFingerprint
+        || !hasCanonicalState(found,task)) {
+        return this.state.audit(delivery.profile,"todoist_cancelled_recovery_duplicate_id_conflict",{taskId:task.id});
+      }
+      stored=found;
+    }
     const todoistRecurring = Boolean(task.due?.is_recurring);
     const todoistRrule = Boolean(desiredRrule && stored.recurrence?.length);
     let active: CalendarEvent | undefined;
@@ -2661,7 +2701,10 @@ export class Synchronizer {
         ? mappedActive
         : selectTodoistCurrentInstance(instances, task);
     }
-    if (pendingAnnualRecovery && (stored.status!=="confirmed"
+    if (pendingAnnualRecovery && (
+      (pendingAnnualRecovery.candidateEventId && (stored.id!==pendingAnnualRecovery.candidateEventId
+        || stored.extendedProperties?.shared?.syncRecoveryFingerprint!==pendingAnnualRecovery.sourceFingerprint))
+      || stored.status!=="confirmed"
       || (pendingAnnualRecovery.sourcePolicy==="standalone"
         ? Boolean(stored.recurrence?.length || stored.recurringEventId || todoistRecurring || !hasCanonicalState(stored,task))
         : !todoistRrule || !active || !occurrenceStateMatches(active,task)
