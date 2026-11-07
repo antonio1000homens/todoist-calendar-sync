@@ -107,7 +107,10 @@ export async function attemptCancelledAnnualRecovery(
     if (!original?.recurrence?.length) continue;
     const exceptions=await calendar.listExplicitSeriesExceptions(id);
     if (!Array.isArray(exceptions) || exceptions.some(e=>
-      e.status!=="cancelled" && (!e.originalStartTime || Date.parse(String(e.originalStartTime))>=Date.now()-86400000))) return false;
+      e.status!=="cancelled" && (!e.originalStartTime
+        || !("date" in e.originalStartTime || "dateTime" in e.originalStartTime)
+        || !Number.isFinite(Date.parse(e.originalStartTime.dateTime || e.originalStartTime.date || ""))
+        || Date.parse(e.originalStartTime.dateTime || e.originalStartTime.date || "")>=Date.now()-86400000))) return false;
   }
   // One final source read before the guarded transaction; never apply an old
   // due/recurrence from a webhook after the user changes the task again.
@@ -128,6 +131,8 @@ export async function attemptCancelledAnnualRecovery(
   if (maps.some(row=>row.taskId!==task.id || row.eventId!==mapping.eventId
     || row.profile!==profile || row.updatedAt!==mapping.updatedAt
     || row.recurrenceOwner || row.seriesId || row.masterEventId)) return false;
+  const mappedControl=await read("SYNC_CONTROL#"+profile+":calendar:"+mapping.eventId);
+  if (mappedControl?.activeRepair || mappedControl?.excluded) return false;
   const controls=await Promise.all(refs.map(async ref=>{
     const row=await read("SYNC_CONTROL#"+typed(ref));
     return {ref,row};
@@ -153,11 +158,11 @@ export async function attemptCancelledAnnualRecovery(
       ExpressionAttributeValues:{":dismissed":"dismissed",":op":operation.id,":at":reviewCase.updatedAt}}},
     {Update:{TableName:table,Key:key("REPAIR#"+operation.id),
       UpdateExpression:"SET abandoned = :yes, #s = :failed, updatedAt = :now, nextAction = :next",
-      ConditionExpression:"#s = :failed AND updatedAt = :at AND attempt = :attempt AND steps = :steps AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted) AND attribute_not_exists(creations) AND attribute_not_exists(outcomes) AND attribute_not_exists(verified) AND attribute_not_exists(recurrenceBindings)",
+      ConditionExpression:"#s = :failed AND updatedAt = :at AND attempt = :attempt AND steps = :steps AND preview = :preview AND (attribute_not_exists(creations) OR creations = :creations) AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted) AND attribute_not_exists(outcomes) AND attribute_not_exists(verified) AND attribute_not_exists(recurrenceBindings)",
       ExpressionAttributeNames:{"#s":"status"},
-      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded annual projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps}}},
+      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded annual projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps,":preview":operation.preview,":creations":operation.creations||{}}}},
     ...controls.map(({ref,row})=>{
-      const conditions=["activeRepair = :op","attribute_not_exists(excluded) OR excluded = :false"];
+      const conditions=["activeRepair = :op","(attribute_not_exists(excluded) OR excluded = :false)"];
       const values:Record<string,unknown>={":op":operation.id,":now":now,":false":false};
       for(const field of ["pendingRefreshAt","fencedAt","providerUpdatedAt"] as const){
         if (row?.[field]===undefined) conditions.push("attribute_not_exists("+field+")");
@@ -167,6 +172,11 @@ export async function attemptCancelledAnnualRecovery(
         UpdateExpression:"SET fencedAt = :now REMOVE activeRepair",
         ConditionExpression:conditions.join(" AND "),ExpressionAttributeValues:values}};
     }),
+    {ConditionCheck:{TableName:table,Key:key("SYNC_CONTROL#"+profile+":calendar:"+mapping.eventId),
+      ConditionExpression:"attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
+      ExpressionAttributeValues:{":no":false}}},
+    {ConditionCheck:{TableName:table,Key:key("REJECTED_PAIR#"+profile+"#"+task.id+"#"+mapping.eventId),
+      ConditionExpression:"attribute_not_exists(pk)"}},
     exactMap("owner"),exactMap("task"),exactMap("event"),
     {Delete:{TableName:table,Key:key("BASELINE#"+profile+"#TASK#"+task.id,"RECONCILE"),
       ConditionExpression:baseline ? "updatedAt = :at" : "attribute_not_exists(pk)",
