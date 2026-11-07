@@ -121,12 +121,12 @@ export function assessResidueRow(row, scope, indexedAuditKeys = new Set(), nowSe
     || hasExactKeyReference(row, scope);
   if (!exactCase && !providerMatch) return null;
 
-  const shared = [...refs.todoist].some(id => !scope.taskIds.includes(id))
+  // A matching ID in another profile is evidence of a potential shared reference,\n  // not attributable cleanup for this profile.\n  const pkParts = String(row.pk || "").split("#");\n  const keyedProfile = ["AUDIT", "AUDIT_REF", "DELETION_REVIEW", "CONFLICT_STATE", "REVIEW_CONFLICT"].includes(family)\n    ? pkParts[1] : undefined;\n  const rowProfile = row.profile || row.preview?.intent?.profile || keyedProfile;\n  const foreignProfile = Boolean(rowProfile && rowProfile !== scope.profile);\n  const shared = foreignProfile || [...refs.todoist].some(id => !scope.taskIds.includes(id))
     || [...refs.calendar].some(id => !scope.eventIds.includes(id));
   const ttl = typeof row.expiresAt === "number" && Number.isFinite(row.expiresAt)
     && row.expiresAt > 0 ? row.expiresAt : null;
   const expired = ttl !== null && ttl <= nowSeconds;
-  const directReceipt = family === "REVIEW_CASE" && hasExactKeyReference(row, scope)
+  const directReceipt = !foreignProfile && family === "REVIEW_CASE" && hasExactKeyReference(row, scope)
     && row.status === "resolved" && typeof row.result === "string"
     && row.result.startsWith("resolved_deleted");
   const active = family === "REPAIR"
