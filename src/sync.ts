@@ -1417,6 +1417,22 @@ export class Synchronizer {
       if (!mapping) return;
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) return this.state.audit(delivery.profile, "calendar_delete_suppressed", { eventId: event.id, mode: delivery.mode });
       if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
+      // #369: a cancelled legacy event must not delete an active annually
+      // recurring Todoist task while its source-driven replacement is being
+      // created (including late Calendar deltas read before the reset).
+      const pending = await this.state.getCancelledAnnualRecoveryReceipt?.(delivery.profile,mapping.taskId);
+      let currentTask: TodoistTask | undefined;
+      try {currentTask=await todoist.getTask(mapping.taskId);}
+      catch(error) {if(Number((error as {status?:number}).status)!==404)throw error;}
+      const newerAnnual = Boolean(currentTask && !currentTask.is_completed && !currentTask.is_deleted
+        && currentTask.due?.is_recurring && todoistRecurrenceToRrule(currentTask)==="RRULE:FREQ=YEARLY"
+        && currentTask.updated_at && mapping.updatedAt
+        && Date.parse(currentTask.updated_at)>Date.parse(mapping.updatedAt));
+      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual) {
+        return this.state.audit(delivery.profile,"calendar_cancelled_annual_todoist_protected",{
+          taskId:mapping.taskId,eventId:mapping.eventId,pendingReset:Boolean(pending),
+        });
+      }
       try {
         await todoist.deleteTask(mapping.taskId);
       } catch (error) {
