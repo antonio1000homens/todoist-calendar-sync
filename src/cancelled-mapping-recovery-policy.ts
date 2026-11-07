@@ -126,20 +126,16 @@ export function evaluateCancelledMappingRecovery(
   };
 }
 
-/** For new policy families we require authoritative cancellation timestamps
- * on every exact old Calendar identity. Missing timestamps fail closed.
- * The original proven yearly all-day #369 case is backward compatible. */
+/** Require an authoritative cancellation timestamp for every exact old
+ * Calendar ID. Without it a later deliberate deletion cannot be excluded. */
 export function validateCancelledProviderVersions(
   task: TodoistTask, policy: RecoveryPolicy, events: CalendarEvent[],
 ): {ok:true;version?:string} | {ok:false;reason:RecoveryDenial} {
   let latest: string | undefined;
   for (const event of events) {
     if (event.status !== "cancelled") return {ok:false,reason:"PROVIDER_GUARD_BLOCKED"};
-    if (!event.updated || !Number.isFinite(Date.parse(event.updated))) {
-      if (policy !== "yearly" || task.due?.datetime || !/^\d{4}-\d{2}-\d{2}$/.test(task.due?.date || ""))
-        return {ok:false,reason:"CANCELLED_PROVIDER_VERSION_UNVERIFIED"};
-      continue;
-    }
+    if (!event.updated || !Number.isFinite(Date.parse(event.updated)))
+      return {ok:false,reason:"CANCELLED_PROVIDER_VERSION_UNVERIFIED"};
     if (!task.updated_at || Date.parse(task.updated_at) <= Date.parse(event.updated))
       return {ok:false,reason:"CANCELLED_PROVIDER_NEWER"};
     if (!latest || Date.parse(event.updated) > Date.parse(latest)) latest = event.updated;
