@@ -121,7 +121,14 @@ export function assessResidueRow(row, scope, indexedAuditKeys = new Set(), nowSe
     || hasExactKeyReference(row, scope);
   if (!exactCase && !providerMatch) return null;
 
-  // A matching ID in another profile is evidence of a potential shared reference,\n  // not attributable cleanup for this profile.\n  const pkParts = String(row.pk || "").split("#");\n  const keyedProfile = ["AUDIT", "AUDIT_REF", "DELETION_REVIEW", "CONFLICT_STATE", "REVIEW_CONFLICT"].includes(family)\n    ? pkParts[1] : undefined;\n  const rowProfile = row.profile || row.preview?.intent?.profile || keyedProfile;\n  const foreignProfile = Boolean(rowProfile && rowProfile !== scope.profile);\n  const shared = foreignProfile || [...refs.todoist].some(id => !scope.taskIds.includes(id))
+  // A matching ID in another profile is evidence of a potential shared reference,
+  // not attributable cleanup for this profile.
+  const pkParts = String(row.pk || "").split("#");
+  const keyedProfile = ["AUDIT", "AUDIT_REF", "DELETION_REVIEW", "CONFLICT_STATE", "REVIEW_CONFLICT"].includes(family)
+    ? pkParts[1] : undefined;
+  const rowProfile = row.profile || row.preview?.intent?.profile || keyedProfile;
+  const foreignProfile = Boolean(rowProfile && rowProfile !== scope.profile);
+  const shared = foreignProfile || [...refs.todoist].some(id => !scope.taskIds.includes(id))
     || [...refs.calendar].some(id => !scope.eventIds.includes(id));
   const ttl = typeof row.expiresAt === "number" && Number.isFinite(row.expiresAt)
     && row.expiresAt > 0 ? row.expiresAt : null;
