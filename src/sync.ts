@@ -20,6 +20,7 @@ import {
 } from "./todoist-recurrence.js";
 import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import { attemptCancelledAnnualRecovery } from "./cancelled-annual-recovery.js";
+import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFingerprint } from "./cancelled-mapping-recovery-policy.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -1424,11 +1425,18 @@ export class Synchronizer {
       let currentTask: TodoistTask | undefined;
       try {currentTask=await todoist.getTask(mapping.taskId);}
       catch(error) {if(Number((error as {status?:number}).status)!==404)throw error;}
+      const recoveryLock = currentTask && await this.state.getCancelledAnnualRecoveryLock?.(delivery.profile,mapping.taskId);
+      const newerSourceWithProof = Boolean(recoveryLock && currentTask
+        && !currentTask.is_completed && !currentTask.is_deleted && !currentTask.completed_at
+        && recoveryPolicyForTask(currentTask) && currentTask.updated_at
+        && event.updated && Date.parse(currentTask.updated_at)>Date.parse(event.updated)
+        && profileForTodoistProject(currentTask.project_id)===delivery.profile);
+      // Preserve the previously validated annual backward-compatibility fence.
       const newerAnnual = Boolean(currentTask && !currentTask.is_completed && !currentTask.is_deleted
         && currentTask.due?.is_recurring && todoistRecurrenceToRrule(currentTask)==="RRULE:FREQ=YEARLY"
         && currentTask.updated_at && mapping.updatedAt
         && Date.parse(currentTask.updated_at)>Date.parse(mapping.updatedAt));
-      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual) {
+      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual || newerSourceWithProof) {
         return this.state.audit(delivery.profile,"calendar_cancelled_annual_todoist_protected",{
           taskId:mapping.taskId,eventId:mapping.eventId,pendingReset:Boolean(pending),
         });
@@ -1824,9 +1832,8 @@ export class Synchronizer {
     // This is one atomic state transaction; provider tasks/events are never
     // deleted. A blocked/unverified candidate keeps all existing safeguards.
     if (lifecycle.action==="upsert" && writeFence && existingMapping?.profile===delivery.profile
-      && !existingMapping.recurrenceOwner && task.due?.is_recurring
+      && !existingMapping.recurrenceOwner && recoveryPolicyForTask(task)
       && profileForTodoistProject(task.project_id)===delivery.profile
-      && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
       && await this.state.mutationAllowed(delivery.profile)
       && modeAllowsMutations(delivery,true)) {
       const operationId=await this.state.getCancelledAnnualRecoveryLock?.(delivery.profile,task.id);
@@ -1916,8 +1923,7 @@ export class Synchronizer {
     const pendingAnnualRecovery = lifecycle.action==="upsert"
       ? await this.state.getCancelledAnnualRecoveryReceipt?.(delivery.profile,task.id)
       : undefined;
-    if (pendingAnnualRecovery && (pendingAnnualRecovery.sourceDueDate!==task.due?.date
-      || !task.due?.is_recurring || todoistRecurrenceToRrule(task)!=="RRULE:FREQ=YEARLY")) {
+    if (pendingAnnualRecovery && !recoveryReceiptMatchesTask(pendingAnnualRecovery,task)) {
       return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_source_changed",{
         taskId:task.id,
       });
@@ -2407,10 +2413,16 @@ export class Synchronizer {
       // projection, or recovery of a POST that succeeded before mapping ACK.
       const aliases=await calendar.listLinkedEventsByTodoistTaskId(task.id);
       const active=aliases.filter(item=>item.status!=="cancelled");
+      const standalone = pendingAnnualRecovery.sourcePolicy==="standalone";
       if (active.length>1 || active.some(item=>item.status!=="confirmed"
         || item.extendedProperties?.shared?.syncSource!=="todoist-calendar-sync"
-        || item.extendedProperties?.shared?.syncRecurrenceOwner!=="todoist"
-        || !item.recurrence?.length || !hasCanonicalState(item,task!))) {
+        || item.extendedProperties?.shared?.taskId!==task.id
+        || (standalone
+          ? Boolean(item.recurrence?.length || item.recurringEventId
+            || item.extendedProperties?.shared?.syncRecurrenceOwner)
+          : item.extendedProperties?.shared?.syncRecurrenceOwner!=="todoist"
+            || !item.recurrence?.length)
+        || !hasCanonicalState(item,task!))) {
         return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_alias_conflict",{
           taskId:task.id,candidateCount:active.length,
         });
@@ -2570,9 +2582,11 @@ export class Synchronizer {
           ? mappedActive
           : selectTodoistCurrentInstance(instances, task);
       }
-      if (pendingAnnualRecovery && (!todoistRrule || !active
-        || !occurrenceStateMatches(active,task)
-        || !calendarRecurrenceMatchesTodoist(existingEvent,task))) {
+      if (pendingAnnualRecovery && (existingEvent.status!=="confirmed"
+        || (pendingAnnualRecovery.sourcePolicy==="standalone"
+          ? Boolean(existingEvent.recurrence?.length || existingEvent.recurringEventId || todoistRecurring)
+          : !todoistRrule || !active || !occurrenceStateMatches(active,task)
+            || !calendarRecurrenceMatchesTodoist(existingEvent,task)))) {
         return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_instance_unverified",{
           taskId:task.id,eventId:existingEvent.id,
         });
@@ -2605,6 +2619,18 @@ export class Synchronizer {
         taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
       });
     }
+    // Re-read the authoritative source immediately before the provider POST.
+    // A redelivered webhook must not project a superseded task revision.
+    if (pendingAnnualRecovery) {
+      const source = await todoist.getTask(task.id);
+      if (!source || source.is_completed || source.is_deleted || source.completed_at
+        || !recoveryReceiptMatchesTask(pendingAnnualRecovery,source)
+        || recoverySourceFingerprint(source)!==recoverySourceFingerprint(task)) {
+        return this.state.audit(delivery.profile,"todoist_cancelled_recovery_source_changed_prewrite",{
+          taskId:task.id,
+        });
+      }
+    }
     const event = toCalendarEvent(task, existingEvent, !recurringDateEdit);
     const stored = await calendar.upsertEvent(event, existingEvent?.id || mapping?.eventId);
     const todoistRecurring = Boolean(task.due?.is_recurring);
@@ -2619,9 +2645,11 @@ export class Synchronizer {
         ? mappedActive
         : selectTodoistCurrentInstance(instances, task);
     }
-    if (pendingAnnualRecovery && (stored.status!=="confirmed" || !todoistRrule || !active
-      || !occurrenceStateMatches(active,task)
-      || !calendarRecurrenceMatchesTodoist(stored,task))) {
+    if (pendingAnnualRecovery && (stored.status!=="confirmed"
+      || (pendingAnnualRecovery.sourcePolicy==="standalone"
+        ? Boolean(stored.recurrence?.length || stored.recurringEventId || todoistRecurring || !hasCanonicalState(stored,task))
+        : !todoistRrule || !active || !occurrenceStateMatches(active,task)
+          || !calendarRecurrenceMatchesTodoist(stored,task)))) {
       return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_instance_unverified",{
         taskId:task.id,eventId:stored.id,
       });
