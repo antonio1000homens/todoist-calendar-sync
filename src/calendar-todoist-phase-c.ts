@@ -77,11 +77,17 @@ function localOccurrence(value: {date?: string; dateTime?: string; timeZone?: st
   } catch { return undefined; }
 }
 function taskOccurrence(task: TodoistTask, semantic: RecurrenceSemantics) {
-  if (semantic.localTime && task.due?.timezone !== semantic.timeZone) return undefined;
-  return localOccurrence(task.due ? {
-    date: task.due.datetime ? undefined : task.due.date,
-    dateTime: task.due.datetime,
-    timeZone: task.due.timezone,
+  if (semantic.localTime && task.due?.timezone && task.due.timezone !== semantic.timeZone) return undefined;
+  const due = task.due;
+  // Todoist can persist floating local due.datetime when its project/account
+  // timezone was verified separately. Never feed this through Date.parse().
+  const floating = due?.datetime?.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/);
+  if (floating && semantic.timeZone)
+    return { date: floating[1], time: floating[2] + ":" + floating[3] };
+  return localOccurrence(due ? {
+    date: due.datetime ? undefined : due.date,
+    dateTime: due.datetime,
+    timeZone: due.timezone,
   } : undefined, semantic.timeZone);
 }
 function sameOccurrence(actual: { date: string; time?: string } | undefined,
@@ -157,6 +163,46 @@ export function calendarPhaseCCandidate(master: CalendarEvent, timeZone?: string
     disposition: "rolling_required", reason: "provider_readback_required", family,
     todoistPhrase, candidateRrule: parsed.canonicalRrule, semantic: s,
   };
+}
+
+/**
+ * Post-write provider readback for the *already independently validated* Phase C
+ * subset. Validates the provider-normalized recurrence, anchored due date, wall
+ * clock and timezone. This is a single-write guard, not completion provenance.
+ */
+export function matchesCalendarPhaseCTask(
+  task: TodoistTask, candidate: CalendarPhaseCCandidate, anchor: string, timeZone?: string,
+): boolean {
+  if (!candidate.semantic || candidate.reason !== "provider_readback_required"
+    || !normalizedTaskMatches(task, candidate, anchor, timeZone)) return false;
+  const dates = occurrenceDates(candidate.semantic, 2000);
+  const due = taskOccurrence(task, candidate.semantic);
+  return Boolean(due && dates.includes(due.date)
+    && due.time === candidate.semantic.localTime);
+}
+
+/** Every returned Google instance must agree with the anchored RRULE sequence.
+ * A complete *explicit exception inventory* is checked separately. */
+export function calendarPhaseCInstancesConform(
+  master: CalendarEvent, instances: CalendarEvent[],
+  candidate: CalendarPhaseCCandidate, timeZone?: string,
+): boolean {
+  if (!candidate.semantic || candidate.reason !== "provider_readback_required"
+    || instances.length < 3) return false;
+  const dates = new Set(occurrenceDates(candidate.semantic, 2000));
+  const ids = new Set<string>();
+  for (const item of instances) {
+    const original = localOccurrence(item.originalStartTime, timeZone);
+    const actual = localOccurrence(item.start, timeZone);
+    if (!item.id || ids.has(item.id) || item.recurringEventId !== master.id
+      || item.status !== "confirmed" || item.recurrence?.length
+      || !original || !actual || !dates.has(original.date)
+      || original.date !== actual.date || original.time !== actual.time
+      || original.time !== candidate.semantic.localTime)
+      return false;
+    ids.add(item.id);
+  }
+  return true;
 }
 
 /**
