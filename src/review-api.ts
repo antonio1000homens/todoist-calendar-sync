@@ -5,7 +5,8 @@ import { ReviewEngine } from "./review-engine.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { inspectRecurrenceRetirement } from "./recurrence-retirement-inspection.js";
 import { previewRecurrenceRetirement } from "./recurrence-retirement-preview.js";
-import { RetirementOperationService, RETIREMENT_APPROVAL_PHRASE } from "./recurrence-retirement-apply.js";
+import { RetirementOperationService, RETIREMENT_APPROVAL_PHRASE,
+  PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE } from "./recurrence-retirement-apply.js";
 import { RetirementUndoService, RETIREMENT_UNDO_PHRASE } from "./recurrence-retirement-undo.js";
 import { RetirementIncidentCleanupService } from "./recurrence-retirement-cleanup.js";
 import { deletedRecurrenceStatus } from "./deletion-review-state.js";
@@ -727,7 +728,9 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         !=="confirmationId,operationId,phrase,profile")
         fail(400,"Apply requires exact operation, profile, token and confirmation phrase");
       const selected=profile(typeof body?.profile==="string"?body.profile:null);
-      if(body!.phrase!==RETIREMENT_APPROVAL_PHRASE)fail(400,"Retirement requires typed KEEP PROVIDER ITEMS confirmation");
+      if(body!.phrase!==RETIREMENT_APPROVAL_PHRASE
+        &&body!.phrase!==PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE)
+        fail(400,"Retirement requires the typed confirmation phrase issued for this evidence mode");
       const service=dependencies.createRetirementOperationService?.()||new RetirementOperationService();
       const result=await service.apply(String(body!.operationId||""),
         String(body!.confirmationId||""),selected,actor.subject,String(body!.phrase));
