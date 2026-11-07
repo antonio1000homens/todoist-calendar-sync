@@ -162,8 +162,9 @@ export async function attemptCancelledAnnualRecovery(
   });
   const tx:Array<Record<string,unknown>>=[
     {ConditionCheck:{TableName:table,Key:key("CALENDAR_WRITE#"+task.id),
-      ConditionExpression:"token = :token AND leaseUntilMs > :now",
-      ExpressionAttributeValues:{":token":writeToken,":now":Date.now()}}},
+      ConditionExpression:"#leaseToken = :leaseToken AND leaseUntilMs > :now",
+      ExpressionAttributeNames:{"#leaseToken":"token"},
+      ExpressionAttributeValues:{":leaseToken":writeToken,":now":Date.now()}}},
     {ConditionCheck:{TableName:table,Key:key("REVIEW_CASE#"+reviewCase.id),
       ConditionExpression:"#s = :dismissed AND operationId = :op AND updatedAt = :at",
       ExpressionAttributeNames:{"#s":"status"},
