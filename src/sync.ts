@@ -19,6 +19,7 @@ import {
   todoistRecurrenceToRrule,
 } from "./todoist-recurrence.js";
 import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
+import { attemptCancelledAnnualRecovery } from "./cancelled-annual-recovery.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -1801,7 +1802,31 @@ export class Synchronizer {
       }
       task = current;
     }
-    const existingMapping = await this.state.getMappingByTaskAnyProfile(task.id);
+    let existingMapping = await this.state.getMappingByTaskAnyProfile(task.id);
+    // #369: only a fresh, already-annual Todoist update may propose retiring
+    // an unmodified failed validation-only repair and its cancelled mapping.
+    // This is one atomic state transaction; provider tasks/events are never
+    // deleted. A blocked/unverified candidate keeps all existing safeguards.
+    if (lifecycle.action==="upsert" && writeFence && existingMapping?.profile===delivery.profile
+      && !existingMapping.recurrenceOwner && task.due?.is_recurring
+      && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
+      && await this.state.mutationAllowed(delivery.profile)
+      && modeAllowsMutations(delivery,true)) {
+      const operationId=await this.state.getCancelledAnnualRecoveryLock?.(delivery.profile,task.id);
+      if (operationId) {
+        const providers=await this.clients(delivery.profile);
+        const recovered=await attemptCancelledAnnualRecovery({
+          profile:delivery.profile,task,mapping:existingMapping,operationId,writeToken:writeFence,
+          state:this.state,calendar:providers.calendar,todoist:providers.todoist,
+        });
+        if (recovered) {
+          await this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_reset",{
+            taskId:task.id,oldEventId:existingMapping.eventId,
+          });
+          existingMapping=undefined;
+        }
+      }
+    }
     const completedHistory = lifecycle.action !== "upsert" && !existingMapping
       ? await this.state.listCompletedCalendarProjectionsByTask?.(delivery.profile, task.id) || []
       : [];
@@ -1871,6 +1896,15 @@ export class Synchronizer {
 
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
+    const pendingAnnualRecovery = lifecycle.action==="upsert"
+      ? await this.state.getCancelledAnnualRecoveryReceipt?.(delivery.profile,task.id)
+      : undefined;
+    if (pendingAnnualRecovery && (pendingAnnualRecovery.sourceDueDate!==task.due?.date
+      || !task.due?.is_recurring || todoistRecurrenceToRrule(task)!=="RRULE:FREQ=YEARLY")) {
+      return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_source_changed",{
+        taskId:task.id,
+      });
+    }
     if (mapping && lifecycle.action === "upsert" && !mapping.recurrenceOwner) {
       const completed = await this.getCompletedProjection(delivery.profile, mapping.eventId);
       if (completed?.taskId === task.id) {
@@ -2350,7 +2384,26 @@ export class Synchronizer {
     }
 
     let cancelledCalendarLink = false;
-    if (!mapping) {
+    if (!mapping && pendingAnnualRecovery) {
+      // After a committed reset, old cancelled Calendar aliases deliberately
+      // remain with the provider. The durable receipt allows a brand-new
+      // projection, or recovery of a POST that succeeded before mapping ACK.
+      const aliases=await calendar.listLinkedEventsByTodoistTaskId(task.id);
+      const active=aliases.filter(item=>item.status!=="cancelled");
+      if (active.length>1 || active.some(item=>item.status!=="confirmed"
+        || item.extendedProperties?.shared?.syncSource!=="todoist-calendar-sync"
+        || item.extendedProperties?.shared?.syncRecurrenceOwner!=="todoist"
+        || !item.recurrence?.length || !hasCanonicalState(item,task))) {
+        return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_alias_conflict",{
+          taskId:task.id,candidateCount:active.length,
+        });
+      }
+      if (active.length===1) {
+        mapping={profile:delivery.profile,eventId:active[0].id,taskId:task.id,
+          updatedAt:new Date().toISOString()};
+      }
+    }
+    if (!mapping && !pendingAnnualRecovery) {
       const linkedEvent = await calendar.findByTodoistTaskId(task.id);
       const retainedLinkedEvent = linkedEvent
         ? await this.getCompletedProjection(delivery.profile, linkedEvent.id)
@@ -2422,7 +2475,7 @@ export class Synchronizer {
         mapping = undefined;
       }
     }
-    if (!existingEvent && !cancelledCalendarLink) {
+    if (!existingEvent && !cancelledCalendarLink && !pendingAnnualRecovery) {
       const linkedEvent = await calendar.findByTodoistTaskId(task.id);
       if (linkedEvent?.status === "cancelled") {
         if (!readdingDue) {
@@ -2522,6 +2575,7 @@ export class Synchronizer {
       await this.state.putMapping(nextMapping);
       if (todoistRecurring && !preservedCalendarMapping) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
       else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
+      if (pendingAnnualRecovery) await this.state.completeCancelledAnnualRecovery?.(delivery.profile,task.id,existingEvent.id);
       // Only the verified uncompletion path can withdraw completion markers.
       return this.state.audit(delivery.profile, "todoist_noop_canonical_state", {
         taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
@@ -2562,6 +2616,7 @@ export class Synchronizer {
     await this.state.putMapping(nextMapping);
     if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
     else if (previousSeriesId) await this.state.deleteRecurrenceLink(delivery.profile, previousSeriesId);
+    if (pendingAnnualRecovery) await this.state.completeCancelledAnnualRecovery?.(delivery.profile,task.id,stored.id);
     // Ordinary updates must never clear a completion guard, even on retries.
     if (projectionTombstone) await this.state.deleteCalendarProjectionTombstone(delivery.profile, task.id);
     await this.state.recordRecurrence(delivery.profile, stored.id, stored.recurrence);
