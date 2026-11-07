@@ -476,6 +476,22 @@ export class SnapshotReconciler {
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
     if (!event || event.status === "cancelled") {
+      // #369: a newer, still-live annual Todoist source must never be
+      // destroyed by the cancelled Calendar projection's stale baseline.
+      // The guarded reset may have already retired the old mapping in a
+      // transaction while this reconciliation held an older snapshot.
+      const pending = await this.state.getCancelledAnnualRecoveryReceipt?.(profile,mapping.taskId);
+      const newerAnnual = Boolean(task && !task.is_deleted && !task.is_completed
+        && task.due?.is_recurring && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
+        && task.updated_at && mapping.updatedAt
+        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt));
+      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual) {
+        await this.state.audit(profile,"calendar_cancelled_annual_todoist_protected",{
+          taskId:mapping.taskId,eventId:mapping.eventId,
+          pendingReset:Boolean(pending),
+        });
+        return "blocked";
+      }
       if (task) {
         await clients.todoist.deleteTask(task.id).catch((error: unknown) => {
           if (Number((error as { status?: number }).status) !== 404) throw error;
@@ -883,6 +899,34 @@ export class SnapshotReconciler {
       return "blocked";
     }
 
+    // #369: a reset that committed before its Todoist webhook/provider POST
+    // finished must remain retryable. Reconciliation drives the normal
+    // source-upsert path from the exact current Todoist task; it must not
+    // interpret preserved cancelled provider aliases as a new conflict.
+    const pendingAnnual = await this.state.getCancelledAnnualRecoveryReceipt?.(profile,task.id);
+    if (pendingAnnual) {
+      if (task.is_deleted || task.is_completed || task.due?.date!==pendingAnnual.sourceDueDate
+        || !task.due?.is_recurring || todoistRecurrenceToRrule(task)!=="RRULE:FREQ=YEARLY") {
+        await this.state.audit(profile,"todoist_snapshot_annual_reset_source_changed",{
+          taskId:task.id,
+        });
+        return "blocked";
+      }
+      await this.repair(this.reconcileDelivery(profile,task,"reconcile-unmapped","projection-create"));
+      const next=await this.state.getMappingByTask(profile,task.id);
+      if (!next || next.recurrenceOwner!=="todoist" || !next.masterEventId
+        || next.masterEventId!==next.eventId) {
+        await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
+        return "blocked";
+      }
+      const event=await this.currentEvent(clients.calendar,next.eventId);
+      if (!event || event.status!=="confirmed" || !calendarRecurrenceMatchesTodoist(event,task)) {
+        await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
+        return "blocked";
+      }
+      await this.store.putBaseline(profile,task.id,task,event);
+      return "created";
+    }
     const baseline = await this.store.getBaseline(profile, task.id);
     const tombstone = await this.state.getCalendarProjectionTombstone(profile, task.id);
     let existing: CalendarEvent | undefined;

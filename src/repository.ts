@@ -715,6 +715,65 @@ export class StateRepository {
     return result.Item as Mapping | undefined;
   }
 
+  /** #369: a failed repair's exact task lock is only a recovery candidate,
+   * never sufficient permission to reset mappings or erase provider history. */
+  async getCancelledAnnualRecoveryLock(profile: Profile, taskId: string): Promise<string | undefined> {
+    const item=await client.send(new GetCommand({
+      TableName:this.ensureTable(),Key:key(`SYNC_CONTROL#${profile}:todoist:${taskId}`),ConsistentRead:true,
+    }));
+    return typeof item.Item?.activeRepair==="string" ? item.Item.activeRepair : undefined;
+  }
+
+  async getCancelledAnnualRecoveryReceipt(profile: Profile, taskId: string): Promise<{
+    profile:Profile; taskId:string; oldEventId:string; operationId:string; sourceUpdatedAt:string;
+    sourceDueDate:string; status:"pending"; createdAt:string;
+  } | undefined> {
+    const item=await client.send(new GetCommand({
+      TableName:this.ensureTable(),Key:key(`ANNUAL_RECOVERY#${profile}#${taskId}`),ConsistentRead:true,
+    }));
+    const row=item.Item;
+    if(!row)return undefined;
+    if(row.profile!==profile || row.taskId!==taskId || row.status!=="pending"
+      || typeof row.oldEventId!=="string" || typeof row.sourceUpdatedAt!=="string"
+      || typeof row.sourceDueDate!=="string" || typeof row.operationId!=="string")
+      throw new Error("Annual Calendar recovery receipt is inconsistent; manual review required");
+    return row as {profile:Profile;taskId:string;oldEventId:string;operationId:string;sourceUpdatedAt:string;sourceDueDate:string;status:"pending";createdAt:string};
+  }
+
+  /** Only clear a pending reset after the new series, its three index views
+   * and Todoist-owned recurrence link were durably written. */
+  async completeCancelledAnnualRecovery(profile:Profile,taskId:string,newEventId:string):Promise<boolean> {
+    const receipt=await this.getCancelledAnnualRecoveryReceipt(profile,taskId);
+    if(!receipt)return false;
+    if(!newEventId || newEventId===receipt.oldEventId)throw new Error("Cannot complete annual reset against its cancelled Calendar event");
+    const mapping=await this.getMappingByTask(profile,taskId);
+    if(!mapping || mapping.eventId!==newEventId || mapping.recurrenceOwner!=="todoist"
+      || mapping.seriesId!==taskId || mapping.masterEventId!==newEventId) return false;
+    const table=this.ensureTable();
+    const mapCheck=(pk:string,sk:string)=>({ConditionCheck:{
+      TableName:table,Key:key(pk,sk),
+      ConditionExpression:"profile = :profile AND taskId = :task AND eventId = :event AND recurrenceOwner = :owner AND seriesId = :series",
+      ExpressionAttributeValues:{":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist",":series":taskId},
+    }});
+    try {
+      await client.send(new TransactWriteCommand({TransactItems:[
+        mapCheck(`TASK#${profile}#${taskId}`,"MAP"),
+        mapCheck(`TASKOWNER#${taskId}`,"MAP"),
+        mapCheck(`EVENT#${profile}#${newEventId}`,"MAP"),
+        {ConditionCheck:{TableName:table,Key:key(`RECURRENCE#${profile}#${taskId}`),
+          ConditionExpression:"profile = :profile AND taskId = :task AND masterEventId = :event AND #owner = :owner",
+          ExpressionAttributeNames:{"#owner":"owner"},
+          ExpressionAttributeValues:{":profile":profile,":task":taskId,":event":newEventId,":owner":"todoist"}}},
+        {Delete:{TableName:table,Key:key(`ANNUAL_RECOVERY#${profile}#${taskId}`),
+          ConditionExpression:"profile = :profile AND taskId = :task AND oldEventId = :old AND sourceUpdatedAt = :version AND #status = :pending",
+          ExpressionAttributeNames:{"#status":"status"},
+          ExpressionAttributeValues:{":profile":profile,":task":taskId,":old":receipt.oldEventId,
+            ":version":receipt.sourceUpdatedAt,":pending":"pending"}}},
+      ]}));
+      return true;
+    }catch(e){if((e as {name?:string}).name==="TransactionCanceledException")return false;throw e;}
+  }
+
   async getMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
     const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASK#${profile}#${taskId}`, "MAP"), ConsistentRead: true }));
     return result.Item as Mapping | undefined;
