@@ -1,5 +1,5 @@
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
-import { classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
+import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
 import type { CalendarEvent, Profile, RecurrenceLink } from "./types.js";
 import type { ReviewCase, ReviewSnapshot } from "./review-types.js";
 
@@ -22,15 +22,24 @@ export async function deletedRecurrenceStatus(
   getLink: (profile: Profile, seriesId: string) => Promise<RecurrenceLink | undefined>,
 ): Promise<DeletedRecurrenceStatus | undefined> {
   if (!item.decision?.type?.includes("recurrence_task_deleted")) return undefined;
-  const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
-  const masterId = item.decision.masterEventId || item.decision.mappingSnapshot?.masterEventId;
-  const activeInstanceId = item.decision.activeInstanceId || item.decision.mappingSnapshot?.activeInstanceId;
-  const common = { taskIds, eventIds, masterId, activeInstanceId, staleLinks: [] };
-  if (!masterId || !activeInstanceId || !taskIds.length || !eventIds.includes(masterId)
-    || !eventIds.includes(activeInstanceId) || taskIds.length + eventIds.length > 20)
-    return { ...common, state: "unverified", bothGone: false, reason: "The recorded master, active occurrence or task identity is incomplete" };
+  const { taskIds, eventIds: recordedEventIds } = reviewCaseEvidenceIds(item);
   const find = (side: "todoist" | "calendar", id: string) =>
     snapshots.find(s => s.ref.profile === item.profile && s.ref.side === side && s.ref.id === id);
+  const activeInstanceId = item.decision.activeInstanceId || item.decision.mappingSnapshot?.activeInstanceId;
+  const recordedMasterId = item.decision.masterEventId || item.decision.mappingSnapshot?.masterEventId;
+  // The UI independently reads the active cancelled instance; never infer the
+  // master by stripping an occurrence ID suffix or from a historical title.
+  const legacyMaster = !recordedMasterId;
+  const activeSnapshot = activeInstanceId ? find("calendar",activeInstanceId) : undefined;
+  const recoveredMaster = !activeSnapshot?.lookupError
+    ? cancelledOccurrenceMasterId(activeInstanceId,activeSnapshot?.object || undefined as CalendarEvent | undefined)
+    : undefined;
+  const masterId = recordedMasterId || recoveredMaster;
+  const eventIds = [...new Set([...recordedEventIds,...(masterId?[masterId]:[])])];
+  const common = { taskIds, eventIds, masterId, activeInstanceId, staleLinks: [] };
+  if (!masterId || !activeInstanceId || !taskIds.length || !eventIds.includes(activeInstanceId)
+    || taskIds.length + eventIds.length > 20)
+    return { ...common, state: "unverified", bothGone: false, reason: "The master, active occurrence or task identity cannot be directly verified" };
   const statuses = [...taskIds.map(id => {
     const snapshot = find("todoist", id);
     if (!snapshot || snapshot.lookupError || snapshot.object?.id !== undefined && snapshot.object.id !== id)
@@ -75,7 +84,11 @@ export async function deletedRecurrenceStatus(
       reason: "Unable to strongly verify all profile and Calendar-series recurrence keys" };
   }
   const classification = classifyDeletedRecurrenceLinks(item.profile, taskIds, eventIds, links, keys,
-    { masterId, activeInstanceId });
+    { masterId, activeInstanceId,
+      ...(legacyMaster ? {legacyMasterVerified:
+        cancelledOccurrenceMasterId(activeInstanceId,calendarObjects.get(activeInstanceId))===masterId
+        && series.valid} : {}),
+    });
   if (classification.blocked.length)
     return { ...common, state: "mapping_blocked", bothGone: false,
       reason: classification.blocked.slice(0, 3).join("; ") };
