@@ -132,3 +132,96 @@ test("a verified Calendar iCalUID key is fenced on all profiles in the terminal 
     assert.ok(checks.some(c=>c.Key.pk===`RECURRENCE#${profile}#${uid}`&&c.Key.sk==="STATE"));
   assert.ok(!f.getTransaction().some(x=>x.Delete?.Key.pk?.startsWith("COMPLETED_")));
 });
+
+test("#292 legacy Work/antonio deleted recurrence closes a dismissed case with a masterless stale link",async()=>{
+  const profile="antonio";
+  const taskId="6hqp4fFR45WvJ5VV",masterId="agejr3i89v5p13lfl95uss11o8";
+  const activeInstanceId=masterId+"_20261116", completedInstanceId=masterId+"_20261102";
+  const masterSeriesId=masterId+"@google.com";
+  const caseId="antonio-todoist_owned_recurrence_task_deleted-1227dad2ad8dd7071bdb";
+  const recurrence={profile,owner:"todoist",seriesId:taskId,taskId,
+    eventId:activeInstanceId,activeInstanceId,
+    updatedAt:"2026-10-25T19:09:07.680Z"}; // legacy: no masterEventId
+  const item={id:caseId,profile,status:"dismissed",taskId,eventId:activeInstanceId,
+    title:"Legacy recurrence",reason:"todoist_owned_recurrence_task_deleted",
+    createdAt:"2026-10-25T19:10:24.379Z",updatedAt:"2026-11-06T16:32:14.015Z",
+    decision:{type:"todoist_owned_recurrence_task_deleted",taskId,eventId:activeInstanceId,
+      activeInstanceId,seriesId:taskId,status:"pending",
+      mappingSnapshot:{...recurrence,recurrenceOwner:"todoist"}}};
+  const manual={status:"resolved",profile,decisionId:caseId,createdAt:item.createdAt};
+  const master={id:masterId,status:"cancelled",iCalUID:masterSeriesId,
+    recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]};
+  const occurrence={id:activeInstanceId,status:"cancelled",recurringEventId:masterId,
+    iCalUID:masterSeriesId};
+  const expected={profile,taskIds:[taskId],eventIds:[activeInstanceId,masterId],
+    masterId,activeInstanceId,masterSeriesId,
+    legacyMasterProof:{master,occurrence},
+    seriesKeys:[taskId,activeInstanceId,masterId,masterSeriesId],
+    staleLinks:[recurrence]};
+  let transaction;
+  const store=new ReviewStore({send:async command=>{
+    if(command instanceof GetCommand){
+      if(command.input.Key.pk==="REVIEW_CASE#"+caseId)return {Item:item};
+      if(command.input.Key.pk==="MANUAL#"+caseId)return {Item:manual};
+      return {};
+    }
+    if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof TransactWriteCommand){transaction=command.input.TransactItems;return {};}
+    throw Error("unexpected read-only fixture operation");
+  }});
+  assert.equal(await store.resolveVerifiedDeletedCase(caseId,expected),true);
+  const linkDelete=transaction.find(entry=>entry.Delete?.Key.pk==="RECURRENCE#"+profile+"#"+taskId)?.Delete;
+  assert.ok(linkDelete,"legacy masterless link must be retired in same transaction");
+  assert.match(linkDelete.ConditionExpression,/attribute_not_exists\(masterEventId\)/);
+  assert.match(linkDelete.ConditionExpression,/updatedAt = :updated/);
+  assert.equal(linkDelete.ExpressionAttributeValues[":updated"],recurrence.updatedAt);
+  assert.ok(transaction.some(entry=>entry.Update?.Key.pk==="REVIEW_CASE#"+caseId));
+  assert.ok(transaction.some(entry=>entry.Update?.Key.pk==="MANUAL#"+caseId));
+  assert.ok(!transaction.some(entry=>entry.Delete?.Key.pk?.startsWith("COMPLETED_")));
+  for(const key of ["RECURRENCE#work#"+masterSeriesId,
+    "RECURRENCE#home#"+masterSeriesId,
+    "TASKOWNER#"+taskId,"EVENT#"+profile+"#"+masterId])
+    assert.ok(transaction.some(entry=>entry.ConditionCheck?.Key.pk===key),key);
+  // Historical completed occurrence is neither a retirement candidate nor
+  // a live ownership guard; it must survive independently of the stale link.
+  assert.ok(!transaction.some(entry=>
+    (entry.Delete||entry.ConditionCheck)?.Key.pk==="COMPLETED_EVENT#"+profile+"#"+completedInstanceId));
+  assert.ok(!transaction.some(entry=>
+    (entry.Delete||entry.ConditionCheck)?.Key.pk==="COMPLETED_TASK#"+profile+"#"+taskId));
+});
+
+test("#292 masterless stale link cannot retire without independent cancelled master and occurrence proof",async()=>{
+  const profile="antonio",taskId="6hqp4fFR45WvJ5VV",masterId="agejr3i89v5p13lfl95uss11o8";
+  const active=masterId+"_20261116",caseId="legacy-no-proof",uid=masterId+"@google.com";
+  const caseItem={id:caseId,profile,status:"open",taskId,eventId:active,
+    title:"Legacy case",reason:"todoist_owned_recurrence_task_deleted",
+    createdAt:"2026-10-25T19:10:24Z",updatedAt:"2026-10-25T19:10:25Z",
+    decision:{type:"todoist_owned_recurrence_task_deleted",taskId,eventId:active,
+      activeInstanceId:active,seriesId:taskId,mappingSnapshot:{
+        taskId,eventId:active,activeInstanceId:active,seriesId:taskId,profile}}};
+  let writes=0;
+  const store=new ReviewStore({send:async command=>{
+    if(command instanceof GetCommand)return {Item:command.input.Key.pk==="REVIEW_CASE#"+caseId?caseItem:undefined};
+    if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof TransactWriteCommand){writes++;return {};}
+    throw Error("Unexpected operation");
+  }});
+  const master={id:masterId,status:"cancelled",iCalUID:uid,
+    recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]};
+  const occurrence={id:active,status:"cancelled",recurringEventId:masterId,iCalUID:uid};
+  const base={profile,taskIds:[taskId],eventIds:[active,masterId],
+    masterId,activeInstanceId:active,masterSeriesId:uid,
+    seriesKeys:[taskId,active,masterId,uid]};
+  for(const bad of [
+    {...base},
+    {...base,legacyMasterProof:{master:{...master,status:"confirmed"},occurrence}},
+    {...base,legacyMasterProof:{master,occurrence:{...occurrence,status:"confirmed"}}},
+    {...base,legacyMasterProof:{master,occurrence:{...occurrence,recurringEventId:"foreign"}}},
+    {...base,legacyMasterProof:{master:{...master,iCalUID:"foreign-uid"},occurrence}},
+    {...base,legacyMasterProof:{master,occurrence:{...occurrence,iCalUID:"foreign-uid"}}},
+    {...base,legacyMasterProof:{master,occurrence},staleLinks:[{
+      profile:"work",owner:"todoist",seriesId:taskId,taskId,eventId:active,
+      activeInstanceId:active,updatedAt:"2026-10-25T19:09:07Z"}]},
+  ]) assert.equal(await store.resolveVerifiedDeletedCase(caseId,bad),false);
+  assert.equal(writes,0,"no transaction may be sent for missing or conflicting positive provider proof");
+});
