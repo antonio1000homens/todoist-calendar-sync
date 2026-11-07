@@ -92,7 +92,8 @@ function harness(overrides={}){
     async listExplicitSeriesExceptions(){return overrides.exceptions??[];},
   };
   const todoist={async getTask(){return overrides.current??task;}};
-  return {rows,transactions,db,review,state,calendar,todoist};
+  return {rows,transactions,db,review,state,calendar,todoist,
+    crossProfileAliases:overrides.crossProfileAliases};
 }
 async function run(h,source=task){
   const prev=process.env.STATE_TABLE_NAME;
@@ -100,7 +101,8 @@ async function run(h,source=task){
   try {
     return await attemptCancelledAnnualRecovery({profile,task:source,mapping,
       operationId:operation.id,writeToken:"writer-token",state:h.state,
-      calendar:h.calendar,todoist:h.todoist},
+      calendar:h.calendar,todoist:h.todoist,
+      calendarForProfile:async()=>({listLinkedEventsByTodoistTaskId:async()=>h.crossProfileAliases??[]})},
       {db:h.db,review:h.review,now:()=>new Date(now)});
   }finally{
     if(prev===undefined)delete process.env.STATE_TABLE_NAME;
@@ -353,4 +355,15 @@ test("old master exceptions, other-profile mappings and concurrent repairs conti
       originalStartTime:{date:"2028-08-16"}}]});
   assert.equal(await run(exceptions,source),false);
   for(const h of [crossed,writes,exceptions])assert.equal(h.transactions.length,0);
+});
+
+test("cross-profile cancelled or confirmed task-linked aliases block all new policies",async()=>{
+  const source={...task,due:{date:"2027-08-17",is_recurring:false,string:"2027-08-17"}};
+  for(const status of ["cancelled","confirmed"]){
+    const h=harness({current:source,crossProfileAliases:[{
+      id:"foreign-alias",status,extendedProperties:{shared:{taskId:task.id}},
+    }]});
+    assert.equal(await run(h,source),false,status);
+    assert.equal(h.transactions.length,0);
+  }
 });
