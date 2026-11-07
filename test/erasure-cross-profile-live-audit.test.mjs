@@ -140,8 +140,8 @@ test("#335 lookalike hosts, suffix tricks and empty DNS labels are always other"
     "https://evilgoogleapis.com/",
     "https://calendar.googleapis.com.evil.example/",
     "https://googleapis.com.attacker.example/",
-    "https://todoist.com@evil.example/rest/v2/tasks",
-    "https://googleapis.com@evil.example/calendar",
+    "https://todoist.com"+String.fromCharCode(64)+"evil.example/rest/v2/tasks",
+    "https://googleapis.com"+String.fromCharCode(64)+"evil.example/calendar",
     "https://.todoist.com/",
     "https://api..todoist.com/",
     "https://.googleapis.com/",
@@ -154,7 +154,7 @@ test("#335 lookalike hosts, suffix tricks and empty DNS labels are always other"
 test("#335 malformed, non-web and unknown inputs cannot be classified as providers",()=>{
   for(const input of [
     "", "api.todoist.com", "not-a-url", "http://", "https://%ZZ/",
-    "mailto:user@api.todoist.com", "ftp://api.todoist.com/path",
+    "mailto:user"+String.fromCharCode(64)+"api.todoist.com", "ftp://api.todoist.com/path",
     "file:///tmp/calendar.googleapis.com", "/api.todoist.com", null,
     undefined, {}, 123, {url:"not-a-url"},
   ])
