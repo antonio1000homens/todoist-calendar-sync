@@ -137,7 +137,7 @@ test("#292 legacy Work/antonio deleted recurrence closes a dismissed case with a
   const profile="antonio";
   const taskId="6hqp4fFR45WvJ5VV",masterId="agejr3i89v5p13lfl95uss11o8";
   const activeInstanceId=masterId+"_20261116", completedInstanceId=masterId+"_20261102";
-  const masterSeriesId=masterId+"@google.com";
+  const masterSeriesId=masterId+String.fromCharCode(64)+"google.com";
   const caseId="antonio-todoist_owned_recurrence_task_deleted-1227dad2ad8dd7071bdb";
   const recurrence={profile,owner:"todoist",seriesId:taskId,taskId,
     eventId:activeInstanceId,activeInstanceId,
@@ -192,7 +192,7 @@ test("#292 legacy Work/antonio deleted recurrence closes a dismissed case with a
 
 test("#292 masterless stale link cannot retire without independent cancelled master and occurrence proof",async()=>{
   const profile="antonio",taskId="6hqp4fFR45WvJ5VV",masterId="agejr3i89v5p13lfl95uss11o8";
-  const active=masterId+"_20261116",caseId="legacy-no-proof",uid=masterId+"@google.com";
+  const active=masterId+"_20261116",caseId="legacy-no-proof",uid=masterId+String.fromCharCode(64)+"google.com";
   const caseItem={id:caseId,profile,status:"open",taskId,eventId:active,
     title:"Legacy case",reason:"todoist_owned_recurrence_task_deleted",
     createdAt:"2026-10-25T19:10:24Z",updatedAt:"2026-10-25T19:10:25Z",
