@@ -2429,7 +2429,7 @@ export class Synchronizer {
       const standalone = pendingAnnualRecovery.sourcePolicy==="standalone";
       if (active.length>1 || active.some(item=>item.status!=="confirmed"
         || item.extendedProperties?.shared?.syncSource!=="todoist-calendar-sync"
-        || item.extendedProperties?.shared?.taskId!==task.id
+        || item.extendedProperties?.shared?.taskId!==task!.id
         || (standalone
           ? Boolean(item.recurrence?.length || item.recurringEventId
             || item.extendedProperties?.shared?.syncRecurrenceOwner)
