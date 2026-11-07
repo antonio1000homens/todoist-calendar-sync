@@ -98,6 +98,8 @@ export function assessRepairRetention(rows, {profile="all", nowMs=Date.now()}={}
       totals.pendingNotification++;
       reasons.add("pending_notification");
     }
+    if (!Array.isArray(op.preview?.snapshots) || !op.steps || typeof op.steps !== "object"
+      || Array.isArray(op.steps)) reasons.add("malformed_operation_evidence");
     let evidence = false;
     try { evidence = operationHasWriteEvidence(op); }
     catch { reasons.add("malformed_operation_evidence"); }
