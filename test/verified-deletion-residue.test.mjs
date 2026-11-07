@@ -128,3 +128,20 @@ test("partial audit reverse-pointer enumeration fails closed",async()=>{
     table:"table",client,cursorStore:cursorStore(),delay:async()=>{}}),/pagination incomplete/);
   assert.equal(commands.some(c=>c instanceof ScanCommand),false);
 });
+
+test("same provider ID in a foreign profile remains protected", () => {
+  const row = {pk:"AUDIT#work#conflict",sk:"STATE",detail:{taskId:"task-one"},
+    expiresAt:now+200};
+  assert.equal(assessResidueRow(row,scope,new Set(),now).classification,"shared_or_active");
+});
+
+test("--restart discards mismatched private cursor scope without scanning a foreign checkpoint",async()=>{
+  const {client,commands}=fixtureClient({pages:[{Items:[],ScannedCount:0}]});
+  const store=cursorStore();
+  await store.save({digest:"another-case",cursor:{pk:"old",sk:"STATE"},report:emptyResidueReport()});
+  const opts={...scope,maxPages:1,maxRefPages:1,restart:true};
+  const report=await inventory({options:opts,table:"table",client,cursorStore:store,delay:async()=>{}});
+  assert.equal(report.scanComplete,true);
+  assert.equal(store.stored,null);
+  assert.ok(commands.some(x=>x instanceof ScanCommand));
+});
