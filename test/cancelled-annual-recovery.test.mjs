@@ -17,8 +17,8 @@ const refs=[
 ];
 const oldCalendar={id:"event-historical",status:"confirmed",start:{date:"2027-08-16"},
   end:{date:"2027-08-17"},extendedProperties:{shared:{taskId:task.id}}};
-const deletedCalendar=(id)=>({id,status:"cancelled",start:{date:"2027-08-16"},
-  end:{date:"2027-08-17"}});
+const deletedCalendar=(id)=>({id,status:"cancelled",updated:"2026-11-05T12:00:00Z",
+  start:{date:"2027-08-16"},end:{date:"2027-08-17"}});
 const reviewCase={id:"case-annual",profile,status:"dismissed",operationId:"repair-annual",updatedAt:"2026-11-01T15:00:00Z"};
 const operation={
   id:"repair-annual",status:"failed",attempt:2,updatedAt:"2026-10-26T11:00:00Z",
