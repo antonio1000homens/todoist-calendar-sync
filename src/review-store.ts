@@ -566,6 +566,79 @@ export class ReviewStore {
         }
       }
     }
+    // Older conflicts may have generated several review incidents before a
+    // deterministic manual decision became the keeper. Retiring only the
+    // keeper leaves closed incident pointers and audit rows in the review
+    // history, and retained state can seed those stale incidents again.
+    // Clean ONLY closed children that explicitly point to this exact keeper,
+    // with their own fully attributable audit. Never follow a conflict
+    // fingerprint into another active or unrelated case.
+    if (current.conflictKey) {
+      const conflictPk=`REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`;
+      const page=await this.db.send(new QueryCommand({
+        TableName:reviewTable(),ConsistentRead:true,Limit:20,
+        KeyConditionExpression:"pk = :pk AND begins_with(sk, :prefix)",
+        ExpressionAttributeValues:{":pk":conflictPk,":prefix":"INCIDENT#"},
+      }));
+      if(page.LastEvaluatedKey)return false; // never perform a partial cleanup
+      const visited=new Set<string>();
+      const auditDeletes=new Set(items.filter(op=>op.Delete).map(op=>op.Delete?.Key?.pk));
+      for(const entry of page.Items || []){
+        const pointer=entry as {pk?:string;sk?:string;incidentId?:string;profile?:string;conflictKey?:string};
+        const id=pointer.incidentId;
+        if(!id||!id.startsWith("incident-")||visited.has(id)
+          ||pointer.pk!==conflictPk||pointer.sk!==`INCIDENT#${id}`
+          ||pointer.profile!==expected.profile||pointer.conflictKey!==current.conflictKey)
+          return false; // an inconsistent pointer must not be orphaned
+        visited.add(id);
+        if(id===caseId)continue; // the original case pointer is handled above
+        const child=await this.getCase(id);
+        if(!child||child.profile!==expected.profile||child.status!=="dismissed"
+          ||child.coalescedInto!==caseId||child.operationId
+          ||child.conflictKey!==current.conflictKey
+          ||!child.sourceAuditKey?.startsWith(`AUDIT#${expected.profile}#`)
+          ||await this.get<ManualDecision>(`MANUAL#${id}`))continue;
+        const childIds=reviewCaseEvidenceIds(child);
+        if(childIds.taskIds.length+childIds.eventIds.length===0
+          ||childIds.taskIds.some(id=>!expected.taskIds.includes(id))
+          ||childIds.eventIds.some(id=>!expected.eventIds.includes(id)))continue;
+        const audit=await this.get<Record<string,unknown>>(child.sourceAuditKey);
+        const auditDetail=audit?.detail&&typeof audit.detail==="object"
+          ?audit.detail as Record<string,unknown>:undefined;
+        const auditIds=auditDetail?retainedAuditProviderIds(auditDetail):undefined;
+        if(!audit||typeof audit.action!=="string"||typeof audit.createdAt!=="string"
+          ||/(?:operational|dlq)/.test(audit.action)||!auditIds
+          ||auditIds.taskIds.length+auditIds.eventIds.length===0
+          ||auditIds.taskIds.some(id=>!expected.taskIds.includes(id))
+          ||auditIds.eventIds.some(id=>!expected.eventIds.includes(id)))continue;
+        // Conditional child receipt, pointer and audit deletion are part of the
+        // SAME DynamoDB transaction as the keeper and stale recurrence link.
+        // A concurrent reopen, ownership change or case coalescing cancels all.
+        items.push({Update:{TableName:reviewTable(),Key:key(`REVIEW_CASE#${id}`),
+          UpdateExpression:"SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now, expiresAt = :expiry REMOVE sourceAuditKey, lookupPk, lookupSk, conflictKey, coalescedInto, taskId, eventId, decision, reconciliationGeneration, progressCheckpoint",
+          ConditionExpression:"#status = :dismissed AND updatedAt = :version AND coalescedInto = :keeper AND sourceAuditKey = :audit AND conflictKey = :conflict AND attribute_not_exists(operationId)",
+          ExpressionAttributeNames:{"#status":"status","#result":"result","#title":"title","#reason":"reason"},
+          ExpressionAttributeValues:{":resolved":"resolved",":result":resolution,":title":"Verified deletion",
+            ":reason":"verified_deletion",":dismissed":"dismissed",":version":child.updatedAt,
+            ":keeper":caseId,":audit":child.sourceAuditKey,":conflict":current.conflictKey,
+            ":now":now,":expiry":Math.floor(Date.now()/1000)+30*86400},
+        }});
+        items.push({Delete:{TableName:reviewTable(),
+          Key:{pk:conflictPk,sk:`INCIDENT#${id}`},
+          ConditionExpression:"incidentId = :id AND #profile = :profile AND conflictKey = :conflict",
+          ExpressionAttributeNames:{"#profile":"profile"},
+          ExpressionAttributeValues:{":id":id,":profile":expected.profile,":conflict":current.conflictKey},
+        }});
+        if(!auditDeletes.has(child.sourceAuditKey)){
+          items.push({Delete:{TableName:reviewTable(),Key:key(child.sourceAuditKey),
+            ConditionExpression:"createdAt = :created AND #action = :action",
+            ExpressionAttributeNames:{"#action":"action"},
+            ExpressionAttributeValues:{":created":audit.createdAt,":action":audit.action},
+          }});
+          auditDeletes.add(child.sourceAuditKey);
+        }
+      }
+    }
     // Retire only canonical identity and reconciliation baseline snapshots
     // scoped to the fully absent provider IDs. Every delete is version-fenced:
     // a concurrent new provider identity or repair aborts the whole transaction
