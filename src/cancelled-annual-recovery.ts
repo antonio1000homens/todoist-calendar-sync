@@ -82,6 +82,18 @@ export async function attemptCancelledAnnualRecovery(
   if (await state.getRecurrenceLinkByTaskAnyProfile(task.id)) return false;
   if ((await state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id)).length) return false;
   if (await review.hasActiveDeletionGuard(profile,"todoist",task.id)) return false;
+  // An independent open review case may own the same identity even without a
+  // DELETION_REVIEW guard. Check every bounded open-case page, never title/date.
+  let caseCursor:Record<string,unknown>|undefined;
+  let openCaseComplete=false;
+  for(let pageNum=0;pageNum<20;pageNum++) {
+    const page=await review.listCases(profile,caseCursor,false,50);
+    if(page.items.some(item=>(item.status==="open"||item.status==="repairing")
+      && (item.taskId===task.id || (item.eventId!==undefined && oldCalendarIds.includes(item.eventId))))) return false;
+    caseCursor=page.cursor as Record<string,unknown>|undefined;
+    if(!caseCursor){openCaseComplete=true;break;}
+  }
+  if(!openCaseComplete) return false;
   for (const other of profiles) {
     const current=await state.getMappingByTask(other,task.id);
     if (other!==profile && current) return false;
