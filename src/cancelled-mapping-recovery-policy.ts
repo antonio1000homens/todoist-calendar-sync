@@ -143,9 +143,19 @@ export function validateCancelledProviderVersions(
   return {ok:true,version:latest};
 }
 
+/** Google Calendar accepts base32hex client IDs; a hex digest is a subset.
+ * Store this before POST so a lost acknowledgement always retries one ID. */
+export function recoveryCounterpartEventId(
+  profile:Profile, taskId:string, oldEventId:string, sourceUpdatedAt:string,
+):string {
+  return "c" + createHash("sha256").update(JSON.stringify([
+    "cancelled-mapping-v1",profile,taskId,oldEventId,sourceUpdatedAt,
+  ])).digest("hex").slice(0,47);
+}
+
 export interface RecoveryReceipt {
   oldEventId: string; sourceDueDate: string; sourceUpdatedAt: string;
-  sourceFingerprint?: string; sourcePolicy?: RecoveryPolicy;
+  sourceFingerprint?: string; sourcePolicy?: RecoveryPolicy; candidateEventId?: string;
 }
 /** Legacy annual receipts have no fingerprint; keep their original guard. */
 export function recoveryReceiptMatchesTask(receipt:RecoveryReceipt,task:TodoistTask):boolean {
