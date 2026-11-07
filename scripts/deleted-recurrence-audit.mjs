@@ -5,7 +5,7 @@
  */
 import { reviewCaseEvidenceIds } from "../dist/deleted-review-identities.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
-import { cancelledOccurrenceMasterId } from "../dist/verified-deletion.js";
+import { cancelledOccurrenceMasterId, verifyCancelledSeriesInstances } from "../dist/verified-deletion.js";
 
 export async function auditDeletedRecurrenceCase(item,provider,state){
   const {taskIds,eventIds}=reviewCaseEvidenceIds(item);
@@ -47,7 +47,31 @@ export async function auditDeletedRecurrenceCase(item,provider,state){
   }
   const deletion=await deletedRecurrenceStatus(item,snapshots,
     (owner,seriesId)=>state.getRecurrenceLink(owner,seriesId));
+  // This is still a read-only recommendation, never authority to retire.
+  // A cancelled master alone is not proof of a fully deleted series. Match
+  // the worker's complete, paginated instance/history safety assessment.
+  let instanceAssessment;
+  if(recoveredMaster && deletion?.bothGone && deletion.masterId===recoveredMaster) {
+    try {
+      const master=snapshots.find(snapshot=>snapshot.ref.side==="calendar"
+        && snapshot.ref.id===recoveredMaster)?.object;
+      const instances=await provider.calendar.listEventInstances(recoveredMaster);
+      if(!master?.iCalUID)throw new Error("Cancelled master iCalUID missing");
+      instanceAssessment=await verifyCancelledSeriesInstances({
+        profile:item.profile,taskIds,masterId:recoveredMaster,
+        masterSeriesId:master.iCalUID,activeInstanceId:activeId,
+        instances,nowMs:Date.now(),
+      },id=>state.getCompletedCalendarProjectionByEvent(item.profile,id));
+    } catch {
+      instanceAssessment={valid:false,reason:"Complete instance or completed-history inventory unavailable"};
+    }
+  }
+  const eligible=deletion?.bothGone&&["pending_cleanup","stale_recurrence"].includes(deletion.state)
+    && (!recoveredMaster||instanceAssessment?.valid===true);
   return {...entry,deletion,recurrenceLinks:deletion?.staleLinks||[],
-    action:deletion?.bothGone&&["pending_cleanup","stale_recurrence"].includes(deletion.state)
-      ?"candidate_for_guarded_reconciliation":"retain_for_manual_review"};
+    ...(instanceAssessment ? {instanceAssessment:{
+      valid:instanceAssessment.valid,
+      ...(instanceAssessment.reason?{reason:instanceAssessment.reason}:{})
+    }} : {}),
+    action:eligible?"candidate_for_guarded_reconciliation":"retain_for_manual_review"};
 }
