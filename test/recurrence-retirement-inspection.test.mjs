@@ -10,6 +10,7 @@ const completed="2026-10-21T13:00:00Z";
 const mapping={profile:"work",taskId:target.taskId,eventId:target.eventId,
   recurrenceOwner:"calendar",seriesId:target.seriesId,
   masterEventId:"master",activeInstanceId:target.eventId,
+  projectId:"work-project-351",
   updatedAt:"2026-10-22T10:00:00Z"};
 const link={profile:"work",owner:"calendar",seriesId:target.seriesId,taskId:target.taskId,
   eventId:target.eventId,masterEventId:"master",activeInstanceId:target.eventId,
@@ -61,6 +62,31 @@ test("#358 legacy recurrence without a series certificate can use complete provi
   assert.match(assessRecurrenceRetirement(input({terminal:undefined,completedTask:undefined})).join(" / "),/independently prove this exact task completed/i);
   const future={...instance,id:"future-instance",start:{dateTime:"2026-12-03T10:00:00Z"}};
   assert.match(assessRecurrenceRetirement(input({terminal:undefined,instances:[instance,future]})).join(" / "),/future/i);
+});
+
+test("#358 an operator may retire only a precisely identified active task whose non-recurring due date is over seven days past",()=>{
+  const task={id:target.taskId,content:"Threat modelling",project_id:mapping.projectId,
+    due:{date:"2026-10-21",is_recurring:false},updated_at:"2026-10-22T19:27:04Z",is_deleted:false};
+  assert.deepEqual(assessRecurrenceRetirement(input({activeTask:task,completedTask:undefined,
+    completedLookupFailed:true,history:[],terminal:undefined})),[]);
+  assert.match(assessRecurrenceRetirement(input({activeTask:{...task,due:{date:"2026-11-01",is_recurring:false}},
+    completedTask:undefined,history:[],terminal:undefined})).join(" / "),/active task|completed more than seven days/i);
+  assert.match(assessRecurrenceRetirement(input({activeTask:{...task,due:{date:"2026-10-21",is_recurring:true}},
+    completedTask:undefined,history:[],terminal:undefined})).join(" / "),/active task|completed more than seven days/i);
+  assert.match(assessRecurrenceRetirement(input({activeTask:{...task,project_id:"another-project"},
+    completedTask:undefined,history:[],terminal:undefined})).join(" / "),/active task|completed more than seven days/i);
+  const future={...instance,id:"future",start:{dateTime:"2026-12-03T10:00:00Z"}};
+  assert.match(assessRecurrenceRetirement(input({activeTask:task,completedTask:undefined,
+    history:[],terminal:undefined,instances:[instance,future]})).join(" / "),/future/i);
+});
+
+test("#358 the explicit active-task override rejects a due date exactly seven days old",()=>{
+  const now=Date.parse("2026-11-06T17:00:00Z");
+  const task={id:target.taskId,content:"Threat modelling",project_id:mapping.projectId,
+    due:{datetime:new Date(now-7*86400_000).toISOString(),is_recurring:false},
+    updated_at:"2026-10-22T19:27:04Z"};
+  assert.match(assessRecurrenceRetirement(input({nowMs:now,activeTask:task,completedTask:undefined,
+    history:[],terminal:undefined})).join(" / "),/active task|completed more than seven days/i);
 });
 
 test("#351 version mismatch, shared ownership, active review and pending repair are blockers",()=>{
@@ -225,6 +251,20 @@ test("#358 a direct Todoist task read marked completed is not misclassified as a
   assert.equal(result.task.value.completed_at,completed);
   assert.ok(calls.some(([name])=>name==="completed"),"completed-task endpoint is checked even when direct GET returns an item");
   assert.ok(!result.blockers.some(reason=>/active task/i.test(reason)));
+});
+
+test("#358 active historical-task override fingerprints exact provider state and never reads or writes provider objects",async()=>{
+  const task={id:target.taskId,content:"Threat modelling",project_id:mapping.projectId,
+    due:{date:"2026-10-21",is_recurring:false},updated_at:"2026-10-22T19:27:04Z",is_deleted:false};
+  const {calls,dependencies}=inspectionFixture({getTaskStatus:200,taskValue:task,historyOverride:[],
+    calendarMaster:master,instanceOverride:[instance]});
+  const result=await inspectRecurrenceRetirement(target,dependencies);
+  assert.equal(result.eligibleForFutureApproval,true);
+  assert.equal(result.retirementEvidenceMode,"past_due_active_task_operator_override");
+  assert.equal(result.task.status,"active");
+  assert.deepEqual(result.blockers,[]);
+  assert.ok(!calls.some(([name])=>name==="completed"));
+  assert.ok(calls.every(([name])=>!/(delete|update|put|write|patch|save)/i.test(name)));
 });
 
 test("#358 a retained direct completion timestamp corroborated by Todoist completed history is verified",async()=>{

@@ -12,12 +12,14 @@ type Inspection = {
   indexKeys:string[]; historicalRowCounts:Record<string,number>;
   otherProfileReferences:Array<{profile:string;key:string}>;
   blockers:string[]; eligibleForFutureApproval:boolean; previewFingerprint:string;
+  retirementEvidenceMode?:"verified_completion"|"past_due_active_task_operator_override";
   providerWrites:false;
 };
 type PlannedRecord = {pk:string;sk:string;recordFingerprint:string;rationale:string};
 type Preview = {
   scope:"whole_ended_calendar_series"; mode:"keep_provider_items";
   inspectedAt:string;inspectionFingerprint:string;planFingerprint:string;
+  evidenceMode?:"verified_completion"|"past_due_active_task_operator_override";
   status:"reviewable"|"blocked";blockers:string[];
   indexRemovalCandidates:PlannedRecord[];
   conditionalCleanupCandidates:PlannedRecord[];
@@ -186,19 +188,21 @@ export function RecurrenceRetirementInspector({
     {opened&&<section className="preview" aria-label="Operator recurrence retirement inspection">
       <h4>Retire association (keep provider items) — safety inspection</h4>
       <p>This diagnostic has no actionable review case. Inspection uses fresh Todoist and Google Calendar reads and a strongly consistent state inventory. It does not modify either provider or DynamoDB.</p>
-      {busy&&<p role="status">Verifying exact recurrence, completion, ownership and audit references…</p>}
+      {busy&&<p role="status">Verifying exact recurrence, provider state, ownership and audit references…</p>}
       {error&&<p className="warning" role="alert">{error}. No retirement operation was authorized.</p>}
       {inspection&&<>
         <dl className="overview-grid">
           <dt>Profile / scope</dt><dd>{profile} · whole series inspection (not an individual occurrence action)</dd>
           <dt>Todoist</dt><dd><code>{item.taskId}</code> · {inspection.task.status}
             {inspection.task.value?.content&&<> · {inspection.task.value.content}</>}</dd>
+          <dt>Todoist due / version</dt><dd>{inspection.task.value?.due?.datetime||inspection.task.value?.due?.date||"No due date"}
+            {inspection.task.value?.updated_at&&<> · updated {inspection.task.value.updated_at}</>}</dd>
           <dt>Calendar master</dt><dd><code>{inspection.calendar.master?.id||"Not verified"}</code> · {inspection.calendar.master?.summary||"No title"}</dd>
           <dt>Calendar occurrence</dt><dd><code>{item.eventId}</code> · {inspection.calendar.occurrence?.status||"Not verified"}</dd>
           <dt>Series</dt><dd><code>{item.seriesId}</code></dd>
           <dt>Recurrence rule</dt><dd>{inspection.calendar.master?.recurrence?.join(", ")||"Unverified"}</dd>
           <dt>Instance count</dt><dd>{inspection.calendar.instances.length} (including cancelled exceptions)</dd>
-          <dt>Completed task evidence</dt><dd>{inspection.task.value?.completed_at||"Not verified"} · {inspection.task.source}</dd>
+          <dt>Provider task evidence</dt><dd>{inspection.task.value?.completed_at||inspection.task.value?.updated_at||"Not verified"} · {inspection.task.source}</dd>
           <dt>Terminal-series marker</dt><dd>{inspection.terminalSeries?.terminalCompletedAt||"Absent or unverified"}</dd>
           <dt>Mapping revision</dt><dd>{inspection.mapping?.updatedAt||"Missing"}</dd>
           <dt>Recurrence link revision</dt><dd>{inspection.recurrenceLink?.updatedAt||"Missing"}</dd>
@@ -243,13 +247,17 @@ export function RecurrenceRetirementInspector({
           </details>
           <p>Preview version: <code>{preview.planFingerprint}</code></p>
           {preview.status==="reviewable"&&!retirementStatus&&<div>
-            <p><strong>Operator approval required.</strong> This retires only the whole-series mapping and prevents future syncing of those exact identities. When the legacy terminal-series certificate is absent, approval is available only with direct proof that this exact Todoist task completed over seven days ago, matching immutable occurrence history, and a complete Calendar series with no future instances. Both provider objects are retained without editing their metadata.</p>
+            <p><strong>Operator approval required.</strong> This retires only the whole-series mapping and prevents future syncing of those exact identities. {preview.evidenceMode==="past_due_active_task_operator_override"
+              ?<>The Todoist task is still active. Its exact provider record says it is non-recurring and due more than seven days ago, and the complete Calendar series has ended. Apply will leave the task open and disconnect only this association; check the task identity and due date above before approving.</>
+              :<>When the legacy terminal-series certificate is absent, approval is available only with direct proof that this exact Todoist task completed over seven days ago, matching immutable occurrence history, and a complete Calendar series with no future instances.</>} Both provider objects are retained without editing their metadata.</p>
             <button type="button" disabled={busy} onClick={requestRetirementApproval}>Request retirement approval token</button>
           </div>}
         </section>}
         {approval&&<section className="preview" aria-label="Confirm whole-series retirement">
           <h4>Confirm retirement — keep both provider items</h4>
-          <p>The current mapping and selected history will be removed conditionally. This approval acknowledges that a legacy terminal-series certificate may be absent; fresh Todoist completion, immutable occurrence history and a complete ended Calendar series are required before Apply. Todoist task <code>{item.taskId}</code> and Calendar series <code>{item.seriesId}</code> will <strong>not</strong> be deleted, rescheduled, completed or edited. Further sync of these identities is disabled until a separate re-enable operation.</p>
+          <p>The current mapping and selected history will be removed conditionally. {approval.phrase.includes("ACTIVE TASK")
+            ?<>This approval explicitly retires an active Todoist task association because the exact task is non-recurring and its due date is over seven days past, and the complete Calendar series has ended. The task will stay open.</>
+            :<>This approval acknowledges that a legacy terminal-series certificate may be absent; fresh Todoist completion, immutable occurrence history and a complete ended Calendar series are required before Apply.</>} Todoist task <code>{item.taskId}</code> and Calendar series <code>{item.seriesId}</code> will <strong>not</strong> be deleted, rescheduled, completed or edited. Further sync of these identities is disabled until a separate re-enable operation.</p>
           <label>Type this exact phrase to authorise retirement: <code>{approval.phrase}</code>
             <input aria-label="Retirement confirmation phrase" value={confirmPhrase}
               onChange={e=>setConfirmPhrase(e.target.value)} />

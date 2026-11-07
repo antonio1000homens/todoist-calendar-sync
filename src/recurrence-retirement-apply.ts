@@ -30,6 +30,7 @@ const validOperationId=/^[0-9a-f-]{36}$/i;
 const validFingerprint=/^[a-f0-9]{64}$/;
 const APPROVAL_MS=30*60_000;
 export const RETIREMENT_APPROVAL_PHRASE="RETIRE ASSOCIATION KEEP PROVIDER ITEMS WITHOUT SERIES CERTIFICATE";
+export const PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE="RETIRE PAST-DUE ACTIVE TASK ASSOCIATION KEEP PROVIDER ITEMS";
 type Db=Pick<DynamoDBDocumentClient,"send">;
 export type RetirementOperation={
   pk:string;sk:"STATE";operationId:string;profile:Profile;
@@ -41,7 +42,9 @@ export type RetirementOperation={
   lookupPk?:string;lookupSk?:string;
   /** Provider identity/ETag proof held stable across future Undo checks. */
   providerVersions?: {masterEventId:string;masterEtag:string;occurrenceEtag:string;
-    completedAt:string;rrule:string[]};
+    completedAt?:string;taskFingerprint?:string;taskUpdatedAt?:string;taskDue?:string;
+    evidenceMode?:"verified_completion"|"past_due_active_task_operator_override";rrule:string[]};
+  evidenceMode?:"verified_completion"|"past_due_active_task_operator_override";
   undoConfirmationHash?:string;
   undoApprovedFingerprint?:string;
   undoApprovalExpiresAt?:string;
@@ -60,7 +63,7 @@ export type RetirementOperationStatus={
 export type IssueRetirementApproval={
   operation:RetirementOperationStatus;
   confirmationId:string;
-  phrase:typeof RETIREMENT_APPROVAL_PHRASE;
+  phrase:typeof RETIREMENT_APPROVAL_PHRASE|typeof PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE;
   providerWrites:false;
 };
 type FenceInspection=Awaited<ReturnType<typeof inspectErasureFence>>;
@@ -293,19 +296,29 @@ export class RetirementOperationService {
       error("Retirement preview contains unresolved safety blockers");
     if(preview.planFingerprint!==expectedFingerprint)
       error("The preview changed; inspect the new version before requesting approval");
+    const evidenceMode=inspection.retirementEvidenceMode||"verified_completion";
+    const task=inspection.task.value;
+    const completedAt=task&&"completed_at" in task&&typeof task.completed_at==="string"
+      &&Number.isFinite(Date.parse(task.completed_at))?task.completed_at:undefined;
+    const taskDue=task?.due?.datetime||task?.due?.date;
     if(!inspection.mapping?.masterEventId||!inspection.calendar.master?.etag
-      ||!inspection.calendar.occurrence?.etag
-      ||inspection.task.status!=="completed_verified"||!inspection.task.value
-      ||!("completed_at" in inspection.task.value)
-      ||typeof inspection.task.value.completed_at!=="string"
-      ||!Number.isFinite(Date.parse(inspection.task.value.completed_at))
-      ||!Array.isArray(inspection.calendar.master.recurrence))
-      error("Verified Calendar and completed Todoist provider versions are required for an undoable retirement");
+      ||!inspection.calendar.occurrence?.etag||!task
+      ||!Array.isArray(inspection.calendar.master.recurrence)
+      ||evidenceMode==="verified_completion"&&(inspection.task.status!=="completed_verified"||!completedAt)
+      ||evidenceMode==="past_due_active_task_operator_override"
+        &&(inspection.task.status!=="active"||task.id!==target.taskId
+          ||task.is_deleted===true||task.is_completed===true||task.due?.is_recurring!==false
+          ||!taskDue||!task.updated_at||!Number.isFinite(Date.parse(task.updated_at))))
+      error("Verified provider identities, evidence mode and versioned task/Calendar state are required for retirement");
     const providerVersions={
       masterEventId:inspection.mapping.masterEventId,
       masterEtag:inspection.calendar.master.etag,
       occurrenceEtag:inspection.calendar.occurrence.etag,
-      completedAt:inspection.task.value.completed_at,
+      ...(completedAt?{completedAt}:{}),
+      taskFingerprint:reviewHash(task),
+      ...(task.updated_at?{taskUpdatedAt:task.updated_at}:{}),
+      ...(taskDue?{taskDue}:{}),
+      evidenceMode,
       rrule:[...inspection.calendar.master.recurrence],
     };
     const operationId=randomUUID(),confirmationId=randomUUID();
@@ -317,11 +330,15 @@ export class RetirementOperationService {
       planFingerprint:preview.planFingerprint,inspectionFingerprint:preview.inspectionFingerprint,
       confirmationHash:sha(confirmationId),confirmationExpiresAt:new Date(Date.now()+APPROVAL_MS).toISOString(),
       createdAt:timestamp,status:"previewed",
+      evidenceMode,
       providerVersions,
     };
     await this.db.send(new PutCommand({TableName:table(),Item:operation,
       ConditionExpression:"attribute_not_exists(pk)"}));
-    return {operation:exposed(operation),confirmationId,phrase:RETIREMENT_APPROVAL_PHRASE,providerWrites:false};
+    return {operation:exposed(operation),confirmationId,
+      phrase:evidenceMode==="past_due_active_task_operator_override"
+        ?PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE:RETIREMENT_APPROVAL_PHRASE,
+      providerWrites:false};
   }
   private async noteRejectedPreflight(operationId:string,actorSubject:string):Promise<void> {
     await this.db.send(new UpdateCommand({TableName:table(),Key:operationKey(operationId),
@@ -336,13 +353,17 @@ export class RetirementOperationService {
     operationId:string,confirmationId:string,profile:Profile,actorSubject:string,phrase:string,
   ):Promise<RetirementOperationStatus> {
     requireExecutionGate();
-    if(phrase!==RETIREMENT_APPROVAL_PHRASE||!validOperationId.test(operationId)
+    if(![RETIREMENT_APPROVAL_PHRASE,PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE].includes(phrase as never)
+      ||!validOperationId.test(operationId)
       ||!validOperationId.test(confirmationId))
       error("Apply requires exact operation, token and typed keep-provider confirmation",400);
     const operation=await this.get(operationId);
     if(!operation)error("Retirement operation not found",404);
     if(operation.actorSubject!==actorSubject||operation.profile!==profile)
       error("Retirement approval does not belong to this operator and profile",403);
+    const expectedPhrase=operation.evidenceMode==="past_due_active_task_operator_override"
+      ?PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE:RETIREMENT_APPROVAL_PHRASE;
+    if(phrase!==expectedPhrase)error("Typed phrase does not acknowledge this retirement evidence mode",400);
     if(operation.confirmationHash!==sha(confirmationId))
       error("Retirement approval token does not match",403);
     if(operation.status==="re_enabled")error("This retirement has already been undone");

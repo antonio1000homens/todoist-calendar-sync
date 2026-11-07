@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { planRecurrenceRetirement } from "../dist/recurrence-retirement-preview.js";
 import { buildRetirementTransaction, RetirementOperationService,
-  RETIREMENT_APPROVAL_PHRASE } from "../dist/recurrence-retirement-apply.js";
+  RETIREMENT_APPROVAL_PHRASE, PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE } from "../dist/recurrence-retirement-apply.js";
 
 const target={profile:"work",generation:"1793982837494-t1u4ucsa",
   taskId:"task351",eventId:"occ_20261021",seriesId:"series-uid-351"};
@@ -126,8 +126,8 @@ function harness(t,changes={}) {
   let fingerprint=row.preview.planFingerprint;
   const preview=async (_target,dependencies={})=>{
     dependencies.onInventory?.(row.rows);
-    return {inspection:{...inspection,eligibleForFutureApproval:true},preview:{
-      ...row.preview,planFingerprint:fingerprint,
+    return {inspection:{...(changes.inspectionOverride||inspection),eligibleForFutureApproval:true},preview:{
+      ...(changes.previewOverride||row.preview),planFingerprint:fingerprint,
     }};
   };
   const db={async send(cmd){
@@ -179,6 +179,27 @@ test("#351 operator-bound approval and Apply are two separate actions with idemp
     "work","operator-351",RETIREMENT_APPROVAL_PHRASE);
   assert.equal(repeat.status,"retired");
   assert.equal(saved.commits.length,1,"duplicate apply must never write again");
+});
+test("#358 active past-due task retirement requires its distinct explicit phrase and retains provider versions",async t=>{
+  const rows=records();
+  const activeTask={id:target.taskId,content:"Historical meeting",project_id:"work-project",
+    due:{date:"2026-10-21",is_recurring:false},updated_at:"2026-10-22T19:27:00Z"};
+  const activeInspection={...inspection,task:{status:"active",value:activeTask,source:"Todoist direct GET"},
+    retirementEvidenceMode:"past_due_active_task_operator_override"};
+  const activePreview=planRecurrenceRetirement(activeInspection,rows);
+  assert.equal(activePreview.status,"reviewable");
+  const {saved,service,setFingerprint}=harness(t,{inspectionOverride:activeInspection,previewOverride:activePreview});
+  setFingerprint(activePreview.planFingerprint);
+  const issued=await service.issue(target,activePreview.planFingerprint,"operator-358");
+  assert.equal(issued.phrase,PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE);
+  assert.equal(saved.operation.evidenceMode,"past_due_active_task_operator_override");
+  assert.equal(saved.operation.providerVersions.taskFingerprint.length,64);
+  assert.equal(saved.operation.providerVersions.taskUpdatedAt,activeTask.updated_at);
+  await assert.rejects(()=>service.apply(issued.operation.operationId,issued.confirmationId,
+    "work","operator-358",RETIREMENT_APPROVAL_PHRASE),/evidence mode/i);
+  const result=await service.apply(issued.operation.operationId,issued.confirmationId,
+    "work","operator-358",PAST_DUE_ACTIVE_TASK_APPROVAL_PHRASE);
+  assert.equal(result.status,"retired");
 });
 test("#351 outstanding provider writer leases suspend Apply instead of mutating",async t=>{
   const {saved,row,service}=harness(t);
