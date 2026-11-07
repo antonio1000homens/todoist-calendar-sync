@@ -16,16 +16,24 @@ const master={id:masterId,status:"cancelled",iCalUID:uid,
   recurrence:["RRULE:FREQ=WEEKLY;COUNT=4"]};
 const active={id:activeId,status:"cancelled",recurringEventId:masterId,iCalUID:uid};
 const gone=()=>{throw Object.assign(new Error("not found"),{status:404});};
-function fixture({task=gone,eventMaster=master,eventActive=active,foreign=false}={}){
+function fixture({task=gone,eventMaster=master,eventActive=active,foreign=false,
+  instances=[{id:activeId,status:"cancelled",recurringEventId:masterId,iCalUID:uid}]}={}){
   const reads=[],writes=[];
   const calendar={async getEvent(id){
     reads.push("calendar:"+id);
     if(id===masterId)return eventMaster;
     if(id===activeId)return eventActive;
     throw Object.assign(new Error("not found"),{status:404});
+  },async listEventInstances(id){
+    reads.push("instances:"+id);
+    return instances;
   }};
   const todoist={async getTask(id){reads.push("todoist:"+id);return task(id);}};
   const state={
+    async getCompletedCalendarProjectionByEvent(profile,id){
+      reads.push("completed:"+profile+":"+id);
+      return undefined;
+    },
     async getMappingByTaskAnyProfile(id){reads.push("task-owner:"+id);return undefined;},
     async getMappingByEvent(profile,id){reads.push("event-owner:"+profile+":"+id);return undefined;},
     async getRecurrenceLink(profile,key){reads.push("link:"+profile+":"+key);
@@ -47,6 +55,8 @@ test("#292 legacy both-deleted dry-run derives master by readback and is repeata
   assert.deepEqual(one.recurrenceLinks.map(row=>row.seriesId),[taskId]);
   assert.equal(one.action,"candidate_for_guarded_reconciliation");
   assert.equal(f.reads.filter(x=>x==="calendar:"+masterId).length,2);
+  assert.equal(f.reads.filter(x=>x==="instances:"+masterId).length,2);
+  assert.equal(one.instanceAssessment.valid,true);
   assert.deepEqual(f.writes,[],"the audit cannot mutate provider or DynamoDB state");
 });
 
@@ -75,4 +85,20 @@ test("#292 unrecorded master cannot be inferred from an occurrence ID or missing
   assert.equal(result.deletion.bothGone,false);
   assert.ok(!f.reads.includes("calendar:"+masterId),
     "the master must not be guessed by stripping an instance ID suffix");
+});
+
+test("#292 read-only audit does not suggest cleanup for active, missing or incomplete series instances",async()=>{
+  for(const instances of [
+    [], 
+    [{id:activeId,status:"confirmed",recurringEventId:masterId,iCalUID:uid}],
+    [{id:"future",status:"confirmed",recurringEventId:masterId,iCalUID:uid,
+      start:{date:"2026-12-16"}},{id:activeId,status:"cancelled",recurringEventId:masterId,iCalUID:uid}],
+    [{id:activeId,status:"cancelled",recurringEventId:"foreign",iCalUID:uid}],
+  ]){
+    const f=fixture({instances});
+    const result=await auditDeletedRecurrenceCase(item,f.provider,f.state);
+    assert.equal(result.action,"retain_for_manual_review");
+    assert.equal(result.instanceAssessment?.valid,false);
+    assert.deepEqual(f.writes,[]);
+  }
 });
