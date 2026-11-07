@@ -9,8 +9,18 @@ export function phaseCNativeEnabled(): boolean {
 }
 
 export function isPhaseCNativeCandidate(master: CalendarEvent, timeZone = master.start?.timeZone): boolean {
-  return phaseCNativeEnabled()
-    && calendarPhaseCCandidate(master, timeZone).reason === "provider_readback_required";
+  if (!phaseCNativeEnabled()) return false;
+  const candidate = calendarPhaseCCandidate(master, timeZone);
+  if (candidate.reason !== "provider_readback_required" || !candidate.semantic) return false;
+  // Actual Todoist completion readback: "every 29, 30, 31" advanced from
+  // 2027-01-31 to 2027-02-28, whereas RFC5545 skips February entirely.
+  // Prevent false native equivalence for end-of-month semantics, including
+  // simple monthly intervals anchored on an absent February date.
+  if (candidate.family === "multi_month_day"
+    && candidate.semantic.byMonthDay?.some((day) => day > 28)) return false;
+  if (candidate.family === "monthly_interval"
+    && Number(candidate.semantic.startDate.slice(-2)) > 28) return false;
+  return true;
 }
 
 export interface CalendarOwnedTodoistRecurrence {
@@ -320,8 +330,7 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolea
   const phaseC = calendarPhaseCCandidate(master, master.start?.timeZone);
   // Without the explicit opt-in, these formerly unsupported families must
   // retain their original rolling representation and scanning policy.
-  if (phaseC.family) return phaseCNativeEnabled()
-    && phaseC.reason === "provider_readback_required";
+  if (phaseC.family) return isPhaseCNativeCandidate(master);
   const fields = ruleFields(master.recurrence[0]);
   return Boolean(fields && ["WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
     && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || fields.INTERVAL === "1")
