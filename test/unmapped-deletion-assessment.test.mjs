@@ -27,7 +27,7 @@ test("#278 fully deleted unmapped annual fixture is visible as provider-deleted,
   assert.equal(result?.state,"providers_deleted");
   assert.equal(result?.bothGone,true);
   assert.deepEqual(result.taskIds,[taskId]);
-  assert.deepEqual(result.eventIds.sort(),[activeId,masterId].sort());
+  assert.deepEqual(result.eventIds.slice().sort(),[activeId,masterId].sort());
   assert.match(result.reason,/still require guarded reconciliation/);
   const reverse=assessUnmappedConflictDeletion(base,[occurrence,task,master]);
   assert.deepEqual(reverse,result,"the order of provider deletion/readback must not change eligibility");
