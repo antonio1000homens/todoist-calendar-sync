@@ -267,6 +267,30 @@ export class ReviewStore {
   }
 
   /**
+   * Exact-ID lookup for deferred deletion rechecks. A dismissed case may
+   * still own stale review evidence even though its active guard MUST stop
+   * blocking normal provider writes immediately on dismissal.
+   */
+  async listDeletedConflictCaseIds(
+    profile:Profile,side:"todoist"|"calendar",id:string,
+  ):Promise<string[]> {
+    if(!id)return [];
+    const pk=`DELETION_REVIEW#${profile}#${side}#${id}`;
+    const page=await this.db.send(new QueryCommand({TableName:reviewTable(),
+      KeyConditionExpression:"pk = :pk AND begins_with(sk, :prefix)",
+      ExpressionAttributeValues:{":pk":pk,":prefix":"CASE#"},
+      ConsistentRead:true,Limit:40,
+    }));
+    if(page.LastEvaluatedKey)
+      throw new Error("Exact deletion review pointer inventory exceeded the safe limit");
+    return [...new Set((page.Items||[]).filter(row=>
+      row.pk===pk&&typeof row.caseId==="string"&&row.caseId.length>0
+      &&row.sk===`CASE#${row.caseId}`&&row.profile===profile
+      &&Number(row.expiresAt||0)>Date.now()/1000,
+    ).map(row=>String(row.caseId)))];
+  }
+
+  /**
    * Versioned pending-refresh markers are already consumed by the worker's
    * reconciliation follow-up protocol. A deletion arriving after a generation
    * starts must have its own next pass, rather than coalescing silently.
@@ -375,6 +399,29 @@ export class ReviewStore {
           ":createdAt":manual.createdAt, ":result":result, ":now":now,
         },
       }});
+    }
+    // Dismissing an alert never establishes provider deletion, but a future
+    // deletion must be able to recheck this exact case. The expiring pointer
+    // is not an active write barrier and is removed by verified cleanup.
+    const deletionRecheck=current.decision?.type==="todoist_unmapped_conflict"
+      || current.decision?.type?.includes("recurrence_task_deleted")===true
+      || current.reason==="calendar_snapshot_recurring_identity_conflict";
+    if(deletionRecheck){
+      const ids=reviewCaseEvidenceIds(current);
+      if(ids.taskIds.length&&ids.eventIds.length
+        &&ids.taskIds.length+ids.eventIds.length<=20){
+        const expiry=Math.floor(Date.now()/1000)+90*86400;
+        for(const [side,providerIds] of [
+          ["todoist",ids.taskIds],["calendar",ids.eventIds],
+        ] as const){
+          for(const providerId of providerIds)items.push({Put:{
+            TableName:reviewTable(),Item:{
+              pk:`DELETION_REVIEW#${current.profile}#${side}#${providerId}`,
+              sk:`CASE#${id}`,profile:current.profile,caseId:id,expiresAt:expiry,
+            },
+          }});
+        }
+      }
     }
     if (operation) items.push({ConditionCheck:{TableName:reviewTable(),Key:key(`REPAIR#${operation.id}`),
       ConditionExpression:"#s = :failed AND updatedAt = :version AND attribute_not_exists(writeStarted)",
