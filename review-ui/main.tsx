@@ -394,7 +394,7 @@ function App() {
         setMessage("Verified deletion cleanup completed; the alert is no longer open. A terminal receipt is retained.");
         return;
       }
-      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots,deletionCleanup:result.deletionCleanup}:current);
+      setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots,deletionCleanup:result.deletionCleanup,unmappedDeletion:result.unmappedDeletion}:current);
       setRepairSelection(current=>reconcileRepairSelection(result.item,result.snapshots,current));setLeftovers({});
       if(operationResumeEligibility(operation)==="fresh-preview") {
         const refreshedSelection=reconcileRepairSelection(result.item,result.snapshots,emptyRepairSelection(result.item));
@@ -623,14 +623,40 @@ function App() {
         {!details?<div className="notice detail-load" role="status">
           {currentDetailState?.status==="error"?<><p>Could not load live provider details: {currentDetailState.message}</p><button className="secondary" onClick={retryDetails}>Retry case details</button></>:
             <p>{currentDetailState?.status==="retrying"?"Review API is busy (HTTP 429). Retrying case details…":"Loading live Todoist and Calendar details…"}</p>}
-        </div>:showProviderPanels?<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>:<p className="notice">No live Todoist or Calendar object could be verified from the identities attached to this case. Recorded candidate or series IDs above are evidence only; search and verify an exact live item before repairing.</p>}
+        </div>:showProviderPanels?<div className="columns"><article><h3>Todoist</h3>{displaySnapshot("todoist")}</article><article><h3>Calendar</h3>{displaySnapshot("calendar")}</article></div>:details?.unmappedDeletion?.bothGone?
+          <p className="notice">The Todoist and Calendar IDs recorded by this unmapped conflict are deleted in the latest direct provider reads. Guarded reconciliation must still verify and retire any remaining mapping, conflict or audit state.</p>:
+          <p className="notice">No live Todoist or Calendar object could be verified from the identities attached to this case. Recorded candidate or series IDs above are evidence only; search and verify an exact live item before repairing.</p>}
         {["resolved","excluded"].includes(selected.status)&&<p className="notice">To change a previous decision, select the exact current provider IDs and create a fresh preview. Exclude the Todoist task to keep it Todoist-only; Leave unchanged permits normal syncing.</p>}
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
-        {details&&!details.deletionCleanup?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
+        {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
           item={details.item} snapshots={details.snapshots||[]} loading={busy}
           recheck={refreshAffected} api={api}/>}
+        {details?.unmappedDeletion?.bothGone&&<section className="preview" role="status" aria-live="polite">
+          <h3>Recorded provider items deleted — guarded cleanup pending</h3>
+          <p>The exact Todoist and Calendar identities on this unmapped conflict have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
+          <p>Todoist IDs: <code>{details.unmappedDeletion.taskIds.join(", ")}</code></p>
+          <p>Calendar event/master IDs: <code>{details.unmappedDeletion.eventIds.join(", ")}</code></p>
+          <ol>
+            <li>Recorded provider identities — deleted by current direct reads</li>
+            <li>Remaining series, mappings and repair ownership — requires guarded reconciliation</li>
+            <li>Attributable audit, review and manual decisions — retire only after independent state checks</li>
+            <li>Terminal conflict receipt — pending successful atomic cleanup</li>
+          </ol>
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck provider deletion (read-only)</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Run guarded cleanup for {selected.profile}</button>
+          <p>No provider object is created or deleted by viewing or rechecking this alert. If the current reconciliation profile does not match this case, select the case's profile before starting cleanup.</p>
+        </section>}
+        {details?.unmappedDeletion?.state==="partial"&&<p className="notice" role="status">
+          <strong>One-sided deletion — no automatic purge.</strong> {details.unmappedDeletion.reason}
+          {" "}Todoist: {details.unmappedDeletion.taskStates.map((x:any)=>`${x.id} (${x.state})`).join(", ")}.
+          {" "}Calendar: {details.unmappedDeletion.eventStates.map((x:any)=>`${x.id} (${x.state})`).join(", ")}.
+          The remaining live items must be reviewed under their normal recurrence and sync policy.
+        </p>}
+        {details?.unmappedDeletion?.state==="unverified"&&<p className="notice" role="status">
+          Unmapped deletion is unverified: {details.unmappedDeletion.reason}. No automatic cleanup is authorised by this read.
+        </p>}
         {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Verified recurring deletion</h3>
           <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
@@ -651,7 +677,7 @@ function App() {
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Retry guarded cleanup via reconciliation</button>
           <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
         </section>}
-        {!details?.deletionCleanup?.bothGone&&<div className="preview">
+        {!details?.deletionCleanup?.bothGone&&!details?.unmappedDeletion?.bothGone&&<div className="preview">
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
