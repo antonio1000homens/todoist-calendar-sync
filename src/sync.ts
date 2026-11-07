@@ -1842,6 +1842,7 @@ export class Synchronizer {
         const recovered=await attemptCancelledAnnualRecovery({
           profile:delivery.profile,task,mapping:existingMapping,operationId,writeToken:writeFence,
           state:this.state,calendar:providers.calendar,todoist:providers.todoist,
+          calendarForProfile:async other=>(await this.clients(other)).calendar,
         });
         if (recovered) {
           await this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_reset",{
@@ -2407,6 +2408,18 @@ export class Synchronizer {
     }
 
     let cancelledCalendarLink = false;
+    if (pendingAnnualRecovery && pendingAnnualRecovery.sourcePolicy
+      && pendingAnnualRecovery.sourcePolicy!=="yearly") {
+      for (const other of profiles) {
+        if (other===delivery.profile) continue;
+        const aliases=await (await this.clients(other)).calendar.listLinkedEventsByTodoistTaskId(task.id);
+        if (!Array.isArray(aliases) || aliases.length) {
+          return this.state.audit(delivery.profile,"todoist_cancelled_recovery_cross_profile_alias_blocked",{
+            taskId:task.id,otherProfile:other,
+          });
+        }
+      }
+    }
     if (!mapping && pendingAnnualRecovery) {
       // After a committed reset, old cancelled Calendar aliases deliberately
       // remain with the provider. The durable receipt allows a brand-new
