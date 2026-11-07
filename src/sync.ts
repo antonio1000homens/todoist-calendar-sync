@@ -29,6 +29,7 @@ import {
   verifiedCalendarOwnedRecurrence,
   finiteWeeklyCalendarRuleCandidate,
   nativeCalendarRecurrenceCandidate,
+  isPhaseCNativeCandidate,
   matchesCalendarOwnedRecurringRule,
   matchesCalendarOwnedRecurringTask,
   resolveCalendarTimeZone,
@@ -1596,7 +1597,10 @@ export class Synchronizer {
     const seriesId = master.iCalUID || master.id;
     const existing = await this.state.getRecurrenceLink(delivery.profile, seriesId);
     const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
-    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master);
+    // New Phase C families are enabled for NEW Calendar-owned series only.
+    // Existing rolling mappings must never be bulk-migrated implicitly.
+    const nativeRecurrence = nativeCalendarRecurrenceCandidate(master)
+      && !(existing && isPhaseCNativeCandidate(master) && !existing.calendarNativeRecurring);
     // Native unbounded recurrences must not expand forever. Preserve the
     // current mapped occurrence (which can be overdue) within a bounded lookahead.
     const from = existing?.activeEffectiveStart || existing?.originalStart;
