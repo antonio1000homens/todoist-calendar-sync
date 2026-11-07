@@ -34,6 +34,7 @@ export type RecurrenceRetirementInspection = {
   otherProfileReferences: Array<{ profile: string; key: string }>;
   blockers: string[];
   eligibleForFutureApproval: boolean;
+  retirementEvidenceMode?: "verified_completion" | "past_due_active_task_operator_override";
   previewFingerprint: string;
   providerWrites: false;
 };
@@ -48,6 +49,20 @@ function reject(message: string, status = 409): never {
 }
 function isoTime(value: unknown): number {
   return typeof value === "string" ? Date.parse(value) : Number.NaN;
+}
+function pastDueActiveTaskEligible(task: TodoistTask | undefined, mapping: Mapping | undefined,
+  target: RetirementDiagnosticTarget, nowMs: number): boolean {
+  if (!task || !mapping || task.id !== target.taskId || task.is_deleted === true
+    || task.is_completed === true || !mapping.projectId || task.project_id !== mapping.projectId
+    || task.due?.is_recurring !== false || !task.due || !task.updated_at
+    || !Number.isFinite(isoTime(task.updated_at))) return false;
+  const dueValue = task.due.datetime || task.due.date;
+  let dueMs = isoTime(dueValue);
+  // Todoist date-only due dates float in the user's timezone. Require an
+  // additional 36 hours past the seven-day boundary so even UTC-12 day-end
+  // interpretations remain strictly older than seven full days.
+  if (task.due.date && !task.due.datetime) dueMs += 36 * 3600_000;
+  return Number.isFinite(dueMs) && dueMs < nowMs - 7 * 86400_000;
 }
 function exactSameMapping(a?: Mapping, b?: Mapping): boolean {
   if (!a || !b) return false;
@@ -138,13 +153,16 @@ export type RetirementSafetyInput = {
 
 /**
  * Pure policy for future approval, not a permission to mutate state.
- * Requires positive terminal evidence from both providers AND local immutable
- * completion history. A missing task, a past date, or a cancelled instance is
- * never sufficient evidence on its own.
+ * Requires either independently verified completion plus matching local
+ * immutable history, or an explicit operator override for an exact, active,
+ * non-recurring task that is itself more than seven days past due and whose
+ * entire finite Calendar series has ended. A past Calendar date alone never
+ * qualifies for either route.
  */
 export function assessRecurrenceRetirement(input: RetirementSafetyInput): string[] {
   const b: string[] = [];
   const {target, mapping, link, master, occurrence, instances, nowMs} = input;
+  const pastDueActiveTask = pastDueActiveTaskEligible(input.activeTask,mapping,target,nowMs);
   if (!mapping || mapping.profile !== target.profile || mapping.taskId !== target.taskId
       || mapping.eventId !== target.eventId || mapping.seriesId !== target.seriesId
       || mapping.recurrenceOwner !== "calendar" || !mapping.masterEventId
@@ -185,14 +203,14 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
       || item.originalStartTime?.dateTime || item.originalStartTime?.date);
     return !Number.isFinite(time) || time >= nowMs;
   })) b.push("A future or unverified Calendar occurrence exists; active series cannot be retired");
-  if (input.activeTask && input.activeTask.is_completed !== true)
+  if (input.activeTask && !pastDueActiveTask)
     b.push("Todoist still has an active task; completion cannot be inferred");
-  if (!input.completedTask || input.completedTask.id !== target.taskId
+  if (!pastDueActiveTask && (!input.completedTask || input.completedTask.id !== target.taskId
     || input.completedTask.is_deleted === true
     || !Number.isFinite(isoTime(input.completedTask.completed_at))
-    || isoTime(input.completedTask.completed_at) >= nowMs - 7 * 86400_000)
+    || isoTime(input.completedTask.completed_at) >= nowMs - 7 * 86400_000))
     b.push("Todoist did not independently prove this exact task completed more than seven days ago");
-  if (input.completedLookupFailed) b.push("Todoist completed-task inventory is unavailable or incomplete");
+  if (!pastDueActiveTask && input.completedLookupFailed) b.push("Todoist completed-task inventory is unavailable or incomplete");
   const completion = terminalCompletionDecision(input.history, nowMs, input.terminal);
   const exactOldProviderCompletion = !!input.completedTask
     && input.completedTask.id === target.taskId
@@ -221,7 +239,17 @@ export function assessRecurrenceRetirement(input: RetirementSafetyInput): string
       return Number.isFinite(time) && time < nowMs
         && (item.status === "cancelled" || item.status === "confirmed");
     });
-  if (completion !== "eligible" && !providerProvesEndedSeries) b.push(completion === "too_recent"
+  const operatorApprovedPastDueTaskSeries = pastDueActiveTask
+    && !!master?.etag && !!occurrence?.etag && instances.length > 0
+    && master.recurrence?.some(rule => rule.startsWith("RRULE:")
+      && /(?:^|;)(COUNT|UNTIL)=/.test(rule)) === true
+    && instances.every(item => {
+      const time = isoTime(item.start?.dateTime || item.start?.date
+        || item.originalStartTime?.dateTime || item.originalStartTime?.date);
+      return Number.isFinite(time) && time < nowMs
+        && (item.status === "cancelled" || item.status === "confirmed");
+    });
+  if (completion !== "eligible" && !providerProvesEndedSeries && !operatorApprovedPastDueTaskSeries) b.push(completion === "too_recent"
     ? "The immutable terminal completion is within the seven-day retention window"
     : "No matching immutable terminal-series completion evidence exists; operator retirement also requires exact completed-task, matching history and fully ended Calendar-series proof");
   if (input.history.some(item => item.seriesId !== target.seriesId
@@ -398,6 +426,8 @@ export async function inspectRecurrenceRetirement(
     historicalRowCounts:relatedCounters,
     otherProfileReferences:otherOwners.map(row=>({profile:String(row.profile||"unknown"),key:String(row.pk)})),
     blockers,eligibleForFutureApproval:blockers.length===0,
+    ...(blockers.length===0 ? {retirementEvidenceMode:activeTask
+      ? "past_due_active_task_operator_override" as const : "verified_completion" as const} : {}),
     previewFingerprint:fingerprint,providerWrites:false,
   };
 }

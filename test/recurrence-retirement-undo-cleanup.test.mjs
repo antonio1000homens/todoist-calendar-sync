@@ -4,6 +4,7 @@ import { buildUndoTransaction,RetirementUndoService,
   RETIREMENT_UNDO_PHRASE } from "../dist/recurrence-retirement-undo.js";
 import { planRetirementIncidentCleanup,buildIncidentCleanupTransaction }
   from "../dist/recurrence-retirement-cleanup.js";
+import { reviewHash } from "../dist/review-store.js";
 
 const target={profile:"work",generation:"historical-351",taskId:"task351",
   eventId:"oct-occurrence",seriesId:"series-uid-351"};
@@ -100,7 +101,7 @@ test("#351 open review owner blocks incident deletion; unrelated audits preserve
   assert.ok(plan.blockedReasons.some(x=>x.includes("open review case")));
 });
 
-function fixture(t){
+function fixture(t,activePastDueOverride=false){
   const originals={table:process.env.STATE_TABLE_NAME,protocol:process.env.ERASURE_PROTOCOL_VERSION,
     version:process.env.RETIREMENT_DISPOSITION_VERSION};
   Object.assign(process.env,{STATE_TABLE_NAME:"table",ERASURE_PROTOCOL_VERSION:"1",
@@ -116,7 +117,12 @@ function fixture(t){
   const occurrence={id:"oct-occurrence",etag:"occurrence-etag",
     iCalUID:target.seriesId,status:"confirmed",recurringEventId:"oct-master",
     start:{dateTime:"2026-10-21T09:30:00Z"}};
-  let stored={...op};let mutations=0;
+  const liveTask={id:target.taskId,content:"Historical meeting",
+    due:{date:"2026-10-21",is_recurring:false},updated_at:"2026-10-22T19:27:00Z"};
+  const initialOp=activePastDueOverride?{...op,evidenceMode:"past_due_active_task_operator_override",
+    providerVersions:{...op.providerVersions,evidenceMode:"past_due_active_task_operator_override",
+      taskFingerprint:reviewHash(liveTask),taskUpdatedAt:liveTask.updated_at,taskDue:liveTask.due.date}}:op;
+  let stored={...initialOp};let mutations=0;
   const db={async send(command){
     if(command.constructor.name==="GetCommand")return {Item:{...stored}};
     if(command.constructor.name==="UpdateCommand"){
@@ -136,7 +142,7 @@ function fixture(t){
   let fence=null;
   const clients=async()=>({
     todoist:{
-      async getTask(){throw Object.assign(new Error("not found"),{status:404});},
+      async getTask(){if(activePastDueOverride)return {...liveTask};throw Object.assign(new Error("not found"),{status:404});},
       async findCompletedTaskById(){return {id:target.taskId,
         completed_at:op.providerVersions.completedAt,is_deleted:false};},
     },
@@ -151,7 +157,7 @@ function fixture(t){
     inspectFence:async()=>({fence,leases:[]}),
     finishFence:async()=>{fence=null;},
   });
-  return {service,get state(){return stored;},get mutations(){return mutations;},get fence(){return fence;},rows};
+  return {service,get state(){return stored;},get mutations(){return mutations;},get fence(){return fence;},rows,liveTask};
 }
 test("#351 Undo requires direct readback, a separate confirmation and performs no provider writes",async t=>{
   const current=fixture(t);
@@ -171,6 +177,16 @@ test("#351 Undo requires direct readback, a separate confirmation and performs n
   assert.equal(again.status,"re_enabled");
   assert.equal(current.mutations,1);
   assert.equal(current.fence,null);
+});
+test("#358 Undo keeps the active task untouched and requires its exact provider version",async t=>{
+  const current=fixture(t,true);
+  const before=await current.service.inspect(op.operationId,"operator-351");
+  assert.equal(before.eligible,true);
+  current.liveTask.updated_at="2026-11-07T10:00:00Z";
+  const changed=await current.service.inspect(op.operationId,"operator-351");
+  assert.equal(changed.eligible,false);
+  assert.match(changed.blockers.join(" / "),/active Todoist task state differs/i);
+  assert.equal(current.mutations,0);
 });
 test("#351 Undo rejects unknown actor and active/future Calendar occurrence without provider write",async t=>{
   const current=fixture(t);

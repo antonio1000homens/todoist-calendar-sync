@@ -202,13 +202,23 @@ export class RetirementUndoService {
     }catch(error){
       if(Number((error as {status?:number}).status)!==404)blockers.push("Todoist task status lookup failed");
     }
-    if(activeTask)blockers.push("Todoist has an active task; re-enable requires separate review");
-    if(!activeTask){
-      try {completedTask=await pair.todoist.findCompletedTaskById(op.target.taskId,versions.completedAt);}
-      catch {blockers.push("Todoist completed-task verification failed or was unavailable");}
-      if(!completedTask||completedTask.id!==op.target.taskId
-        ||completedTask.is_deleted===true||completedTask.completed_at!==versions.completedAt)
-        blockers.push("Completed Todoist task identity or completion version differs from retirement evidence");
+    if(op.evidenceMode==="past_due_active_task_operator_override"){
+      if(!activeTask||!versions.taskFingerprint||reviewHash(activeTask)!==versions.taskFingerprint
+        ||activeTask.updated_at!==versions.taskUpdatedAt
+        ||(activeTask.due?.datetime||activeTask.due?.date)!==versions.taskDue)
+        blockers.push("Active Todoist task state differs from the explicitly retired version");
+    }else{
+      if(activeTask)blockers.push("Todoist has an active task; re-enable requires separate review");
+      if(!activeTask){
+        if(!versions.completedAt)blockers.push("Original completed-task version is missing");
+        else {
+          try {completedTask=await pair.todoist.findCompletedTaskById(op.target.taskId,versions.completedAt);}
+          catch {blockers.push("Todoist completed-task verification failed or was unavailable");}
+          if(!completedTask||completedTask.id!==op.target.taskId
+            ||completedTask.is_deleted===true||completedTask.completed_at!==versions.completedAt)
+            blockers.push("Completed Todoist task identity or completion version differs from retirement evidence");
+        }
+      }
     }
     const relevant=rows.filter(row=>markerKeys.some(k=>k.pk===row.pk&&k.sk===row.sk))
       .map(row=>({pk:row.pk,sk:row.sk,hash:reviewHash(row)}))

@@ -20,6 +20,7 @@ export type RetirementPreview = {
   target: RetirementDiagnosticTarget;
   scope: "whole_ended_calendar_series";
   mode: "keep_provider_items";
+  evidenceMode?: "verified_completion" | "past_due_active_task_operator_override";
   inspectedAt: string;
   inspectionFingerprint: string;
   planFingerprint: string;
@@ -215,10 +216,13 @@ export function planRecurrenceRetirement(
   if([providerEvent,masterEvent].some(event=>
     event?.extendedProperties?.shared?.taskId===target.taskId))
     metadataHazards.push("Calendar shared taskId remains on provider objects; re-ingestion must honour the tombstone");
+  if(inspection.retirementEvidenceMode==="past_due_active_task_operator_override")
+    metadataHazards.push("The Todoist task is still active and remains open; operator approval retires only this old association based on its own past due date and ended Calendar series");
   metadataHazards.push("Todoist and Calendar provider objects are preserved without ANY metadata edits");
   const uniqueBlockers=[...new Set(blockers)];
   const plan={
     target,scope:"whole_ended_calendar_series" as const,mode:"keep_provider_items" as const,
+    ...(inspection.retirementEvidenceMode?{evidenceMode:inspection.retirementEvidenceMode}:{}),
     inspectedAt:inspection.checkedAt,inspectionFingerprint:inspection.previewFingerprint,
     status:uniqueBlockers.length?"blocked" as const:"reviewable" as const,
     blockers:uniqueBlockers,
