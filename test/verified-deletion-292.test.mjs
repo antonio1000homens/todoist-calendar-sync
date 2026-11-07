@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, readExactRecurrenceLinks, verifyCancelledSeries } from "../dist/verified-deletion.js";
+import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, readExactRecurrenceLinks, verifyCancelledSeries, verifyCancelledSeriesInstances } from "../dist/verified-deletion.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
 
 const taskId="6hqp4fFR45WvJ5VV";
@@ -174,4 +174,66 @@ test("#292 cancelled child never proves deleted master with different UID or sti
   assert.equal((await deletedRecurrenceStatus(legacyCase,missingMaster,lookup)).state,"unverified");
   assert.equal(verifyCancelledSeries(master,active,[master,active],
     new Map([[master,cancelledMaster],[active,{...cancelledActive,iCalUID:"another-uid"}]])).valid,false);
+});
+
+test("#292 complete instance inventory preserves a completed historical exception, never deletes history",async()=>{
+  const nowMs=Date.parse("2026-11-07T12:00:00Z");
+  const previous={id:completed,status:"confirmed",recurringEventId:master,
+    iCalUID:masterSeriesId,start:{date:"2026-11-02"}};
+  const current={id:active,status:"cancelled",recurringEventId:master,
+    iCalUID:masterSeriesId,start:{date:"2026-11-16"}};
+  const history={profile:"antonio",taskId,eventId:completed,masterEventId:master,
+    seriesId:masterSeriesId,recurrenceOwner:"calendar",
+    completedAt:"2026-10-25T19:09:00.177Z"};
+  const input={profile:"antonio",taskIds:[taskId],masterId:master,
+    masterSeriesId,activeInstanceId:active,instances:[previous,current],nowMs};
+  let reads=0;
+  const marker=async id=>{reads++;return id===completed?history:undefined;};
+  const first=await verifyCancelledSeriesInstances(input,marker);
+  assert.equal(first.valid,true,first.reason);
+  assert.equal(reads,1);
+  const second=await verifyCancelledSeriesInstances({
+    ...input,instances:[current,previous],
+  },marker);
+  assert.equal(second.valid,true,second.reason);
+  assert.equal(second.fingerprint,first.fingerprint,"provider pagination order cannot change proof");
+  for(const changed of [
+    {...input,instances:[{...previous,status:"tentative"},current]},
+    {...input,instances:[{...previous,id:active},current]},
+    {...input,instances:[{...previous,iCalUID:"foreign-uid"},current]},
+    {...input,instances:[previous,previous,current]},
+    {...input,instances:[{...previous,start:{date:"2026-12-02"}},current]},
+    {...input,instances:[{...current,status:"confirmed"},previous]},
+    {...input,instances:Array.from({length:101},(_,i)=>({
+      id:"occurrence-"+i,status:"cancelled",recurringEventId:master,
+    }))},
+  ]) assert.equal((await verifyCancelledSeriesInstances(changed,marker)).valid,false);
+  for(const missing of [
+    undefined,
+    {...history,taskId:"other"},
+    {...history,eventId:"other"},
+    {...history,masterEventId:"other"},
+    {...history,seriesId:"other"},
+    {...history,recurrenceOwner:"todoist"},
+    {...history,completedAt:"invalid"},
+  ]) {
+    const result=await verifyCancelledSeriesInstances(input,async()=>missing);
+    assert.equal(result.valid,false,JSON.stringify(missing));
+  }
+  const absent=await verifyCancelledSeriesInstances({...input,instances:[current]},marker);
+  assert.equal(absent.valid,true,"a fully cancelled series is safe without historical completion markers");
+});
+
+test("#292 provider instance version drift invalidates an already verified legacy retirement",async()=>{
+  const input={profile:"antonio",taskIds:[taskId],masterId:master,masterSeriesId,
+    activeInstanceId:active,nowMs:Date.parse("2026-11-07T12:00:00Z")};
+  const first=await verifyCancelledSeriesInstances({...input,instances:[
+    {id:active,status:"cancelled",recurringEventId:master,etag:"etag-a"},
+  ]},async()=>undefined);
+  const changed=await verifyCancelledSeriesInstances({...input,instances:[
+    {id:active,status:"cancelled",recurringEventId:master,etag:"etag-b"},
+  ]},async()=>undefined);
+  assert.equal(first.valid,true);
+  assert.equal(changed.valid,true);
+  assert.notEqual(first.fingerprint,changed.fingerprint);
 });
