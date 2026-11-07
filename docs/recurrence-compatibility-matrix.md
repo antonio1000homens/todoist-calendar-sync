@@ -189,3 +189,12 @@ observation are operator attestations, *not* provider-authenticated proof.
 Even a reported `native_exact` is a read-only diagnostic and cannot be
 used to enable automatic native writes. Further live fixture results,
 per-family acceptance, idempotent native mutation and rollback still remain.
+
+
+## Phase C Calendar → Todoist candidate/readback (read-only)
+
+The four Phase C candidate families, strict provider evidence gates and
+remaining live-provider/rollout work are documented in
+[Phase C Calendar → Todoist proof gates](phase-c-calendar-provider-gates.md).
+The production native translator is intentionally unchanged; no new native
+Calendar-owned writes are enabled by Phase C classification alone.
