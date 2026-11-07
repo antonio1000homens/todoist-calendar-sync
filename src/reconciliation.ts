@@ -600,7 +600,7 @@ export class SnapshotReconciler {
         const legacyMaster = recurring && !recordedMasterId;
         const masterId = legacyMaster
           ? cancelledOccurrenceMasterId(activeInstanceId,
-            await this.currentEvent(clients.calendar, activeInstanceId))
+            await this.currentEvent(clients.calendar, activeInstanceId!))
           : recordedMasterId;
         if (recurring && (!masterId || masterId === activeInstanceId)) continue;
         const verifiedEventIds = recurring
