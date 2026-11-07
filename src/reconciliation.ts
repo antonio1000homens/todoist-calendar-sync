@@ -491,7 +491,8 @@ export class SnapshotReconciler {
       const newerAnnual = Boolean(task && !task.is_deleted && !task.is_completed
         && task.due?.is_recurring && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
         && task.updated_at && mapping.updatedAt
-        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt));
+        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt)
+        && (!event?.updated || Date.parse(task.updated_at)>Date.parse(event.updated)));
       if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual || newerSourceWithProof) {
         await this.state.audit(profile,"calendar_cancelled_annual_todoist_protected",{
           taskId:mapping.taskId,eventId:mapping.eventId,
