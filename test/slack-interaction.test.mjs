@@ -121,3 +121,11 @@ test("worker authorization preserves workspace behavior and applies an exact opt
   assert.equal(isSlackControlUserAllowed("U123456", " U123456, U999999 "), true);
   assert.equal(isSlackControlUserAllowed("U1234567", "U123456"), false);
 });
+
+
+test("empty /sync command text preserves legacy help behaviour after gateway cutover", () => {
+  const delivery = envelope({ commandText: "" });
+  const decoded = decodeSlackInteractionDelivery(delivery);
+  assert.equal(decoded.manual?.command, "help");
+  assert.match(decoded.manual?.message || "", /\/sync policies/);
+});

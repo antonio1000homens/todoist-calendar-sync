@@ -12,9 +12,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function boundedString(value: unknown, name: string, maxBytes = 256): string | undefined {
+function boundedString(value: unknown, name: string, maxBytes = 256, allowEmpty = false): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > maxBytes || /[\u0000-\u001f\u007f]/.test(value)) {
+  if (typeof value !== "string" || (!allowEmpty && !value) || Buffer.byteLength(value, "utf8") > maxBytes || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Invalid Slack interaction ${name}`);
   }
   return value;
@@ -186,7 +186,7 @@ export function decodeSlackInteractionDelivery(delivery: Delivery): Delivery {
   const messageTs = boundedString(value.messageTs, "message timestamp", 32);
   let manual: ManualControlDelivery;
   if (value.type === "slash_command") {
-    const commandText = boundedString(value.commandText, "command text", maxCommandBytes);
+    const commandText = boundedString(value.commandText, "command text", maxCommandBytes, true);
     if (commandText === undefined) throw new Error("Slack command text is required");
     manual = parseSlashCommand(commandText, delivery.profile);
   } else if (value.type === "block_action") {
