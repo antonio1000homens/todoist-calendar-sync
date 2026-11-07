@@ -42,7 +42,6 @@ export interface CalendarPhaseCReadback {
     owner: "calendar";
   };
 }
-const weekdayOrder = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 const weekdayLabels: Record<string, string> = {
   MO: "mon", TU: "tue", WE: "wed", TH: "thu", FR: "fri", SA: "sat", SU: "sun",
 };
@@ -92,7 +91,10 @@ function sameOccurrence(actual: { date: string; time?: string } | undefined,
 }
 function phraseTime(value: string): string | undefined {
   const ending = /\s+(?:at\s+)?(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\s*$/i.exec(value);
-  if (!ending) return undefined;
+  if (!ending) {
+    const clock24 = /\s+(?:at\s+)?([01]?\d|2[0-3]):([0-5]\d)\s*$/i.exec(value);
+    return clock24 ? String(Number(clock24[1])).padStart(2, "0") + ":" + clock24[2] : undefined;
+  }
   const hour = Number(ending[1]);
   if (hour < 1 || hour > 12) return undefined;
   return String(hour % 12 + (ending[3].toLowerCase() === "pm" ? 12 : 0)).padStart(2, "0")
@@ -105,7 +107,8 @@ function normalizedTaskMatches(task: TodoistTask, candidate: CalendarPhaseCCandi
   const normalized = task.due.string.trim().replace(/\s+/g, " ");
   if (semantic.localTime) {
     if (phraseTime(normalized) !== semantic.localTime) return false;
-  } else if (/\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)$/i.test(normalized)) return false;
+  } else if (/\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)$/i.test(normalized)
+    || /\s+(?:at\s+)?(?:[01]?\d|2[0-3]):[0-5]\d$/i.test(normalized)) return false;
   const parsed = classifyTodoistRule(normalized, { start: anchor, timeZone: zone });
   return Boolean(parsed.semantic && parsed.canonicalRrule === candidate.candidateRrule
     && compareOccurrenceSemantics(semantic, parsed.semantic).equivalent);
@@ -186,7 +189,7 @@ export function verifyCalendarPhaseCReadback(master: CalendarEvent, timeZone: st
     || !compareOccurrenceSemantics(s, persistedCandidate.semantic).equivalent)
     return reject("calendar_master_readback_mismatch");
   if (!evidence.exceptionInventoryComplete || !Array.isArray(evidence.explicitExceptions)
-    || evidence.explicitExceptions.length !== 0
+    || evidence.explicitExceptions.length !== 0 || !Array.isArray(evidence.calendarInstances)
     || evidence.calendarInstances.some((item) => item.status === "cancelled"))
     return reject("calendar_exception_inventory_unverified");
   if (s.localTime && (!evidence.timeZoneVerified || !timeZone
