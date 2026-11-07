@@ -180,3 +180,67 @@ test("#351 Undo rejects unknown actor and active/future Calendar occurrence with
   assert.equal(inspected.eligible,false);
   assert.match(inspected.blockers.join(" / "),/live or competing mapping/i);
 });
+
+test("#351 clean exclusively attributable closed review case, conflict pointer and resolved manual with its audit",()=>{
+  const rows=records();
+  rows.push(
+    {pk:"REVIEW_CASE#incident-owned",sk:"STATE",id:"incident-owned",
+      profile:"work",status:"dismissed",taskId:target.taskId,eventId:target.eventId,
+      sourceAuditKey:"AUDIT#work#item-1",conflictKey:"owned-fingerprint",
+      updatedAt:"2026-10-23T00:00:00Z",createdAt:"2026-10-22T12:00:00Z"},
+    {pk:"REVIEW_CONFLICT#work#owned-fingerprint",sk:"INCIDENT#incident-owned",
+      profile:"work",conflictKey:"owned-fingerprint",incidentId:"incident-owned"},
+    {pk:"MANUAL#incident-owned",sk:"STATE",profile:"work",decisionId:"incident-owned",
+      status:"resolved",createdAt:"2026-10-22T12:00:00Z"},
+  );
+  const plan=planRetirementIncidentCleanup(op,rows);
+  assert.equal(plan.eligible,true,JSON.stringify(plan.blockedReasons));
+  assert.deepEqual(plan.safeClosedCaseKeys,[{pk:"REVIEW_CASE#incident-owned",sk:"STATE"}]);
+  assert.deepEqual(plan.safeClosedConflictPointerKeys,[{
+    pk:"REVIEW_CONFLICT#work#owned-fingerprint",sk:"INCIDENT#incident-owned"}]);
+  assert.deepEqual(plan.safeResolvedManualKeys,[{pk:"MANUAL#incident-owned",sk:"STATE"}]);
+  const cmd=buildIncidentCleanupTransaction(op,plan,rows,"2026-11-06T19:31:00Z","table");
+  const keys=cmd.input.TransactItems.filter(x=>x.Delete).map(x=>x.Delete.Key.pk);
+  for(const pk of ["AUDIT#work#item-1","AUDIT_REF#work#todoist#task351",
+    "REVIEW_CASE#incident-owned","REVIEW_CONFLICT#work#owned-fingerprint",
+    "MANUAL#incident-owned"]) assert.ok(keys.includes(pk),pk);
+  assert.ok(!keys.includes("COMPLETED_EVENT#work#oct-occurrence"));
+  assert.ok(!keys.includes("AUDIT#work#shared"));
+});
+test("#351 active, shared or repaired review cases keep source audit and cannot be cleaned",()=>{
+  const cases=[
+    {status:"open"},
+    {status:"repairing"},
+    {status:"dismissed",taskId:"someone-else"},
+    {status:"resolved",operationId:"repair-in-progress"},
+    {status:"resolved",coalescedInto:"another-case"},
+  ];
+  for(const changes of cases){
+    const rows=records();
+    rows.push({pk:"REVIEW_CASE#incident-owned",sk:"STATE",id:"incident-owned",
+      profile:"work",status:"dismissed",taskId:target.taskId,eventId:target.eventId,
+      sourceAuditKey:"AUDIT#work#item-1",createdAt:"2026-10-22T12:00:00Z",
+      updatedAt:"2026-10-23T00:00:00Z",...changes});
+    const plan=planRetirementIncidentCleanup(op,rows);
+    assert.equal(plan.eligible,false,JSON.stringify(changes));
+    assert.equal(plan.safeClosedCaseKeys.length,0);
+    assert.throws(()=>buildIncidentCleanupTransaction(op,plan,rows,
+      "2026-11-06T19:31:00Z","table"),/unchanged retired operation/i);
+  }
+});
+test("#351 missing conflict pointer or pending manual decision prevents orphaning history",()=>{
+  for(const kind of ["missing-pointer","pending-manual"]){
+    const rows=records();
+    rows.push({pk:"REVIEW_CASE#incident-owned",sk:"STATE",id:"incident-owned",
+      profile:"work",status:"resolved",taskId:target.taskId,eventId:target.eventId,
+      sourceAuditKey:"AUDIT#work#item-1",createdAt:"2026-10-22T12:00:00Z",
+      updatedAt:"2026-10-23T00:00:00Z",
+      ...(kind==="missing-pointer"?{conflictKey:"missing"}:{})});
+    if(kind==="pending-manual")rows.push({pk:"MANUAL#incident-owned",sk:"STATE",
+      profile:"work",decisionId:"incident-owned",status:"pending",
+      createdAt:"2026-10-22T12:00:00Z"});
+    const plan=planRetirementIncidentCleanup(op,rows);
+    assert.equal(plan.eligible,false);
+    assert.match(plan.blockedReasons.join(" / "),kind==="missing-pointer"?/pointer is missing/:/manual decision/);
+  }
+});
