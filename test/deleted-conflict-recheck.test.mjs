@@ -4,6 +4,7 @@ import { requestDeletedConflictReview } from "../dist/deleted-conflict-recheck.j
 
 const reviewFor = (items) => ({
   async listCases() { return { items, cursor: undefined }; },
+  async listDeletedConflictCaseIds(){return [];},
   async indexDeletedConflictCase(item) { assert.equal(item.status, "open"); },
   async markDeletedReviewPendingRefresh(refs) {
     return refs.map(ref=>({...ref,pendingRefreshAt:"fresh-"+ref.id}));
@@ -62,6 +63,7 @@ test("unrelated or already-resolved deleted identities never enqueue reconciliat
 test("one cancellation of two case-backed events indexes ALL cases before one queued generation",async()=>{
   const h=harness(),order=[];
   const review={
+    async listDeletedConflictCaseIds(){return [];},
     async listCases(){return {items:[
       {id:"A",status:"open",taskId:"task-a",eventId:"event-a"},
       {id:"B",status:"open",taskId:"task-b",eventId:"event-b"},
