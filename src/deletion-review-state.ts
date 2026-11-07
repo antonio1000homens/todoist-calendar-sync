@@ -32,7 +32,7 @@ export async function deletedRecurrenceStatus(
   const legacyMaster = !recordedMasterId;
   const activeSnapshot = activeInstanceId ? find("calendar",activeInstanceId) : undefined;
   const recoveredMaster = !activeSnapshot?.lookupError
-    ? cancelledOccurrenceMasterId(activeInstanceId,activeSnapshot?.object || undefined as CalendarEvent | undefined)
+    ? cancelledOccurrenceMasterId(activeInstanceId,(activeSnapshot?.object ?? undefined) as CalendarEvent | undefined)
     : undefined;
   const masterId = recordedMasterId || recoveredMaster;
   const eventIds = [...new Set([...recordedEventIds,...(masterId?[masterId]:[])])];
