@@ -186,9 +186,10 @@ export async function attemptCancelledAnnualRecovery(
       ExpressionAttributeValues:{":dismissed":"dismissed",":op":operation.id,":at":reviewCase.updatedAt}}},
     {Update:{TableName:table,Key:key("REPAIR#"+operation.id),
       UpdateExpression:"SET abandoned = :yes, #s = :failed, updatedAt = :now, nextAction = :next",
-      ConditionExpression:"#s = :failed AND updatedAt = :at AND attempt = :attempt AND steps = :steps AND preview = :preview AND (attribute_not_exists(creations) OR creations = :creations) AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted) AND attribute_not_exists(outcomes) AND attribute_not_exists(verified) AND attribute_not_exists(recurrenceBindings)",
+      ConditionExpression:"#s = :failed AND updatedAt = :at AND attempt = :attempt AND steps = :steps AND preview = :preview AND (attribute_not_exists(creations) OR creations = :creations) AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted) AND attribute_not_exists(outcomes) AND attribute_not_exists(verified) AND attribute_not_exists(recurrenceBindings) AND (attribute_not_exists(expectedProviders) OR expectedProviders = :expectedProviders) AND (attribute_not_exists(claimSnapshots) OR claimSnapshots = :claimSnapshots)",
       ExpressionAttributeNames:{"#s":"status"},
-      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded evidence-based projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps,":preview":operation.preview,":creations":operation.creations||{}}}},
+      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded evidence-based projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps,":preview":operation.preview,":creations":operation.creations||{},
+        ":expectedProviders":operation.expectedProviders||{},":claimSnapshots":operation.claimSnapshots||[]}}},
     ...controls.map(({ref,row})=>{
       const conditions=["activeRepair = :op","(attribute_not_exists(excluded) OR excluded = :false)"];
       const values:Record<string,unknown>={":op":operation.id,":now":now,":false":false};
