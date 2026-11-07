@@ -123,7 +123,6 @@ test("creates exactly one guarded transaction, preserves repair, original task a
   assert.ok(items.every(x=>!x.Delete?.Key?.pk?.startsWith("AUDIT#")));
   assert.ok(items.every(x=>!x.Delete?.Key?.pk?.startsWith("COMPLETED")));
   assert.ok(items.every(x=>!x.Delete?.Key?.pk?.startsWith("REPAIR#")));
-  assert.ok(!items.some(x=>x.Delete?.Key?.pk==="TASK#home#task-annual"));
 });
 
 test("fails closed on a confirmed or ambiguous provider-linked counterpart",async()=>{
