@@ -476,6 +476,22 @@ export class SnapshotReconciler {
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
     if (!event || event.status === "cancelled") {
+      // #369: a newer, still-live annual Todoist source must never be
+      // destroyed by the cancelled Calendar projection's stale baseline.
+      // The guarded reset may have already retired the old mapping in a
+      // transaction while this reconciliation held an older snapshot.
+      const pending = await this.state.getCancelledAnnualRecoveryReceipt?.(profile,mapping.taskId);
+      const newerAnnual = Boolean(task && !task.is_deleted && !task.is_completed
+        && task.due?.is_recurring && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
+        && task.updated_at && mapping.updatedAt
+        && Date.parse(task.updated_at)>Date.parse(mapping.updatedAt));
+      if ((pending && pending.oldEventId===mapping.eventId) || newerAnnual) {
+        await this.state.audit(profile,"calendar_cancelled_annual_todoist_protected",{
+          taskId:mapping.taskId,eventId:mapping.eventId,
+          pendingReset:Boolean(pending),
+        });
+        return "blocked";
+      }
       if (task) {
         await clients.todoist.deleteTask(task.id).catch((error: unknown) => {
           if (Number((error as { status?: number }).status) !== 404) throw error;
