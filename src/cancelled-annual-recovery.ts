@@ -5,7 +5,7 @@
 import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore } from "./review-store.js";
-import { operationHasWriteEvidence, entityKey, type RepairOperation, type ReviewCase, type EntityRef } from "./review-types.js";
+import { entityKey, type RepairOperation, type ReviewCase, type EntityRef } from "./review-types.js";
 import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { knownPrewriteRecoveryValidationCase } from "./guarded-recovery-incidents.js";
@@ -36,6 +36,8 @@ export interface AnnualRecoveryInput {
   profile:Profile; task:TodoistTask; mapping:Mapping; operationId:string; writeToken:string;
   state:StateRepository;
   calendar:Pick<GoogleCalendar,"getEvent"|"listLinkedEventsByTodoistTaskId"|"listExplicitSeriesExceptions">;
+  /** Required for new #378 policy families; a missing inventory is not absence. */
+  calendarForProfile?:(profile:Profile)=>Promise<Pick<GoogleCalendar,"listLinkedEventsByTodoistTaskId">>;
   todoist:Pick<Todoist,"getTask">;
 }
 export async function attemptCancelledAnnualRecovery(
@@ -87,6 +89,19 @@ export async function attemptCancelledAnnualRecovery(
   for (const id of oldCalendarIds) {
     if (await state.getCompletedCalendarProjectionByEvent(profile,id)) return false;
     if (await review.hasActiveDeletionGuard(profile,"calendar",id)) return false;
+  }
+  // The task ID can be present as a Calendar alias in another profile even
+  // when all DynamoDB mapping views are absent there. An exhaustive provider
+  // search (including cancelled aliases) must succeed before a new policy
+  // can claim sole ownership. Legacy #369 annual remains compatible.
+  if (eligibility.policy!=="yearly" && !input.calendarForProfile) return false;
+  if (input.calendarForProfile) {
+    for (const other of profiles) {
+      if (other===profile) continue;
+      const otherCalendar=await input.calendarForProfile(other);
+      const aliases=await otherCalendar.listLinkedEventsByTodoistTaskId(task.id);
+      if (!Array.isArray(aliases) || aliases.length) return false;
+    }
   }
 
   // Full typed source inventory: this method pages even cancelled events.
