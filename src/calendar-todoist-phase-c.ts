@@ -180,10 +180,46 @@ export function matchesCalendarPhaseCTask(
   const localAnchor = candidate.semantic.startDate
     + (candidate.semantic.localTime ? "T" + candidate.semantic.localTime + ":00" : "");
   if (!normalizedTaskMatches(task, candidate, localAnchor, timeZone)) return false;
-  const dates = occurrenceDates(candidate.semantic, 2000);
   const due = taskOccurrence(task, candidate.semantic);
-  return Boolean(due && dates.includes(due.date)
+  return Boolean(due && phaseCDateMatches(candidate.semantic, due.date)
     && due.time === candidate.semantic.localTime);
+}
+
+const DAY_CODES = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"] as const;
+const DAY_MS = 86_400_000;
+/** Calendar-date membership without unbounded RRULE expansion or DST arithmetic.
+ * The four Phase C families only use weekly BYDAY or fixed monthly days. */
+function phaseCDateMatches(semantic: RecurrenceSemantics, iso: string): boolean {
+  if (!dateOnly.test(iso)) return false;
+  const anchor = new Date(semantic.startDate + "T00:00:00Z");
+  const date = new Date(iso + "T00:00:00Z");
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== iso
+    || date.getTime() < anchor.getTime()) return false;
+  if (semantic.frequency === "WEEKLY") {
+    const firstMonday = anchor.getTime() - ((anchor.getUTCDay() + 6) % 7) * DAY_MS;
+    const thisMonday = date.getTime() - ((date.getUTCDay() + 6) % 7) * DAY_MS;
+    const weeks = (thisMonday - firstMonday) / (DAY_MS * 7);
+    return Number.isInteger(weeks) && weeks % semantic.interval === 0
+      && Boolean(semantic.byDay?.includes(DAY_CODES[date.getUTCDay()]));
+  }
+  if (semantic.frequency === "MONTHLY") {
+    const months = (date.getUTCFullYear() - anchor.getUTCFullYear()) * 12
+      + date.getUTCMonth() - anchor.getUTCMonth();
+    return months >= 0 && months % semantic.interval === 0
+      && (semantic.byMonthDay?.length
+        ? semantic.byMonthDay.includes(date.getUTCDate())
+        : date.getUTCDate() === anchor.getUTCDate());
+  }
+  return false;
+}
+function phaseCNextDate(semantic: RecurrenceSemantics, iso: string): string | undefined {
+  const start = Date.parse(iso + "T00:00:00Z");
+  // Every whitelisted pattern has a successor in <= 370 civil days.
+  for (let offset = 1; offset <= 370; offset++) {
+    const next = new Date(start + offset * DAY_MS).toISOString().slice(0, 10);
+    if (phaseCDateMatches(semantic, next)) return next;
+  }
+  return undefined;
 }
 
 /** Every returned Google instance must agree with the anchored RRULE sequence.
@@ -194,18 +230,20 @@ export function calendarPhaseCInstancesConform(
 ): boolean {
   if (!candidate.semantic || candidate.reason !== "provider_readback_required"
     || instances.length < 3) return false;
-  const dates = new Set(occurrenceDates(candidate.semantic, 2000));
   const ids = new Set<string>();
+  let previousDate: string | undefined;
   for (const item of instances) {
     const original = localOccurrence(item.originalStartTime, timeZone);
     const actual = localOccurrence(item.start, timeZone);
     if (!item.id || ids.has(item.id) || item.recurringEventId !== master.id
       || item.status !== "confirmed" || item.recurrence?.length
-      || !original || !actual || !dates.has(original.date)
+      || !original || !actual || !phaseCDateMatches(candidate.semantic, original.date)
+      || (previousDate && phaseCNextDate(candidate.semantic, previousDate) !== original.date)
       || original.date !== actual.date || original.time !== actual.time
       || original.time !== candidate.semantic.localTime)
       return false;
     ids.add(item.id);
+    previousDate = original.date;
   }
   return true;
 }
