@@ -4,7 +4,7 @@ import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
-import { classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
+import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
 import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
@@ -591,13 +591,26 @@ export class SnapshotReconciler {
         const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
         if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
         const recurring = item.decision?.type?.includes("recurrence_task_deleted") === true;
-        const masterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
+        const recordedMasterId = item.decision?.masterEventId || item.decision?.mappingSnapshot?.masterEventId;
         const activeInstanceId = item.decision?.activeInstanceId || item.decision?.mappingSnapshot?.activeInstanceId;
-        if (recurring && (!masterId || !activeInstanceId
-          || !eventIds.includes(masterId) || !eventIds.includes(activeInstanceId))) continue;
+        if (recurring && (!activeInstanceId || !eventIds.includes(activeInstanceId))) continue;
+        // Legacy Todoist-owned recurrence mappings did not persist masterEventId.
+        // Recover only from the cancelled active occurrence's direct provider
+        // recurringEventId; independently verify the cancelled master below.
+        const legacyMaster = recurring && !recordedMasterId;
+        const masterId = legacyMaster
+          ? cancelledOccurrenceMasterId(activeInstanceId,
+            await this.currentEvent(clients.calendar, activeInstanceId))
+          : recordedMasterId;
+        if (recurring && (!masterId || masterId === activeInstanceId)) continue;
+        const verifiedEventIds = recurring
+          ? [...new Set([...eventIds,masterId!])]
+          : eventIds;
+        if (taskIds.length + verifiedEventIds.length > 20) continue;
 
         const readProviders = async (): Promise<{
           absent: boolean; masterSeriesId?: string; reason?: string;
+          legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
         }> => {
           for (const taskId of taskIds) {
             if (await this.currentTask(clients.todoist, taskId)
@@ -605,7 +618,7 @@ export class SnapshotReconciler {
               || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
           }
           const events = new Map<string, CalendarEvent | undefined>();
-          for (const eventId of eventIds) {
+          for (const eventId of verifiedEventIds) {
             const event = await this.currentEvent(clients.calendar, eventId);
             events.set(eventId, event);
             if (event && event.status !== "cancelled") return { absent: false };
@@ -614,16 +627,26 @@ export class SnapshotReconciler {
               || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
           }
           if (!recurring) return { absent: true };
-          const relationship = verifyCancelledSeries(masterId, activeInstanceId, eventIds, events);
-          return { absent: relationship.valid, masterSeriesId: relationship.masterSeriesId,
+          const relationship = verifyCancelledSeries(masterId, activeInstanceId, verifiedEventIds, events);
+          const active = events.get(activeInstanceId!);
+          // A recovered master must remain the one independently named by
+          // the cancelled occurrence at BOTH preflight reads.
+          const legacyVerified = legacyMaster && relationship.valid
+            && cancelledOccurrenceMasterId(activeInstanceId,active) === masterId;
+          return { absent: relationship.valid && (!legacyMaster || legacyVerified),
+            masterSeriesId: relationship.masterSeriesId,
+            ...(legacyVerified ? {legacyMasterProof: {
+              master: events.get(masterId!)!, occurrence: active!,
+            }} : {}),
             reason: relationship.reason };
         };
         const first = await readProviders();
-        if (!first.absent || recurring && !first.masterSeriesId) continue;
+        if (!first.absent || recurring && !first.masterSeriesId
+          || legacyMaster && !first.legacyMasterProof) continue;
         const seriesKeys = recurring
-          ? deletedSeriesKeys(taskIds, eventIds, first.masterSeriesId!,
+          ? deletedSeriesKeys(taskIds, verifiedEventIds, first.masterSeriesId!,
             [item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId])
-          : [...new Set([...taskIds, ...eventIds])];
+          : [...new Set([...taskIds, ...verifiedEventIds])];
         if (seriesKeys.length > 20) continue;
 
         // The profile lookup GSI is eventually consistent and cannot prove
@@ -632,8 +655,10 @@ export class SnapshotReconciler {
         // Their absences are fenced again INSIDE the terminal transaction.
         const links = await readExactRecurrenceLinks(seriesKeys,
           (owner, seriesId) => this.state.getRecurrenceLink(owner, seriesId));
-        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, eventIds, links, seriesKeys,
-          recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId! } : undefined);
+        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, verifiedEventIds, links, seriesKeys,
+          recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId!,
+            ...(legacyMaster ? {legacyMasterVerified: Boolean(first.legacyMasterProof)} : {}),
+          } : undefined);
         if (classification.blocked.length) {
           await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
             taskId: taskIds[0], eventId: eventIds[0],
@@ -644,11 +669,13 @@ export class SnapshotReconciler {
         // Re-read all provider identities after the state inventory. A changed
         // master UID invalidates the series-key set rather than using old data.
         const final = await readProviders();
-        if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId) continue;
+        if (!final.absent || recurring && final.masterSeriesId !== first.masterSeriesId
+          || legacyMaster && !final.legacyMasterProof) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, {
-          profile, taskIds, eventIds, staleLinks: classification.stale,
+          profile, taskIds, eventIds: verifiedEventIds, staleLinks: classification.stale,
           seriesKeys, ...(recurring ? {
             masterId, activeInstanceId, masterSeriesId: first.masterSeriesId,
+            ...(legacyMaster ? {legacyMasterProof: final.legacyMasterProof} : {}),
           } : {}),
         });
         if (closed) {
