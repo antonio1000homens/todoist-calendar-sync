@@ -77,11 +77,17 @@ function localOccurrence(value: {date?: string; dateTime?: string; timeZone?: st
   } catch { return undefined; }
 }
 function taskOccurrence(task: TodoistTask, semantic: RecurrenceSemantics) {
-  if (semantic.localTime && task.due?.timezone !== semantic.timeZone) return undefined;
-  return localOccurrence(task.due ? {
-    date: task.due.datetime ? undefined : task.due.date,
-    dateTime: task.due.datetime,
-    timeZone: task.due.timezone,
+  if (semantic.localTime && task.due?.timezone && task.due.timezone !== semantic.timeZone) return undefined;
+  const due = task.due;
+  // Todoist can persist floating local due.datetime when its project/account
+  // timezone was verified separately. Never feed this through Date.parse().
+  const floating = due?.datetime?.match(/^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/);
+  if (floating && semantic.timeZone)
+    return { date: floating[1], time: floating[2] + ":" + floating[3] };
+  return localOccurrence(due ? {
+    date: due.datetime ? undefined : due.date,
+    dateTime: due.datetime,
+    timeZone: due.timezone,
   } : undefined, semantic.timeZone);
 }
 function sameOccurrence(actual: { date: string; time?: string } | undefined,
@@ -157,6 +163,89 @@ export function calendarPhaseCCandidate(master: CalendarEvent, timeZone?: string
     disposition: "rolling_required", reason: "provider_readback_required", family,
     todoistPhrase, candidateRrule: parsed.canonicalRrule, semantic: s,
   };
+}
+
+/**
+ * Post-write provider readback for the *already independently validated* Phase C
+ * subset. Validates the provider-normalized recurrence, anchored due date, wall
+ * clock and timezone. This is a single-write guard, not completion provenance.
+ */
+export function matchesCalendarPhaseCTask(
+  task: TodoistTask, candidate: CalendarPhaseCCandidate, anchor: string, timeZone?: string,
+): boolean {
+  if (!candidate.semantic || candidate.reason !== "provider_readback_required" || !anchor) return false;
+  // The provider may expose a floating local datetime. Normalize Todoist's
+  // due text against the Calendar-local DTSTART, not a date-only anchor that
+  // would silently lose the 09:00 wall clock across DST.
+  const localAnchor = candidate.semantic.startDate
+    + (candidate.semantic.localTime ? "T" + candidate.semantic.localTime + ":00" : "");
+  if (!normalizedTaskMatches(task, candidate, localAnchor, timeZone)) return false;
+  const due = taskOccurrence(task, candidate.semantic);
+  return Boolean(due && phaseCDateMatches(candidate.semantic, due.date)
+    && due.time === candidate.semantic.localTime);
+}
+
+const DAY_CODES = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"] as const;
+const DAY_MS = 86_400_000;
+/** Calendar-date membership without unbounded RRULE expansion or DST arithmetic.
+ * The four Phase C families only use weekly BYDAY or fixed monthly days. */
+function phaseCDateMatches(semantic: RecurrenceSemantics, iso: string): boolean {
+  if (!dateOnly.test(iso)) return false;
+  const anchor = new Date(semantic.startDate + "T00:00:00Z");
+  const date = new Date(iso + "T00:00:00Z");
+  if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== iso
+    || date.getTime() < anchor.getTime()) return false;
+  if (semantic.frequency === "WEEKLY") {
+    const firstMonday = anchor.getTime() - ((anchor.getUTCDay() + 6) % 7) * DAY_MS;
+    const thisMonday = date.getTime() - ((date.getUTCDay() + 6) % 7) * DAY_MS;
+    const weeks = (thisMonday - firstMonday) / (DAY_MS * 7);
+    return Number.isInteger(weeks) && weeks % semantic.interval === 0
+      && Boolean(semantic.byDay?.includes(DAY_CODES[date.getUTCDay()]));
+  }
+  if (semantic.frequency === "MONTHLY") {
+    const months = (date.getUTCFullYear() - anchor.getUTCFullYear()) * 12
+      + date.getUTCMonth() - anchor.getUTCMonth();
+    return months >= 0 && months % semantic.interval === 0
+      && (semantic.byMonthDay?.length
+        ? semantic.byMonthDay.includes(date.getUTCDate())
+        : date.getUTCDate() === anchor.getUTCDate());
+  }
+  return false;
+}
+function phaseCNextDate(semantic: RecurrenceSemantics, iso: string): string | undefined {
+  const start = Date.parse(iso + "T00:00:00Z");
+  // Every whitelisted pattern has a successor in <= 370 civil days.
+  for (let offset = 1; offset <= 370; offset++) {
+    const next = new Date(start + offset * DAY_MS).toISOString().slice(0, 10);
+    if (phaseCDateMatches(semantic, next)) return next;
+  }
+  return undefined;
+}
+
+/** Every returned Google instance must agree with the anchored RRULE sequence.
+ * A complete *explicit exception inventory* is checked separately. */
+export function calendarPhaseCInstancesConform(
+  master: CalendarEvent, instances: CalendarEvent[],
+  candidate: CalendarPhaseCCandidate, timeZone?: string,
+): boolean {
+  if (!candidate.semantic || candidate.reason !== "provider_readback_required"
+    || instances.length < 3) return false;
+  const ids = new Set<string>();
+  let previousDate: string | undefined;
+  for (const item of instances) {
+    const original = localOccurrence(item.originalStartTime, timeZone);
+    const actual = localOccurrence(item.start, timeZone);
+    if (!item.id || ids.has(item.id) || item.recurringEventId !== master.id
+      || item.status !== "confirmed" || item.recurrence?.length
+      || !original || !actual || !phaseCDateMatches(candidate.semantic, original.date)
+      || (previousDate && phaseCNextDate(candidate.semantic, previousDate) !== original.date)
+      || original.date !== actual.date || original.time !== actual.time
+      || original.time !== candidate.semantic.localTime)
+      return false;
+    ids.add(item.id);
+    previousDate = original.date;
+  }
+  return true;
 }
 
 /**

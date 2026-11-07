@@ -42,6 +42,9 @@ jobs:
       # (seven-day retained mappings) has been deployed and verified.
       # Unset/false keeps the destructive cleanup OFF; revert without code edits.
       COMPLETED_HISTORY_CLEANUP_APPLY: ${{ vars.COMPLETED_HISTORY_CLEANUP_APPLY || 'false' }}
+      # #290: true by operator request; set production var PHASE_C_NATIVE_ENABLED=false
+      # and dispatch deployment to roll back new native Calendar->Todoist creation.
+      PHASE_C_NATIVE_ENABLED: ${{ vars.PHASE_C_NATIVE_ENABLED || 'true' }}
       # A merge triggers automatic production deployment; lowering live RCU/WCU
       # requires a separate operator approval in the production environment.
       DYNAMODB_CAPACITY_REDUCTION_APPROVED: ${{ vars.DYNAMODB_CAPACITY_REDUCTION_APPROVED }}
