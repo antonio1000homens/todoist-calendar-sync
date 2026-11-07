@@ -582,7 +582,7 @@ export class ReviewStore {
       }));
       if(page.LastEvaluatedKey)return false; // never perform a partial cleanup
       const visited=new Set<string>();
-      const auditDeletes=new Set(items.filter(op=>op.Delete).map(op=>op.Delete?.Key.pk));
+      const auditDeletes=new Set(items.filter(op=>op.Delete).map(op=>op.Delete?.Key?.pk));
       for(const entry of page.Items || []){
         const pointer=entry as {pk?:string;sk?:string;incidentId?:string;profile?:string;conflictKey?:string};
         const id=pointer.incidentId;
