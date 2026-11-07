@@ -73,6 +73,7 @@ function harness(overrides={}){
     async getOperation(){return overrides.operation??operation;},
     async getCase(){return overrides.reviewCase??reviewCase;},
     async hasActiveDeletionGuard(){return overrides.deletionGuard??false;},
+    async listCases(){return {items:overrides.openCases??[],cursor:undefined};},
   };
   const state={
     async isRetired(){return false;},
@@ -167,6 +168,12 @@ test("lost transaction acknowledgement or conditional race never triggers a best
     }
     throw new Error("Unexpected command");
   };
+  assert.equal(await run(h),false);
+  assert.equal(h.transactions.length,0);
+});
+
+test("open competing case blocks recovery without modifying any provider or state",async()=>{
+  const h=harness({openCases:[{id:"unrelated",profile:"home",status:"open",taskId:task.id}]});
   assert.equal(await run(h),false);
   assert.equal(h.transactions.length,0);
 });
