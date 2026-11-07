@@ -149,6 +149,8 @@ export interface TodoistTask {
   due?: TodoistDue | null;
   url?: string;
   updated_at?: string;
+  /** Set by Todoist provider reads that expose retained completion evidence. */
+  completed_at?: string;
   is_completed?: boolean;
   is_deleted?: boolean;
 }

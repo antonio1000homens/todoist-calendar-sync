@@ -29,7 +29,7 @@ import type { Profile } from "./types.js";
 const validOperationId=/^[0-9a-f-]{36}$/i;
 const validFingerprint=/^[a-f0-9]{64}$/;
 const APPROVAL_MS=30*60_000;
-export const RETIREMENT_APPROVAL_PHRASE="RETIRE ASSOCIATION KEEP PROVIDER ITEMS";
+export const RETIREMENT_APPROVAL_PHRASE="RETIRE ASSOCIATION KEEP PROVIDER ITEMS WITHOUT SERIES CERTIFICATE";
 type Db=Pick<DynamoDBDocumentClient,"send">;
 export type RetirementOperation={
   pk:string;sk:"STATE";operationId:string;profile:Profile;

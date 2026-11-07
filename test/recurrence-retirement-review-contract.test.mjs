@@ -7,7 +7,7 @@ import {handler} from "../dist/review-api.js";
 const origin="https://calendar-sync.alf-broadcast.co.uk";
 const issuer="https://retirement-351-access.example";
 const audience="retirement-audience-351";
-const phrase="RETIRE ASSOCIATION KEEP PROVIDER ITEMS";
+const phrase="RETIRE ASSOCIATION KEEP PROVIDER ITEMS WITHOUT SERIES CERTIFICATE";
 const undoPhrase="RE-ENABLE ASSOCIATION SYNC WITHOUT RESTORING MAPPING";
 const target={profile:"work",generation:"historical-351",
   taskId:"completed-task-351",eventId:"historical-occurrence-351",

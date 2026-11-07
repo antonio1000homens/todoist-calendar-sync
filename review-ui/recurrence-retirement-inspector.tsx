@@ -243,13 +243,13 @@ export function RecurrenceRetirementInspector({
           </details>
           <p>Preview version: <code>{preview.planFingerprint}</code></p>
           {preview.status==="reviewable"&&!retirementStatus&&<div>
-            <p><strong>Operator approval required.</strong> This retires only the whole-series mapping and prevents future syncing of those exact identities. Both provider objects are retained without editing their metadata.</p>
+            <p><strong>Operator approval required.</strong> This retires only the whole-series mapping and prevents future syncing of those exact identities. When the legacy terminal-series certificate is absent, approval is available only with direct proof that this exact Todoist task completed over seven days ago, matching immutable occurrence history, and a complete Calendar series with no future instances. Both provider objects are retained without editing their metadata.</p>
             <button type="button" disabled={busy} onClick={requestRetirementApproval}>Request retirement approval token</button>
           </div>}
         </section>}
         {approval&&<section className="preview" aria-label="Confirm whole-series retirement">
           <h4>Confirm retirement — keep both provider items</h4>
-          <p>The current mapping and selected history will be removed conditionally. Todoist task <code>{item.taskId}</code> and Calendar series <code>{item.seriesId}</code> will <strong>not</strong> be deleted, rescheduled, completed or edited. Further sync of these identities is disabled until a separate re-enable operation.</p>
+          <p>The current mapping and selected history will be removed conditionally. This approval acknowledges that a legacy terminal-series certificate may be absent; fresh Todoist completion, immutable occurrence history and a complete ended Calendar series are required before Apply. Todoist task <code>{item.taskId}</code> and Calendar series <code>{item.seriesId}</code> will <strong>not</strong> be deleted, rescheduled, completed or edited. Further sync of these identities is disabled until a separate re-enable operation.</p>
           <label>Type this exact phrase to authorise retirement: <code>{approval.phrase}</code>
             <input aria-label="Retirement confirmation phrase" value={confirmPhrase}
               onChange={e=>setConfirmPhrase(e.target.value)} />
