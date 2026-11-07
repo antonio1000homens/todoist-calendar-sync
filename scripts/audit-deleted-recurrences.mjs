@@ -6,17 +6,22 @@ import { ReviewStore } from "../dist/review-store.js";
 import { StateRepository } from "../dist/repository.js";
 import { reviewCaseEvidenceIds } from "../dist/deleted-review-identities.js";
 import { deletedRecurrenceStatus } from "../dist/deletion-review-state.js";
+import { cancelledOccurrenceMasterId } from "../dist/verified-deletion.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 
 const table = process.env.STATE_TABLE_NAME?.trim();
 if (!table) throw new Error("Explicit STATE_TABLE_NAME is required");
 const args = process.argv.slice(2);
-for (const arg of args) if (!["--profile=", "--case=", "--max-cases="].some(prefix => arg.startsWith(prefix)))
-  throw new Error("Read-only audit supports only --profile, --case and --max-cases; it has no --apply mode");
+for (const arg of args) if (arg!=="--include-dismissed"
+  && !["--profile=", "--case=", "--max-cases="].some(prefix => arg.startsWith(prefix)))
+  throw new Error("Read-only audit supports only --profile, --case, --max-cases and --include-dismissed; it has no --apply mode");
 const selected = args.find(arg => arg.startsWith("--profile="))?.slice(10) || "antonio";
 const profiles = selected === "all" ? ["home", "antonio", "work"] : [selected];
 if (profiles.some(profile => !["home", "antonio", "work"].includes(profile))) throw new Error("Unknown profile");
 const caseId = args.find(arg => arg.startsWith("--case="))?.slice(7);
+const includeDismissed = args.includes("--include-dismissed");
+if(caseId && (caseId.length>200 || !/^[A-Za-z0-9._-]+$/.test(caseId)))
+  throw new Error("--case must contain an exact review decision ID");
 const maxCases = Number(args.find(arg => arg.startsWith("--max-cases="))?.slice(12) || "30");
 if (!Number.isSafeInteger(maxCases) || maxCases < 1 || maxCases > 100)
   throw new Error("--max-cases must be in 1..100");
@@ -30,11 +35,17 @@ for (const profile of profiles) {
   const provider = await defaultProviderClientFactory(profile);
   let cursor;
   do {
-    const page = await store.listCases(profile, cursor, false, 10);
+    // A precise historical case must be readable without a GSI sweep.
+    // Normal listing covers open cases; opted-in history also includes
+    // previously dismissed cases that still have attributable stale links.
+    const page = caseId
+      ? {items:[await store.getCase(caseId)].filter(Boolean),cursor:undefined}
+      : await store.listCases(profile,cursor,includeDismissed,10);
     cursor = page.cursor;
     for (const item of page.items) {
-      if (item.status !== "open" || !item.decision?.type?.includes("recurrence_task_deleted")
-        || (caseId && item.id !== caseId)) continue;
+      if (item.profile!==profile
+        || item.status!=="open" && !(includeDismissed && item.status==="dismissed")
+        || !item.decision?.type?.includes("recurrence_task_deleted")) continue;
       if (checked >= maxCases) { truncated = true; break; }
       checked++;
       const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
@@ -59,6 +70,23 @@ for (const profile of profiles) {
       };
       for (const id of taskIds) await read("todoist", id);
       for (const id of eventIds) await read("calendar", id);
+      // Older decisions store only the active Calendar occurrence. The
+      // cancelled occurrence may directly identify its master; fetch that
+      // master separately instead of guessing from an ID suffix.
+      const recordedMasterId=item.decision.masterEventId || item.decision.mappingSnapshot?.masterEventId;
+      const activeId=item.decision.activeInstanceId || item.decision.mappingSnapshot?.activeInstanceId;
+      const observedActive=snapshots.find(snapshot=>snapshot.ref.side==="calendar"
+        && snapshot.ref.id===activeId && !snapshot.lookupError);
+      const recoveredMasterId=!recordedMasterId
+        ? cancelledOccurrenceMasterId(activeId,observedActive?.object||undefined)
+        : undefined;
+      if(recoveredMasterId && !eventIds.includes(recoveredMasterId)) {
+        if(taskIds.length+eventIds.length+1>20) {
+          report.push({...entry,state:"unverified",reason:"Recovered master exceeds bounded identity limit"});
+          continue;
+        }
+        await read("calendar",recoveredMasterId);
+      }
       const deletion = await deletedRecurrenceStatus(item, snapshots,
         (owner, seriesId) => state.getRecurrenceLink(owner, seriesId));
       report.push({
@@ -71,5 +99,5 @@ for (const profile of profiles) {
   } while (cursor);
   if (truncated) break;
 }
-console.log(JSON.stringify({ mode: "dry-run", table, checked, truncated, cases: report,
+console.log(JSON.stringify({ mode: "dry-run", table, checked, truncated, includeDismissed, cases: report,
   note: "No provider or DynamoDB writes. Guarded cleanup requires separately reviewed deployment and reconciliation." }, null, 2));
