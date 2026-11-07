@@ -198,6 +198,8 @@ test("#292 complete instance inventory preserves a completed historical exceptio
   assert.equal(second.valid,true,second.reason);
   assert.equal(second.fingerprint,first.fingerprint,"provider pagination order cannot change proof");
   for(const changed of [
+    {...input,instances:[]},
+    {...input,instances:[previous]},
     {...input,instances:[{...previous,status:"tentative"},current]},
     {...input,instances:[{...previous,id:active},current]},
     {...input,instances:[{...previous,iCalUID:"foreign-uid"},current]},
@@ -220,6 +222,11 @@ test("#292 complete instance inventory preserves a completed historical exceptio
     const result=await verifyCancelledSeriesInstances(input,async()=>missing);
     assert.equal(result.valid,false,JSON.stringify(missing));
   }
+  const differentCompletion=await verifyCancelledSeriesInstances(input,
+    async id=>id===completed?{...history,completedAt:"2026-10-26T19:09:00.177Z"}:undefined);
+  assert.equal(differentCompletion.valid,true);
+  assert.notEqual(differentCompletion.fingerprint,first.fingerprint,
+    "completion history change between preflight and final read must revoke eligibility");
   const absent=await verifyCancelledSeriesInstances({...input,instances:[current]},marker);
   assert.equal(absent.valid,true,"a fully cancelled series is safe without historical completion markers");
 });
