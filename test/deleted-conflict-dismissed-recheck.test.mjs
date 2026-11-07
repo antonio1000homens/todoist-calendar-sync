@@ -132,3 +132,19 @@ test("#278 exact pointer reader excludes expired/foreign/mismatched entries and 
   const crowded=new ReviewStore({send:async()=>({Items:[valid],LastEvaluatedKey:{pk,sk:valid.sk}})});
   await assert.rejects(crowded.listDeletedConflictCaseIds(profile,"calendar",masterId),/safe limit/);
 });
+
+test("#278 bulk Calendar cancellations request one full guarded sweep without per-event DynamoDB reads",async()=>{
+  const q=queue();let pointQueries=0,guardWrites=0;
+  const review={
+    async listCases(){return {items:[],cursor:undefined};},
+    async listDeletedConflictCaseIds(){pointQueries++;return [];},
+    async markDeletedReviewPendingRefresh(){guardWrites++;return [];},
+  };
+  const eventIds=Array.from({length:41},(_,i)=>"bulk-event-"+i);
+  assert.equal(await requestDeletedConflictReview(q.state,profile,{eventIds},review,q.enqueue),true);
+  assert.equal(pointQueries,0,"a large Calendar delta must not issue 41 individual DynamoDB pointer queries");
+  assert.equal(guardWrites,1);
+  assert.equal(q.deliveries.length,1);
+  assert.equal(q.events.length,1);
+  assert.deepEqual(q.events[0].context.pendingRefreshRefs,[]);
+});
