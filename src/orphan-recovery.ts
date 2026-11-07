@@ -12,6 +12,7 @@ import { acquireMoveWriterLeases, ProjectAwareSynchronizer } from "./project-syn
 import { guardReplayProviderClients } from "./erasure-replay-providers.js";
 import { StateRepository } from "./repository.js";
 import { ignorableElapsedStandaloneCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
+import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => Promise<void>;
@@ -344,7 +345,28 @@ export class OrphanRecoveringSynchronizer {
     }
 
     const directMapping = await this.state.getMappingByTaskAnyProfile(task.id);
-    if (await this.state.syncBlocked(directMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile, { taskId: task.id })) return;
+    const controlProfile=directMapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
+    if (await this.state.syncBlocked(controlProfile,{taskId:task.id})) {
+      const recoverable=await hasGuardedRecoveryDispatchCandidate({
+        profile:controlProfile,mapping:directMapping,sourceTask:task,
+        action:todoistCalendarLifecycle(payload)?.action,
+        getExactRepairLock:(profile,id)=>this.state.getCancelledAnnualRecoveryLock(profile,id),
+      });
+      if (recoverable) {
+        // The project-aware layer will independently route this same mapped
+        // identity to the final Synchronizer. Only its guarded transaction can
+        // release a repair; this outer layer never changes ownership itself.
+        await this.state.audit(controlProfile,"todoist_preflight_guarded_recovery_routed",{
+          taskId:task.id,eventId:directMapping?.eventId,
+        });
+        return new ProjectAwareSynchronizer(this.state,this.scheduleOrphan,this.clientFactory).process(delivery);
+      }
+      // Do not silently ACK an unexamined blocked update. Ordinary conflicts
+      // are still blocked, but leave an observable diagnostic.
+      return this.state.audit(controlProfile,"todoist_preflight_sync_control_blocked",{
+        taskId:task.id,eventId:directMapping?.eventId,
+      });
+    }
 
     let mapping = await this.state.getMappingByTaskAnyProfile(task.id);
     const targetProfile = mapping?.profile || profileForTodoistProject(task.project_id) || delivery.profile;
