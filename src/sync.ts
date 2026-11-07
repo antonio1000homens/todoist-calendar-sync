@@ -1825,6 +1825,7 @@ export class Synchronizer {
     // deleted. A blocked/unverified candidate keeps all existing safeguards.
     if (lifecycle.action==="upsert" && writeFence && existingMapping?.profile===delivery.profile
       && !existingMapping.recurrenceOwner && task.due?.is_recurring
+      && profileForTodoistProject(task.project_id)===delivery.profile
       && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
       && await this.state.mutationAllowed(delivery.profile)
       && modeAllowsMutations(delivery,true)) {
