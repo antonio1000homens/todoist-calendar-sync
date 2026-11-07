@@ -2409,7 +2409,7 @@ export class Synchronizer {
       if (active.length>1 || active.some(item=>item.status!=="confirmed"
         || item.extendedProperties?.shared?.syncSource!=="todoist-calendar-sync"
         || item.extendedProperties?.shared?.syncRecurrenceOwner!=="todoist"
-        || !item.recurrence?.length || !hasCanonicalState(item,task))) {
+        || !item.recurrence?.length || !hasCanonicalState(item,task!))) {
         return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_alias_conflict",{
           taskId:task.id,candidateCount:active.length,
         });
