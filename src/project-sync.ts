@@ -7,6 +7,7 @@ import { attachProjectCommentReference, deleteMappingComments } from "./mapping-
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository, type CalendarProjectionTombstone, type CalendarProjectionTombstoneReason } from "./repository.js";
 import { canRecreateCalendarProjection, hasCanonicalState, Synchronizer, toCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
+import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch.js";
 import {
   calendarRecurrenceMatchesTodoist,
   recurrenceEffectiveStart,
@@ -355,7 +356,23 @@ export class ProjectAwareSynchronizer {
     const mapping = await this.state.getMappingByTaskAnyProfile(rawPayload.event_data.id);
     const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {
-      return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: rawPayload.event_data.id });
+      const recoverable=await hasGuardedRecoveryDispatchCandidate({
+        profile:controlProfile,mapping,sourceTask:rawPayload.event_data,
+        action:todoistCalendarLifecycle(rawPayload)?.action,
+        getExactRepairLock:(profile,id)=>this.state.getCancelledAnnualRecoveryLock(profile,id),
+      });
+      if (recoverable) {
+        // A mapped same-profile edit cannot be a project transfer.
+        // Delegating to the final Synchronizer does NOT release its lock.
+        // The guarded recovery must prove no-write and exact ownership first.
+        await this.state.audit(controlProfile,"todoist_project_guarded_recovery_routed",{
+          taskId:rawPayload.event_data.id,eventId:mapping?.eventId,
+        });
+        return this.delegate.process(delivery);
+      }
+      return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", {
+        taskId: rawPayload.event_data.id,eventId:mapping?.eventId,
+      });
     }
     const task = await this.authoritativeTask(delivery, rawPayload, mapping);
     const payload: TodoistWebhookPayload = { ...rawPayload, event_data: task };
