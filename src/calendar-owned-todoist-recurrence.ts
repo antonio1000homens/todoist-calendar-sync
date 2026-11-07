@@ -317,10 +317,17 @@ function ruleFields(rule: string): Record<string, string> | undefined {
  * rules deliberately stay on the Calendar-owned rolling mirror path. */
 export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolean {
   if (master.recurrence?.length !== 1) return false;
-  if (isPhaseCNativeCandidate(master)) return true;
+  const phaseC = calendarPhaseCCandidate(master, master.start?.timeZone);
+  // Without the explicit opt-in, these formerly unsupported families must
+  // retain their original rolling representation and scanning policy.
+  if (phaseC.family) return phaseCNativeEnabled()
+    && phaseC.reason === "provider_readback_required";
   const fields = ruleFields(master.recurrence[0]);
   return Boolean(fields && ["WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
     && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || fields.INTERVAL === "1")
+    && !fields.BYDAY?.includes(",") && !fields.BYMONTHDAY?.includes(",")
+    && !(fields.BYDAY && fields.BYMONTHDAY)
+    && (fields.FREQ !== "WEEKLY" || (!fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
     && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY"].includes(key)));
 }
 
