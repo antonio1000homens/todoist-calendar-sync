@@ -2570,6 +2570,13 @@ export class Synchronizer {
           ? mappedActive
           : selectTodoistCurrentInstance(instances, task);
       }
+      if (pendingAnnualRecovery && (!todoistRrule || !active
+        || !occurrenceStateMatches(active,task)
+        || !calendarRecurrenceMatchesTodoist(existingEvent,task))) {
+        return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_instance_unverified",{
+          taskId:task.id,eventId:existingEvent.id,
+        });
+      }
       const nextMapping: Mapping = {
         ...(preservedCalendarMapping || {}),
         profile: delivery.profile,
@@ -2611,6 +2618,13 @@ export class Synchronizer {
       active = mappedActive && occurrenceStateMatches(mappedActive, task)
         ? mappedActive
         : selectTodoistCurrentInstance(instances, task);
+    }
+    if (pendingAnnualRecovery && (stored.status!=="confirmed" || !todoistRrule || !active
+      || !occurrenceStateMatches(active,task)
+      || !calendarRecurrenceMatchesTodoist(stored,task))) {
+      return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_instance_unverified",{
+        taskId:task.id,eventId:stored.id,
+      });
     }
     const nextMapping: Mapping = {
       profile: delivery.profile,
