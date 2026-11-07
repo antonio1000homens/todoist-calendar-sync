@@ -9,6 +9,7 @@ import { operationHasWriteEvidence, entityKey, type RepairOperation, type Review
 import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { knownPrewriteRecoveryValidationCase } from "./guarded-recovery-incidents.js";
+import { evaluateCancelledMappingRecovery, recoverySourceFingerprint, recoverySourceValue, validateCancelledProviderVersions } from "./cancelled-mapping-recovery-policy.js";
 import type { Profile, Mapping, TodoistTask, CalendarEvent } from "./types.js";
 import type { StateRepository } from "./repository.js";
 import type { GoogleCalendar, Todoist } from "./providers.js";
@@ -21,36 +22,13 @@ const validDate = (v:unknown) => typeof v==="string" && /^\d{4}-\d{2}-\d{2}$/.te
 const conditionConflict = (error:unknown) => (error as {name?:string}).name==="TransactionCanceledException"
   || (error as {name?:string}).name==="ConditionalCheckFailedException";
 
+/** Kept for compatibility with the original yearly-only acceptance fixtures. */
 export function annualRecoveryCandidate(
   profile:Profile, task:TodoistTask, mapping:Mapping, operation:RepairOperation, reviewCase:ReviewCase,
 ): boolean {
-  if (!profiles.includes(profile) || task.is_deleted || task.is_completed
-    || task.due?.is_recurring !== true || !validDate(task.due.date)
-    || task.due.datetime || todoistRecurrenceToRrule(task)!=="RRULE:FREQ=YEARLY"
-    || !task.updated_at || !Number.isFinite(Date.parse(task.updated_at))
-    || task.id!==mapping.taskId || mapping.profile!==profile
-    || mapping.recurrenceOwner || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId
-    || !mapping.updatedAt || !(Date.parse(task.updated_at)>Date.parse(mapping.updatedAt))) return false;
-  if (operation.status!=="failed" || operation.abandoned || operation.nonResumable
-    || operation.writeStarted || operationHasWriteEvidence(operation)
-    || operation.steps?.validated?.status!=="done"
-    || Object.keys(operation.steps||{}).some(step=>step!=="validated")
-    || !operation.updatedAt || Date.parse(task.updated_at)<=Date.parse(operation.updatedAt)
-    || operation.preview?.intent?.profile!==profile
-    || operation.preview.intent.taskId!==task.id
-    || operation.preview.intent.caseId!==reviewCase.id
-    || operation.preview.case?.id!==reviewCase.id
-    || reviewCase.status!=="dismissed" || reviewCase.profile!==profile
-    || reviewCase.operationId!==operation.id) return false;
-  const snapshots=operation.preview.snapshots;
-  if (!Array.isArray(snapshots) || snapshots.length<2 || snapshots.length>15
-    || snapshots.some(s=>!s?.ref?.id || s.ref.profile!==profile || s.lookupError)
-    || new Set(snapshots.map(s=>typed(s.ref))).size!==snapshots.length
-    || !snapshots.some(s=>s.ref.side==="todoist" && s.ref.id===task.id
-      && s.object && (s.object as TodoistTask).due?.is_recurring!==true)
-    || !snapshots.some(s=>s.ref.side==="calendar"
-      && s.ref.id===operation.preview.intent.eventId)) return false;
-  return true;
+  return task.due?.datetime === undefined && validDate(task.due?.date)
+    && todoistRecurrenceToRrule(task)==="RRULE:FREQ=YEARLY"
+    && evaluateCancelledMappingRecovery(profile,task,mapping,operation,reviewCase).eligible;
 }
 
 /** A fully approved plan is bound to the caller-owned task write fence. */
@@ -71,7 +49,9 @@ export async function attemptCancelledAnnualRecovery(
   const operation=await review.getOperation(operationId);
   const reviewCase=operation?.preview?.intent?.caseId
     ? await review.getCase(operation.preview.intent.caseId) : undefined;
-  if (!operation || !reviewCase || !annualRecoveryCandidate(profile,task,mapping,operation,reviewCase)) return false;
+  if (!operation || !reviewCase) return false;
+  const eligibility=evaluateCancelledMappingRecovery(profile,task,mapping,operation,reviewCase);
+  if (!eligibility.eligible || !eligibility.policy) return false;
   const refs=operation.preview.snapshots.map(s=>s.ref);
   const oldCalendarIds=[...new Set([...refs.filter(r=>r.side==="calendar").map(r=>r.id),mapping.eventId])];
   if (oldCalendarIds.length>15) return false;
@@ -118,6 +98,11 @@ export async function attemptCancelledAnnualRecovery(
     if (!item || item.id!==id || item.status!=="cancelled") return false;
     observed.set(id,item);
   }
+  // New recovery policies require a source edit strictly AFTER the actual
+  // cancellation, not merely after a stale DynamoDB mapping. A missing
+  // provider timestamp is not proof (except the legacy #369 yearly policy).
+  const cancellation=validateCancelledProviderVersions(task,eligibility.policy,[...observed.values()]);
+  if (!cancellation.ok) return false;
   // A cancelled master can still have a separately confirmed future exception.
   for (const id of oldCalendarIds) {
     const original=operation.preview.snapshots.find(s=>s.ref.side==="calendar"&&s.ref.id===id)?.object as CalendarEvent|undefined;
@@ -133,9 +118,9 @@ export async function attemptCancelledAnnualRecovery(
   // due/recurrence from a webhook after the user changes the task again.
   const current=await todoist.getTask(task.id);
   if (!current || current.id!==task.id || current.updated_at!==task.updated_at
-    || current.project_id!==task.project_id || current.due?.date!==task.due?.date
-    || !current.due?.is_recurring || todoistRecurrenceToRrule(current)!=="RRULE:FREQ=YEARLY"
-    || current.is_completed || current.is_deleted) return false;
+    || current.project_id!==task.project_id
+    || recoverySourceFingerprint(current)!==recoverySourceFingerprint(task)
+    || current.is_completed || current.is_deleted || current.completed_at) return false;
   const read=async (pk:string,sk="STATE") => (await db.send(new GetCommand({TableName:table,Key:key(pk,sk),ConsistentRead:true}))).Item as Record<string,unknown>|undefined;
   const [taskMap,ownerMap,eventMap,baseline,reset,otherReceipt]=await Promise.all([
     read("TASK#"+profile+"#"+task.id,"MAP"),read("TASKOWNER#"+task.id,"MAP"),
@@ -178,7 +163,7 @@ export async function attemptCancelledAnnualRecovery(
       UpdateExpression:"SET abandoned = :yes, #s = :failed, updatedAt = :now, nextAction = :next",
       ConditionExpression:"#s = :failed AND updatedAt = :at AND attempt = :attempt AND steps = :steps AND preview = :preview AND (attribute_not_exists(creations) OR creations = :creations) AND attribute_not_exists(abandoned) AND attribute_not_exists(writeStarted) AND attribute_not_exists(outcomes) AND attribute_not_exists(verified) AND attribute_not_exists(recurrenceBindings)",
       ExpressionAttributeNames:{"#s":"status"},
-      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded annual projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps,":preview":operation.preview,":creations":operation.creations||{}}}},
+      ExpressionAttributeValues:{":yes":true,":failed":"failed",":now":now,":next":"No-write repair superseded by guarded evidence-based projection reset; do not resume",":at":operation.updatedAt,":attempt":operation.attempt,":steps":operation.steps,":preview":operation.preview,":creations":operation.creations||{}}}},
     ...controls.map(({ref,row})=>{
       const conditions=["activeRepair = :op","(attribute_not_exists(excluded) OR excluded = :false)"];
       const values:Record<string,unknown>={":op":operation.id,":now":now,":false":false};
@@ -205,7 +190,9 @@ export async function attemptCancelledAnnualRecovery(
       ConditionExpression:"attribute_not_exists(pk)"}})),
     {Put:{TableName:table,Item:{...key("ANNUAL_RECOVERY#"+profile+"#"+task.id),
       profile,taskId:task.id,oldEventId:mapping.eventId,operationId:operation.id,
-      sourceUpdatedAt:task.updated_at,sourceDueDate:task.due!.date,createdAt:now,status:"pending"},
+      sourceUpdatedAt:task.updated_at,sourceDueDate:task.due?.date || recoverySourceValue(task),
+       sourcePolicy:eligibility.policy,sourceFingerprint:recoverySourceFingerprint(task),
+       cancelledVersion:cancellation.version,createdAt:now,status:"pending"},
       ConditionExpression:"attribute_not_exists(pk)"}},
   ];
   try {await db.send(new TransactWriteCommand({TransactItems:tx as never}));return true;}
