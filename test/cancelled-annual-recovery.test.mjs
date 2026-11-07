@@ -117,7 +117,12 @@ test("creates exactly one guarded transaction, preserves repair, original task a
   assert.equal(items.filter(x=>x.Update).length,3,"repair plus 2 owned control references");
   assert.equal(items.filter(x=>x.Put).length,1,"only one pending replay-safe reset receipt");
   assert.ok(items.some(x=>x.Put?.Item?.pk==="ANNUAL_RECOVERY#home#task-annual"));
-  assert.ok(items.some(x=>x.ConditionCheck?.Key?.pk==="CALENDAR_WRITE#task-annual"));
+  const leaseCheck=items.find(x=>x.ConditionCheck?.Key?.pk==="CALENDAR_WRITE#task-annual")?.ConditionCheck;
+  assert.ok(leaseCheck,"writer lease must be an atomic condition in the reset transaction");
+  assert.equal(leaseCheck.ConditionExpression,"#leaseToken = :leaseToken AND leaseUntilMs > :now");
+  assert.deepEqual(leaseCheck.ExpressionAttributeNames,{"#leaseToken":"token"});
+  assert.equal(leaseCheck.ExpressionAttributeValues[":leaseToken"],"writer-token");
+  assert.ok(Number.isFinite(leaseCheck.ExpressionAttributeValues[":now"]));
   assert.ok(items.some(x=>x.ConditionCheck?.Key?.pk==="REVIEW_CASE#case-annual"));
   assert.ok(items.some(x=>x.Update?.Key?.pk==="REPAIR#repair-annual"));
   assert.ok(items.some(x=>x.Update?.Key?.pk==="SYNC_CONTROL#home:todoist:task-annual"));
@@ -224,4 +229,26 @@ test("snapshot reconciliation keeps a changed reset source blocked",async()=>{
   const outcome=await reconciler.reconcileUnmappedTask(profile,task,{calendar:{},todoist:{}});
   assert.equal(outcome,"blocked");
   assert.equal(called,0);
+});
+
+test("all recovery DynamoDB expressions alias reserved names at the AWS boundary",async()=>{
+  const h=harness();
+  assert.equal(await run(h),true);
+  const prohibited=new Set(["token","status","owner","error","name","count","value"]);
+  for(const entry of h.transactions[0].TransactItems) {
+    const operation=entry.ConditionCheck||entry.Update||entry.Put||entry.Delete;
+    if(!operation)continue;
+    const aliases=operation.ExpressionAttributeNames||{};
+    for(const field of ["ConditionExpression","UpdateExpression"]) {
+      const expression=operation[field];
+      if(!expression)continue;
+      const aliasNames=[...expression.matchAll(/#[A-Za-z][A-Za-z0-9_]*/g)].map(x=>x[0]);
+      for(const a of aliasNames)assert.ok(Object.hasOwn(aliases,a),`Undefined alias ${a} in ${field}`);
+      const withoutReferences=expression.replace(/#[A-Za-z][A-Za-z0-9_]*|:[A-Za-z][A-Za-z0-9_]*/g," ");
+      for(const word of withoutReferences.matchAll(/[A-Za-z][A-Za-z0-9_]*/g)){
+        assert.equal(prohibited.has(word[0].toLowerCase()),false,
+          `Unaliased reserved DynamoDB attribute ${word[0]} in ${field}: ${expression}`);
+      }
+    }
+  }
 });
