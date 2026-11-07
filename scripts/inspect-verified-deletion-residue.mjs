@@ -5,8 +5,7 @@
  * Resumable scan state (including raw DynamoDB keys) stays in a mode-0600
  * local file; published JSON never contains provider IDs or raw DynamoDB rows.
  */
-import { createHash } from "node:crypto";
-import { readFile, writeFile, unlink } from "node:fs/promises";
+import { readFile, writeFile, unlink, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -47,9 +46,9 @@ export async function inventory({
 }) {
   const scope = validateResidueScope(options);
   const digest = scopeDigest(scope, table);
-  let saved = await cursorStore.load();
-  if (options.restart) { saved = null; await cursorStore.clear(); }
-  else if (saved && (saved.digest !== digest || !saved.report || !saved.cursor))
+  if (options.restart) await cursorStore.clear();
+  const saved = options.restart ? null : await cursorStore.load();
+  if (saved && (saved.digest !== digest || !saved.report || !saved.cursor))
     throw new Error("Cursor scope differs from this exact table, case and provider-ID set; use --restart");
 
   // Immutable terminal receipts are necessary for the *inventory scope*.
@@ -137,7 +136,7 @@ export async function main(args = process.argv.slice(2), env = process.env) {
       try { return JSON.parse(await readFile(filename, "utf8")); }
       catch (e) { if (e?.code === "ENOENT") return null; throw e; }
     },
-    save: async value => { await writeFile(filename, JSON.stringify(value), { mode: 0o600 }); },
+    save: async value => { await writeFile(filename, JSON.stringify(value), { mode: 0o600 }); await chmod(filename, 0o600); },
     clear: async () => { await unlink(filename).catch(e => { if (e.code !== "ENOENT") throw e; }); },
   };
   const db = DynamoDBDocumentClient.from(new DynamoDBClient({
