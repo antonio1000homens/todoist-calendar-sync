@@ -9,7 +9,7 @@ import { entityKey, type RepairOperation, type ReviewCase, type EntityRef } from
 import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { knownPrewriteRecoveryValidationCase } from "./guarded-recovery-incidents.js";
-import { evaluateCancelledMappingRecovery, recoverySourceFingerprint, recoverySourceValue, validateCancelledProviderVersions } from "./cancelled-mapping-recovery-policy.js";
+import { evaluateCancelledMappingRecovery, recoveryCounterpartEventId, recoverySourceFingerprint, recoverySourceValue, validateCancelledProviderVersions } from "./cancelled-mapping-recovery-policy.js";
 import type { Profile, Mapping, TodoistTask, CalendarEvent } from "./types.js";
 import type { StateRepository } from "./repository.js";
 import type { GoogleCalendar, Todoist } from "./providers.js";
@@ -110,7 +110,8 @@ export async function attemptCancelledAnnualRecovery(
   const observed=new Map<string,CalendarEvent>();
   for (const id of oldCalendarIds) {
     const item=await calendar.getEvent(id); // 404/410 and provider errors fail closed
-    if (!item || item.id!==id || item.status!=="cancelled") return false;
+    if (!item || item.id!==id || item.status!=="cancelled"
+      || item.recurringEventId || item.recurrence?.length) return false;
     observed.set(id,item);
   }
   // New recovery policies require a source edit strictly AFTER the actual
@@ -207,6 +208,7 @@ export async function attemptCancelledAnnualRecovery(
       profile,taskId:task.id,oldEventId:mapping.eventId,operationId:operation.id,
       sourceUpdatedAt:task.updated_at,sourceDueDate:task.due?.date || recoverySourceValue(task),
        sourcePolicy:eligibility.policy,sourceFingerprint:recoverySourceFingerprint(task),
+       candidateEventId:recoveryCounterpartEventId(profile,task.id,mapping.eventId,task.updated_at!),
        cancelledVersion:cancellation.version,createdAt:now,status:"pending"},
       ConditionExpression:"attribute_not_exists(pk)"}},
   ];
