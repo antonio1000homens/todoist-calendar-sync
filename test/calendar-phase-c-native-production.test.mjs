@@ -113,3 +113,17 @@ test("timezones and DST: an advanced floating Todoist local time matches the Cal
       datetime:"2027-03-29T08:00:00"}},recurrence,"Europe/London"),false);
   } finally { delete process.env[flag]; }
 });
+
+test("live Todoist month-end semantics are excluded from Phase C native writes", () => {
+  process.env[flag] = "true";
+  try {
+    assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-29",
+      "RRULE:FREQ=MONTHLY;BYMONTHDAY=29,30,31")), false,
+      "Todoist advances Jan 31 to Feb 28 while RFC5545 skips February");
+    assert.equal(nativeCalendarRecurrenceCandidate(m("2027-12-31",
+      "RRULE:FREQ=MONTHLY;INTERVAL=2")), false,
+      "bimonthly end-of-month drift must stay on a rolling mirror");
+    assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-02",
+      "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27")), true);
+  } finally { delete process.env[flag]; }
+});
