@@ -18,6 +18,10 @@ export type CleanupPlan={
   operationId:string;profile:Profile;
   eligible:boolean;blockedReasons:string[];
   safeAuditKeys:string[];safeReferenceKeys:Array<{pk:string;sk:string}>;
+  /** Closed review incidents exclusively associated with an approved audit. */
+  safeClosedCaseKeys:Array<{pk:string;sk:string}>;
+  safeClosedConflictPointerKeys:Array<{pk:string;sk:string}>;
+  safeResolvedManualKeys:Array<{pk:string;sk:string}>;
   protectedRecordCount:number;
   providerWrites:false;
 };
@@ -39,6 +43,9 @@ export function planRetirementIncidentCleanup(op:RetirementOperation,rows:readon
     reject("Only completed whole-series retirement receipts can be cleaned");
   const safeAuditKeys:string[]=[];
   const safeReferenceKeys:Array<{pk:string;sk:string}>=[];
+  const safeClosedCaseKeys:Array<{pk:string;sk:string}>=[];
+  const safeClosedConflictPointerKeys:Array<{pk:string;sk:string}>=[];
+  const safeResolvedManualKeys:Array<{pk:string;sk:string}>=[];
   const blockers:string[]=[];
   let protectedRecordCount=0;
   const ids=expectedIds(op);
@@ -100,12 +107,57 @@ export function planRetirementIncidentCleanup(op:RetirementOperation,rows:readon
     safeAuditKeys.push(row.pk!);
     safeReferenceKeys.push(...indexed.map(ref=>({pk:ref.pk!,sk:ref.sk!})));
   }
+  // An attributable audit can have a persisted review case. Never delete its
+  // source audit while leaving a dangling live/terminal case behind. Only an
+  // exact closed incident (no ongoing repair, hand-off, or coalesced successor)
+  // may be retired together with its owned conflict pointer/manual decision.
+  const auditSet=new Set(safeAuditKeys);
+  for(const review of rows.filter(row=>String(row.pk).startsWith("REVIEW_CASE#")
+    &&typeof row.sourceAuditKey==="string"&&auditSet.has(row.sourceAuditKey))){
+    const id=review.id;
+    const caseKey={pk:review.pk!,sk:review.sk!};
+    const taskId=review.taskId,eventId=review.eventId;
+    if(review.sk!=="STATE"||typeof id!=="string"||caseKey.pk!=="REVIEW_CASE#"+id
+      ||review.profile!==op.profile
+      ||!["resolved","dismissed"].includes(String(review.status))
+      ||typeof review.updatedAt!=="string"||typeof review.createdAt!=="string"
+      ||review.operationId||review.coalescedInto||review.progressCheckpoint
+      ||(taskId!==undefined&&taskId!==op.target.taskId)
+      ||(eventId!==undefined&&!ids.has(String(eventId)))){
+      blockers.push("An attributable audit is still referenced by a live, shared or unverified review case: "+caseKey.pk);
+      continue;
+    }
+    const pointer=typeof review.conflictKey==="string"
+      ?rows.find(row=>row.pk==="REVIEW_CONFLICT#"+op.profile+"#"+review.conflictKey
+        &&row.sk==="INCIDENT#"+id):undefined;
+    if(review.conflictKey!==undefined && (!pointer
+      ||pointer.incidentId!==id||pointer.profile!==op.profile
+      ||pointer.conflictKey!==review.conflictKey)){
+      blockers.push("Closed review conflict pointer is missing or changed: "+caseKey.pk);
+      continue;
+    }
+    const manual=rows.find(row=>row.pk==="MANUAL#"+id);
+    if(manual && (manual.sk!=="STATE"||manual.profile!==op.profile
+      ||manual.decisionId!==id||manual.status!=="resolved"
+      ||typeof manual.createdAt!=="string"
+      ||manual.operationId||manual.lookupPk||manual.lookupSk)){
+      blockers.push("Closed review has an active or unverified manual decision: "+caseKey.pk);
+      continue;
+    }
+    // A conflict pointer must NEVER represent a different case, even when
+    // a shared conflict fingerprint has multiple closed incidents.
+    safeClosedCaseKeys.push(caseKey);
+    if(pointer)safeClosedConflictPointerKeys.push({pk:pointer.pk!,sk:pointer.sk!});
+    if(manual)safeResolvedManualKeys.push({pk:manual.pk!,sk:manual.sk!});
+  }
   const duplicatePointers=new Set(safeReferenceKeys.map(key));
   if(duplicatePointers.size!==safeReferenceKeys.length)
     blockers.push("Duplicate conflict audit reference candidate found");
   // Audits and their reverse pointers must be removed together; if the bounded
   // batch is too large, report pending instead of deleting a random subset.
-  if(safeAuditKeys.length+safeReferenceKeys.length+retirementDispositionKeys({
+  if(safeAuditKeys.length+safeReferenceKeys.length
+    +safeClosedCaseKeys.length+safeClosedConflictPointerKeys.length
+    +safeResolvedManualKeys.length+retirementDispositionKeys({
     profile:op.profile,taskId:op.target.taskId,seriesIds:[op.target.seriesId],
     eventIds:[op.target.eventId,op.providerVersions.masterEventId],
   }).length+1>65)
@@ -114,6 +166,9 @@ export function planRetirementIncidentCleanup(op:RetirementOperation,rows:readon
     operationId:op.operationId,profile:op.profile,eligible:blockers.length===0,
     blockedReasons:[...new Set(blockers)],safeAuditKeys:[...new Set(safeAuditKeys)].sort(),
     safeReferenceKeys:safeReferenceKeys.sort((a,b)=>key(a).localeCompare(key(b))),
+    safeClosedCaseKeys:safeClosedCaseKeys.sort((a,b)=>key(a).localeCompare(key(b))),
+    safeClosedConflictPointerKeys:safeClosedConflictPointerKeys.sort((a,b)=>key(a).localeCompare(key(b))),
+    safeResolvedManualKeys:safeResolvedManualKeys.sort((a,b)=>key(a).localeCompare(key(b))),
     protectedRecordCount,providerWrites:false,
   };
 }
@@ -122,6 +177,16 @@ export function buildIncidentCleanupTransaction(op:RetirementOperation,plan:Clea
   if(op.status!=="retired"||!plan.eligible||plan.blockedReasons.length
     ||op.operationId!==plan.operationId||op.profile!==plan.profile)
     reject("Incident cleanup requires the unchanged retired operation and complete safe plan");
+  const checked=planRetirementIncidentCleanup(op,rows);
+  const manifest=(value:CleanupPlan)=>JSON.stringify({
+    audits:value.safeAuditKeys,
+    refs:value.safeReferenceKeys.map(key),
+    cases:value.safeClosedCaseKeys.map(key),
+    conflicts:value.safeClosedConflictPointerKeys.map(key),
+    manuals:value.safeResolvedManualKeys.map(key),
+  });
+  if(!checked.eligible||manifest(plan)!==manifest(checked))
+    reject("Review case or audit cleanup manifest changed since planning");
   const index=new Map(rows.map(row=>[key(row),row]));
   const tableRows=plan.safeAuditKeys.map(pk=>{
     const row=index.get(pk+"|STATE");
@@ -147,6 +212,43 @@ export function buildIncidentCleanupTransaction(op:RetirementOperation,plan:Clea
       ExpressionAttributeNames:{"#profile":"profile"},
       ExpressionAttributeValues:{":audit":row.auditKey,":profile":op.profile}}};
   });
+  const closedCases=plan.safeClosedCaseKeys.map(ref=>{
+    const row=index.get(key(ref));
+    if(!row||!["resolved","dismissed"].includes(String(row.status))
+      ||typeof row.sourceAuditKey!=="string"
+      ||!plan.safeAuditKeys.includes(row.sourceAuditKey)
+      ||row.profile!==op.profile||row.operationId||row.coalescedInto)
+      reject("Review case no longer belongs exclusively to the retired audit");
+    return {Delete:{TableName:stateTable,Key:ref,
+      ConditionExpression:"#s = :s AND #profile = :profile AND updatedAt = :updated AND createdAt = :created AND sourceAuditKey = :audit AND attribute_not_exists(operationId) AND attribute_not_exists(coalescedInto)",
+      ExpressionAttributeNames:{"#s":"status","#profile":"profile"},
+      ExpressionAttributeValues:{":s":row.status,":profile":op.profile,
+        ":updated":row.updatedAt,":created":row.createdAt,":audit":row.sourceAuditKey}}};
+  });
+  const closedConflictPointers=plan.safeClosedConflictPointerKeys.map(ref=>{
+    const row=index.get(key(ref));
+    if(!row||typeof row.incidentId!=="string"||row.profile!==op.profile
+      ||ref.pk!=="REVIEW_CONFLICT#"+op.profile+"#"+row.conflictKey
+      ||ref.sk!=="INCIDENT#"+row.incidentId
+      ||!plan.safeClosedCaseKeys.some(item=>item.pk==="REVIEW_CASE#"+row.incidentId))
+      reject("Closed conflict pointer is no longer exclusively attributable");
+    return {Delete:{TableName:stateTable,Key:ref,
+      ConditionExpression:"incidentId = :id AND #profile = :profile AND conflictKey = :conflict",
+      ExpressionAttributeNames:{"#profile":"profile"},
+      ExpressionAttributeValues:{":id":row.incidentId,":profile":op.profile,":conflict":row.conflictKey}}};
+  });
+  const resolvedManuals=plan.safeResolvedManualKeys.map(ref=>{
+    const row=index.get(key(ref));
+    if(!row||row.status!=="resolved"||row.profile!==op.profile
+      ||ref.pk!=="MANUAL#"+row.decisionId||row.sk!=="STATE"
+      ||!plan.safeClosedCaseKeys.some(item=>item.pk==="REVIEW_CASE#"+row.decisionId))
+      reject("Manual decision is not exclusively attributable to a closed review");
+    return {Delete:{TableName:stateTable,Key:ref,
+      ConditionExpression:"#s = :resolved AND #profile = :profile AND decisionId = :id AND createdAt = :created AND attribute_not_exists(operationId)",
+      ExpressionAttributeNames:{"#s":"status","#profile":"profile"},
+      ExpressionAttributeValues:{":resolved":"resolved",":profile":op.profile,
+        ":id":row.decisionId,":created":row.createdAt}}};
+  });
   const guard=retirementDispositionKeys({profile:op.profile,taskId:op.target.taskId,
     eventIds:[op.target.eventId,op.providerVersions!.masterEventId],
     seriesIds:[op.target.seriesId]}).map(Key=>({ConditionCheck:{
@@ -164,7 +266,8 @@ export function buildIncidentCleanupTransaction(op:RetirementOperation,plan:Clea
       ":done":"completed",":now":now,":count":plan.safeAuditKeys.length,
       ":protected":plan.protectedRecordCount},
   }};
-  return new TransactWriteCommand({TransactItems:[...tableRows,...pointers,...guard,operation] as never});
+  return new TransactWriteCommand({TransactItems:[...tableRows,...pointers,
+    ...closedCases,...closedConflictPointers,...resolvedManuals,...guard,operation] as never});
 }
 export class RetirementIncidentCleanupService {
   private readonly db:Db;
