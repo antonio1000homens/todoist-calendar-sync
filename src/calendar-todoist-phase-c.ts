@@ -173,8 +173,13 @@ export function calendarPhaseCCandidate(master: CalendarEvent, timeZone?: string
 export function matchesCalendarPhaseCTask(
   task: TodoistTask, candidate: CalendarPhaseCCandidate, anchor: string, timeZone?: string,
 ): boolean {
-  if (!candidate.semantic || candidate.reason !== "provider_readback_required"
-    || !normalizedTaskMatches(task, candidate, anchor, timeZone)) return false;
+  if (!candidate.semantic || candidate.reason !== "provider_readback_required" || !anchor) return false;
+  // The provider may expose a floating local datetime. Normalize Todoist's
+  // due text against the Calendar-local DTSTART, not a date-only anchor that
+  // would silently lose the 09:00 wall clock across DST.
+  const localAnchor = candidate.semantic.startDate
+    + (candidate.semantic.localTime ? "T" + candidate.semantic.localTime + ":00" : "");
+  if (!normalizedTaskMatches(task, candidate, localAnchor, timeZone)) return false;
   const dates = occurrenceDates(candidate.semantic, 2000);
   const due = taskOccurrence(task, candidate.semantic);
   return Boolean(due && dates.includes(due.date)
