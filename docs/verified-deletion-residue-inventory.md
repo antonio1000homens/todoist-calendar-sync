@@ -63,3 +63,21 @@ For the two original #278 Home cases, use **separate scoped scans** so independe
 Record aggregate read-only evidence from representative resolved cases on #367, with scan completeness and exact read budgets. First decide whether anything actionable remains **beyond intended TTL retention**. If not, document the outcome and close #367 without adding another writer.
 
 If a real gap is confirmed, separately review whether significant legacy conflict audits should keep their existing seven-day forensic window or qualify for a narrowly scoped early retirement with fresh provider/ownership proof, conditional race checks and backup gating. Independently decide a retention policy for truly terminal, unreferenced repair operations. Neither cleanup path is authorised by this inventory.
+
+## Initial production read-only evidence — 7 November 2026
+
+A separate **strongly consistent**, complete read-only production DynamoDB scan (35 pages of up to 100 evaluated items) examined **3,425** rows in `eu-west-2`. Both selected #278 Home fixtures already had independent `resolved_deleted` terminal receipts. These aggregate numbers are **exact-known-identity matches**, not a claim of comprehensive historical alias proof:
+
+| Observation | Home annual test fixture | Home deleted-recurrence fixture |
+| --- | ---: | ---: |
+| Matching significant/historical `AUDIT#` candidates with no exact `AUDIT_REF#` pointer | 8 | 1 |
+| Of those, within the recorded TTL at inspection | 8 | 1 |
+| Matched `REPAIR#` / `REPAIR_PREVIEW#` | 0 / 0 | 0 / 0 |
+| Matched `MANUAL#` | 1, **resolved** | 0 |
+| Protected `COMPLETED_*` history matches | 0 | 2 |
+
+Across the **entire** table (not just these two fixtures): `AUDIT#=212`, `AUDIT_REF#=51`, `REPAIR#=8`, `REPAIR_PREVIEW#=0`, and `MANUAL#=67`. All eight `REPAIR#` operations have **no TTL** (five `failed`, three `succeeded`). That is a **known deliberate retention boundary**, not evidence they are orphaned: `docs/dynamodb-history-efficiency.md` explicitly warns that terminal repair records may be consumed by resume/notification/idempotency and should **not** receive a blind 30-/90-day TTL. No production record was mutated.
+
+**Decision from Phase A:** The nine matched conflict audits are inside the established seven-day forensic window; do **not** add an early-deletion writer on this evidence. The eight unexpiring `REPAIR#` rows justify a **separate, read-only lifecycle dependency audit** before considering any retention policy or conditional cleanup. No orphaned repair for the two #278 fixtures was found in this exact-ID scan.
+
+This was a distinct administrative read-only scan, not an execution of the branch CLI. The script added by this PR should be run after deployment/review in the authorised environment for repeatable scoped reporting. Strong scans are not an atomic snapshot if concurrent writers update the table.
