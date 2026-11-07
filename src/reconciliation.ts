@@ -591,13 +591,15 @@ export class SnapshotReconciler {
         const { taskIds, eventIds } = reviewCaseEvidenceIds(item);
         if (!taskIds.length || !eventIds.length || taskIds.length + eventIds.length > 20) continue;
         const recurring = item.decision?.type?.includes("recurrence_task_deleted") === true;
+        const contextMaster = typeof item.decision?.context?.masterEventId === "string"
+          ? item.decision.context.masterEventId : undefined;
         const unmappedRecurring = !recurring
           && (item.decision?.type === "todoist_unmapped_conflict"
             || item.reason === "calendar_snapshot_recurring_identity_conflict")
-          && Boolean(item.decision?.masterEventId || item.decision?.context?.masterEventId);
+          && Boolean(item.decision?.masterEventId || contextMaster);
         const recordedMasterId = item.decision?.masterEventId
           || item.decision?.mappingSnapshot?.masterEventId
-          || (unmappedRecurring ? item.decision?.context?.masterEventId : undefined);
+          || (unmappedRecurring ? contextMaster : undefined);
         const activeInstanceId = item.decision?.activeInstanceId
           || item.decision?.mappingSnapshot?.activeInstanceId
           || (unmappedRecurring ? item.decision?.eventId || item.eventId : undefined);
