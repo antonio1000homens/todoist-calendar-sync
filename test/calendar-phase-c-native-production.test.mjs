@@ -127,3 +127,30 @@ test("live Todoist month-end semantics are excluded from Phase C native writes",
       "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27")), true);
   } finally { delete process.env[flag]; }
 });
+
+test("live Todoist timed due.date format is treated as a datetime and preserved across BST", async () => {
+  process.env[flag] = "true";
+  try {
+    const calendar = m("2027-03-26T09:00:00Z","RRULE:FREQ=WEEKLY;BYDAY=MO,FR",true);
+    const instances = ["2027-03-26T09:00:00Z","2027-03-29T08:00:00Z",
+      "2027-04-02T08:00:00Z"].map((d,j)=>i(d,j,true));
+    const rule = await verifiedCalendarOwnedRecurrence(calendar, instances,
+      "Europe/London", async () => []);
+    assert.equal(rule?.phaseCCandidate?.family, "multi_weekday");
+    const todoist = {id:"provider-task",due:{
+      date:"2027-03-26T09:00:00",
+      string:"every mon, fri at 9:00am",
+      is_recurring:true,
+      timezone:"Europe/London",
+    }};
+    assert.equal(calendarOwnedRecurringTaskReadback(todoist, instances[0], rule, "Europe/London").matches, true,
+      "Todoist REST due.date can contain a local time, even when due.datetime is absent");
+    assert.equal(matchesCalendarOwnedRecurringRule({...todoist,due:{...todoist.due,
+      date:"2027-03-29T09:00:00"}},rule,"Europe/London"),true);
+    assert.equal(matchesCalendarOwnedRecurringRule({...todoist,due:{...todoist.due,
+      date:"2027-03-29T08:00:00Z"}},rule,"Europe/London"),true,
+      "UTC 08:00 is London-local 09:00 after the DST transition");
+    assert.equal(matchesCalendarOwnedRecurringRule({...todoist,due:{...todoist.due,
+      date:"2027-03-29T08:00:00"}},rule,"Europe/London"),false);
+  } finally { delete process.env[flag]; }
+});
