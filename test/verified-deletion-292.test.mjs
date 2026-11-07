@@ -41,7 +41,9 @@ test("lookup failures and unknown master are never treated as missing",async()=>
   const failed=snapshots.map(s=>s.ref.id===taskId?{...s,lookupError:"HTTP 429"}:s);
   assert.equal((await deletedRecurrenceStatus(deletedCase,failed,getLink)).state,"unverified");
   const unknown={...deletedCase,decision:{...deletedCase.decision,masterEventId:undefined,mappingSnapshot:{eventId:master}}};
-  assert.equal((await deletedRecurrenceStatus(unknown,snapshots,getLink)).bothGone,false);
+  const unverifiedChild=snapshots.map(row=>row.ref.id===active
+    ?{...row,object:{...row.object,recurringEventId:undefined}}:row);
+  assert.equal((await deletedRecurrenceStatus(unknown,unverifiedChild,getLink)).bothGone,false);
 });
 test("retirement classifier rejects foreign, Calendar-owned, new and incomplete associations",()=>{
   const extra={...linked,profile:"work"};
