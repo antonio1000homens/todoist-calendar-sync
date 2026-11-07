@@ -2410,7 +2410,7 @@ export class Synchronizer {
     let cancelledCalendarLink = false;
     if (task && pendingAnnualRecovery && pendingAnnualRecovery.sourcePolicy
       && pendingAnnualRecovery.sourcePolicy!=="yearly") {
-      for (const other of profiles) {
+      for (const other of ["home","antonio","work"] as const) {
         if (other===delivery.profile) continue;
         const aliases=await (await this.clients(other)).calendar.listLinkedEventsByTodoistTaskId(task.id);
         if (!Array.isArray(aliases) || aliases.length) {
@@ -2420,7 +2420,7 @@ export class Synchronizer {
         }
       }
     }
-    if (!mapping && pendingAnnualRecovery) {
+    if (!mapping && pendingAnnualRecovery && task) {
       // After a committed reset, old cancelled Calendar aliases deliberately
       // remain with the provider. The durable receipt allows a brand-new
       // projection, or recovery of a POST that succeeded before mapping ACK.
