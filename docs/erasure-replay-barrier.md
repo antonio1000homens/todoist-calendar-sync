@@ -6,6 +6,27 @@ post-write fence, or close #243/#239/#113 from this branch. The current
 provider outcomes. In particular, a 404 or completed deletion step is not proof
 that a delayed ingress event cannot recreate the identity.
 
+## Bounded known-identity recovery (#349)
+
+The #349 release decision is limited to identities recorded by the confirmed
+operation: the Todoist task, selected Calendar event, and explicitly recorded
+master/instance aliases or known profile moves. Fresh direct reads and durable
+HMAC markers apply to those identities. The outcome is
+`known_identity_deleted`, not global erasure. Unrecorded Calendar copies,
+external integrations, exports and backups are outside that claim.
+
+The separately signed Calendar ACL registry in
+[`erasure-calendar-provenance.md`](./erasure-calendar-provenance.md) is an
+optional stronger observer. Its absence or incomplete coverage is not a #349
+release prerequisite. If the operation's own exact alias inventory is
+ambiguous, incomplete or conflicting, keep its fence and require review.
+
+This bounded policy does not relax replay protection: every known Todoist and
+Calendar identity must have a durable HMAC marker before admission resumes,
+and every writer that can recreate a known identity must enforce marker and
+lease checks. #347 invocation coverage and disposable Work-profile acceptance
+remain independent release gates.
+
 ## Implemented in this draft
 
 - `src/erasure-replay-barrier.ts` defines deterministic HMAC-SHA256 marker keys
@@ -303,14 +324,13 @@ rechecked at action time. Old Lambda versions, IAM invoke paths, writer
 fence/lease invariants, privacy approval and Work-profile staging remain
 independent gates.
 
-**No deployed worker/API imports this observation as authorisation.** A
-future privileged verifier must reconcile these observations with fully
-paginated strong DynamoDB state, every accessible project comment and task
-comments from a recent full Sync read plus direct reads for discovered task
-identities, direct Todoist and Calendar
-item/master/instance reads in every profile, old versions and new independent
-operator confirmation before calling
-`atomicReplayRelease()`. Any missing provenance keeps the fence in place.
+**No deployed worker/API imports this observation as authorisation.** This
+optional broader observer may inform a separate global-coverage investigation.
+The #349 release proof uses the exact known identities recorded by the original
+operation and fresh direct readbacks for those identities. It does not require
+enumerating every accessible Calendar or inferring identities from titles,
+dates or unrelated rows. Ambiguity in the operation's own identity set keeps
+its fence in place.
 
 Calendar inventory paginates each profile's CalendarList, including hidden
 entries, and independently queries source/destination IDs from a separately
@@ -324,7 +344,8 @@ Without a trusted signed registry, CalendarList-only coverage remains
 incomplete. Untagged events remain identity-ambiguous without an exact ID
 link from state, comments or the inventory. Todoist's full Sync notes
 snapshot and project/DynamoDB reads are separately captured, not atomic.
-Do not interpret a complete coverage field as authorization for release.
+Do not interpret a complete coverage field as authorization for release, or
+its incompleteness as proof that a known-identity release is unsafe.
 
 This is a staged read-only primitive, not an accepted #307 safety gate.
 `ERASURE_REPLAY_BARRIER_VERSION` remains OFF. Do not restore worker

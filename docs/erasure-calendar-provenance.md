@@ -1,4 +1,16 @@
-# Issue #333 — independently attested Calendar direct-ID coverage
+# Optional Calendar direct-ID coverage observer
+
+**Scope under #349:** this document describes an optional, stronger global
+Calendar-coverage observer. Its signed ACL registry and Ed25519 trust key are
+not prerequisites for the bounded known-identity recovery flow. That flow
+checks only the exact Todoist and Calendar identities recorded in the original
+operation and reports `known_identity_deleted`; it does not claim every
+historical, shared, directly addressed, backed-up, or externally copied event
+is absent. See [the #349 recovery contract](erasure-replay-barrier.md#bounded-known-identity-recovery).
+
+This observer remains useful when a separate investigation requires broader
+Calendar coverage. Missing or incomplete registry evidence means that broader
+observer is incomplete; it does not by itself block the bounded #349 path.
 
 **Read-only observer, not recovery authorization.** This procedure does not
 install markers, modify mappings, clear fences, replay events or authorize
