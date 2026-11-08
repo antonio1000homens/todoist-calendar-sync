@@ -9,7 +9,7 @@ import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { ManualInterventionService } from "../dist/manual-intervention.js";
 import { Todoist } from "../dist/providers.js";
 import { profiles } from "../dist/config.js";
-import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -282,9 +282,10 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
   const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
   process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
   const projectId=profiles.home.todoistProjectId;
+  const createdAt=new Date().toISOString();
   const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
-    taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt:new Date().toISOString(),
-    expiresAt:new Date(Date.now()+14*24*60*60*1000).toISOString()});
+    taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt,
+    expiresAt:projectDeletionTombstoneExpiry(createdAt)});
   t.mock.method(Todoist.prototype,"listProjectComments",async()=>[
     {id:"tombstone-comment",project_id:projectId,content},
   ]);
