@@ -10,6 +10,7 @@ import { ManualInterventionService } from "../dist/manual-intervention.js";
 import { Todoist } from "../dist/providers.js";
 import { profiles } from "../dist/config.js";
 import { projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { ErasureReplayBlockedError } from "../dist/erasure-replay-barrier.js";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -332,6 +333,30 @@ test("tombstone lookup failure retries without writing task identity or review s
     {awsRequestId:"tombstone-lookup-failure"});
   assert.deepEqual(result.batchItemFailures,[{itemIdentifier:"lookup-failure-message"}]);
   assert.equal(audit.mock.callCount(),0);
+  assert.equal(completed.mock.callCount(),0);
+  assert.equal(report.mock.callCount(),0);
+});
+
+test("late replay-admission suppression is audited without a delivery receipt or DLQ incident",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  t.mock.method(documentClient,"send",async()=>({}));
+  const audit=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const report=t.mock.method(ManualInterventionService.prototype,"reportDeliveryFailure",async()=>{});
+  t.mock.method(OrphanRecoveringSynchronizer.prototype,"process",async()=>{throw new ErasureReplayBlockedError();});
+  t.after(()=>{
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+  });
+  const delivery={id:"late-stale-update",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:updated",
+      event_data:{id:"erased-task-id"}})};
+  const result=await handler({Records:[{messageId:"late-stale-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"late-marker-admission"});
+  assert.deepEqual(result.batchItemFailures,[]);
+  assert.equal(audit.mock.callCount(),1);
+  assert.deepEqual(audit.mock.calls[0].arguments.slice(1),["erasure_replay_admission_suppressed",{side:"todoist"}]);
   assert.equal(completed.mock.callCount(),0);
   assert.equal(report.mock.callCount(),0);
 });
