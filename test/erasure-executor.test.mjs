@@ -25,6 +25,13 @@ function memoryDb(seed){
     }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
+      if(values[":attempt"]){
+        if(item.lifecycle.deletionProgress.attempt)
+          throw Object.assign(new Error("conditional check failed"),{name:"ConditionalCheckFailedException"});
+        item={...item,lifecycle:{...item.lifecycle,deletionProgress:{...item.lifecycle.deletionProgress,
+          attempt:values[":attempt"]}},updatedAt:values[":updatedAt"]};
+        return {};
+      }
       const nextStatus=values[":next"]??values[":fencing"];
       item={...item,status:nextStatus,lifecycle:values[":lifecycle"]??item.lifecycle,
         updatedAt:values[":updatedAt"]??item.updatedAt};
@@ -522,4 +529,54 @@ test("ambiguous provider deletion and verification failures quarantine durably w
       assert.equal(providerAttempts,1,"a repeated delivery cannot re-execute an uncertain delete");
     }
   }
+});
+
+test("a lost deletion checkpoint acknowledgement leaves a durable claim and never repeats the provider step",async t=>{
+  const originalNow=Date.now;
+  let now=1_800_000_000_000;
+  Date.now=()=>now;
+  t.after(()=>{Date.now=originalNow;});
+  const operation={...storedQueuedOperation(),status:"deleting",providerDeletionReady:true,
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{},
+      deletionProgress:{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now}}};
+  let item=operation,providerAttempts=0,failedCheckpoint=false;
+  const db={async send(command){
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      if(values[":attempt"]){
+        item={...item,lifecycle:{...item.lifecycle,deletionProgress:{...item.lifecycle.deletionProgress,
+          attempt:values[":attempt"]}},updatedAt:values[":updatedAt"]};
+        return {};
+      }
+      if(!failedCheckpoint&&values[":lifecycle"]?.phase==="delete"
+        &&!values[":lifecycle"]?.deletionProgress?.attempt){
+        failedCheckpoint=true;
+        throw new Error("simulated lost checkpoint acknowledgement");
+      }
+      item={...item,status:values[":next"],lifecycle:values[":lifecycle"],updatedAt:values[":updatedAt"]};
+      return {};
+    }
+    throw new Error("Unexpected command");
+  }};
+  const adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},
+    restoreMappings:async()=>{},finishFence:async()=>{},verifyDeletion:async()=>({providersAbsent:false,stateAbsent:false}),
+    readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],executeDeletionStep:async(_op,progress)=>{
+    providerAttempts++;
+    const {attempt:_attempt,...nextProgress}=progress;
+    return {complete:false,progress:{...nextProgress,stage:"todoist"}};
+  }};
+  const store=new ErasureOperationStore(db,()=>"unused",adapters);
+  await assert.rejects(store.advanceFencedLifecycle("op"),/lost checkpoint acknowledgement/);
+  assert.equal(providerAttempts,1);
+  assert.ok(item.lifecycle.deletionProgress.attempt,"the write-ahead claim survives the failed checkpoint");
+
+  now+=40_000;
+  const retry=await store.advanceFencedLifecycle("op");
+  assert.equal(retry.status,"review_required");
+  assert.equal(item.status,"review_required");
+  assert.equal(item.lifecycle.phase,"delete");
+  assert.equal(providerAttempts,1,"the claimed provider step is never repeated after the ACK is lost");
 });

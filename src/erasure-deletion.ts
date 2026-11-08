@@ -14,6 +14,7 @@ export type ErasureDeletionProgress = {
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
+  attempt?: { id: string; startedAt: number };
 };
 
 type Dependencies = {
@@ -69,6 +70,10 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
   dependencies: Dependencies): Promise<{progress:ErasureDeletionProgress;complete:boolean}> {
   const {db,clients}=dependencies;
   const progress={...current};
+  // A successful step result advances the checkpoint and clears the durable
+  // write-ahead attempt claim. If the function throws, the caller retains the
+  // old claimed checkpoint and cannot repeat the provider mutation.
+  delete progress.attempt;
   const plan:ErasureActionPlan=operation.actionPlan;
   if(progress.stage==="comments") {
     const item=plan.comments[progress.commentIndex];

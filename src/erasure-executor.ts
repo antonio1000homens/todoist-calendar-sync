@@ -16,6 +16,8 @@ export interface ErasureDeletionProgress {
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
+  /** Write-ahead claim for the current step; kept if its checkpoint ACK is lost. */
+  attempt?: { id: string; startedAt: number };
 }
 export interface FencedLifecycle {
   phase: FencedLifecyclePhase;
@@ -100,6 +102,10 @@ export class ErasureGateDriftError extends Error {
     super("Erasure is not ready: persisted action receipts, confirmation, inventory, or lifecycle changed");
     this.name="ErasureGateDriftError";
   }
+}
+
+class ErasureDeletionAttemptClaimError extends Error {
+  constructor(){super("Another worker claimed this deletion step");this.name="ErasureDeletionAttemptClaimError";}
 }
 
 export const ERASURE_REVIEW_REQUIRED_MESSAGE="Operator break-glass recovery is required. Preserve any protections that remain, inspect the actual profile fence and worker mapping state, and escalate if either is missing, changed, or cannot be verified. Do not start a fresh preview until service admission is restored; this operation cannot be resumed.";
@@ -380,8 +386,20 @@ export class ErasureOperationStore {
         }
         case "delete": {
           if(!adapters.executeDeletionStep) throw new Error("Trusted erasure deletion adapter is not configured");
-          const result=await adapters.executeDeletionStep(operation,current.deletionProgress
-            ||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now});
+          if(current.deletionProgress?.attempt) {
+            const reviewAt=current.deletionProgress.attempt.startedAt+current.timeoutSeconds*1000+2000;
+            if(now<reviewAt) next={...current,nextRunAt:reviewAt};
+            else {
+              next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
+              nextStatus="review_required";
+            }
+            break;
+          }
+          const progress=current.deletionProgress
+            ||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now};
+          const attempt=await this.#claimDeletionAttempt(operation,current,progress,now);
+          operation.lifecycle={...current,deletionProgress:{...progress,attempt}};
+          const result=await adapters.executeDeletionStep(operation,operation.lifecycle.deletionProgress!);
           if(result.complete) next=this.#advance(operation.operationId,current,"verify_deletion",now);
           else next={...current,deletionProgress:result.progress,nextRunAt:now};
           break;
@@ -427,6 +445,8 @@ export class ErasureOperationStore {
         }
       }
     } catch(error) {
+      if(error instanceof ErasureDeletionAttemptClaimError)
+        return {phase:"delete",nextRunAt:now+current.pollMs,status:operation.status,waiting:true};
       // Once provider deletion has been attempted, even a transient-looking
       // failure may mean the remote mutation succeeded but its response was
       // lost. Never retry the same destructive step from an old checkpoint.
@@ -436,10 +456,10 @@ export class ErasureOperationStore {
       const ambiguousProviderWrite=operation.status==="deleting"
         &&(current.phase==="delete"||current.phase==="verify_deletion");
       if(error instanceof ErasureGateDriftError||error instanceof ErasureReplayUnavailableError||ambiguousProviderWrite) {
-        next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
+        next={...(operation.lifecycle||current),nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
         nextStatus="review_required";
       } else {
-        next={...current,nextRunAt:now+current.pollMs,
+        next={...(operation.lifecycle||current),nextRunAt:now+current.pollMs,
           lastError:error instanceof Error?error.message:String(error)};
       }
     }
@@ -556,6 +576,26 @@ export class ErasureOperationStore {
     return next;
   }
 
+  async #claimDeletionAttempt(operation:ErasureOperation,current:FencedLifecycle,
+    progress:ErasureDeletionProgress,now:number):Promise<{id:string;startedAt:number}> {
+    const attempt={id:randomUUID(),startedAt:now};
+    try {
+      await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
+        UpdateExpression:"SET lifecycle.#progress.#attempt=:attempt, updatedAt=:updatedAt",
+        ConditionExpression:"#status=:deleting AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
+        ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress",
+          "#attempt":"attempt","#stage":"stage","#commentIndex":"commentIndex","#stateIndex":"stateIndex"},
+        ExpressionAttributeValues:{":deleting":"deleting",":delete":"delete",":stage":progress.stage,
+          ":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,":attempt":attempt,
+          ":updatedAt":new Date(now).toISOString(),":ready":true,":fingerprint":operation.previewFingerprint}}));
+    } catch(error) {
+      if((error as {name?:string})?.name==="ConditionalCheckFailedException")
+        throw new ErasureDeletionAttemptClaimError();
+      throw error;
+    }
+    return attempt;
+  }
+
   async #persistLifecycle(operation: ErasureOperation, candidate: FencedLifecycle,
     nextStatus: ErasureOperationStatus, now: number): Promise<void> {
     const current=operation.lifecycle;
@@ -617,12 +657,15 @@ export class ErasureOperationStore {
     if(candidate.phase==="wait_worker_timeout"&&candidate.nextRunAt!==
       (candidate.evidence.fenceInstalled?.completedAt??0)+candidate.timeoutSeconds*1000+2000)
       throw new Error("Worker timeout must start at persisted fence installation time");
+    const conditionAttempt=current.phase==="delete"&&current.deletionProgress?.attempt;
     await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
       UpdateExpression:"SET #status=:next, lifecycle=:lifecycle, updatedAt=:updatedAt",
-      ConditionExpression:"#status=:expected AND lifecycle.#phase=:phase AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
-      ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":expected":operation.status,
+      ConditionExpression:"#status=:expected AND lifecycle.#phase=:phase AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint"
+        +(conditionAttempt?" AND lifecycle.#progress.#attempt.#attemptId=:attemptId":""),
+      ExpressionAttributeNames:{"#status":"status","#phase":"phase",...(conditionAttempt?{"#progress":"deletionProgress",
+        "#attempt":"attempt","#attemptId":"id"}:{})},ExpressionAttributeValues:{":expected":operation.status,
         ":next":nextStatus,":phase":current.phase,":ready":true,":lifecycle":candidate,":updatedAt":new Date(now).toISOString(),
-        ":fingerprint":operation.previewFingerprint}}));
+        ":fingerprint":operation.previewFingerprint,...(conditionAttempt?{":attemptId":conditionAttempt.id}:{})}}));
   }
 
   async #finishAndEraseOperation(operation:ErasureOperation):Promise<void> {
