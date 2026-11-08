@@ -60,7 +60,10 @@ export interface ErasureOperation {
 }
 export interface ErasureActionPlan {
   todoistTask?: { id: string; digest: string };
-  calendarEvent?: { id: string; digest: string; etag: string };
+  calendarEvent?: { id: string; calendarId:string; digest: string; etag: string };
+  /** Exact event aliases captured before mutation, scoped by profile and Calendar. */
+  knownCalendarAliases?:Array<{profile:Profile;calendarId:string;eventId:string}>;
+  knownCalendarAliasesComplete?:boolean;
   comments: Array<{ id: string; kind: "project" | "task"; digest: string }>;
 }
 export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
@@ -112,11 +115,22 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
 function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
-function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"target"|"selectedActions">):boolean {
+function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions">):boolean {
   if(!plan||!Array.isArray(plan.comments)) return false;
   if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
   if(plan.calendarEvent&&(!operation.selectedActions.deleteCalendar||plan.calendarEvent.id!==operation.target.eventId
+    ||typeof plan.calendarEvent.calendarId!=="string"||!/^[^\u0000-\u001f\u007f]{1,1024}$/.test(plan.calendarEvent.calendarId)
     ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.digest)||typeof plan.calendarEvent.etag!=="string"||!plan.calendarEvent.etag)) return false;
+  if(operation.selectedActions.deleteCalendar) {
+    const aliases=plan.knownCalendarAliases;
+    if(plan.knownCalendarAliasesComplete!==true||!Array.isArray(aliases)||!aliases.length||aliases.length>32
+      ||aliases.some(alias=>!alias||!(["home","antonio","work"] as string[]).includes(alias.profile)
+        ||typeof alias.calendarId!=="string"||!/^[^\u0000-\u001f\u007f]{1,1024}$/.test(alias.calendarId)
+        ||typeof alias.eventId!=="string"||!/^[A-Za-z0-9_.-]{1,1024}$/.test(alias.eventId))
+      ||new Set(aliases.map(alias=>JSON.stringify([alias.profile,alias.calendarId,alias.eventId]))).size!==aliases.length
+      ||!plan.calendarEvent||!aliases.some(alias=>alias.profile===operation.profile
+        &&alias.calendarId===plan.calendarEvent!.calendarId&&alias.eventId===operation.target.eventId)) return false;
+  }
   const ids=new Set<string>();
   return plan.comments.every(item=>typeof item.id==="string"&&item.id.length>0&&!ids.has(item.id)
     &&(ids.add(item.id),true)&&(item.kind==="project"||item.kind==="task")&&/^[a-f0-9]{64}$/.test(item.digest));

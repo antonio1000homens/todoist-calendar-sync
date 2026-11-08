@@ -3,5 +3,6 @@ export interface PurgeRecord { pk: string; sk: string; type: string; classificat
 export function planPurge(rows: Record<string, unknown>[], target: PurgeTarget): {
   records: PurgeRecord[]; counts: Record<string, number>; blockers: string[]; inventoryDigest: string;
 };
+export function exactCalendarEventIds(row: Record<string, unknown>): string[];
 export function fingerprint(value: unknown): string;
 export function publicInventoryRecord(record: PurgeRecord): Omit<PurgeRecord, "digest">;

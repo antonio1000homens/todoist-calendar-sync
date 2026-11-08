@@ -107,3 +107,68 @@ test("cancelled linked lookup results require the exact selected Calendar identi
     });
   }
 });
+
+test("deletion preview captures profile and Calendar-scoped event aliases before any mutation",async()=>{
+  const db={send:async command=>command.constructor.name==="ScanCommand"
+    ?{Items:[{pk:"TASK#home#task-123",sk:"MAP",profile:"home",taskId:"task-123",eventId:"event-123"}]}
+    :{}};
+  const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.deepEqual(preview.actionPlan.knownCalendarAliases,[
+    {profile:"home",calendarId:"home@example.test",eventId:"event-123"},
+  ]);
+  assert.equal(preview.actionPlan.knownCalendarAliasesComplete,true);
+  assert.equal(preview.actionPlan.calendarEvent.calendarId,"home@example.test");
+  assert.deepEqual(preview.blockers,[]);
+});
+
+test("recorded profile moves are retained in the alias manifest and block cross-profile deletion",async()=>{
+  const db={send:async command=>command.constructor.name==="ScanCommand"
+    ?{Items:[{pk:"EVENT#antonio#task-123",sk:"event-1",profile:"antonio",taskId:"task-123",eventId:"moved-event"}]}
+    :{}};
+  const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.actionPlan.knownCalendarAliases.some(alias=>alias.profile==="antonio"
+    &&alias.calendarId==="personal@example.test"&&alias.eventId==="moved-event"));
+  assert.ok(preview.blockers.length>0,"a cross-profile move is recorded but still requires review");
+  assert.equal(preview.confirmation,undefined);
+});
+
+test("recurring master IDs from exact Calendar metadata are saved but remain manual-review only",async()=>{
+  const db={send:async command=>command.constructor.name==="ScanCommand"
+    ?{Items:[{pk:"TASK#home#task-123",sk:"MAP",profile:"home",taskId:"task-123",eventId:"event-123"}]}
+    :{}};
+  const event={id:"event-123",etag:"etag-123",recurringEventId:"series-master",
+    extendedProperties:{shared:{taskId:"task-123"}}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.actionPlan.knownCalendarAliases.some(alias=>alias.eventId==="series-master"));
+  assert.ok(preview.blockers.some(item=>item.includes("series/exception requires manual handling")));
+  assert.equal(preview.confirmation,undefined);
+});
+
+test("an event reference without a trustworthy profile scope cannot produce a complete marker manifest",async()=>{
+  const db={send:async command=>command.constructor.name==="ScanCommand"
+    ?{Items:[{pk:"AUDIT#opaque#row",sk:"STATE",detail:{taskId:"task-123",eventId:"orphan-event"}}]}
+    :{}};
+  const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.equal(preview.actionPlan.knownCalendarAliasesComplete,false);
+  assert.ok(preview.blockers.some(item=>item.includes("no unambiguous profile scope")));
+  assert.equal(preview.confirmation,undefined);
+});

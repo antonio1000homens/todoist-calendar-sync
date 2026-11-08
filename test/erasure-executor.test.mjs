@@ -386,6 +386,32 @@ test("durable operation store digests immutable preview content and atomically c
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
 });
 
+test("Calendar deletion confirmation requires a complete, exact profile/Calendar/event alias manifest",async()=>{
+  const before=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const previewWithAliases={...preview,target:{...preview.target,eventId:"event-123",deleteCalendar:true},
+    selectedActions:{deleteTodoist:true,deleteCalendar:true},
+    actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},
+      calendarEvent:{id:"event-123",calendarId:"home@example.test",digest:"c".repeat(64),etag:"etag"},
+      knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-123"}],
+      knownCalendarAliasesComplete:true,comments:[]}};
+  const db={async send(){throw new Error("invalid manifests must be refused before writing a confirmation");}};
+  const store=new ErasureOperationStore(db);
+  try {
+    for(const patch of [
+      {actionPlan:{...previewWithAliases.actionPlan,knownCalendarAliasesComplete:false}},
+      {actionPlan:{...previewWithAliases.actionPlan,knownCalendarAliases:[]}},
+      {actionPlan:{...previewWithAliases.actionPlan,knownCalendarAliases:[
+        {profile:"home",calendarId:"home@example.test",eventId:"other-event"}]}},
+      {actionPlan:{...previewWithAliases.actionPlan,knownCalendarAliases:[
+        ...previewWithAliases.actionPlan.knownCalendarAliases,
+        {profile:"home",calendarId:"home@example.test",eventId:"event-123"}]}},
+    ]) await assert.rejects(store.issueConfirmation({operationId:"op-calendar",...previewWithAliases,...patch}),
+      /Invalid erasure operation preview/);
+    await assert.rejects(store.issueConfirmation({operationId:"op-calendar",...previewWithAliases}),
+      /invalid manifests must be refused/);
+  } finally {if(before===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=before;}
+});
+
 test("confirmation persists the readiness at issuance, not the later deployment state",async t=>{
   const before={table:process.env.STATE_TABLE_NAME,enabled:process.env.ERASURE_EXECUTION_ENABLED,
     protocol:process.env.ERASURE_PROTOCOL_VERSION};
