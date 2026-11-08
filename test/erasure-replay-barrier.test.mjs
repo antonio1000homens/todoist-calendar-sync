@@ -70,6 +70,8 @@ function proof(){
     originalPreviewFingerprint:"c".repeat(64),
     reviewedAt:"2026-11-03T19:40:00.000Z",
     identity:{profile:"work",taskId:"deleted-task",eventIds:["deleted-event","deleted-alias"]},
+    selectedEventId:"deleted-event",
+    selectedCalendarId:"work@example.test",
     knownCalendarAliases:[{profile:"work",calendarId:"work@example.test",eventId:"deleted-event"},
       {profile:"work",calendarId:"work@example.test",eventId:"deleted-alias"}],
     workerMappings:{mappingIds:["11111111-1111-4111-8111-111111111111",
@@ -201,6 +203,7 @@ test("missing new confirmation, epoch and oversize alias set cannot construct a 
       {profile:"work",calendarId:"work@example.test",eventId:"deleted-event"}]},
     {knownCalendarAliases:Array.from({length:33},(_,i)=>({profile:"work",
       calendarId:"work@example.test",eventId:"event-"+i}))},
+    {selectedCalendarId:""},
     {knownCalendarAliases:proof().knownCalendarAliases.map(alias=>({...alias,calendarId:"other@example.test"}))},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:Array.from({length:33},(_,i)=>"event-"+i)}},
     {workerMappings:{mappingIds:[],enabledMappingIds:["11111111-1111-4111-8111-111111111111"]}},
@@ -249,6 +252,12 @@ test("release transaction matches the exact reviewed-fenced and consumed-token s
   assert.ok(operation.ConditionExpression.includes("selectedActions.deleteTodoist=:yes"));
   assert.ok(operation.ConditionExpression.includes("attribute_exists(actionPlan.calendarEvent)"));
   assert.ok(operation.ConditionExpression.includes("attribute_exists(actionPlan.todoistTask)"));
+  assert.ok(operation.ConditionExpression.includes("target.taskId=:taskId"));
+  assert.ok(operation.ConditionExpression.includes("target.eventId=:eventId"));
+  assert.ok(operation.ConditionExpression.includes("actionPlan.calendarEvent.calendarId=:calendarId"));
+  assert.equal(operation.ExpressionAttributeValues[":taskId"],input.identity.taskId);
+  assert.equal(operation.ExpressionAttributeValues[":eventId"],input.selectedEventId);
+  assert.equal(operation.ExpressionAttributeValues[":calendarId"],input.selectedCalendarId);
   assert.ok(operation.ConditionExpression.includes("attribute_not_exists(recovery)"));
   assert.ok(token.ConditionExpression.includes("originalPreviewFingerprint=:original"));
   assert.ok(token.ConditionExpression.includes("attribute_not_exists(expiresAtMs)"));
@@ -280,6 +289,17 @@ test("only explicitly known cross-profile Calendar aliases create scoped HMAC ma
   const original=atomicReplayRelease(proof()).input.TransactItems;
   assert.equal(original.filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).length,REPLAY_PROFILES.length+2,
     "unrelated calendars are not automatically marked");
+});
+test("explicitly recorded historical Calendar IDs remain scoped and can be tombstoned",()=>{
+  const p={...proof(),knownCalendarAliases:[
+    ...proof().knownCalendarAliases,
+    {profile:"work",calendarId:"work-archive@example.test",eventId:"moved-before-config-change"},
+  ]};
+  const markers=atomicReplayRelease(p).input.TransactItems
+    .filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#"))
+    .filter(x=>x.Put.Item.sk.startsWith("EVENT#"));
+  assert.equal(markers.length,3);
+  assert.equal(JSON.stringify(markers).includes("moved-before-config-change"),false);
 });
 test("oversized known alias set refuses release instead of split batches",()=>{
   const p={...proof(),identity:{
