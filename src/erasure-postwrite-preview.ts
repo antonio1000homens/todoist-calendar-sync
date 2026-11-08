@@ -18,6 +18,12 @@ export interface PostWriteRecoveryAssessment {
   onlyAvailableAction:"keep_fenced";
   potentialDisposition:"independent_full_deletion_verification"|"new_reviewed_deletion_authorization"|"use_pre_write_recovery";
   blockers:string[];
+  /** Scoped read-only diagnostic; never a release or deletion authorization. */
+  knownIdentity:{
+    status:"known_identity_deleted"|"partial_or_ambiguous"|"not_post_write";
+    scope:"recorded_original_targets_in_configured_profile";
+    releaseAllowed:false;
+  };
   evidence:{
     originalProviderWriteIndicated:boolean;
     originalCalendarDeletionSelected:boolean;
@@ -60,7 +66,23 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
     &&inspection.providerItemsAbsent&&inspection.stateRowsAbsent;
   const classification:PostWriteClassification=!indicated?"not_post_write":
     candidate?"fully_deleted_candidate":"partial_or_ambiguous";
+  const knownReadback=inspection.knownTargetReadback;
+  // This separate read-only outcome intentionally does NOT require a signed
+  // all-calendar registry. It is limited to the immutable, originally recorded
+  // provider IDs. Unknown or conflicting source snapshots never prove absence.
+  const relatedLiveEvidence=Object.values(inspection.crossProfileEvidence?.profiles||{}).some(profile=>
+    profile.taskReadsFound>0||profile.taskInventoryMatches>0
+    ||profile.directEventReadsFound>0||profile.inventoryMatchedEvents>0);
+  const scopedKnownDeleted=indicated&&writeReceipt&&deletionSelected&&targets
+    &&knownReadback?.todoist==="absent"&&knownReadback.calendar==="absent"
+    &&knownReadback.configuredCalendarLink==="not_found"
+    &&inspection.snapshotSafetyBlockerCount===0&&!relatedLiveEvidence
+    &&inspection.fenceOwned&&typeof inspection.epoch==="number"&&inspection.epoch>0
+    &&inspection.leaseCount===0&&inspection.stateRowsAbsent;
+  const knownIdentityStatus=!indicated?"not_post_write":scopedKnownDeleted?
+    "known_identity_deleted":"partial_or_ambiguous";
   const blockers=[...inspection.blockers];
+  if(scopedKnownDeleted)blockers.push("Known recorded targets are absent; this is not proof of global Calendar erasure or authorization to release a fence");
   if(!indicated)blockers.push("No provider-write boundary is indicated; use pre-write recovery if independently verified");
   if(indicated&&!writeReceipt)blockers.push("No valid durable deletion-start receipt proves the original provider-write stage");
   if(!deletionSelected)blockers.push("Original confirmation did not select deletion of both Todoist and Calendar");
@@ -86,6 +108,8 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
     operationId:operation.operationId,profile:operation.profile,classification,releaseAllowed:false,
     onlyAvailableAction:"keep_fenced",potentialDisposition,
     blockers:[...new Set(blockers)].sort(),
+    knownIdentity:{status:knownIdentityStatus,scope:"recorded_original_targets_in_configured_profile",
+      releaseAllowed:false},
     evidence:{
       originalProviderWriteIndicated:indicated,originalCalendarDeletionSelected:deletionSelected,
       exactTodoistAndCalendarTargetsRecorded:targets,matchingFence:inspection.fenceOwned,

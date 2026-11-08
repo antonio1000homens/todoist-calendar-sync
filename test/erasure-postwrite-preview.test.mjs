@@ -92,3 +92,51 @@ test("original operation/provider IDs are not returned even on failed evidence",
   assert.equal(output.includes("secret-event"),false);
   assert.equal(output.includes(enabled),false);
 });
+
+test("scoped known-identity assessment does not require a signed global Calendar inventory",()=>{
+  const {operation,preview}=fixture();
+  preview.classification="partial_or_ambiguous";
+  preview.providerItemsAbsent=false; // global provenance is unproven
+  preview.snapshotSafetyBlockerCount=0;
+  preview.knownTargetReadback={todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"};
+  const result=assessPostWriteRecovery(operation,preview);
+  assert.equal(result.knownIdentity.status,"known_identity_deleted");
+  assert.equal(result.knownIdentity.scope,"recorded_original_targets_in_configured_profile");
+  assert.equal(result.classification,"partial_or_ambiguous");
+  assert.equal(result.knownIdentity.releaseAllowed,false);
+  assert.equal(result.releaseAllowed,false);
+  assert.equal(result.onlyAvailableAction,"keep_fenced");
+  assert.ok(result.blockers.some(x=>x.includes("not proof of global Calendar erasure")));
+});
+test("scoped absence refuses unknown, surviving, stale or conflicting evidence",()=>{
+  const variations=[
+    x=>{x.preview.knownTargetReadback.todoist="present";},
+    x=>{x.preview.knownTargetReadback.calendar="unknown";},
+    x=>{x.preview.knownTargetReadback.configuredCalendarLink="present";},
+    x=>{x.preview.snapshotSafetyBlockerCount=1;},
+    x=>{x.preview.stateRowsAbsent=false;},
+    x=>{x.preview.fenceOwned=false;},
+    x=>{x.preview.leaseCount=1;},
+    x=>{x.preview.crossProfileEvidence={profiles:{work:{taskReadsFound:1}},missingProof:[]};},
+    x=>{x.operation.lifecycle.evidence={};},
+    x=>{x.operation.actionPlan.calendarEvent.id="other-target";},
+  ];
+  for(const change of variations){
+    const x=fixture();
+    x.preview.snapshotSafetyBlockerCount=0;
+    x.preview.knownTargetReadback={todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"};
+    x.preview.providerItemsAbsent=false;
+    change(x);
+    const result=assessPostWriteRecovery(x.operation,x.preview);
+    assert.equal(result.knownIdentity.status,"partial_or_ambiguous");
+    assert.equal(result.releaseAllowed,false);
+  }
+});
+test("scoped outcome is not post-write without an original deletion receipt",()=>{
+  const x=fixture();
+  x.operation.lifecycle.phase="wait_worker_timeout";
+  x.operation.lifecycle.evidence={};
+  x.preview.snapshotSafetyBlockerCount=0;
+  x.preview.knownTargetReadback={todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"};
+  assert.equal(assessPostWriteRecovery(x.operation,x.preview).knownIdentity.status,"not_post_write");
+});

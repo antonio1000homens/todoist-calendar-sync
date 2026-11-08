@@ -4,7 +4,7 @@ import {GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateComman
 import {documentClient} from "./dynamodb-capacity.js";
 import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation, type FencedMapping} from "./erasure-executor.js";
 import type {CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
-import type {ErasurePreviewResult} from "./erasure-preview.js";
+import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.js";
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
@@ -30,6 +30,10 @@ export interface RecoveryPreview {
   leaseCount:number;
   providerItemsAbsent:boolean;
   stateRowsAbsent:boolean;
+  /** Read-only result for exact originally mapped provider IDs, not global erasure proof. */
+  knownTargetReadback?:KnownTargetReadback;
+  /** Provider/state preview blockers before the global-absence policy is evaluated. */
+  snapshotSafetyBlockerCount?:number;
   operationFingerprint:string;
   recoveryStatus?:RecoveryStatus;
   crossProfileEvidence?:CrossProfileErasureEvidence;
@@ -206,6 +210,8 @@ export class ErasureRecoveryService {
         &&snapshot.crossProfileEvidence?.knownIdentitiesAbsentFromCurrentProviders===true,
       stateRowsAbsent:snapshot.inventory.length===0
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
+      ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
+      snapshotSafetyBlockerCount:snapshot.blockers.length,
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
       ...(snapshot.crossProfileEvidence?{crossProfileEvidence:snapshot.crossProfileEvidence}:{})};
