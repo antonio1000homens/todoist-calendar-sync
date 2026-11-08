@@ -14,7 +14,6 @@ export interface PostWriteRecoveryAssessment {
   classification:PostWriteClassification;
   releaseAllowed:false;
   reviewStatus?:"reviewed_fenced";
-  reviewEnabled?:boolean;
   onlyAvailableAction:"keep_fenced";
   potentialDisposition:"independent_full_deletion_verification"|"new_reviewed_deletion_authorization"|"use_pre_write_recovery";
   blockers:string[];

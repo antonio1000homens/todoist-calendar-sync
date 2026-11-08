@@ -33,7 +33,7 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   const recovery={
     async inspectPostWrite(id){calls.push(["postwrite",id]);return {operationId:id,profile:"work",
       classification:"fully_deleted_candidate",releaseAllowed:false,onlyAvailableAction:"keep_fenced",
-      reviewEnabled:true,blockers:["not yet authorised"],evidence:{matchingFence:true,leasesDrained:true}};},
+      blockers:["not yet authorised"],evidence:{matchingFence:true,leasesDrained:true}};},
     async issuePostWriteReviewToken(id,operator){calls.push(["postwrite-token",id,operator]);return {
       operationId:id,profile:"work",confirmationId:"token-123",expiresAt:Date.now()+60000,releaseAllowed:false};},
     async acknowledgePostWriteReview(id,token,operator,typed){

@@ -15,8 +15,7 @@ export function recoveryNeedsDispatch(status) {
 
 /** This acknowledges evidence only; it cannot approve any post-write release. */
 export function canAcknowledgeFencedPostWrite(assessment,token,typed,operation){
-  return Boolean(assessment?.reviewEnabled===true
-    &&assessment?.classification==="fully_deleted_candidate"
+  return Boolean(assessment?.classification==="fully_deleted_candidate"
     &&assessment?.releaseAllowed===false
     &&assessment?.onlyAvailableAction==="keep_fenced"
     &&assessment?.reviewStatus!=="reviewed_fenced"

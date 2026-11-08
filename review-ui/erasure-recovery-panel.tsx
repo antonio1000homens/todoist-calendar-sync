@@ -53,7 +53,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     finally{setBusy(false);}
   };
   const requestPostWriteToken=async()=>{
-    if(!operation||busy||postWriteAssessment?.reviewEnabled!==true
+    if(!operation||busy
       ||postWriteAssessment?.classification!=="fully_deleted_candidate"
       ||postWriteAssessment?.reviewStatus==="reviewed_fenced")return;
     setBusy(true);setPostWriteToken(undefined);setNotice("");
@@ -149,7 +149,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           <p>Provider items absent: {postWriteAssessment.evidence?.providersAbsent?"yes":"no"} · state rows absent: {postWriteAssessment.evidence?.stateRowsAbsent?"yes":"no"} · original worker mappings restored: {postWriteAssessment.evidence?.workerMappingsRestored?"yes":"no"}</p>
           <p className="warning">Only safe action: preserve the existing fence. Recording a review does not authorise provider changes, recovery, or fence release.</p>
           {postWriteAssessment.reviewStatus==="reviewed_fenced"&&<p role="status">Post-write evidence review recorded; still fenced.</p>}
-          {postWriteAssessment.reviewEnabled===true&&postWriteAssessment.classification==="fully_deleted_candidate"
+          {postWriteAssessment.classification==="fully_deleted_candidate"
             &&!postWriteAssessment.reviewStatus&&!postWriteToken&&
             <button className="secondary" disabled={busy} onClick={()=>void requestPostWriteToken()}>Request fenced-review token</button>}
           {postWriteToken&&<div className="erasure-results" aria-label="Post-write review acknowledgement">
