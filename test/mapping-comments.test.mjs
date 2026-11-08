@@ -4,6 +4,7 @@ import { profiles, rememberTodoistTokenProject } from "../dist/config.js";
 import {
   MAPPING_COMMENT_MARKER,
   DELETION_TOMBSTONE_COMMENT_MARKER,
+  PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
   activeProjectDeletionTombstone,
   attachProjectCommentReference,
   buildProjectMappingIndex,
@@ -55,27 +56,29 @@ test("v1 project mapping comment round-trips recurrence metadata", () => {
 });
 
 test("project deletion tombstone round-trips exact identities and expires without DynamoDB state", () => {
+  assert.equal(PROJECT_DELETION_TOMBSTONE_RETENTION_MS, 18 * 24 * 60 * 60 * 1000,
+    "four-day FIFO source retention plus fourteen-day FIFO DLQ retention");
   const payload = { schemaVersion: 1, profile: "home", projectId: "project-home", taskId: "task-1",
     eventIds: ["master-1", "event-1"], createdAt: "2026-11-08T12:00:00.000Z",
-    expiresAt: "2026-11-22T12:00:00.000Z" };
+    expiresAt: "2026-11-26T12:00:00.000Z" };
   const content = serializeDeletionTombstoneComment(payload);
   assert.ok(content.startsWith(`${DELETION_TOMBSTONE_COMMENT_MARKER}\n`));
   const comment = { id: "comment-1", content };
   assert.deepEqual(parseDeletionTombstoneComment(comment), { ...payload, eventIds: ["event-1", "master-1"] });
   assert.equal(parseMappingComment(comment), undefined, "deleted mapping is no longer indexed as active");
-  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", taskId: "task-1" }, Date.parse("2026-11-22T11:59:59.000Z"))?.taskId, "task-1");
-  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", eventIds: ["event-1"] }, Date.parse("2026-11-22T12:00:00.000Z")), undefined);
-  assert.equal(projectDeletionTombstoneExpired(comment, Date.parse("2026-11-22T12:00:00.000Z")), true);
+  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", taskId: "task-1" }, Date.parse("2026-11-26T11:59:59.000Z"))?.taskId, "task-1");
+  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", eventIds: ["event-1"] }, Date.parse("2026-11-26T12:00:00.000Z")), undefined);
+  assert.equal(projectDeletionTombstoneExpired(comment, Date.parse("2026-11-26T12:00:00.000Z")), true);
 });
 
 test("project deletion tombstone parser rejects malformed or non-finite scopes", () => {
   const malformed = [
     `${DELETION_TOMBSTONE_COMMENT_MARKER}\n{bad`,
-    `${DELETION_TOMBSTONE_COMMENT_MARKER}\n${JSON.stringify({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: Array.from({ length: 33 }, (_, i) => `event-${i}`), createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-22T12:00:00.000Z" })}`,
+    `${DELETION_TOMBSTONE_COMMENT_MARKER}\n${JSON.stringify({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: Array.from({ length: 33 }, (_, i) => `event-${i}`), createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-26T12:00:00.000Z" })}`,
     `${DELETION_TOMBSTONE_COMMENT_MARKER}\n${JSON.stringify({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2099-11-08T12:00:00.000Z" })}`,
   ];
   for (const content of malformed) assert.equal(parseDeletionTombstoneComment({ id: "bad", content }), undefined);
-  assert.ok(serializeDeletionTombstoneComment({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-22T12:00:00.000Z" }));
+  assert.ok(serializeDeletionTombstoneComment({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-26T12:00:00.000Z" }));
 });
 
 test("project mapping comment becomes a verified short-lived deletion tombstone idempotently", async () => {
@@ -90,7 +93,7 @@ test("project mapping comment becomes a verified short-lived deletion tombstone 
   const second = await writeProjectDeletionTombstone(client, input);
   assert.deepEqual(parseDeletionTombstoneComment(first), parseDeletionTombstoneComment(second));
   assert.equal(parseMappingComment(first), undefined);
-  assert.equal(parseDeletionTombstoneComment(first).expiresAt, "2026-11-22T12:00:00.000Z");
+  assert.equal(parseDeletionTombstoneComment(first).expiresAt, "2026-11-26T12:00:00.000Z");
   await assert.rejects(writeProjectDeletionTombstone(client, { ...input, taskId: "other-task" }), /does not match/);
 });
 
@@ -106,16 +109,16 @@ test("project deletion marker never creates a replacement comment when the exact
 });
 
 test("expired project tombstone cleanup is scoped, dry-run by default, and rechecks before delete", async () => {
-  const now=Date.parse("2026-11-23T12:00:00.000Z");
+  const now=Date.parse("2026-12-01T12:00:00.000Z");
   const expired={id:"expired",project_id:"project-home",content:serializeDeletionTombstoneComment({schemaVersion:1,
     profile:"home",projectId:"project-home",taskId:"task-old",eventIds:["event-old"],
-    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"})};
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"})};
   const active={id:"active",project_id:"project-home",content:serializeDeletionTombstoneComment({schemaVersion:1,
     profile:"home",projectId:"project-home",taskId:"task-new",eventIds:["event-new"],
-    createdAt:"2026-11-15T12:00:00.000Z",expiresAt:"2026-11-29T12:00:00.000Z"})};
+    createdAt:"2026-11-15T12:00:00.000Z",expiresAt:"2026-12-03T12:00:00.000Z"})};
   const other={id:"other",project_id:"project-other",content:serializeDeletionTombstoneComment({schemaVersion:1,
     profile:"antonio",projectId:"project-other",taskId:"task-other",eventIds:["event-other"],
-    createdAt:"2026-11-01T12:00:00.000Z",expiresAt:"2026-11-15T12:00:00.000Z"})};
+    createdAt:"2026-11-01T12:00:00.000Z",expiresAt:"2026-11-19T12:00:00.000Z"})};
   const comments=new Map([[expired.id,expired],[active.id,active],[other.id,other]]);
   let deletes=0;
   const client={listProjectComments:async()=>[...comments.values()],

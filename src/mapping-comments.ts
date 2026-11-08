@@ -3,8 +3,8 @@ import type { Mapping, Profile } from "./types.js";
 export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v1";
 /** Short-lived post-erasure marker kept beside the deleted task's project mapping. */
 export const DELETION_TOMBSTONE_COMMENT_MARKER = "todoist-calendar-sync:deleted:v1";
-/** Match the maximum configured SQS/DLQ retention for a bounded replay window. */
-export const PROJECT_DELETION_TOMBSTONE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+/** Cover the four-day FIFO source queue plus its 14-day FIFO DLQ retention. */
+export const PROJECT_DELETION_TOMBSTONE_RETENTION_MS = 18 * 24 * 60 * 60 * 1000;
 export const LEGACY_MAPPING_COMMENT_MARKER = "gcp-app2-sync:mapping:v1";
 /** Historical task-comment identities are accepted only for migration/cleanup. */
 export const LEGACY_TASK_COMMENT_MARKERS = new Set<string>(["gcp-app2-sync", "todoist-calendar-sync"]);

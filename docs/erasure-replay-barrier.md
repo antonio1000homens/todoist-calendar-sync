@@ -3,15 +3,17 @@
 **Current policy (8 November 2026):** do not retain deleted task identity in
 DynamoDB. An explicitly confirmed erasure rewrites its exact Todoist project
 mapping comment into a temporary marker containing the task ID, exact known
-Calendar event IDs, and a 14-day expiry. The project comment remains available
+Calendar event IDs, and an 18-day expiry. The project comment remains available
 after the Calendar event is deleted. The erasure transaction removes the
 identity-bearing DynamoDB operation/state and releases its fence only after
 fresh provider readback confirms the marker.
 
 The primary Todoist webhook and Google Calendar delta paths check active project
-markers before processing stale updates. The marker expires at the configured
-SQS/DLQ maximum retention. A manually replayed payload after expiry can no
-longer be distinguished by retained identity. Expired comments are removed only
+markers before processing stale updates. The 18-day window covers the live
+four-day FIFO sync queue plus the fourteen-day FIFO DLQ; SQS resets message age
+when a FIFO message moves to its DLQ. Operator redrive resets retention again,
+and a manually replayed payload after marker expiry can no longer be
+distinguished by retained identity. Expired comments are removed only
 by the operator-run report/apply workflow; there is no automatic cleanup
 schedule. Cleanup never changes the separate seven-day completed-task lifecycle.
 The expiry clock starts when the exact existing project comment is rewritten;

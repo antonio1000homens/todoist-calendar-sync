@@ -625,7 +625,7 @@ test("temporary project tombstone suppresses a stale Todoist webhook before task
   const state={async audit(profile,action,detail){audits.push({profile,action,detail});}};
   const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
     projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
-    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"});
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"});
   const todoist={async listProjectComments(projectId){assert.equal(projectId,profiles.home.todoistProjectId);return [
     {id:"tombstone-comment",project_id:projectId,content},
   ];},async getTask(){taskReads++;return {id:"purged-task"};},async upsertTask(){taskWrites++;}};
@@ -648,7 +648,7 @@ test("temporary project tombstone suppresses a stale Calendar delta before Todoi
     extendedProperties:{shared:{taskId:"purged-task"}}};
   const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
     projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
-    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"});
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"});
   const calendar={async listDelta(){return {items:[event],nextSyncToken:"next-token"};}};
   const todoist={async listProjectComments(projectId){return [{id:"tombstone-comment",project_id:projectId,content}];},
     async upsertTask(){creates++;}};
