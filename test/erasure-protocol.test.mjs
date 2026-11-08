@@ -10,6 +10,7 @@ import { ManualInterventionService } from "../dist/manual-intervention.js";
 import { Todoist } from "../dist/providers.js";
 import { profiles } from "../dist/config.js";
 import { projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { SSMClient } from "@aws-sdk/client-ssm";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -279,8 +280,17 @@ test("failed erased-item suppression audit cannot create an identity-bearing inc
 });
 
 test("project-comment tombstone suppresses deleted Todoist webhooks before manual review or DynamoDB writes",async t=>{
-  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    googlePrefix:process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX,todoistPrefix:process.env.TODOIST_TOKEN_PARAMETER_PREFIX};
   process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX="/test/tombstone-google";
+  process.env.TODOIST_TOKEN_PARAMETER_PREFIX="/test/tombstone-todoist";
+  t.mock.method(SSMClient.prototype,"send",async command=>{
+    if(command.input.Name==="/test/tombstone-google/home")
+      return {Parameter:{Value:JSON.stringify({client_id:"test",client_secret:"test",refresh_token:"test"})}};
+    if(command.input.Name==="/test/tombstone-todoist/home")return {Parameter:{Value:"test-token"}};
+    throw new Error("unexpected secure parameter read in tombstone test");
+  });
   const projectId=profiles.home.todoistProjectId;
   const createdAt=new Date().toISOString();
   const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
@@ -300,6 +310,8 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
   t.after(()=>{
     if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
     if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+    if(previous.googlePrefix===undefined)delete process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX;else process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX=previous.googlePrefix;
+    if(previous.todoistPrefix===undefined)delete process.env.TODOIST_TOKEN_PARAMETER_PREFIX;else process.env.TODOIST_TOKEN_PARAMETER_PREFIX=previous.todoistPrefix;
   });
   const delivery={id:"stale-deleted-task",kind:"todoist",profile:"home",mode:"aws",
     receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:deleted",
