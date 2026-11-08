@@ -8,18 +8,6 @@ const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
 
-function verifiedCurrentProviderAbsence(){
-  return {
-    phase:"read_only_cross_profile_observation",eligibleForPostWriteRelease:false,
-    allProfilesQueried:true,closureComplete:true,knownIdentitiesAbsentFromCurrentProviders:true,
-    stateScan:{stronglyConsistent:true,allPagesReceived:true,rowCount:0,relatedRowCount:0,
-      fingerprint:"a".repeat(64),tableFingerprint:"b".repeat(64)},
-    identities:{taskCount:1,eventCount:1,seriesCount:0,overflowCount:0,fingerprint:"c".repeat(64)},
-    profiles:{},evidenceFingerprint:"d".repeat(64),
-    missingProof:["Unknown historical aliases and required independent review remain"],
-  };
-}
-
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},
@@ -128,6 +116,8 @@ function fixture(options={}) {
       for(const id of ids)external.mappingStates.set(id,options.enabling?"Enabling":"Enabled");
     },
     async readSnapshot(){external.providerCalls++;return external.snapshot;},
+    async readKnownTargetSnapshot(){external.knownTargetCalls=(external.knownTargetCalls||0)+1;
+      return external.knownTargetSnapshot||external.snapshot;},
   };
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
@@ -154,7 +144,8 @@ test("independent post-write preview never issues a confirmation, writes state, 
   assert.equal(assessment.onlyAvailableAction,"keep_fenced");
   assert.equal(assessment.evidence.originalProviderWriteIndicated,false);
   assert.equal(assessment.evidence.matchingFence,true);
-  assert.equal(external.providerCalls,1);
+  assert.equal(external.knownTargetCalls,1,"post-write inspection uses the bounded known-target snapshot");
+  assert.equal(external.providerCalls,0,"post-write inspection does not run the all-profile provenance observer");
   assert.equal(external.writes.length,0);
   assert.ok(external.control.some(row=>row.sk==="FENCE"));
 });
@@ -179,16 +170,18 @@ test("strong exact postflight is a read-only candidate only with an original del
     operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],
     actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
-    crossProfileEvidence:verifiedCurrentProviderAbsence(),
+    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
   };
   snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
   f.external.snapshot=snapshot;
+  f.external.knownTargetSnapshot=snapshot;
   const assessment=await f.service.inspectPostWrite("op-recovery");
   assert.equal(assessment.classification,"fully_deleted_candidate");
   assert.equal(assessment.releaseAllowed,false);
   assert.equal(assessment.evidence.matchingFence,true);
   assert.equal(f.external.writes.length,0);
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  assert.equal(f.external.knownTargetCalls,1);
   // A stale or malformed fingerprint must not count as fully verified absence.
   snapshot.previewFingerprint="0".repeat(64);
   const unsafe=await f.service.inspectPostWrite("op-recovery");
@@ -398,9 +391,10 @@ function fullyDeletedPostWriteFixture(options={}) {
   const snapshot={operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],actionPlan:{comments:[]},
     providerSnapshotFingerprint:"9".repeat(64),blockers:[],
-    crossProfileEvidence:verifiedCurrentProviderAbsence()};
+    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"}};
   snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
   f.external.snapshot=snapshot;
+  f.external.knownTargetSnapshot=snapshot;
   return f;
 }
 const typedReview={operationId:"op-recovery",profile:"work",phrase:"REVIEW AND KEEP FENCED"};

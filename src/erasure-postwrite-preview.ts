@@ -69,13 +69,10 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
   // This separate read-only outcome intentionally does NOT require a signed
   // all-calendar registry. It is limited to the immutable, originally recorded
   // provider IDs. Unknown or conflicting source snapshots never prove absence.
-  const relatedLiveEvidence=Object.values(inspection.crossProfileEvidence?.profiles||{}).some(profile=>
-    profile.taskReadsFound>0||profile.taskInventoryMatches>0
-    ||profile.directEventReadsFound>0||profile.inventoryMatchedEvents>0);
   const scopedKnownDeleted=indicated&&writeReceipt&&deletionSelected&&targets
     &&knownReadback?.todoist==="absent"&&knownReadback.calendar==="absent"
     &&knownReadback.configuredCalendarLink==="not_found"
-    &&inspection.snapshotSafetyBlockerCount===0&&!relatedLiveEvidence
+    &&inspection.snapshotSafetyBlockerCount===0
     &&inspection.fenceOwned&&typeof inspection.epoch==="number"&&inspection.epoch>0
     &&inspection.leaseCount===0&&inspection.stateRowsAbsent;
   const knownIdentityStatus=!indicated?"not_post_write":scopedKnownDeleted?
@@ -94,10 +91,9 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
   if(!mappingsRestored)blockers.push("Worker mapping states differ from original enablement; restoration remains guarded");
   if(classification==="partial_or_ambiguous")
     blockers.push("Partial or unverified deletion requires a NEW independently reviewed authorization and action-time version checks");
-  // Even a perfect snapshot does not prove source/alias completeness, old
-  // qualified consumer safety, or the immutable marker/fence transaction.
-  if(inspection.crossProfileEvidence)blockers.push(...inspection.crossProfileEvidence.missingProof);
-  else blockers.push("No read-only all-profile provider, comment and state provenance report was collected");
+  // Global Calendar/provenance observation is explicitly outside #349's
+  // release requirement. This bounded result covers only operation-recorded
+  // targets; #347 and the atomic replay-marker transaction remain blockers.
   blockers.push("Complete replay-barrier rollout, alias and old-Lambda coverage, executable post-write authorisation and verified atomic release are not yet accepted");
   blockers.push("Disposable Work-profile staging and independent security/privacy review remain required");
   const potentialDisposition=classification==="not_post_write"?"use_pre_write_recovery":

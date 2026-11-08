@@ -54,11 +54,20 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
       }
     },
     async readSnapshot(operation:ErasureOperation) {
+      return readErasureSnapshot(operation,true,canRestore?95_000:68_000);
+    },
+    async readKnownTargetSnapshot(operation:ErasureOperation) {
+      return readErasureSnapshot(operation,false,canRestore?95_000:68_000);
+    },
+  };
+}
+
+async function readErasureSnapshot(operation:ErasureOperation,auditCrossProfileIdentity:boolean,scanDeadlineMs:number) {
       return buildErasurePreview({profile:operation.profile,taskId:operation.target.taskId,
         ...(operation.target.eventId?{eventId:operation.target.eventId}:{}),
         deleteCalendar:operation.selectedActions.deleteCalendar},
       {db:documentClient,clients:await defaultProviderClientFactory(operation.profile),
-        auditCrossProfileIdentity:true,
+        auditCrossProfileIdentity,
         inspectFence:async profile=>{
           const value=await inspectErasureFence(profile);
           return {fence:value.fence,leases:value.leases};
@@ -67,7 +76,5 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
         allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId,
         // Bounded by the caller's Lambda timeout; any partial scan throws,
         // leaving the fence and mappings untouched.
-        scanDeadlineMs:canRestore?95_000:68_000});
-    },
-  };
+        scanDeadlineMs});
 }
