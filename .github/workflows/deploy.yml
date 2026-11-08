@@ -36,8 +36,10 @@ jobs:
       CF_ACCESS_ISSUER: ${{ vars.CF_ACCESS_ISSUER }}
       CF_ACCESS_AUDIENCE: ${{ vars.CF_ACCESS_AUDIENCE }}
       REVIEW_OPERATOR_EMAILS: ${{ vars.REVIEW_OPERATOR_EMAILS }}
-      # Explicit production operator opt-in. Recovery implementation tracked by #239.
-      ERASURE_EXECUTION_ENABLED: 'true'
+      # Keep item erasure execution disabled until #347 writer-boundary and #349
+      # disposable acceptance/release gates are complete. This reuses the
+      # existing two-Lambda gate; it does not add another feature flag.
+      ERASURE_EXECUTION_ENABLED: 'false'
       # Set this production environment variable to true ONLY after #277
       # (seven-day retained mappings) has been deployed and verified.
       # Unset/false keeps the destructive cleanup OFF; revert without code edits.
