@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { admitNewTodoistPhaseBNative } from "../dist/todoist-phase-b-native-admission.js";
+import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "../dist/todoist-phase-b-native-admission.js";
 import { todoistPhaseBCandidate, verifyTodoistPhaseBReadback } from "../dist/todoist-calendar-phase-b.js";
 
 const at = "2026-11-08T09:20:00Z";
@@ -85,4 +85,44 @@ test("Todoist due.date timed values are parsed as instants, even when due.dateti
   const floating={...timed,due:{...timed.due,date:"2027-03-26T09:00:00"}};
   assert.equal(todoistPhaseBCandidate(floating,{start:anchor.start,
     source:"verified_original_schedule"}).reason,"invalid_or_unverified_due");
+});
+
+test("strict Phase B Calendar provider admission requires exact master and instances",()=>{
+  const source=task();
+  const plan=admitNewTodoistPhaseBNative(evidence(source));
+  assert.equal(plan.admitted,true);
+  const master={
+    id:"master-290",etag:"observed-etag",status:"confirmed",
+    summary:source.content, start:{date:"2027-01-02"},end:{date:"2027-01-03"},
+    recurrence:[plan.rule],
+    extendedProperties:{shared:{
+      taskId:source.id,syncRecurrenceOwner:"todoist",
+      todoistRecurrence:source.due.string,
+      todoistAnchorStart:"2027-01-02",todoistAnchorEnd:"2027-01-03",
+    }},
+  };
+  const instances=["2027-01-02","2027-01-15","2027-01-27"].map((date,i)=>({
+    id:"i-"+i, status:"confirmed",recurringEventId:"master-290",
+    originalStartTime:{date},start:{date},end:{date:"2027-01-03"},
+  }));
+  const clean={master,instances,calendarTimeZone:"Europe/London",
+    explicitExceptions:[],exceptionInventoryComplete:true};
+  const good=verifyInitialPhaseBCalendarWrite(plan,source,clean);
+  assert.deepEqual(good,{accepted:true,reason:"calendar_provider_readback_verified"});
+  const bad=[
+    {master:{...master,etag:undefined}},
+    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,taskId:"other"}}}},
+    {master:{...master,recurrence:["RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15"]}},
+    {master:{...master,start:{date:"2027-01-15"}}},
+    {instances:instances.slice(0,2)},
+    {instances:[instances[0],{...instances[1],start:{date:"2027-01-16"}},instances[2]]},
+    {instances:[instances[0],{...instances[1],recurringEventId:"other"},instances[2]]},
+    {instances:[instances[0],{...instances[2]},instances[1]]},
+    {explicitExceptions:[{id:"exception",recurringEventId:master.id,status:"cancelled"}]},
+    {exceptionInventoryComplete:false},
+    {calendarTimeZone:"UTC"},
+  ];
+  for(const change of bad)
+    assert.equal(verifyInitialPhaseBCalendarWrite(plan,source,{...clean,...change}).accepted,false,
+      JSON.stringify(change));
 });
