@@ -41,7 +41,7 @@ test("confirmed erasure replaces the project mapping comment with a readback-ver
   assert.equal(deletes,0,"the project note must remain as the temporary replay marker");
 });
 
-test("completed known-identity deletion leaves the replay identity in Todoist and removes it from DynamoDB",async()=>{
+test("provider deletion steps leave the replay identity in Todoist and remove it from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
   let comment={id:"project-1",project_id:"test-home-project",content:original};
