@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
+import { SSMClient } from "@aws-sdk/client-ssm";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureReplayBlockedError } from "../dist/erasure-replay-barrier.js";
-import { assertRepairPreviewReplayAdmission, ReviewStore, reviewHash, SyncControls } from "../dist/review-store.js";
+import { assertManualDecisionReplayAdmission, assertRepairPreviewReplayAdmission, ReviewStore, reviewHash, SyncControls } from "../dist/review-store.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { profiles } from "../dist/config.js";
+import { Todoist } from "../dist/providers.js";
 
 const secret = Buffer.alloc(32, 41);
 function markerKey(profile, kind, id) {
@@ -24,6 +28,8 @@ function enableBarrier(t) {
   process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: secret.toString("base64") });
   process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
   process.env.STATE_TABLE_NAME = "review-replay-admission-test";
+  t.mock.method(SSMClient.prototype, "send", async () => ({Parameter:{Value:"test-todoist-token"}}));
+  const projectCommentReader = t.mock.method(Todoist.prototype, "listProjectComments", async () => []);
   t.after(() => {
     for (const [key, value] of Object.entries({
       ERASURE_REPLAY_BARRIER_VERSION: previous.barrier,
@@ -33,6 +39,7 @@ function enableBarrier(t) {
       STATE_TABLE_NAME: previous.table,
     })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
   });
+  return projectCommentReader;
 }
 function decision(overrides = {}) {
   return {
@@ -42,6 +49,54 @@ function decision(overrides = {}) {
     fingerprint: "decision-fingerprint", permittedActions: [], ...overrides,
   };
 }
+
+test("manual and repair review admissions consult bounded project-comment tombstones", async t => {
+  const projectCommentReader = enableBarrier(t);
+  const stateWrites = [];
+  t.mock.method(documentClient, "send", async command => { stateWrites.push(command); return {}; });
+  const projectId = profiles.home.todoistProjectId;
+  const createdAt = new Date().toISOString();
+  const comment = {
+    id: "project-tombstone", project_id: projectId,
+    content: serializeDeletionTombstoneComment({
+      schemaVersion: 1, profile: "home", projectId, taskId: "erased-review-task",
+      eventIds: ["erased-review-event"], createdAt,
+      expiresAt: new Date(Date.parse(createdAt) + 18 * 24 * 60 * 60 * 1000).toISOString(),
+    }),
+  };
+  const reads = [];
+  const clientFactory = async profile => ({todoist:{
+    async listProjectComments(id, refresh) {
+      reads.push({profile,id,refresh});
+      return [comment];
+    },
+  }});
+
+  await assert.rejects(assertManualDecisionReplayAdmission(
+    decision({taskId:"erased-review-task"}), clientFactory), ErasureReplayBlockedError);
+  await assert.rejects(assertRepairPreviewReplayAdmission({
+    intent:{profile:"home",action:"link",taskId:"safe-task",eventId:"erased-review-event"},
+    snapshots:[],itemPlan:[],
+  }, clientFactory), ErasureReplayBlockedError);
+  assert.deepEqual(reads,[
+    {profile:"home",id:projectId,refresh:true},
+    {profile:"home",id:projectId,refresh:true},
+  ]);
+
+  projectCommentReader.mock.mockImplementation(async () => [comment]);
+  await assert.rejects(new ReviewStore().observeDecision(decision({taskId:"erased-review-task"})), ErasureReplayBlockedError);
+  assert.equal(stateWrites.some(command => ["PutCommand","UpdateCommand","DeleteCommand","TransactWriteCommand"]
+    .includes(command.constructor.name)), false, "a tombstoned manual decision is rejected before any DynamoDB write");
+});
+
+test("review admission fails closed when project-comment tombstone reads are unavailable", async t => {
+  enableBarrier(t);
+  t.mock.method(documentClient, "send", async () => ({}));
+  await assert.rejects(assertManualDecisionReplayAdmission(
+    decision({taskId:"possibly-erased-task"}),
+    async () => ({todoist:{async listProjectComments(){throw new Error("Todoist unavailable");}}}),
+  ), /Todoist unavailable/);
+});
 
 test("decision context provider IDs are checked before a review case can be seeded", async t => {
   enableBarrier(t);

@@ -1,4 +1,4 @@
-import { profileForTodoistProject } from "./config.js";
+import { profileForTodoistProject, profiles } from "./config.js";
 import {
   calendarCanonicalIdentity,
   CanonicalIdentityStore,
@@ -13,6 +13,7 @@ import { guardReplayProviderClients } from "./erasure-replay-providers.js";
 import { StateRepository } from "./repository.js";
 import { ignorableElapsedStandaloneCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch.js";
+import { activeProjectDeletionTombstone } from "./mapping-comments.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 type ScheduleOrphan = (delivery: Delivery, eventId: string, taskId: string) => Promise<void>;
@@ -88,6 +89,25 @@ export class OrphanRecoveringSynchronizer {
   }
 
   async process(delivery: Delivery): Promise<void> {
+    // Orphan rechecks carry both provider IDs in SQS and can outlive the
+    // original mapping. Suppress them before either the moved-task handler or
+    // the sync worker can read/write state using that stale identity.
+    if (delivery.kind === "orphan" && delivery.orphan) {
+      const clients = await this.clients(delivery.profile);
+      const projectId = profiles[delivery.profile].todoistProjectId;
+      const comments = await clients.todoist.listProjectComments(projectId, true);
+      if (activeProjectDeletionTombstone(comments, {
+        profile: delivery.profile,
+        projectId,
+        taskId: delivery.orphan.taskId,
+        eventIds: [delivery.orphan.eventId],
+      })) {
+        await this.state.audit(delivery.profile, "erasure_project_comment_replay_suppressed", {
+          side: "orphan_recheck",
+        });
+        return;
+      }
+    }
     if (delivery.kind === "calendar") return this.processCalendar(delivery);
     if (delivery.kind === "todoist") return this.processTodoist(delivery);
     return new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
@@ -167,6 +187,7 @@ export class OrphanRecoveringSynchronizer {
     }
 
     let tasks: TodoistTask[] | undefined;
+    let projectComments: Awaited<ReturnType<ProviderClients["todoist"]["listProjectComments"]>> | undefined;
     const blockedEventIds = new Set<string>();
     const ignoredHistoryEventIds = new Set<string>();
     const now = Date.now();
@@ -194,6 +215,16 @@ export class OrphanRecoveringSynchronizer {
         continue;
       }
       if (!standaloneCalendarSource(event)) continue;
+      projectComments ||= await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId, true);
+      if (activeProjectDeletionTombstone(projectComments, {
+        profile: delivery.profile,
+        projectId: profiles[delivery.profile].todoistProjectId,
+        eventIds: [event.id, event.recurringEventId].filter((id): id is string => Boolean(id)),
+      })) {
+        blockedEventIds.add(event.id);
+        await this.state.audit(delivery.profile, "erasure_project_comment_replay_suppressed", { side: "orphan_calendar" });
+        continue;
+      }
       // No amount of title/date similarity can reassign a completed event.
       // The permanent event-keyed completion guard survives cleanup of its
       // task-keyed lookup after seven days.
@@ -321,6 +352,20 @@ export class OrphanRecoveringSynchronizer {
     if (!task?.id) {
       await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
       return;
+    }
+
+    const sourceProfile = profileForTodoistProject(task.project_id) || delivery.profile;
+    if (!await this.state.getMappingByTaskAnyProfile(task.id)) {
+      const sourceClients = await this.clients(sourceProfile);
+      const projectComments = await sourceClients.todoist.listProjectComments(profiles[sourceProfile].todoistProjectId, true);
+      if (activeProjectDeletionTombstone(projectComments, {
+        profile: sourceProfile,
+        projectId: profiles[sourceProfile].todoistProjectId,
+        taskId: task.id,
+      })) {
+        await this.state.audit(sourceProfile, "erasure_project_comment_replay_suppressed", { side: "orphan_todoist" });
+        return;
+      }
     }
 
     // Validate an otherwise-unmapped upsert against Todoist before orphan

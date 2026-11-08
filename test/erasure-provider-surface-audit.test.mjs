@@ -71,6 +71,7 @@ test("production provider construction has only guarded identity routes or class
     "completed-project-comment-cleanup.ts":["Todoist"],
     "mutation-budget.ts":["GoogleCalendar","Todoist"],
     "providers.ts":["GoogleCalendar"],
+    "review-store.ts":["Todoist"],
     "watch.ts":["GoogleCalendar"],
   });
   const factory=await readFile(path.join(sourceRoot,"mutation-budget.ts"),"utf8");
@@ -79,6 +80,9 @@ test("production provider construction has only guarded identity routes or class
   const cleanup=await readFile(path.join(sourceRoot,"completed-project-comment-cleanup.ts"),"utf8");
   assert.match(cleanup,/guardReplayProviderClients\(profile,\s*\{[\s\S]{0,120}new Todoist/,
     "operator cleanup's separate Todoist client must keep the replay guard");
+  const review=await readFile(path.join(sourceRoot,"review-store.ts"),"utf8");
+  assert.match(review,/activeProjectDeletionTombstone\(comments,[\s\S]{0,180}ErasureReplayBlockedError/,
+    "stored review and repair identities must be checked against bounded project-comment tombstones");
   const providerFactory=await readFile(path.join(sourceRoot,"providers.ts"),"utf8");
   assert.match(providerFactory,/calendarForProfile[\s\S]{0,240}guardReplayCalendarClient\(profile,\s*new GoogleCalendar/,
     "the exported single-provider factory must not return an unguarded Calendar client");

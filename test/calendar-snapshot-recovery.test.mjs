@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { reconcileUnmappedCalendar, recurringTaskIdentityCandidates } from "../dist/calendar-reconciliation.js";
 import { ReconciliationMutationBudget } from "../dist/mutation-budget.js";
+import { profiles } from "../dist/config.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 function futureEvent(id, day, summary = `Event ${id}`) {
   return {
@@ -61,6 +63,7 @@ function fakeClients(events, initialTasks = []) {
       },
       todoist: {
         async listTasks() { return tasks; },
+        async listProjectComments() { return []; },
         async getTimeZone() { return "Europe/London"; },
         async upsertTask(task) {
           created += 1;
@@ -105,6 +108,42 @@ test("Calendar import rechecks a resolved pair after comment lookup before writi
   clients.pair.todoist.findComment=async()=>{blocked=true;return undefined;};
   const summary=await reconcileUnmappedCalendar("home",state,async()=>clients.pair);
   assert.equal(summary.blocked,1);assert.equal(state.mappings.length,0);assert.equal(clients.comments,0);
+});
+
+test("Calendar snapshot recovery does not recreate a task for an erased event retained in Calendar", async () => {
+  const event = futureEvent("erased-calendar-event", 10, "Erased appointment");
+  const state = fakeState();
+  const clients = fakeClients([event]);
+  const projectId = profiles.home.todoistProjectId;
+  const createdAt = new Date().toISOString();
+  clients.pair.todoist.listProjectComments = async (requestedProjectId, refresh) => {
+    assert.equal(requestedProjectId, projectId);
+    assert.equal(refresh, true);
+    return [{
+      id: "bounded-erasure-marker",
+      project_id: projectId,
+      content: serializeDeletionTombstoneComment({
+        schemaVersion: 1,
+        profile: "home",
+        projectId,
+        taskId: "erased-todoist-task",
+        eventIds: [event.id],
+        createdAt,
+        expiresAt: new Date(Date.parse(createdAt) + 18 * 24 * 60 * 60 * 1000).toISOString(),
+      }),
+    }];
+  };
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.imported, 0);
+  assert.equal(summary.rebound, 0);
+  assert.equal(summary.skipped, 1);
+  assert.equal(clients.created, 0);
+  assert.equal(clients.comments, 0);
+  assert.equal(state.mappings.length, 0);
+  assert.ok(state.audits.some(entry => entry.action === "erasure_project_comment_replay_suppressed"
+    && Object.keys(entry.detail).join(",") === "side"));
 });
 
 test("snapshot recovery imports one future unmapped Calendar event and binds it", async () => {
@@ -195,6 +234,7 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
       async getTimeZone() { return "Europe/London"; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return tasks.map((task) => structuredClone(task)); },
       async getTimeZone() { return "Europe/London"; },
       async upsertTask(payload) {
@@ -245,6 +285,7 @@ test("snapshot import creates one native recurring Todoist task for indefinite w
         async getTimeZone() { return "Europe/London"; },
       },
       todoist: {
+        async listProjectComments() { return []; },
         async listTasks() { return tasks.map((task) => structuredClone(task)); },
         async getTimeZone() { return "Europe/London"; },
         async upsertTask(payload) {
@@ -334,6 +375,7 @@ test("snapshot recovery retains an ending-only recurrence returned with a zone-l
       async getTimeZone() { return "Europe/London"; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return tasks.map((task) => structuredClone(task)); },
       async getTimeZone() { return "Europe/London"; },
       async upsertTask() {
@@ -384,6 +426,7 @@ test("snapshot recovery fails closed without creating a timed recurrence when To
   const clients = {
     calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; } },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return []; },
       async getTimeZone() { return "America/New_York"; },
       async upsertTask() { creates += 1; throw new Error("must not create"); },
@@ -419,6 +462,7 @@ test("snapshot recovery imports an all-day finite recurrence using the verified 
       async getTimeZone() { calendarZoneReads += 1; return "Europe/London"; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return tasks; },
       async getTimeZone() { return "Europe/London"; },
       async upsertTask(payload) {
@@ -459,6 +503,7 @@ test("all-day recurrence timezone mismatch fails closed before Todoist or mappin
   const clients = {
     calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; }, async getTimeZone() { return "Europe/Berlin"; } },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return []; }, async getTimeZone() { return "Europe/London"; },
       async upsertTask() { writes += 1; throw new Error("must not write"); },
       async findComment() { return undefined; }, async upsertComment() { writes += 1; },
