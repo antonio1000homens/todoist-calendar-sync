@@ -1,7 +1,8 @@
 # #243 post-write erased-identity replay barrier: draft implementation and rollout gate
 
-**State:** foundational code only. Do **not** enable post-write recovery, release a
-post-write fence, or close #243/#239/#113 from this branch. The current
+**State:** forward erasure completion is marker-gated; post-write recovery remains
+unavailable. Do **not** enable the barrier, release a post-write fence, or close
+#243/#239/#113 from this branch. The current
 `ErasureRecoveryService` must continue rejecting fully deleted and partial
 provider outcomes. In particular, a 404 or completed deletion step is not proof
 that a delayed ingress event cannot recreate the identity.
@@ -31,12 +32,19 @@ remain independent release gates.
 
 - `src/erasure-replay-barrier.ts` defines deterministic HMAC-SHA256 marker keys
   and strongly consistent, fail-closed individual admission reads.
-- A prospective **single DynamoDB transaction** would install markers,
+- The confirmed forward erasure executor strongly checks the existing replay
+  gate, HMAC key ring and exact known identities before the first provider
+  delete. It installs minimal task and exact Calendar alias markers in the same
+  transaction that removes the confirmed operation and its owned fence. If the
+  gate/key ring is missing, an identity is already marked, or a commit cannot
+  be verified, the operation stays fenced for review. This path adds no flag.
+- The post-write recovery **single DynamoDB transaction** would install markers,
   conditionally consume and remove a distinct post-write authorization, delete
   the original identity-bearing operation record after final verification,
-  and remove the owner-matched FENCE/JOURNAL under the expected epoch. This is **only a transaction constructor**, not a callable recovery
-  endpoint: unimplemented operator-approval and postflight attributes make it
-  deliberately unusable by the existing pre-write flow.
+  and remove the owner-matched FENCE/JOURNAL under the expected epoch. That
+  remains **only a transaction constructor**, not a callable recovery endpoint:
+  operator approval, postflight integration and #347 invocation controls are
+  still outstanding.
 - Markers store only `pk`, `sk`, `markerVersion`. They store **no plaintext**
   task ID, event ID, summary, timestamp, comment, journal, or operation ID.
   A deleted Todoist ID is marked in **all three configured profiles** to block

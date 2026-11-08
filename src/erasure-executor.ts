@@ -4,6 +4,8 @@ import { erasureExecutionEnabled } from "./erasure-readiness.js";
 import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
+import {atomicConfirmedErasureCompletion,assertConfirmedErasureReplayAdmission,
+  ErasureReplayBlockedError,ErasureReplayUnavailableError,verifyConfirmedErasureCompletion} from "./erasure-replay-barrier.js";
 
 export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure" | "review_required";
 export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "drain_before_fence"
@@ -154,6 +156,14 @@ function stateTable(): string {
   if (!value) throw new Error("STATE_TABLE_NAME is required");
   return value;
 }
+function confirmedCompletionProof(operation:ErasureOperation,epoch:number) {
+  return {operationId:operation.operationId,profile:operation.profile,taskId:operation.target.taskId,
+    deleteCalendar:operation.selectedActions.deleteCalendar===true,eventId:operation.target.eventId,
+    calendarId:operation.actionPlan.calendarEvent?.calendarId,
+    knownCalendarAliases:operation.actionPlan.knownCalendarAliases,
+    knownCalendarAliasesComplete:operation.actionPlan.knownCalendarAliasesComplete,
+    confirmationId:operation.confirmationId,previewFingerprint:operation.previewFingerprint,epoch};
+}
 const defaultFencePollMs=5_000;
 const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   disable_mappings:["disable_mappings","confirm_disabled"],
@@ -293,6 +303,18 @@ export class ErasureOperationStore {
       || !current.confirmationId || current.confirmationFingerprint!==current.previewFingerprint
       || current.previewFingerprint!==erasurePreviewFingerprint(current))
       throw new Error("Erasure operation is not ready to begin fencing");
+    const epochResult=await this.db.send(new GetCommand({TableName:stateTable(),
+      Key:{pk:`ERASURE#${current.profile}`,sk:"EPOCH"},ConsistentRead:true}));
+    const storedEpoch=epochResult.Item?.epoch;
+    if(storedEpoch!==undefined&&(!Number.isSafeInteger(storedEpoch)||storedEpoch<0))
+      throw new ErasureGateDriftError();
+    const nextEpoch=(storedEpoch??0)+1;
+    try {await assertConfirmedErasureReplayAdmission(confirmedCompletionProof(current,nextEpoch),this.db);}
+    catch(error) {
+      if(error instanceof ErasureReplayUnavailableError)throw error;
+      if(error instanceof ErasureReplayBlockedError)throw new ErasureGateDriftError();
+      throw error;
+    }
     const mappings=await this.#worker().listWorkerMappings();
     if(!mappings.length || mappings.some(item=>!item.id || !["Enabled","Disabled"].includes(item.state)
       || !item.eventSourceArn.includes(":sqs:")) || new Set(mappings.map(item=>item.id)).size!==mappings.length)
@@ -417,7 +439,7 @@ export class ErasureOperationStore {
       // their existing retry behaviour.
       const ambiguousProviderWrite=operation.status==="deleting"
         &&(current.phase==="delete"||current.phase==="verify_deletion");
-      if(error instanceof ErasureGateDriftError||ambiguousProviderWrite) {
+      if(error instanceof ErasureGateDriftError||error instanceof ErasureReplayUnavailableError||ambiguousProviderWrite) {
         next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
         nextStatus="review_required";
       } else {
@@ -469,6 +491,16 @@ export class ErasureOperationStore {
         || (index>0 && (time as number)<(times[index-1] as number)))
       || (times[4] as number)<(times[3] as number)+lifecycle.timeoutSeconds*1000+2000)
       throw new ErasureGateDriftError();
+    const epochResult=await this.db.send(new GetCommand({TableName:stateTable(),
+      Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},ConsistentRead:true}));
+    const epoch=epochResult.Item?.epoch;
+    if(typeof epoch!=="number"||!Number.isSafeInteger(epoch)||epoch<1)throw new ErasureGateDriftError();
+    try {await assertConfirmedErasureReplayAdmission(confirmedCompletionProof(operation,epoch),this.db);}
+    catch(error) {
+      if(error instanceof ErasureReplayUnavailableError)throw error;
+      if(error instanceof ErasureReplayBlockedError)throw new ErasureGateDriftError();
+      throw error;
+    }
   }
 
   /** Stop a fenced operation durably when its action-time deletion gate has drifted. */
@@ -484,6 +516,20 @@ export class ErasureOperationStore {
       ExpressionAttributeNames:{"#status":"status","#phase":"phase","#lastError":"lastError","#error":"error"},
       ExpressionAttributeValues:{":deleting":"deleting",":reviewRequired":"review_required",":ready":"ready_for_delete",
         ":error":message,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
+  }
+
+  /** A queued operation blocked by replay readiness has no fence to recover. */
+  async markQueuedReplayBlocked(id:string):Promise<void> {
+    const operation=await this.get(id);
+    if(!operation||operation.status!=="queued"||operation.lifecycle)
+      throw new Error("Operation is no longer a queued, unfenced erasure");
+    const now=new Date().toISOString();
+    await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(id),
+      UpdateExpression:"SET #status=:reviewRequired, #error=:error, updatedAt=:updatedAt",
+      ConditionExpression:"#status=:queued AND attribute_not_exists(lifecycle) AND previewFingerprint=:fingerprint",
+      ExpressionAttributeNames:{"#status":"status","#error":"error"},
+      ExpressionAttributeValues:{":reviewRequired":"review_required",":queued":"queued",
+        ":error":ERASURE_REVIEW_REQUIRED_MESSAGE,":updatedAt":now,":fingerprint":operation.previewFingerprint}}));
   }
 
   /** Freeze an active execution when the deployment switch or durable readiness is revoked. */
@@ -588,19 +634,24 @@ export class ErasureOperationStore {
   }
 
   async #finishAndEraseOperation(operation:ErasureOperation):Promise<void> {
+    if(operation.previewFingerprint!==erasurePreviewFingerprint(operation)
+      ||operation.confirmationFingerprint!==operation.previewFingerprint)
+      throw new ErasureGateDriftError();
     const fence=await this.#worker().inspectFence(operation.profile);
     if(fence.fence?.operationId!==operation.operationId||fence.leases.length)
       throw new ErasureGateDriftError();
-    await this.db.send(new TransactWriteCommand({TransactItems:[
-      {Delete:{TableName:stateTable(),Key:operationKey(operation.operationId),
-        ConditionExpression:"#status=:verifying AND lifecycle.#phase=:release AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
-        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:{":verifying":"verifying",":release":"release_fence",":ready":true,":fingerprint":operation.previewFingerprint}}},
-      {Delete:{TableName:stateTable(),Key:confirmationKey(operation.operationId),
-        ConditionExpression:"#status=:consumed AND operationId=:operationId",
-        ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:{":consumed":"consumed",":operationId":operation.operationId}}},
-      {Delete:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"FENCE"},
-        ConditionExpression:"operationId=:operationId",ExpressionAttributeValues:{":operationId":operation.operationId}}},
-    ]}));
+    const epochResult=await this.db.send(new GetCommand({TableName:stateTable(),
+      Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},ConsistentRead:true}));
+    const epoch=epochResult.Item?.epoch;
+    if(typeof epoch!=="number"||!Number.isSafeInteger(epoch)||epoch<1)throw new ErasureGateDriftError();
+    const proof=confirmedCompletionProof(operation,epoch);
+    const command=atomicConfirmedErasureCompletion(proof);
+    try {await this.db.send(command);}
+    catch {
+      try {if(await verifyConfirmedErasureCompletion(proof,this.db))return;}
+      catch { /* An uncertain read must leave the operation fenced for review. */ }
+      throw new ErasureGateDriftError();
+    }
   }
 }
 
