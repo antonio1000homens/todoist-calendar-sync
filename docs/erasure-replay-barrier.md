@@ -46,6 +46,11 @@ remain independent release gates.
   configured Calendar ID and event ID. No empty per-profile inventory or proof
   of unrelated-calendar absence is required; an unknown relevant alias keeps
   the operation fenced.
+- New deletion confirmations persist a bounded `{profile, calendarId, eventId}`
+  manifest from the selected event and exact event references in attributable
+  state rows before mutation. A missing profile scope or more than 32 aliases
+  blocks confirmation. This captures identities already recorded by the
+  operation; it does not search unrelated calendars or establish global absence.
 - Test cases check historical-key reads, consistent-read requirements,
   unavailable DB/keys, malformed aliases, profile scoping, and atomic
   transaction shape. They do **not** simulate the entire production replay path.
@@ -164,10 +169,10 @@ are verified.
 
 ## Remaining recovery implementation
 
-1. Build the bounded set of identities explicitly recorded by the operation
-   and verify each with fresh provider reads, including recorded recurrence
-   aliases and profile moves. Do not enumerate unrelated calendars. If a
-   relevant alias is unknown or conflicting, retain the original fence.
+1. Freshly re-read every persisted known Calendar alias on its recorded
+   profile and Calendar ID, including recurrence aliases and recorded profile
+   moves. Do not enumerate unrelated calendars. If a relevant alias is unknown
+   or conflicting, retain the original fence.
 2. Add a **new**, typed, single-use post-write operator review state and
    confirmation that is distinct from the original delete consent and the
    pre-write `RESTORE SYNC` flow. Validate original immutable selection and

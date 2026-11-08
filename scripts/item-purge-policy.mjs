@@ -58,6 +58,10 @@ function providerRefs(row) {
   recurse(row);
   return { tasks, events, series };
 }
+/** Exact provider event IDs present in typed identity fields, never titles or dates. */
+export function exactCalendarEventIds(row) {
+  return [...providerRefs(row).events].sort();
+}
 export function planPurge(rows, target) {
   const { profile, taskId, eventId } = target;
   const extraProtectedTaskIds = target.protectedTaskIds ?? [];

@@ -8,7 +8,7 @@ import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {VerifiedCalendarProvenance} from "./erasure-calendar-provenance.js";
-import { fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
+import { exactCalendarEventIds, fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
 import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
@@ -172,13 +172,14 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       || row.pk===`ERASURE_CONFIRMATION#${dependencies.ignoreOperationId}`)));
   const plan = planPurge(rows, target);
   const todoistMissing = (error: unknown) => Number((error as { status?: number })?.status) === 404;
-  let task: any, event: any;
+  let task: any, event: any, directEventIdentity:any;
   let taskMissing = false, eventMissing = false;
   try { task = await providerClients.todoist.getTask(target.taskId); }
   catch (error) { if (!todoistMissing(error)) throw error; taskMissing = true; }
   if (target.eventId) {
     try {
       event = await providerClients.calendar.getEvent(target.eventId);
+      directEventIdentity=event;
       // A cancelled item is absent for purge purposes only after the provider
       // response proves it is the exact requested event. A malformed or
       // mismatched response must flow through providerBlockers and fail closed.
@@ -230,6 +231,50 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
   const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
     digest: record.digest, classification: record.classification }));
+  const knownAliases=new Map<string,{profile:Profile;calendarId:string;eventId:string}>();
+  let knownAliasesComplete=true;
+  const addKnownAlias=(profile:Profile,calendarId:string,eventId:string)=>{
+    if(!/^[^\u0000-\u001f\u007f]{1,1024}$/.test(calendarId)
+      ||!/^[A-Za-z0-9_.-]{1,1024}$/.test(eventId)) {
+      knownAliasesComplete=false;
+      return;
+    }
+    knownAliases.set(JSON.stringify([profile,calendarId,eventId]),{profile,calendarId,eventId});
+  };
+  if(target.eventId)addKnownAlias(target.profile,profiles[target.profile].calendarId,target.eventId);
+  for(const source of [directEventIdentity,linkedResult]) {
+    if(source&&typeof source.id==="string")
+      addKnownAlias(target.profile,profiles[target.profile].calendarId,source.id);
+    if(source&&typeof source.recurringEventId==="string")
+      addKnownAlias(target.profile,profiles[target.profile].calendarId,source.recurringEventId);
+  }
+  const selectedRowKeys=new Set(plan.records.map(record=>JSON.stringify([record.pk,record.sk])));
+  for(const row of rows) {
+    if(!selectedRowKeys.has(JSON.stringify([row.pk,row.sk])))continue;
+    const eventIds=exactCalendarEventIds(row);
+    if(!eventIds.length)continue;
+    const keyProfiles=String(row.pk).split("#").filter((value):value is Profile=>
+      value==="home"||value==="antonio"||value==="work");
+    const rowProfile=typeof row.profile==="string"&&(row.profile==="home"||row.profile==="antonio"||row.profile==="work")
+      ?row.profile:keyProfiles.length===1?keyProfiles[0]:undefined;
+    if(!rowProfile||(new Set(keyProfiles).size>1)
+      ||(keyProfiles.length===1&&keyProfiles[0]!==rowProfile)) {
+      knownAliasesComplete=false;
+      blockers.push("A recorded Calendar alias has no unambiguous profile scope");
+      continue;
+    }
+    const calendarId=typeof row.calendarId==="string"?row.calendarId:profiles[rowProfile].calendarId;
+    for(const eventId of eventIds)addKnownAlias(rowProfile,calendarId,eventId);
+  }
+  const allKnownAliases=[...knownAliases.values()].sort((a,b)=>
+    a.profile.localeCompare(b.profile)||a.calendarId.localeCompare(b.calendarId)||a.eventId.localeCompare(b.eventId));
+  if(allKnownAliases.length>32) {
+    knownAliasesComplete=false;
+    blockers.push("Recorded Calendar aliases exceed the bounded replay-marker limit; manual handling is required");
+  }
+  if(!knownAliasesComplete)
+    blockers.push("The operation's exact Calendar alias manifest is incomplete; no deletion confirmation is available");
+  const boundedKnownAliases=allKnownAliases.slice(0,32);
   const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
     taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
     calendarProvenance:dependencies.calendarProvenance,
@@ -239,7 +284,9 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const providerSnapshotFingerprint = fingerprint(crossProfileEvidence
     ?{primary:providerData,crossProfileEvidence}:providerData);
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
-    calendarEvent: event ? { id: target.eventId!, digest: fingerprint(event), etag:event.etag as string } : undefined,
+    calendarEvent: event ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
+      digest: fingerprint(event), etag:event.etag as string } : undefined,
+    knownCalendarAliases:boundedKnownAliases,knownCalendarAliasesComplete:knownAliasesComplete,
     comments: [
       ...relevant.map(item => ({ id: item.comment.id, kind: "project" as const, digest: fingerprint(item.comment.content) })),
       ...legacy.map(item => ({ id: item.id, kind: "task" as const, digest: item.digest })),
