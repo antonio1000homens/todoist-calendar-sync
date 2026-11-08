@@ -60,12 +60,17 @@ function familyFor(key: string): TodoistPhaseBFamily | undefined {
   return undefined;
 }
 
-function localDue(task: TodoistTask, timeZone?: string): { date: string; time?: string } | undefined {
+function localDue(task: TodoistTask, timeZone?: string, allowFloating = false): { date: string; time?: string } | undefined {
   const value = task.due?.datetime || task.due?.date;
   if (!value) return undefined;
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return { date: value };
-  if (!timeZone || !/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return undefined;
-  // Floating times cannot be interpreted with the runner machine timezone.
+  if (!timeZone || (task.due?.timezone && task.due.timezone !== timeZone)) return undefined;
+  // Todoist REST can persist a timed date in due.date, or expose it as a
+  // floating value (without UTC offset). Accept floating only when a fresh
+  // independent profile timezone was verified and matches Todoist.
+  const floating = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/.exec(value);
+  if (floating) return allowFloating ? { date: floating[1], time: floating[2] + ":" + floating[3] } : undefined;
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) return undefined;
   const parsed = new Date(value);
   if (!Number.isFinite(parsed.getTime()) || parsed.getUTCMilliseconds() !== 0) return undefined;
   try {
@@ -85,7 +90,8 @@ function candidate(task: TodoistTask, anchor?: TodoistPhaseBAnchor): TodoistPhas
   if (!key) return { disposition: "unsupported", reason: "not_recurring" };
   const family = familyFor(key);
   if (!family) return { disposition: "unsupported", reason: "not_phase_b_family" };
-  const due = localDue(task, anchor?.timeZone || task.due?.timezone);
+  const due = localDue(task, anchor?.timeZone || task.due?.timezone,
+    Boolean(anchor?.timeZone && anchor.timeZone === task.due?.timezone));
   if (!due) return { disposition: "rolling_required", reason: "invalid_or_unverified_due", family };
   // A current Todoist due date is only a parser hint, never the original
   // DTSTART for a newly promoted recurrence.
@@ -100,6 +106,15 @@ function candidate(task: TodoistTask, anchor?: TodoistPhaseBAnchor): TodoistPhas
     candidateRrule: classified.canonicalRrule, semantic: classified.semantic,
   };
   if (!anchor || anchor.source !== "verified_original_schedule") return provisional;
+  // Live Todoist provider evidence: "every 29,30,31" fills February with its
+  // last day, and quarterly Jan31 -> Apr30 -> Jul30, whereas RFC5545 skips
+  // nonexistent BYMONTHDAY. These are deliberately not native equivalents.
+  if (family === "multi_month_day"
+      && classified.semantic.byMonthDay?.some((day) => day > 28))
+    return { ...provisional, reason: "month_end_provider_drift" };
+  if (family === "quarterly"
+      && Number(classified.semantic.startDate.slice(-2)) > 28)
+    return { ...provisional, reason: "month_end_provider_drift" };
   const dates = occurrenceDates(classified.semantic, 100);
   if (!dates.length || dates[0] !== classified.semantic.startDate || !dates.includes(due.date)
     || (classified.semantic.localTime || undefined) !== (due.time || undefined))
@@ -117,7 +132,7 @@ function matchingLocalTime(value: { date?: string; dateTime?: string; timeZone?:
   return value ? localDue({ id: "calendar", content: "", due: {
     ...(value.date ? { date: value.date } : {}),
     ...(value.dateTime ? { datetime: value.dateTime } : {}),
-  } }, semantic.timeZone)?.date : undefined;
+  } }, semantic.timeZone, Boolean(semantic.timeZone))?.date : undefined;
 }
 
 function sameLocalOccurrence(value: { date?: string; dateTime?: string; timeZone?: string } | undefined,
@@ -126,7 +141,7 @@ function sameLocalOccurrence(value: { date?: string; dateTime?: string; timeZone
   const actual = localDue({ id: "calendar", content: "", due: {
     ...(value.date ? { date: value.date } : {}),
     ...(value.dateTime ? { datetime: value.dateTime } : {}),
-  } }, semantic.timeZone);
+  } }, semantic.timeZone, Boolean(semantic.timeZone));
   return Boolean(actual && actual.date === expectedDate
     && (actual.time || undefined) === (semantic.localTime || undefined));
 }
@@ -167,8 +182,9 @@ export function verifyTodoistPhaseBReadback(
     return reject("timezone_not_verified");
 
   const dates = occurrenceDates(result.semantic, 100);
-  const priorDue = localDue(before, result.semantic.timeZone);
-  const nextDue = localDue(after, result.semantic.timeZone);
+  const independentlyTimed = Boolean(readback.timeZoneVerified && result.semantic.timeZone);
+  const priorDue = localDue(before, result.semantic.timeZone, independentlyTimed);
+  const nextDue = localDue(after, result.semantic.timeZone, independentlyTimed);
   const previousIndex = priorDue ? dates.indexOf(priorDue.date) : -1;
   if (previousIndex < 0 || !nextDue || dates[previousIndex + 1] !== nextDue.date
     || (priorDue?.time || undefined) !== (result.semantic.localTime || undefined)
