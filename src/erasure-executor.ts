@@ -507,7 +507,13 @@ export class ErasureOperationStore {
   async #persistLifecycle(operation: ErasureOperation, candidate: FencedLifecycle,
     nextStatus: ErasureOperationStatus, now: number): Promise<void> {
     const current=operation.lifecycle;
-    if(!current || !lifecyclePhaseEdges[current.phase].includes(candidate.phase)
+    // Verification previously had no same-phase edge. Permit it ONLY when
+    // an ambiguous provider readback permanently transitions to manual review.
+    // Do not allow an ordinary verify_deletion polling/retry loop.
+    const terminalVerifyReview=current?.phase==="verify_deletion"
+      &&candidate.phase==="verify_deletion"&&operation.status==="deleting"
+      &&nextStatus==="review_required";
+    if(!current || (!lifecyclePhaseEdges[current.phase].includes(candidate.phase)&&!terminalVerifyReview)
       || JSON.stringify(current.mappingIds)!==JSON.stringify(candidate.mappingIds)
       || JSON.stringify(current.enabledMappingIds)!==JSON.stringify(candidate.enabledMappingIds)
       || current.timeoutSeconds!==candidate.timeoutSeconds || current.pollMs!==candidate.pollMs)
