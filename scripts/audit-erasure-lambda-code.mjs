@@ -22,11 +22,10 @@ const ACCOUNT=/^\d{12}$/;
 const MAX_PACKAGE_BYTES=50_000_000;
 const MAX_JS_BYTES=30_000_000;
 const MARKERS={
+  projectTombstone:"todoist-calendar-sync:deleted:v1",
+  projectTombstoneReader:"activeProjectDeletionTombstone",
+  projectTombstoneSuppression:"erasure_project_comment_replay_suppressed",
   replayGate:"ERASURE_REPLAY_BARRIER_VERSION",
-  markerKey:"ERASURE_REPLAY#",
-  hmacKeyring:"ERASURE_REPLAY_HMAC_KEYS",
-  ingressUnavailable:"replay_admission_unavailable",
-  ingressSuppressed:"erased_webhook_suppressed",
   fencedReview:"reviewed_fenced",
 };
 
@@ -113,7 +112,7 @@ export async function collectCodeAudit(client,{functionNames,region}) {
         uniqueCodeDigestCount:digests.length,verifiedPackageCount:digests.length,
         verifiedPackageBytes:digests.reduce((sum,item)=>sum+item.packageBytes,0),digests});
     }
-    return {purpose:"issue-307-read-only-lambda-code-digest-and-marker-inventory",region,
+    return {purpose:"issue-347-read-only-lambda-code-digest-and-project-comment-tombstone-inventory",region,
       status:"BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW",functions,
       explicitLimitations:[
         "Marker strings are not proof that checks dominate every provider or DynamoDB mutation",

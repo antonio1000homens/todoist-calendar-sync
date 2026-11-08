@@ -609,3 +609,20 @@ does not establish post-write release authorization or replay-barrier
 admission. The audit omitted all environment values and made no AWS changes.
 Historical version invocation rights and the safety of every enabled pre-write
 path remain part of the unchecked writer/IAM review.
+
+# 8 November storage correction
+
+The earlier static package markers in this document (`ERASURE_REPLAY#` and
+the HMAC keyring) described the superseded permanent DynamoDB tombstone model.
+For #349, the selected marker is now the bounded Todoist project-comment
+entry `todoist-calendar-sync:deleted:v1`; the source admission helper is
+`activeProjectDeletionTombstone`. The code-package auditor reports these
+strings only as triage evidence: their presence does not prove every writer
+checks the comment before its first write. Historical versions without this
+implementation remain unsafe for post-write fence release unless denied.
+
+The 8 November AWS inventory predates this source change. It remains read-only
+evidence about the deployed packages and IAM/Function URL boundary; it does
+not prove the new marker is deployed or authorize any AWS update. Permanent
+DynamoDB HMAC markers and historical verification-key retention are not part
+of the corrected #349 marker design.

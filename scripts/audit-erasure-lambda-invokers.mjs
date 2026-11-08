@@ -253,7 +253,7 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[],ac
       "Review all IAM identity-based invokers, schedules, external accounts and Lambda resource policies",
       "Repeat inventory across all deployed regions/accounts and nonstandard/legacy prefixes",
       "Prove SQS/DLQ, webhook, recurrence and cross-profile lease/barrier ordering",
-      "Approve privacy/HMAC key retention, all-profile alias evidence and Work-profile fault injection",
+      "Approve bounded Todoist project-comment tombstone retention and disposable Work-profile fault injection",
     ],
     replayBarrierMayBeEnabled:false,
     executableRecoveryMayBeEnabled:false,
