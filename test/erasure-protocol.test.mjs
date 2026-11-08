@@ -7,6 +7,9 @@ import { StateRepository } from "../dist/repository.js";
 import { handler } from "../dist/worker.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { ManualInterventionService } from "../dist/manual-intervention.js";
+import { Todoist } from "../dist/providers.js";
+import { profiles } from "../dist/config.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -273,6 +276,63 @@ test("failed erased-item suppression audit cannot create an identity-bearing inc
   assert.deepEqual(result.batchItemFailures, [{ itemIdentifier: "message-erased" }]);
   assert.equal(completed.mock.callCount(), 0);
   assert.equal(failureReports.mock.callCount(), 0);
+});
+
+test("project-comment tombstone suppresses deleted Todoist webhooks before manual review or DynamoDB writes",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  const projectId=profiles.home.todoistProjectId;
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
+    taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt:new Date().toISOString(),
+    expiresAt:new Date(Date.now()+14*24*60*60*1000).toISOString()});
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>[
+    {id:"tombstone-comment",project_id:projectId,content},
+  ]);
+  const audits=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const manual=t.mock.method(ManualInterventionService.prototype,"interceptTodoistDeletion",async()=>{
+    throw new Error("manual interception must not run before tombstone admission");
+  });
+  const syncProcess=t.mock.method(OrphanRecoveringSynchronizer.prototype,"process",async()=>{
+    throw new Error("synchronizer must not run for an active tombstone");
+  });
+  t.after(()=>{
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+  });
+  const delivery={id:"stale-deleted-task",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:deleted",
+      event_data:{id:"erased-task-id",is_deleted:true}})};
+  const result=await handler({Records:[{messageId:"stale-delete-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"tombstone-delete-request"});
+  assert.deepEqual(result.batchItemFailures,[]);
+  assert.equal(audits.mock.callCount(),1);
+  assert.deepEqual(audits.mock.calls[0].arguments.slice(1),["erasure_project_comment_replay_suppressed",{side:"todoist"}]);
+  assert.equal(completed.mock.callCount(),0);
+  assert.equal(manual.mock.callCount(),0);
+  assert.equal(syncProcess.mock.callCount(),0);
+});
+
+test("tombstone lookup failure retries without writing task identity or review state",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>{throw new Error("Todoist unavailable");});
+  const audit=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const report=t.mock.method(ManualInterventionService.prototype,"reportDeliveryFailure",async()=>{});
+  t.after(()=>{
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+  });
+  const delivery={id:"stale-deleted-task",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:deleted",
+      event_data:{id:"erased-task-id",is_deleted:true}})};
+  const result=await handler({Records:[{messageId:"lookup-failure-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"tombstone-lookup-failure"});
+  assert.deepEqual(result.batchItemFailures,[{itemIdentifier:"lookup-failure-message"}]);
+  assert.equal(audit.mock.callCount(),0);
+  assert.equal(completed.mock.callCount(),0);
+  assert.equal(report.mock.callCount(),0);
 });
 
 test("worker rejects replay barrier without lease protocol before any DynamoDB write",async t=>{

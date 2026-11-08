@@ -15,6 +15,8 @@ import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
+import { profiles } from "./config.js";
+import { activeProjectDeletionTombstone } from "./mapping-comments.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
@@ -409,6 +411,26 @@ export const handler: SQSHandler = async (event, context: Context) => {
           if(!(error instanceof ErasureReplayBlockedError))throw error;
           logEvent("erased_identity_delivery_suppressed",{profile:delivery.profile,kind:"todoist"});
           continue;
+        }
+      }
+      // A deletion webhook can be intercepted into a review decision before
+      // Synchronizer.process() runs. Check the provider tombstone first so a
+      // stale deleted identity cannot create review/receipt state in DynamoDB.
+      if(delivery.kind==="todoist") {
+        let payload:TodoistWebhookPayload|undefined;
+        try { payload=JSON.parse(delivery.body) as TodoistWebhookPayload; } catch { /* normal validation owns malformed payloads */ }
+        const task=payload?.event_data;
+        const explicitDelete=Boolean(task?.id&&(/deleted/i.test(payload?.event_name||"")||task.is_deleted));
+        if(explicitDelete&&task?.id) {
+          suppressCompletionReceipt=true;
+          const clients=await defaultProviderClientFactory(delivery.profile);
+          const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+          if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
+            projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id})) {
+            await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist"});
+            continue;
+          }
+          suppressCompletionReceipt=false;
         }
       }
       manual = new ManualInterventionService();
