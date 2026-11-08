@@ -38,7 +38,13 @@ Completed #349 erasures now store a bounded tombstone in the exact existing
 Todoist project mapping comment. Every recognized Todoist webhook lifecycle
 and Calendar delta path reads a fresh project-comment inventory before
 processing; active markers suppress matching task and Calendar aliases without
-writing task/event IDs to DynamoDB.
+writing task/event IDs to DynamoDB. Calendar snapshot reconciliation and the
+orphan-recovery pass also check the marker before importing or rebinding an
+unmapped retained event/task. Stored manual decisions / queued repair previews
+check all retained identities before state changes or provider execution.
+Those review checks group identities by profile, read each current project
+comment inventory once, and fail closed when Todoist cannot be read. These
+checks run under the existing writer protocol; no new feature flag was added.
 The legacy provider guard still performs its strongly consistent HMAC lookup
 only when `ERASURE_REPLAY_BARRIER_VERSION=1`; that marker store is not used for
 completed #349 erasures. The standalone Calendar-only factory therefore has no
@@ -85,3 +91,24 @@ Do not use this source review to enable the barrier, release a fence, restore
 worker mappings, retire a Lambda version, or authorize replay. Keep the
 deployed criterion unchecked until its live evidence and approvals are
 complete.
+
+
+## Post-#405 deployed evidence (8 Nov 2026)
+
+The current deployed packages include project-comment marker and suppression
+code in ingress, review, and erasure-worker packages. The seven-function audit
+verified 223 published versions and two aliases, but package-string discovery
+is not a control-flow proof. Seventy-one Review API configurations still have
+the paired erasure execution/protocol settings enabled; the live alias targets
+version 136 with execution false, while historical qualified versions remain
+invoke candidates. The current stack setting is false, but this does not deny
+qualified historical invocation. The replay barrier is absent across the
+inventoried configurations.
+
+Calendar snapshot reconciliation, orphan recovery, review/repair admission,
+Todoist webhook and Calendar delta paths are represented in current source;
+this does not establish that every historical executable or caller observes
+the same marker before every provider or DynamoDB write. #347 remains open for
+the complete version/caller inventory and an enforceable IAM/resource-policy
+boundary, independent review, and rollback evidence. #349 remains open for the
+disposable Work-profile fault matrix.
