@@ -87,7 +87,7 @@ test("quarterly is three calendar months and skips short months rather than 90 d
   const result = todoistPhaseBCandidate(task(dates[0], phrase), knownAnchor(dates[0]));
   assert.equal(result.candidateRrule, "RRULE:FREQ=MONTHLY;INTERVAL=3");
   assert.equal(result.disposition, "rolling_required");
-  assert.equal(result.reason, "provider_readback_required");
+  assert.equal(result.reason, "month_end_provider_drift");
   // The anchor's Jan 31 cadence skips April's missing 31st. This Todoist
   // advancement cannot safely be treated as equivalent until verified.
   const proof = readbacks(phrase, dates[0], dates);
