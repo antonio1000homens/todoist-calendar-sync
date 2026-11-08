@@ -405,3 +405,36 @@ test("confirmation persists the readiness at issuance, not the later deployment 
   await store.issueConfirmation({...preview,operationId:"issued-enabled"});
   assert.equal(writes[1].TransactItems[0].Put.Item.executionReadyAtIssue,true);
 });
+
+test("ambiguous provider deletion and verification failures quarantine durably without automatic replay",async()=>{
+  for(const phase of ["delete","verify_deletion"]){
+    const operation={...storedQueuedOperation(),status:"deleting",providerDeletionReady:true,
+      lifecycle:{phase,mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+        pollMs:5000,nextRunAt:0,evidence:{},
+        deletionProgress:{stage:"todoist",commentIndex:0,stateIndex:0,startedAt:1}}};
+    const db=memoryDb(operation);
+    let providerAttempts=0, restored=0, released=0;
+    const adapters={
+      listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+      inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),
+      beginFence:async()=>{},restoreMappings:async()=>{restored++;},
+      finishFence:async()=>{released++;},
+      readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
+      executeDeletionStep:async()=>{providerAttempts++;throw new Error("provider timeout after an unknown write");},
+      verifyDeletion:async()=>{providerAttempts++;throw new Error("provider response was unavailable");},
+    };
+    const store=new ErasureOperationStore(db,()=>"unused",adapters);
+    const result=await store.advanceFencedLifecycle("op");
+    assert.equal(result.status,"review_required",phase);
+    assert.equal(result.phase,phase);
+    assert.equal(db.item.lifecycle.phase,phase,"preserve the original operation checkpoint");
+    assert.match(db.item.lifecycle.lastError,/break-glass recovery is required/);
+    assert.doesNotMatch(db.item.lifecycle.lastError,/provider timeout|provider response/);
+    assert.equal(providerAttempts,1);
+    assert.equal(restored,0);
+    assert.equal(released,0);
+    assert.equal(db.calls.some(x=>x.constructor.name==="TransactWriteCommand"),false);
+    await assert.rejects(store.advanceFencedLifecycle("op"),/not in a resumable fenced lifecycle/);
+    assert.equal(providerAttempts,1,"a repeated delivery cannot re-execute an uncertain delete");
+  }
+});
