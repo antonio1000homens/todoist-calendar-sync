@@ -3,13 +3,20 @@ import test from "node:test";
 import { profiles, rememberTodoistTokenProject } from "../dist/config.js";
 import {
   MAPPING_COMMENT_MARKER,
+  DELETION_TOMBSTONE_COMMENT_MARKER,
+  activeProjectDeletionTombstone,
   attachProjectCommentReference,
   buildProjectMappingIndex,
+  cleanupExpiredProjectDeletionTombstones,
   deleteMappingComments,
   findProjectMappingComment,
   parseMappingComment,
+  parseDeletionTombstoneComment,
+  projectDeletionTombstoneExpired,
+  serializeDeletionTombstoneComment,
   serializeMappingComment,
   upsertProjectMappingComment,
+  writeProjectDeletionTombstone,
 } from "../dist/mapping-comments.js";
 import { Todoist } from "../dist/providers.js";
 
@@ -45,6 +52,83 @@ test("v1 project mapping comment round-trips recurrence metadata", () => {
   assert.equal(parsed.payload.masterEventId, "master-1");
   assert.equal(parsed.payload.activeInstanceId, "event-1");
   assert.equal(parsed.payload.mappingRevision, 3);
+});
+
+test("project deletion tombstone round-trips exact identities and expires without DynamoDB state", () => {
+  const payload = { schemaVersion: 1, profile: "home", projectId: "project-home", taskId: "task-1",
+    eventIds: ["master-1", "event-1"], createdAt: "2026-11-08T12:00:00.000Z",
+    expiresAt: "2026-11-22T12:00:00.000Z" };
+  const content = serializeDeletionTombstoneComment(payload);
+  assert.ok(content.startsWith(`${DELETION_TOMBSTONE_COMMENT_MARKER}\n`));
+  const comment = { id: "comment-1", content };
+  assert.deepEqual(parseDeletionTombstoneComment(comment), { ...payload, eventIds: ["event-1", "master-1"] });
+  assert.equal(parseMappingComment(comment), undefined, "deleted mapping is no longer indexed as active");
+  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", taskId: "task-1" }, Date.parse("2026-11-22T11:59:59.000Z"))?.taskId, "task-1");
+  assert.equal(activeProjectDeletionTombstone([comment], { profile: "home", projectId: "project-home", eventIds: ["event-1"] }, Date.parse("2026-11-22T12:00:00.000Z")), undefined);
+  assert.equal(projectDeletionTombstoneExpired(comment, Date.parse("2026-11-22T12:00:00.000Z")), true);
+});
+
+test("project deletion tombstone parser rejects malformed or non-finite scopes", () => {
+  const malformed = [
+    `${DELETION_TOMBSTONE_COMMENT_MARKER}\n{bad`,
+    `${DELETION_TOMBSTONE_COMMENT_MARKER}\n${JSON.stringify({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: Array.from({ length: 33 }, (_, i) => `event-${i}`), createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-22T12:00:00.000Z" })}`,
+    `${DELETION_TOMBSTONE_COMMENT_MARKER}\n${JSON.stringify({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2099-11-08T12:00:00.000Z" })}`,
+  ];
+  for (const content of malformed) assert.equal(parseDeletionTombstoneComment({ id: "bad", content }), undefined);
+  assert.ok(serializeDeletionTombstoneComment({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-22T12:00:00.000Z" }));
+});
+
+test("project mapping comment becomes a verified short-lived deletion tombstone idempotently", async () => {
+  const comments = new Map([["map-1", { id: "map-1", project_id:"project-home", content: serializeMappingComment(mapping(), "project-home") }]]);
+  const client = {
+    async getComment(id) { const value = comments.get(id); if (!value) throw Object.assign(new Error("missing"), { status: 404 }); return value; },
+    async updateComment(id, content) { const current=comments.get(id);const value={...current,content};comments.set(id,value);return value; },
+  };
+  const input = { commentId: "map-1", profile: "home", projectId: "project-home", taskId: "task-1",
+    eventIds: ["event-1", "master-1"], createdAt: "2026-11-08T12:00:00.000Z" };
+  const first = await writeProjectDeletionTombstone(client, input);
+  const second = await writeProjectDeletionTombstone(client, input);
+  assert.deepEqual(parseDeletionTombstoneComment(first), parseDeletionTombstoneComment(second));
+  assert.equal(parseMappingComment(first), undefined);
+  assert.equal(parseDeletionTombstoneComment(first).expiresAt, "2026-11-22T12:00:00.000Z");
+  await assert.rejects(writeProjectDeletionTombstone(client, { ...input, taskId: "other-task" }), /does not match/);
+});
+
+test("project deletion marker never creates a replacement comment when the exact mapping note cannot be updated", async () => {
+  const content=serializeMappingComment(mapping(),"project-home");
+  let fallbackCreates=0;
+  const client={getComment:async id=>({id,project_id:"project-home",content}),
+    updateComment:async()=>{throw new Error("Comment is not yours");},
+    upsertProjectComment:async()=>{fallbackCreates++;}};
+  await assert.rejects(writeProjectDeletionTombstone(client,{commentId:"map-1",profile:"home",
+    projectId:"project-home",taskId:"task-1",eventIds:["event-1"]}),/Comment is not yours/);
+  assert.equal(fallbackCreates,0);
+});
+
+test("expired project tombstone cleanup is scoped, dry-run by default, and rechecks before delete", async () => {
+  const now=Date.parse("2026-11-23T12:00:00.000Z");
+  const expired={id:"expired",project_id:"project-home",content:serializeDeletionTombstoneComment({schemaVersion:1,
+    profile:"home",projectId:"project-home",taskId:"task-old",eventIds:["event-old"],
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"})};
+  const active={id:"active",project_id:"project-home",content:serializeDeletionTombstoneComment({schemaVersion:1,
+    profile:"home",projectId:"project-home",taskId:"task-new",eventIds:["event-new"],
+    createdAt:"2026-11-15T12:00:00.000Z",expiresAt:"2026-11-29T12:00:00.000Z"})};
+  const other={id:"other",project_id:"project-other",content:serializeDeletionTombstoneComment({schemaVersion:1,
+    profile:"antonio",projectId:"project-other",taskId:"task-other",eventIds:["event-other"],
+    createdAt:"2026-11-01T12:00:00.000Z",expiresAt:"2026-11-15T12:00:00.000Z"})};
+  const comments=new Map([[expired.id,expired],[active.id,active],[other.id,other]]);
+  let deletes=0;
+  const client={listProjectComments:async()=>[...comments.values()],
+    getComment:async id=>{const value=comments.get(id);if(!value)throw Object.assign(new Error("missing"),{status:404});return value;},
+    deleteComment:async id=>{deletes++;comments.delete(id);}};
+  const report=await cleanupExpiredProjectDeletionTombstones(client,"home","project-home",{now});
+  assert.deepEqual(report,{eligible:1,deleted:0,skippedChanged:0});
+  assert.equal(deletes,0);
+  const applied=await cleanupExpiredProjectDeletionTombstones(client,"home","project-home",{now,apply:true});
+  assert.deepEqual(applied,{eligible:1,deleted:1,skippedChanged:0});
+  assert.equal(deletes,1);
+  assert.ok(comments.has(active.id));
+  assert.ok(comments.has(other.id));
 });
 
 test("index ignores human comments, reports malformed mappings, and indexes task/event/series", () => {

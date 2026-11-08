@@ -6,6 +6,7 @@ import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
@@ -100,6 +101,7 @@ test("elapsed standalone Calendar delta cannot update the current Todoist task",
     async getTimeZone() { return "Europe/London"; },
   };
   const todoist = {
+    async listProjectComments() { return []; },
     async getTask() { taskReads += 1; return { id: mapping.taskId, content: "Vehicle tax", due: { date: "2027-05-02" } }; },
     async upsertTask() { taskWrites += 1; },
   };
@@ -255,6 +257,7 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async deleteEvent(id) { calendarDeletes.push(id); },
   };
   const todoist = {
+    async listProjectComments() { return []; },
     async getTask(taskId) {
       return { id: taskId, content: event.summary, project_id: profiles.home.todoistProjectId,
         due: { date: "2026-09-28" }, is_completed: false,
@@ -338,6 +341,7 @@ test("rechecks completion immediately before Calendar-to-Todoist mutation", asyn
     async listDelta() { return { items: [event], nextSyncToken: "next-token" }; },
   };
   const todoist = {
+    async listProjectComments() { return []; },
     async getTask() { return task; },
     async upsertTask() { todoistUpserts += 1; return task; },
   };
@@ -567,7 +571,8 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
       return structuredClone(event);
     },
   };
-  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: { async getTask() { return structuredClone(task); } } }));
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {
+    async listProjectComments() { return []; }, async getTask() { return structuredClone(task); } } }));
 
   await sync.process({
     id: "canonical-noop",
@@ -595,6 +600,7 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
     async listCompletedCalendarProjectionsByTask() { return []; },
   };
   const todoist = {
+    async listProjectComments() { return []; },
     async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar: {}, todoist }));
@@ -612,6 +618,45 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
     assert.equal(Object.hasOwn(audit.detail, "taskId"), false);
     assert.equal(Object.hasOwn(audit.detail, "deliveryId"), false);
   }
+});
+
+test("temporary project tombstone suppresses a stale Todoist webhook before task reads or writes",async()=>{
+  const audits=[];let taskReads=0,taskWrites=0;
+  const state={async audit(profile,action,detail){audits.push({profile,action,detail});}};
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
+    projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"});
+  const todoist={async listProjectComments(projectId){assert.equal(projectId,profiles.home.todoistProjectId);return [
+    {id:"tombstone-comment",project_id:projectId,content},
+  ];},async getTask(){taskReads++;return {id:"purged-task"};},async upsertTask(){taskWrites++;}};
+  const sync=new Synchronizer(state,undefined,async()=>({calendar:{},todoist}));
+  await sync.process({id:"late-webhook",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},
+    body:JSON.stringify({event_name:"item:updated",event_data:{id:"purged-task",content:"stale",due:{date:"2026-11-20"}}})});
+  assert.equal(taskReads,0);
+  assert.equal(taskWrites,0);
+  assert.equal(audits.length,1);
+  assert.equal(audits[0].action,"erasure_project_comment_replay_suppressed");
+  assert.deepEqual(audits[0].detail,{side:"todoist",event:"item:updated"});
+});
+
+test("temporary project tombstone suppresses a stale Calendar delta before Todoist creation",async()=>{
+  const audits=[];let creates=0;
+  const state={async getSyncToken(){return "sync-token";},async putSyncToken(){},
+    async audit(profile,action,detail){audits.push({profile,action,detail});}};
+  const event={id:"purged-event",status:"confirmed",summary:"stale event",start:{date:"2026-11-20"},end:{date:"2026-11-21"},
+    extendedProperties:{shared:{taskId:"purged-task"}}};
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
+    projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
+    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-22T12:00:00.000Z"});
+  const calendar={async listDelta(){return {items:[event],nextSyncToken:"next-token"};}};
+  const todoist={async listProjectComments(projectId){return [{id:"tombstone-comment",project_id:projectId,content}];},
+    async upsertTask(){creates++;}};
+  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
+  await sync.process({id:"late-calendar-delta",kind:"calendar",profile:"home",mode:"aws",
+    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},body:""});
+  assert.equal(creates,0);
+  assert.equal(audits.some(entry=>entry.action==="erasure_project_comment_replay_suppressed"),true);
 });
 
 test("pending cancelled annual reset creates a NEW yearly master without reusing deleted Calendar aliases",async()=>{
@@ -664,7 +709,7 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
       }];
     },
   };
-  const todoist={async getTask(id){assert.equal(id,task.id);return structuredClone(task);}};
+  const todoist={async listProjectComments(){return [];},async getTask(id){assert.equal(id,task.id);return structuredClone(task);}};
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
   await sync.process({id:"annual-update",kind:"todoist",profile:"home",mode:"aws",
     headers:{},receivedAt:"2026-11-07T16:00:01Z",
@@ -700,7 +745,7 @@ test("pending annual recovery refuses to recreate a Calendar event if the user c
     async audit(_profile,action){logs.push(action);},
   };
   const calendar={async listLinkedEventsByTodoistTaskId(){created++;return [];}};
-  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist:{async getTask(){return task;}}}));
+  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist:{async listProjectComments(){return [];},async getTask(){return task;}}}));
   await sync.process({id:"annual-edited",kind:"todoist",profile:"home",mode:"aws",
     headers:{},receivedAt:"2026-11-07T17:00:01Z",
     body:JSON.stringify({event_name:"item:updated",event_data:task})});
@@ -761,7 +806,7 @@ test("pending standalone reset reuses exact Calendar ID after POST succeeded but
       error.status=503;throw error;
     },
   };
-  const todoist={async getTask(id){assert.equal(id,source.id);return structuredClone(source);}};
+  const todoist={async listProjectComments(){return [];},async getTask(id){assert.equal(id,source.id);return structuredClone(source);}};
   const foreign={calendar:{async listLinkedEventsByTodoistTaskId(){return [];}},todoist};
   const synchronizer=new Synchronizer(state,undefined,async p=>p==="home"?{calendar,todoist}:foreign);
   const delivery=id=>({id,kind:"todoist",profile:"home",mode:"aws",

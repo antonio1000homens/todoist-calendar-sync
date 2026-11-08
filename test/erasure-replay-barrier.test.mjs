@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   assertReplayAdmission, atomicReplayRelease, verifyAtomicReplayRelease, completePostWriteMappingRestore, ErasureReplayBlockedError,
   ErasureReplayUnavailableError, REPLAY_PROFILES, atomicConfirmedErasureCompletion,
-  assertConfirmedErasureReplayAdmission,
 } from "../dist/erasure-replay-barrier.js";
 
 const original={table:process.env.STATE_TABLE_NAME,protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
@@ -302,36 +301,27 @@ test("explicitly recorded historical Calendar IDs remain scoped and can be tombs
   assert.equal(markers.length,3);
   assert.equal(JSON.stringify(markers).includes("moved-before-config-change"),false);
 });
-test("confirmed erasure writes minimal HMAC markers atomically and checks them before provider deletion",async()=>{
+test("confirmed erasure releases its fence only against recorded project tombstones and writes no DynamoDB identity",async()=>{
   const previous=process.env.ERASURE_REPLAY_BARRIER_VERSION;
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
   const proof={operationId:"op-atomic",profile:"work",taskId:"deleted-task",deleteCalendar:true,
     eventId:"deleted-event",calendarId:"work@example.test",knownCalendarAliasesComplete:true,
     knownCalendarAliases:[{profile:"work",calendarId:"work@example.test",eventId:"deleted-event"},
       {profile:"antonio",calendarId:"personal-archive@example.test",eventId:"moved-event"}],
+    projectCommentIds:["project-comment-1"],
     confirmationId:"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",previewFingerprint:"d".repeat(64),epoch:7};
   try{
     const tx=atomicConfirmedErasureCompletion(proof).input.TransactItems;
-    const markers=tx.filter(item=>item.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).map(item=>item.Put);
-    assert.equal(markers.length,5);
-    assert.ok(markers.every(item=>Object.keys(item.Item).sort().join(",")==="markerVersion,pk,sk"));
-    assert.equal(JSON.stringify(markers).includes("deleted-task"),false);
-    assert.equal(JSON.stringify(markers).includes("moved-event"),false);
+    assert.equal(tx.some(item=>item.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")),false);
+    assert.equal(tx.some(item=>item.Put?.Item?.markerVersion===1),false,
+      "the transaction persists no task/event tombstone row");
     assert.ok(tx.some(item=>item.Delete?.Key?.sk==="FENCE"));
     assert.ok(tx.some(item=>item.ConditionCheck?.Key?.sk==="EPOCH"));
     assert.ok(tx.some(item=>item.Delete?.Key?.pk==="ERASURE_OPERATION#op-atomic"
-      &&item.Delete.ConditionExpression.includes("actionPlan.knownCalendarAliasesComplete=:ready")));
-    const reads=[];
-    const db={async send(command){reads.push(command.input.Key);return {};}};
-    await assertConfirmedErasureReplayAdmission(proof,db);
-    assert.equal(reads.length,14,"check every retained key for task markers plus scoped and legacy Calendar aliases");
-    assert.ok(reads.every(key=>key.pk.startsWith("ERASURE_REPLAY#")));
-    const blocked={async send(command){return command.input.Key.sk.startsWith("TASK#")?{Item:{markerVersion:1}}:{};}};
-    await assert.rejects(assertConfirmedErasureReplayAdmission(proof,blocked),ErasureReplayBlockedError);
-    const throttled={async send(){throw new Error("DynamoDB throttled");}};
-    await assert.rejects(assertConfirmedErasureReplayAdmission(proof,throttled),/readback is unavailable/);
+      &&item.Delete.ConditionExpression.includes("contains(actionPlan.projectCommentIds, :comment0)")));
     process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
-    assert.throws(()=>atomicConfirmedErasureCompletion(proof),ErasureReplayUnavailableError);
+    assert.ok(atomicConfirmedErasureCompletion(proof),"the confirmed comment model uses no new DynamoDB replay flag");
+    process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
   }finally{if(previous===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
     else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous;}
 });

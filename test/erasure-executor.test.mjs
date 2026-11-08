@@ -7,7 +7,7 @@ const operation={operationId:"op",profile:"home",target:{taskId:"task",deleteCal
   status:"previewed",createdAt:"2026-10-23T00:00:00Z",updatedAt:"2026-10-23T00:00:00Z"};
 const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
-  actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},comments:[]},
+  actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},projectCommentIds:["project-comment-1"],comments:[]},
   inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row-v1",classification:"selected"}]};
 const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
@@ -329,7 +329,7 @@ test("worker adapters are bound at construction and request arguments cannot rep
     };
     result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"complete");assert.equal(result.status,"succeeded");
-    assert.equal(db.markers.size,3,"the lost transaction acknowledgement is resolved only after all task markers are visible");
+    assert.equal(db.markers.size,0,"the lost transaction acknowledgement is resolved from state readback; no DynamoDB task marker is stored");
     assert.equal(events.filter(event=>event[0]==="finish").length,0,"the fence is removed atomically with operation cleanup");
     assert.ok(!events.some(event=>event[0]==="delete"),"provider deletion is delegated to the bound deletion adapter");
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;

@@ -2,7 +2,7 @@ import {defaultProviderClientFactory} from "./mutation-budget.js";
 import {calendarReplaySourceIds,guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
-import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
@@ -1028,7 +1028,9 @@ export class Synchronizer {
       });
       return;
     }
-    for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist);
+    const projectComments=delta.items.length
+      ?await todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true):[];
+    for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist,projectComments);
     if (this.state instanceof StateRepository) {
       const deleted = delta.items.filter(event => event.status === "cancelled");
       const eligibleDeleted: CalendarEvent[] = [];
@@ -1049,7 +1051,8 @@ export class Synchronizer {
     await this.state.audit(delivery.profile, "calendar_delta_processed", { deliveryId: delivery.id, count: delta.items.length, mode: delivery.mode });
   }
 
-  private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar, todoist: Todoist): Promise<void> {
+  private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar,
+    todoist: Todoist,projectComments:Awaited<ReturnType<Todoist["listProjectComments"]>>): Promise<void> {
     // This must run BEFORE master readback or conflict/audit processing. A
     // stale webhook for a retired series must not seed fresh review evidence.
     if (await this.state.isRetired?.({profile:delivery.profile,
@@ -1058,6 +1061,11 @@ export class Synchronizer {
       ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{}),
       ...(event.extendedProperties?.shared?.taskId
         ?{taskId:event.extendedProperties.shared.taskId}:{})})) return;
+    if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
+      projectId:profiles[delivery.profile].todoistProjectId,
+      taskId:event.extendedProperties?.shared?.taskId,
+      eventIds:[event.id,event.recurringEventId].filter((id):id is string=>Boolean(id))}))
+      return this.state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"calendar"});
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any provider mutation.
@@ -1805,6 +1813,13 @@ export class Synchronizer {
     // Exact retired Todoist IDs short-circuit stale webhook replay before
     // version acceptance, active provider lookups and write-fence claims.
     if (await this.state.isRetired?.({profile:delivery.profile,taskId:task.id})) return;
+    if(lifecycle.action==="upsert"||lifecycle.action==="delete_projection") {
+      const projectCommentClient=(await this.clients(delivery.profile)).todoist;
+      const projectComments=await projectCommentClient.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+      if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
+        projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id}))
+        return this.state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist",event:payload.event_name});
+    }
     // Every Todoist-origin Calendar update/delete holds this task's durable
     // write fence until provider and mapping writes finish. Completion retries
     // rather than committing its immutable marker mid-mutation.

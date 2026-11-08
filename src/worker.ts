@@ -458,7 +458,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // decisions. Notification failure never suppresses the underlying audit.
       const audit = state.audit.bind(state);
       state.audit = async (profile, action, detail) => {
-        if (action === "todoist_erased_item_replay_suppressed") {
+        if (action === "todoist_erased_item_replay_suppressed"
+          || action === "erasure_project_comment_replay_suppressed") {
           suppressCompletionReceipt = true;
           identityRefs.taskIds.clear();
           identityRefs.eventIds.clear();
@@ -466,7 +467,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
         collectIdentityRefs(detail);
         await audit(profile, action, detail);
-        if (delivery && action !== "todoist_erased_item_replay_suppressed") {
+        if (delivery && action !== "todoist_erased_item_replay_suppressed"
+          && action !== "erasure_project_comment_replay_suppressed") {
           const observedCase = await manual?.observeAudit(delivery, profile, action, detail);
           if (delivery.kind === "reconcile" && delivery.reconcile?.generation) {
             try {

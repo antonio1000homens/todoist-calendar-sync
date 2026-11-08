@@ -214,7 +214,9 @@ test("erased-item webhook replay writes no identity-bearing completion receipt",
   const audit = t.mock.method(StateRepository.prototype, "audit", async () => {});
   const completed = t.mock.method(StateRepository.prototype, "markDeliveryCompleted", async () => {});
   t.mock.method(OrphanRecoveringSynchronizer.prototype, "process", async function (delivery) {
-    await this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+    const action=delivery.id.includes("project-comment")
+      ?"erasure_project_comment_replay_suppressed":"todoist_erased_item_replay_suppressed";
+    await this.state.audit(delivery.profile, action, {});
   });
   t.after(() => {
     documentClient.send = originalSend;
@@ -228,10 +230,14 @@ test("erased-item webhook replay writes no identity-bearing completion receipt",
     receivedAt: new Date().toISOString(), headers: {}, erasureEpoch: 1,
     body: JSON.stringify({ event_name: "item:updated", event_data: { id: "erased-task-id" } }),
   };
-  const result = await handler({ Records: [{ messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} }] }, { awsRequestId: "request-erased" });
+  const projectCommentDelivery={...delivery,id:"todoist-webhook-project-comment"};
+  const result = await handler({ Records: [
+    { messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} },
+    { messageId: "message-project-comment", body: JSON.stringify(projectCommentDelivery), attributes: {}, messageAttributes: {} },
+  ] }, { awsRequestId: "request-erased" });
   assert.deepEqual(result.batchItemFailures, []);
-  assert.equal(audit.mock.callCount(), 1);
-  assert.deepEqual(audit.mock.calls[0].arguments[2], {});
+  assert.equal(audit.mock.callCount(), 2);
+  assert.deepEqual(audit.mock.calls.map(call=>call.arguments[2]), [{},{}]);
   assert.equal(completed.mock.callCount(), 0);
 });
 

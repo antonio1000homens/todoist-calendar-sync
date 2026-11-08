@@ -20,7 +20,7 @@ test("#351 past mapping is a silent no-op on two successive manual/scheduled rec
     isRetired:async(identity)=>retired(identity),
     audit:async(_profile,action)=>audits.push(action),
   };
-  const clientFactory=async()=>({todoist:{listTasks:async()=>tasks},calendar:{}});
+  const clientFactory=async()=>({todoist:{listProjectComments:async()=>[],listTasks:async()=>tasks},calendar:{}});
   const store={
     listMappings:async()=>[mapping],
     getBaseline:async()=>{throw new Error("retired mapping must not read baseline");},
@@ -42,7 +42,7 @@ test("#351 retained task with no Dynamo mapping never reimports in two repeated 
   const task={id:"task-351",content:"Already retired",due:{date:"2026-10-21"}};
   const state={isRetired:async identity=>retired(identity),
     audit:async()=>{}};
-  const clients=async()=>({todoist:{listTasks:async()=>[task]},calendar:{
+  const clients=async()=>({todoist:{listProjectComments:async()=>[],listTasks:async()=>[task]},calendar:{
     findByTodoistTaskId:async()=>{throw new Error("retired task must not discover/recreate provider event");},
   }});
   const store={listMappings:async()=>[],getBaseline:async()=>{throw new Error("no baseline");}};
@@ -68,7 +68,7 @@ test("#351 stale Todoist and Calendar webhook replays never reach provider write
   };
   let writes=0;
   const factory=async()=>({
-    todoist:{async getTask(){throw new Error("retired task re-read");},
+    todoist:{async listProjectComments(){return [];},async getTask(){throw new Error("retired task re-read");},
       async upsertTask(){writes++;}},
     calendar:{async listDelta(){return {items:[{
       id:"oct-occurrence",recurringEventId:"oct-master",
@@ -111,7 +111,7 @@ test("#351 full Calendar recovery silently skips retired finite RRULE but preser
     getMappingByEvent:async()=>undefined,
   };
   const factory=async()=>({
-    todoist:{listTasks:async()=>[],upsertTask:async()=>{writes++;}},
+    todoist:{listProjectComments:async()=>[],listTasks:async()=>[],upsertTask:async()=>{writes++;}},
     calendar:{listDelta:async()=>({items:[event]}),
       listInstances:async()=>{throw new Error("Retired series must not expand");},
       upsertEvent:async()=>{writes++;}},

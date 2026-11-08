@@ -152,6 +152,7 @@ function fixture({ events = [], tasks = [] } = {}) {
   };
 
   const todoist = {
+    async listProjectComments() { return []; },
     async listTasks() { return [...taskMap.values()].map((task) => structuredClone(task)); },
     async getTask(taskId) {
       const task = taskMap.get(taskId);

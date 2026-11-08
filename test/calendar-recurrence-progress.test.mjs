@@ -196,6 +196,7 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
       async upsertEvent(event) { calendarUpserts.push(structuredClone(event)); return { ...structuredClone(event), id: event.id || "stored" }; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async getTask(id) {
         const task = tasks.get(id);
         if (!task) throw Object.assign(new Error("missing"), { status: 404 });

@@ -3,7 +3,7 @@ import { GetCommand, ScanCommand, type DynamoDBDocumentClient } from "@aws-sdk/l
 import { documentClient, pacingDelayMs, scanPageItemLimit } from "./dynamodb-capacity.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
-import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
@@ -152,7 +152,8 @@ function providerBlockers(data: {
   if (data.linked && (!target.eventId || typeof data.linked.id !== "string" || data.linked.id !== target.eventId)) blockers.push("Another or unidentifiable Calendar projection links to this task; manual inspection required");
   if (data.linked && !deleteCalendar) blockers.push("A live Calendar projection would recreate the Todoist task unless separately deleted");
   if (data.linked?.recurrence?.length || data.linked?.recurringEventId) blockers.push("Linked Calendar recurrence needs manual handling");
-  if (data.comments.some(item => item.profile !== target.profile || item.taskId !== target.taskId || item.eventId !== target.eventId || item.seriesId))
+  if (data.comments.some(item => item.profile !== target.profile || item.taskId !== target.taskId
+    || (target.eventId !== undefined && item.eventId !== target.eventId) || item.seriesId))
     blockers.push("Project mapping comment belongs to another item or recurrence");
   if (data.malformed.length) blockers.push("Unparseable mapping comments contain the selected identity");
   if (data.legacy.some(item => !target.eventId || item.eventId !== target.eventId)) blockers.push("Legacy task comments refer to another or unknown Calendar event");
@@ -191,6 +192,9 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     providerClients.calendar.findByTodoistTaskId(target.taskId),
     providerClients.todoist.listProjectComments(profiles[target.profile].todoistProjectId, true),
   ]);
+  const existingDeletionTombstone=activeProjectDeletionTombstone(projectComments,{profile:target.profile,
+    projectId:profiles[target.profile].todoistProjectId,taskId:target.taskId,
+    eventIds:target.eventId?[target.eventId]:[]});
   // A cancelled lookup result is absence only when it identifies the exact
   // selected Calendar event. Without an explicit event target, or with an
   // absent/mismatched ID, retain it so providerBlockers fails closed.
@@ -198,6 +202,12 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     ? undefined : linkedResult;
   const indexed = buildProjectMappingIndex(projectComments);
   const relevant = indexed.parsed.filter(item => item.payload.taskId === target.taskId || item.payload.eventId === target.eventId);
+  if(existingDeletionTombstone&&!dependencies.allowFenceOperationId)
+    plan.blockers.push("An active project deletion tombstone already exists for this identity");
+  if(!relevant.some(item=>item.payload.profile===target.profile
+    &&item.payload.projectId===profiles[target.profile].todoistProjectId
+    &&item.payload.taskId===target.taskId)&&!(existingDeletionTombstone&&dependencies.allowFenceOperationId))
+    plan.blockers.push("No exact Todoist project mapping comment is available to hold the bounded deletion tombstone");
   const malformed = indexed.malformed.filter(item => item.comment.content?.includes(target.taskId)
     || (target.eventId && item.comment.content?.includes(target.eventId)));
   // Task-scoped comments may outlive a task. Inventory them even when the
@@ -287,6 +297,9 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     calendarEvent: event ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
       digest: fingerprint(event), etag:event.etag as string } : undefined,
     knownCalendarAliases:boundedKnownAliases,knownCalendarAliasesComplete:knownAliasesComplete,
+    projectCommentIds:relevant.filter(item=>item.payload.profile===target.profile
+      &&item.payload.projectId===profiles[target.profile].todoistProjectId
+      &&item.payload.taskId===target.taskId).map(item=>item.comment.id).sort(),
     comments: [
       ...relevant.map(item => ({ id: item.comment.id, kind: "project" as const, digest: fingerprint(item.comment.content) })),
       ...legacy.map(item => ({ id: item.id, kind: "task" as const, digest: item.digest })),

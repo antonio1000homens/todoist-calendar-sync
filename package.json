@@ -22,6 +22,7 @@
     "state:audit-deleted-recurrences": "npm run build --silent && node scripts/audit-deleted-recurrences.mjs",
     "state:cleanup-completed": "npm run build --silent && node scripts/cleanup-terminal-completions.mjs",
     "state:cleanup-completed-comment": "npm run build --silent && node scripts/cleanup-completed-project-comment.mjs",
+    "cleanup:erasure-tombstones": "npm run build --silent && node scripts/cleanup-erasure-tombstones.mjs",
     "audit:erasure:codedeploy": "node scripts/audit-erasure-lambda-codedeploy.mjs",
     "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
     "check:public": "bash scripts/check-public-source.sh",

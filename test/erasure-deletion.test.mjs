@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { executeErasureDeletionStep } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
+import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
+  serializeMappingComment } from "../dist/mapping-comments.js";
 
 const baseOperation={operationId:"erase-1",profile:"home",target:{taskId:"task-1",eventId:"event-1",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[],actionPlan:{todoistTask:{id:"task-1",digest:fingerprint({id:"task-1",project_id:"test-home-project"})},comments:[]}};
@@ -15,6 +17,35 @@ test("comment deletion rejects a provider response whose ID differs from the inv
     {db:{send:async()=>({})},clients:{todoist:{getComment:async()=>({id:"other-comment",content:"mapping"}),deleteComment:async()=>{deletes++;}},calendar:{}},inspectFence:async()=>({leases:[]})}),
     ErasureGateDriftError);
   assert.equal(deletes,0);
+});
+
+test("confirmed erasure replaces the project mapping comment with a readback-verified bounded tombstone",async()=>{
+  let deletes=0;
+  const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
+  let current={id:"project-1",project_id:"test-home-project",content:original};
+  const todoist={getComment:async id=>{assert.equal(id,"project-1");return current;},
+    updateComment:async(id,content)=>{assert.equal(id,"project-1");current={...current,content};return current;},
+    deleteComment:async()=>{deletes++;}};
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+    comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
+  const startedAt=Date.now();
+  const result=await executeErasureDeletionStep(operation,{stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")},
+    {db:{send:async()=>({})},clients:{todoist,calendar:{}},inspectFence:async()=>({leases:[]})});
+  const tombstone=parseDeletionTombstoneComment(current);
+  assert.equal(result.progress.commentIndex,1);
+  assert.equal(tombstone.taskId,"task-1");
+  assert.deepEqual(tombstone.eventIds,["event-1"]);
+  assert.ok(Date.parse(tombstone.createdAt)>=startedAt);
+  assert.equal(Date.parse(tombstone.expiresAt)-Date.parse(tombstone.createdAt),PROJECT_DELETION_TOMBSTONE_RETENTION_MS);
+  assert.equal(deletes,0,"the project note must remain as the temporary replay marker");
+});
+
+test("confirmed erasure cannot advance when its project tombstone comment is missing",async()=>{
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    comments:[{id:"project-1",kind:"project",digest:fingerprint("mapping")}]}};
+  await assert.rejects(executeErasureDeletionStep(operation,{stage:"comments",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:{send:async()=>({})},clients:{todoist:{getComment:async()=>{throw Object.assign(new Error("missing"),{status:404});}},calendar:{}},inspectFence:async()=>({leases:[]})}),/missing/);
 });
 
 test("task deletion rejects malformed live responses instead of treating them as absent",async()=>{

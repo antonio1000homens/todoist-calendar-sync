@@ -248,6 +248,7 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     },
   };
   const todoist = {
+    async listProjectComments() { return []; },
     async getTimeZone() { return "Europe/London"; },
     async getTask(id) {
       if (!tasks.has(id)) { const error = new Error("not found"); error.status = 404; throw error; }

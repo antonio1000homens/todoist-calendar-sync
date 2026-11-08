@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildErasurePreview } from "../dist/erasure-preview.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 
 test("erasure preview scans complete state and providers read-only and returns a canonical exact inventory", async () => {
   const commands=[];
@@ -20,7 +21,7 @@ test("erasure preview scans complete state and providers read-only and returns a
   }};
   const clients={
     todoist:{getTask:async id=>({id,project_id:"test-home-project",content:"private title"}),
-      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+      listProjectComments:async()=>[{id:"project-comment",content:serializeMappingComment({profile:"home",taskId:"task-123",eventId:"event-123",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")}],listTaskComments:async()=>[]},
     calendar:{getEvent:async()=>{throw Object.assign(new Error("missing"),{status:404});},
       findByTodoistTaskId:async()=>undefined},
   };
@@ -63,7 +64,7 @@ test("strong state scan rejects a repeated pagination cursor instead of acceptin
       :{pk:"AUDIT#home#second",sk:"STATE",detail:"new row"}],LastEvaluatedKey:cursor};
   }};
   const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
-      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+      listProjectComments:async()=>[{id:"project-comment",content:serializeMappingComment({profile:"home",taskId:"task-123",eventId:"event-123",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")}],listTaskComments:async()=>[]},
     calendar:{getEvent:async()=>undefined,findByTodoistTaskId:async()=>undefined}};
   await assert.rejects(buildErasurePreview({profile:"home",taskId:"task-123",deleteCalendar:false},
     {db,clients,inspectFence:async()=>({leases:[]})}),/repeated a pagination cursor/);
@@ -114,7 +115,7 @@ test("deletion preview captures profile and Calendar-scoped event aliases before
     :{}};
   const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
   const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
-      listProjectComments:async()=>[],listTaskComments:async()=>[]},
+      listProjectComments:async()=>[{id:"project-comment",content:serializeMappingComment({profile:"home",taskId:"task-123",eventId:"event-123",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")}],listTaskComments:async()=>[]},
     calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
   const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
     {db,clients,inspectFence:async()=>({leases:[]})});

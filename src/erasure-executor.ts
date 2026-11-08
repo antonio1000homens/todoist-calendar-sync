@@ -4,8 +4,8 @@ import { erasureExecutionEnabled } from "./erasure-readiness.js";
 import { GetCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
-import {atomicConfirmedErasureCompletion,assertConfirmedErasureReplayAdmission,
-  ErasureReplayBlockedError,ErasureReplayUnavailableError,verifyConfirmedErasureCompletion} from "./erasure-replay-barrier.js";
+import {atomicConfirmedErasureCompletion,ErasureReplayUnavailableError,
+  verifyConfirmedErasureCompletion} from "./erasure-replay-barrier.js";
 
 export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure" | "review_required";
 export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "drain_before_fence"
@@ -66,6 +66,8 @@ export interface ErasureActionPlan {
   /** Exact event aliases captured before mutation, scoped by profile and Calendar. */
   knownCalendarAliases?:Array<{profile:Profile;calendarId:string;eventId:string}>;
   knownCalendarAliasesComplete?:boolean;
+  /** Exact project comments that must be converted to temporary deletion markers before release. */
+  projectCommentIds?:string[];
   comments: Array<{ id: string; kind: "project" | "task"; digest: string }>;
 }
 export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
@@ -162,6 +164,7 @@ function confirmedCompletionProof(operation:ErasureOperation,epoch:number) {
     calendarId:operation.actionPlan.calendarEvent?.calendarId,
     knownCalendarAliases:operation.actionPlan.knownCalendarAliases,
     knownCalendarAliasesComplete:operation.actionPlan.knownCalendarAliasesComplete,
+    projectCommentIds:operation.actionPlan.projectCommentIds,
     confirmationId:operation.confirmationId,previewFingerprint:operation.previewFingerprint,epoch};
 }
 const defaultFencePollMs=5_000;
@@ -308,13 +311,6 @@ export class ErasureOperationStore {
     const storedEpoch=epochResult.Item?.epoch;
     if(storedEpoch!==undefined&&(!Number.isSafeInteger(storedEpoch)||storedEpoch<0))
       throw new ErasureGateDriftError();
-    const nextEpoch=(storedEpoch??0)+1;
-    try {await assertConfirmedErasureReplayAdmission(confirmedCompletionProof(current,nextEpoch),this.db);}
-    catch(error) {
-      if(error instanceof ErasureReplayUnavailableError)throw error;
-      if(error instanceof ErasureReplayBlockedError)throw new ErasureGateDriftError();
-      throw error;
-    }
     const mappings=await this.#worker().listWorkerMappings();
     if(!mappings.length || mappings.some(item=>!item.id || !["Enabled","Disabled"].includes(item.state)
       || !item.eventSourceArn.includes(":sqs:")) || new Set(mappings.map(item=>item.id)).size!==mappings.length)
@@ -495,12 +491,8 @@ export class ErasureOperationStore {
       Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},ConsistentRead:true}));
     const epoch=epochResult.Item?.epoch;
     if(typeof epoch!=="number"||!Number.isSafeInteger(epoch)||epoch<1)throw new ErasureGateDriftError();
-    try {await assertConfirmedErasureReplayAdmission(confirmedCompletionProof(operation,epoch),this.db);}
-    catch(error) {
-      if(error instanceof ErasureReplayUnavailableError)throw error;
-      if(error instanceof ErasureReplayBlockedError)throw new ErasureGateDriftError();
-      throw error;
-    }
+    if(!operation.actionPlan.projectCommentIds?.length)
+      throw new ErasureGateDriftError();
   }
 
   /** Stop a fenced operation durably when its action-time deletion gate has drifted. */
