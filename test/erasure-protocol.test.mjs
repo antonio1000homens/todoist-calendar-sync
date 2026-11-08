@@ -282,10 +282,30 @@ test("failed erased-item suppression audit cannot create an identity-bearing inc
 
 test("project-comment tombstone suppresses deleted Todoist webhooks before manual review or DynamoDB writes",async t=>{
   const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,
-    googlePrefix:process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX,todoistPrefix:process.env.TODOIST_TOKEN_PARAMETER_PREFIX};
-  process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+    table:process.env.STATE_TABLE_NAME,googlePrefix:process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX,
+    todoistPrefix:process.env.TODOIST_TOKEN_PARAMETER_PREFIX};
+  process.env.ERASURE_PROTOCOL_VERSION="1";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.STATE_TABLE_NAME="test-tombstone-state";
   process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX="/test/tombstone-google";
   process.env.TODOIST_TOKEN_PARAMETER_PREFIX="/test/tombstone-todoist";
+  const originalSend=documentClient.send;
+  let writerLeaseHeld=false;
+  documentClient.send=async command=>{
+    if(command.constructor.name.includes("Get")&&command.input.Key.sk==="EPOCH")return {Item:{epoch:0}};
+    if(command.constructor.name.includes("TransactWrite")){
+      const items=command.input.TransactItems||[];
+      assert.ok(items.some(item=>item.ConditionCheck?.Key?.sk==="FENCE"));
+      assert.ok(items.some(item=>item.Put?.Item?.kind==="writer"));
+      writerLeaseHeld=true;
+      return {};
+    }
+    if(command.constructor.name.includes("Delete")&&command.input.Key.sk.startsWith("WRITER#")){
+      assert.equal(writerLeaseHeld,true,"the profile lease remains held through tombstone suppression");
+      writerLeaseHeld=false;
+      return {};
+    }
+    throw new Error(`Unexpected state access in tombstone worker test: ${command.constructor.name}`);
+  };
   t.mock.method(SSMClient.prototype,"send",async command=>{
     if(command.input.Name==="/test/tombstone-google/home")
       return {Parameter:{Value:JSON.stringify({client_id:"test",client_secret:"test",refresh_token:"test"})}};
@@ -297,9 +317,10 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
   const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
     taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt,
     expiresAt:projectDeletionTombstoneExpiry(createdAt)});
-  t.mock.method(Todoist.prototype,"listProjectComments",async()=>[
-    {id:"tombstone-comment",project_id:projectId,content},
-  ]);
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>{
+    assert.equal(writerLeaseHeld,true,"fresh tombstone lookup must be serialized under the writer lease");
+    return [{id:"tombstone-comment",project_id:projectId,content}];
+  });
   const audits=t.mock.method(StateRepository.prototype,"audit",async()=>{});
   const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
   const manual=t.mock.method(ManualInterventionService.prototype,"interceptTodoistDeletion",async()=>{
@@ -309,8 +330,10 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
     throw new Error("synchronizer must not run for an active tombstone");
   });
   t.after(()=>{
+    documentClient.send=originalSend;
     if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
     if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+    if(previous.table===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=previous.table;
     if(previous.googlePrefix===undefined)delete process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX;else process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX=previous.googlePrefix;
     if(previous.todoistPrefix===undefined)delete process.env.TODOIST_TOKEN_PARAMETER_PREFIX;else process.env.TODOIST_TOKEN_PARAMETER_PREFIX=previous.todoistPrefix;
   });
@@ -325,6 +348,7 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
   assert.equal(completed.mock.callCount(),0);
   assert.equal(manual.mock.callCount(),0);
   assert.equal(syncProcess.mock.callCount(),0);
+  assert.equal(writerLeaseHeld,false,"the writer lease is released after the delivery is suppressed");
 });
 
 test("tombstone lookup failure retries without writing task identity or review state",async t=>{
