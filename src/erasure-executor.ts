@@ -395,11 +395,20 @@ export class ErasureOperationStore {
         }
       }
     } catch(error) {
-      if(error instanceof ErasureGateDriftError) {
+      // Once provider deletion has been attempted, even a transient-looking
+      // failure may mean the remote mutation succeeded but its response was
+      // lost. Never retry the same destructive step from an old checkpoint.
+      // Persist an actionable, fenced review state instead of silently
+      // rescheduling. Ordinary pre-deletion and mapping-restore polling keep
+      // their existing retry behaviour.
+      const ambiguousProviderWrite=operation.status==="deleting"
+        &&(current.phase==="delete"||current.phase==="verify_deletion");
+      if(error instanceof ErasureGateDriftError||ambiguousProviderWrite) {
         next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
         nextStatus="review_required";
       } else {
-      next={...current,nextRunAt:now+current.pollMs,lastError:error instanceof Error?error.message:String(error)};
+        next={...current,nextRunAt:now+current.pollMs,
+          lastError:error instanceof Error?error.message:String(error)};
       }
     }
     await this.#persistLifecycle(operation,next,nextStatus,now);
@@ -498,7 +507,13 @@ export class ErasureOperationStore {
   async #persistLifecycle(operation: ErasureOperation, candidate: FencedLifecycle,
     nextStatus: ErasureOperationStatus, now: number): Promise<void> {
     const current=operation.lifecycle;
-    if(!current || !lifecyclePhaseEdges[current.phase].includes(candidate.phase)
+    // Verification previously had no same-phase edge. Permit it ONLY when
+    // an ambiguous provider readback permanently transitions to manual review.
+    // Do not allow an ordinary verify_deletion polling/retry loop.
+    const terminalVerifyReview=current?.phase==="verify_deletion"
+      &&candidate.phase==="verify_deletion"&&operation.status==="deleting"
+      &&nextStatus==="review_required";
+    if(!current || (!lifecyclePhaseEdges[current.phase].includes(candidate.phase)&&!terminalVerifyReview)
       || JSON.stringify(current.mappingIds)!==JSON.stringify(candidate.mappingIds)
       || JSON.stringify(current.enabledMappingIds)!==JSON.stringify(candidate.enabledMappingIds)
       || current.timeoutSeconds!==candidate.timeoutSeconds || current.pollMs!==candidate.pollMs)
