@@ -318,6 +318,7 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
       schemaVersion:1,operationId:proof.operationId,profile:proof.identity.profile,epoch:proof.epoch,
       state:"pending",mappingIds:workerMappings.mappingIds,
       enabledMappingIds:workerMappings.enabledMappingIds,mappingFingerprint:workerMappings.fingerprint,
+      markerKeyId:ring.current,
       createdAt:proof.reviewedAt},ConditionExpression:"attribute_not_exists(pk)"}},
     {ConditionCheck:{TableName:table,Key:profileKey("EPOCH"),
       ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":proof.epoch}}},
@@ -335,6 +336,62 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
   // partially committed batch or release a fence in multiple requests.
   if(tx.length>100)throw new ErasureReplayUnavailableError("Replay release exceeds the atomic transaction limit");
   return new TransactWriteCommand({TransactItems:tx});
+}
+
+/**
+ * Resolve an ambiguous TransactWrite acknowledgement without repeating the
+ * release. Every read is strongly consistent. `true` means the complete
+ * marker/restore/fence transaction committed; partial evidence is never
+ * accepted as success. This deliberately does not repair or mutate state.
+ */
+export async function verifyAtomicReplayRelease(proof:PostWriteReleaseProof,db:Db=documentClient):Promise<boolean> {
+  const command=atomicReplayRelease(proof);
+  const tx=command.input.TransactItems||[];
+  const table=tableName();
+  const keys=tx.flatMap(action=>{
+    const item=action.Put?.Item||action.Delete?.Key||action.ConditionCheck?.Key;
+    if(action.Put?.Item?.pk?.startsWith("ERASURE_REPLAY#"))return [];
+    return item?[{pk:String(item.pk),sk:String(item.sk)}]:[];
+  });
+  // The transaction may have committed immediately before a key rotation.
+  // Read its signing key ID from the atomic restore receipt, then verify only
+  // that complete key generation instead of probing every historical key.
+  const unique=[...new Map(keys.map(key=>[`${key.pk}\0${key.sk}`,key])).values()];
+  const rows=new Map<string,Record<string,unknown>>();
+  for(const key of unique) {
+    let result;
+    try { result=await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true})); }
+    catch { throw new ErasureReplayUnavailableError("Atomic replay release readback is unavailable"); }
+    if(result.Item)rows.set(`${key.pk}\0${key.sk}`,result.Item as Record<string,unknown>);
+  }
+  const restoreKey=`ERASURE_POSTWRITE_RESTORE#${proof.operationId}\0STATE`;
+  const restore=rows.get(restoreKey);
+  const manifest=postWriteWorkerMappingManifest(proof.workerMappings);
+  if(!restore||restore.operationId!==proof.operationId||restore.profile!==proof.identity.profile
+    ||restore.epoch!==proof.epoch||restore.mappingFingerprint!==manifest.fingerprint
+    ||JSON.stringify(restore.mappingIds)!==JSON.stringify(manifest.mappingIds)
+    ||JSON.stringify(restore.enabledMappingIds)!==JSON.stringify(manifest.enabledMappingIds)
+    ||!(restore.state==="pending"||restore.state==="complete")
+    ||typeof restore.markerKeyId!=="string")return false;
+  const signingKey=keyRing().keys.get(restore.markerKeyId);
+  if(!signingKey)return false;
+  const markerKeys:ReplayKey[]=REPLAY_PROFILES.map(profile=>
+    marker(profile,"TASK",proof.identity.taskId!,restore.markerKeyId as string,signingKey));
+  for(const alias of validatedPostWriteAliases(proof))
+    markerKeys.push(marker(alias.profile,"EVENT",alias.eventId,restore.markerKeyId as string,signingKey));
+  for(const key of markerKeys) {
+    let result;
+    try { result=await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true})); }
+    catch { throw new ErasureReplayUnavailableError("Atomic replay marker readback is unavailable"); }
+    if((result.Item as Record<string,unknown>|undefined)?.markerVersion!==1)return false;
+  }
+  const absent=[`ERASURE_OPERATION#${proof.operationId}\0STATE`,
+    `ERASURE_POSTWRITE_CONFIRMATION#${proof.operationId}\0STATE`,
+    `ERASURE#${proof.identity.profile}\0FENCE`];
+  if(proof.journalPresent)absent.push(`ERASURE#${proof.identity.profile}\0JOURNAL`);
+  if(absent.some(key=>rows.has(key)))return false;
+  const epoch=rows.get(`ERASURE#${proof.identity.profile}\0EPOCH`);
+  return epoch?.epoch===proof.epoch;
 }
 
 
