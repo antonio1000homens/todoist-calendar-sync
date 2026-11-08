@@ -3,6 +3,7 @@ import { GetEventSourceMappingCommand, GetFunctionConfigurationCommand, LambdaCl
   ListEventSourceMappingsCommand, UpdateEventSourceMappingCommand } from "@aws-sdk/client-lambda";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
+import {ErasureReplayBlockedError,ErasureReplayUnavailableError} from "./erasure-replay-barrier.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
 import { enqueueErasureOperation, enqueueErasureRecovery } from "./erasure-queue.js";
 import { ErasureRecoveryService } from "./erasure-recovery.js";
@@ -145,7 +146,14 @@ export async function processErasureOperation(operationId: string): Promise<{
     const target=await lambda.send(new GetFunctionConfigurationCommand({FunctionName:targetWorkerFunction()}));
     const timeoutSeconds=Number(target.Timeout);
     if(!Number.isInteger(timeoutSeconds)||timeoutSeconds<1) throw new Error("Target worker timeout could not be verified");
-    await store.startFencedLifecycle(operationId,timeoutSeconds);
+    try {await store.startFencedLifecycle(operationId,timeoutSeconds);}
+    catch(error) {
+      if(!(error instanceof ErasureReplayUnavailableError)&&!(error instanceof ErasureReplayBlockedError))throw error;
+      await store.markQueuedReplayBlocked(operationId);
+      console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",event:"operation_step",
+        operationId,status:"review_required",phase:"queued",scheduled:false}));
+      return {status:"review_required",phase:"queued",scheduled:false};
+    }
     await enqueueErasureOperation(operationId);
     return {status:"fencing",phase:"disable_mappings",scheduled:true};
   }
@@ -156,7 +164,7 @@ export async function processErasureOperation(operationId: string): Promise<{
   if(operation.lifecycle.phase==="ready_for_delete") {
     try { await store.beginDeletion(operationId); }
     catch(error) {
-      if(!(error instanceof ErasureGateDriftError)) throw error;
+      if(!(error instanceof ErasureGateDriftError)&&!(error instanceof ErasureReplayUnavailableError)) throw error;
       await store.markReviewRequired(operationId);
       return {status:"review_required",phase:operation.lifecycle.phase,scheduled:false};
     }
@@ -169,7 +177,7 @@ export async function processErasureOperation(operationId: string): Promise<{
   if(result.phase==="ready_for_delete") {
     try { await store.beginDeletion(operationId); }
     catch(error) {
-      if(!(error instanceof ErasureGateDriftError)) throw error;
+      if(!(error instanceof ErasureGateDriftError)&&!(error instanceof ErasureReplayUnavailableError)) throw error;
       await store.markReviewRequired(operationId);
       return {status:"review_required",phase:result.phase,scheduled:false};
     }

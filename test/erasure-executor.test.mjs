@@ -12,10 +12,17 @@ const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
 const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
   let item=seed;
+  const markers=new Set();
   const calls=[];
-  return {calls,get item(){return item;},async send(command){
+  return {calls,get item(){return item;},set item(value){item=value;},markers,async send(command){
     calls.push(command);
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.pk.startsWith("ERASURE_REPLAY#"))return {Item:markers.has(`${key.pk}\0${key.sk}`)?{markerVersion:1}:undefined};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
       const nextStatus=values[":next"]??values[":fencing"];
@@ -28,7 +35,7 @@ function memoryDb(seed){
 }
 function storedQueuedOperation(){
   const digest=erasurePreviewFingerprint(preview);
-  return {...preview,operationId:"op",previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"one-time",
+  return {...preview,operationId:"op",previewFingerprint:digest,confirmationFingerprint:digest,confirmationId:"11111111-1111-4111-8111-111111111111",
     providerDeletionReady:true,status:"queued",createdAt:"now",updatedAt:"now"};
 }
 
@@ -71,6 +78,26 @@ test("deletion gate drift is persisted as review-required with a CAS and cannot 
     await assert.rejects(store.markReviewRequired("op"),/no longer at the deletion review gate/);
     assert.equal(calls.filter(command=>command.constructor.name.includes("Update")).length,1);
   }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
+});
+
+test("queued replay-readiness failure records review without creating a lifecycle or fence",async()=>{
+  const prior=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const item={...storedQueuedOperation()},calls=[];
+  const db={async send(command){calls.push(command);
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      assert.match(command.input.ConditionExpression,/attribute_not_exists\(lifecycle\)/);
+      const values=command.input.ExpressionAttributeValues;
+      item.status=values[":reviewRequired"];item.error=values[":error"];
+      return {};
+    }
+    throw new Error("Unexpected database command");
+  }};
+  try{
+    await new ErasureOperationStore(db).markQueuedReplayBlocked("op");
+    assert.equal(item.status,"review_required");assert.equal(item.lifecycle,undefined);
+    assert.equal(calls.filter(command=>command.constructor.name.includes("Update")).length,1);
+  }finally{if(prior===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=prior;}
 });
 
 test("revoked readiness stops active lifecycle work and retains its fence for break-glass review",async()=>{
@@ -179,6 +206,11 @@ test("fence and journal are retained until mapping restoration completes",async(
 });
 
 test("worker adapters are bound at construction and request arguments cannot replace lifecycle evidence",async()=>{
+  const prior={barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,protocol:process.env.ERASURE_PROTOCOL_VERSION,
+    keys:process.env.ERASURE_REPLAY_HMAC_KEYS,current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="1";process.env.ERASURE_PROTOCOL_VERSION="1";
+  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="current";
+  process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({current:Buffer.alloc(32,1).toString("base64")});
   let now=10_000,leases=[{id:"writer"}],fence,failDisable=true,failRestore=true,failSaveAfterRelease=true;
   const states=new Map([["uuid-enabled","Enabled"],["uuid-disabled","Enabled"]]),events=[];
   const db=memoryDb(storedQueuedOperation());
@@ -275,9 +307,19 @@ test("worker adapters are bound at construction and request arguments cannot rep
     now=db.item.lifecycle.nextRunAt;assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"confirm_restored");
     assert.equal((await store.advanceFencedLifecycle("op",attacker)).phase,"release_fence");
     db.send=async command=>{
-      if(command.constructor.name.includes("Get"))return {Item:db.item};
+      if(command.constructor.name.includes("Get")){
+        const key=command.input.Key;
+        if(key.sk==="EPOCH")return {Item:{epoch:7}};
+        if(key.pk.startsWith("ERASURE_REPLAY#"))return {Item:db.markers.has(`${key.pk}\0${key.sk}`)?{markerVersion:1}:undefined};
+        if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:db.item};
+        return {Item:undefined};
+      }
       if(command.constructor.name.includes("TransactWrite")&&failSaveAfterRelease){
-        failSaveAfterRelease=false;throw new Error("simulated process crash before atomic operation cleanup");
+        failSaveAfterRelease=false;
+        for(const item of command.input.TransactItems)if(item.Put?.Item?.pk.startsWith("ERASURE_REPLAY#"))
+          db.markers.add(`${item.Put.Item.pk}\0${item.Put.Item.sk}`);
+        db.item=undefined;
+        throw new Error("simulated lost acknowledgement after atomic commit");
       }
       if(command.constructor.name.includes("Update")){
         const values=command.input.ExpressionAttributeValues;
@@ -286,14 +328,14 @@ test("worker adapters are bound at construction and request arguments cannot rep
       return {};
     };
     result=await store.advanceFencedLifecycle("op",attacker);
-    assert.equal(result.phase,"release_fence");
-    assert.match(db.item.lifecycle.lastError,/simulated process crash/);
-    assert.equal(db.item.lifecycle.phase,"release_fence","failed atomic cleanup leaves durable phase unchanged");
-    now=db.item.lifecycle.nextRunAt;result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"complete");assert.equal(result.status,"succeeded");
+    assert.equal(db.markers.size,3,"the lost transaction acknowledgement is resolved only after all task markers are visible");
     assert.equal(events.filter(event=>event[0]==="finish").length,0,"the fence is removed atomically with operation cleanup");
     assert.ok(!events.some(event=>event[0]==="delete"),"provider deletion is delegated to the bound deletion adapter");
-  }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;}
+  }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;
+    for(const [key,value] of Object.entries({ERASURE_REPLAY_BARRIER_VERSION:prior.barrier,ERASURE_PROTOCOL_VERSION:prior.protocol,
+      ERASURE_REPLAY_HMAC_KEYS:prior.keys,ERASURE_REPLAY_HMAC_CURRENT_KEY:prior.current}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;}
 });
 
 test("trusted class-based worker adapters retain their instance state after binding",async()=>{
@@ -316,12 +358,21 @@ test("trusted class-based worker adapters retain their instance state after bind
   }
   const adapters=new StatefulWorkerAdapters();
   const store=new ErasureOperationStore(db,()=>"unused",adapters);
-  const old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const old={table:process.env.STATE_TABLE_NAME,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
+    current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
+  process.env.STATE_TABLE_NAME="test-state";process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  process.env.ERASURE_PROTOCOL_VERSION="1";process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="current";
+  process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({current:Buffer.alloc(32,1).toString("base64")});
   try{
     await store.startFencedLifecycle("op",30);
     assert.equal(adapters.listCalls,1,"the original class instance supplies its own state");
     assert.deepEqual(db.item.lifecycle.mappingIds,["worker-uuid"]);
-  }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
+  }finally{
+    for(const [key,value] of Object.entries({STATE_TABLE_NAME:old.table,ERASURE_REPLAY_BARRIER_VERSION:old.barrier,
+      ERASURE_PROTOCOL_VERSION:old.protocol,ERASURE_REPLAY_HMAC_KEYS:old.keys,ERASURE_REPLAY_HMAC_CURRENT_KEY:old.current}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }
 });
 
 test("trusted clock controls confirmation issue and consume; caller timestamps cannot replay expiration",async()=>{

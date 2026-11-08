@@ -4,6 +4,7 @@ import { LambdaClient } from "@aws-sdk/client-lambda";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore } from "../dist/erasure-executor.js";
+import {ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 import { handler, parseErasureQueueRecord } from "../dist/erasure-worker.js";
 
 // The existing worker integration cases exercise an explicitly approved deployment.
@@ -45,6 +46,29 @@ test("worker starts only a stored queued operation and self-dispatches its ident
     if (old.queue === undefined) delete process.env.ERASURE_OPERATION_QUEUE_URL; else process.env.ERASURE_OPERATION_QUEUE_URL = old.queue;
     if (old.target === undefined) delete process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME; else process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME = old.target;
   }
+});
+
+test("queued erasure with unavailable replay readiness is reviewed before mapping changes or queueing",async t=>{
+  const oldTarget=process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME;
+  const operation={operationId:"op_no_replay",status:"queued",providerDeletionReady:true};
+  let started=0,reviewed=0,queued=0;
+  process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME="sync-worker";
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>operation);
+  t.mock.method(ErasureOperationStore.prototype,"startFencedLifecycle",async()=>{
+    started++;throw new ErasureReplayUnavailableError("Replay keyring is not configured");
+  });
+  t.mock.method(ErasureOperationStore.prototype,"markQueuedReplayBlocked",async()=>{
+    reviewed++;operation.status="review_required";
+  });
+  t.mock.method(LambdaClient.prototype,"send",async()=>({Timeout:300}));
+  t.mock.method(SQSClient.prototype,"send",async()=>{queued++;return {};});
+  try{
+    const result=await handler({Records:[record('{"version":1,"operationId":"op_no_replay"}')],awsRequestId:"req"});
+    assert.deepEqual(result,{batchItemFailures:[]});
+    assert.equal(started,1);assert.equal(reviewed,1);assert.equal(queued,0);
+    assert.equal(operation.status,"review_required");
+  }finally{if(oldTarget===undefined)delete process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME;
+    else process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME=oldTarget;}
 });
 
 test("preview-only operations cannot enter the queue or install a fence", async t => {
@@ -136,6 +160,25 @@ test("failed action-time gate becomes durable review-required state and cannot b
   assert.deepEqual(duplicate,{batchItemFailures:[]});
   assert.equal(gateReads,1,"a duplicate delivery cannot retry a stale deletion gate");
   assert.equal(reviewMarks,1);
+});
+
+test("missing replay-marker readiness quarantines before provider deletion and queue continuation",async t=>{
+  let operation={operationId:"op_no_replay",status:"deleting",providerDeletionReady:true,
+    lifecycle:{phase:"ready_for_delete",nextRunAt:Date.now()}};
+  let reviewMarks=0,queued=0;
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>operation);
+  t.mock.method(ErasureOperationStore.prototype,"beginDeletion",async()=>{
+    throw new ErasureReplayUnavailableError("HMAC replay gate is unavailable");
+  });
+  t.mock.method(ErasureOperationStore.prototype,"markReviewRequired",async()=>{
+    reviewMarks++;operation={...operation,status:"review_required"};
+  });
+  t.mock.method(SQSClient.prototype,"send",async()=>{queued++;return {};});
+  const result=await handler({Records:[record('{"version":1,"operationId":"op_no_replay"}')],awsRequestId:"req"});
+  assert.deepEqual(result,{batchItemFailures:[]});
+  assert.equal(reviewMarks,1);
+  assert.equal(queued,0);
+  assert.equal(operation.status,"review_required");
 });
 
 test("transient action-time gate read failures are retried instead of marked review-required", async t => {
