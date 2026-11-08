@@ -121,7 +121,7 @@ test("Calendar-sourced Todoist creation checks the event and master aliases befo
   await clients.todoist.upsertTask({content:"new task"},undefined,source);
   await clients.todoist.createTaskOnce({content:"idempotent new task"},"request-not-task-id",source);
   assert.equal(called.length,2);
-  assert.equal(reads.length,4);
+  assert.equal(reads.length,8,"each alias checks calendar-scoped and legacy markers across both signing keys");
   assert.ok(reads.every(item=>item.pk==="ERASURE_REPLAY#work"&&item.sk.startsWith("EVENT#")));
   assert.deepEqual(called[0].slice(1),[{content:"new task"},undefined,source]);
   assert.deepEqual(called[1].slice(1),[{content:"idempotent new task"},"request-not-task-id",source]);

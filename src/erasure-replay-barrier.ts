@@ -8,6 +8,7 @@ import {createHash,createHmac} from "node:crypto";
 import {GetCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import type {Profile} from "./types.js";
+import {profiles} from "./config.js";
 import { assertRetirementAdmissionIfEnabled } from "./recurrence-retirement-disposition.js";
 import type {OrphanDeletionOperation} from "./orphan-deletion-executor.js";
 
@@ -21,6 +22,7 @@ type Db = Pick<DynamoDBDocumentClient,"send">;
 type ReplayKey = {pk:string;sk:string};
 type KeyRing = {current:string;keys:Map<string,Buffer>};
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
+const CALENDAR_ID=/^[^\u0000-\u001f\u007f]{1,1024}$/;
 const KEY_ID=/^[A-Za-z0-9_-]{1,32}$/;
 const MAX_EVENT_ALIASES=32;
 const MAX_POSTWRITE_WORKER_MAPPINGS=100;
@@ -72,17 +74,33 @@ function validate(identity:ReplayIdentity):void {
     ||new Set(identity.eventIds||[]).size!==(identity.eventIds?.length||0))
     throw new ErasureReplayUnavailableError("Unresolved or malformed identity; replay admission refused");
 }
-function marker(profile:Profile,kind:"TASK"|"EVENT",id:string,keyId:string,secret:Buffer):ReplayKey {
+function marker(profile:Profile,kind:"TASK"|"EVENT",id:string,keyId:string,secret:Buffer,
+  calendarId?:string):ReplayKey {
   // Domain separation prevents a task/event cross-type collision. IDs are never stored or logged.
+  if(kind==="EVENT"&&(!calendarId||!CALENDAR_ID.test(calendarId)))
+    throw new ErasureReplayUnavailableError("Calendar-scoped replay identity is required");
   const digest=createHmac("sha256",secret)
-    .update(JSON.stringify(["erasure-replay-v1",profile,kind,id])).digest("hex");
+    .update(JSON.stringify(kind==="EVENT"
+      ?["erasure-replay-v2",profile,kind,calendarId,id]
+      :["erasure-replay-v1",profile,kind,id])).digest("hex");
   return {pk:`ERASURE_REPLAY#${profile}`,sk:`${kind}#${keyId}#${digest}`};
+}
+function legacyEventMarker(profile:Profile,id:string,keyId:string,secret:Buffer):ReplayKey {
+  const digest=createHmac("sha256",secret)
+    .update(JSON.stringify(["erasure-replay-v1",profile,"EVENT",id])).digest("hex");
+  return {pk:`ERASURE_REPLAY#${profile}`,sk:`EVENT#${keyId}#${digest}`};
 }
 function checkKeys(identity:ReplayIdentity,ring:KeyRing):ReplayKey[] {
   const keys:ReplayKey[]=[];
   for(const [kid,secret] of ring.keys) {
     if(identity.taskId)keys.push(marker(identity.profile,"TASK",identity.taskId,kid,secret));
-    for(const eventId of identity.eventIds||[])keys.push(marker(identity.profile,"EVENT",eventId,kid,secret));
+    for(const eventId of identity.eventIds||[]) {
+      const calendarId=profiles[identity.profile].calendarId;
+      keys.push(marker(identity.profile,"EVENT",eventId,kid,secret,calendarId));
+      // Read pre-calendar-scope markers as a compatibility guard. New releases
+      // only write the calendar-scoped v2 key.
+      keys.push(legacyEventMarker(identity.profile,eventId,kid,secret));
+    }
   }
   return keys;
 }
@@ -161,10 +179,10 @@ export type PostWriteReleaseProof = {
   /** The original atomic review timestamp also becomes operation.updatedAt. */
   reviewedAt:string;
   identity:ReplayIdentity & {taskId:string;eventIds:readonly string[]};
-  /** Exhaustive per-profile Calendar aliases, independently verified by a
-   * future privileged worker. Empty arrays require proof of absence, not
-   * merely missing keys. Aliases for the source profile must match eventIds. */
-  calendarAliases:Record<Profile,readonly string[]>;
+  /** Bounded set of Calendar identities explicitly recorded by this operation.
+   * Each pair must use that profile's configured Calendar ID; this is not a
+   * global per-profile inventory. Other entries are known aliases/moves only. */
+  knownCalendarAliases:readonly {profile:Profile;calendarId:string;eventId:string}[];
   /** Complete action-time SQS mapping inventory rechecked by the future
    * privileged worker. Only enabledMappingIds may be resumed; both lists are
    * retained in a separate durable retry record. */
@@ -230,34 +248,30 @@ export function completePostWriteMappingRestore(proof:PostWriteMappingRestoreCom
       ":mappingIds":manifest.mappingIds,":enabledMappingIds":manifest.enabledMappingIds}});
 }
 
-function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:Profile;eventId:string}> {
-  const aliases=proof.calendarAliases;
-  if(!aliases||typeof aliases!=="object"||Array.isArray(aliases)
-    ||Object.keys(aliases).length!==REPLAY_PROFILES.length
-    ||Object.keys(aliases).some(key=>!REPLAY_PROFILES.includes(key as Profile)))
-    throw new ErasureReplayUnavailableError("Complete Calendar alias inventory is required for every profile");
-  const all:Array<{profile:Profile;eventId:string}>=[];
-  for(const profile of REPLAY_PROFILES) {
-    const items=aliases[profile];
-    if(!Array.isArray(items)||items.length>MAX_EVENT_ALIASES
-      ||items.some(id=>typeof id!=="string"||!ID.test(id))
-      ||new Set(items).size!==items.length)
-      throw new ErasureReplayUnavailableError("Invalid Calendar replay aliases");
-    for(const eventId of items)all.push({profile,eventId});
-  }
+function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:Profile;calendarId:string;eventId:string}> {
+  const all=proof.knownCalendarAliases;
+  if(!Array.isArray(all)||all.length===0||all.length>MAX_EVENT_ALIASES
+    ||all.some(alias=>!alias||!REPLAY_PROFILES.includes(alias.profile as Profile)
+      ||typeof alias.calendarId!=="string"||!CALENDAR_ID.test(alias.calendarId)
+      ||alias.calendarId!==profiles[alias.profile as Profile]?.calendarId
+      ||typeof alias.eventId!=="string"||!ID.test(alias.eventId)))
+    throw new ErasureReplayUnavailableError("Bounded known Calendar alias set is required");
+  const identities=all.map(alias=>`${alias.profile}\0${alias.calendarId}\0${alias.eventId}`);
+  if(new Set(identities).size!==identities.length)
+    throw new ErasureReplayUnavailableError("Duplicate known Calendar replay alias");
   const selected=new Set(proof.identity.eventIds);
-  const supplied=new Set(aliases[proof.identity.profile]);
-  if(!selected.size||selected.size!==supplied.size
-    ||[...selected].some(id=>!supplied.has(id)))
-    throw new ErasureReplayUnavailableError("Selected Calendar aliases differ from the reviewed source inventory");
-  return all;
+  const supplied=new Set(all.filter(alias=>alias.profile===proof.identity.profile
+    &&alias.calendarId===profiles[proof.identity.profile].calendarId).map(alias=>alias.eventId));
+  if(!selected.size||[...selected].some(id=>!supplied.has(id)))
+    throw new ErasureReplayUnavailableError("Known Calendar aliases omit a selected source event");
+  return [...all];
 }
 
 /**
  * Construct a transaction WITHOUT EXECUTING IT. This is a staged contract;
  * the production worker must not call it before independently proving replay
  * admission on every live/qualified writer, action-time full deletion,
- * cross-profile alias completeness, privacy approval and staged failure tests.
+ * known-alias completeness, privacy approval and staged failure tests.
  *
  * No executor, API route, queue command or deployment switch currently calls
  * this function. All markers, proof removal and fence cleanup are atomic.
@@ -282,8 +296,8 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
   // scoped to their own profile to avoid blocking an unrelated calendar.
   for(const profile of REPLAY_PROFILES)
     keys.push(marker(profile,"TASK",proof.identity.taskId,ring.current,secret));
-  for(const {profile,eventId} of aliases)
-    keys.push(marker(profile,"EVENT",eventId,ring.current,secret));
+  for(const {profile,eventId,calendarId} of aliases)
+    keys.push(marker(profile,"EVENT",eventId,ring.current,secret,calendarId));
   const table=tableName();
   const profileKey=(sk:string)=>({pk:"ERASURE#"+proof.identity.profile,sk});
   const operationValues={
@@ -378,7 +392,8 @@ export async function verifyAtomicReplayRelease(proof:PostWriteReleaseProof,db:D
   const markerKeys:ReplayKey[]=REPLAY_PROFILES.map(profile=>
     marker(profile,"TASK",proof.identity.taskId!,restore.markerKeyId as string,signingKey));
   for(const alias of validatedPostWriteAliases(proof))
-    markerKeys.push(marker(alias.profile,"EVENT",alias.eventId,restore.markerKeyId as string,signingKey));
+    markerKeys.push(marker(alias.profile,"EVENT",alias.eventId,restore.markerKeyId as string,
+      signingKey,alias.calendarId));
   for(const key of markerKeys) {
     let result;
     try { result=await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true})); }
@@ -432,7 +447,7 @@ function validateOrphanIdentity(op:OrphanDeletionOperation):void {
 function orphanKeys(op:OrphanDeletionOperation,kid:string,secret:Buffer):ReplayKey[] {
   return op.side==="todoist"
     ? REPLAY_PROFILES.map(profile=>marker(profile,"TASK",op.targetId,kid,secret))
-    : [marker(op.profile,"EVENT",op.targetId,kid,secret)];
+    : [marker(op.profile,"EVENT",op.targetId,kid,secret,profiles[op.profile].calendarId)];
 }
 function orphanGuardKey(op:OrphanDeletionOperation):ReplayKey {
   return {pk:"ORPHAN_REPLAY_GUARD#"+op.id,sk:"STATE"};

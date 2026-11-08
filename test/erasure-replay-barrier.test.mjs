@@ -57,7 +57,7 @@ test("calendar IDs are profile-scoped: unrelated profile event IDs are not rejec
   await assertReplayAdmission({profile:"home",eventIds:["shared-calendar-id"]},{
     async send(command){reads.push(command.input.Key);return {};}
   });
-  assert.equal(reads.length,2);
+  assert.equal(reads.length,4,"check calendar-scoped and legacy markers for both retained keys");
   assert.ok(reads.every(row=>row.pk==="ERASURE_REPLAY#home"));
   assert.ok(reads.every(row=>row.sk.startsWith("EVENT#")));
 });
@@ -70,7 +70,8 @@ function proof(){
     originalPreviewFingerprint:"c".repeat(64),
     reviewedAt:"2026-11-03T19:40:00.000Z",
     identity:{profile:"work",taskId:"deleted-task",eventIds:["deleted-event","deleted-alias"]},
-    calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-alias"]},
+    knownCalendarAliases:[{profile:"work",calendarId:"work@example.test",eventId:"deleted-event"},
+      {profile:"work",calendarId:"work@example.test",eventId:"deleted-alias"}],
     workerMappings:{mappingIds:["11111111-1111-4111-8111-111111111111",
       "22222222-2222-4222-8222-222222222222"],enabledMappingIds:["11111111-1111-4111-8111-111111111111"]},
     journalPresent:true,
@@ -193,10 +194,14 @@ test("missing new confirmation, epoch and oversize alias set cannot construct a 
     {reviewedAt:"not-a-timestamp"},
     {confirmationId:"non-uuid-token"},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:[]}},
-    {calendarAliases:{home:[],antonio:[],work:["deleted-event"]}},
-    {calendarAliases:{home:[],work:["deleted-event","deleted-alias"]}},
-    {calendarAliases:{home:[],antonio:[],work:["deleted-event","deleted-event"]}},
-    {calendarAliases:{home:[],antonio:[],work:Array.from({length:33},(_,i)=>"event-"+i)}},
+    {knownCalendarAliases:[{profile:"work",calendarId:"work@example.test",eventId:"deleted-event"}]},
+    {knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"deleted-event"},
+      {profile:"work",calendarId:"work@example.test",eventId:"deleted-alias"}]},
+    {knownCalendarAliases:[{profile:"work",calendarId:"work@example.test",eventId:"deleted-event"},
+      {profile:"work",calendarId:"work@example.test",eventId:"deleted-event"}]},
+    {knownCalendarAliases:Array.from({length:33},(_,i)=>({profile:"work",
+      calendarId:"work@example.test",eventId:"event-"+i}))},
+    {knownCalendarAliases:proof().knownCalendarAliases.map(alias=>({...alias,calendarId:"other@example.test"}))},
     {identity:{profile:"work",taskId:"deleted-task",eventIds:Array.from({length:33},(_,i)=>"event-"+i)}},
     {workerMappings:{mappingIds:[],enabledMappingIds:["11111111-1111-4111-8111-111111111111"]}},
     {workerMappings:{mappingIds:["not-a-uuid"],enabledMappingIds:[]}},
@@ -254,16 +259,18 @@ test("release transaction matches the exact reviewed-fenced and consumed-token s
   assert.equal(sourceOperation.updatedAt,sourceOperation.postwriteReview.reviewedAt);
   assert.equal(sourceToken.status,"consumed");
 });
-test("cross-profile Calendar aliases create scoped HMAC markers without blocking unrelated event IDs",()=>{
-  const p={...proof(),calendarAliases:{
-    home:["home-recurring-master"],antonio:["antonio-moved-instance"],
-    work:["deleted-event","deleted-alias"]}};
+test("only explicitly known cross-profile Calendar aliases create scoped HMAC markers",()=>{
+  const p={...proof(),knownCalendarAliases:[
+    {profile:"home",calendarId:"home@example.test",eventId:"home-recurring-master"},
+    {profile:"antonio",calendarId:"personal@example.test",eventId:"antonio-moved-instance"},
+    {profile:"work",calendarId:"work@example.test",eventId:"deleted-event"},
+    {profile:"work",calendarId:"work@example.test",eventId:"deleted-alias"}]};
   const tx=atomicReplayRelease(p).input.TransactItems;
   const markerPuts=tx.filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).map(x=>x.Put);
   assert.equal(markerPuts.length,REPLAY_PROFILES.length+4);
   assert.equal(markerPuts.filter(x=>x.Item.sk.startsWith("EVENT#")).length,4);
   for(const profile of REPLAY_PROFILES){
-    const expected=p.calendarAliases[profile].length;
+    const expected=p.knownCalendarAliases.filter(alias=>alias.profile===profile).length;
     assert.equal(markerPuts.filter(x=>x.Item.sk.startsWith("EVENT#")
       &&x.Item.pk==="ERASURE_REPLAY#"+profile).length,expected);
   }
@@ -274,13 +281,10 @@ test("cross-profile Calendar aliases create scoped HMAC markers without blocking
   assert.equal(original.filter(x=>x.Put?.Item?.pk.startsWith("ERASURE_REPLAY#")).length,REPLAY_PROFILES.length+2,
     "unrelated calendars are not automatically marked");
 });
-test("overflow of one DynamoDB transaction refuses release instead of split batches",()=>{
+test("oversized known alias set refuses release instead of split batches",()=>{
   const p={...proof(),identity:{
     ...proof().identity,eventIds:Array.from({length:32},(_,i)=>"work-"+i)},
-    calendarAliases:{
-      home:Array.from({length:32},(_,i)=>"home-"+i),
-      antonio:Array.from({length:32},(_,i)=>"antonio-"+i),
-      work:Array.from({length:32},(_,i)=>"work-"+i),
-    }};
+    knownCalendarAliases:Array.from({length:33},(_,i)=>({profile:"work",
+      calendarId:"work@example.test",eventId:"work-"+i}))};
   assert.throws(()=>atomicReplayRelease(p),ErasureReplayUnavailableError);
 });

@@ -41,7 +41,11 @@ remain independent release gates.
   task ID, event ID, summary, timestamp, comment, journal, or operation ID.
   A deleted Todoist ID is marked in **all three configured profiles** to block
   re-admission after cross-profile moves. Calendar event markers are scoped to
-  the source profile to protect unrelated calendars.
+  explicitly recorded profile/event pairs: selected source events plus known
+  recurrence aliases or profile moves. Each event marker is scoped by profile,
+  configured Calendar ID and event ID. No empty per-profile inventory or proof
+  of unrelated-calendar absence is required; an unknown relevant alias keeps
+  the operation fenced.
 - Test cases check historical-key reads, consistent-read requirements,
   unavailable DB/keys, malformed aliases, profile scoping, and atomic
   transaction shape. They do **not** simulate the entire production replay path.
@@ -160,9 +164,10 @@ are verified.
 
 ## Remaining recovery implementation
 
-1. Build alias inventory from an independently verified fresh snapshot, including
-   recurring series/instances and cross-profile links. If any alias is unknown,
-   retain the original fence.
+1. Build the bounded set of identities explicitly recorded by the operation
+   and verify each with fresh provider reads, including recorded recurrence
+   aliases and profile moves. Do not enumerate unrelated calendars. If a
+   relevant alias is unknown or conflicting, retain the original fence.
 2. Add a **new**, typed, single-use post-write operator review state and
    confirmation that is distinct from the original delete consent and the
    pre-write `RESTORE SYNC` flow. Validate original immutable selection and
@@ -314,7 +319,7 @@ provider comments, and a closed identity walk; a 404/410 response alone never
 sets it. An oversized or
 nonconvergent identity walk remains incomplete. The result always sets
 `eligibleForPostWriteRelease:false`, has explicit blockers, and deliberately
-has no `calendarAliases` field accepted by the offline transaction
+has no `knownCalendarAliases` field accepted by the offline transaction
 constructor.
 
 These reads still do not prove historical aliases that have no provider tag,
