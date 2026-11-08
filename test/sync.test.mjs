@@ -7,6 +7,8 @@ import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
 import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { StateRepository } from "../dist/repository.js";
+import { ReviewStore } from "../dist/review-store.js";
 
 test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
@@ -656,6 +658,31 @@ test("temporary project tombstone suppresses a stale Calendar delta before Todoi
   await sync.process({id:"late-calendar-delta",kind:"calendar",profile:"home",mode:"aws",
     receivedAt:"2026-11-08T12:01:00.000Z",headers:{},body:""});
   assert.equal(creates,0);
+  assert.equal(audits.some(entry=>entry.action==="erasure_project_comment_replay_suppressed"),true);
+});
+
+test("a cancelled Calendar delta for an active project tombstone does not create deleted-conflict review state",async t=>{
+  const projectId=profiles.home.todoistProjectId;
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
+    taskId:"purged-task",eventIds:["purged-event"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z"});
+  const audits=[],tokens=[];let reviewLookups=0;
+  const originalListCases=ReviewStore.prototype.listCases;
+  ReviewStore.prototype.listCases=async()=>{reviewLookups++;return {items:[]};};
+  t.after(()=>{ReviewStore.prototype.listCases=originalListCases;});
+  const state=Object.assign(Object.create(StateRepository.prototype),{
+    async getSyncToken(){return "old-sync-token";},async putSyncToken(_profile,token){tokens.push(token);},
+    async isRetired(){return false;},async audit(profile,action,detail){audits.push({profile,action,detail});},
+  });
+  const event={id:"purged-event",status:"cancelled",summary:"deleted by sync worker"};
+  const calendar={async listDelta(token){assert.equal(token,"old-sync-token");return {items:[event],nextSyncToken:"new-sync-token"};}};
+  const todoist={async listProjectComments(id,refresh){assert.equal(id,projectId);assert.equal(refresh,true);
+    return [{id:"tombstone-comment",project_id:id,content}];}};
+  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
+  await sync.process({id:"cancelled-tombstone-delta",kind:"calendar",profile:"home",mode:"aws",
+    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},body:""});
+  assert.deepEqual(tokens,["new-sync-token"],"the safely suppressed cancellation can advance the Calendar cursor");
+  assert.equal(reviewLookups,0,"the cancellation-only review path must not persist deleted identity");
   assert.equal(audits.some(entry=>entry.action==="erasure_project_comment_replay_suppressed"),true);
 });
 
