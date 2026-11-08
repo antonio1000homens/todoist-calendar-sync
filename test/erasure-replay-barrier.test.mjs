@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  assertReplayAdmission, atomicReplayRelease, completePostWriteMappingRestore, ErasureReplayBlockedError,
+  assertReplayAdmission, atomicReplayRelease, verifyAtomicReplayRelease, completePostWriteMappingRestore, ErasureReplayBlockedError,
   ErasureReplayUnavailableError, REPLAY_PROFILES,
 } from "../dist/erasure-replay-barrier.js";
 
@@ -123,6 +123,31 @@ test("marker writes and fence release are ONE conditional transaction, with no p
   const serialized=JSON.stringify(markers);
   assert.ok(!serialized.includes("deleted-task")&&!serialized.includes("deleted-event")
     &&!serialized.includes("deleted-alias")&&!serialized.includes("operator-operation-id"));
+});
+
+test("lost atomic-release acknowledgement is accepted only after strongly consistent complete readback",async()=>{
+  const p=proof(),tx=atomicReplayRelease(p).input.TransactItems;
+  const committed=new Map();
+  for(const action of tx)if(action.Put?.Item)committed.set(`${action.Put.Item.pk}\0${action.Put.Item.sk}`,action.Put.Item);
+  committed.set("ERASURE#work\0EPOCH",{pk:"ERASURE#work",sk:"EPOCH",epoch:p.epoch});
+  const reads=[];
+  const db={async send(command){
+    assert.equal(command.constructor.name,"GetCommand");
+    assert.equal(command.input.ConsistentRead,true);
+    reads.push(command.input.Key);
+    const key=command.input.Key;
+    return {Item:committed.get(`${key.pk}\0${key.sk}`)};
+  }};
+  const currentKey=process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY;
+  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="old";
+  try { assert.equal(await verifyAtomicReplayRelease(p,db),true,"retained old signing key must verify a commit across rotation"); }
+  finally { process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY=currentKey; }
+  assert.ok(reads.length>=REPLAY_PROFILES.length+5);
+  committed.delete("ERASURE_REPLAY#work\0TASK#current#");
+  const marker=tx.find(x=>x.Put?.Item?.pk==="ERASURE_REPLAY#work");
+  committed.delete(`${marker.Put.Item.pk}\0${marker.Put.Item.sk}`);
+  assert.equal(await verifyAtomicReplayRelease(p,db),false,"partial marker evidence must not be treated as a committed release");
+  await assert.rejects(verifyAtomicReplayRelease(p,{async send(){throw new Error("read failed");}}),ErasureReplayUnavailableError);
 });
 
 test("every new erasure marker uses only the current key; historical keys remain verification-only",async()=>{
