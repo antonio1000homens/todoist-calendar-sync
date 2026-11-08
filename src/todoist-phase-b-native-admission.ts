@@ -10,9 +10,9 @@ import {
   todoistPhaseBCandidate, type TodoistPhaseBFamily,
   type TodoistPhaseBAnchor,
 } from "./todoist-calendar-phase-b.js";
-import { classifyCalendarRule, compareOccurrenceSemantics } from "./recurrence-semantics.js";
+import { classifyCalendarRule, compareOccurrenceSemantics, occurrenceDates } from "./recurrence-semantics.js";
 import { todoistRecurrenceKey } from "./todoist-recurrence.js";
-import type { TodoistTask } from "./types.js";
+import type { TodoistTask, CalendarEvent } from "./types.js";
 
 export interface TodoistPhaseBInitialEvidence {
   /** Current authenticated Todoist task after webhook admission. */
@@ -104,4 +104,78 @@ export function admitNewTodoistPhaseBNative(
 
   return { admitted: true, reason: "new_task_anchor_verified",
     family: candidate.family, rule: candidate.candidateRrule, anchor };
+}
+
+/** Provider readbacks that a future guarded writer MUST obtain independently
+ * after creating a fresh master and BEFORE committing a durable mapping.
+ * A successful Calendar HTTP POST is not acceptance evidence by itself.
+ */
+export interface TodoistPhaseBCalendarReadback {
+  master: CalendarEvent;
+  instances: CalendarEvent[];
+  explicitExceptions: CalendarEvent[];
+  /** True only when the complete explicit exception inventory was obtained. */
+  exceptionInventoryComplete: boolean;
+  /** Independently retrieved Calendar time zone, never guessed from Lambda. */
+  calendarTimeZone: string;
+}
+export interface TodoistPhaseBWriteVerification {
+  accepted: boolean;
+  reason: string;
+}
+
+/** The initial commit gate: exact Calendar readback + three consecutive
+ * originalStartTime occurrences + empty complete exception inventory.
+ * It intentionally never infers completed Todoist iterations from Calendar.
+ */
+export function verifyInitialPhaseBCalendarWrite(
+  plan: TodoistPhaseBAdmission,
+  task: TodoistTask,
+  evidence: TodoistPhaseBCalendarReadback,
+): TodoistPhaseBWriteVerification {
+  const reject = (reason: string): TodoistPhaseBWriteVerification => ({
+    accepted: false, reason,
+  });
+  if (!plan.admitted) return reject("admission_missing");
+  const { master, instances, explicitExceptions } = evidence;
+  if (!evidence.exceptionInventoryComplete || !Array.isArray(explicitExceptions)
+    || explicitExceptions.length !== 0) return reject("exception_inventory_not_empty");
+  if (!master.id || !master.etag || master.status !== "confirmed"
+    || master.recurringEventId || master.recurrence?.length !== 1
+    || !Array.isArray(instances) || instances.length < 3)
+    return reject("calendar_master_or_instances_missing");
+  const shared = master.extendedProperties?.shared;
+  if (shared?.syncRecurrenceOwner !== "todoist"
+    || shared?.taskId !== task.id
+    || shared?.todoistRecurrence !== todoistRecurrenceKey(task)
+    || shared?.todoistAnchorStart !== plan.anchor.start)
+    return reject("master_identity_or_anchor_drift");
+  // Google may omit the all-day start timezone, but the independently queried
+  // Calendar timezone and Todoist account timezone were checked on admission.
+  if (evidence.calendarTimeZone !== plan.anchor.timeZone
+    || master.start?.date !== plan.anchor.start
+    || master.start?.dateTime || master.end?.dateTime)
+    return reject("calendar_timezone_or_first_occurrence_drift");
+  const classified = classifyCalendarRule(master.recurrence[0], {
+    start: master.start.date, timeZone: evidence.calendarTimeZone,
+  });
+  const desired = todoistPhaseBCandidate(task, plan.anchor);
+  if (!classified.semantic || !desired.semantic
+    || desired.candidateRrule !== plan.rule
+    || classified.canonicalRrule !== plan.rule
+    || !compareOccurrenceSemantics(desired.semantic, classified.semantic).equivalent)
+    return reject("calendar_rrule_semantics_mismatch");
+  const expected = occurrenceDates(desired.semantic, 100);
+  const ids = new Set<string>();
+  for (let i=0; i<instances.length; i++) {
+    const instance = instances[i];
+    const logical = instance.originalStartTime?.date;
+    if (!instance.id || ids.has(instance.id) || instance.recurringEventId !== master.id
+      || instance.status !== "confirmed" || instance.recurrence?.length
+      || !logical || instance.start?.date !== logical || instance.start?.dateTime
+      || logical !== expected[i])
+      return reject("calendar_instance_sequence_or_exception_mismatch");
+    ids.add(instance.id);
+  }
+  return { accepted:true, reason:"calendar_provider_readback_verified" };
 }
