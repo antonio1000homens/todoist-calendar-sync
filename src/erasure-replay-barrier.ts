@@ -180,8 +180,11 @@ export type PostWriteReleaseProof = {
   reviewedAt:string;
   identity:ReplayIdentity & {taskId:string;eventIds:readonly string[]};
   /** Bounded set of Calendar identities explicitly recorded by this operation.
-   * Each pair must use that profile's configured Calendar ID; this is not a
-   * global per-profile inventory. Other entries are known aliases/moves only. */
+   * The selected target uses its action-time Calendar ID; other entries may
+   * name explicitly recorded historical/profile-move Calendars. This is not
+   * a global per-profile inventory. */
+  selectedEventId:string;
+  selectedCalendarId:string;
   knownCalendarAliases:readonly {profile:Profile;calendarId:string;eventId:string}[];
   /** Complete action-time SQS mapping inventory rechecked by the future
    * privileged worker. Only enabledMappingIds may be resumed; both lists are
@@ -251,9 +254,9 @@ export function completePostWriteMappingRestore(proof:PostWriteMappingRestoreCom
 function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:Profile;calendarId:string;eventId:string}> {
   const all=proof.knownCalendarAliases;
   if(!Array.isArray(all)||all.length===0||all.length>MAX_EVENT_ALIASES
+    ||typeof proof.selectedCalendarId!=="string"||!CALENDAR_ID.test(proof.selectedCalendarId)
     ||all.some(alias=>!alias||!REPLAY_PROFILES.includes(alias.profile as Profile)
       ||typeof alias.calendarId!=="string"||!CALENDAR_ID.test(alias.calendarId)
-      ||alias.calendarId!==profiles[alias.profile as Profile]?.calendarId
       ||typeof alias.eventId!=="string"||!ID.test(alias.eventId)))
     throw new ErasureReplayUnavailableError("Bounded known Calendar alias set is required");
   const identities=all.map(alias=>`${alias.profile}\0${alias.calendarId}\0${alias.eventId}`);
@@ -261,7 +264,7 @@ function validatedPostWriteAliases(proof:PostWriteReleaseProof):Array<{profile:P
     throw new ErasureReplayUnavailableError("Duplicate known Calendar replay alias");
   const selected=new Set(proof.identity.eventIds);
   const supplied=new Set(all.filter(alias=>alias.profile===proof.identity.profile
-    &&alias.calendarId===profiles[proof.identity.profile].calendarId).map(alias=>alias.eventId));
+    &&alias.calendarId===proof.selectedCalendarId).map(alias=>alias.eventId));
   if(!selected.size||[...selected].some(id=>!supplied.has(id)))
     throw new ErasureReplayUnavailableError("Known Calendar aliases omit a selected source event");
   return [...all];
@@ -286,7 +289,9 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     ||!Number.isFinite(Date.parse(proof.reviewedAt))
     ||new Date(proof.reviewedAt).toISOString()!==proof.reviewedAt
     ||typeof proof.journalPresent!=="boolean"
-    ||!proof.identity.taskId||!proof.identity.eventIds.length)
+    ||!proof.identity.taskId||!proof.identity.eventIds.length
+    ||typeof proof.selectedEventId!=="string"||!ID.test(proof.selectedEventId)
+    ||!proof.identity.eventIds.includes(proof.selectedEventId))
     throw new ErasureReplayUnavailableError("Post-write release proof is incomplete");
   const aliases=validatedPostWriteAliases(proof);
   const workerMappings=postWriteWorkerMappingManifest(proof.workerMappings);
@@ -305,6 +310,7 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     ":epoch":proof.epoch,":token":proof.confirmationId,":inspected":proof.inspectedFingerprint,
     ":postflight":proof.postflightFingerprint,":original":proof.originalPreviewFingerprint,
     ":reviewedAt":proof.reviewedAt,":profile":proof.identity.profile,":yes":true,
+    ":taskId":proof.identity.taskId,":eventId":proof.selectedEventId,":calendarId":proof.selectedCalendarId,
   };
   const tokenValues={
     ":consumed":"consumed",":mode":"post_write",":id":proof.operationId,
@@ -318,7 +324,7 @@ export function atomicReplayRelease(proof:PostWriteReleaseProof):TransactWriteCo
     // #304 atomically writes postwriteReview, NOT recovery. Check precisely
     // the saved reviewed_fenced fields and original selection before deletion.
     {Delete:{TableName:table,Key:{pk:"ERASURE_OPERATION#"+proof.operationId,sk:"STATE"},
-      ConditionExpression:"#status=:required AND profile=:profile AND postwriteReview.#status=:reviewed AND postwriteReview.mode=:mode AND postwriteReview.epoch=:epoch AND postwriteReview.confirmationId=:token AND postwriteReview.inspectedFingerprint=:inspected AND postwriteReview.postflightFingerprint=:postflight AND postwriteReview.reviewedAt=:reviewedAt AND previewFingerprint=:original AND updatedAt=:reviewedAt AND selectedActions.deleteTodoist=:yes AND selectedActions.deleteCalendar=:yes AND target.deleteCalendar=:yes AND attribute_exists(actionPlan.todoistTask) AND attribute_exists(actionPlan.calendarEvent) AND attribute_not_exists(recovery)",
+      ConditionExpression:"#status=:required AND profile=:profile AND postwriteReview.#status=:reviewed AND postwriteReview.mode=:mode AND postwriteReview.epoch=:epoch AND postwriteReview.confirmationId=:token AND postwriteReview.inspectedFingerprint=:inspected AND postwriteReview.postflightFingerprint=:postflight AND postwriteReview.reviewedAt=:reviewedAt AND previewFingerprint=:original AND updatedAt=:reviewedAt AND selectedActions.deleteTodoist=:yes AND selectedActions.deleteCalendar=:yes AND target.taskId=:taskId AND target.deleteCalendar=:yes AND target.eventId=:eventId AND attribute_exists(actionPlan.todoistTask) AND actionPlan.todoistTask.id=:taskId AND attribute_exists(actionPlan.calendarEvent) AND actionPlan.calendarEvent.id=:eventId AND actionPlan.calendarEvent.calendarId=:calendarId AND attribute_not_exists(recovery)",
       ExpressionAttributeNames:{"#status":"status"},ExpressionAttributeValues:operationValues}},
     // Consumed token (including operator field and TTL already removed) must
     // still match the exact operation, epoch and originally reviewed evidence.

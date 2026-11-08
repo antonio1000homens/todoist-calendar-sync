@@ -43,7 +43,9 @@ remain independent release gates.
   re-admission after cross-profile moves. Calendar event markers are scoped to
   explicitly recorded profile/event pairs: selected source events plus known
   recurrence aliases or profile moves. Each event marker is scoped by profile,
-  configured Calendar ID and event ID. No empty per-profile inventory or proof
+  exact recorded Calendar ID and event ID. The selected target uses its
+  action-time Calendar ID; an explicitly recorded historical or profile-move
+  alias keeps its original Calendar ID. No empty per-profile inventory or proof
   of unrelated-calendar absence is required; an unknown relevant alias keeps
   the operation fenced.
 - New deletion confirmations persist a bounded `{profile, calendarId, eventId}`
