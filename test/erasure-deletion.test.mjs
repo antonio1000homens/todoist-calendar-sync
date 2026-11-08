@@ -41,6 +41,56 @@ test("confirmed erasure replaces the project mapping comment with a readback-ver
   assert.equal(deletes,0,"the project note must remain as the temporary replay marker");
 });
 
+test("completed known-identity deletion leaves the replay identity in Todoist and removes it from DynamoDB",async()=>{
+  const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
+    updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
+  let comment={id:"project-1",project_id:"test-home-project",content:original};
+  let task={id:"task-1",project_id:"test-home-project"};
+  let event={id:"event-1",etag:"etag-approved",status:"confirmed"};
+  const row={pk:"TASK#task-1",sk:"META",taskId:"task-1",profile:"home",revision:7};
+  const rows=new Map([[`${row.pk}|${row.sk}`,row]]);
+  const todoist={
+    async getComment(id){assert.equal(id,"project-1");if(!comment)throw Object.assign(new Error("not found"),{status:404});return comment;},
+    async updateComment(id,content){assert.equal(id,"project-1");comment={...comment,content};return comment;},
+    async getTask(id){assert.equal(id,"task-1");if(!task)throw Object.assign(new Error("not found"),{status:404});return task;},
+    async deleteTask(id){assert.equal(id,"task-1");task=undefined;},
+  };
+  const calendar={
+    async getEvent(id){assert.equal(id,"event-1");if(!event)throw Object.assign(new Error("not found"),{status:404});return event;},
+    async deleteEvent(id,etag){assert.equal(id,"event-1");assert.equal(etag,"etag-approved");event={...event,status:"cancelled"};},
+  };
+  const db={async send(command){
+    const input=command.input;
+    if(command.constructor.name.includes("Get"))return {Item:rows.get(`${input.Key.pk}|${input.Key.sk}`)};
+    if(command.constructor.name.includes("Delete")){
+      const key=`${input.Key.pk}|${input.Key.sk}`;
+      const current=rows.get(key);
+      assert.ok(current,"the inventoried row is present until its deletion step");
+      rows.delete(key);
+      return {};
+    }
+    throw new Error(`Unexpected database command ${command.constructor.name}`);
+  }};
+  const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
+    selectedActions:{deleteTodoist:true,deleteCalendar:true},
+    inventory:[{type:"TASK",key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected"}],
+    actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
+      knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+      comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
+  const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({leases:[]})};
+  let progress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")};
+  while(progress.stage!=="verify"){
+    const result=await executeErasureDeletionStep(operation,progress,dependencies);
+    progress=result.progress;
+  }
+  const tombstone=parseDeletionTombstoneComment(comment);
+  assert.equal(tombstone?.taskId,"task-1");
+  assert.deepEqual(tombstone?.eventIds,["event-1"]);
+  assert.equal(task,undefined);
+  assert.equal(event.status,"cancelled");
+  assert.equal(rows.size,0,"no task-identity row remains in DynamoDB after provider deletion");
+});
+
 test("confirmed erasure cannot advance when its project tombstone comment is missing",async()=>{
   const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
     comments:[{id:"project-1",kind:"project",digest:fingerprint("mapping")}]}};
