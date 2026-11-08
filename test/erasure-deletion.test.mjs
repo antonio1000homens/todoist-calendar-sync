@@ -65,14 +65,22 @@ test("a repeated project-comment deletion step accepts only its exact tombstone 
   assert.equal(comment.id,"project-1","the existing project comment ID is preserved");
 });
 
-test("provider deletion steps leave the replay identity in Todoist and remove it from DynamoDB",async()=>{
+test("provider deletion steps leave the replay identity in Todoist and remove every inventoried identity row from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
   let comment={id:"project-1",project_id:"test-home-project",content:original};
   let task={id:"task-1",project_id:"test-home-project"};
   let event={id:"event-1",etag:"etag-approved",status:"confirmed"};
-  const row={pk:"TASK#task-1",sk:"META",taskId:"task-1",profile:"home",revision:7};
-  const rows=new Map([[`${row.pk}|${row.sk}`,row]]);
+  const identityRows=[
+    {pk:"TASK#task-1",sk:"META",taskId:"task-1",profile:"home",revision:7},
+    {pk:"TASK#home#task-1",sk:"MAPPING",taskId:"task-1",eventId:"event-1",profile:"home"},
+    {pk:"BASELINE#home#TASK#task-1",sk:"RECONCILE",taskId:"task-1",lastEventId:"event-1",profile:"home"},
+    {pk:"CANONICAL#home#calendar#event-1",sk:"EVENT",eventId:"event-1",profile:"home"},
+    {pk:"DELIVERY#task-1:event-1",sk:"COMPLETED",identityRefs:{taskIds:["task-1"],eventIds:["event-1"]}},
+    {pk:"AUDIT#home#event-1",sk:"STATE",detail:{taskId:"task-1",eventId:"event-1"}},
+  ];
+  const unrelatedRow={pk:"TASK#home#unrelated",sk:"MAPPING",taskId:"unrelated-task",eventId:"unrelated-event",profile:"home"};
+  const rows=new Map([...identityRows,unrelatedRow].map(row=>[`${row.pk}|${row.sk}`,row]));
   const todoist={
     async getComment(id){assert.equal(id,"project-1");if(!comment)throw Object.assign(new Error("not found"),{status:404});return comment;},
     async updateComment(id,content){assert.equal(id,"project-1");comment={...comment,content};return comment;},
@@ -97,7 +105,7 @@ test("provider deletion steps leave the replay identity in Todoist and remove it
   }};
   const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
     selectedActions:{deleteTodoist:true,deleteCalendar:true},
-    inventory:[{type:"TASK",key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected"}],
+    inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only"})),
     actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
       knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
       comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
@@ -112,7 +120,13 @@ test("provider deletion steps leave the replay identity in Todoist and remove it
   assert.deepEqual(tombstone?.eventIds,["event-1"]);
   assert.equal(task,undefined);
   assert.equal(event.status,"cancelled");
-  assert.equal(rows.size,0,"no task-identity row remains in DynamoDB after provider deletion");
+  assert.equal(rows.size,1,"all inventoried identity rows are removed while unrelated DynamoDB state remains");
+  assert.equal(rows.get(`${unrelatedRow.pk}|${unrelatedRow.sk}`),unrelatedRow);
+  const remainingDynamoRows=JSON.stringify([...rows.values()]);
+  assert.doesNotMatch(remainingDynamoRows,/task-1|event-1/,
+    "DynamoDB no longer contains the deleted task or Calendar event identity");
+  assert.equal(tombstone.taskId,"task-1","the bounded replay identity remains in the Todoist project comment");
+  assert.deepEqual(tombstone.eventIds,["event-1"]);
 });
 
 test("confirmed erasure cannot advance when its project tombstone comment is missing",async()=>{
