@@ -75,7 +75,18 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
     if(!item) return {progress:{...progress,stage:"todoist"},complete:false};
     try {
       const comment=await clients.todoist.getComment(item.id);
-      if(comment.id!==item.id||typeof comment.content!=="string"||fingerprint(comment.content)!==item.digest) throw new ErasureGateDriftError();
+      if(comment.id!==item.id||typeof comment.content!=="string") throw new ErasureGateDriftError();
+      // Todoist may have accepted the tombstone update even if DynamoDB did
+      // not persist this step's progress checkpoint. On redelivery, accept
+      // only the same exact comment with the same confirmed identity/aliases;
+      // all other content drift remains a hard stop.
+      if(item.kind==="project"&&parseDeletionTombstoneComment(comment)) {
+        const eventIds=(plan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+        await writeProjectDeletionTombstone(clients.todoist,{commentId:item.id,profile:operation.profile,
+          projectId:profiles[operation.profile].todoistProjectId,taskId:operation.target.taskId,eventIds});
+        return {progress:{...progress,commentIndex:progress.commentIndex+1},complete:false};
+      }
+      if(fingerprint(comment.content)!==item.digest) throw new ErasureGateDriftError();
       if(item.kind==="task") {
         validateComment(item.kind,comment.content,operation);
         await clients.todoist.deleteComment(item.id);
