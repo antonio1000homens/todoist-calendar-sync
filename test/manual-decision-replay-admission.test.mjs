@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
+import { SSMClient } from "@aws-sdk/client-ssm";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureReplayBlockedError } from "../dist/erasure-replay-barrier.js";
 import { ManualDecisionStore } from "../dist/manual-intervention.js";
+import { Todoist } from "../dist/providers.js";
 
 const secret = Buffer.alloc(32, 73);
 
@@ -22,6 +24,8 @@ function enableBarrier(t) {
   process.env.ERASURE_PROTOCOL_VERSION = "1";
   process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: secret.toString("base64") });
   process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
+  t.mock.method(SSMClient.prototype, "send", async () => ({Parameter:{Value:"test-todoist-token"}}));
+  t.mock.method(Todoist.prototype, "listProjectComments", async () => []);
   t.after(() => {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];

@@ -642,6 +642,33 @@ test("temporary project tombstone suppresses a stale Todoist webhook before task
   assert.deepEqual(audits[0].detail,{side:"todoist",event:"item:updated"});
 });
 
+test("temporary project tombstone suppresses completion lifecycle webhooks before mapping writes",async()=>{
+  const projectId=profiles.home.todoistProjectId;
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
+    taskId:"purged-task",eventIds:["purged-event"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z"});
+  for(const [eventName,isCompleted] of [["item:completed",true],["item:uncompleted",false]]) {
+    const audits=[];let taskReads=0,mappingReads=0,writes=0,commentReads=0;
+    const state={async isRetired(){return false;},async getMappingByTaskAnyProfile(){mappingReads++;},
+      async audit(profile,action,detail){audits.push({profile,action,detail});},
+      async putMapping(){writes++;},async deleteMapping(){writes++;},async putRecurrenceLink(){writes++;}};
+    const todoist={async listProjectComments(){commentReads++;return [
+      {id:"tombstone-comment",project_id:projectId,content},
+    ];},async getTask(){taskReads++;return {id:"purged-task",is_completed:isCompleted};}};
+    const sync=new Synchronizer(state,undefined,async()=>({calendar:{},todoist}));
+    await sync.process({id:`late-${eventName}`,kind:"todoist",profile:"home",mode:"aws",
+      receivedAt:"2026-11-08T12:01:00.000Z",headers:{},
+      body:JSON.stringify({event_name:eventName,event_data:{id:"purged-task",is_completed:isCompleted,
+        content:"stale",due:{date:"2026-11-20"}}})});
+    assert.equal(commentReads,1,eventName);
+    assert.equal(taskReads,0,eventName);
+    assert.equal(mappingReads,0,eventName);
+    assert.equal(writes,0,eventName);
+    assert.equal(audits.length,1,eventName);
+    assert.deepEqual(audits[0].detail,{side:"todoist",event:eventName});
+  }
+});
+
 test("temporary project tombstone suppresses a stale Calendar delta before Todoist creation",async()=>{
   const audits=[];let creates=0;
   const state={async getSyncToken(){return "sync-token";},async putSyncToken(){},

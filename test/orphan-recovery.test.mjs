@@ -7,6 +7,7 @@ import {
 } from "../dist/canonical-identity.js";
 import { profiles } from "../dist/config.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 const HOME = profiles.home.todoistProjectId;
 
@@ -178,6 +179,60 @@ function fixture({ events = [], tasks = [] } = {}) {
   const sync = new OrphanRecoveringSynchronizer(state, undefined, clients, identities);
   return { state, identities, eventMap, taskMap, calendar, todoist, calendarUpserts, todoistUpserts, sync };
 }
+
+function tombstoneComment({profile="home",taskId,eventIds=[]}) {
+  const projectId=profiles[profile].todoistProjectId;
+  const createdAt=new Date().toISOString();
+  return {id:"bounded-erasure-marker",project_id:projectId,
+    content:serializeDeletionTombstoneComment({schemaVersion:1,profile,projectId,taskId,eventIds,
+      createdAt,expiresAt:new Date(Date.parse(createdAt)+18*24*60*60*1000).toISOString()})};
+}
+
+test("Calendar orphan recovery does not rebind a retained event covered by an erasure tombstone",async()=>{
+  const event=timedEvent("erased-calendar-event","School pickup",8);
+  const matchingTask=timedTask("candidate-task","School pickup",8);
+  const f=fixture({events:[event],tasks:[matchingTask]});
+  f.todoist.listProjectComments=async()=>[tombstoneComment({taskId:"erased-task",eventIds:[event.id]})];
+
+  await f.sync.process(delivery("calendar"));
+
+  assert.equal(f.state.mappings.length,0);
+  assert.equal(f.todoistUpserts.length,0);
+  assert.equal(f.calendarUpserts.length,0);
+  assert.ok(f.state.audits.some(item=>item.action==="erasure_project_comment_replay_suppressed"
+    &&item.detail.side==="orphan_calendar"&&Object.keys(item.detail).length===1));
+});
+
+test("Todoist orphan recovery ignores a stale task covered by an erasure tombstone",async()=>{
+  const event=timedEvent("calendar-counterpart","School pickup",8);
+  const erasedTask=timedTask("erased-task","School pickup",8);
+  const f=fixture({events:[event],tasks:[erasedTask]});
+  f.todoist.listProjectComments=async()=>[tombstoneComment({taskId:erasedTask.id,eventIds:[event.id]})];
+
+  await f.sync.process(delivery("todoist",JSON.stringify({event_name:"item:updated",event_data:erasedTask})));
+
+  assert.equal(f.state.mappings.length,0);
+  assert.equal(f.todoistUpserts.length,0);
+  assert.equal(f.calendarUpserts.length,0);
+  assert.ok(f.state.audits.some(item=>item.action==="erasure_project_comment_replay_suppressed"
+    &&item.detail.side==="orphan_todoist"&&Object.keys(item.detail).length===1));
+});
+
+test("queued orphan rechecks covered by an erasure tombstone do not recreate task identity",async()=>{
+  const event=timedEvent("calendar-counterpart","School pickup",8);
+  const f=fixture({events:[event]});
+  f.todoist.listProjectComments=async()=>[tombstoneComment({taskId:"erased-task",eventIds:[event.id]})];
+  let taskReads=0;
+  f.todoist.getTask=async()=>{taskReads++;const error=new Error("not found");error.status=404;throw error;};
+
+  await f.sync.process({...delivery("orphan"),orphan:{eventId:event.id,taskId:"erased-task",attempt:2}});
+
+  assert.equal(taskReads,0,"the recheck must be suppressed before reading the stale task ID");
+  assert.equal(f.state.mappings.length,0);
+  assert.equal(f.state.mutations,0);
+  assert.ok(f.state.audits.some(item=>item.action==="erasure_project_comment_replay_suppressed"
+    &&item.detail.side==="orphan_recheck"&&Object.keys(item.detail).length===1));
+});
 
 test("historical standalone Calendar deltas bypass orphan ownership reads and preserve the sync cursor", async () => {
   const old = {

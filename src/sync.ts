@@ -1820,13 +1820,11 @@ export class Synchronizer {
     // Exact retired Todoist IDs short-circuit stale webhook replay before
     // version acceptance, active provider lookups and write-fence claims.
     if (await this.state.isRetired?.({profile:delivery.profile,taskId:task.id})) return;
-    if(lifecycle.action==="upsert"||lifecycle.action==="delete_projection") {
-      const projectCommentClient=(await this.clients(delivery.profile)).todoist;
-      const projectComments=await projectCommentClient.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
-      if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
-        projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id}))
-        return this.state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist",event:payload.event_name});
-    }
+    const projectCommentClient=(await this.clients(delivery.profile)).todoist;
+    const projectComments=await projectCommentClient.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+    if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
+      projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id}))
+      return this.state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist",event:payload.event_name});
     // Every Todoist-origin Calendar update/delete holds this task's durable
     // write fence until provider and mapping writes finish. Completion retries
     // rather than committing its immutable marker mid-mutation.

@@ -36,7 +36,7 @@ test('Calendar continuations keep increasing after mapped/unmapped chunk IDs', a
   };
   const clients = async () => ({
     calendar: { async listDelta() { return { items: Array.from({ length: 5 }, (_, i) => ({ id: `event-${i}`, status: 'cancelled' })) }; } },
-    todoist: { async listTasks() { return []; } },
+    todoist: { async listTasks() { return []; }, async listProjectComments() { return []; } },
   });
   const delivery = {
     id: 'reconcile:home:gen:chunk:3', kind: 'reconcile', profile: 'home', mode: 'aws',

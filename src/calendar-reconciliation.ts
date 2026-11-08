@@ -1,7 +1,7 @@
 import { profiles } from "./config.js";
 import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
-import { attachProjectCommentReference } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, attachProjectCommentReference } from "./mapping-comments.js";
 import {
   createBudgetedClientFactory,
   defaultProviderClientFactory,
@@ -171,6 +171,13 @@ export async function reconcileUnmappedCalendar(
   const pair = await createBudgetedClientFactory(mutationBudget, clientFactory)(profile);
   const tasks = await pair.todoist.listTasks();
   const snapshot = await pair.calendar.listDelta();
+  // Snapshot recovery can import an unmapped Calendar event after confirmed
+  // erasure deliberately removed its DynamoDB mapping. Read the bounded
+  // project-comment tombstones while the worker's profile writer lease is
+  // held so this path cannot recreate the erased Todoist task.
+  const projectComments = snapshot.items.length
+    ? await pair.todoist.listProjectComments(profiles[profile].todoistProjectId, true)
+    : [];
   const now = Date.now();
   let calendarTimeZone: string | undefined;
   if (snapshot.items.some((event) => event.end?.date && !event.end.dateTime) && pair.calendar.getTimeZone) {
@@ -185,6 +192,16 @@ export async function reconcileUnmappedCalendar(
       await state.audit(profile,"calendar_snapshot_reconcile_mutation_gate_blocked",{
         eventId,taskId,reason:"mutation_gate_closed",
       });
+      return false;
+    }
+    if (activeProjectDeletionTombstone(projectComments, {
+      profile,
+      projectId: profiles[profile].todoistProjectId,
+      ...(taskId ? { taskId } : {}),
+      ...(eventId ? { eventIds: [eventId] } : {}),
+    })) {
+      summary.skipped += 1;
+      await state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "calendar_reconciliation" });
       return false;
     }
     return true;

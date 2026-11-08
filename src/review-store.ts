@@ -7,7 +7,13 @@ import { verifyCancelledSeries } from "./verified-deletion.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
-import { assertReplayAdmissionIfEnabled, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
+import { assertReplayAdmissionIfEnabled, ErasureReplayBlockedError, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
+import { activeProjectDeletionTombstone } from "./mapping-comments.js";
+import { profiles, todoistToken } from "./config.js";
+import { Todoist } from "./providers.js";
+type ProjectCommentClientFactory = (profile: Profile) => Promise<{todoist: Pick<Todoist, "listProjectComments">}>;
+const defaultProjectCommentClientFactory: ProjectCommentClientFactory = async profile =>
+  ({todoist:new Todoist(await todoistToken(profile))});
 export function reviewTable(): string { if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required"); return process.env.STATE_TABLE_NAME; }
 export function reviewHash(value: unknown): string {
   const stable = (v: unknown): unknown => Array.isArray(v) ? v.map(stable) : v && typeof v === "object"
@@ -17,16 +23,30 @@ export function reviewHash(value: unknown): string {
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 const dismissalResolutions = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
-async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: string): Promise<void> {
-  if (taskId || eventId) await assertReplayAdmissionIfEnabled({ profile,
-    ...(taskId ? { taskId } : {}), ...(eventId ? { eventIds: [eventId] } : {}) });
+async function admitReviewIdentities(refs: Iterable<EntityRef>, clientFactory: ProjectCommentClientFactory): Promise<void> {
+  const unique = new Map<string, EntityRef>();
+  for (const ref of refs) unique.set(entityKey(ref), ref);
+  for (const ref of unique.values()) await assertReplayAdmissionIfEnabled({ profile: ref.profile,
+    ...(ref.side === "todoist" ? { taskId: ref.id } : { eventIds: [ref.id] }) });
+
+  // The bounded tombstone lives only in the Todoist project comment after
+  // successful erasure. Old review/repair decisions are another replay source,
+  // so an enabled writer protocol must consult that marker before recording or
+  // executing a decision that carries the deleted identity.
+  if (process.env.ERASURE_PROTOCOL_VERSION !== "1") return;
+  const byProfile = new Map<Profile, EntityRef[]>();
+  for (const ref of unique.values()) byProfile.set(ref.profile, [...(byProfile.get(ref.profile) || []), ref]);
+  for (const [profile, profileRefs] of byProfile) {
+    const clients = await clientFactory(profile);
+    const projectId = profiles[profile].todoistProjectId;
+    const comments = await clients.todoist.listProjectComments(projectId, true);
+    for (const ref of profileRefs) if (activeProjectDeletionTombstone(comments, {
+      profile, projectId,
+      ...(ref.side === "todoist" ? { taskId: ref.id } : { eventIds: [ref.id] }),
+    })) throw new ErasureReplayBlockedError();
+  }
 }
-async function admitEntityRef(ref: EntityRef): Promise<void> {
-  await admitReviewIdentity(ref.profile,
-    ref.side === "todoist" ? ref.id : undefined,
-    ref.side === "calendar" ? ref.id : undefined);
-}
-async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
+async function nestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<EntityRef[]> {
   const refs = new Map<string, EntityRef>();
   const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
   const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId",
@@ -67,16 +87,30 @@ async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profi
     }
   };
   collect(value,defaultProfile);
-  for (const ref of refs.values()) await admitEntityRef(ref);
+  return [...refs.values()];
+}
+async function admitReviewIdentity(profile: Profile, taskId?: string, eventId?: string): Promise<void> {
+  const refs: EntityRef[] = [];
+  if (taskId) refs.push({profile,side:"todoist",id:taskId});
+  if (eventId) refs.push({profile,side:"calendar",id:eventId});
+  await admitReviewIdentities(refs,defaultProjectCommentClientFactory);
+}
+async function admitEntityRef(ref: EntityRef): Promise<void> {
+  await admitReviewIdentities([ref],defaultProjectCommentClientFactory);
+}
+async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
+  await admitReviewIdentities(await nestedReviewIdentities(value,defaultProfile),defaultProjectCommentClientFactory);
 }
 /** Check all provider identities retained by a manual decision before the
  * decision itself is written or changed. */
-export async function assertManualDecisionReplayAdmission(decision: ManualDecision): Promise<void> {
-  await admitNestedReviewIdentities(decision, decision.profile);
+export async function assertManualDecisionReplayAdmission(decision: ManualDecision,
+  clientFactory: ProjectCommentClientFactory = defaultProjectCommentClientFactory): Promise<void> {
+  await admitReviewIdentities(await nestedReviewIdentities(decision, decision.profile), clientFactory);
 }
-export async function assertRepairPreviewReplayAdmission(preview: RepairPreview): Promise<void> {
+export async function assertRepairPreviewReplayAdmission(preview: RepairPreview,
+  clientFactory: ProjectCommentClientFactory = defaultProjectCommentClientFactory): Promise<void> {
   const refs = new Map<string, EntityRef>();
-  await admitNestedReviewIdentities(preview,preview.intent.profile);
+  for (const ref of await nestedReviewIdentities(preview,preview.intent.profile)) refs.set(entityKey(ref),ref);
   for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
   for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
   for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
@@ -95,8 +129,7 @@ export async function assertRepairPreviewReplayAdmission(preview: RepairPreview)
     ...(preview.intent.action === "move" && preview.intent.targetProfile && preview.intent.taskId
       ? [{profile:preview.intent.targetProfile,side:"todoist" as const,id:preview.intent.taskId}] : []),
   ];
-  for (const ref of [...refs.values(), ...intent]) await admitReviewIdentity(ref.profile,
-    ref.side === "todoist" ? ref.id : undefined, ref.side === "calendar" ? ref.id : undefined);
+  await admitReviewIdentities([...refs.values(), ...intent], clientFactory);
 }
 export class ReviewStore {
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}

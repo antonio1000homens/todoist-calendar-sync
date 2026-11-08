@@ -35,9 +35,10 @@ completed-comment cleanup separately wraps its Todoist client. The only direct
 subscriptions, not identity-bearing event writes.
 
 Completed #349 erasures now store a bounded tombstone in the exact existing
-Todoist project mapping comment. Worker ingress and Calendar delta paths read
-fresh project-comment inventories before processing; active markers suppress
-matching task and Calendar aliases without writing task/event IDs to DynamoDB.
+Todoist project mapping comment. Every recognized Todoist webhook lifecycle
+and Calendar delta path reads a fresh project-comment inventory before
+processing; active markers suppress matching task and Calendar aliases without
+writing task/event IDs to DynamoDB.
 The legacy provider guard still performs its strongly consistent HMAC lookup
 only when `ERASURE_REPLAY_BARRIER_VERSION=1`; that marker store is not used for
 completed #349 erasures. The standalone Calendar-only factory therefore has no

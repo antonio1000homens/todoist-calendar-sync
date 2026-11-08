@@ -73,6 +73,7 @@ test("Calendar snapshot recovery re-links and updates the unique Todoist orphan 
       async listInstances() { return []; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { return tasks; },
       async upsertTask(next, existingId) {
         const stored = { ...tasks.find((candidate) => candidate.id === existingId), ...next, id: existingId || "created", project_id: "home-project" };
