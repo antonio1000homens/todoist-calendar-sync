@@ -115,13 +115,16 @@ creation repeats the reads before atomically storing the immutable operation
 and consuming the confirmation.
 
 The async erasure executor is implemented, including conditional provider deletion,
-exact DynamoDB row deletion, provider readback, and postflight verification. It
-remains **off by default**. The CloudFormation parameter
-`ErasureExecutionEnabled` defaults to `"false"`; it is deployed as
-`ERASURE_EXECUTION_ENABLED` on **both** the authenticated review API and
-the erasure worker. Execution requires that value to be exactly `"true"`
-on both functions and `ERASURE_PROTOCOL_VERSION=1`. The API start and
-the worker check their own deployment switch before doing any work.
+exact DynamoDB row deletion, provider readback, and postflight verification. The
+CloudFormation parameter `ErasureExecutionEnabled` defaults to `"false"`; this is
+the template default, not a statement about the live stack. A read-only production
+audit on 8 November 2026 found `ERASURE_EXECUTION_ENABLED="true"` on the live
+Review API and erasure worker, with `ERASURE_PROTOCOL_VERSION=1`. The worker's
+queue mapping was enabled. The live executor must therefore be treated as
+enabled until a separate approved deployment changes and verifies that state.
+Execution requires the value to be exactly `"true"` on both functions and
+`ERASURE_PROTOCOL_VERSION=1`. The API start and the worker check their own
+deployment switch before doing any work.
 
 To enable the reviewed execution path:
 1. Complete a deployment review of the preview, deletion, readback, profile
@@ -153,6 +156,30 @@ fenced operation then becomes `review_required`, retaining its protections;
 plan**. A successful production rollout must include the review-page
 confirmation/progress experience and a tested operator recovery process.
 This flag alone is not full issue #113 acceptance.
+
+## Bounded replay tombstone for issue #349
+
+The #349 implementation uses the exact existing Todoist project mapping
+comment as a temporary replay tombstone. The comment retains the deleted task
+ID and explicitly recorded Calendar event aliases for 18 days after a verified
+rewrite, then an operator-run cleanup removes that exact expired comment. A
+successful operation leaves no deleted-task identity in DynamoDB. This is a
+bounded engineering default based on the current four-day FIFO source queue and
+fourteen-day DLQ; an arbitrarily late webhook or repeated manual redrive after
+expiry cannot be recognized from retained identity.
+
+The source PRs for this model are still drafts and are not deployed. A current
+read-only Lambda package audit found no project-comment tombstone marker in the
+seven deployed functions or their inspected published versions. Source checks
+cover Todoist webhooks, Calendar deltas, snapshot reconciliation and orphan
+recovery, plus stored manual decisions and queued repair previews. The current
+Review API and erasure worker are enabled, so do not treat the source-only
+tombstone checks as protecting live operations. Keep the existing replay
+barrier off, do not release an erasure fence, and do not start recovery until
+the #347 invocation boundary and #349 disposable Work-profile acceptance are
+complete. This model is known-identity recovery only; it does not prove absence
+of unknown Calendar copies, backups, or external integrations. Normal sync,
+recurrence, and seven-day completed-task retention remain separate behavior.
 
 The API scan stops after its bounded 80-second preview window and returns no
 confirmation if it cannot finish. It uses the configured DynamoDB scan page
@@ -365,3 +392,22 @@ action-time deletion/completion implementation exists. Keep #243 open
 until the full replay barrier, qualified Lambda/version audit, fault
 matrix, privacy/IAM approval and disposable Work-profile staging are
 complete. No production erasure or recovery is part of this increment.
+
+
+## Production status after PRs #403–#405 (8 Nov 2026)
+
+The bounded Todoist project-comment marker changes are deployed to current
+master (deployment run 42536045650). The `todoist-calendar-sync` stack is
+`UPDATE_COMPLETE` with `ErasureExecutionEnabled=false`; the live Review API
+setting is false and its replay-barrier setting is absent. The unqualified
+worker has no execution flag. The erasure worker mapping remains enabled.
+
+A fresh seven-function audit found 223 published versions and two aliases.
+Seventy-one Review API configurations still carry execution enabled, including
+historical qualified versions that remain invocation candidates. The current
+`live` alias target is version 136 with execution false, but the audit has not
+proven a deny for old qualified versions or every external caller. Therefore
+this deployment does not satisfy #347's writer/IAM boundary or #349's
+disposable Work-profile fault-injection acceptance. Keep the production gate
+false. Do not release fences or enable the replay barrier until both criteria
+are independently verified.

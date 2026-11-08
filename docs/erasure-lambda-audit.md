@@ -284,6 +284,43 @@ effective deny. AWS Organizations SCPs do not affect management-account roles
 An unavailable organization read remains `UNAVAILABLE` and cannot be treated as
 evidence that a guardrail applies.
 
+### Refreshed account-local inventory and candidate simulation (8 Nov 2026)
+
+After refreshing the configured IAM Identity Center session, the account-local
+read-only inventory was rerun against `243857182133` in `eu-west-2`. It found
+all seven template-expected production functions, 220 published versions, two
+aliases, two Function URLs and two enabled event-source mappings. The bounded
+invocation target set contained 229 resources: seven unqualified function
+targets, 220 published versions and two aliases. The separately verified
+package audit downloaded and checked each distinct deployed code digest; no
+inspected package contained the selected `todoist-calendar-sync:deleted:v1`
+marker, `activeProjectDeletionTombstone` reader or identity-free tombstone
+suppression marker.
+
+The identity-policy scan found 58 users, roles and groups, five candidate
+policy grants across four principals, and no missing managed-policy documents.
+The role-trust summary had no wildcard or external AWS principal counted. The
+account is the Organizations management account, so its enabled SCP policy type
+does not apply. The candidate policy simulator evaluated eight cases: each of
+the four principals was allowed `lambda:InvokeFunction` and legacy
+`lambda:InvokeAsync` on all 229 inventoried targets, including all 222
+qualified targets, with no simulated denies. This is not effective-permission
+proof: role assumption, actual callers, session context, resource policies and
+external paths remain unresolved.
+
+Both configured Function URLs use `AuthType=NONE` and have wildcard
+URL-invocation resource-policy statements. Anonymous ingress POST and Review API
+GET requests returned 401 at their deployed application handlers in the prior
+8 November check; that application response does not remove the public Lambda
+policy or prove authenticated bypasses are absent. The live Review API and
+erasure worker remain configured with `ERASURE_EXECUTION_ENABLED=true`, and
+the worker queue mapping is enabled. Neither contains the project-comment
+tombstone implementation. No AWS or provider state was changed by this
+inventory or simulation. The result remains
+`BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW`; it does not authorize an
+IAM, Function URL, deployment, version-retirement, queue, fence or replay
+change.
+
 To query invocation metrics for each inventoried published version, alias,
 alias-executed version and unqualified function over the CloudWatch retention
 window, run:
@@ -626,3 +663,116 @@ evidence about the deployed packages and IAM/Function URL boundary; it does
 not prove the new marker is deployed or authorize any AWS update. Permanent
 DynamoDB HMAC markers and historical verification-key retention are not part
 of the corrected #349 marker design.
+
+
+## 8 November live execution and endpoint recheck
+
+A focused read-only recheck found the production Review API `live` alias and
+the production erasure worker configured with
+`ERASURE_EXECUTION_ENABLED=true` and `ERASURE_PROTOCOL_VERSION=1`; the
+`ERASURE_REPLAY_BARRIER_VERSION` setting is absent. The erasure worker's SQS
+event-source mapping is enabled. The deployed review API sets
+`executionReadyAtIssue` from the execution/protocol pair, so a fresh exact
+preview and operator confirmation can create an executable operation. This
+does not prove that any operation was recently run, but the executor must not
+be described as disabled. Both deployed bundles inspected lacked the new
+project-comment tombstone marker, so the new #349 path is not live.
+
+At the audit time, the erasure queue had no visible, in-flight, or delayed
+messages, and no profile FENCE item was present for home, antonio, or work.
+A paced full-table scan subsequently found zero `ERASURE_OPERATION#*` /
+`STATE` rows across 151 pages, consuming 188 read-capacity units. Both public
+Function URLs still have wildcard Lambda URL invoke policies and
+`AuthType=NONE`;
+unauthenticated ingress POST and review API GET requests returned 401 from the
+deployed application handlers. The ingress requires its proxy secret plus
+provider signature/channel token, and the review API validates Cloudflare
+Access JWT issuer/audience and operator allowlist.
+
+These findings are read-only. No AWS configuration, operation state, queue,
+provider data, or Lambda version was changed. The #403 draft changes the
+existing production execution setting to false for future master deployments
+until #347/#349 acceptance is complete; it does not change the current live
+configuration until merged and deployed.
+
+### Windsor IAM trust and credential metadata refresh (8 Nov 2026)
+
+A further read-only check refreshed the trust documents for the three roles
+with candidate Lambda invocation grants. The GitHub Actions role trusts the
+GitHub OIDC provider only with audience `sts.amazonaws.com` and a subject
+pattern restricted to `repo:antonio1000homens/lambdas:*`. The Windsor VSS
+role trusts only the account's named Administrator SSO role. The active
+Administrator SSO role has one conditional federated trust statement. These
+trust documents identify possible assumption routes; they do not establish
+that a particular caller can assume each role or that the resulting session
+can invoke an inventoried function.
+
+The `vsstudio` IAM user has one active access key and no console login profile.
+The key value was not retrieved or recorded. Its presence is not evidence that
+the key is in use or that it can reach Lambda. The five previously reported
+identity-policy invocation grants remain candidates, not effective-permission
+proof. The AWS policy simulator still cannot resolve role assumption, session
+policies, Lambda resource policies, or all external paths. No IAM policy,
+credential, Lambda, queue, application setting, or provider data was changed.
+
+### Windsor CloudTrail and IAM last-used evidence (8 Nov 2026)
+
+A corrected read-only regional inventory queried CloudTrail trails (including
+shadow trails) and CloudTrail Lake event data stores in all 17 regions whose
+EC2 opt-in status was `opt-in-not-required` or `opted-in`. All 17 trail queries
+and all 17 event-data-store queries succeeded. No trail or event data store was
+returned. This account therefore has no configured CloudTrail trail or Lake
+store available through those regional APIs for historical Lambda invocation
+data-event review. This is a logging gap, not evidence that no direct Lambda
+invocation occurred; IAM and package inventories still cannot resolve the
+historical caller question.
+
+IAM last-used metadata for the `vsstudio` active access key reported
+CloudFormation in `eu-west-2` at 2026-10-27 18:54 UTC. The metadata does not
+identify which CloudFormation operation ran and does not prove the key was
+never used for Lambda. Role last-used metadata reported the current
+Administrator SSO role at 2026-11-08 21:14 UTC in `eu-west-2`,
+`S3-access-github-actions` at 2026-03-12 10:31 UTC in `eu-west-2`, and
+`WindsorVsstudioAccess` at 2026-09-11 17:01 UTC in `us-east-1`. Role
+last-used metadata has no action-level attribution and does not establish
+Lambda invocation. No secret key value was retrieved. No IAM, CloudTrail,
+Lambda, queue, application setting, or provider data was changed.
+
+
+### Production state after PRs #403–#405 (8 Nov 2026, 23:42 UTC)
+
+After deployment run 42536045650 completed successfully, the `todoist-calendar-sync`
+CloudFormation stack was `UPDATE_COMPLETE` (updated 23:39:08 UTC) with
+`ErasureExecutionEnabled=false`. A direct read of the live Review API returned
+`ERASURE_EXECUTION_ENABLED=false`, protocol `1`, and no replay-barrier version.
+The unqualified worker had no execution flag, protocol `1`, and no replay-barrier
+version. The erasure worker's event-source mapping remained enabled.
+
+Fresh read-only audits verified the expected seven production functions in
+`243857182133` / `eu-west-2`: 223 published versions, two aliases, two enabled
+event-source mappings, and 219 unique verified Lambda package digests. The
+package scan found the project-marker key, replay-gate, and HMAC-keyring strings
+in inspected packages; it also found the ingress tombstone suppression markers
+in current ingress packages and fenced-review markers in the review API and
+erasure worker. String presence does not prove check ordering or coverage of
+every provider/DynamoDB write.
+
+The redacted config audit found 71 Review API configurations with the paired
+erasure execution/protocol settings enabled. The current `live` alias points to
+version 136, whose execution setting is present but false; `$LATEST` is also
+false. Historical qualified versions remain directly invokable candidates,
+including configurations that still have execution enabled. The account-local
+invoke inventory and candidate IAM simulation do not deny those old-version
+paths. Thus the false stack setting protects the current deployment default,
+but does **not** prove that every old executable is disabled or unreachable.
+The replay barrier and HMAC keyring are absent from all seven functions'
+inventoried configurations.
+
+The audits remain `BLOCKED_PENDING_CALL_PATH_IAM_AND_APPROVAL_REVIEW` and
+`BLOCKED_PENDING_INDEPENDENT_WRITER_AND_IAM_AUDIT`. They do not cover all
+accounts/regions, legacy names, all external callers, session/resource-policy
+semantics, or a proven deny for qualified historical versions. No Lambda, IAM,
+queue, operation, fence, or provider state was changed during these audits.
+Keep execution disabled, do not release fences or enable replay admission, and
+leave #347 and #349 open pending the writer boundary, independent review, and
+disposable Work-profile fault-injection acceptance.
