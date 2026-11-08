@@ -41,6 +41,30 @@ test("confirmed erasure replaces the project mapping comment with a readback-ver
   assert.equal(deletes,0,"the project note must remain as the temporary replay marker");
 });
 
+test("a repeated project-comment deletion step accepts only its exact tombstone after a lost checkpoint acknowledgement",async()=>{
+  const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
+    updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
+  let comment={id:"project-1",project_id:"test-home-project",content:original};
+  let updates=0;
+  const todoist={getComment:async()=>comment,
+    updateComment:async(id,content)=>{updates++;comment={...comment,id,content};return comment;}};
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+    comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
+  const staleProgress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")};
+  const dependencies={db:{send:async()=>({})},clients:{todoist,calendar:{}},inspectFence:async()=>({leases:[]})};
+  const first=await executeErasureDeletionStep(operation,staleProgress,dependencies);
+  assert.equal(parseDeletionTombstoneComment(comment)?.taskId,"task-1");
+  assert.equal(updates,1);
+
+  // Simulate provider success followed by a lost DynamoDB progress ACK: retry
+  // the same operation step from the original checkpoint.
+  const replay=await executeErasureDeletionStep(operation,staleProgress,dependencies);
+  assert.equal(replay.progress.commentIndex,first.progress.commentIndex);
+  assert.equal(updates,1,"replay verifies the existing marker without rewriting its expiry");
+  assert.equal(comment.id,"project-1","the existing project comment ID is preserved");
+});
+
 test("provider deletion steps leave the replay identity in Todoist and remove it from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
