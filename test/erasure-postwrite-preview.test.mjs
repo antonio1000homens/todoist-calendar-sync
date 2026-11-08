@@ -117,7 +117,6 @@ test("scoped absence refuses unknown, surviving, stale or conflicting evidence",
     x=>{x.preview.stateRowsAbsent=false;},
     x=>{x.preview.fenceOwned=false;},
     x=>{x.preview.leaseCount=1;},
-    x=>{x.preview.crossProfileEvidence={profiles:{work:{taskReadsFound:1}},missingProof:[]};},
     x=>{x.operation.lifecycle.evidence={};},
     x=>{x.operation.actionPlan.calendarEvent.id="other-target";},
   ];
@@ -131,6 +130,19 @@ test("scoped absence refuses unknown, surviving, stale or conflicting evidence",
     assert.equal(result.knownIdentity.status,"partial_or_ambiguous");
     assert.equal(result.releaseAllowed,false);
   }
+});
+test("optional global Calendar evidence does not change the bounded known-target outcome",()=>{
+  const x=fixture();
+  x.preview.classification="partial_or_ambiguous";
+  x.preview.providerItemsAbsent=false;
+  x.preview.snapshotSafetyBlockerCount=0;
+  x.preview.knownTargetReadback={todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"};
+  x.preview.crossProfileEvidence={profiles:{home:{taskReadsFound:1}},missingProof:["Unrecorded Calendar copies remain outside scope"]};
+  const result=assessPostWriteRecovery(x.operation,x.preview);
+  assert.equal(result.knownIdentity.status,"known_identity_deleted");
+  assert.equal(result.releaseAllowed,false);
+  assert.ok(result.blockers.some(item=>item.includes("not proof of global Calendar erasure")));
+  assert.ok(!result.blockers.some(item=>item.includes("Unrecorded Calendar copies")));
 });
 test("scoped outcome is not post-write without an original deletion receipt",()=>{
   const x=fixture();

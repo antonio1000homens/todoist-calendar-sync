@@ -43,6 +43,8 @@ export interface RecoveryAdapters {
   mappingStates(ids:string[]):Promise<Array<{id:string;state:string}>>;
   restoreMappings(ids:string[]):Promise<void>;
   readSnapshot(operation:ErasureOperation):Promise<ErasurePreviewResult>;
+  /** Exact operation-target reads for bounded post-write assessment. */
+  readKnownTargetSnapshot?(operation:ErasureOperation):Promise<ErasurePreviewResult>;
 }
 type Db=Pick<typeof documentClient,"send">;
 const idPattern=/^[A-Za-z0-9_-]{1,128}$/;
@@ -157,7 +159,7 @@ export class ErasureRecoveryService {
     private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db as typeof documentClient),
     private readonly newToken:()=>string=randomUUID) {}
 
-  async inspect(id:string):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean}> {
+  async inspect(id:string,options:{knownIdentityOnly?:boolean}={}):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean}> {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const op=await this.erasures.get(id);
     if(!op)throw Object.assign(new Error("Erasure operation not found; absence cannot prove success"),{status:404});
@@ -165,8 +167,10 @@ export class ErasureRecoveryService {
       throw Object.assign(new Error("Only a persisted review_required erasure can be inspected for recovery"),{status:409});
     const blockers=validateLifecycle(op);
     // Read each source even if another is blocked; never issue confirmation on a partial read or exception.
+    const readSnapshot=options.knownIdentityOnly&&this.adapters.readKnownTargetSnapshot
+      ?this.adapters.readKnownTargetSnapshot.bind(this.adapters):this.adapters.readSnapshot.bind(this.adapters);
     const [control,mappings,snapshot]=await Promise.all([
-      readControl(this.db,op.profile),this.adapters.listWorkerMappings(),this.adapters.readSnapshot(op),
+      readControl(this.db,op.profile),this.adapters.listWorkerMappings(),readSnapshot(op),
     ]);
     const original=op.lifecycle?.mappingIds||[];
     const presentIds=mappings.map(x=>x.id).sort();
@@ -202,8 +206,13 @@ export class ErasureRecoveryService {
       blockers:[...new Set(blockers)].sort(),allowed:blockers.length===0,
       mappingStates,epoch:control.epoch,fenceOwned:control.fence?.operationId===id,
       leaseCount:control.leases.length,
-      providerItemsAbsent:!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent&&snapshot.actionPlan.comments.length===0
-        &&snapshot.crossProfileEvidence?.knownIdentitiesAbsentFromCurrentProviders===true,
+      providerItemsAbsent:!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent
+        &&snapshot.actionPlan.comments.length===0
+        &&(options.knownIdentityOnly
+          ?snapshot.knownTargetReadback?.todoist==="absent"
+            &&snapshot.knownTargetReadback.calendar==="absent"
+            &&snapshot.knownTargetReadback.configuredCalendarLink==="not_found"
+          :snapshot.crossProfileEvidence?.knownIdentitiesAbsentFromCurrentProviders===true),
       stateRowsAbsent:snapshot.inventory.length===0
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
@@ -223,14 +232,14 @@ export class ErasureRecoveryService {
   /** Post-write review is separate from the pre-write RESTORE SYNC executor.
    * It can persist a fenced acknowledgement but NEVER queues or releases work. */
   async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
-    const inspection=await this.inspect(id);
+    const inspection=await this.inspect(id,{knownIdentityOnly:true});
     return {...assessPostWriteRecovery(inspection.operation,inspection.preview),
       ...(inspection.operation.postwriteReview?.status==="reviewed_fenced"
         ?{reviewStatus:"reviewed_fenced" as const}:{})};
   }
 
   private async inspectPostWriteCandidate(id:string) {
-    const inspection=await this.inspect(id);
+    const inspection=await this.inspect(id,{knownIdentityOnly:true});
     const assessment=assessPostWriteRecovery(inspection.operation,inspection.preview);
     if(assessment.classification!=="fully_deleted_candidate"||!inspection.preview.epoch
       ||inspection.operation.recovery||inspection.operation.postwriteReview)
