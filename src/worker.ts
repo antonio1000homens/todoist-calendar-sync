@@ -481,7 +481,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
       const audit = state.audit.bind(state);
       state.audit = async (profile, action, detail) => {
         if (action === "todoist_erased_item_replay_suppressed"
-          || action === "erasure_project_comment_replay_suppressed") {
+          || action === "erasure_project_comment_replay_suppressed"
+          || action === "erasure_replay_admission_suppressed") {
           suppressCompletionReceipt = true;
           identityRefs.taskIds.clear();
           identityRefs.eventIds.clear();
@@ -490,7 +491,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
         collectIdentityRefs(detail);
         await audit(profile, action, detail);
         if (delivery && action !== "todoist_erased_item_replay_suppressed"
-          && action !== "erasure_project_comment_replay_suppressed") {
+          && action !== "erasure_project_comment_replay_suppressed"
+          && action !== "erasure_replay_admission_suppressed") {
           const observedCase = await manual?.observeAudit(delivery, profile, action, detail);
           if (delivery.kind === "reconcile" && delivery.reconcile?.generation) {
             try {
@@ -735,6 +737,20 @@ export const handler: SQSHandler = async (event, context: Context) => {
         || !!releaseWriterLease;
       if (!mayWriteFailureState) {
         failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
+      if(error instanceof ErasureReplayBlockedError&&state&&delivery
+        &&(delivery.kind==="todoist"||delivery.kind==="calendar")) {
+        // Treat a replay-admission block as suppression, never as a failed
+        // identity-bearing delivery or a reason to retry a provider write.
+        // The audit deliberately omits task/event IDs.
+        suppressCompletionReceipt=true;
+        try {
+          await state.audit(delivery.profile,"erasure_replay_admission_suppressed",
+            {side:delivery.kind});
+        } catch {
+          failures.push({itemIdentifier:record.messageId});
+        }
         continue;
       }
       // The suppression audit is intentionally identity-free. If its write

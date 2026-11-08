@@ -34,12 +34,22 @@ completed-comment cleanup separately wraps its Todoist client. The only direct
 `src/watch.ts`; it uses only `watch()` and `stopWatch()` to manage push
 subscriptions, not identity-bearing event writes.
 
-The provider guard checks the replay barrier only when
-`ERASURE_REPLAY_BARRIER_VERSION=1`. When the flag is off, the wrapper does not
-provide replay protection. Turning the flag on remains unsafe until the
-deployed-version, identity propagation, lease, alias, and IAM gates in #307 are
-closed. Todoist `deleteComment()` currently fails closed when the barrier is
-on because a bare comment ID cannot prove its owning erased identity.
+Completed #349 erasures now store a bounded tombstone in the exact existing
+Todoist project mapping comment. Worker ingress and Calendar delta paths read
+fresh project-comment inventories before processing; active markers suppress
+matching task and Calendar aliases without writing task/event IDs to DynamoDB.
+The legacy provider guard still performs its strongly consistent HMAC lookup
+only when `ERASURE_REPLAY_BARRIER_VERSION=1`; that marker store is not used for
+completed #349 erasures. The standalone Calendar-only factory therefore has no
+project-comment admission check of its own.
+
+These source checks do not establish full writer admission: every caller must
+still hold the applicable writer lease before its first identity-bearing
+DynamoDB or provider write. The SQS catch for `ErasureReplayBlockedError` records
+a generic replay suppression without a task/event ID, receipt, or incident record.
+The live/historical Lambda and IAM boundary in #347 must be closed before any
+post-write fence release. Fresh source reads depend on that lease boundary to
+serialize a stale delivery against tombstone installation and erasure.
 
 ## DynamoDB mutation surfaces
 
