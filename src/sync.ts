@@ -1035,6 +1035,13 @@ export class Synchronizer {
       const deleted = delta.items.filter(event => event.status === "cancelled");
       const eligibleDeleted: CalendarEvent[] = [];
       for(const event of deleted){
+        // applyCalendarEvent observes this marker before event-specific work,
+        // but cancellation review scheduling runs afterward on a separate
+        // path. Do not let the sync worker's own deleted-event delta create
+        // review/DynamoDB identity from the same tombstoned Calendar ID.
+        if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
+          projectId:profiles[delivery.profile].todoistProjectId,
+          eventIds:[event.id,event.recurringEventId].filter((id):id is string=>Boolean(id))})) continue;
         if(await this.state.isRetired?.({profile:delivery.profile,
           eventIds:[...new Set([event.id,event.recurringEventId]
             .filter((id):id is string=>Boolean(id)))],
