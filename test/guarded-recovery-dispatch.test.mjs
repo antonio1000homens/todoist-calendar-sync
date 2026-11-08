@@ -52,6 +52,7 @@ function harness({hasRepair=true,source=task}={}) {
   };
   const calendar={async upsertEvent(...args){writes.push(["calendar",args]);throw Error("unexpected provider write");}};
   const todoist={
+    async listProjectComments(){return [];},
     async getTask(id){reads.push(["provider",id]);return {...source};},
     async deleteTask(){writes.push(["todoist_delete"]);throw Error("unexpected provider write");},
   };

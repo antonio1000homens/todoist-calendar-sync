@@ -15,6 +15,8 @@ import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
+import { profiles } from "./config.js";
+import { activeProjectDeletionTombstone } from "./mapping-comments.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
@@ -411,6 +413,26 @@ export const handler: SQSHandler = async (event, context: Context) => {
           continue;
         }
       }
+      // A deletion webhook can be intercepted into a review decision before
+      // Synchronizer.process() runs. Check the provider tombstone first so a
+      // stale deleted identity cannot create review/receipt state in DynamoDB.
+      if(delivery.kind==="todoist") {
+        let payload:TodoistWebhookPayload|undefined;
+        try { payload=JSON.parse(delivery.body) as TodoistWebhookPayload; } catch { /* normal validation owns malformed payloads */ }
+        const task=payload?.event_data;
+        const explicitDelete=Boolean(task?.id&&(/deleted/i.test(payload?.event_name||"")||task.is_deleted));
+        if(explicitDelete&&task?.id) {
+          suppressCompletionReceipt=true;
+          const clients=await defaultProviderClientFactory(delivery.profile);
+          const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+          if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
+            projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id})) {
+            await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist"});
+            continue;
+          }
+          suppressCompletionReceipt=false;
+        }
+      }
       manual = new ManualInterventionService();
       const identityRefs = { taskIds: new Set<string>(), eventIds: new Set<string>(), seriesIds: new Set<string>(), generation: delivery.reconcile?.generation };
       const collectIdentityRefs = (value: unknown, field = ""): void => {
@@ -458,7 +480,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // decisions. Notification failure never suppresses the underlying audit.
       const audit = state.audit.bind(state);
       state.audit = async (profile, action, detail) => {
-        if (action === "todoist_erased_item_replay_suppressed") {
+        if (action === "todoist_erased_item_replay_suppressed"
+          || action === "erasure_project_comment_replay_suppressed") {
           suppressCompletionReceipt = true;
           identityRefs.taskIds.clear();
           identityRefs.eventIds.clear();
@@ -466,7 +489,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
         collectIdentityRefs(detail);
         await audit(profile, action, detail);
-        if (delivery && action !== "todoist_erased_item_replay_suppressed") {
+        if (delivery && action !== "todoist_erased_item_replay_suppressed"
+          && action !== "erasure_project_comment_replay_suppressed") {
           const observedCase = await manual?.observeAudit(delivery, profile, action, detail);
           if (delivery.kind === "reconcile" && delivery.reconcile?.generation) {
             try {

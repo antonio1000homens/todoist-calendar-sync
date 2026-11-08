@@ -110,20 +110,22 @@ export type ConfirmedErasureCompletionProof={
   eventId?:string;calendarId?:string;
   knownCalendarAliases?:readonly {profile:Profile;calendarId:string;eventId:string}[];
   knownCalendarAliasesComplete?:boolean;
+  projectCommentIds?:readonly string[];
   confirmationId:string;previewFingerprint:string;epoch:number;
 };
 
-/** Build marker installation and successful erasure cleanup as one transaction. */
+/** Atomically remove the verified operation/fence after its provider comment tombstones are read back. */
 export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletionProof):TransactWriteCommand {
-  if(!replayAdmissionEnabled())
-    throw new ErasureReplayUnavailableError("Successful erasure cannot release its fence before replay admission is enabled");
   if(!OPERATION_ID.test(proof.operationId)||!REPLAY_PROFILES.includes(proof.profile)
     ||!ID.test(proof.taskId)||!UUID.test(proof.confirmationId)
     ||!Number.isSafeInteger(proof.epoch)||proof.epoch<1||!SHA256.test(proof.previewFingerprint))
     throw new ErasureReplayUnavailableError("Confirmed erasure completion proof is incomplete");
-  const ring=keyRing(),table=tableName(),markers:ReplayKey[]=[];
-  for(const profile of REPLAY_PROFILES)
-    markers.push(marker(profile,"TASK",proof.taskId,ring.current,ring.keys.get(ring.current)!));
+  const table=tableName();
+  const commentIds=proof.projectCommentIds||[];
+  if(!commentIds.length||commentIds.length>32||commentIds.some(id=>typeof id!=="string"
+    ||id.length<1||id.length>256||/[\u0000-\u001f\u007f]/.test(id))
+    ||new Set(commentIds).size!==commentIds.length)
+    throw new ErasureReplayUnavailableError("An exact verified project tombstone comment is required before erasure completion");
   const aliases=proof.knownCalendarAliases||[];
   if(proof.deleteCalendar) {
     if(!proof.eventId||!ID.test(proof.eventId)||!proof.calendarId||!CALENDAR_ID.test(proof.calendarId)
@@ -133,11 +135,8 @@ export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletio
       ||new Set(aliases.map(alias=>JSON.stringify([alias.profile,alias.calendarId,alias.eventId]))).size!==aliases.length
       ||!aliases.some(alias=>alias.profile===proof.profile&&alias.calendarId===proof.calendarId
         &&alias.eventId===proof.eventId))
-      throw new ErasureReplayUnavailableError("Complete exact Calendar aliases are required before replay-safe erasure completion");
-    for(const alias of aliases)
-      markers.push(marker(alias.profile,"EVENT",alias.eventId,ring.current,ring.keys.get(ring.current)!,alias.calendarId));
-  } else if(aliases.length)
-    throw new ErasureReplayUnavailableError("Calendar aliases cannot be tombstoned when Calendar deletion was not confirmed");
+      throw new ErasureReplayUnavailableError("Complete exact Calendar aliases are required before erasure completion");
+  }
 
   const operationValues:Record<string,unknown>={":verifying":"verifying",":release":"release_fence",":ready":true,
     ":fingerprint":proof.previewFingerprint,":taskId":proof.taskId,":deleteCalendar":proof.deleteCalendar};
@@ -150,9 +149,11 @@ export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletio
     operationCondition.push("target.eventId=:eventId","actionPlan.calendarEvent.id=:eventId",
       "actionPlan.calendarEvent.calendarId=:calendarId","actionPlan.knownCalendarAliasesComplete=:ready");
   }
+  commentIds.forEach((id,index)=>{
+    operationValues[`:comment${index}`]=id;
+    operationCondition.push(`contains(actionPlan.projectCommentIds, :comment${index})`);
+  });
   const tx:any[]=[
-    ...markers.map(key=>({Put:{TableName:table,Item:{...key,markerVersion:1},
-      ConditionExpression:"attribute_not_exists(pk)"}})),
     {Delete:{TableName:table,Key:{pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"},
       ConditionExpression:operationCondition.join(" AND "),
       ExpressionAttributeNames:{"#status":"status","#phase":"phase"},ExpressionAttributeValues:operationValues}},
@@ -172,34 +173,12 @@ export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletio
   return new TransactWriteCommand({TransactItems:tx});
 }
 
-/** Before the first provider delete, require the permanent marker gate and prove
- * no task or explicitly recorded Calendar alias was already erased. */
-export async function assertConfirmedErasureReplayAdmission(proof:ConfirmedErasureCompletionProof,
-  db:Db=documentClient):Promise<void> {
-  atomicConfirmedErasureCompletion(proof); // validates the existing gate, keyring, and complete identity manifest
-  const ring=keyRing(),keys:ReplayKey[]=[];
-  for(const profile of REPLAY_PROFILES)
-    for(const [keyId,secret] of ring.keys)keys.push(marker(profile,"TASK",proof.taskId,keyId,secret));
-  if(proof.deleteCalendar)for(const alias of proof.knownCalendarAliases||[])
-    for(const [keyId,secret] of ring.keys) {
-      keys.push(marker(alias.profile,"EVENT",alias.eventId,keyId,secret,alias.calendarId));
-      keys.push(legacyEventMarker(alias.profile,alias.eventId,keyId,secret));
-    }
-  const unique=[...new Map(keys.map(key=>[`${key.pk}\0${key.sk}`,key])).values()];
-  for(const key of unique) {
-    let result;
-    try {result=await db.send(new GetCommand({TableName:tableName(),Key:key,ConsistentRead:true}));}
-    catch {throw new Error("Existing erasure marker readback is unavailable");}
-    if(result.Item)throw new ErasureReplayBlockedError();
-  }
-}
-
 /** Resolve a lost commit acknowledgement without repeating any provider delete. */
 export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCompletionProof,
   db:Db=documentClient):Promise<boolean> {
   const command=atomicConfirmedErasureCompletion(proof);
-  const table=tableName(),ring=keyRing();
-  const read=async(key:ReplayKey)=>{
+  const table=tableName();
+  const read=async(key:{pk:string;sk:string})=>{
     try{return (await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true}))).Item;}
     catch {throw new ErasureReplayUnavailableError("Erasure completion readback is unavailable");}
   };
@@ -211,18 +190,6 @@ export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCom
     read({pk:`ERASURE#${proof.profile}`,sk:"JOURNAL"}),
   ]);
   if(operation||confirmation||fence||journal||epoch?.epoch!==proof.epoch)return false;
-  const identities=REPLAY_PROFILES.map(profile=>[...ring.keys].map(([keyId,secret])=>
-    marker(profile,"TASK",proof.taskId,keyId,secret)));
-  for(const alias of proof.knownCalendarAliases||[])
-    identities.push([...ring.keys].map(([keyId,secret])=>
-      marker(alias.profile,"EVENT",alias.eventId,keyId,secret,alias.calendarId)));
-  for(const candidates of identities) {
-    let found=false;
-    for(const candidate of candidates) {
-      if(await read(candidate)){found=true;break;}
-    }
-    if(!found)return false;
-  }
   return true;
 }
 /** Deployment gate is intentionally OFF until all producer/worker versions

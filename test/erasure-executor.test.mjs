@@ -7,7 +7,7 @@ const operation={operationId:"op",profile:"home",target:{taskId:"task",deleteCal
   status:"previewed",createdAt:"2026-10-23T00:00:00Z",updatedAt:"2026-10-23T00:00:00Z"};
 const preview={profile:"home",target:{taskId:"task",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
-  actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},comments:[]},
+  actionPlan:{todoistTask:{id:"task",digest:"b".repeat(64)},projectCommentIds:["project-comment-1"],comments:[]},
   inventory:[{type:"TASK",key:{pk:"TASK#task",sk:"META"},digest:"row-v1",classification:"selected"}]};
 const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
@@ -25,6 +25,13 @@ function memoryDb(seed){
     }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
+      if(values[":attempt"]){
+        if(item.lifecycle.deletionProgress.attempt)
+          throw Object.assign(new Error("conditional check failed"),{name:"ConditionalCheckFailedException"});
+        item={...item,lifecycle:{...item.lifecycle,deletionProgress:{...item.lifecycle.deletionProgress,
+          attempt:values[":attempt"]}},updatedAt:values[":updatedAt"]};
+        return {};
+      }
       const nextStatus=values[":next"]??values[":fencing"];
       item={...item,status:nextStatus,lifecycle:values[":lifecycle"]??item.lifecycle,
         updatedAt:values[":updatedAt"]??item.updatedAt};
@@ -329,7 +336,7 @@ test("worker adapters are bound at construction and request arguments cannot rep
     };
     result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"complete");assert.equal(result.status,"succeeded");
-    assert.equal(db.markers.size,3,"the lost transaction acknowledgement is resolved only after all task markers are visible");
+    assert.equal(db.markers.size,0,"the lost transaction acknowledgement is resolved from state readback; no DynamoDB task marker is stored");
     assert.equal(events.filter(event=>event[0]==="finish").length,0,"the fence is removed atomically with operation cleanup");
     assert.ok(!events.some(event=>event[0]==="delete"),"provider deletion is delegated to the bound deletion adapter");
   }finally{Date.now=realNow;if(oldTable===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=oldTable;
@@ -484,34 +491,92 @@ test("confirmation persists the readiness at issuance, not the later deployment 
 });
 
 test("ambiguous provider deletion and verification failures quarantine durably without automatic replay",async()=>{
+  const failures=[
+    {name:"network timeout",error:new Error("provider timeout after an unknown write")},
+    {name:"401",error:Object.assign(new Error("unauthorized"),{status:401})},
+    {name:"403",error:Object.assign(new Error("forbidden"),{status:403})},
+    {name:"429",error:Object.assign(new Error("rate limited"),{status:429})},
+    {name:"5xx",error:Object.assign(new Error("provider unavailable"),{status:503})},
+  ];
   for(const phase of ["delete","verify_deletion"]){
-    const operation={...storedQueuedOperation(),status:"deleting",providerDeletionReady:true,
-      lifecycle:{phase,mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
-        pollMs:5000,nextRunAt:0,evidence:{},
-        deletionProgress:{stage:"todoist",commentIndex:0,stateIndex:0,startedAt:1}}};
-    const db=memoryDb(operation);
-    let providerAttempts=0, restored=0, released=0;
-    const adapters={
-      listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
-      inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),
-      beginFence:async()=>{},restoreMappings:async()=>{restored++;},
-      finishFence:async()=>{released++;},
-      readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
-      executeDeletionStep:async()=>{providerAttempts++;throw new Error("provider timeout after an unknown write");},
-      verifyDeletion:async()=>{providerAttempts++;throw new Error("provider response was unavailable");},
-    };
-    const store=new ErasureOperationStore(db,()=>"unused",adapters);
-    const result=await store.advanceFencedLifecycle("op");
-    assert.equal(result.status,"review_required",phase);
-    assert.equal(result.phase,phase);
-    assert.equal(db.item.lifecycle.phase,phase,"preserve the original operation checkpoint");
-    assert.match(db.item.lifecycle.lastError,/break-glass recovery is required/);
-    assert.doesNotMatch(db.item.lifecycle.lastError,/provider timeout|provider response/);
-    assert.equal(providerAttempts,1);
-    assert.equal(restored,0);
-    assert.equal(released,0);
-    assert.equal(db.calls.some(x=>x.constructor.name==="TransactWriteCommand"),false);
-    await assert.rejects(store.advanceFencedLifecycle("op"),/not in a resumable fenced lifecycle/);
-    assert.equal(providerAttempts,1,"a repeated delivery cannot re-execute an uncertain delete");
+    for(const failure of failures){
+      const operation={...storedQueuedOperation(),status:"deleting",providerDeletionReady:true,
+        lifecycle:{phase,mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+          pollMs:5000,nextRunAt:0,evidence:{},
+          deletionProgress:{stage:"todoist",commentIndex:0,stateIndex:0,startedAt:1}}};
+      const db=memoryDb(operation);
+      let providerAttempts=0, restored=0, released=0;
+      const fail=async()=>{providerAttempts++;throw failure.error;};
+      const adapters={
+        listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+        inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),
+        beginFence:async()=>{},restoreMappings:async()=>{restored++;},
+        finishFence:async()=>{released++;},
+        readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
+        executeDeletionStep:fail,verifyDeletion:fail,
+      };
+      const store=new ErasureOperationStore(db,()=>"unused",adapters);
+      const result=await store.advanceFencedLifecycle("op");
+      assert.equal(result.status,"review_required",`${phase}: ${failure.name}`);
+      assert.equal(result.phase,phase,`${phase}: preserve the failed checkpoint`);
+      assert.match(db.item.lifecycle.lastError,/break-glass recovery is required/);
+      assert.doesNotMatch(db.item.lifecycle.lastError,/timeout|unauthorized|forbidden|rate limited|unavailable/);
+      assert.equal(providerAttempts,1);
+      assert.equal(restored,0,"do not restore writers while the provider outcome is uncertain");
+      assert.equal(released,0,"do not release the fence while the provider outcome is uncertain");
+      assert.equal(db.calls.some(x=>x.constructor.name==="TransactWriteCommand"),false);
+      await assert.rejects(store.advanceFencedLifecycle("op"),/not in a resumable fenced lifecycle/);
+      assert.equal(providerAttempts,1,"a repeated delivery cannot re-execute an uncertain delete");
+    }
   }
+});
+
+test("a lost deletion checkpoint acknowledgement leaves a durable claim and never repeats the provider step",async t=>{
+  const originalNow=Date.now;
+  let now=1_800_000_000_000;
+  Date.now=()=>now;
+  t.after(()=>{Date.now=originalNow;});
+  const operation={...storedQueuedOperation(),status:"deleting",providerDeletionReady:true,
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{},
+      deletionProgress:{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now}}};
+  let item=operation,providerAttempts=0,failedCheckpoint=false;
+  const db={async send(command){
+    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      if(values[":attempt"]){
+        item={...item,lifecycle:{...item.lifecycle,deletionProgress:{...item.lifecycle.deletionProgress,
+          attempt:values[":attempt"]}},updatedAt:values[":updatedAt"]};
+        return {};
+      }
+      if(!failedCheckpoint&&values[":lifecycle"]?.phase==="delete"
+        &&!values[":lifecycle"]?.deletionProgress?.attempt){
+        failedCheckpoint=true;
+        throw new Error("simulated lost checkpoint acknowledgement");
+      }
+      item={...item,status:values[":next"],lifecycle:values[":lifecycle"],updatedAt:values[":updatedAt"]};
+      return {};
+    }
+    throw new Error("Unexpected command");
+  }};
+  const adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},
+    restoreMappings:async()=>{},finishFence:async()=>{},verifyDeletion:async()=>({providersAbsent:false,stateAbsent:false}),
+    readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],executeDeletionStep:async(_op,progress)=>{
+    providerAttempts++;
+    const {attempt:_attempt,...nextProgress}=progress;
+    return {complete:false,progress:{...nextProgress,stage:"todoist"}};
+  }};
+  const store=new ErasureOperationStore(db,()=>"unused",adapters);
+  await assert.rejects(store.advanceFencedLifecycle("op"),/lost checkpoint acknowledgement/);
+  assert.equal(providerAttempts,1);
+  assert.ok(item.lifecycle.deletionProgress.attempt,"the write-ahead claim survives the failed checkpoint");
+
+  now+=40_000;
+  const retry=await store.advanceFencedLifecycle("op");
+  assert.equal(retry.status,"review_required");
+  assert.equal(item.status,"review_required");
+  assert.equal(item.lifecycle.phase,"delete");
+  assert.equal(providerAttempts,1,"the claimed provider step is never repeated after the ACK is lost");
 });

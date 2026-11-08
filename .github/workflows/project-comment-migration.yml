@@ -30,8 +30,10 @@ on:
           - backfill-apply
           - cleanup-report
           - cleanup-apply
+          - tombstones-report
+          - tombstones-apply
       confirmation:
-        description: For writes, type BACKFILL or DELETE_VERIFIED_LEGACY_COMMENTS
+        description: For writes, type the exact operation-specific confirmation
         required: false
         type: string
 
@@ -74,7 +76,7 @@ jobs:
           if [[ "$MIGRATION_REQUEST" == '/mapping-migrate all report' ]]; then
             profile=all
             operation=report
-          elif [[ "$MIGRATION_REQUEST" =~ ^/mapping-migrate[[:space:]]+(home|antonio|work)[[:space:]]+(report|backfill|cleanup-report|cleanup-apply)$ ]]; then
+          elif [[ "$MIGRATION_REQUEST" =~ ^/mapping-migrate[[:space:]]+(home|antonio|work)[[:space:]]+(report|backfill|cleanup-report|cleanup-apply|tombstones-report|tombstones-apply)$ ]]; then
             profile="${BASH_REMATCH[1]}"
             operation="${BASH_REMATCH[2]}"
           else
@@ -87,6 +89,8 @@ jobs:
             confirmation=BACKFILL
           elif [[ "$operation" == cleanup-apply ]]; then
             confirmation=DELETE_VERIFIED_LEGACY_COMMENTS
+          elif [[ "$operation" == tombstones-apply ]]; then
+            confirmation=DELETE_EXPIRED_ERASURE_TOMBSTONES
           fi
           {
             printf 'MIGRATION_PROFILE=%s\n' "$profile"
@@ -106,6 +110,11 @@ jobs:
           done
           case "$MIGRATION_OPERATION" in
             report|cleanup-report) ;;
+            tombstones-report)
+              [[ "$MIGRATION_PROFILE" != all ]] || {
+                echo 'Expired tombstone report requires one profile' >&2
+                exit 1
+              } ;;
             backfill-apply)
               [[ "$MIGRATION_PROFILE" != all && "$MIGRATION_CONFIRMATION" == BACKFILL ]] || {
                 echo 'Backfill writes require one profile and confirmation BACKFILL' >&2
@@ -114,6 +123,11 @@ jobs:
             cleanup-apply)
               [[ "$MIGRATION_PROFILE" != all && "$MIGRATION_CONFIRMATION" == DELETE_VERIFIED_LEGACY_COMMENTS ]] || {
                 echo 'Legacy deletion requires one profile and exact confirmation DELETE_VERIFIED_LEGACY_COMMENTS' >&2
+                exit 1
+              } ;;
+            tombstones-apply)
+              [[ "$MIGRATION_PROFILE" != all && "$MIGRATION_CONFIRMATION" == DELETE_EXPIRED_ERASURE_TOMBSTONES ]] || {
+                echo 'Expired tombstone deletion requires one profile and exact confirmation DELETE_EXPIRED_ERASURE_TOMBSTONES' >&2
                 exit 1
               } ;;
             *) exit 2 ;;
@@ -161,6 +175,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$MIGRATION_OPERATION" == tombstones-report || "$MIGRATION_OPERATION" == tombstones-apply ]]; then
+            args=("--profile=$MIGRATION_PROFILE")
+            if [[ "$MIGRATION_OPERATION" == tombstones-apply ]]; then
+              args+=(--apply --confirm=DELETE_EXPIRED_ERASURE_TOMBSTONES)
+            fi
+            npm run cleanup:erasure-tombstones -- "${args[@]}" | tee project-comment-migration-results.json
+            exit 0
+          fi
           args=("$MIGRATION_PROFILE")
           case "$MIGRATION_OPERATION" in
             report) ;;

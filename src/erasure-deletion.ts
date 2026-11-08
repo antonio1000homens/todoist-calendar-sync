@@ -1,5 +1,6 @@
 import { DeleteCommand, GetCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
+import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS, parseDeletionTombstoneComment,
+  writeProjectDeletionTombstone } from "./mapping-comments.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
@@ -13,6 +14,7 @@ export type ErasureDeletionProgress = {
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
+  attempt?: { id: string; startedAt: number };
 };
 
 type Dependencies = {
@@ -68,22 +70,43 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
   dependencies: Dependencies): Promise<{progress:ErasureDeletionProgress;complete:boolean}> {
   const {db,clients}=dependencies;
   const progress={...current};
+  // A successful step result advances the checkpoint and clears the durable
+  // write-ahead attempt claim. If the function throws, the caller retains the
+  // old claimed checkpoint and cannot repeat the provider mutation.
+  delete progress.attempt;
   const plan:ErasureActionPlan=operation.actionPlan;
   if(progress.stage==="comments") {
     const item=plan.comments[progress.commentIndex];
     if(!item) return {progress:{...progress,stage:"todoist"},complete:false};
     try {
       const comment=await clients.todoist.getComment(item.id);
-      if(comment.id!==item.id||typeof comment.content!=="string"||fingerprint(comment.content)!==item.digest) throw new ErasureGateDriftError();
-      validateComment(item.kind,comment.content,operation);
-      await clients.todoist.deleteComment(item.id);
-      try {
-        const remaining=await clients.todoist.getComment(item.id);
-        if(remaining.id!==item.id) throw new ErasureGateDriftError();
-        throw new Error("Todoist mapping comment remains after delete readback");
-      } catch(error) { if(!commentGone(error)) throw error; }
+      if(comment.id!==item.id||typeof comment.content!=="string") throw new ErasureGateDriftError();
+      // Todoist may have accepted the tombstone update even if DynamoDB did
+      // not persist this step's progress checkpoint. On redelivery, accept
+      // only the same exact comment with the same confirmed identity/aliases;
+      // all other content drift remains a hard stop.
+      if(item.kind==="project"&&parseDeletionTombstoneComment(comment)) {
+        const eventIds=(plan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+        await writeProjectDeletionTombstone(clients.todoist,{commentId:item.id,profile:operation.profile,
+          projectId:profiles[operation.profile].todoistProjectId,taskId:operation.target.taskId,eventIds});
+        return {progress:{...progress,commentIndex:progress.commentIndex+1},complete:false};
+      }
+      if(fingerprint(comment.content)!==item.digest) throw new ErasureGateDriftError();
+      if(item.kind==="task") {
+        validateComment(item.kind,comment.content,operation);
+        await clients.todoist.deleteComment(item.id);
+        try {
+          const remaining=await clients.todoist.getComment(item.id);
+          if(remaining.id!==item.id) throw new ErasureGateDriftError();
+          throw new Error("Todoist mapping comment remains after delete readback");
+        } catch(error) { if(!commentGone(error)) throw error; }
+      } else {
+        const eventIds=(plan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+        await writeProjectDeletionTombstone(clients.todoist,{commentId:item.id,profile:operation.profile,
+          projectId:profiles[operation.profile].todoistProjectId,taskId:operation.target.taskId,eventIds});
+      }
     } catch(error) {
-      if(!commentGone(error)) throw error;
+      if(item.kind==="project"||!commentGone(error)) throw error;
     }
     return {progress:{...progress,commentIndex:progress.commentIndex+1},complete:false};
   }
@@ -151,8 +174,18 @@ export async function verifyErasurePostflight(operation:ErasureOperation,depende
     {db:dependencies.db,clients:dependencies.clients,inspectFence:async()=>dependencies.inspectFence(operation.profile),
       newOperationId:()=>operation.operationId,ignoreOperationId:operation.operationId,
       allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId});
+  const projectId=profiles[operation.profile].todoistProjectId;
+  const projectComments=await dependencies.clients.todoist.listProjectComments(projectId,true);
+  const requiredAliases=(operation.actionPlan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+  const requiredComments=operation.actionPlan.projectCommentIds||[];
+  const markerComments=projectComments.map(comment=>({comment,marker:parseDeletionTombstoneComment(comment)}))
+    .filter(value=>value.marker?.profile===operation.profile&&value.marker.projectId===projectId
+      &&value.marker.taskId===operation.target.taskId&&Date.parse(value.marker.expiresAt)>Date.now());
+  const markerVerified=requiredComments.length>0&&requiredComments.every(id=>markerComments.some(({comment,marker})=>
+    comment.id===id&&requiredAliases.every(alias=>marker!.eventIds.includes(alias))));
   const providersAbsent=preview.blockers.length===0
-    && !preview.actionPlan.todoistTask && !preview.actionPlan.calendarEvent && preview.actionPlan.comments.length===0;
+    && !preview.actionPlan.todoistTask && !preview.actionPlan.calendarEvent && preview.actionPlan.comments.length===0
+    &&markerVerified;
   return {providersAbsent,stateAbsent:preview.inventory.length===0};
 }
 

@@ -144,7 +144,8 @@ function fixture({ unlinked = false, unmapped = false } = {}) {
     },
     async deleteEvent() {},
   };
-  const todoist = { async getTask() { return structuredClone(currentTodoistTask); } };
+  const todoist = { async listProjectComments() { return []; },
+    async getTask() { return structuredClone(currentTodoistTask); } };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
   return { state, sync, upserts };
 }

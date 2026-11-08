@@ -30,6 +30,7 @@ test("Calendar delta edits on archived occurrences never recreate Todoist tasks"
       async getEvent(id) { assert.equal(id, historicalMaster.id); getMaster += 1; return historicalMaster; },
     },
     todoist: {
+      async listProjectComments() { return []; },
       async listTasks() { throw new Error("Archived instances must never enter task matching"); },
       async upsertTask() { writes += 1; throw new Error("Historical task resurrection"); },
     },

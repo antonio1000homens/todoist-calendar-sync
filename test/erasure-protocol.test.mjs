@@ -7,6 +7,10 @@ import { StateRepository } from "../dist/repository.js";
 import { handler } from "../dist/worker.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { ManualInterventionService } from "../dist/manual-intervention.js";
+import { Todoist } from "../dist/providers.js";
+import { profiles } from "../dist/config.js";
+import { projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { SSMClient } from "@aws-sdk/client-ssm";
 
 test("lease transaction refuses an epoch read before a concurrent fence advance", async (t) => {
   const originalSend = documentClient.send;
@@ -214,7 +218,9 @@ test("erased-item webhook replay writes no identity-bearing completion receipt",
   const audit = t.mock.method(StateRepository.prototype, "audit", async () => {});
   const completed = t.mock.method(StateRepository.prototype, "markDeliveryCompleted", async () => {});
   t.mock.method(OrphanRecoveringSynchronizer.prototype, "process", async function (delivery) {
-    await this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+    const action=delivery.id.includes("project-comment")
+      ?"erasure_project_comment_replay_suppressed":"todoist_erased_item_replay_suppressed";
+    await this.state.audit(delivery.profile, action, {});
   });
   t.after(() => {
     documentClient.send = originalSend;
@@ -228,10 +234,14 @@ test("erased-item webhook replay writes no identity-bearing completion receipt",
     receivedAt: new Date().toISOString(), headers: {}, erasureEpoch: 1,
     body: JSON.stringify({ event_name: "item:updated", event_data: { id: "erased-task-id" } }),
   };
-  const result = await handler({ Records: [{ messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} }] }, { awsRequestId: "request-erased" });
+  const projectCommentDelivery={...delivery,id:"todoist-webhook-project-comment"};
+  const result = await handler({ Records: [
+    { messageId: "message-erased", body: JSON.stringify(delivery), attributes: {}, messageAttributes: {} },
+    { messageId: "message-project-comment", body: JSON.stringify(projectCommentDelivery), attributes: {}, messageAttributes: {} },
+  ] }, { awsRequestId: "request-erased" });
   assert.deepEqual(result.batchItemFailures, []);
-  assert.equal(audit.mock.callCount(), 1);
-  assert.deepEqual(audit.mock.calls[0].arguments[2], {});
+  assert.equal(audit.mock.callCount(), 2);
+  assert.deepEqual(audit.mock.calls.map(call=>call.arguments[2]), [{},{}]);
   assert.equal(completed.mock.callCount(), 0);
 });
 
@@ -267,6 +277,99 @@ test("failed erased-item suppression audit cannot create an identity-bearing inc
   assert.deepEqual(result.batchItemFailures, [{ itemIdentifier: "message-erased" }]);
   assert.equal(completed.mock.callCount(), 0);
   assert.equal(failureReports.mock.callCount(), 0);
+});
+
+test("project-comment tombstone suppresses deleted Todoist webhooks before manual review or DynamoDB writes",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    table:process.env.STATE_TABLE_NAME,googlePrefix:process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX,
+    todoistPrefix:process.env.TODOIST_TOKEN_PARAMETER_PREFIX};
+  process.env.ERASURE_PROTOCOL_VERSION="1";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.STATE_TABLE_NAME="test-tombstone-state";
+  process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX="/test/tombstone-google";
+  process.env.TODOIST_TOKEN_PARAMETER_PREFIX="/test/tombstone-todoist";
+  const originalSend=documentClient.send;
+  let writerLeaseHeld=false;
+  documentClient.send=async command=>{
+    if(command.constructor.name.includes("Get")&&command.input.Key.sk==="EPOCH")return {Item:{epoch:0}};
+    if(command.constructor.name.includes("TransactWrite")){
+      const items=command.input.TransactItems||[];
+      assert.ok(items.some(item=>item.ConditionCheck?.Key?.sk==="FENCE"));
+      assert.ok(items.some(item=>item.Put?.Item?.kind==="writer"));
+      writerLeaseHeld=true;
+      return {};
+    }
+    if(command.constructor.name.includes("Delete")&&command.input.Key.sk.startsWith("WRITER#")){
+      assert.equal(writerLeaseHeld,true,"the profile lease remains held through tombstone suppression");
+      writerLeaseHeld=false;
+      return {};
+    }
+    throw new Error(`Unexpected state access in tombstone worker test: ${command.constructor.name}`);
+  };
+  t.mock.method(SSMClient.prototype,"send",async command=>{
+    if(command.input.Name==="/test/tombstone-google/home")
+      return {Parameter:{Value:JSON.stringify({client_id:"test",client_secret:"test",refresh_token:"test"})}};
+    if(command.input.Name==="/test/tombstone-todoist/home")return {Parameter:{Value:"test-token"}};
+    throw new Error("unexpected secure parameter read in tombstone test");
+  });
+  const projectId=profiles.home.todoistProjectId;
+  const createdAt=new Date().toISOString();
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
+    taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt,
+    expiresAt:projectDeletionTombstoneExpiry(createdAt)});
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>{
+    assert.equal(writerLeaseHeld,true,"fresh tombstone lookup must be serialized under the writer lease");
+    return [{id:"tombstone-comment",project_id:projectId,content}];
+  });
+  const audits=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const manual=t.mock.method(ManualInterventionService.prototype,"interceptTodoistDeletion",async()=>{
+    throw new Error("manual interception must not run before tombstone admission");
+  });
+  const syncProcess=t.mock.method(OrphanRecoveringSynchronizer.prototype,"process",async()=>{
+    throw new Error("synchronizer must not run for an active tombstone");
+  });
+  t.after(()=>{
+    documentClient.send=originalSend;
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+    if(previous.table===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=previous.table;
+    if(previous.googlePrefix===undefined)delete process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX;else process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX=previous.googlePrefix;
+    if(previous.todoistPrefix===undefined)delete process.env.TODOIST_TOKEN_PARAMETER_PREFIX;else process.env.TODOIST_TOKEN_PARAMETER_PREFIX=previous.todoistPrefix;
+  });
+  const delivery={id:"stale-deleted-task",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:deleted",
+      event_data:{id:"erased-task-id",is_deleted:true}})};
+  const result=await handler({Records:[{messageId:"stale-delete-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"tombstone-delete-request"});
+  assert.deepEqual(result.batchItemFailures,[]);
+  assert.equal(audits.mock.callCount(),1);
+  assert.deepEqual(audits.mock.calls[0].arguments.slice(1),["erasure_project_comment_replay_suppressed",{side:"todoist"}]);
+  assert.equal(completed.mock.callCount(),0);
+  assert.equal(manual.mock.callCount(),0);
+  assert.equal(syncProcess.mock.callCount(),0);
+  assert.equal(writerLeaseHeld,false,"the writer lease is released after the delivery is suppressed");
+});
+
+test("tombstone lookup failure retries without writing task identity or review state",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
+  process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>{throw new Error("Todoist unavailable");});
+  const audit=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const report=t.mock.method(ManualInterventionService.prototype,"reportDeliveryFailure",async()=>{});
+  t.after(()=>{
+    if(previous.protocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous.protocol;
+    if(previous.barrier===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous.barrier;
+  });
+  const delivery={id:"stale-deleted-task",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:JSON.stringify({event_name:"item:deleted",
+      event_data:{id:"erased-task-id",is_deleted:true}})};
+  const result=await handler({Records:[{messageId:"lookup-failure-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"tombstone-lookup-failure"});
+  assert.deepEqual(result.batchItemFailures,[{itemIdentifier:"lookup-failure-message"}]);
+  assert.equal(audit.mock.callCount(),0);
+  assert.equal(completed.mock.callCount(),0);
+  assert.equal(report.mock.callCount(),0);
 });
 
 test("worker rejects replay barrier without lease protocol before any DynamoDB write",async t=>{

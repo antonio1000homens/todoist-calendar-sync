@@ -1,11 +1,35 @@
-# #243 post-write erased-identity replay barrier: draft implementation and rollout gate
+# #349 temporary project-comment deletion markers
 
-**State:** forward erasure completion is marker-gated; post-write recovery remains
-unavailable. Do **not** enable the barrier, release a post-write fence, or close
-#243/#239/#113 from this branch. The current
-`ErasureRecoveryService` must continue rejecting fully deleted and partial
-provider outcomes. In particular, a 404 or completed deletion step is not proof
-that a delayed ingress event cannot recreate the identity.
+**Current policy (8 November 2026):** do not retain deleted task identity in
+DynamoDB. An explicitly confirmed erasure rewrites its exact Todoist project
+mapping comment into a temporary marker containing the task ID, exact known
+Calendar event IDs, and an 18-day expiry. The project comment remains available
+after the Calendar event is deleted. The erasure transaction removes the
+identity-bearing DynamoDB operation/state and releases its fence only after
+fresh provider readback confirms the marker.
+
+The primary Todoist webhook and Google Calendar delta paths check active project
+markers before processing stale updates. The 18-day window covers the live
+four-day FIFO sync queue plus the fourteen-day FIFO DLQ; SQS resets message age
+when a FIFO message moves to its DLQ. Operator redrive resets retention again,
+and a manually replayed payload after marker expiry can no longer be
+distinguished by retained identity. Expired comments are removed only
+by the operator-run report/apply workflow; there is no automatic cleanup
+schedule. Cleanup never changes the separate seven-day completed-task lifecycle.
+The expiry clock starts when the exact existing project comment is rewritten;
+the update must preserve that comment ID and fails closed rather than creating
+a replacement comment. A webhook suppressed by the marker receives an
+identity-free audit outcome and no identity-bearing DynamoDB completion receipt.
+
+**Post-write recovery is still unavailable.** Keep an uncertain/partial
+operation fenced. #347 invocation coverage, qualified/historical Lambda review,
+complete writer admission, DLQ review and disposable Work-profile acceptance
+remain release blockers. Merged PR #402’s production deployment was skipped;
+no AWS replay-barrier or HMAC-key configuration was changed.
+
+The remaining content in this document describes the earlier permanent
+DynamoDB/HMAC design. It is historical context only and is superseded by this
+policy; do not deploy or re-enable that design.
 
 ## Bounded known-identity recovery (#349)
 
