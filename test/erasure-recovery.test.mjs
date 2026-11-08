@@ -403,29 +403,17 @@ function fullyDeletedPostWriteFixture(options={}) {
   f.external.snapshot=snapshot;
   return f;
 }
-function enablePostwriteReview(t){
-  const previous=process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
-  process.env.ERASURE_POSTWRITE_REVIEW_VERSION="1";
-  t.after(()=>{if(previous===undefined)delete process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
-    else process.env.ERASURE_POSTWRITE_REVIEW_VERSION=previous;});
-}
 const typedReview={operationId:"op-recovery",profile:"work",phrase:"REVIEW AND KEEP FENCED"};
 
-test("post-write review token is disabled without explicit rollout and never changes the fence",async()=>{
-  const previous=process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
-  delete process.env.ERASURE_POSTWRITE_REVIEW_VERSION;
+test("post-write review token needs no feature flag and never changes the fence",async()=>{
   const f=fullyDeletedPostWriteFixture();
-  try {
-    await assert.rejects(f.service.issuePostWriteReviewToken("op-recovery","operator"),/disabled/);
-    assert.equal(f.external.writes.length,0);
-    assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
-  } finally {
-    if(previous!==undefined)process.env.ERASURE_POSTWRITE_REVIEW_VERSION=previous;
-  }
+  const issued=await f.service.issuePostWriteReviewToken("op-recovery","operator");
+  assert.equal(issued.releaseAllowed,false);
+  assert.equal(f.external.writes.length,1,"only a short-lived review token is written");
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
 });
 
-test("single-use post-write review token binds fresh evidence and records only a still-fenced disposition",async t=>{
-  enablePostwriteReview(t);
+test("single-use post-write review token binds fresh evidence and records only a still-fenced disposition",async()=>{
   const f=fullyDeletedPostWriteFixture();
   const issued=await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
   assert.equal(issued.confirmationId,postwriteReviewToken);
@@ -470,8 +458,7 @@ test("single-use post-write review token binds fresh evidence and records only a
   await assert.rejects(f.service.issuePostWriteReviewToken("op-recovery","operator-1"),/fresh, fully deleted/);
 });
 
-test("expired token and provider snapshot drift are rejected without consuming the token",async t=>{
-  enablePostwriteReview(t);
+test("expired token and provider snapshot drift are rejected without consuming the token",async()=>{
   const f=fullyDeletedPostWriteFixture();
   await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
   f.postwriteToken.expiresAtMs=Date.now()-1000;
@@ -486,8 +473,7 @@ test("expired token and provider snapshot drift are rejected without consuming t
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
 });
 
-test("fence, epoch, lease, mapping, and original selection drift reject token use",async t=>{
-  enablePostwriteReview(t);
+test("fence, epoch, lease, mapping, and original selection drift reject token use",async()=>{
   for(const change of [
     f=>{f.external.control.find(x=>x.sk==="FENCE").operationId="another-operation";},
     f=>{f.external.control.find(x=>x.sk==="EPOCH").epoch=8;},
@@ -507,8 +493,7 @@ test("fence, epoch, lease, mapping, and original selection drift reject token us
   }
 });
 
-test("conditional review transaction failure leaves token issued and fence untouched",async t=>{
-  enablePostwriteReview(t);
+test("conditional review transaction failure leaves token issued and fence untouched",async()=>{
   const f=fullyDeletedPostWriteFixture({failPostwriteTransaction:true});
   await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
   await assert.rejects(

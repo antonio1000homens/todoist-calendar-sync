@@ -60,10 +60,6 @@ const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
-function postwriteReviewEnabled():void {
-  if(process.env.ERASURE_POSTWRITE_REVIEW_VERSION!=="1")
-    throw Object.assign(new Error("Post-write review token feature is disabled; profile remains fenced"),{status:409});
-}
 function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
   const {operation,preview,fingerprint}=inspection;
   return digest({mode:"post_write",fingerprint,epoch:preview.epoch,profile:operation.profile,
@@ -229,7 +225,6 @@ export class ErasureRecoveryService {
   async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
     const inspection=await this.inspect(id);
     return {...assessPostWriteRecovery(inspection.operation,inspection.preview),
-      reviewEnabled:process.env.ERASURE_POSTWRITE_REVIEW_VERSION==="1",
       ...(inspection.operation.postwriteReview?.status==="reviewed_fenced"
         ?{reviewStatus:"reviewed_fenced" as const}:{})};
   }
@@ -248,7 +243,6 @@ export class ErasureRecoveryService {
   async issuePostWriteReviewToken(id:string,operator:string):Promise<{
     confirmationId:string;expiresAt:number;operationId:string;profile:string;releaseAllowed:false;
   }> {
-    postwriteReviewEnabled();
     if(!operator||operator.length>256)throw Object.assign(new Error("Invalid operator identity"),{status:400});
     const {inspection,postflightFingerprint}=await this.inspectPostWriteCandidate(id);
     const confirmationId=this.newToken(),now=Date.now(),expiresAt=now+5*60_000;
@@ -268,7 +262,6 @@ export class ErasureRecoveryService {
    * acknowledgement. No worker, provider, mapping, marker or profile changes. */
   async acknowledgePostWriteReview(id:string,confirmationId:string,operator:string,
     typed:{operationId:string;profile:string;phrase:string}):Promise<{status:"reviewed_fenced";releaseAllowed:false}> {
-    postwriteReviewEnabled();
     if(!idPattern.test(id)||!uuid.test(confirmationId)||!operator||operator.length>256
       ||typed?.operationId!==id||typed?.profile===undefined
       ||typed.phrase!==postwriteReviewPhrase)

@@ -348,9 +348,8 @@ fence, epoch and journal, that persists only
 confirmation row. The operator identifier is removed when its token is consumed. The expired token can be replaced before consumption;
 a consumed token cannot be reissued or replayed.
 
-**Explicit rollout gate:** `ERASURE_POSTWRITE_REVIEW_VERSION` defaults to
-off. No deployment/template change enables it. Even if set to `1`,
-the API can only record an operator's review while preserving the original
+No additional rollout flag is needed to record a fenced evidence review. The API
+can only record an operator's review while preserving the original
 `review_required` operation, all provider data/absence evidence, the
 existing erasure fence, writer mappings and the monotonic epoch.
 
