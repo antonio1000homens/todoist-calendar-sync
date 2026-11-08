@@ -20,6 +20,14 @@ export interface ErasurePreviewRequest {
   deleteCalendar: boolean;
 }
 
+/** Exact direct-read results for the configured profile only.
+ * These statuses NEVER assert that unknown shared/legacy Calendars are empty. */
+export interface KnownTargetReadback {
+  todoist: "present" | "absent" | "unknown";
+  calendar: "present" | "absent" | "unknown" | "not_recorded";
+  configuredCalendarLink: "present" | "not_found";
+}
+
 export interface ErasurePreviewResult {
   operationId: string;
   profile: Profile;
@@ -30,6 +38,7 @@ export interface ErasurePreviewResult {
   inventoryDigest: string;
   inventory: ErasureOperation["inventory"];
   actionPlan: NonNullable<ErasureOperation["actionPlan"]>;
+  knownTargetReadback?: KnownTargetReadback;
   backupRetentionNotice: string;
   classificationCounts: Record<string, number>;
   blockers: string[];
@@ -245,6 +254,13 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     inventory: plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
       digest: record.digest, classification: record.classification })),
     actionPlan,
+    // From fresh exact provider GETs only. The link lookup is limited to the
+    // configured Calendar and cannot rule out unrecorded historical copies.
+    knownTargetReadback: {
+      todoist: task ? "present" : taskMissing ? "absent" : "unknown",
+      calendar: !target.eventId ? "not_recorded" : event ? "present" : eventMissing ? "absent" : "unknown",
+      configuredCalendarLink: linked ? "present" : "not_found",
+    },
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
     ...(crossProfileEvidence?{crossProfileEvidence}:{}),
