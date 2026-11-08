@@ -395,11 +395,20 @@ export class ErasureOperationStore {
         }
       }
     } catch(error) {
-      if(error instanceof ErasureGateDriftError) {
+      // Once provider deletion has been attempted, even a transient-looking
+      // failure may mean the remote mutation succeeded but its response was
+      // lost. Never retry the same destructive step from an old checkpoint.
+      // Persist an actionable, fenced review state instead of silently
+      // rescheduling. Ordinary pre-deletion and mapping-restore polling keep
+      // their existing retry behaviour.
+      const ambiguousProviderWrite=operation.status==="deleting"
+        &&(current.phase==="delete"||current.phase==="verify_deletion");
+      if(error instanceof ErasureGateDriftError||ambiguousProviderWrite) {
         next={...current,nextRunAt:now,lastError:ERASURE_REVIEW_REQUIRED_MESSAGE};
         nextStatus="review_required";
       } else {
-      next={...current,nextRunAt:now+current.pollMs,lastError:error instanceof Error?error.message:String(error)};
+        next={...current,nextRunAt:now+current.pollMs,
+          lastError:error instanceof Error?error.message:String(error)};
       }
     }
     await this.#persistLifecycle(operation,next,nextStatus,now);
