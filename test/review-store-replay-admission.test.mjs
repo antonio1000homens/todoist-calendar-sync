@@ -83,7 +83,7 @@ test("mapping snapshot recurrence aliases are checked before a decision is persi
   const mapping = {profile:"home",taskId:"safe-task",eventId:"safe-occurrence",masterEventId:"erased-master-alias",
     activeInstanceId:"safe-occurrence",seriesId:"erased-master-alias",updatedAt:new Date().toISOString()};
   await assert.rejects(new ReviewStore().observeDecision(decision({mappingSnapshot:mapping})), ErasureReplayBlockedError);
-  assert.equal(calls.length, 3, "both task and occurrence are checked before the erased master blocks persistence");
+  assert.equal(calls.length, 5, "task, source, and legacy/current master markers are checked before persistence is blocked");
 });
 
 test("queued repair admission walks embedded decision and review aliases", async t => {
@@ -102,7 +102,7 @@ test("queued repair admission walks embedded decision and review aliases", async
       masterEventId:"erased-embedded-master"}}},
   };
   await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
-  assert.equal(calls.length, 3, "embedded historical aliases are checked before the operation can resume");
+  assert.equal(calls.length, 5, "embedded historical aliases are checked before the operation can resume");
 });
 
 for (const [field, erasedId] of [
@@ -139,7 +139,7 @@ test("review admission checks recurring master aliases carried by history plans"
     case:{decision:{profile:"home",elapsedCalendarHistoryPlan:{taskId:"safe-task",eventId:"safe-event",
       recurringMasterId:"erased-history-master"}}}};
   await assert.rejects(assertRepairPreviewReplayAdmission(preview),ErasureReplayBlockedError);
-  assert.equal(calls.length,3,"the erased historical master is admitted before any repair state is read or written");
+  assert.equal(calls.length,5,"the erased historical master is admitted before any repair state is read or written");
 });
 
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {
@@ -186,7 +186,7 @@ test("case status transitions refuse to mutate a case that references an erased 
     return {};
   });
   await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"no case status write follows the marker hit");
+  assert.equal(calls.length,2,"no case status write follows the legacy marker hit");
 });
 
 test("deferred deletion cleanup refuses to update a case that references an erased identity", async t => {
@@ -202,7 +202,7 @@ test("deferred deletion cleanup refuses to update a case that references an eras
     return {};
   });
   await assert.rejects(store.noteVerifiedDeletionCleanupDeferred("case-1",new Date().toISOString()),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"no deferred-cleanup status write follows the marker hit");
+  assert.equal(calls.length,2,"no deferred-cleanup status write follows the legacy marker hit");
 });
 
 test("verified-deleted case closure refuses an erased identity before cleanup reads", async t => {
