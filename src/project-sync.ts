@@ -208,6 +208,12 @@ export class ProjectAwareSynchronizer {
       const currentProfile = profileForTodoistProject(task.project_id);
       if (currentProfile === delivery.profile) return false;
       const mapping = await this.state.getMappingByEvent(delivery.profile, orphan.eventId);
+      if (mapping?.todoistPhaseBVersion === 1) {
+        await this.state.audit(delivery.profile, "todoist_phase_b_cross_profile_move_requires_review", {
+          taskId: orphan.taskId, eventId: mapping.eventId, toProfile: currentProfile,
+        });
+        return true;
+      }
       await this.state.putCalendarProjectionTombstone(
         delivery.profile,
         orphan.taskId,
@@ -455,6 +461,18 @@ export class ProjectAwareSynchronizer {
       && transition.action === "create_projection"
       && transition.toProfile,
     );
+
+    // Moving the backing Calendar master across profile calendars needs its
+    // own deterministic native-master copy/readback protocol. Keep the source
+    // mapping/master intact until that migration can be verified; never let
+    // the ordinary rolling projection writer flatten this Phase B recurrence.
+    if (mapping?.todoistPhaseBVersion === 1
+      && ["move_projection", "delete_projection", "create_projection"].includes(transition.action)) {
+      return this.state.audit(mapping.profile, "todoist_phase_b_cross_profile_move_requires_review", {
+        taskId: task.id, eventId: mapping.masterEventId, fromProfile: mapping.profile,
+        toProfile: transition.toProfile, reason: "native_master_copy_not_implemented",
+      });
+    }
 
     if (transition.action === "skip") {
       return this.state.audit(delivery.profile, "todoist_calendar_skipped_unmapped_project", {

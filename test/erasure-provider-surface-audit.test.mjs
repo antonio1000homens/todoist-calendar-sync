@@ -24,7 +24,7 @@ async function sourceFiles(dir=sourceRoot) {
 // to either provider without updating this inventory fails closed in CI.
 const inventory={
   calendar:{
-    writes:["createFutureMasterOnce","createRepairEventOnce","deleteEvent","deleteEventIfUnchanged",
+    writes:["createFutureMasterOnce","createTodoistPhaseBNativeMasterOnce","createRepairEventOnce","deleteEvent","deleteEventIfUnchanged",
       "patchEventMetadataIfUnchanged","updateSharedEventPropertiesIfUnchanged","upsertEvent","upsertEventIfUnchanged"],
     controls:["stopWatch","watch"],
     reads:["findByTodoistTaskId","getEvent","getTimeZone","listAllEventsForErasureAudit",

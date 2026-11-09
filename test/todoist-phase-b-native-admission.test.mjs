@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "../dist/todoist-phase-b-native-admission.js";
 import { todoistPhaseBCandidate, verifyTodoistPhaseBReadback } from "../dist/todoist-calendar-phase-b.js";
+import { GoogleCalendar } from "../dist/providers.js";
 
 const at = "2026-11-08T09:20:00Z";
 const project = "profile-project-id";
@@ -125,4 +126,43 @@ test("strict Phase B Calendar provider admission requires exact master and insta
   for(const change of bad)
     assert.equal(verifyInitialPhaseBCalendarWrite(plan,source,{...clean,...change}).accepted,false,
       JSON.stringify(change));
+});
+
+test("Phase B master create uses its deterministic Calendar identity and never creates a duplicate on retry", async()=>{
+  const taskId="task-290", eventId="ab".repeat(16);
+  const event={id:eventId,status:"confirmed",start:{date:"2027-01-02"},end:{date:"2027-01-03"},
+    recurrence:["RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27"],extendedProperties:{shared:{
+      taskId,syncRecurrenceOwner:"todoist",todoistAnchorStart:"2027-01-02",todoistPhaseBVersion:"1",
+    }}};
+  const calls=[];
+  const previous=globalThis.fetch;
+  globalThis.fetch=async (input,init={})=>{
+    const url=String(input); calls.push({url,init});
+    if(url==="https://oauth2.googleapis.com/token")
+      return new Response(JSON.stringify({access_token:"test-token"}),{status:200});
+    if(url.endsWith("/events") && init.method==="POST") return new Response(JSON.stringify(event),{status:200});
+    if(url.endsWith(`/events/${eventId}`)) return new Response(JSON.stringify(event),{status:200});
+    throw new Error(`Unexpected Calendar request ${init.method||"GET"} ${url}`);
+  };
+  try {
+    const calendar=new GoogleCalendar({client_id:"client",client_secret:"secret",refresh_token:"refresh"},"calendar");
+    const first=await calendar.createTodoistPhaseBNativeMasterOnce(event);
+    assert.equal(first.created,true);
+    assert.equal(first.event.id,eventId);
+    // Simulate a lost first response: a second deterministic POST conflicts,
+    // then reads back the exact identity instead of inserting another master.
+    let postCount=0;
+    globalThis.fetch=async (input,init={})=>{
+      const url=String(input); calls.push({url,init});
+      if(url==="https://oauth2.googleapis.com/token") return new Response(JSON.stringify({access_token:"test-token"}),{status:200});
+      if(url.endsWith("/events") && init.method==="POST" && postCount++===0) return new Response("conflict",{status:409});
+      if(url.endsWith(`/events/${eventId}`)) return new Response(JSON.stringify(event),{status:200});
+      throw new Error(`Unexpected Calendar request ${init.method||"GET"} ${url}`);
+    };
+    const retryCalendar=new GoogleCalendar({client_id:"client",client_secret:"secret",refresh_token:"refresh"},"calendar");
+    const retry=await retryCalendar.createTodoistPhaseBNativeMasterOnce(event);
+    assert.equal(retry.created,false);
+    assert.equal(retry.event.id,eventId);
+    assert.equal(calls.filter(call=>call.url.endsWith("/events")&&call.init.method==="POST").length,2);
+  } finally { globalThis.fetch=previous; }
 });

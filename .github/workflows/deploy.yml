@@ -50,6 +50,8 @@ jobs:
       # #290: true by operator request; set production var PHASE_C_NATIVE_ENABLED=false
       # and dispatch deployment to roll back new native Calendar->Todoist creation.
       PHASE_C_NATIVE_ENABLED: ${{ vars.PHASE_C_NATIVE_ENABLED || 'true' }}
+      # #389 remains off until disposable provider acceptance and rollback pass.
+      PHASE_B_NATIVE_ENABLED: ${{ vars.PHASE_B_NATIVE_ENABLED || 'false' }}
       # A merge triggers automatic production deployment; lowering live RCU/WCU
       # requires a separate operator approval in the production environment.
       DYNAMODB_CAPACITY_REDUCTION_APPROVED: ${{ vars.DYNAMODB_CAPACITY_REDUCTION_APPROVED }}

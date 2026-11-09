@@ -18,7 +18,7 @@ type Side="calendar"|"todoist";
 /** Identity-bearing provider mutation surface reviewed for replay admission. */
 export const REPLAY_GUARDED_PROVIDER_WRITES={
   calendar:[
-  "createFutureMasterOnce","upsertEvent","patchEventMetadataIfUnchanged",
+  "createFutureMasterOnce","createTodoistPhaseBNativeMasterOnce","upsertEvent","patchEventMetadataIfUnchanged",
   "createRepairEventOnce","upsertEventIfUnchanged",
   "updateSharedEventPropertiesIfUnchanged","deleteEvent","deleteEventIfUnchanged",
   ],
@@ -35,7 +35,7 @@ function ids(values:unknown[]):string[] {
   return [...new Set(values.filter((value):value is string=>typeof value==="string"&&value.length>0))];
 }
 function eventIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdentity {
-  const objectMethods=new Set(["createFutureMasterOnce","upsertEvent","createRepairEventOnce","upsertEventIfUnchanged"]);
+  const objectMethods=new Set(["createFutureMasterOnce","createTodoistPhaseBNativeMasterOnce","upsertEvent","createRepairEventOnce","upsertEventIfUnchanged"]);
   const event=objectMethods.has(method) ? args[0] as CalendarEvent|undefined : undefined;
   const shared=method==="updateSharedEventPropertiesIfUnchanged"
     ? args[2] as Record<string,string|null>|undefined

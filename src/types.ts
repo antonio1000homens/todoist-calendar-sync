@@ -219,6 +219,8 @@ export interface Mapping {
   syncedDescription?: string;
   /** True when the Calendar-owned mirror is one native recurring Todoist task. */
   calendarNativeRecurring?: boolean;
+  /** Versioned marker for a verified Todoist-owned native Phase B Calendar master. */
+  todoistPhaseBVersion?: 1;
   updatedAt: string;
 }
 
