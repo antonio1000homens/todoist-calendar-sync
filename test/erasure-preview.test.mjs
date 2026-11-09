@@ -127,6 +127,26 @@ test("deletion preview captures profile and Calendar-scoped event aliases before
   assert.deepEqual(preview.blockers,[]);
 });
 
+test("erasure preview binds completed delivery identity scrubbing to post-tombstone cleanup",async()=>{
+  const receipt={pk:"DELIVERY#exact",sk:"COMPLETED",profile:"home",kind:"calendar",
+    identityRefs:{taskIds:["task-123"],eventIds:["event-123"],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
+  const comment={id:"project-comment",content:serializeMappingComment({profile:"home",taskId:"task-123",
+    eventId:"event-123",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[comment],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId:"task-123",eventId:"event-123",deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.deepEqual(preview.blockers,[]);
+  assert.equal(preview.inventory.some(item=>item.type==="DELIVERY"&&item.key.sk==="COMPLETED"
+    &&item.receiptCleanup==="scrub_identity_refs"&&/^[a-f0-9]{64}$/.test(item.scrubbedDigest)),true);
+  assert.equal(preview.actionPlan.scrubCompletedDeliveryIdentityRefsAfterTombstone,true);
+  assert.equal(preview.receiptSanitizationRequirements.length,1);
+});
+
 test("recorded profile moves are retained in the alias manifest and block cross-profile deletion",async()=>{
   const db={send:async command=>command.constructor.name==="ScanCommand"
     ?{Items:[{pk:"EVENT#antonio#task-123",sk:"event-1",profile:"antonio",taskId:"task-123",eventId:"moved-event"}]}

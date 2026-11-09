@@ -4,7 +4,7 @@ import { executeErasureDeletionStep } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
-  serializeMappingComment } from "../dist/mapping-comments.js";
+  serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
 
 const baseOperation={operationId:"erase-1",profile:"home",target:{taskId:"task-1",eventId:"event-1",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[],actionPlan:{todoistTask:{id:"task-1",digest:fingerprint({id:"task-1",project_id:"test-home-project"})},comments:[]}};
@@ -65,7 +65,7 @@ test("a repeated project-comment deletion step accepts only its exact tombstone 
   assert.equal(comment.id,"project-1","the existing project comment ID is preserved");
 });
 
-test("provider deletion steps leave the replay identity in Todoist and remove every inventoried identity row from DynamoDB",async()=>{
+test("provider deletion leaves replay identity in Todoist and scrubs completed receipt identities from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
   let comment={id:"project-1",project_id:"test-home-project",content:original};
@@ -76,7 +76,9 @@ test("provider deletion steps leave the replay identity in Todoist and remove ev
     {pk:"TASK#home#task-1",sk:"MAPPING",taskId:"task-1",eventId:"event-1",profile:"home"},
     {pk:"BASELINE#home#TASK#task-1",sk:"RECONCILE",taskId:"task-1",lastEventId:"event-1",profile:"home"},
     {pk:"CANONICAL#home#calendar#event-1",sk:"EVENT",eventId:"event-1",profile:"home"},
-    {pk:"DELIVERY#task-1:event-1",sk:"COMPLETED",identityRefs:{taskIds:["task-1"],eventIds:["event-1"]}},
+    {pk:"DELIVERY#opaque-receipt",sk:"COMPLETED",profile:"home",kind:"calendar",
+      identityRefs:{taskIds:["task-1"],eventIds:["event-1"],seriesIds:[]},
+      completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000},
     {pk:"AUDIT#home#event-1",sk:"STATE",detail:{taskId:"task-1",eventId:"event-1"}},
   ];
   const unrelatedRow={pk:"TASK#home#unrelated",sk:"MAPPING",taskId:"unrelated-task",eventId:"unrelated-event",profile:"home"};
@@ -94,6 +96,13 @@ test("provider deletion steps leave the replay identity in Todoist and remove ev
   const db={async send(command){
     const input=command.input;
     if(command.constructor.name.includes("Get"))return {Item:rows.get(`${input.Key.pk}|${input.Key.sk}`)};
+    if(command.constructor.name.includes("Update")){
+      const key=`${input.Key.pk}|${input.Key.sk}`,current=rows.get(key);
+      assert.ok(current,"the inventoried receipt is present until its identity-scrub step");
+      rows.set(key,{...current,identityRefs:{...current.identityRefs,
+        taskIds:input.ExpressionAttributeValues[":tasks"],eventIds:input.ExpressionAttributeValues[":events"]}});
+      return {};
+    }
     if(command.constructor.name.includes("Delete")){
       const key=`${input.Key.pk}|${input.Key.sk}`;
       const current=rows.get(key);
@@ -105,11 +114,14 @@ test("provider deletion steps leave the replay identity in Todoist and remove ev
   }};
   const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
     selectedActions:{deleteTodoist:true,deleteCalendar:true},
-    inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only"})),
+    inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only",
+      ...(row.pk.startsWith("DELIVERY#")?{receiptCleanup:"scrub_identity_refs",
+        scrubbedDigest:fingerprint({...row,identityRefs:{...row.identityRefs,taskIds:[],eventIds:[]}})}:{})})),
     actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
       knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+      projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
       comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
-  const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({leases:[]})};
+  const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})};
   let progress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")};
   while(progress.stage!=="verify"){
     const result=await executeErasureDeletionStep(operation,progress,dependencies);
@@ -120,8 +132,10 @@ test("provider deletion steps leave the replay identity in Todoist and remove ev
   assert.deepEqual(tombstone?.eventIds,["event-1"]);
   assert.equal(task,undefined);
   assert.equal(event.status,"cancelled");
-  assert.equal(rows.size,1,"all inventoried identity rows are removed while unrelated DynamoDB state remains");
+  assert.equal(rows.size,2,"identity-bearing mappings are removed while unrelated state and an identity-free receipt remain");
   assert.equal(rows.get(`${unrelatedRow.pk}|${unrelatedRow.sk}`),unrelatedRow);
+  const receipt=[...rows.values()].find(row=>row.pk.startsWith("DELIVERY#"));
+  assert.deepEqual(receipt.identityRefs,{taskIds:[],eventIds:[],seriesIds:[]});
   const remainingDynamoRows=JSON.stringify([...rows.values()]);
   assert.doesNotMatch(remainingDynamoRows,/task-1|event-1/,
     "DynamoDB no longer contains the deleted task or Calendar event identity");
@@ -160,6 +174,46 @@ test("state deletion uses an exact conditional match for every inventoried attri
   assert.match(deleteInput.ConditionExpression,/#a\d+ = :v\d+/);
   assert.ok(Object.values(deleteInput.ExpressionAttributeNames).includes("revision"));
   assert.ok(Object.values(deleteInput.ExpressionAttributeValues).includes(7));
+});
+
+test("completed receipt identity scrubbing requires the confirmed active project tombstone on every step",async()=>{
+  const receipt={pk:"DELIVERY#receipt",sk:"COMPLETED",profile:"home",kind:"todoist",
+    identityRefs:{taskIds:["task-1"],eventIds:["event-1"],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const scrubbed={...receipt,identityRefs:{...receipt.identityRefs,taskIds:[],eventIds:[]}};
+  const operation={...baseOperation,inventory:[{type:"DELIVERY",key:{pk:receipt.pk,sk:receipt.sk},
+    digest:fingerprint(receipt),scrubbedDigest:fingerprint(scrubbed),receiptCleanup:"scrub_identity_refs",
+    classification:"selected-only"}],actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+    comments:[{id:"project-1",kind:"project",digest:fingerprint("mapping")}]} };
+  const db={send:async command=>command.constructor.name.includes("Get")?{Item:receipt}:({})};
+  const noMarker={todoist:{getComment:async()=>({id:"project-1",project_id:"test-home-project",content:"mapping"})},calendar:{}};
+  await assert.rejects(executeErasureDeletionStep(operation,{stage:"state",commentIndex:0,stateIndex:0,startedAt:1},
+    {db,clients:noMarker,inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})}),ErasureGateDriftError);
+
+  const createdAt=new Date().toISOString();
+  const marker=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId:"test-home-project",
+    taskId:"task-1",eventIds:["event-1"],createdAt,
+    expiresAt:new Date(Date.parse(createdAt)+PROJECT_DELETION_TOMBSTONE_RETENTION_MS).toISOString()});
+  let current=receipt,writeApplied=false;
+  const clients={todoist:{getComment:async()=>({id:"project-1",project_id:"test-home-project",
+    content:marker})},calendar:{}};
+  const guardedDb={send:async command=>{
+    if(command.constructor.name.includes("Get"))return {Item:current};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      current={...current,identityRefs:{...current.identityRefs,taskIds:values[":tasks"],eventIds:values[":events"]}};
+      writeApplied=true;
+      throw new Error("simulated lost DynamoDB update acknowledgement");
+    }
+    throw new Error("Unexpected database command");
+  }};
+  const result=await executeErasureDeletionStep(operation,{stage:"state",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:guardedDb,clients,inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})});
+  assert.equal(result.progress.stateIndex,1);
+  assert.equal(writeApplied,true);
+  assert.deepEqual(current.identityRefs,{taskIds:[],eventIds:[],seriesIds:[]});
 });
 
 test("Calendar deletion is bound to the approved event ETag",async()=>{

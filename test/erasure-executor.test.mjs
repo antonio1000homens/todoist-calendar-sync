@@ -470,6 +470,24 @@ test("Calendar deletion confirmation requires a complete, exact profile/Calendar
   } finally {if(before===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=before;}
 });
 
+test("operation confirmation binds completed-receipt identity scrubbing to a project tombstone",async()=>{
+  const before=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const receipt={type:"DELIVERY",key:{pk:"DELIVERY#receipt",sk:"COMPLETED"},digest:"d".repeat(64),
+    scrubbedDigest:"f".repeat(64),receiptCleanup:"scrub_identity_refs",classification:"shared with protected state"};
+  const safePreview={...preview,inventory:[...preview.inventory,receipt],
+    actionPlan:{...preview.actionPlan,scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
+      comments:[{id:"project-comment-1",kind:"project",digest:"e".repeat(64)}]}};
+  const db={send:async()=>({})},store=new ErasureOperationStore(db);
+  try {
+    await assert.rejects(store.issueConfirmation({...safePreview,actionPlan:{...safePreview.actionPlan,
+      scrubCompletedDeliveryIdentityRefsAfterTombstone:false}}),/Invalid erasure operation preview/);
+    await assert.rejects(store.issueConfirmation({...safePreview,actionPlan:{...safePreview.actionPlan,projectCommentIds:[]}}),
+      /Invalid erasure operation preview/);
+    await assert.rejects(store.issueConfirmation({...safePreview,inventory:[{...receipt,key:{...receipt.key,sk:"STATE"}}]}),
+      /Invalid erasure operation preview/);
+  } finally { if(before===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=before; }
+});
+
 test("confirmation persists the readiness at issuance, not the later deployment state",async t=>{
   const before={table:process.env.STATE_TABLE_NAME,enabled:process.env.ERASURE_EXECUTION_ENABLED,
     protocol:process.env.ERASURE_PROTOCOL_VERSION};

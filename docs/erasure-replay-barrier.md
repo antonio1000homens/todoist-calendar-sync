@@ -21,6 +21,19 @@ The guarantee covers only identities recorded in the confirmed operation: its To
 5. Verify provider deletion, the active tombstone, and removal of attributable DynamoDB state. Restore and verify only the SQS worker mappings that were enabled before the operation.
 6. Atomically remove the completed operation, confirmation, and operation-owned fence. Each delete-stage action first writes a conditional attempt claim for its exact checkpoint. Successful progress clears that claim atomically with the advanced checkpoint; if the checkpoint acknowledgement is lost, redelivery sees the claim and will not repeat the provider action. After the configured worker timeout, an unresolved claim is moved to `review_required`, still fenced, for operator inspection. A lost final transaction acknowledgement is resolved by exact readback.
 
+Exact `DELIVERY#…/COMPLETED` receipts for this task/event are included in the
+confirmed inventory only when their profile, kind, and full identity-reference
+schema are valid. Under the profile fence, the worker re-reads every active
+project tombstone immediately before removing the selected task and event IDs
+from each receipt. It preserves the hashed completion key and references to
+other tasks, events, and series, so a redelivered completed message remains
+deduplicated while DynamoDB no longer records the erased identity. Pending
+receipts, legacy receipts without exact identity, malformed receipts, and
+receipts that identify the selected item as a recurrence series remain
+blockers. The generic operator purge path keeps its default rule that all
+delivery receipts block. Scrubbed receipts continue under the normal 14-day
+TTL; this does not change the separate seven-day completed-task lifecycle.
+
 A missing or changed tombstone, incomplete postflight, lease/epoch drift, failed mapping restore, or uncertain commit remains actionable and fenced. The worker does not automatically resume an ambiguous destructive step. Operators use the authenticated review flow and a new scoped approval for any retry or repair.
 
 ### Replay admission

@@ -1,4 +1,4 @@
-import { DeleteCommand, GetCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, UpdateCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS, parseDeletionTombstoneComment,
   writeProjectDeletionTombstone } from "./mapping-comments.js";
 import { profiles } from "./config.js";
@@ -43,6 +43,27 @@ function validateComment(kind: "project"|"task", content: string, operation: Era
     const lines=String(content||"").split(/\r?\n/);
     const eventId=lines.find(line=>line.startsWith("calendarEventId="))?.slice("calendarEventId=".length);
     if(!LEGACY_TASK_COMMENT_MARKERS.has(lines[0]) || !target.eventId || eventId!==target.eventId)
+      throw new ErasureGateDriftError();
+  }
+}
+
+async function verifyTombstonesBeforeReceiptScrub(operation:ErasureOperation, todoist:any,
+  inspectFence:Dependencies["inspectFence"]):Promise<void> {
+  const ids=operation.actionPlan.projectCommentIds||[];
+  if(operation.actionPlan.scrubCompletedDeliveryIdentityRefsAfterTombstone!==true||!ids.length)
+    throw new ErasureGateDriftError();
+  const protocol=await inspectFence(operation.profile);
+  if(protocol.fence?.operationId!==operation.operationId||protocol.leases.length)
+    throw new ErasureGateDriftError();
+  const projectId=profiles[operation.profile].todoistProjectId;
+  const requiredEventIds=[...new Set((operation.actionPlan.knownCalendarAliases||[]).map(alias=>alias.eventId))];
+  for(const id of ids) {
+    const comment=await todoist.getComment(id);
+    const marker=parseDeletionTombstoneComment(comment);
+    if(comment.id!==id||comment.project_id!==projectId||!marker||marker.profile!==operation.profile
+      ||marker.projectId!==projectId||marker.taskId!==operation.target.taskId
+      ||Date.parse(marker.expiresAt)<=Date.now()
+      ||requiredEventIds.some(eventId=>!marker.eventIds.includes(eventId)))
       throw new ErasureGateDriftError();
   }
 }
@@ -151,9 +172,50 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
       ||a.key.pk.localeCompare(b.key.pk)||a.key.sk.localeCompare(b.key.sk));
     const record=ordered[progress.stateIndex];
     if(!record) return {progress:{...progress,stage:"verify"},complete:false};
+    if(record.type==="DELIVERY") {
+      if(record.key.sk!=="COMPLETED"||record.receiptCleanup!=="scrub_identity_refs"
+        ||!/^[a-f0-9]{64}$/.test(record.scrubbedDigest||""))
+        throw new ErasureGateDriftError();
+      await verifyTombstonesBeforeReceiptScrub(operation,clients.todoist,dependencies.inspectFence);
+    }
     const response=await db.send(new GetCommand({TableName:tableName(),Key:record.key,ConsistentRead:true}));
     const existing=response.Item as Record<string,unknown>|undefined;
     if(existing) {
+      if(record.type==="DELIVERY") {
+        if(fingerprint(existing)===record.scrubbedDigest)
+          return {progress:{...progress,stateIndex:progress.stateIndex+1},complete:false};
+        if(fingerprint(existing)!==record.digest)throw new ErasureGateDriftError();
+        const refs=existing.identityRefs as Record<string,unknown>|undefined;
+        if(!Array.isArray(refs?.taskIds)||!Array.isArray(refs?.eventIds))throw new ErasureGateDriftError();
+        const scrubbed={...existing,identityRefs:{...refs,
+          taskIds:refs.taskIds.filter(id=>id!==operation.target.taskId),
+          eventIds:refs.eventIds.filter(id=>id!==operation.target.eventId)}};
+        if(fingerprint(scrubbed)!==record.scrubbedDigest)throw new ErasureGateDriftError();
+        const names={"#profile":"profile","#kind":"kind","#refs":"identityRefs","#tasks":"taskIds","#events":"eventIds"};
+        const values:Record<string,unknown>={":profile":existing.profile,":kind":existing.kind,
+          ":completedAt":existing.completedAt,":expiresAt":existing.expiresAt,
+          ":taskCount":refs.taskIds.length,":eventCount":refs.eventIds.length,
+          ":tasks":scrubbed.identityRefs.taskIds,":events":scrubbed.identityRefs.eventIds};
+        const conditions=["#profile=:profile","#kind=:kind","completedAt=:completedAt","expiresAt=:expiresAt",
+          "size(#refs.#tasks)=:taskCount","size(#refs.#events)=:eventCount"];
+        if((refs.taskIds as unknown[]).includes(operation.target.taskId)) {
+          conditions.push("contains(#refs.#tasks,:taskId)");values[":taskId"]=operation.target.taskId;
+        }
+        if(operation.target.eventId&&(refs.eventIds as unknown[]).includes(operation.target.eventId)) {
+          conditions.push("contains(#refs.#events,:eventId)");values[":eventId"]=operation.target.eventId;
+        }
+        try {
+          await db.send(new UpdateCommand({TableName:tableName(),Key:record.key,
+            UpdateExpression:"SET #refs.#tasks=:tasks, #refs.#events=:events",
+            ConditionExpression:conditions.join(" AND "),ExpressionAttributeNames:names,ExpressionAttributeValues:values}));
+        } catch(error) {
+          const after=await db.send(new GetCommand({TableName:tableName(),Key:record.key,ConsistentRead:true}));
+          if(after.Item&&fingerprint(after.Item)===record.scrubbedDigest)
+            return {progress:{...progress,stateIndex:progress.stateIndex+1},complete:false};
+          throw error;
+        }
+        return {progress:{...progress,stateIndex:progress.stateIndex+1},complete:false};
+      }
       if(fingerprint(existing)!==record.digest) throw new ErasureGateDriftError();
       try {
         await db.send(new DeleteCommand({TableName:tableName(),Key:record.key,...exactDeleteCondition(existing)}));

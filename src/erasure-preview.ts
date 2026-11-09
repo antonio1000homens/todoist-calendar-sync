@@ -41,6 +41,7 @@ export interface ErasurePreviewResult {
   knownTargetReadback?: KnownTargetReadback;
   backupRetentionNotice: string;
   classificationCounts: Record<string, number>;
+  receiptSanitizationRequirements: string[];
   blockers: string[];
   crossProfileEvidence?:CrossProfileErasureEvidence;
   deliveryReceiptAudit?:ErasureDeliveryReceiptAudit;
@@ -171,7 +172,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const rows = allRows.filter(row => row.pk !== `ERASURE#${target.profile}`
     && !(dependencies.ignoreOperationId && (row.pk===`ERASURE_OPERATION#${dependencies.ignoreOperationId}`
       || row.pk===`ERASURE_CONFIRMATION#${dependencies.ignoreOperationId}`)));
-  const plan = planPurge(rows, target);
+  const plan = planPurge(rows, target, {allowCompletedExactDeliveryReceipts:true});
   const todoistMissing = (error: unknown) => Number((error as { status?: number })?.status) === 404;
   let task: any, event: any, directEventIdentity:any;
   let taskMissing = false, eventMissing = false;
@@ -240,7 +241,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const operationId = (dependencies.newOperationId || randomUUID)();
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
   const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
-    digest: record.digest, classification: record.classification }));
+    digest: record.digest, classification: record.classification,
+    ...(record.receiptCleanup?{receiptCleanup:record.receiptCleanup,scrubbedDigest:record.scrubbedDigest}:{}) }));
   const knownAliases=new Map<string,{profile:Profile;calendarId:string;eventId:string}>();
   let knownAliasesComplete=true;
   const addKnownAlias=(profile:Profile,calendarId:string,eventId:string)=>{
@@ -300,6 +302,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     projectCommentIds:relevant.filter(item=>item.payload.profile===target.profile
       &&item.payload.projectId===profiles[target.profile].todoistProjectId
       &&item.payload.taskId===target.taskId).map(item=>item.comment.id).sort(),
+    ...(plan.records.some(record=>record.type==="DELIVERY")
+      ?{scrubCompletedDeliveryIdentityRefsAfterTombstone:true}:{}),
     comments: [
       ...relevant.map(item => ({ id: item.comment.id, kind: "project" as const, digest: fingerprint(item.comment.content) })),
       ...legacy.map(item => ({ id: item.id, kind: "task" as const, digest: item.digest })),
@@ -311,8 +315,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   return {
     operationId, profile: target.profile, target: operationPreview.target, selectedActions,
     previewFingerprint: erasurePreviewFingerprint(operationPreview), providerSnapshotFingerprint, inventoryDigest: plan.inventoryDigest,
-    inventory: plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
-      digest: record.digest, classification: record.classification })),
+    inventory,
     actionPlan,
     // From fresh exact provider GETs only. The link lookup is limited to the
     // configured Calendar and cannot rule out unrecorded historical copies.
@@ -322,7 +325,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       configuredCalendarLink: linked ? "present" : "not_found",
     },
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
-    classificationCounts: plan.counts, blockers: [...new Set(blockers)].sort(),
+    classificationCounts: plan.counts, receiptSanitizationRequirements:plan.receiptSanitizationRequirements,
+    blockers: [...new Set(blockers)].sort(),
     ...(crossProfileEvidence?{crossProfileEvidence}:{}),
     ...(deliveryReceiptAudit?{deliveryReceiptAudit}:{}),
   };

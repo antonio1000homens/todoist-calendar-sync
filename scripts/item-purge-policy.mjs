@@ -14,6 +14,7 @@ export const PURGE_FAMILIES = new Set([
 ]);
 const SHARED_FAMILIES = new Set(["RECONCILE", "RECONCILE_RUN", "RECONCILE_OUTCOME", "SYNC", "WATCH", "WATCH_CHANNEL", "CIRCUIT"]);
 const LINK_FIELDS = new Set(["sourceAuditKey", "decisionId", "caseId", "previewId", "operationId", "incidentId", "repairId"]);
+const COMPLETED_RECEIPT_SCRUB_REQUIREMENT = "Completed delivery receipt identity references are scrubbed only after the active project-comment tombstone is read back and the worker queues and leases have drained under the profile fence.";
 const hash = value => createHash("sha256").update(value).digest("hex");
 export const stable = value => {
   if (Array.isArray(value)) return value.map(stable);
@@ -49,8 +50,11 @@ function providerRefs(row) {
         if (key === "seriesId") series.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "todoist") tasks.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "calendar") events.add(value);
-      } else if (Array.isArray(value) && /^(candidateTaskIds|candidateEventIds|taskIds|eventIds)$/.test(key)) {
-        for (const item of value) if (typeof item === "string") ((key === "candidateTaskIds" || key === "taskIds") ? tasks : events).add(item);
+      } else if (Array.isArray(value) && /^(candidateTaskIds|candidateEventIds|taskIds|eventIds|seriesIds)$/.test(key)) {
+        for (const item of value) if (typeof item === "string") {
+          if(key==="seriesIds")series.add(item);
+          else ((key === "candidateTaskIds" || key === "taskIds") ? tasks : events).add(item);
+        }
       }
       if (value && typeof value === "object") recurse(value, path ? path + "." + key : key, activeSide);
     }
@@ -62,7 +66,7 @@ function providerRefs(row) {
 export function exactCalendarEventIds(row) {
   return [...providerRefs(row).events].sort();
 }
-export function planPurge(rows, target) {
+export function planPurge(rows, target, options = {}) {
   const { profile, taskId, eventId } = target;
   const extraProtectedTaskIds = target.protectedTaskIds ?? [];
   const extraProtectedEventIds = target.protectedEventIds ?? [];
@@ -82,6 +86,7 @@ export function planPurge(rows, target) {
     ...(eventId ? [hash("eventId:" + eventId)] : []),
   ]);
   const presentKeys = new Set(), included = new Map(), blockers = new Set();
+  const receiptSanitizationRequirements = new Set();
   const matchedReason = row => {
     const reasons = [];
     const pk = String(row.pk || "");
@@ -191,16 +196,42 @@ export function planPurge(rows, target) {
       || tokens(row.pk).includes(taskId) || (eventId && tokens(row.pk).includes(eventId))
       || (family === "CONFLICT_STATE" && reasons.some(reason => reason === "conflict identity hash"));
     let classification = "selected-only";
+    const deliveryRefs=row.identityRefs;
+    const deliveryTaskIds=deliveryRefs?.taskIds;
+    const deliveryEventIds=deliveryRefs?.eventIds;
+    const deliverySeriesIds=deliveryRefs?.seriesIds;
+    const otherReceiptIdentity=otherTaskIds.length>0||otherEventIds.length>0
+      ||(Array.isArray(deliverySeriesIds)&&deliverySeriesIds.some(id=>id!==taskId&&id!==eventId));
+    const exactCompletedReceipt=options.allowCompletedExactDeliveryReceipts===true
+      &&row.sk==="COMPLETED"&&row.profile===profile&&["calendar","todoist","reconcile","orphan"].includes(row.kind)
+      &&!target.preserveTask&&!extraProtectedTaskIds.includes(taskId)
+      &&(!eventId||!extraProtectedEventIds.includes(eventId))
+      &&Array.isArray(deliveryTaskIds)&&Array.isArray(deliveryEventIds)&&Array.isArray(deliverySeriesIds)
+      &&(deliveryTaskIds.some(id=>id===taskId)||deliveryEventIds.some(id=>Boolean(eventId)&&id===eventId))
+      &&deliveryTaskIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.-]{1,256}$/.test(id))
+      &&deliveryEventIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.-]{1,1024}$/.test(id))
+      // Google Calendar iCalUIDs conventionally contain one @ separator.
+      &&deliverySeriesIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.@-]{1,1024}$/.test(id))
+      &&!deliverySeriesIds.includes(taskId)&&(!eventId||!deliverySeriesIds.includes(eventId))
+      &&refs.series.size===deliverySeriesIds.length
+      &&Number.isFinite(Date.parse(row.completedAt))&&Number.isSafeInteger(row.expiresAt)&&row.expiresAt>0
+      &&Object.keys(row).every(name=>["pk","sk","profile","kind","identityRefs","completedAt","expiresAt"].includes(name))
+      &&Object.keys(deliveryRefs).every(name=>["taskIds","eventIds","seriesIds","generation"].includes(name))
+      &&(deliveryRefs.generation===undefined||typeof deliveryRefs.generation==="string");
     if (family === "DELIVERY" && !directTargetRef) {
       classification = "unattributable";
       hazards.push("delivery receipt has no exact selected provider identity; replay safety cannot be proven");
     } else if (family === "DELIVERY") {
-      classification = target.preserveTask && refs.tasks.has(taskId)
+      classification = exactCompletedReceipt ? (otherReceiptIdentity?"shared with protected state":"selected-only")
+        : target.preserveTask && refs.tasks.has(taskId)
         || [...protectedTaskIds].some(id => refs.tasks.has(id))
         || [...protectedEventIds].some(id => refs.events.has(id))
         || otherTaskIds.length || otherEventIds.length
         ? "shared with protected state" : "selected-only";
-      hazards.push("delivery receipt may be pending, delayed, or replayable; exact identity does not prove quiescence");
+      if(exactCompletedReceipt) {
+        hazards.push(COMPLETED_RECEIPT_SCRUB_REQUIREMENT);
+        receiptSanitizationRequirements.add(COMPLETED_RECEIPT_SCRUB_REQUIREMENT);
+      } else hazards.push("delivery receipt may be pending, delayed, or replayable; exact identity does not prove quiescence");
     } else if (target.preserveTask && (refs.tasks.has(taskId) || tokens(row.pk).includes(taskId))) {
       classification = "shared with protected state";
       hazards.push("selected Todoist task is explicitly retained");
@@ -247,15 +278,26 @@ export function planPurge(rows, target) {
     if (family === "TASKOWNER" && row.taskId !== taskId) { hazards.push("task owner mismatch"); classification = "ambiguous"; }
     if (family === "EVENT" && (!eventId || row.eventId !== eventId)) { hazards.push("mapping to a different event"); classification = "shared with protected state"; }
     if (family === "TASK" && row.taskId !== taskId) { hazards.push("mapping to a different task"); classification = "shared with protected state"; }
-    if (refs.series.size || row.recurrenceOwner || row.owner === "calendar" || row.owner === "todoist")
+    if ((family!=="DELIVERY"&&refs.series.size) || row.recurrenceOwner || row.owner === "calendar" || row.owner === "todoist")
       hazards.push("recurrence/series ownership needs manual handling");
     if ((row.profile && row.profile !== profile)
       || (scoped.has(family) && !row.pk.startsWith(family + "#" + profile + "#")))
       classification = "ambiguous";
-    hazards.forEach(hazard => blockers.add(row.pk + " / " + row.sk + ": " + hazard));
-    return { pk: row.pk, sk: row.sk, type: family, classification, reasons, hazards: [...new Set(hazards)], digest: fingerprint(row) };
+    hazards.forEach(hazard => {
+      const retainedReceiptHazard=family==="DELIVERY"&&exactCompletedReceipt
+        &&[COMPLETED_RECEIPT_SCRUB_REQUIREMENT,"references another Todoist task","references another Calendar item"].includes(hazard);
+      if(!retainedReceiptHazard)
+        blockers.add(row.pk + " / " + row.sk + ": " + hazard);
+    });
+    const sanitizedReceipt=exactCompletedReceipt?{...row,identityRefs:{...deliveryRefs,
+      taskIds:deliveryTaskIds.filter(id=>id!==taskId),
+      eventIds:deliveryEventIds.filter(id=>id!==eventId)}}:undefined;
+    return { pk: row.pk, sk: row.sk, type: family, classification, reasons, hazards: [...new Set(hazards)], digest: fingerprint(row),
+      ...(sanitizedReceipt?{receiptCleanup:"scrub_identity_refs",scrubbedDigest:fingerprint(sanitizedReceipt)}:{}) };
   }).sort((a,b) => a.pk.localeCompare(b.pk) || a.sk.localeCompare(b.sk));
   const counts = Object.fromEntries(["selected-only", "shared with protected state", "ambiguous", "unattributable"]
     .map(classification => [classification, records.filter(record => record.classification === classification).length]));
-  return { records, counts, blockers: [...blockers].sort(), inventoryDigest: fingerprint(records.map(({pk,sk,digest,classification})=>[pk,sk,digest,classification])) };
+  return { records, counts, blockers: [...blockers].sort(), receiptSanitizationRequirements:[...receiptSanitizationRequirements].sort(),
+    inventoryDigest: fingerprint(records.map(({pk,sk,digest,classification,receiptCleanup,scrubbedDigest})=>
+      [pk,sk,digest,classification,receiptCleanup,scrubbedDigest])) };
 }
