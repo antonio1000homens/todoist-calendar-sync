@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { executeErasureDeletionStep } from "../dist/erasure-deletion.js";
+import { executeErasureDeletionStep, erasureProjectTombstonesPresent } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
@@ -65,7 +65,7 @@ test("a repeated project-comment deletion step accepts only its exact tombstone 
   assert.equal(comment.id,"project-1","the existing project comment ID is preserved");
 });
 
-test("provider deletion leaves replay identity in Todoist and scrubs completed receipt identities from DynamoDB",async()=>{
+test("provider deletion leaves a bounded Todoist tombstone and scrubs completed receipt identities from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
   let comment={id:"project-1",project_id:"test-home-project",content:original};
@@ -86,6 +86,7 @@ test("provider deletion leaves replay identity in Todoist and scrubs completed r
   const todoist={
     async getComment(id){assert.equal(id,"project-1");if(!comment)throw Object.assign(new Error("not found"),{status:404});return comment;},
     async updateComment(id,content){assert.equal(id,"project-1");comment={...comment,content};return comment;},
+    async deleteComment(id){assert.equal(id,"project-1");comment=undefined;},
     async getTask(id){assert.equal(id,"task-1");if(!task)throw Object.assign(new Error("not found"),{status:404});return task;},
     async deleteTask(id){assert.equal(id,"task-1");task=undefined;},
   };
@@ -127,9 +128,7 @@ test("provider deletion leaves replay identity in Todoist and scrubs completed r
     const result=await executeErasureDeletionStep(operation,progress,dependencies);
     progress=result.progress;
   }
-  const tombstone=parseDeletionTombstoneComment(comment);
-  assert.equal(tombstone?.taskId,"task-1");
-  assert.deepEqual(tombstone?.eventIds,["event-1"]);
+  assert.ok(parseDeletionTombstoneComment(comment),"bounded project tombstone remains after successful erasure");
   assert.equal(task,undefined);
   assert.equal(event.status,"cancelled");
   assert.equal(rows.size,2,"identity-bearing mappings are removed while unrelated state and an identity-free receipt remain");
@@ -139,8 +138,7 @@ test("provider deletion leaves replay identity in Todoist and scrubs completed r
   const remainingDynamoRows=JSON.stringify([...rows.values()]);
   assert.doesNotMatch(remainingDynamoRows,/task-1|event-1/,
     "DynamoDB no longer contains the deleted task or Calendar event identity");
-  assert.equal(tombstone.taskId,"task-1","the bounded replay identity remains in the Todoist project comment");
-  assert.deepEqual(tombstone.eventIds,["event-1"]);
+  assert.equal(comment.id,"project-1","existing comment identity is preserved for tombstone lifecycle cleanup");
 });
 
 test("confirmed erasure cannot advance when its project tombstone comment is missing",async()=>{
@@ -273,4 +271,75 @@ test("Calendar 410 without exact deleted-resource evidence remains an error afte
     {db:{send:async()=>({})},clients:{todoist:{},calendar},inspectFence:async()=>({leases:[]})}),/expired sync token/);
   assert.equal(deletes,1,"the exact ETag-bound delete is attempted once");
   assert.equal(reads,2,"the uncertain delete outcome is checked with a direct readback");
+});
+
+test("legacy final-comments checkpoint retains only exact operation-owned project tombstones",async()=>{
+  const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
+  const original={
+    schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
+    eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z",
+  };
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["project-1"],
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}]}};
+  for(const mismatch of [
+    {...original,taskId:"another-task"}, {...original,projectId:"another-project"},
+    {...original,eventIds:["different-event"]},
+  ]){
+    let deletions=0;
+    const comment={id:"project-1",project_id:"test-home-project",
+      content:serializeDeletionTombstoneComment(mismatch)};
+    const clients={todoist:{
+      getComment:async()=>comment,
+      deleteComment:async()=>{deletions++;},
+    }};
+    await assert.rejects(executeErasureDeletionStep(operation,
+      {stage:"finalize_comments",commentIndex:0,stateIndex:0,finalCommentIndex:0,startedAt:1},
+      {db:{send:async()=>({})},clients,inspectFence:async()=>({leases:[]})}),
+      ErasureGateDriftError);
+    assert.equal(deletions,0,"unrelated project content must not be deleted");
+  }
+});
+test("legacy final-comments checkpoint retains an active verified tombstone",async()=>{
+  const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
+  const marker={schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
+    eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"};
+  const comment={id:"project-1",project_id:"test-home-project",content:serializeDeletionTombstoneComment(marker)};
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["project-1"],
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}]}};
+  let deletes=0;
+  const result=await executeErasureDeletionStep(operation,
+    {stage:"finalize_comments",commentIndex:0,stateIndex:0,finalCommentIndex:0,startedAt:1},
+    {db:{send:async()=>({})},clients:{todoist:{
+      getComment:async()=>comment,deleteComment:async()=>{deletes++;},
+    }},inspectFence:async()=>({leases:[]})});
+  assert.equal(result.progress.finalCommentIndex,1);
+  assert.equal(deletes,0);
+});
+
+
+test("postflight requires the exact active tombstone and ignores unrelated notes",async()=>{
+  const {serializeDeletionTombstoneComment}=await import("../dist/mapping-comments.js");
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["original-1"],knownCalendarAliases:[
+      {profile:"home",calendarId:"home@example.test",eventId:"event-1"}]}};
+  const originalContent=serializeMappingComment({
+    profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
+    updatedAt:"2026-11-08T12:00:00.000Z",
+  },"test-home-project");
+  const markerContent=serializeDeletionTombstoneComment({
+    schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
+    eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z",
+  });
+  const unrelated={id:"unrelated",project_id:"test-home-project",content:"User's personal shopping note"};
+  const now=Date.parse("2026-11-09T12:00:00.000Z");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],now),true);
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated],now),false,"selected tombstone must remain");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:originalContent}],now),false,
+    "an unconverted mapping comment cannot pass postflight");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],
+    Date.parse("2026-11-27T12:00:00.000Z")),false,"expired tombstones cannot pass postflight");
 });

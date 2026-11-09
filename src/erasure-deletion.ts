@@ -1,6 +1,6 @@
 import { DeleteCommand, GetCommand, UpdateCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS, parseDeletionTombstoneComment,
-  writeProjectDeletionTombstone } from "./mapping-comments.js";
+  writeProjectDeletionTombstone, type TodoistCommentRecord } from "./mapping-comments.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
@@ -10,7 +10,9 @@ import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
 export type ErasureDeletionProgress = {
-  stage: "comments" | "todoist" | "calendar" | "state" | "verify";
+  stage: "comments" | "todoist" | "calendar" | "state" | "finalize_comments" | "verify";
+  /** Index through exact project comments to remove after provider and state deletion. */
+  finalCommentIndex?: number;
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
@@ -226,7 +228,53 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
     }
     return {progress:{...progress,stateIndex:progress.stateIndex+1},complete:false};
   }
+  if((progress.stage as string)==="finalize_comments") {
+    // Compatibility for operations whose saved checkpoint was written by
+    // the prior release. Verify the exact marker and keep it through expiry.
+    const commentIds=plan.projectCommentIds||[];
+    const index=progress.finalCommentIndex??0;
+    if(!commentIds.length||index>commentIds.length)throw new ErasureGateDriftError();
+    const id=commentIds[index];
+    if(!id)return {progress:{...progress,stage:"verify"},complete:false};
+    const comment=await clients.todoist.getComment(id);
+    const marker=parseDeletionTombstoneComment(comment);
+    const aliases=(plan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+    if(comment.id!==id||comment.project_id!==profiles[operation.profile].todoistProjectId
+      ||!marker||marker.profile!==operation.profile||marker.projectId!==profiles[operation.profile].todoistProjectId
+      ||marker.taskId!==operation.target.taskId||Date.parse(marker.expiresAt)<=Date.now()
+      ||aliases.some(alias=>!marker.eventIds.includes(alias)))throw new ErasureGateDriftError();
+    return {progress:{...progress,finalCommentIndex:index+1},complete:false};
+  }
   return {progress,complete:true};
+}
+
+/** Selected app mapping comments become bounded project tombstones on success. */
+export function erasureProjectTombstonesPresent(
+  operation: ErasureOperation, projectComments: TodoistCommentRecord[], now=Date.now(),
+): boolean {
+  const originalIds=operation.actionPlan.projectCommentIds||[];
+  if(!originalIds.length)return false;
+  const aliases=new Set([operation.target.eventId,...(operation.actionPlan.knownCalendarAliases||[])
+    .map(alias=>alias.eventId)].filter((id):id is string=>Boolean(id)));
+  const index=buildProjectMappingIndex(projectComments);
+  return originalIds.every(id=>projectComments.some(comment=>{
+    const marker=parseDeletionTombstoneComment(comment);
+    return comment.id===id&&comment.project_id===profiles[operation.profile].todoistProjectId
+      &&Boolean(marker&&marker.profile===operation.profile
+        &&marker.projectId===profiles[operation.profile].todoistProjectId
+        &&marker.taskId===operation.target.taskId&&Date.parse(marker.expiresAt)>now
+        &&[...aliases].every(alias=>marker.eventIds.includes(alias)));
+  }))
+    && !index.parsed.some(({comment,payload})=>!originalIds.includes(comment.id)
+      &&(payload.taskId===operation.target.taskId||aliases.has(payload.eventId)))
+    && !index.malformed.some(({comment})=>!originalIds.includes(comment.id)
+      &&Boolean(comment.content?.includes(operation.target.taskId)||[...aliases].some(alias=>comment.content?.includes(alias))))
+    && !projectComments.some(comment=>{
+      if(originalIds.includes(comment.id))return false;
+      const marker=parseDeletionTombstoneComment(comment);
+      return Boolean(marker&&(marker.taskId===operation.target.taskId
+        ||marker.eventIds.some(alias=>aliases.has(alias))));
+    });
 }
 
 /** Action-time readback is deliberately a full exact inventory pass and must prove no attributable data remains. */
@@ -238,16 +286,9 @@ export async function verifyErasurePostflight(operation:ErasureOperation,depende
       allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId});
   const projectId=profiles[operation.profile].todoistProjectId;
   const projectComments=await dependencies.clients.todoist.listProjectComments(projectId,true);
-  const requiredAliases=(operation.actionPlan.knownCalendarAliases||[]).map(alias=>alias.eventId);
-  const requiredComments=operation.actionPlan.projectCommentIds||[];
-  const markerComments=projectComments.map(comment=>({comment,marker:parseDeletionTombstoneComment(comment)}))
-    .filter(value=>value.marker?.profile===operation.profile&&value.marker.projectId===projectId
-      &&value.marker.taskId===operation.target.taskId&&Date.parse(value.marker.expiresAt)>Date.now());
-  const markerVerified=requiredComments.length>0&&requiredComments.every(id=>markerComments.some(({comment,marker})=>
-    comment.id===id&&requiredAliases.every(alias=>marker!.eventIds.includes(alias))));
   const providersAbsent=preview.blockers.length===0
-    && !preview.actionPlan.todoistTask && !preview.actionPlan.calendarEvent && preview.actionPlan.comments.length===0
-    &&markerVerified;
+    &&!preview.actionPlan.todoistTask&&!preview.actionPlan.calendarEvent&&preview.actionPlan.comments.length===0
+    &&erasureProjectTombstonesPresent(operation,projectComments);
   return {providersAbsent,stateAbsent:preview.inventory.length===0};
 }
 

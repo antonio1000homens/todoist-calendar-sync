@@ -12,7 +12,8 @@ export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "dr
   | "install_fence" | "wait_worker_timeout" | "drain_after_timeout" | "ready_for_delete"
   | "delete" | "verify_deletion" | "restore_mappings" | "confirm_restored" | "release_fence" | "complete";
 export interface ErasureDeletionProgress {
-  stage: "comments" | "todoist" | "calendar" | "state" | "verify";
+  stage: "comments" | "todoist" | "calendar" | "state" | "finalize_comments" | "verify";
+  finalCommentIndex?: number;
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
@@ -69,7 +70,7 @@ export interface ErasureActionPlan {
   /** Exact event aliases captured before mutation, scoped by profile and Calendar. */
   knownCalendarAliases?:Array<{profile:Profile;calendarId:string;eventId:string}>;
   knownCalendarAliasesComplete?:boolean;
-  /** Exact project comments that must be converted to temporary deletion markers before release. */
+  /** Project comments become temporary markers under the fence, then are deleted before success. */
   projectCommentIds?:string[];
   /** Completed identity references are scrubbed only after every project tombstone is read back. */
   scrubCompletedDeliveryIdentityRefsAfterTombstone?:boolean;
@@ -593,11 +594,17 @@ export class ErasureOperationStore {
     try {
       await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
         UpdateExpression:"SET lifecycle.#progress.#attempt=:attempt, updatedAt=:updatedAt",
-        ConditionExpression:"#status=:deleting AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
+        ConditionExpression:"#status=:deleting AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex"
+          +(progress.finalCommentIndex===undefined?" AND attribute_not_exists(lifecycle.#progress.#finalCommentIndex)"
+            :" AND lifecycle.#progress.#finalCommentIndex=:finalCommentIndex")
+          +" AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
         ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress",
-          "#attempt":"attempt","#stage":"stage","#commentIndex":"commentIndex","#stateIndex":"stateIndex"},
+          "#attempt":"attempt","#stage":"stage","#commentIndex":"commentIndex","#stateIndex":"stateIndex",
+          "#finalCommentIndex":"finalCommentIndex"},
         ExpressionAttributeValues:{":deleting":"deleting",":delete":"delete",":stage":progress.stage,
-          ":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,":attempt":attempt,
+          ":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,
+          ...(progress.finalCommentIndex===undefined?{}:{":finalCommentIndex":progress.finalCommentIndex}),
+          ":attempt":attempt,
           ":updatedAt":new Date(now).toISOString(),":ready":true,":fingerprint":operation.previewFingerprint}}));
     } catch(error) {
       if((error as {name?:string})?.name==="ConditionalCheckFailedException")
@@ -658,10 +665,12 @@ export class ErasureOperationStore {
     if(current.phase==="delete") {
       const before=current.deletionProgress||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:0};
       const after=candidate.deletionProgress;
-      const rank={comments:0,todoist:1,calendar:2,state:3,verify:4} as const;
+      const rank={comments:0,todoist:1,calendar:2,state:3,finalize_comments:4,verify:5} as const;
       if(!after||after.startedAt!==before.startedAt||rank[after.stage]<rank[before.stage]
         ||after.commentIndex<before.commentIndex||after.stateIndex<before.stateIndex
-        ||after.commentIndex>operation.actionPlan.comments.length||after.stateIndex>operation.inventory.length)
+        ||(after.finalCommentIndex??0)<(before.finalCommentIndex??0)
+        ||after.commentIndex>operation.actionPlan.comments.length||after.stateIndex>operation.inventory.length
+        ||(after.finalCommentIndex??0)>(operation.actionPlan.projectCommentIds?.length??0))
         throw new Error("Deletion progress must advance monotonically within the confirmed inventory");
     }
     if(candidate.nextRunAt<now) throw new Error("Durable next-run time cannot be backdated");

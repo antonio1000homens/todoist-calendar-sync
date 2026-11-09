@@ -1,12 +1,12 @@
-# #349 bounded project-comment deletion markers
+# #349 bounded project-comment tombstone; no DynamoDB deleted-task identity
 
 ## Current policy
 
-A successful exceptional erasure leaves its short-lived replay marker in the exact existing Todoist project mapping comment. The marker contains the confirmed Todoist task ID, explicitly recorded Calendar event IDs, profile, project, and expiry. It is written and read back before the selected provider deletion steps continue. The Calendar event can therefore be removed while the Todoist project comment remains available to suppress stale messages.
+An exceptional erasure rewrites the exact existing Todoist project mapping comment as a guarded deletion marker. The marker remains after provider and DynamoDB cleanup so current workers can suppress queued or retried stale deliveries after the operation fence is released. The existing 18-day expiry bounds its lifetime; the tombstone cleanup job removes expired markers. No deleted-task identity is retained in DynamoDB after successful cleanup.
 
-The marker expires 18 days after the verified rewrite. This covers the live four-day FIFO sync queue plus the fourteen-day FIFO DLQ; SQS resets message age when a FIFO message moves to its DLQ. Operator redrive resets retention again, so a manual replay after marker expiry cannot be distinguished by retained identity. Expired markers are removed only by the operator-run report/apply workflow; there is no scheduled cleanup. The Todoist comment ID must remain the same. If that exact comment is missing, moved, or cannot be updated and read back, the erasure stays fenced for review rather than creating a replacement comment.
+The existing 18-day expiry also covers the post-success queue and retry window. It does not cover arbitrary manual redrive or direct invocation after expiry. An untrusted or moved comment remains a review failure; do not create a replacement.
 
-Do not write a permanent HMAC replay marker or deleted task/event identity to DynamoDB after successful completion. The final completion transaction removes the operation, confirmation, and owned fence after fresh provider/state checks. The project comment is the bounded identity store during the replay window.
+Do not write a permanent HMAC replay marker or deleted task/event identity to DynamoDB after successful completion. The final completion transaction removes the operation, confirmation, and owned fence after fresh provider/state checks and exact active project-comment tombstone readback. The existing Todoist project comment carries the task/event identity until expiry.
 
 ## Bounded known-identity recovery
 
@@ -18,7 +18,7 @@ The guarantee covers only identities recorded in the confirmed operation: its To
 2. Stop new queue admissions and writers using the existing profile lease/fence protocol. Disable the worker mappings recorded by the operation, drain in-flight writers, install the fence, and wait out the configured worker timeout.
 3. Rewrite the exact inventoried Todoist project mapping comment as a tombstone. Read it back and verify its comment ID, project, task ID, aliases, and expiry before continuing.
 4. Delete only the provider objects selected by the confirmed operation. Direct reads and deletion receipts must match the original target. A changed or unavailable provider response leaves the operation fenced for review.
-5. Verify provider deletion, the active tombstone, and removal of attributable DynamoDB state. Restore and verify only the SQS worker mappings that were enabled before the operation.
+5. Verify provider deletion, removal of attributable DynamoDB state, and each exact active project-comment tombstone while the fence is still held. Only then restore and verify the SQS worker mappings that were enabled before the operation.
 6. Atomically remove the completed operation, confirmation, and operation-owned fence. Each delete-stage action first writes a conditional attempt claim for its exact checkpoint. Successful progress clears that claim atomically with the advanced checkpoint; if the checkpoint acknowledgement is lost, redelivery sees the claim and will not repeat the provider action. After the configured worker timeout, an unresolved claim is moved to `review_required`, still fenced, for operator inspection. A lost final transaction acknowledgement is resolved by exact readback.
 
 Exact `DELIVERY#…/COMPLETED` receipts for this task/event are included in the
@@ -53,7 +53,7 @@ The source checks and lease protocol prevent an admitted writer from racing mark
 
 The tombstone applies only to its exact recorded identity while active. In normal sync without a matching marker, existing Todoist/Calendar deletion, update, and recurrence behavior continues. The separate seven-day completed-task mapping retention and historical Calendar event rules are unchanged. Ordinary completion does not create an erasure marker.
 
-After the 18-day marker expires and is explicitly removed, the retained comment can no longer identify an arbitrarily late or manually replayed message. The 18-day window covers one ordinary SQS/DLQ cycle; operator redrive or manual replay after expiry remains a known limit. The design does not claim permanent replay prevention.
+After the 18-day tombstone expires, arbitrary manual redrive or direct invocation may no longer be identifiable as stale. This retention window does not replace #347's requirement to deny unsafe historical invocation paths. The design does not claim permanent replay prevention.
 
 ## Marker cleanup
 

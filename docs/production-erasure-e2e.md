@@ -12,7 +12,7 @@ not grow.
 The harness uses the production preview builder and durable operation store,
 then enqueues the confirmed operation directly to the real erasure queue. It
 does not call the retired unscoped review HTTP routes. It verifies the real
-erasure worker's provider deletions, project-comment tombstone, strong full
+erasure worker's provider deletions, retained bounded project-comment tombstone, strong full
 DynamoDB identity scan, queue/DLQ counts, fence release and worker mapping
 restoration. The result file and console output contain counts and pass/fail
 state, not provider identities.

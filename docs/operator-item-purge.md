@@ -157,16 +157,21 @@ plan**. A successful production rollout must include the review-page
 confirmation/progress experience and a tested operator recovery process.
 This flag alone is not full issue #113 acceptance.
 
-## Bounded replay tombstone for issue #349
+## Bounded Todoist project-comment tombstone for issue #349
 
-The #349 implementation uses the exact existing Todoist project mapping
-comment as a temporary replay tombstone. The comment retains the deleted task
-ID and explicitly recorded Calendar event aliases for 18 days after a verified
-rewrite, then an operator-run cleanup removes that exact expired comment. A
-successful operation leaves no deleted-task identity in DynamoDB. This is a
-bounded engineering default based on the current four-day FIFO source queue and
-fourteen-day DLQ; an arbitrarily late webhook or repeated manual redrive after
-expiry cannot be recognized from retained identity.
+The exact existing Todoist project mapping comment is rewritten as a tombstone
+and retained after successful deletion for the bounded 18-day expiry. Current
+workers consult it under the profile writer lease before processing matching
+webhooks, Calendar deltas, or orphan rechecks. The tombstone cleanup job removes
+it after expiry. Completed DynamoDB delivery receipts remain for their normal
+14-day TTL, but the selected task/event IDs are scrubbed only after the exact
+active project tombstone is read back under the erasure fence. Thus DynamoDB
+retains delivery idempotency without retaining the erased identity.
+
+The retention window covers ordinary SQS retry/redrive lifetimes, not arbitrary
+manual invocation after expiry. Historical Lambda versions that do not read
+the comment still require the separate #347 invocation boundary; the marker
+alone does not make an unguarded version safe.
 
 The implementation is merged and deployed. A fresh read-only audit on 9 Nov
 2026 verified the project-tombstone marker in the deployed ingress, sync worker,
