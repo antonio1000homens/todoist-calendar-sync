@@ -9,17 +9,15 @@ migration_access_stack_name="${MIGRATION_ACCESS_STACK_NAME:-todoist-calendar-syn
 role_name="${DEPLOYMENT_ROLE_NAME:-GitHubActionsTodoistCalendarSyncDeployRole}"
 code_bucket="${CODE_BUCKET:-}"
 application_stack="${APPLICATION_STACK_NAME:-todoist-calendar-sync}"
-legacy_application_stack="${LEGACY_APPLICATION_STACK_NAME:-gcp-app2-sync}"
 resource_name_prefix="${RESOURCE_NAME_PREFIX:-todoist-calendar-sync}"
-legacy_resource_name_prefix="${LEGACY_RESOURCE_NAME_PREFIX:-gcp-app2-sync}"
-legacy_sam_bucket="${SAM_CLI_MANAGED_SOURCE_BUCKET_NAME:-}"
+sam_managed_bucket="${SAM_CLI_MANAGED_SOURCE_BUCKET_NAME:-}"
 
 if [[ -z "$code_bucket" ]]; then
   echo 'CODE_BUCKET is required.' >&2
   exit 2
 fi
-if [[ -z "$legacy_sam_bucket" ]]; then
-  echo 'SAM_CLI_MANAGED_SOURCE_BUCKET_NAME is required during the legacy cutover.' >&2
+if [[ -z "$sam_managed_bucket" ]]; then
+  echo 'SAM_CLI_MANAGED_SOURCE_BUCKET_NAME is required for SAM deployment artifacts.' >&2
   exit 2
 fi
 
@@ -35,10 +33,8 @@ aws cloudformation deploy \
     "DeploymentRoleName=$role_name" \
     "CodeBucketName=$code_bucket" \
     "ApplicationStackName=$application_stack" \
-    "LegacyApplicationStackName=$legacy_application_stack" \
     "ResourceNamePrefix=$resource_name_prefix" \
-    "LegacyResourceNamePrefix=$legacy_resource_name_prefix" \
-    "SamCliManagedSourceBucketName=$legacy_sam_bucket" \
+    "SamCliManagedSourceBucketName=$sam_managed_bucket" \
   >&2
 
 aws cloudformation deploy \

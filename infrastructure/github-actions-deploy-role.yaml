@@ -14,15 +14,9 @@ Parameters:
   ApplicationStackName:
     Type: String
     Default: todoist-calendar-sync
-  LegacyApplicationStackName:
-    Type: String
-    Default: gcp-app2-sync
   ResourceNamePrefix:
     Type: String
     Default: todoist-calendar-sync
-  LegacyResourceNamePrefix:
-    Type: String
-    Default: gcp-app2-sync
 
 Resources:
   DeploymentRole:
@@ -46,16 +40,15 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: TodoistCalendarSyncDeploymentPolicy
-      Description: Deploy todoist-calendar-sync while retaining narrowly scoped access to the legacy resource prefix during cutover.
+      Description: Deploy todoist-calendar-sync using only its canonical resource prefix.
       Roles: [!Ref DeploymentRole]
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Sid: ReadLegacyApplicationArtifacts
+          - Sid: ReadSamManagedArtifacts
             Effect: Allow
             Action: s3:GetObject
             Resource:
-              - !Sub arn:${AWS::Partition}:s3:::${CodeBucketName}/${LegacyResourceNamePrefix}/*
               - !Sub arn:${AWS::Partition}:s3:::${SamCliManagedSourceBucketName}/*
 
           - Sid: ManageApplicationStacks
@@ -76,7 +69,6 @@ Resources:
               - cloudformation:ListStackResources
             Resource:
               - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationStackName}/*
-              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${LegacyApplicationStackName}/*
 
           - Sid: UseSamTransform
             Effect: Allow
@@ -123,7 +115,6 @@ Resources:
               - lambda:ListTags
             Resource:
               - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LegacyResourceNamePrefix}-*
 
           - Sid: ManageApplicationEventSourceMappings
             Effect: Allow
@@ -137,7 +128,6 @@ Resources:
               StringLike:
                 lambda:FunctionArn:
                   - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ResourceNamePrefix}-*
-                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LegacyResourceNamePrefix}-*
 
           - Sid: InspectLambdaEventSourceMappings
             Effect: Allow
@@ -159,8 +149,6 @@ Resources:
             Resource:
               - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${ResourceNamePrefix}-*
               - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${ResourceNamePrefix}-*/*
-              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:application:${LegacyResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:codedeploy:${AWS::Region}:${AWS::AccountId}:deploymentgroup:${LegacyResourceNamePrefix}-*/*
 
           - Sid: RunApplicationCodeDeployments
             Effect: Allow
@@ -194,7 +182,6 @@ Resources:
               - iam:ListAttachedRolePolicies
             Resource:
               - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LegacyResourceNamePrefix}-*
 
           - Sid: ManageApplicationQueues
             Effect: Allow
@@ -209,7 +196,6 @@ Resources:
               - sqs:ListQueueTags
             Resource:
               - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${LegacyResourceNamePrefix}-*
 
           - Sid: ManageApplicationEventRules
             Effect: Allow
@@ -225,7 +211,6 @@ Resources:
               - events:ListTagsForResource
             Resource:
               - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${LegacyResourceNamePrefix}-*
 
           - Sid: ManageApplicationDynamoDbTables
             Effect: Allow
@@ -241,7 +226,6 @@ Resources:
               - dynamodb:ListTagsOfResource
             Resource:
               - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
-              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LegacyResourceNamePrefix}-state-*
 
           - Sid: ManageApplicationLogGroups
             Effect: Allow
@@ -258,7 +242,6 @@ Resources:
               - logs:ListTagsForResource
             Resource:
               - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LegacyResourceNamePrefix}-*
 
           - Sid: InspectLogGroups
             Effect: Allow
@@ -270,7 +253,6 @@ Resources:
             Action: [cloudwatch:PutMetricAlarm, cloudwatch:DeleteAlarms, cloudwatch:TagResource, cloudwatch:UntagResource]
             Resource:
               - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${LegacyResourceNamePrefix}-*
 
           - Sid: InspectAlarms
             Effect: Allow
@@ -282,7 +264,6 @@ Resources:
             Action: [budgets:ModifyBudget, budgets:ViewBudget]
             Resource:
               - !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${ResourceNamePrefix}-*
-              - !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${LegacyResourceNamePrefix}-*
 
   CanonicalArtifactPolicy:
     Type: AWS::IAM::Policy
@@ -314,7 +295,7 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: TodoistCalendarSyncDeploymentAdditionsPolicy
-      Description: Read-only secret access plus backup and alert management during the todoist-calendar-sync cutover.
+      Description: Read-only secret access plus backup and alert management for todoist-calendar-sync.
       Roles: [!Ref DeploymentRole]
       PolicyDocument:
         Version: "2012-10-17"
@@ -324,7 +305,6 @@ Resources:
             Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
             Resource:
               - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/todoist-calendar-sync/*
-              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lambdas/gcp-app2-sync/*
               - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lambdas/shared/slack-bot-token
 
           - Sid: ManageApplicationDynamoDbBackups
@@ -332,7 +312,6 @@ Resources:
             Action: [dynamodb:UpdateContinuousBackups, dynamodb:DescribeContinuousBackups]
             Resource:
               - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourceNamePrefix}-state-*
-              - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${LegacyResourceNamePrefix}-state-*
 
           - Sid: ManageApplicationAlertTopics
             Effect: Allow
@@ -349,7 +328,6 @@ Resources:
               - sns:ListSubscriptionsByTopic
             Resource:
               - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${ResourceNamePrefix}-alerts-*
-              - !Sub arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${LegacyResourceNamePrefix}-alerts-*
 
 Outputs:
   DeploymentRoleArn:
