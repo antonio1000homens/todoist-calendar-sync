@@ -1,13 +1,13 @@
 import { DeleteCommand, GetCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS, parseDeletionTombstoneComment,
-  writeProjectDeletionTombstone } from "./mapping-comments.js";
+  writeProjectDeletionTombstone, type TodoistCommentRecord } from "./mapping-comments.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
 import { ErasureGateDriftError, type ErasureActionPlan, type ErasureOperation } from "./erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
-import type { Profile, TodoistCommentRecord } from "./types.js";
+import type { Profile } from "./types.js";
 
 export type ErasureDeletionProgress = {
   stage: "comments" | "todoist" | "calendar" | "state" | "finalize_comments" | "verify";
@@ -212,8 +212,8 @@ export function erasureProjectCommentsAbsent(
   return !projectComments.some(comment=>originalIds.includes(comment.id))
     && !index.parsed.some(({payload})=>payload.taskId===operation.target.taskId
       ||aliases.has(payload.eventId))
-    && !index.malformed.some(({comment})=>comment.content.includes(operation.target.taskId)
-      ||[...aliases].some(alias=>comment.content.includes(alias)))
+    && !index.malformed.some(({comment})=>Boolean(comment.content?.includes(operation.target.taskId)
+      ||[...aliases].some(alias=>comment.content?.includes(alias))))
     && !projectComments.some(comment=>{
       const marker=parseDeletionTombstoneComment(comment);
       return Boolean(marker&&(marker.taskId===operation.target.taskId
