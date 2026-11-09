@@ -798,3 +798,31 @@ create them. Keep execution disabled until the independent #347 boundary and
 rollback review and the #349 disposable-profile acceptance are complete. No
 fence release, DLQ replay, provider deletion or production erasure test is
 approved by this audit.
+
+### Legacy deployment-role reactivation path (9 Nov 2026)
+
+A read-only audit across all 17 opted-in/standard regions found the seven
+canonical Todoist Calendar Sync functions only in `eu-west-2`. No
+`gcp-app2-sync` application stack or Lambda function was present in any region,
+and the legacy artifact bucket prefix was empty. The `lambdas` repository's
+current deploy workflow no longer contains a legacy app target; its remaining
+`gcp-app2-sync` directory contains tests only.
+
+The old GitHub OIDC deployment role is nevertheless still trusted for pushes
+from `antonio1000homens/lambdas` `main` and `master`. Its active IAM stack,
+`github-actions-gcp-app2-sync-policy`, attaches two managed policies to that
+role, including permission to create/update `gcp-app2-sync-*` Lambda functions,
+Function URLs, event-source mappings, runtime roles, queues and the old stack.
+The role is the repository's current `AWS_ROLE_TO_ASSUME`; the current workflow
+has deployed unrelated Lambda changes with it. Legacy SSM parameters also
+remain. Thus absence of the old runtime is verified, but the ability to
+recreate a legacy writer is not yet denied.
+
+This PR removes the legacy prefix from the Todoist repository's own deployment
+role template. That template is not deployed by the application deploy
+workflow: the managed IAM role changes only after the privileged role-bootstrap
+script is run. This source change also does not remove the separate old
+`github-actions-gcp-app2-sync-policy` stack. Both live IAM boundaries still
+need reviewed retirement and redacted readback before #347 can pass. Keep
+production execution disabled until that and the #349 disposable erasure
+acceptance are complete.

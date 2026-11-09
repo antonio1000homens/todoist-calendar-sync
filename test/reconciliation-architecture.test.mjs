@@ -15,6 +15,7 @@ const healthSource = await readText("../src/reconcile.ts");
 const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
+const deployRoleBootstrap = await readText("../infrastructure/bootstrap-deployment-role.sh");
 const deployScript = await readText("../deploy.sh");
 const productionWorkflow = await readText("../.github/workflows/deploy.yml");
 
@@ -121,11 +122,14 @@ test("reconciliation API does not expose an unimplemented dry-run mode", () => {
   assert.doesNotMatch(typesSource, /dryRun/);
 });
 
-test("standalone deployment role scopes SNS and cannot write application secrets", () => {
+test("standalone deployment role scopes SNS and removes the legacy deploy path", () => {
   const snsBlock = deployPolicy.match(/- Sid: ManageApplicationAlertTopic[\s\S]*?\nOutputs:/)?.[0] || "";
   assert.match(snsBlock, /arn:\$\{AWS::Partition\}:sns:\$\{AWS::Region\}:\$\{AWS::AccountId\}:\$\{ResourceNamePrefix\}-alerts-\*/);
   assert.match(deployPolicy, /ResourceNamePrefix:[\s\S]*?Default:\s*todoist-calendar-sync/);
-  assert.match(snsBlock, /\$\{LegacyResourceNamePrefix\}-alerts-\*/);
+  assert.doesNotMatch(deployPolicy, /gcp-app2-sync|LegacyApplicationStackName|LegacyResourceNamePrefix/);
+  assert.doesNotMatch(deployRoleBootstrap, /gcp-app2-sync|LEGACY_APPLICATION_STACK_NAME|LEGACY_RESOURCE_NAME_PREFIX/);
+  assert.match(deployPolicy, /SamCliManagedSourceBucketName/);
+  assert.match(deployRoleBootstrap, /SAM_CLI_MANAGED_SOURCE_BUCKET_NAME/);
   assert.doesNotMatch(snsBlock, /Resource:\s*"\*"/);
   assert.doesNotMatch(snsBlock, /StringLikeIfExists/);
   assert.doesNotMatch(deployPolicy, /ssm:PutParameter/);
