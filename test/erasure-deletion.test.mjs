@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { executeErasureDeletionStep } from "../dist/erasure-deletion.js";
+import { executeErasureDeletionStep, erasureProjectCommentsAbsent } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
@@ -275,4 +275,32 @@ test("already absent project comment advances idempotently without recreating a 
     }},inspectFence:async()=>({leases:[]})});
   assert.equal(result.progress.finalCommentIndex,1);
   assert.equal(writes,0);
+});
+
+
+test("postflight rejects original mapping, tombstone and stale alias references but ignores unrelated notes",async()=>{
+  const {serializeDeletionTombstoneComment}=await import("../dist/mapping-comments.js");
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["original-1"],knownCalendarAliases:[
+      {profile:"home",calendarId:"home@example.test",eventId:"event-1"}]}};
+  const originalContent=serializeMappingComment({
+    profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
+    updatedAt:"2026-11-08T12:00:00.000Z",
+  },"test-home-project");
+  const markerContent=serializeDeletionTombstoneComment({
+    schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
+    eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z",
+  });
+  const unrelated={id:"unrelated",project_id:"test-home-project",content:"User's personal shopping note"};
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated]),true);
+  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"original-1"}]),false,
+    "the exact originally selected comment ID must be missing");
+  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",content:originalContent}]),false,
+    "a mapping copied under another comment ID must block success");
+  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",content:markerContent}]),false,
+    "expired markers are still deleted-task identity and block success");
+  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",
+    content:"todoist-calendar-sync:mapping:v1\n{bad-json task-1"}]),false,
+    "malformed app mapping that references the deleted task requires review");
 });
