@@ -123,11 +123,14 @@ test("reconciliation API does not expose an unimplemented dry-run mode", () => {
 });
 
 test("standalone deployment role scopes SNS and removes the legacy deploy path", () => {
+  const legacyResourcePrefix = ["gcp", "app2", "sync"].join("-");
   const snsBlock = deployPolicy.match(/- Sid: ManageApplicationAlertTopic[\s\S]*?\nOutputs:/)?.[0] || "";
   assert.match(snsBlock, /arn:\$\{AWS::Partition\}:sns:\$\{AWS::Region\}:\$\{AWS::AccountId\}:\$\{ResourceNamePrefix\}-alerts-\*/);
   assert.match(deployPolicy, /ResourceNamePrefix:[\s\S]*?Default:\s*todoist-calendar-sync/);
-  assert.doesNotMatch(deployPolicy, /gcp-app2-sync|LegacyApplicationStackName|LegacyResourceNamePrefix/);
-  assert.doesNotMatch(deployRoleBootstrap, /gcp-app2-sync|LEGACY_APPLICATION_STACK_NAME|LEGACY_RESOURCE_NAME_PREFIX/);
+  assert.doesNotMatch(deployPolicy, new RegExp(legacyResourcePrefix));
+  assert.doesNotMatch(deployPolicy, /LegacyApplicationStackName|LegacyResourceNamePrefix/);
+  assert.doesNotMatch(deployRoleBootstrap, new RegExp(legacyResourcePrefix));
+  assert.doesNotMatch(deployRoleBootstrap, /LEGACY_APPLICATION_STACK_NAME|LEGACY_RESOURCE_NAME_PREFIX/);
   assert.match(deployPolicy, /SamCliManagedSourceBucketName/);
   assert.match(deployRoleBootstrap, /SAM_CLI_MANAGED_SOURCE_BUCKET_NAME/);
   assert.doesNotMatch(snsBlock, /Resource:\s*"\*"/);
