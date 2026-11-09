@@ -36,7 +36,7 @@
     "@aws-sdk/client-sqs": "^3.1160.0",
     "@aws-sdk/client-ssm": "^3.1161.0",
     "@aws-sdk/credential-provider-ini": "^3.973.25",
-    "@aws-sdk/lib-dynamodb": "^3.1160.0",
+    "@aws-sdk/lib-dynamodb": "^3.1163.0",
     "jose": "^6.2.14",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
