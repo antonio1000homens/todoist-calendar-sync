@@ -109,6 +109,7 @@ test("confirmed deletion removes project comment and every inventoried DynamoDB 
     inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only"})),
     actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
       knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+      projectCommentIds:["project-1"],
       comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
   const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({leases:[]})};
   let progress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")};
