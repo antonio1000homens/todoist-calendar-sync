@@ -18,33 +18,91 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.select.outputs.full }}
+      unit: ${{ steps.select.outputs.unit }}
+      base: ${{ steps.select.outputs.base }}
+      review: ${{ steps.select.outputs.review }}
+      worker: ${{ steps.select.outputs.worker }}
+      sam: ${{ steps.select.outputs.sam }}
+      public: ${{ steps.select.outputs.public }}
+      e2eSyntax: ${{ steps.select.outputs.e2eSyntax }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Select checks for changed files
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [[ -z "$base" ]]; then files=(); else mapfile -t files < <(git diff --name-only "$base" "$GITHUB_SHA"); fi
+          node scripts/select-ci-checks.mjs "${files[@]}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        if: steps.select.outputs.unit == 'true' || steps.select.outputs.review == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
         with:
           node-version: '22'
           cache: npm
 
       - name: Install dependencies
+        if: steps.select.outputs.unit == 'true' || steps.select.outputs.review == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
         run: npm ci
 
       - name: Validate production E2E harness syntax
+        if: steps.select.outputs.e2eSyntax == 'true'
         run: node --check scripts/production-e2e.mjs
 
       - name: Build and test
+        if: steps.select.outputs.full == 'true'
         run: npm test
 
+      - name: Build and run changed tests
+        if: steps.select.outputs.unit == 'true' && steps.select.outputs.full != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          mapfile -t changed_tests < <(git diff --name-only "${{ steps.select.outputs.base }}" "$GITHUB_SHA" -- 'test/*.test.mjs')
+          if (( ${#changed_tests[@]} == 0 )); then
+            npm test
+          else
+            node --import ./test/setup-env.mjs --test "${changed_tests[@]}"
+          fi
+
       - name: Build review UI
+        if: steps.select.outputs.review == 'true'
         run: npm run build:review
 
+      - name: Test Calendar Cloudflare Worker
+        if: steps.select.outputs.worker == 'true'
+        run: node --test cloudflare/calendar-sync/worker.test.mjs
+
       - name: Check public-source boundary
+        if: steps.select.outputs.public == 'true'
         run: bash scripts/check-public-source.sh
 
       - uses: aws-actions/setup-sam@341eee193f458fa5aae5d52c94b0c5cf3a1c5a52 # v3
+        if: steps.select.outputs.sam == 'true'
 
       - name: Validate SAM template
+        if: steps.select.outputs.sam == 'true'
         run: sam validate --lint
 
       - name: Build SAM application
+        if: steps.select.outputs.sam == 'true'
         run: PATH="$PWD/node_modules/.bin:$PATH" sam build
+
+      - name: Stable CI result
+        if: always()
+        run: test "${{ job.status }}" = success
