@@ -776,3 +776,25 @@ queue, operation, fence, or provider state was changed during these audits.
 Keep execution disabled, do not release fences or enable replay admission, and
 leave #347 and #349 open pending the writer boundary, independent review, and
 disposable Work-profile fault-injection acceptance.
+
+### Production qualified-version boundary update (9 Nov 2026)
+
+A fresh production read-only audit after PRs #403–#406 found 223 published
+versions across seven functions, two aliases, and two enabled SQS mappings.
+For the ingress and Review API functions, exact resource-policy Deny statements
+were installed on every old numeric published version: 87 ingress versions and
+133 Review API versions. Direct harmless invocation probes for representative
+old versions returned AWS `AccessDeniedException`; harmless DryRun probes for
+both live aliases remained allowed. Review API v135 remains a guarded rollback
+target. The live aliases point to ingress v89 and Review API v136. Private
+readback reports are retained outside the repository.
+
+The read-only inventory now reports whether an exact-version
+`DenyUnreviewedQualifiedInvocation` statement is present. This is not a complete
+effective-permissions proof: identity, trust/session, organization, endpoint,
+URL, external account, legacy-name and other-region paths still require review.
+The live resource-policy Denies are already in place; repository changes do not
+create them. Keep execution disabled until the independent #347 boundary and
+rollback review and the #349 disposable-profile acceptance are complete. No
+fence release, DLQ replay, provider deletion or production erasure test is
+approved by this audit.

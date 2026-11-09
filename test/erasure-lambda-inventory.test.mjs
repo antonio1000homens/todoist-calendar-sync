@@ -55,6 +55,8 @@ function fakeClient({loop=false,failOnPolicy=false}={}) {
               {Effect:"Allow",Principal:{AWS:"arn:aws:iam::444455556666:root"},Action:["lambda:InvokeFunction","lambda:InvokeAsync"]},
               {Effect:"Allow",Principal:{Service:"events.amazonaws.com"},Action:"lambda:InvokeFunction"},
               {Effect:"Allow",Principal:{Federated:"arn:aws:iam::111122223333:saml-provider/example"},Action:"lambda:InvokeFunction"},
+              {Sid:"DenyUnreviewedQualifiedInvocation",Effect:"Deny",Principal:"*",
+                Action:["lambda:InvokeFunction","lambda:InvokeAsync"],Resource:base+worker+":3"},
             ],
           })};
           throw Object.assign(new Error("not found"),{name:"ResourceNotFoundException"});
@@ -80,9 +82,10 @@ test("collects ALL Lambda pages, published versions, aliases, qualified SQS trig
   assert.deepEqual(w.eventSourceMappings,[{
     qualifier:"live",state:"Enabled",sourceService:"sqs",
   }]);
-  assert.deepEqual(w.policies["3"],{statementCount:5,wildcardPrincipalPresent:true});
+  assert.deepEqual(w.policies["3"],{statementCount:6,wildcardPrincipalPresent:true});
+  assert.deepEqual(w.resourcePolicyControls["3"],{unreviewedQualifiedInvokeDenyPresent:true});
   assert.deepEqual(w.resourcePolicyPrincipals["3"],{
-    wildcardPrincipalStatementCount:1,sameAccountAwsPrincipalCount:1,
+    wildcardPrincipalStatementCount:2,sameAccountAwsPrincipalCount:1,
     externalAwsPrincipalCount:1,unknownAwsPrincipalCount:0,servicePrincipalCount:1,
     federatedPrincipalCount:1,unknownPrincipalStatementCount:0,
     externalInvokeFunctionAllowCount:1,externalInvokeFunctionUrlAllowCount:0,
@@ -112,5 +115,6 @@ test("inventory imports only Lambda read commands; never mutates provider, queue
   const imports=source.split('from "@aws-sdk/client-lambda"')[0];
   for(const forbidden of ["UpdateEventSourceMappingCommand","InvokeCommand",
     "DeleteFunctionCommand","PublishVersionCommand","AddPermissionCommand",
+    "PutResourcePolicyCommand","DeleteResourcePolicyCommand",
     "PutFunctionEventInvokeConfigCommand"])assert.equal(imports.includes(forbidden),false);
 });

@@ -39,6 +39,10 @@ function actionMayMatch(statement,action) {
   if(Object.hasOwn(statement,"NotAction"))return !asArray(statement.NotAction).some(item=>actionMatches(item,action));
   return true;
 }
+function resourceMayMatch(statement,resourceArn) {
+  if(Object.hasOwn(statement,"NotResource"))return false;
+  return asArray(statement?.Resource).some(pattern=>typeof pattern==="string"&&actionMatches(pattern,resourceArn));
+}
 function principalEntries(value) {
   if(typeof value==="string")return [value];
   if(Array.isArray(value))return value.filter(item=>typeof item==="string");
@@ -117,7 +121,7 @@ export async function pages(client,Command,key,inputs={}) {
   throw new Error("Lambda pagination exceeded limit; incomplete inventory");
 }
 
-async function policySummary(client,name,qualifier,accountId) {
+async function policySummary(client,name,qualifier,accountId,baseArn) {
   try {
     const input={FunctionName:name,...(qualifier?{Qualifier:qualifier}:{})};
     const response=await client.send(new GetPolicyCommand(input));
@@ -125,6 +129,14 @@ async function policySummary(client,name,qualifier,accountId) {
     const parsed=JSON.parse(response.Policy);
     const statements=Array.isArray(parsed.Statement)?parsed.Statement:
       parsed.Statement?[parsed.Statement]:[];
+    const qualifiedArn=qualifier?`${baseArn}:${qualifier}`:baseArn;
+    const unreviewedQualifiedInvokeDenyPresent=Boolean(qualifier&&/^\d+$/.test(qualifier)
+      &&statements.some(statement=>statement?.Sid==="DenyUnreviewedQualifiedInvocation"
+        &&statement?.Effect==="Deny"&&statement?.Principal==="*"
+        &&statement?.Condition===undefined&&statement?.NotPrincipal===undefined
+        &&actionMayMatch(statement,"lambda:InvokeFunction")
+        &&actionMayMatch(statement,"lambda:InvokeAsync")
+        &&resourceMayMatch(statement,qualifiedArn)));
     const wildcardAllows=action=>statements.some(statement=>statement?.Effect==="Allow"
       &&wildcardPrincipal(statement.Principal)&&actionMayMatch(statement,action));
     const urlAction=statements.some(statement=>statement?.Effect==="Allow"&&wildcardPrincipal(statement.Principal)
@@ -139,11 +151,13 @@ async function policySummary(client,name,qualifier,accountId) {
       wildcardInvokeFunctionUrlAllowPresent:wildcardAllows("lambda:InvokeFunctionUrl"),
       wildcardInvokeFunctionUrlNoneAllowPresent:urlAction,
       wildcardInvokeFunctionViaUrlAllowPresent:invokeViaUrl,
+      unreviewedQualifiedInvokeDenyPresent,
       resourcePolicyPrincipals:resourcePolicyPrincipalSummary(statements,accountId)};
   } catch(error) {
     if(error?.name==="ResourceNotFoundException")return {statementCount:0,wildcardPrincipalPresent:false,
       wildcardInvokeFunctionAllowPresent:false,wildcardInvokeFunctionUrlAllowPresent:false,
       wildcardInvokeFunctionUrlNoneAllowPresent:false,wildcardInvokeFunctionViaUrlAllowPresent:false,
+      unreviewedQualifiedInvokeDenyPresent:false,
       resourcePolicyPrincipals:resourcePolicyPrincipalSummary([],accountId)};
     throw error;
   }
@@ -200,9 +214,9 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[],ac
       ...versions.map(v=>v.Version).filter(v=>v&&v!=="$LATEST"),
       ...aliases.map(a=>a.Name).filter(Boolean),
     ])].sort();
-    const policyDetails={unqualified:await policySummary(client,f.FunctionName,undefined,accountId)};
+    const policyDetails={unqualified:await policySummary(client,f.FunctionName,undefined,accountId,f.FunctionArn)};
     for(const qualifier of qualifierNames) {
-      policyDetails[qualifier]=await policySummary(client,f.FunctionName,qualifier,accountId);
+      policyDetails[qualifier]=await policySummary(client,f.FunctionName,qualifier,accountId,f.FunctionArn);
     }
     const policies=Object.fromEntries(Object.entries(policyDetails).map(([qualifier,policy])=>[qualifier,{
       statementCount:policy.statementCount,wildcardPrincipalPresent:policy.wildcardPrincipalPresent,
@@ -215,6 +229,8 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[],ac
     }]));
     const resourcePolicyPrincipals=Object.fromEntries(Object.entries(policyDetails)
       .map(([qualifier,policy])=>[qualifier,policy.resourcePolicyPrincipals]));
+    const resourcePolicyControls=Object.fromEntries(Object.entries(policyDetails)
+      .map(([qualifier,policy])=>[qualifier,{unreviewedQualifiedInvokeDenyPresent:policy.unreviewedQualifiedInvokeDenyPresent}]));
     const urls={unqualified:await functionUrlSummary(client,f.FunctionName)};
     for(const alias of aliases) {
       if(!alias.Name)throw new Error("Alias with no name: "+f.FunctionName);
@@ -235,7 +251,7 @@ export async function collectLambdaInventory(client,{prefix,stage,expected=[],ac
           m.FunctionArn.slice(f.FunctionArn.length+1),
         state:m.State??"UNKNOWN",sourceService:sourceService(m.EventSourceArn),
       })),
-      policies,functionUrlPolicies,resourcePolicyPrincipals,urls,
+      policies,functionUrlPolicies,resourcePolicyPrincipals,resourcePolicyControls,urls,
       // IAM identity policies, legacy functions and direct invocations are not
       // established by these read-only Lambda APIs.
       approvedForReplayRelease:false,

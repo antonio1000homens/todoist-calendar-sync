@@ -112,3 +112,16 @@ the same marker before every provider or DynamoDB write. #347 remains open for
 the complete version/caller inventory and an enforceable IAM/resource-policy
 boundary, independent review, and rollback evidence. #349 remains open for the
 disposable Work-profile fault matrix.
+
+## Production boundary update (9 Nov 2026)
+
+Production now has exact resource-policy Denies on ingress numeric versions
+2–88 and Review API numeric versions 2–134. Representative direct invocations
+of old versions were rejected, while the live aliases and Review API v135
+rollback target remain callable and guarded. The complete current invoker
+snapshot has seven functions, 223 numeric published versions, two aliases and
+two enabled SQS mappings. This materially closes the known old-qualified-version
+path in `eu-west-2`, but does not establish all-account, all-region, legacy-name,
+Function URL, effective IAM/trust, or manual rollback safety. Independent review
+and rollback rehearsal remain required before checking the #347 acceptance box.
+The exact redacted inventory and policy readbacks are kept outside the repo.
