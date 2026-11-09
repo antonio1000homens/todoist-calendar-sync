@@ -92,6 +92,7 @@ Resources:
               - lambda:GetFunctionRecursionConfig
               - lambda:GetRuntimeManagementConfig
               - lambda:GetPolicy
+              - lambda:GetResourcePolicy
               - lambda:UpdateFunctionCode
               - lambda:UpdateFunctionConfiguration
               - lambda:PublishVersion
@@ -103,6 +104,7 @@ Resources:
               - lambda:ListAliases
               - lambda:AddPermission
               - lambda:RemovePermission
+              - lambda:PutResourcePolicy
               - lambda:CreateFunctionUrlConfig
               - lambda:UpdateFunctionUrlConfig
               - lambda:DeleteFunctionUrlConfig

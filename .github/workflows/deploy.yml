@@ -147,6 +147,9 @@ jobs:
           BILLING_ALARM_EMAIL: ${{ env.TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL }}
         run: bash ./deploy.sh
 
+      - name: Enforce qualified Lambda invocation boundary
+        run: node scripts/enforce-erasure-lambda-invocation-boundary.mjs --region "$AWS_REGION"
+
       - name: Verify completed-history retirement schedule and Lambda mode
         shell: bash
         run: |
