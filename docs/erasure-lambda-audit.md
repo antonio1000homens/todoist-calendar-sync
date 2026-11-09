@@ -825,8 +825,28 @@ Todoist/legacy Lambda management, mappings targeting Todoist workers,
 Todoist/legacy CloudFormation stacks, and legacy runtime-role pass operations;
 unrelated NFC deploy operations remained allowed. The old managed policies are
 still attached, but the new explicit Deny overrides the protected actions.
-This closes the identified cross-repository deployment path; independent
-review of the full invocation boundary and rollback behavior remains open.
+This closes the previously identified route through the current
+`GitHubActionsLambdasDeployRole`; it does not neutralize any other role that
+trusts the repository.
+
+### Separate legacy OIDC role remains active (9 Nov 2026)
+
+A refreshed read-only IAM audit found a second role, `S3-access-github-actions`,
+whose OIDC trust also accepts `antonio1000homens/lambdas` repository refs. It
+has the AWS-managed `IAMFullAccess`, `AWSCloudFormationFullAccess`,
+`AWSLambda_FullAccess`, and `AmazonS3FullAccess` policies attached, and it does
+not carry the Todoist invocation-boundary policy. IAM last-used metadata reports
+12 Mar 2026. The current `lambdas` repository variable points to
+`GitHubActionsLambdasDeployRole` and was updated on 13 Mar; code search found no
+current source reference to the older role outside audit documentation. These
+facts indicate that the role is likely retired, but do not prove that no
+dormant branch or external process depends on it.
+
+PR #126 merged a template change that adds a reversible deny-all managed policy
+for this role. The existing stack's change set was prepared and read back; it
+adds only that policy and has **not** been executed. Until the approved stack
+update is applied and read back, the old role remains able to use its broad
+permissions. The #347 writer/IAM boundary and rollback review remain open.
 
 ### Post-deployment refresh after PR #412 (9 Nov 2026)
 
