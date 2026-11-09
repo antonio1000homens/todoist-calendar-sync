@@ -808,21 +808,44 @@ artifact bucket prefix was empty. The `lambdas` repository's current deploy
 workflow no longer contains the old app target; its remaining source directory
 contains tests only.
 
-The old GitHub OIDC deployment role is nevertheless still trusted for pushes
-from `antonio1000homens/lambdas` `main` and `master`. Its active IAM policy
-stack attaches two managed policies to that role, including permission to
-create/update functions under the old prefix,
-Function URLs, event-source mappings, runtime roles, queues and the old stack.
-The role is the repository's current `AWS_ROLE_TO_ASSUME`; the current workflow
-has deployed unrelated Lambda changes with it. Legacy SSM parameters also
-remain. Thus absence of the old runtime is verified, but the ability to
-recreate a legacy writer is not yet denied.
+The old GitHub OIDC deployment role is still trusted for pushes from
+`antonio1000homens/lambdas` `main` and `master`. At the time of this audit, its
+legacy policy stack attached two managed policies that granted management of
+old-prefix functions, URLs, event-source mappings, runtime roles, queues, and
+the old stack. Legacy SSM parameters also remain. Subsequent guard deployment
+is recorded below; this earlier finding is retained as history, not the current
+effective-boundary conclusion.
 
-This PR removes the legacy prefix from the Todoist repository's own deployment
-role template. That template is not deployed by the application deploy
-workflow: the managed IAM role changes only after the privileged role-bootstrap
-script is run. This source change also does not remove the separate legacy
-policy stack. Both live IAM boundaries still
-need reviewed retirement and redacted readback before #347 can pass. Keep
-production execution disabled until that and the #349 disposable erasure
-acceptance are complete.
+PRs #413/#414 were subsequently merged and the Todoist deploy-role stack update
+completed. The Todoist role now uses stack-qualified replacement policies and
+no longer carries the legacy event-source-mapping policy. PR #125 in the
+`lambdas` repository added and deployed a customer-managed explicit-deny policy
+on the shared GitHub deploy role. Live IAM simulations confirmed Deny for
+Todoist/legacy Lambda management, mappings targeting Todoist workers,
+Todoist/legacy CloudFormation stacks, and legacy runtime-role pass operations;
+unrelated NFC deploy operations remained allowed. The old managed policies are
+still attached, but the new explicit Deny overrides the protected actions.
+This closes the identified cross-repository deployment path; independent
+review of the full invocation boundary and rollback behavior remains open.
+
+### Post-deployment refresh after PR #412 (9 Nov 2026)
+
+Production deployment run 42565444685 succeeded for master commit
+`06c62fe6dd9f72dafc9cd64ad6130d5e4ff6f300`. A fresh seven-function code audit
+verified the deployed package digests. Current ingress version 92 and Review
+API version 139 are the `live` alias targets. Resource-policy Denies remain on
+the older ingress versions 2–88 and Review API versions 2–134; the later
+versions ingress 89–92 and Review API 135–139 do not have that version-specific
+Deny statement. The latest ingress and Review API packages contain the current
+project-tombstone implementation strings; the worker package contains the
+tombstone suppression path. String presence still does not prove ordering at
+every write boundary. The Review API versions 135–139 and the erasure worker
+currently have execution disabled, while the erasure worker's SQS mapping is
+enabled. No erasure operation, fence release, DLQ replay, or provider mutation
+was performed.
+
+The post-deployment findings do not close #347: all actual invocation
+principals, direct/alias/URL paths and future rollback/publish behavior still
+need independent review. They also do not satisfy #349's disposable erasure
+E2E, fault-injection, retry/quarantine, and rollback rehearsal. Keep production
+execution disabled until both tickets' acceptance criteria are verified.

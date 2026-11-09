@@ -168,18 +168,28 @@ bounded engineering default based on the current four-day FIFO source queue and
 fourteen-day DLQ; an arbitrarily late webhook or repeated manual redrive after
 expiry cannot be recognized from retained identity.
 
-The source PRs for this model are still drafts and are not deployed. A current
-read-only Lambda package audit found no project-comment tombstone marker in the
-seven deployed functions or their inspected published versions. Source checks
-cover Todoist webhooks, Calendar deltas, snapshot reconciliation and orphan
-recovery, plus stored manual decisions and queued repair previews. The current
-Review API and erasure worker are enabled, so do not treat the source-only
-tombstone checks as protecting live operations. Keep the existing replay
-barrier off, do not release an erasure fence, and do not start recovery until
-the #347 invocation boundary and #349 disposable Work-profile acceptance are
-complete. This model is known-identity recovery only; it does not prove absence
-of unknown Calendar copies, backups, or external integrations. Normal sync,
-recurrence, and seven-day completed-task retention remain separate behavior.
+The implementation is merged and deployed. A fresh read-only audit on 9 Nov
+2026 verified the project-tombstone marker in the deployed ingress, sync worker,
+Review API, and erasure-worker packages. Source-level admission checks cover
+Todoist webhooks, Calendar deltas, snapshot reconciliation, orphan recovery,
+stored manual decisions, and queued repair previews. The production Review API
+and erasure worker currently have execution disabled (`ERASURE_EXECUTION_ENABLED=false`);
+the erasure worker's SQS event-source mapping is enabled, so the application
+gate remains essential.
+
+The version boundary needs ongoing review. Exact invocation Denies cover the
+older ingress versions 2–88 and Review API versions 2–134. The later-published
+ingress versions 89–92 and Review API versions 135–139 do not carry those
+version-specific Denies; they contain the current tombstone-related code, and
+the Review API versions are configured with execution disabled. Marker strings
+and configuration readback do not prove that every check dominates every write
+or that every caller and rollback path is covered. Keep the production gate
+disabled, do not release an erasure fence, and do not start recovery until the
+#347 invocation boundary and independent security/rollback review, plus #349
+disposable Work-profile acceptance, are complete. This model is known-identity
+recovery only; it does not prove absence of unknown Calendar copies, backups, or
+external integrations. Normal sync, recurrence, and seven-day completed-task
+retention remain separate behavior.
 
 The API scan stops after its bounded 80-second preview window and returns no
 confirmation if it cannot finish. It uses the configured DynamoDB scan page
