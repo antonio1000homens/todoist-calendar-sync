@@ -157,16 +157,18 @@ plan**. A successful production rollout must include the review-page
 confirmation/progress experience and a tested operator recovery process.
 This flag alone is not full issue #113 acceptance.
 
-## Bounded replay tombstone for issue #349
+## Ephemeral in-flight replay guard for issue #349
 
-The #349 implementation uses the exact existing Todoist project mapping
-comment as a temporary replay tombstone. The comment retains the deleted task
-ID and explicitly recorded Calendar event aliases for 18 days after a verified
-rewrite, then an operator-run cleanup removes that exact expired comment. A
-successful operation leaves no deleted-task identity in DynamoDB. This is a
-bounded engineering default based on the current four-day FIFO source queue and
-fourteen-day DLQ; an arbitrarily late webhook or repeated manual redrive after
-expiry cannot be recognized from retained identity.
+While the erasure fence is active, the exact existing Todoist project mapping
+comment is temporarily rewritten to preserve the original task/Calendar identity
+for safe interrupted-operation review. After provider and DynamoDB deletion,
+**the executor deletes the exact project comment and verifies absence before
+successful completion and fence release**. Successful deletion therefore leaves
+no task-specific identity in DynamoDB **or** in an app-owned Todoist project
+comment. A separate 18-day expiry applies only to leftover in-flight/legacy
+markers needing explicit operator cleanup, not to completed deletions. A late
+webhook or manually redriven queue message may no longer be recognizable after
+success; this is the deliberate no-retention trade-off.
 
 The implementation is merged and deployed. A fresh read-only audit on 9 Nov
 2026 verified the project-tombstone marker in the deployed ingress, sync worker,
