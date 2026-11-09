@@ -148,7 +148,7 @@ jobs:
         run: bash ./deploy.sh
 
       - name: Enforce qualified Lambda invocation boundary
-        run: node scripts/enforce-erasure-lambda-invocation-boundary.mjs --region "$AWS_REGION"
+        run: node scripts/enforce-erasure-lambda-invocation-boundary.mjs --region="$AWS_REGION"
 
       - name: Verify completed-history retirement schedule and Lambda mode
         shell: bash

@@ -10,7 +10,7 @@ test("production deploy enforces the resource-policy boundary after SAM publishe
   const boundaryIndex=workflow.indexOf("- name: Enforce qualified Lambda invocation boundary");
   const verifyIndex=workflow.indexOf("- name: Verify completed-history retirement schedule and Lambda mode");
   assert.ok(deployIndex>=0&&boundaryIndex>deployIndex&&verifyIndex>boundaryIndex);
-  assert.match(workflow.slice(boundaryIndex,verifyIndex),/scripts\/enforce-erasure-lambda-invocation-boundary\.mjs --region "\$AWS_REGION"/);
+  assert.match(workflow.slice(boundaryIndex,verifyIndex),/scripts\/enforce-erasure-lambda-invocation-boundary\.mjs --region="\$AWS_REGION"/);
 });
 
 test("deployment role can read and replace Lambda policies only under the app function prefix",()=>{
