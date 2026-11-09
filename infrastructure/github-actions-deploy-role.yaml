@@ -39,7 +39,7 @@ Resources:
   DeploymentPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: TodoistCalendarSyncDeploymentPolicy
+      ManagedPolicyName: !Sub "${AWS::StackName}-DeploymentPolicy"
       Description: Deploy todoist-calendar-sync using only its canonical resource prefix.
       Roles: [!Ref DeploymentRole]
       PolicyDocument:
@@ -294,7 +294,7 @@ Resources:
   DeploymentAdditionsPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: TodoistCalendarSyncDeploymentAdditionsPolicy
+      ManagedPolicyName: !Sub "${AWS::StackName}-DeploymentAdditionsPolicy"
       Description: Read-only secret access plus backup and alert management for todoist-calendar-sync.
       Roles: [!Ref DeploymentRole]
       PolicyDocument:
