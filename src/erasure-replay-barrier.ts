@@ -114,7 +114,7 @@ export type ConfirmedErasureCompletionProof={
   confirmationId:string;previewFingerprint:string;epoch:number;
 };
 
-/** Atomically remove the verified operation/fence after its provider comment tombstones are read back. */
+/** Atomically retire the operation/fence after the original project comments have been deleted and verified absent. */
 export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletionProof):TransactWriteCommand {
   if(!OPERATION_ID.test(proof.operationId)||!REPLAY_PROFILES.includes(proof.profile)
     ||!ID.test(proof.taskId)||!UUID.test(proof.confirmationId)
@@ -125,7 +125,7 @@ export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletio
   if(!commentIds.length||commentIds.length>32||commentIds.some(id=>typeof id!=="string"
     ||id.length<1||id.length>256||/[\u0000-\u001f\u007f]/.test(id))
     ||new Set(commentIds).size!==commentIds.length)
-    throw new ErasureReplayUnavailableError("An exact verified project tombstone comment is required before erasure completion");
+    throw new ErasureReplayUnavailableError("An exact original project mapping comment inventory is required before erasure completion");
   const aliases=proof.knownCalendarAliases||[];
   if(proof.deleteCalendar) {
     if(!proof.eventId||!ID.test(proof.eventId)||!proof.calendarId||!CALENDAR_ID.test(proof.calendarId)
