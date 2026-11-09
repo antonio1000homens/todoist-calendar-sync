@@ -1,6 +1,6 @@
 import { DeleteCommand, GetCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS, parseDeletionTombstoneComment,
-  writeProjectDeletionTombstone } from "./mapping-comments.js";
+  writeProjectDeletionTombstone, type TodoistCommentRecord } from "./mapping-comments.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
 import { buildErasurePreview } from "./erasure-preview.js";
@@ -10,7 +10,9 @@ import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
 export type ErasureDeletionProgress = {
-  stage: "comments" | "todoist" | "calendar" | "state" | "verify";
+  stage: "comments" | "todoist" | "calendar" | "state" | "finalize_comments" | "verify";
+  /** Index through exact project comments to remove after provider and state deletion. */
+  finalCommentIndex?: number;
   commentIndex: number;
   stateIndex: number;
   startedAt: number;
@@ -150,7 +152,7 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
     const ordered=[...operation.inventory].sort((a,b)=>Number(a.type==="SYNC_CONTROL")-Number(b.type==="SYNC_CONTROL")
       ||a.key.pk.localeCompare(b.key.pk)||a.key.sk.localeCompare(b.key.sk));
     const record=ordered[progress.stateIndex];
-    if(!record) return {progress:{...progress,stage:"verify"},complete:false};
+    if(!record) return {progress:{...progress,stage:"finalize_comments",finalCommentIndex:0},complete:false};
     const response=await db.send(new GetCommand({TableName:tableName(),Key:record.key,ConsistentRead:true}));
     const existing=response.Item as Record<string,unknown>|undefined;
     if(existing) {
@@ -164,7 +166,59 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
     }
     return {progress:{...progress,stateIndex:progress.stateIndex+1},complete:false};
   }
+  if(progress.stage==="finalize_comments") {
+    // The project mapping comment is a temporary recovery guard ONLY while
+    // the confirmed deletion is fenced. Successful sync must retain no
+    // project comment containing the deleted task's identity.
+    const commentIds=plan.projectCommentIds||[];
+    const index=progress.finalCommentIndex??0;
+    if(!commentIds.length||index>commentIds.length)throw new ErasureGateDriftError();
+    const id=commentIds[index];
+    if(!id)return {progress:{...progress,stage:"verify"},complete:false};
+    let comment:Awaited<ReturnType<typeof clients.todoist.getComment>>|undefined;
+    try { comment=await clients.todoist.getComment(id); }
+    catch(error) { if(!commentGone(error))throw error; }
+    if(comment) {
+      const marker=parseDeletionTombstoneComment(comment);
+      const aliases=(plan.knownCalendarAliases||[]).map(alias=>alias.eventId);
+      if(comment.id!==id||comment.project_id!==profiles[operation.profile].todoistProjectId||comment.task_id
+        ||!marker||marker.profile!==operation.profile
+        ||marker.projectId!==profiles[operation.profile].todoistProjectId
+        ||marker.taskId!==operation.target.taskId
+        ||aliases.some(alias=>!marker.eventIds.includes(alias)))
+        throw new ErasureGateDriftError();
+      await clients.todoist.deleteComment(id);
+      try {
+        const remaining=await clients.todoist.getComment(id);
+        if(remaining.id!==id)throw new ErasureGateDriftError();
+        throw new Error("Deleted task's project mapping comment remains after cleanup");
+      } catch(error) { if(!commentGone(error))throw error; }
+    }
+    return {progress:{...progress,finalCommentIndex:index+1},complete:false};
+  }
   return {progress,complete:true};
+}
+
+/** No app-owned Todoist project comment may refer to this deleted identity
+ * once an operation is successful. This deliberately does not retain a marker. */
+export function erasureProjectCommentsAbsent(
+  operation: ErasureOperation, projectComments: TodoistCommentRecord[],
+): boolean {
+  const originalIds=operation.actionPlan.projectCommentIds||[];
+  if(!originalIds.length)return false;
+  const aliases=new Set([operation.target.eventId,...(operation.actionPlan.knownCalendarAliases||[])
+    .map(alias=>alias.eventId)].filter((id):id is string=>Boolean(id)));
+  const index=buildProjectMappingIndex(projectComments);
+  return !projectComments.some(comment=>originalIds.includes(comment.id))
+    && !index.parsed.some(({payload})=>payload.taskId===operation.target.taskId
+      ||aliases.has(payload.eventId))
+    && !index.malformed.some(({comment})=>Boolean(comment.content?.includes(operation.target.taskId)
+      ||[...aliases].some(alias=>comment.content?.includes(alias))))
+    && !projectComments.some(comment=>{
+      const marker=parseDeletionTombstoneComment(comment);
+      return Boolean(marker&&(marker.taskId===operation.target.taskId
+        ||marker.eventIds.some(alias=>aliases.has(alias))));
+    });
 }
 
 /** Action-time readback is deliberately a full exact inventory pass and must prove no attributable data remains. */
@@ -176,16 +230,9 @@ export async function verifyErasurePostflight(operation:ErasureOperation,depende
       allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId});
   const projectId=profiles[operation.profile].todoistProjectId;
   const projectComments=await dependencies.clients.todoist.listProjectComments(projectId,true);
-  const requiredAliases=(operation.actionPlan.knownCalendarAliases||[]).map(alias=>alias.eventId);
-  const requiredComments=operation.actionPlan.projectCommentIds||[];
-  const markerComments=projectComments.map(comment=>({comment,marker:parseDeletionTombstoneComment(comment)}))
-    .filter(value=>value.marker?.profile===operation.profile&&value.marker.projectId===projectId
-      &&value.marker.taskId===operation.target.taskId&&Date.parse(value.marker.expiresAt)>Date.now());
-  const markerVerified=requiredComments.length>0&&requiredComments.every(id=>markerComments.some(({comment,marker})=>
-    comment.id===id&&requiredAliases.every(alias=>marker!.eventIds.includes(alias))));
   const providersAbsent=preview.blockers.length===0
-    && !preview.actionPlan.todoistTask && !preview.actionPlan.calendarEvent && preview.actionPlan.comments.length===0
-    &&markerVerified;
+    &&!preview.actionPlan.todoistTask&&!preview.actionPlan.calendarEvent&&preview.actionPlan.comments.length===0
+    &&erasureProjectCommentsAbsent(operation,projectComments);
   return {providersAbsent,stateAbsent:preview.inventory.length===0};
 }
 
