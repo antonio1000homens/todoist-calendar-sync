@@ -38,3 +38,14 @@ test("review API publishes a new live-alias version on reviewed function-propert
   assert.match(review,/Description: (Authenticated review API with the explicit erasure opt-in release|Recovery-aware authenticated review API)/);
   assert.match(review,/ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled/);
 });
+
+test("erasure worker reads only configured Google and Todoist credential parameters",()=>{
+  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
+  assert.ok(worker,"ErasureWorkerFunction SAM resource is defined");
+  assert.match(worker,/GOOGLE_CREDENTIALS_PARAMETER_PREFIX: !Ref GoogleCredentialsParameterPrefix/);
+  assert.match(worker,/TODOIST_TOKEN_PARAMETER_PREFIX: !Ref TodoistTokenParameterPrefix/);
+  assert.match(worker,/Action:\s*\n\s*- ssm:GetParameter/);
+  assert.match(worker,/parameter\$\{GoogleCredentialsParameterPrefix\}\/\*/);
+  assert.match(worker,/parameter\$\{TodoistTokenParameterPrefix\}\/\*/);
+  assert.doesNotMatch(worker,/ssm:\*/);
+});

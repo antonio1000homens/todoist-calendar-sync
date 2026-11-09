@@ -520,6 +520,8 @@ Resources:
           ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
           ERASURE_TARGET_WORKER_FUNCTION_NAME: !Ref WorkerFunction
           ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled
+          GOOGLE_CREDENTIALS_PARAMETER_PREFIX: !Ref GoogleCredentialsParameterPrefix
+          TODOIST_TOKEN_PARAMETER_PREFIX: !Ref TodoistTokenParameterPrefix
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
@@ -527,6 +529,13 @@ Resources:
             QueueName: !GetAtt ErasureOperationQueue.QueueName
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ErasureOperationQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterPrefix}/*
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TodoistTokenParameterPrefix}/*
         - Statement:
             - Effect: Allow
               Action:
