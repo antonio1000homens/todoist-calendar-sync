@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { executeErasureDeletionStep, erasureProjectCommentsAbsent } from "../dist/erasure-deletion.js";
+import { executeErasureDeletionStep, erasureProjectTombstonesPresent } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
-  serializeMappingComment } from "../dist/mapping-comments.js";
+  serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
 
 const baseOperation={operationId:"erase-1",profile:"home",target:{taskId:"task-1",eventId:"event-1",deleteCalendar:false},
   selectedActions:{deleteTodoist:true,deleteCalendar:false},inventory:[],actionPlan:{todoistTask:{id:"task-1",digest:fingerprint({id:"task-1",project_id:"test-home-project"})},comments:[]}};
@@ -65,7 +65,7 @@ test("a repeated project-comment deletion step accepts only its exact tombstone 
   assert.equal(comment.id,"project-1","the existing project comment ID is preserved");
 });
 
-test("confirmed deletion removes project comment and every inventoried DynamoDB identity row",async()=>{
+test("provider deletion leaves a bounded Todoist tombstone and scrubs completed receipt identities from DynamoDB",async()=>{
   const original=serializeMappingComment({profile:"home",projectId:"test-home-project",taskId:"task-1",eventId:"event-1",
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project");
   let comment={id:"project-1",project_id:"test-home-project",content:original};
@@ -76,7 +76,9 @@ test("confirmed deletion removes project comment and every inventoried DynamoDB 
     {pk:"TASK#home#task-1",sk:"MAPPING",taskId:"task-1",eventId:"event-1",profile:"home"},
     {pk:"BASELINE#home#TASK#task-1",sk:"RECONCILE",taskId:"task-1",lastEventId:"event-1",profile:"home"},
     {pk:"CANONICAL#home#calendar#event-1",sk:"EVENT",eventId:"event-1",profile:"home"},
-    {pk:"DELIVERY#task-1:event-1",sk:"COMPLETED",identityRefs:{taskIds:["task-1"],eventIds:["event-1"]}},
+    {pk:"DELIVERY#opaque-receipt",sk:"COMPLETED",profile:"home",kind:"calendar",
+      identityRefs:{taskIds:["task-1"],eventIds:["event-1"],seriesIds:[]},
+      completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000},
     {pk:"AUDIT#home#event-1",sk:"STATE",detail:{taskId:"task-1",eventId:"event-1"}},
   ];
   const unrelatedRow={pk:"TASK#home#unrelated",sk:"MAPPING",taskId:"unrelated-task",eventId:"unrelated-event",profile:"home"};
@@ -95,6 +97,13 @@ test("confirmed deletion removes project comment and every inventoried DynamoDB 
   const db={async send(command){
     const input=command.input;
     if(command.constructor.name.includes("Get"))return {Item:rows.get(`${input.Key.pk}|${input.Key.sk}`)};
+    if(command.constructor.name.includes("Update")){
+      const key=`${input.Key.pk}|${input.Key.sk}`,current=rows.get(key);
+      assert.ok(current,"the inventoried receipt is present until its identity-scrub step");
+      rows.set(key,{...current,identityRefs:{...current.identityRefs,
+        taskIds:input.ExpressionAttributeValues[":tasks"],eventIds:input.ExpressionAttributeValues[":events"]}});
+      return {};
+    }
     if(command.constructor.name.includes("Delete")){
       const key=`${input.Key.pk}|${input.Key.sk}`;
       const current=rows.get(key);
@@ -106,26 +115,30 @@ test("confirmed deletion removes project comment and every inventoried DynamoDB 
   }};
   const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
     selectedActions:{deleteTodoist:true,deleteCalendar:true},
-    inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only"})),
+    inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only",
+      ...(row.pk.startsWith("DELIVERY#")?{receiptCleanup:"scrub_identity_refs",
+        scrubbedDigest:fingerprint({...row,identityRefs:{...row.identityRefs,taskIds:[],eventIds:[]}})}:{})})),
     actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
       knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
-      projectCommentIds:["project-1"],
+      projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
       comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
-  const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({leases:[]})};
+  const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})};
   let progress={stage:"comments",commentIndex:0,stateIndex:0,startedAt:Date.parse("2026-11-08T12:00:00.000Z")};
   while(progress.stage!=="verify"){
     const result=await executeErasureDeletionStep(operation,progress,dependencies);
     progress=result.progress;
   }
-  assert.equal(comment,undefined,"project comment no longer holds deleted task identity at successful completion");
+  assert.ok(parseDeletionTombstoneComment(comment),"bounded project tombstone remains after successful erasure");
   assert.equal(task,undefined);
   assert.equal(event.status,"cancelled");
-  assert.equal(rows.size,1,"all inventoried identity rows are removed while unrelated DynamoDB state remains");
+  assert.equal(rows.size,2,"identity-bearing mappings are removed while unrelated state and an identity-free receipt remain");
   assert.equal(rows.get(`${unrelatedRow.pk}|${unrelatedRow.sk}`),unrelatedRow);
+  const receipt=[...rows.values()].find(row=>row.pk.startsWith("DELIVERY#"));
+  assert.deepEqual(receipt.identityRefs,{taskIds:[],eventIds:[],seriesIds:[]});
   const remainingDynamoRows=JSON.stringify([...rows.values()]);
   assert.doesNotMatch(remainingDynamoRows,/task-1|event-1/,
     "DynamoDB no longer contains the deleted task or Calendar event identity");
-  assert.equal(comment,undefined,"no project mapping comment or tombstone survives success");
+  assert.equal(comment.id,"project-1","existing comment identity is preserved for tombstone lifecycle cleanup");
 });
 
 test("confirmed erasure cannot advance when its project tombstone comment is missing",async()=>{
@@ -159,6 +172,46 @@ test("state deletion uses an exact conditional match for every inventoried attri
   assert.match(deleteInput.ConditionExpression,/#a\d+ = :v\d+/);
   assert.ok(Object.values(deleteInput.ExpressionAttributeNames).includes("revision"));
   assert.ok(Object.values(deleteInput.ExpressionAttributeValues).includes(7));
+});
+
+test("completed receipt identity scrubbing requires the confirmed active project tombstone on every step",async()=>{
+  const receipt={pk:"DELIVERY#receipt",sk:"COMPLETED",profile:"home",kind:"todoist",
+    identityRefs:{taskIds:["task-1"],eventIds:["event-1"],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const scrubbed={...receipt,identityRefs:{...receipt.identityRefs,taskIds:[],eventIds:[]}};
+  const operation={...baseOperation,inventory:[{type:"DELIVERY",key:{pk:receipt.pk,sk:receipt.sk},
+    digest:fingerprint(receipt),scrubbedDigest:fingerprint(scrubbed),receiptCleanup:"scrub_identity_refs",
+    classification:"selected-only"}],actionPlan:{...baseOperation.actionPlan,
+    projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
+    knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+    comments:[{id:"project-1",kind:"project",digest:fingerprint("mapping")}]} };
+  const db={send:async command=>command.constructor.name.includes("Get")?{Item:receipt}:({})};
+  const noMarker={todoist:{getComment:async()=>({id:"project-1",project_id:"test-home-project",content:"mapping"})},calendar:{}};
+  await assert.rejects(executeErasureDeletionStep(operation,{stage:"state",commentIndex:0,stateIndex:0,startedAt:1},
+    {db,clients:noMarker,inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})}),ErasureGateDriftError);
+
+  const createdAt=new Date().toISOString();
+  const marker=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId:"test-home-project",
+    taskId:"task-1",eventIds:["event-1"],createdAt,
+    expiresAt:new Date(Date.parse(createdAt)+PROJECT_DELETION_TOMBSTONE_RETENTION_MS).toISOString()});
+  let current=receipt,writeApplied=false;
+  const clients={todoist:{getComment:async()=>({id:"project-1",project_id:"test-home-project",
+    content:marker})},calendar:{}};
+  const guardedDb={send:async command=>{
+    if(command.constructor.name.includes("Get"))return {Item:current};
+    if(command.constructor.name.includes("Update")){
+      const values=command.input.ExpressionAttributeValues;
+      current={...current,identityRefs:{...current.identityRefs,taskIds:values[":tasks"],eventIds:values[":events"]}};
+      writeApplied=true;
+      throw new Error("simulated lost DynamoDB update acknowledgement");
+    }
+    throw new Error("Unexpected database command");
+  }};
+  const result=await executeErasureDeletionStep(operation,{stage:"state",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:guardedDb,clients,inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})});
+  assert.equal(result.progress.stateIndex,1);
+  assert.equal(writeApplied,true);
+  assert.deepEqual(current.identityRefs,{taskIds:[],eventIds:[],seriesIds:[]});
 });
 
 test("Calendar deletion is bound to the approved event ETag",async()=>{
@@ -220,7 +273,7 @@ test("Calendar 410 without exact deleted-resource evidence remains an error afte
   assert.equal(reads,2,"the uncertain delete outcome is checked with a direct readback");
 });
 
-test("final cleanup deletes only exact operation-owned project tombstones",async()=>{
+test("legacy final-comments checkpoint retains only exact operation-owned project tombstones",async()=>{
   const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
   const original={
     schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
@@ -248,7 +301,7 @@ test("final cleanup deletes only exact operation-owned project tombstones",async
     assert.equal(deletions,0,"unrelated project content must not be deleted");
   }
 });
-test("final cleanup requires provider-confirmed comment disappearance",async()=>{
+test("legacy final-comments checkpoint retains an active verified tombstone",async()=>{
   const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
   const marker={schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
     eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"};
@@ -257,29 +310,17 @@ test("final cleanup requires provider-confirmed comment disappearance",async()=>
     projectCommentIds:["project-1"],
     knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}]}};
   let deletes=0;
-  await assert.rejects(executeErasureDeletionStep(operation,
-    {stage:"finalize_comments",commentIndex:0,stateIndex:0,finalCommentIndex:0,startedAt:1},
-    {db:{send:async()=>({})},clients:{todoist:{
-      getComment:async()=>comment,deleteComment:async()=>{deletes++;},
-    }},inspectFence:async()=>({leases:[]})}),/remains after cleanup/);
-  assert.equal(deletes,1);
-});
-test("already absent project comment advances idempotently without recreating a marker",async()=>{
-  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,projectCommentIds:["project-1"]}};
-  let writes=0;
   const result=await executeErasureDeletionStep(operation,
     {stage:"finalize_comments",commentIndex:0,stateIndex:0,finalCommentIndex:0,startedAt:1},
     {db:{send:async()=>({})},clients:{todoist:{
-      getComment:async()=>{throw Object.assign(new Error("not found"),{status:404});},
-      deleteComment:async()=>{writes++;},
-      updateComment:async()=>{writes++;},
+      getComment:async()=>comment,deleteComment:async()=>{deletes++;},
     }},inspectFence:async()=>({leases:[]})});
   assert.equal(result.progress.finalCommentIndex,1);
-  assert.equal(writes,0);
+  assert.equal(deletes,0);
 });
 
 
-test("postflight rejects original mapping, tombstone and stale alias references but ignores unrelated notes",async()=>{
+test("postflight requires the exact active tombstone and ignores unrelated notes",async()=>{
   const {serializeDeletionTombstoneComment}=await import("../dist/mapping-comments.js");
   const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
     projectCommentIds:["original-1"],knownCalendarAliases:[
@@ -294,14 +335,11 @@ test("postflight rejects original mapping, tombstone and stale alias references 
     expiresAt:"2026-11-26T12:00:00.000Z",
   });
   const unrelated={id:"unrelated",project_id:"test-home-project",content:"User's personal shopping note"};
-  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated]),true);
-  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"original-1"}]),false,
-    "the exact originally selected comment ID must be missing");
-  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",content:originalContent}]),false,
-    "a mapping copied under another comment ID must block success");
-  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",content:markerContent}]),false,
-    "expired markers are still deleted-task identity and block success");
-  assert.equal(erasureProjectCommentsAbsent(operation,[{...unrelated,id:"new",
-    content:"todoist-calendar-sync:mapping:v1\n{bad-json task-1"}]),false,
-    "malformed app mapping that references the deleted task requires review");
+  const now=Date.parse("2026-11-09T12:00:00.000Z");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],now),true);
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated],now),false,"selected tombstone must remain");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:originalContent}],now),false,
+    "an unconverted mapping comment cannot pass postflight");
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],
+    Date.parse("2026-11-27T12:00:00.000Z")),false,"expired tombstones cannot pass postflight");
 });

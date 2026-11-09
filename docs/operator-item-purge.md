@@ -157,18 +157,21 @@ plan**. A successful production rollout must include the review-page
 confirmation/progress experience and a tested operator recovery process.
 This flag alone is not full issue #113 acceptance.
 
-## Ephemeral in-flight replay guard for issue #349
+## Bounded Todoist project-comment tombstone for issue #349
 
-While the erasure fence is active, the exact existing Todoist project mapping
-comment is temporarily rewritten to preserve the original task/Calendar identity
-for safe interrupted-operation review. After provider and DynamoDB deletion,
-**the executor deletes the exact project comment and verifies absence before
-successful completion and fence release**. Successful deletion therefore leaves
-no task-specific identity in DynamoDB **or** in an app-owned Todoist project
-comment. A separate 18-day expiry applies only to leftover in-flight/legacy
-markers needing explicit operator cleanup, not to completed deletions. A late
-webhook or manually redriven queue message may no longer be recognizable after
-success; this is the deliberate no-retention trade-off.
+The exact existing Todoist project mapping comment is rewritten as a tombstone
+and retained after successful deletion for the bounded 18-day expiry. Current
+workers consult it under the profile writer lease before processing matching
+webhooks, Calendar deltas, or orphan rechecks. The tombstone cleanup job removes
+it after expiry. Completed DynamoDB delivery receipts remain for their normal
+14-day TTL, but the selected task/event IDs are scrubbed only after the exact
+active project tombstone is read back under the erasure fence. Thus DynamoDB
+retains delivery idempotency without retaining the erased identity.
+
+The retention window covers ordinary SQS retry/redrive lifetimes, not arbitrary
+manual invocation after expiry. Historical Lambda versions that do not read
+the comment still require the separate #347 invocation boundary; the marker
+alone does not make an unguarded version safe.
 
 The implementation is merged and deployed. A fresh read-only audit on 9 Nov
 2026 verified the project-tombstone marker in the deployed ingress, sync worker,

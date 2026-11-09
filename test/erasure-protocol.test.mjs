@@ -351,6 +351,60 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
   assert.equal(writerLeaseHeld,false,"the writer lease is released after the delivery is suppressed");
 });
 
+test("project-comment tombstone suppresses stale orphan rechecks before synchronization or receipt writes",async t=>{
+  const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    table:process.env.STATE_TABLE_NAME,googlePrefix:process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX,
+    todoistPrefix:process.env.TODOIST_TOKEN_PARAMETER_PREFIX};
+  process.env.ERASURE_PROTOCOL_VERSION="1";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.STATE_TABLE_NAME="test-orphan-tombstone-state";
+  process.env.GOOGLE_CREDENTIALS_PARAMETER_PREFIX="/test/tombstone-google";
+  process.env.TODOIST_TOKEN_PARAMETER_PREFIX="/test/tombstone-todoist";
+  const originalSend=documentClient.send;let writerLeaseHeld=false;
+  documentClient.send=async command=>{
+    if(command.constructor.name.includes("Get")&&command.input.Key.sk==="EPOCH")return {Item:{epoch:0}};
+    if(command.constructor.name.includes("TransactWrite")){
+      const items=command.input.TransactItems||[];
+      assert.ok(items.some(item=>item.ConditionCheck?.Key?.sk==="FENCE"));
+      assert.ok(items.some(item=>item.Put?.Item?.kind==="writer"));writerLeaseHeld=true;return {};
+    }
+    if(command.constructor.name.includes("Delete")&&command.input.Key.sk.startsWith("WRITER#")){
+      assert.equal(writerLeaseHeld,true);writerLeaseHeld=false;return {};
+    }
+    throw new Error(`Unexpected state access in orphan tombstone test: ${command.constructor.name}`);
+  };
+  t.mock.method(SSMClient.prototype,"send",async command=>{
+    if(command.input.Name==="/test/tombstone-google/home")return {Parameter:{Value:JSON.stringify({client_id:"test",client_secret:"test",refresh_token:"test"})}};
+    if(command.input.Name==="/test/tombstone-todoist/home")return {Parameter:{Value:"test-token"}};
+    throw new Error("unexpected secure parameter read in orphan tombstone test");
+  });
+  const projectId=profiles.home.todoistProjectId,createdAt=new Date().toISOString();
+  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
+    taskId:"erased-task-id",eventIds:["erased-event-id"],createdAt,
+    expiresAt:projectDeletionTombstoneExpiry(createdAt)});
+  t.mock.method(Todoist.prototype,"listProjectComments",async()=>{
+    assert.equal(writerLeaseHeld,true);return [{id:"tombstone-comment",project_id:projectId,content}];
+  });
+  const audits=t.mock.method(StateRepository.prototype,"audit",async()=>{});
+  const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
+  const syncProcess=t.mock.method(OrphanRecoveringSynchronizer.prototype,"process",async()=>{
+    throw new Error("orphan synchronizer must not run for an active tombstone");
+  });
+  t.after(()=>{
+    documentClient.send=originalSend;
+    for(const [key,value] of Object.entries({ERASURE_PROTOCOL_VERSION:previous.protocol,ERASURE_REPLAY_BARRIER_VERSION:previous.barrier,
+      STATE_TABLE_NAME:previous.table,GOOGLE_CREDENTIALS_PARAMETER_PREFIX:previous.googlePrefix,TODOIST_TOKEN_PARAMETER_PREFIX:previous.todoistPrefix}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  });
+  const delivery={id:"stale-orphan",kind:"orphan",profile:"home",mode:"aws",receivedAt:new Date().toISOString(),headers:{},
+    orphan:{eventId:"erased-event-id",taskId:"erased-task-id",attempt:2}};
+  const result=await handler({Records:[{messageId:"stale-orphan-message",body:JSON.stringify(delivery),attributes:{},messageAttributes:{}}]},
+    {awsRequestId:"tombstone-orphan-request"});
+  assert.deepEqual(result.batchItemFailures,[]);
+  assert.deepEqual(audits.mock.calls.map(call=>call.arguments.slice(1)),[["erasure_project_comment_replay_suppressed",{side:"orphan"}]]);
+  assert.equal(completed.mock.callCount(),0);assert.equal(syncProcess.mock.callCount(),0);
+  assert.equal(writerLeaseHeld,false,"writer lease is released after orphan suppression");
+});
+
 test("tombstone lookup failure retries without writing task identity or review state",async t=>{
   const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
   process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";

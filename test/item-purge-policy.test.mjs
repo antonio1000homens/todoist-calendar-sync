@@ -229,6 +229,60 @@ test("new delivery receipts are attributable by exact references but remain repl
  assert.match(plan.blockers[0],/replayable/);
 });
 
+test("erasure can scrub exact completed Todoist and Calendar receipt identities after the tombstone",()=>{
+ const receipt=record("DELIVERY#exact","COMPLETED",{profile:"home",kind:"calendar",
+  identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:[]},
+  completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000});
+ const plan=planPurge([receipt],target,{allowCompletedExactDeliveryReceipts:true});
+ assert.equal(plan.records[0].classification,"selected-only");
+ assert.deepEqual(plan.blockers,[]);
+ assert.equal(plan.receiptSanitizationRequirements.length,1);
+ assert.match(plan.records[0].hazards.join(" "),/project-comment tombstone/);
+ assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
+ assert.match(plan.records[0].scrubbedDigest,/^[a-f0-9]{64}$/);
+});
+
+test("erasure permits valid Google Calendar iCalUIDs in completed receipt metadata",()=>{
+ const receipt=record("DELIVERY#icaluid","COMPLETED",{profile:"home",kind:"reconcile",
+  identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:["series-token@example.test"]},
+  completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000});
+ const plan=planPurge([receipt],target,{allowCompletedExactDeliveryReceipts:true});
+ assert.deepEqual(plan.blockers,[]);
+ assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
+});
+
+test("erasure can scrub an orphan receipt only after the current worker suppresses its replay",()=>{
+ const receipt=record("DELIVERY#orphan","COMPLETED",{profile:"home",kind:"orphan",
+  identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:[]},
+  completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000});
+ const plan=planPurge([receipt],target,{allowCompletedExactDeliveryReceipts:true});
+ assert.deepEqual(plan.blockers,[]);
+ assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
+});
+
+test("erasure scrubs selected IDs from shared receipts and keeps unsafe receipts blocked",()=>{
+ const base={profile:"home",kind:"todoist",identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:[]},
+  completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+ for(const [name,row] of [
+  ["pending",record("DELIVERY#pending","STATE",base)],
+  ["legacy",record("DELIVERY#legacy","COMPLETED",{profile:"home",kind:"todoist"})],
+  ["selected series",record("DELIVERY#recurring","COMPLETED",{...base,identityRefs:{...base.identityRefs,seriesIds:["task-123"]}})],
+  ["unknown kind",record("DELIVERY#unknown","COMPLETED",{...base,kind:"unknown"})],
+  ["wrong profile",record("DELIVERY#wrong-profile","COMPLETED",{...base,profile:"work"})],
+ ]) {
+  const plan=planPurge([row],target,{allowCompletedExactDeliveryReceipts:true});
+  assert.ok(plan.blockers.length,`${name} receipt must block erasure`);
+ }
+ const shared=record("DELIVERY#shared","COMPLETED",{...base,
+  identityRefs:{...base.identityRefs,taskIds:["task-123","other-task"],eventIds:["evt_123","other-event"],seriesIds:["other-series"]}});
+ const plan=planPurge([shared],target,{allowCompletedExactDeliveryReceipts:true});
+ assert.equal(plan.records[0].classification,"shared with protected state");
+ assert.deepEqual(plan.blockers,[]);
+ assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
+ assert.equal(plan.records[0].scrubbedDigest,fingerprint({...shared,identityRefs:{...shared.identityRefs,
+  taskIds:["other-task"],eventIds:["other-event"],seriesIds:["other-series"]}}));
+});
+
 test("legacy receipts without exact refs remain blockers until their retention expires",()=>{
  const plan=planPurge([
   record("DELIVERY#legacy","COMPLETED",{profile:"home",kind:"todoist"}),

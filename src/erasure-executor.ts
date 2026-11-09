@@ -45,7 +45,8 @@ export interface ErasureOperation {
   /** Set only by a future trusted executor release that wires provider deletion and readback. */
   providerDeletionReady?: boolean;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
-  inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string }>;
+  inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string;
+    receiptCleanup?:"scrub_identity_refs";scrubbedDigest?:string }>;
   /** Exact temporary provider deletion inputs; removed together with the operation on success. */
   actionPlan: ErasureActionPlan;
   status: ErasureOperationStatus;
@@ -71,6 +72,8 @@ export interface ErasureActionPlan {
   knownCalendarAliasesComplete?:boolean;
   /** Project comments become temporary markers under the fence, then are deleted before success. */
   projectCommentIds?:string[];
+  /** Completed identity references are scrubbed only after every project tombstone is read back. */
+  scrubCompletedDeliveryIdentityRefsAfterTombstone?:boolean;
   comments: Array<{ id: string; kind: "project" | "task"; digest: string }>;
 }
 export interface FencedMapping { id: string; state: "Enabled" | "Disabled"; eventSourceArn: string }
@@ -126,7 +129,7 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
 function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
-function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions">):boolean {
+function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions"|"inventory">):boolean {
   if(!plan||!Array.isArray(plan.comments)) return false;
   if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
   if(plan.calendarEvent&&(!operation.selectedActions.deleteCalendar||plan.calendarEvent.id!==operation.target.eventId
@@ -142,6 +145,14 @@ function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,
       ||!plan.calendarEvent||!aliases.some(alias=>alias.profile===operation.profile
         &&alias.calendarId===plan.calendarEvent!.calendarId&&alias.eventId===operation.target.eventId)) return false;
   }
+  const deliveryReceipts=operation.inventory.filter(item=>item.type==="DELIVERY");
+  if(deliveryReceipts.length&&(plan.scrubCompletedDeliveryIdentityRefsAfterTombstone!==true
+    ||operation.selectedActions.deleteTodoist!==true||!plan.projectCommentIds?.length
+    ||!plan.comments.some(item=>item.kind==="project")
+    ||deliveryReceipts.some(item=>item.key.sk!=="COMPLETED"
+      ||!(["selected-only","shared with protected state"] as string[]).includes(item.classification)
+      ||item.receiptCleanup!=="scrub_identity_refs"||!/^[a-f0-9]{64}$/.test(item.scrubbedDigest||"")))) return false;
+  if(!deliveryReceipts.length&&plan.scrubCompletedDeliveryIdentityRefsAfterTombstone===true) return false;
   const ids=new Set<string>();
   return plan.comments.every(item=>typeof item.id==="string"&&item.id.length>0&&!ids.has(item.id)
     &&(ids.add(item.id),true)&&(item.kind==="project"||item.kind==="task")&&/^[a-f0-9]{64}$/.test(item.digest));

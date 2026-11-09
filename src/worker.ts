@@ -413,6 +413,20 @@ export const handler: SQSHandler = async (event, context: Context) => {
           continue;
         }
       }
+      // Orphan rechecks can delete a Calendar event and its mapping without
+      // entering either provider webhook path. Consult the durable project
+      // comment under the writer lease before the synchronizer or receipt
+      // handling can write any task identity.
+      if(delivery.kind==="orphan"&&delivery.orphan) {
+        const clients=await defaultProviderClientFactory(delivery.profile);
+        const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+        if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
+          projectId:profiles[delivery.profile].todoistProjectId,taskId:delivery.orphan.taskId,
+          eventIds:[delivery.orphan.eventId]})) {
+          await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"orphan"});
+          continue;
+        }
+      }
       // A deletion webhook can be intercepted into a review decision before
       // Synchronizer.process() runs. Check the provider tombstone first so a
       // stale deleted identity cannot create review/receipt state in DynamoDB.
