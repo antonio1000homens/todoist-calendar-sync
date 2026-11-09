@@ -244,7 +244,7 @@ test("erasure can scrub exact completed Todoist and Calendar receipt identities 
 
 test("erasure permits valid Google Calendar iCalUIDs in completed receipt metadata",()=>{
  const receipt=record("DELIVERY#icaluid","COMPLETED",{profile:"home",kind:"reconcile",
-  identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:["series-token@example.calendar.google.com"]},
+  identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:["series-token@example.test"]},
   completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000});
  const plan=planPurge([receipt],target,{allowCompletedExactDeliveryReceipts:true});
  assert.deepEqual(plan.blockers,[]);
