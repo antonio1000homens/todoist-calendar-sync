@@ -23,6 +23,13 @@ test("production deployment reads back the stack and both function gates",()=>{
   assert.match(workflow,/--qualifier live/);
 });
 
+test("production deployment rejects stale master CI and non-master manual dispatches",()=>{
+  assert.match(workflow,/workflow_dispatch' && github\.ref == 'refs\/heads\/master'/);
+  assert.match(workflow,/workflow_run\.head_branch == 'master'/);
+  assert.match(workflow,/workflow_run\.head_sha == github\.sha/);
+  assert.match(workflow,/ref: \$\{\{ github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_sha \|\| github\.sha \}\}/);
+});
+
 test("review API publishes a new live-alias version on reviewed function-property changes",()=>{
   const review=template.split("\n  ReviewApiFunction:\n")[1]?.split("\n  ReviewApiUrlPermission:\n")[0];
   assert.ok(review,"ReviewApiFunction SAM resource is defined");
