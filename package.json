@@ -30,7 +30,7 @@
     "cost:audit": "node scripts/monthly-cost-audit.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-codedeploy": "^3.1161.0",
+    "@aws-sdk/client-codedeploy": "^3.1163.0",
     "@aws-sdk/client-dynamodb": "^3.1156.0",
     "@aws-sdk/client-lambda": "^3.1163.0",
     "@aws-sdk/client-sqs": "^3.1160.0",
