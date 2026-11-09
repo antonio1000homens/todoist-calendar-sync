@@ -7,7 +7,7 @@ import { buildErasurePreview } from "./erasure-preview.js";
 import { ErasureGateDriftError, type ErasureActionPlan, type ErasureOperation } from "./erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
-import type { Profile } from "./types.js";
+import type { Profile, TodoistCommentRecord } from "./types.js";
 
 export type ErasureDeletionProgress = {
   stage: "comments" | "todoist" | "calendar" | "state" | "finalize_comments" | "verify";
@@ -199,6 +199,28 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
   return {progress,complete:true};
 }
 
+/** No app-owned Todoist project comment may refer to this deleted identity
+ * once an operation is successful. This deliberately does not retain a marker. */
+export function erasureProjectCommentsAbsent(
+  operation: ErasureOperation, projectComments: TodoistCommentRecord[],
+): boolean {
+  const originalIds=operation.actionPlan.projectCommentIds||[];
+  if(!originalIds.length)return false;
+  const aliases=new Set([operation.target.eventId,...(operation.actionPlan.knownCalendarAliases||[])
+    .map(alias=>alias.eventId)].filter((id):id is string=>Boolean(id)));
+  const index=buildProjectMappingIndex(projectComments);
+  return !projectComments.some(comment=>originalIds.includes(comment.id))
+    && !index.parsed.some(({payload})=>payload.taskId===operation.target.taskId
+      ||aliases.has(payload.eventId))
+    && !index.malformed.some(({comment})=>comment.content.includes(operation.target.taskId)
+      ||[...aliases].some(alias=>comment.content.includes(alias)))
+    && !projectComments.some(comment=>{
+      const marker=parseDeletionTombstoneComment(comment);
+      return Boolean(marker&&(marker.taskId===operation.target.taskId
+        ||marker.eventIds.some(alias=>aliases.has(alias))));
+    });
+}
+
 /** Action-time readback is deliberately a full exact inventory pass and must prove no attributable data remains. */
 export async function verifyErasurePostflight(operation:ErasureOperation,dependencies:Dependencies):Promise<{providersAbsent:boolean;stateAbsent:boolean}> {
   const preview=await buildErasurePreview({profile:operation.profile,taskId:operation.target.taskId,
@@ -208,24 +230,9 @@ export async function verifyErasurePostflight(operation:ErasureOperation,depende
       allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId});
   const projectId=profiles[operation.profile].todoistProjectId;
   const projectComments=await dependencies.clients.todoist.listProjectComments(projectId,true);
-  const requiredAliases=(operation.actionPlan.knownCalendarAliases||[]).map(alias=>alias.eventId);
-  const requiredComments=operation.actionPlan.projectCommentIds||[];
-  const remainingMapping=buildProjectMappingIndex(projectComments).parsed.some(({payload})=>
-    payload.profile===operation.profile&&(payload.taskId===operation.target.taskId
-      ||requiredAliases.includes(payload.eventId)));
-  const remainingMarker=projectComments.some(comment=>{
-    const marker=parseDeletionTombstoneComment(comment);
-    return marker?.profile===operation.profile&&marker.projectId===projectId
-      &&(marker.taskId===operation.target.taskId
-        ||requiredAliases.some(alias=>marker.eventIds.includes(alias)));
-  });
-  // The original exact project comments must be physically absent. An
-  // expired marker is still deleted-task identity and fails this check.
-  const removedOriginalComments=requiredComments.length>0
-    &&requiredComments.every(id=>!projectComments.some(comment=>comment.id===id));
   const providersAbsent=preview.blockers.length===0
     &&!preview.actionPlan.todoistTask&&!preview.actionPlan.calendarEvent&&preview.actionPlan.comments.length===0
-    &&removedOriginalComments&&!remainingMapping&&!remainingMarker;
+    &&erasureProjectCommentsAbsent(operation,projectComments);
   return {providersAbsent,stateAbsent:preview.inventory.length===0};
 }
 
