@@ -187,3 +187,36 @@ test("Calendar changes after approval block deletion",async()=>{
     ErasureGateDriftError);
   assert.equal(deletes,0);
 });
+
+test("Calendar direct read accepts exact 404 and deleted-resource 410 as already absent",async()=>{
+  const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
+    selectedActions:{...baseOperation.selectedActions,deleteCalendar:true},
+    actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint({id:"event-1"})}}};
+  for(const error of [
+    Object.assign(new Error("not found"),{status:404}),
+    Object.assign(new Error("gone"),{status:410,body:JSON.stringify({error:{errors:[{reason:"deleted"}]}})}),
+  ]) {
+    const calendar={getEvent:async id=>{assert.equal(id,"event-1");throw error;},
+      deleteEvent:async()=>assert.fail("an already absent event must not be deleted again")};
+    const result=await executeErasureDeletionStep(operation,{stage:"calendar",commentIndex:0,stateIndex:0,startedAt:1},
+      {db:{send:async()=>({})},clients:{todoist:{},calendar},inspectFence:async()=>({leases:[]})});
+    assert.equal(result.progress.stage,"state");
+  }
+});
+
+test("Calendar 410 without exact deleted-resource evidence remains an error after a delete attempt",async()=>{
+  const event={id:"event-1",etag:"etag-approved",status:"confirmed"};
+  const operation={...baseOperation,target:{...baseOperation.target,deleteCalendar:true},
+    selectedActions:{...baseOperation.selectedActions,deleteCalendar:true},
+    actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:event.id,etag:event.etag,digest:fingerprint(event)}}};
+  let reads=0,deletes=0;
+  const calendar={getEvent:async()=>{
+    if(reads++===0)return event;
+    throw Object.assign(new Error("expired sync token"),{status:410,
+      body:JSON.stringify({error:{errors:[{reason:"fullSyncRequired"}]}})});
+  },deleteEvent:async()=>{deletes++;}};
+  await assert.rejects(executeErasureDeletionStep(operation,{stage:"calendar",commentIndex:0,stateIndex:0,startedAt:1},
+    {db:{send:async()=>({})},clients:{todoist:{},calendar},inspectFence:async()=>({leases:[]})}),/expired sync token/);
+  assert.equal(deletes,1,"the exact ETag-bound delete is attempted once");
+  assert.equal(reads,2,"the uncertain delete outcome is checked with a direct readback");
+});
