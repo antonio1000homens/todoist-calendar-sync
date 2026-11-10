@@ -1,22 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {readFile,readdir} from "node:fs/promises";
+import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
+import {listTypeScriptSources} from "./helpers/source-files.mjs";
 
 const root=path.join(path.dirname(fileURLToPath(import.meta.url)),"../src");
-async function recursiveSources(folder) {
-  const entries=await readdir(folder,{withFileTypes:true});
-  const all=[];
-  for(const entry of entries) {
-    const file=path.join(folder,entry.name);
-    if(entry.isDirectory())all.push(...await recursiveSources(file));
-    else if(entry.isFile()&&file.endsWith(".ts"))all.push(file);
-  }
-  return all;
-}
 test("the future post-write marker+fence transaction stays offline, not invoked by any deployed source",async()=>{
-  const files=await recursiveSources(root);
+  const files=await listTypeScriptSources(root);
   let foundDeclaration=0;
   for(const file of files) {
     const source=await readFile(file,"utf8");
