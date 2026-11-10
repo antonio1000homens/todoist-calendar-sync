@@ -39,9 +39,10 @@ function assertInputs(tableName,functions) {
 function envSummary(configuration) {
   if(configuration?.Environment?.Error)throw new Error("Lambda environment cannot be inspected");
   const vars=configuration?.Environment?.Variables;
-  if(vars!==undefined&&(!vars||typeof vars!=="object"||Array.isArray(vars)))
-    throw new Error("Invalid Lambda environment");
-  const present=Object.fromEntries(LEGACY_ENV.map(key=>[key,Object.hasOwn(vars||{},key)]));
+  if(!vars||typeof vars!=="object"||Array.isArray(vars)
+    ||vars.ERASURE_PROTOCOL_VERSION!=="1")
+    throw new Error("Lambda environment or writer protocol could not be verified");
+  const present=Object.fromEntries(LEGACY_ENV.map(key=>[key,Object.hasOwn(vars,key)]));
   return {
     legacyGateConfigured:present.ERASURE_REPLAY_BARRIER_VERSION,
     hmacKeyRingConfigured:present.ERASURE_REPLAY_HMAC_KEYS,
@@ -71,11 +72,15 @@ async function aliasesFor(lambda,name) {
 
 async function functionCheck(lambda,fn) {
   const aliases=await aliasesFor(lambda,fn.name);
+  if(new Set(aliases.map(alias=>alias.Name)).size!==aliases.length)
+    throw new Error("Duplicate Lambda alias in inventory");
   const qualifiers=new Set(["$LATEST"]);
+  const aliasTargets=new Map();
   for(const alias of aliases) {
     if(typeof alias.Name!=="string"||!alias.Name||typeof alias.FunctionVersion!=="string")
       throw new Error("Invalid Lambda alias identity");
     qualifiers.add(alias.Name);
+    aliasTargets.set(alias.Name,alias.FunctionVersion);
     for(const version of Object.keys(alias.RoutingConfig?.AdditionalVersionWeights||{})) {
       if(!/^\d+$/.test(version))throw new Error("Invalid weighted Lambda alias version");
       qualifiers.add(version);
@@ -86,7 +91,10 @@ async function functionCheck(lambda,fn) {
     const response=await lambda.send(new GetFunctionConfigurationCommand({
       FunctionName:fn.name,...(qualifier==="$LATEST"?{}:{Qualifier:qualifier}),
     }));
-    if(!response||response.FunctionName!==fn.name||typeof response.Version!=="string")
+    if(!response||response.FunctionName!==fn.name||typeof response.Version!=="string"
+      ||(qualifier==="$LATEST"&&response.Version!=="$LATEST")
+      ||(aliasTargets.has(qualifier)&&response.Version!==aliasTargets.get(qualifier))
+      ||(/^\\d+$/.test(qualifier)&&response.Version!==qualifier))
       throw new Error("Lambda configuration missing or changed");
     configurations.push({qualifier,version:response.Version,...envSummary(response)});
   }
