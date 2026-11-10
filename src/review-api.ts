@@ -317,21 +317,27 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         return response(200,{recovery:{status:current.status,startedAt:current.startedAt,
           ...(current.lastError?{lastError:current.lastError}:{} )}});
       }
-      if(method==="POST"&&action==="confirm") {
+      if(method==="POST"&&(action==="confirm"||action==="confirm-calendar-drift")) {
         if(Object.keys(body||{}).length)fail(400,"Recovery confirmation creation accepts no request fields");
-        const issued=await recovery.issueConfirmation(id,actor.subject);
+        // Separate, authenticated cancellation mode; never available to the watchdog.
+        const mode=action==="confirm-calendar-drift"?"calendar_drift_cancel":"strict_pre_write";
+        const issued=await recovery.issueConfirmation(id,actor.subject,mode);
         return response(200,{...issued});
       }
-      if(method==="POST"&&action==="apply") {
+      if(method==="POST"&&(action==="apply"||action==="apply-calendar-drift")) {
+        const isDrift=action==="apply-calendar-drift";
+        const phrase=isDrift?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC";
         if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
           ||typeof body?.confirmationId!=="string"||body.confirmationId.length>256
-          ||body.operationId!==id||body.phrase!=="RESTORE SYNC"
+          ||body.operationId!==id||body.phrase!==phrase
           ||!REVIEW_PROFILES.includes(body.profile as Profile))
-          fail(400,"Recovery requires an exact operation ID, profile, and typed RESTORE SYNC confirmation");
+          fail(400,"Recovery requires the exact operation ID, profile and mode-specific typed confirmation");
         const operation=await erasureStore().get(id);
         if(!operation||operation.profile!==body.profile)fail(409,"Recovery profile or operation changed");
-        await recovery.apply(id,body.confirmationId,actor.subject);
+        await recovery.apply(id,body.confirmationId,actor.subject,
+          isDrift?"calendar_drift_cancel":"strict_pre_write");
         console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",event:"recovery_accepted",
+          mode:isDrift?"calendar_drift_cancel":"strict_pre_write",
           operationId:id,profile:operation.profile}));
         try { await (dependencies.enqueueErasureRecovery||enqueueErasureRecovery)(id); }
         catch {return response(503,{error:"recovery_enqueue_failed",

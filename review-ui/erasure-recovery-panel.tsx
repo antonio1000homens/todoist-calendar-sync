@@ -49,7 +49,9 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
       setInspectionState("succeeded");
       setInspectionMessage(result.preview?.allowed
         ?"Inspection completed: guarded recovery is eligible. Review the evidence before requesting confirmation."
-        :"Inspection completed: guarded recovery is blocked. Review the reasons below; protections remain unchanged.");
+        :result.preview?.calendarDriftReview?.candidateForSeparateApproval
+          ?"Inspection completed: Calendar-only drift is eligible for separately confirmed erasure cancellation. No recovery has started."
+          :"Inspection completed: guarded recovery is blocked. Review the reasons below; protections remain unchanged.");
     }catch(e:any){
       setInspectionState("failed");
       const message=typeof e?.message==="string"?e.message:"";
@@ -94,21 +96,38 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     }catch(e:any){setPostWriteToken(undefined);setNotice(e.message||"Post-write review rejected; fence remains protected");}
     finally{setBusy(false);}
   };
-  const requestConfirmation=async()=>{
-    if(!operation||!preview?.allowed||busy)return;
+  const requestConfirmation=async(mode:"strict_pre_write"|"calendar_drift_cancel"="strict_pre_write")=>{
+    if(!operation||busy||!(mode==="strict_pre_write"?preview?.allowed
+      :preview?.calendarDriftReview?.candidateForSeparateApproval))return;
     setBusy(true);
     try{
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/confirm",{method:"POST",body:"{}"});
-      setPreview(result.preview);setConfirmation({confirmationId:result.confirmationId,expiresAt:result.expiresAt});
+      const route=mode==="calendar_drift_cancel"?"confirm-calendar-drift":"confirm";
+      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/"+route,{method:"POST",body:"{}"});
+      setPreview(result.preview);setConfirmation({confirmationId:result.confirmationId,expiresAt:result.expiresAt,mode:result.mode});
     }catch(e:any){setConfirmation(undefined);setNotice(e.message||"Recovery confirmation failed");}
     finally{setBusy(false);}
   };
+  const canConfirm=()=>{
+    if(!operation||!confirmation)return false;
+    if(confirmation.mode!=="calendar_drift_cancel")
+      return canApplyRecovery(preview,confirmation,typed,operation);
+    return preview?.calendarDriftReview?.candidateForSeparateApproval===true
+      &&typed.phrase==="CANCEL ERASURE AND RESTORE SYNC"
+      &&typed.operationId===operation.operationId
+      &&typed.profile===operation.profile
+      &&typeof confirmation.confirmationId==="string"
+      &&Number.isFinite(confirmation.expiresAt)&&confirmation.expiresAt>Date.now();
+  };
   const apply=async()=>{
-    if(!operation||busy||!canApplyRecovery(preview,confirmation,typed,operation))return;
-    if(!window.confirm("Restore synchronization for exactly this profile? This will not resume or undo provider deletion."))return;
+    if(!operation||busy||!canConfirm())return;
+    const drift=confirmation.mode==="calendar_drift_cancel";
+    if(!window.confirm(drift
+      ?"Cancel the interrupted erasure and restore original synchronization? The existing Calendar revision and Todoist task will be kept. The server will recheck every safety condition."
+      :"Restore synchronization for exactly this profile? This will not resume or undo provider deletion."))return;
     setBusy(true);
     try{
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/apply",{
+      const route=drift?"apply-calendar-drift":"apply";
+      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/"+route,{
         method:"POST",body:JSON.stringify({...typed,confirmationId:confirmation.confirmationId}),
       });
       setRecoveryStatus(result.recovery?.status||"queued");setConfirmation(undefined);setNotice("Guarded recovery accepted. No provider deletion was started.");
@@ -176,10 +195,12 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
               <li key={label} className={passed?"":"warning"}>{label}: {passed?"passed":"changed or unverified"}</li>)}</ul>
             <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
           </details>}
-          {preview.calendarDriftReview?.candidateForSeparateApproval&&<p role="status" className="warning">
-            Calendar-only provider revision is a candidate for separately reviewed pre-write cancellation. This inspection is read-only: cancellation is not implemented or authorised, no recovery confirmation is available, and the Work fence and worker mapping remain unchanged. Do not force-enable synchronization or delete the fence.
-          </p>}
-          {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation()}>Request recovery confirmation</button>}
+          {preview.calendarDriftReview?.candidateForSeparateApproval&&<div className="erasure-results" role="status">
+            <p><strong>Reviewed Calendar-drift cancellation available.</strong> The original Todoist task, its mapping comment, Calendar aliases, and state inventory are unchanged. The Calendar event has a different revision. This cancels the interrupted erasure and preserves both provider items; it does not delete either item.</p>
+            <p>Before acceptance the server independently rereads provider, mapping, fence, lease, and cross-profile evidence. It rechecks the exact Calendar revision again during worker restoration. If anything changes, recovery is refused and the fence is preserved.</p>
+            {!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation("calendar_drift_cancel")}>Request reviewed Calendar-drift cancellation</button>}
+          </div>}
+          {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation("strict_pre_write")}>Request recovery confirmation</button>}
         </>}
         <h4>Post-write evidence (read-only)</h4>
         <p>Inspect evidence after an erasure may have deleted a provider item. This assessment cannot confirm, resume or finish deletion, restore worker mappings, or release a fence.</p>
@@ -205,10 +226,10 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
         </div>}
         {confirmation&&<>
           <p>Confirmation expires {new Date(confirmation.expiresAt).toLocaleString()}.</p>
-          <label>Type RESTORE SYNC<input value={typed.phrase} autoComplete="off" onChange={e=>setTyped(v=>({...v,phrase:e.target.value}))}/></label>
+          <label>Type {confirmation.mode==="calendar_drift_cancel"?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC"}<input value={typed.phrase} autoComplete="off" onChange={e=>setTyped(v=>({...v,phrase:e.target.value}))}/></label>
           <label>Repeat operation ID<input value={typed.operationId} autoComplete="off" onChange={e=>setTyped(v=>({...v,operationId:e.target.value}))}/></label>
           <label>Repeat profile<input value={typed.profile} autoComplete="off" onChange={e=>setTyped(v=>({...v,profile:e.target.value}))}/></label>
-          <button disabled={busy||!canApplyRecovery(preview,confirmation,typed,operation)} onClick={()=>void apply()}>Confirm guarded recovery</button>
+          <button disabled={busy||!canConfirm()} onClick={()=>void apply()}>{confirmation.mode==="calendar_drift_cancel"?"Confirm reviewed erasure cancellation":"Confirm guarded recovery"}</button>
         </>}
         {recoveryStatus&&<p role="status">Recovery state: {recoveryStatus.replaceAll("_"," ")}</p>}
         <button className="secondary" onClick={()=>void refreshRecovery()}>Refresh recovery status</button>
