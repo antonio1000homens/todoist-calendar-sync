@@ -82,10 +82,24 @@ export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreview
   const lifecycle=operation.lifecycle!;
   const noWrites=!lifecycle.evidence.deletionStarted && !lifecycle.deletionProgress
     && recoverableBeforeWrite.has(lifecycle.phase);
+  // Guard both domains independently: the fresh cross-profile snapshot must
+  // validate its own fingerprint, while the immutable confirmation was issued
+  // against the *target-only* snapshot before any global audit was requested.
+  // Comparing the global-audit digest directly against the original digest
+  // will always fail even if not one provider item has changed.
+  const freshSelfConsistent=erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint;
+  const targetBaseline=snapshot.crossProfileEvidence
+    ?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
+  const auditVerified=!snapshot.crossProfileEvidence
+    || (snapshot.crossProfileEvidence.allProfilesQueried===true
+      &&snapshot.crossProfileEvidence.stateScan?.allPagesReceived===true
+      &&snapshot.crossProfileEvidence.stateScan?.stronglyConsistent===true);
   const identical=snapshot.blockers.length===0
-    && erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint
-    && snapshot.previewFingerprint===operation.previewFingerprint
-    && snapshot.providerSnapshotFingerprint===operation.providerSnapshotFingerprint;
+    &&freshSelfConsistent&&auditVerified
+    &&typeof targetBaseline==="string"&&/^[a-f0-9]{64}$/.test(targetBaseline)
+    &&targetBaseline===operation.providerSnapshotFingerprint
+    &&erasurePreviewFingerprint({...snapshot,providerSnapshotFingerprint:targetBaseline})
+      ===operation.previewFingerprint;
   if(noWrites&&identical)return "pre_write";
   const noProviders=!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent
     &&snapshot.actionPlan.comments.length===0;
