@@ -166,7 +166,13 @@ test("UI requests only the selected case and keeps failed detail panels out of r
 test("reconciliation status polling starts slowly and backs off under repeated 429s",()=>{
   assert.deepEqual([0,1,2,3,4,5,8].map(reconciliationPollDelayMs),[5000,10000,20000,40000,60000,60000,60000]);
   const source=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  // This is the single retained UI wiring guard for terminal polling. The
+  // independent retry schedule and behaviour are tested below; do not
+  // duplicate these source assertions in reconciliation-ui.test.mjs.
+  assert.match(source,/overviewProfiles\.filter/);
+  assert.match(source,/refreshReconciliation\(target,\{quiet:true\}\)/);
   assert.match(source,/if\(\["succeeded","needs_review","failed"\]\.includes\(status\)\|\|!data\.reconciliation\?\.pending\)[\s\S]*?setTerminalInboxRefreshPending\(true\)/);
+  assert.match(source,/actionableCaseCount/, "actionable review cases must remain distinguishable from run diagnostics");
   assert.match(source,/createRetryingTask\(\{[\s\S]*?run:refresh,[\s\S]*?onSuccess:\(\)=>setTerminalInboxRefreshPending\(false\)/);
   assert.doesNotMatch(source,/else timer=window\.setTimeout\(poll,1500\)/);
   assert.match(source,/if\(options\.quiet&&previous\?\.data\)/,
