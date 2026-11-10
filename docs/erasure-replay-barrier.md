@@ -72,19 +72,9 @@ npm run cleanup:erasure-tombstones -- --profile=work --apply \
 
 The apply path re-reads each candidate and deletes only the unchanged, expired comment in the configured project. It does not scan or delete DynamoDB rows, task comments, active markers, or unrelated project comments.
 
-### Current-runtime retirement-readiness evidence (10 November 2026)
+### Repeatable current-runtime retirement audit
 
-A read-only check of the `todoist-calendar-sync` CloudFormation stack in
-`eu-west-2` found `UPDATE_COMPLETE` and `ErasureExecutionEnabled=false`.
-All seven current Lambda functions and both `live` aliases had **no**
-`ERASURE_REPLAY_BARRIER_VERSION`, `ERASURE_REPLAY_HMAC_KEYS` or
-`ERASURE_REPLAY_HMAC_CURRENT_KEY` environment setting. Strongly consistent
-DynamoDB queries of the exact `ERASURE_REPLAY#home`,
-`ERASURE_REPLAY#antonio` and `ERASURE_REPLAY#work` partitions each returned
-zero records. No keys, task IDs or event IDs were retrieved or logged.
-
-Repeat the **current-runtime**, read-only check before retiring the remaining
-reader or reviewing a rollback:
+Repeat the **current-runtime**, read-only check during rollback or release review:
 
 ```bash
 npm run audit:legacy-hmac-retirement -- \
@@ -100,20 +90,18 @@ table and Lambda functions, queries the three HMAC partitions, and reads
 boolean HMAC configuration presence, no environment values or marker identity.
 Any marker, configured legacy setting or incomplete read blocks readiness.
 
-**This is not the full #347 invoker or rollback audit.** The tool deliberately
-does not enumerate every historical published Lambda version, independent
-stacks/accounts, IAM callers, CloudTrail access, or pre-existing marker rows
-stored under unexpected partition keys. Zero recognized records and a disabled
-gate alone do **not** permit deleting the admission reader, dropping the
-qualified-version Deny boundary, enabling exceptional erasure, unfencing a
-recovery operation or replaying queued deliveries.
+## Retired HMAC admission and compatibility safety
 
-## Legacy HMAC admission compatibility (disabled)
+The obsolete permanent DynamoDB/HMAC marker writers and post-write release code were removed in #437. The historical **admission reader** has now also been retired from current source; the remaining `ERASURE_REPLAY_BARRIER_VERSION` environment switch is a **fail-closed compatibility tripwire**. Unset, empty or `0` allows the current path, while `1` or any unknown nonzero value refuses admission. Do **not** turn on the obsolete switch.
 
-The permanent-DynamoDB-HMAC **writer, orphan installer and staged post-write marker/fence release implementation have been retired**. They have no active production callers and are not part of #349's bounded 18-day project-comment tombstone workflow. The separate current `atomicConfirmedErasureCompletion` transaction is retained and writes **no permanent HMAC replay identity**.
+Read-only production verification on **10 November 2026** (`eu-west-2`) found:
+- Strongly consistent DynamoDB queries for `ERASURE_REPLAY#antonio`, `ERASURE_REPLAY#home` and `ERASURE_REPLAY#work`: **zero rows**, no pagination;
+- A strongly consistent full-table scan (2,791 evaluated items) with all three historical prefixes `ERASURE_REPLAY#`, `ORPHAN_REPLAY_GUARD#` and `ERASURE_POSTWRITE_RESTORE#`: **zero matches**;
+- All seven current stack Lambda configurations and the Review API `live` alias had `ERASURE_REPLAY_BARRIER_VERSION` unset and neither old HMAC keyring variable configured. The Review API and erasure worker retained `ERASURE_EXECUTION_ENABLED=false`.
 
-The **legacy HMAC admission reader** remains compiled because existing mapping, provider, queue and worker call paths reference it, and previously installed marker rows cannot be assumed absent. The reader is still controlled by the existing `ERASURE_REPLAY_BARRIER_VERSION` gate. **Keep that gate off.** Do not enable this legacy mechanism or clear historical HMAC rows based on this source-only cleanup. Auditing any historical marker rows, qualified Lambda versions, IAM permissions, rollback and removing the remaining dormant reader is a separate #347/#349 review, not a safe automatic follow-up to this change.
+These observations support removing the dormant HMAC lookup, **not** a claim about every historical Lambda version, AWS principal or future rollback. Current production invokes only the bounded Todoist project-comment tombstone and independently retained profile writer/retirement-admission protections. Do not delete live DynamoDB records or weaken the separate #347 historical-invocation review based solely on this inspection. Historical Lambda package/alias, IAM and rollback acceptance and the #349 disposable-erasure E2E remain separate requirements.
+
 
 The bounded project-comment implementation from #403–#405 is deployed to current production master. Deployment run 42536045650 succeeded. The `todoist-calendar-sync` stack is `UPDATE_COMPLETE` with `ErasureExecutionEnabled=false`; the live Review API execution setting is false, and the replay-barrier setting remains absent. The erasure worker mapping is enabled.
 
-This does not close #347: the read-only audit found 71 Review API configurations with execution enabled, including historical qualified versions that remain invocation candidates. The current alias target is false, but the account-local IAM/invoker audit does not establish an enforceable deny for old versions or all external callers. Package-marker strings are not proof of safe check ordering. #349's disposable Work-profile fault-injection acceptance also remains outstanding. Keep execution disabled, keep uncertain operations fenced, and do not enable the replay barrier, restore mappings, release fences, or replay messages until both acceptance tracks and independent review are complete.
+This does not close #347: the 10 November 2026 read-only live check found eight stack Lambda functions, 240 numeric published versions and two aliases. All 250 numeric-version/unqualified/alias resources returned their expected direct-invocation Deny; this does not prove every effective IAM caller, authenticated Function URL, service invocation or rollback/redeployment path is safe. Historical package-marker strings are not proof of check ordering. #349's disposable Work-profile fault-injection acceptance also remains outstanding. Keep exceptional erasure disabled, uncertain operations fenced, and do not force-enable source mappings, release fences or replay messages until independently reviewed acceptance passes.

@@ -7,8 +7,7 @@ import {StateRepository} from "../dist/repository.js";
 import {DynamoReconciliationStore} from "../dist/reconciliation.js";
 import {CanonicalIdentityStore} from "../dist/canonical-identity.js";
 import {documentClient} from "../dist/dynamodb-capacity.js";
-import {ErasureReplayBlockedError} from "../dist/erasure-replay-barrier.js";
-import {enableReplayBarrierFixture} from "./helpers/replay-barrier-env.mjs";
+import {ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 
 const repositorySource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/repository.ts"),"utf8");
 const reconciliationSource=await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)),"../src/reconciliation.ts"),"utf8");
@@ -85,64 +84,44 @@ test("canonical identity mutators check replay admission before identity writes"
   }
 });
 
-async function withReplayBarrier(t,send){
-  t.after(enableReplayBarrierFixture({
-    keySeed:19,
-    extra:{STATE_TABLE_NAME:process.env.STATE_TABLE_NAME||"test-state"},
-  }));
-  const calls=[];
+test("retired HMAC setting denies identity state writes instead of checking old marker rows",async t=>{
+  const names=["ERASURE_REPLAY_BARRIER_VERSION","RETIREMENT_DISPOSITION_VERSION","STATE_TABLE_NAME"];
+  const before=Object.fromEntries(names.map(key=>[key,process.env[key]]));
+  Object.assign(process.env,{
+    ERASURE_REPLAY_BARRIER_VERSION:"1",RETIREMENT_DISPOSITION_VERSION:"0",STATE_TABLE_NAME:"test-state",
+  });
+  t.after(()=>{for(const [key,value] of Object.entries(before)){
+    if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }});
+  const reads=[],writes=[];
   t.mock.method(documentClient,"send",async command=>{
-    calls.push(command);
-    return send(command);
+    if(command.constructor.name==="GetCommand"){
+      reads.push(command.input.Key.pk);
+      if(command.input.Key.pk==="RECURRENCE#work#blocked-series")
+        return {Item:{profile:"work",owner:"calendar",seriesId:"blocked-series",
+          taskId:"blocked-task",eventId:"blocked-event",masterEventId:"blocked-master",
+          updatedAt:"2026-11-04T00:00:00.000Z"}};
+      return {};
+    }
+    writes.push(command.constructor.name);
+    throw Error("obsolete gate must not authorise any state write");
   });
-  return calls;
-}
-
-test("deleted mapping refuses marker and sends no state mutation",async t=>{
-  const calls=await withReplayBarrier(t,command=>{
-    assert.equal(command.constructor.name,"GetCommand");
-    return {Item:{markerVersion:1}};
-  });
-  await assert.rejects(new StateRepository().deleteMapping({profile:"work",taskId:"blocked-task",
-    eventId:"blocked-event",updatedAt:"2026-11-04T00:00:00.000Z"}),ErasureReplayBlockedError);
-  assert.ok(calls.length>=1);
-  assert.equal(calls.some(command=>command.constructor.name!=="GetCommand"),false);
-});
-
-test("conditional reconciliation baseline deletion refuses a replay marker",async t=>{
-  const calls=await withReplayBarrier(t,command=>{
-    assert.equal(command.constructor.name,"GetCommand");
-    return {Item:{markerVersion:1}};
-  });
-  await assert.rejects(new DynamoReconciliationStore().deleteBaselineIfUnchanged("work","blocked-task",null),
-    ErasureReplayBlockedError);
-  assert.equal(calls.length,1);
-});
-
-test("canonical identity puts and deletes refuse a replay marker before writing",async t=>{
-  const calls=await withReplayBarrier(t,command=>{
-    assert.equal(command.constructor.name,"GetCommand");
-    return {Item:{markerVersion:1}};
-  });
-  const store=new CanonicalIdentityStore();
   const identity={normalizedTitle:"task",normalizedStart:"2026-11-04",allDay:true};
-  await assert.rejects(store.put("work","calendar","blocked-event",identity),ErasureReplayBlockedError);
-  await assert.rejects(store.deleteIfUnchanged({profile:"work",side:"calendar",providerId:"blocked-event",
-    identity,updatedAt:"2026-11-04T00:00:00.000Z"}),ErasureReplayBlockedError);
-  assert.equal(calls.length,2);
-  assert.ok(calls.every(command=>command.constructor.name==="GetCommand"));
-});
-
-test("recurrence deletion reads then checks every known alias before deleting",async t=>{
-  const calls=await withReplayBarrier(t,command=>{
-    if(command.input.Key?.pk==="RECURRENCE#work#blocked-series")return {Item:{profile:"work",owner:"calendar",
-      seriesId:"blocked-series",taskId:"blocked-task",eventId:"blocked-event",masterEventId:"blocked-master",
-      updatedAt:"2026-11-04T00:00:00.000Z"}};
-    if(command.input.Key?.pk.startsWith("ERASURE_REPLAY#"))return {Item:{markerVersion:1}};
-    assert.fail("Unexpected DynamoDB command before replay admission");
-  });
-  await assert.rejects(new StateRepository().deleteRecurrenceLink("work","blocked-series"),ErasureReplayBlockedError);
-  assert.equal(calls.some(command=>command.constructor.name==="DeleteCommand"),false);
+  const calls=[
+    ()=>new StateRepository().deleteMapping({profile:"work",taskId:"blocked-task",
+      eventId:"blocked-event",updatedAt:"2026-11-04T00:00:00.000Z"}),
+    ()=>new DynamoReconciliationStore().deleteBaselineIfUnchanged("work","blocked-task",null),
+    ()=>new CanonicalIdentityStore().put("work","calendar","blocked-event",identity),
+    ()=>new CanonicalIdentityStore().deleteIfUnchanged({
+      profile:"work",side:"calendar",providerId:"blocked-event",identity,
+      updatedAt:"2026-11-04T00:00:00.000Z",
+    }),
+    ()=>new StateRepository().deleteRecurrenceLink("work","blocked-series"),
+  ];
+  for(const invoke of calls)
+    await assert.rejects(invoke(),ErasureReplayUnavailableError);
+  assert.deepEqual(writes,[]);
+  assert.ok(reads.every(pk=>!pk.startsWith("ERASURE_REPLAY#")));
 });
 
 test("recurrence deletion is conditional on the exact identity snapshot",async t=>{
@@ -169,12 +148,3 @@ test("recurrence deletion is conditional on the exact identity snapshot",async t
   assert.equal(deletion.ExpressionAttributeValues[":updatedAt"],"2026-11-04T00:00:00.000Z");
 });
 
-test("calendar write lease creation refuses a Todoist marker in any profile",async t=>{
-  const calls=await withReplayBarrier(t,command=>{
-    assert.equal(command.constructor.name,"GetCommand");
-    if(command.input.Key.pk==="ERASURE_REPLAY#antonio")return {Item:{markerVersion:1}};
-    return {};
-  });
-  await assert.rejects(new StateRepository().beginTodoistCalendarWrite("blocked-task"),ErasureReplayBlockedError);
-  assert.equal(calls.some(command=>command.constructor.name==="PutCommand"),false);
-});
