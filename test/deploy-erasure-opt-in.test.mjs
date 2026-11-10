@@ -48,3 +48,10 @@ test("erasure worker reads only configured Google and Todoist credential paramet
   assert.match(worker,/parameter\$\{TodoistTokenParameterPrefix\}\/\*/);
   assert.doesNotMatch(worker,/ssm:\*/);
 });
+
+test("guarded erasure recovery can use DynamoDB transactions on only its state table",()=>{
+  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
+  assert.ok(worker);
+  assert.match(worker,/Action: dynamodb:TransactWriteItems\s*\n\s*Resource: !GetAtt SyncState\.Arn/);
+  assert.doesNotMatch(worker,/dynamodb:\*/);
+});
