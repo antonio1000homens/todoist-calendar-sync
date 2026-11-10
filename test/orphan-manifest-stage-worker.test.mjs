@@ -5,6 +5,7 @@ import {
   orphanManifestStageEnabled, processOrphanManifestStage, readOrphanManifestWorkerMappings,
 } from "../dist/orphan-manifest-stage-worker.js";
 import {parseErasureQueueCommand,parseErasureQueueRecord,handler} from "../dist/erasure-worker.js";
+import {createLambdaMappingMock} from "./helpers/lambda-mapping-mock.mjs";
 
 const fn="target-worker";
 const id="11111111-1111-4111-8111-111111111111";
@@ -127,24 +128,24 @@ test("default-disabled SQS staging command becomes a retryable failure, never a 
   }finally{old===undefined?delete process.env.ORPHAN_FENCE_STAGING_ENABLED:
     process.env.ORPHAN_FENCE_STAGING_ENABLED=old;}
 });
-function lambdaFixture(custom={}){
-  const calls=[];
-  const lambda={send:async command=>{
-    const kind=command.constructor.name;calls.push(kind);
-    if(kind==="ListEventSourceMappingsCommand")
-      return {EventSourceMappings:[{UUID:id,EventSourceArn:arn,FunctionArn:fa,State:"Enabled"}],
-        ...custom.list};
-    if(kind==="GetEventSourceMappingCommand")
-      return {UUID:id,EventSourceArn:arn,FunctionArn:fa,State:"Enabled",...custom.get};
-    throw new Error("No Lambda write or provider operation allowed: "+kind);
-  }};
-  return {lambda,calls};
+function lambdaFixture(custom={}) {
+  return createLambdaMappingMock({
+    functionArn:fa,
+    recordConfiguration:false,
+    list:()=>({
+      EventSourceMappings:[{UUID:id,EventSourceArn:arn,FunctionArn:fa,State:"Enabled"}],
+      ...custom.list,
+    }),
+    readback:()=>({
+      UUID:id,EventSourceArn:arn,FunctionArn:fa,State:"Enabled",...custom.get,
+    }),
+  });
 }
 test("raw mapping capture contains only complete verified exact Enabled SQS rows",async()=>{
   const f=lambdaFixture();
   const result=await readOrphanManifestWorkerMappings(f.lambda,fn);
   assert.deepEqual(result,rows);
-  assert.deepEqual(f.calls,["ListEventSourceMappingsCommand","GetEventSourceMappingCommand"]);
+  assert.deepEqual(f.calls.map(call=>call.kind),["ListEventSourceMappingsCommand","GetEventSourceMappingCommand"]);
 });
 test("mapping capture fails closed on unverified, missing, changed or duplicate mapping states",async()=>{
   for(const config of [
