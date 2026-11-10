@@ -18,6 +18,11 @@ type FutureSplitPreview = { originalRule:string; truncatedRule:string; newStart:
 type RepairPreview = { id:string; intent:any; snapshots:any[]; changes:string[]; warnings:string[]; expiresAt:number; itemPlan:Array<{ref:{profile:string;side:"todoist"|"calendar";id:string};operation:string;result:string}>; splitPlan?:FutureSplitPreview };
 type RepairOperation = { id:string; attempt:number; status:string; abandoned?:boolean; error?:string; nextAction?:string; notificationText?:string; steps:Record<string,{status:string}>; outcomes?:Array<{entity:string;outcome:string}> };
 const profiles = ["all",...SYNC_PROFILES];
+function caseHeadline(item:Case):string {
+  if(item.decision?.type==="operational_dlq")return "Failed sync operation";
+  if(item.decision?.type==="operational_reconciliation_stuck")return "Sync run needs attention";
+  return (item.title||"Review item").replaceAll("_"," ");
+}
 const api = createReviewApiClient();
 function IdentityDetails({value,scope}:{value:any;scope?:string}) {
   const identity=providerIdentity(value);
@@ -358,7 +363,7 @@ function App() {
   const emptyOperationalExplanation=selected?.decision?.type==="operational_dlq"&&!hasProviderIds
     ? alertContext.kind==="reconcile"
       ? "This was a profile-wide reconciliation delivery, so it has no single Todoist task or Calendar event attached. The empty panels are expected; inspect the failure details and request a fresh reconciliation after addressing the cause."
-      : "This failure record has no provider item IDs, so the dashboard cannot look up a specific task or event. Search by title or description to find the current items, or request a fresh reconciliation."
+      : "This failure has no recorded Todoist task or Calendar event identity. Inspect the failure evidence or request a new profile reconciliation; no individual provider item can be repaired from this alert."
     : undefined;
   const liveTask=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.ref.side==="todoist")?.object;
   const liveEvent=details?.snapshots?.find((s:any)=>s.ref.profile===selected?.profile&&s.ref.side==="calendar")?.object;
@@ -525,7 +530,7 @@ function App() {
       const reconciliation=view?.data;
       const latestRun=reconciliation?.reconciliation;
       const summary=reconciliation?.summary;
-      const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
+      const latestRunAt=latestRun?.lastProgressAt||latestRun?.lastStartedAt||latestRun?.requestedAt||latestRun?.lastFailedAt||latestRun?.lastCompletedAt;
       return <div className="profile-report-item" key={runProfile}>
         <section className="preview reconciliation-overview" aria-label={`Latest reconciliation for ${runProfile}`}>
           <h3>{runProfile==="antonio"?"Antonio":runProfile==="home"?"Home":"Work"}</h3>
@@ -580,17 +585,17 @@ function App() {
       {overviewProfiles.map(runProfile=><RetirementHistory key={runProfile} api={api} profile={runProfile}/>)}
       <ErasureRecoveryPanel api={api} />
     </details>
-    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Review alerts"}{profile==="all"?" · all profiles":""}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span className="case-profile">{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Review alerts"}{profile==="all"?" · all profiles":""}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{caseHeadline(item)}</strong><span className="case-profile">{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
       <section className="detail">{!selected?<><p>Select an alert to review its details and available actions.</p><details className="preview manual-sync"><summary>Run a manual sync check</summary><h3>Manual reconciliation · single profile</h3>
           {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
             <option value="">Select a profile — no reconciliation requested</option>
             {SYNC_PROFILES.map(p=><option key={p} value={p}>{p}</option>)}
           </select></label>}
-          <p>Target sync profile: <strong>{manualTarget||"Choose one profile above"}</strong>. This action runs only for the indicated profile; changing the review-alert filter never starts reconciliation.</p>
+          <p>Target sync profile: <strong>{manualTarget||"Choose one profile above"}</strong>. Reconciliation may synchronize Todoist and Calendar and clear quarantined deliveries for that profile. Changing the alert filter never starts reconciliation.</p>
           <button onClick={runReconciliation} disabled={busy||!manualTarget}>Run reconciliation {manualTarget?`for ${manualTarget}`:"(select profile)"}</button>
           {manualTarget&&runViews[manualTarget]?.data&&<details><summary>Latest status for {manualTarget}</summary><pre>{JSON.stringify(runViews[manualTarget].data,null,2)}</pre></details>}
         </details></>:<>
-        <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
+        <div className="title"><div><h2>{caseHeadline(selected)}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         <section className="preview alert-evidence">
           <details><summary>Recorded alert evidence</summary>
             <pre>{JSON.stringify(selected.decision?.context||{},null,2)}</pre>
@@ -778,7 +783,7 @@ function App() {
           <section className="preview operational-actions">
             <h3>No provider item to repair</h3>
             <p>This alert has no verified Todoist task or Calendar event. Review the recorded failure above; there is no item here to delete, link or repair.</p>
-            <p>Reconciliation checks the selected profile and may clear quarantined deliveries. It does not replay the failed delivery or apply an item-specific repair.</p>
+            <p>Reconciliation may synchronize Todoist and Calendar and clear quarantined deliveries for this profile. It does not replay this failed delivery or apply an item-specific repair.</p>
             <button className="secondary" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Request reconciliation for {selected.profile}</button>
             {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
             <p className="action-explanation">Dismissing hides this alert; it does not fix the underlying failure.</p>
