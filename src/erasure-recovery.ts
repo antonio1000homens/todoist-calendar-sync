@@ -37,6 +37,22 @@ export interface RecoveryPreview {
   operationFingerprint:string;
   recoveryStatus?:RecoveryStatus;
   crossProfileEvidence?:CrossProfileErasureEvidence;
+  /** Read-only comparisons only. None of these booleans can grant recovery. */
+  evidenceChecks?:{
+    originalPreWritePhase:boolean;
+    originalConfirmationIntact:boolean;
+    auditComplete:boolean;
+    freshPreviewSelfConsistent:boolean;
+    primaryProviderMatches:boolean;
+    originalPreviewMatches:boolean;
+    todoistTaskMatches:boolean;
+    calendarEventMatches:boolean;
+    commentsMatch:boolean;
+    projectCommentIdsMatch:boolean;
+    knownCalendarAliasesMatch:boolean;
+    stateInventoryMatches:boolean;
+    providerSafetyBlockerCount:number;
+  };
 }
 export interface RecoveryAdapters {
   listWorkerMappings():Promise<FencedMapping[]>;
@@ -163,6 +179,42 @@ function validateLifecycle(op:ErasureOperation):string[] {
   if(!Number.isFinite(lc.timeoutSeconds)||lc.timeoutSeconds<=0)blockers.push("Invalid original worker timeout");
   return blockers;
 }
+/** Explain an ineligible pre-write inspection without exposing provider content,
+ * credentials, raw IDs, hashes, or authorising any state mutation. */
+function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:ErasurePreviewResult):
+  NonNullable<RecoveryPreview["evidenceChecks"]> {
+  const lifecycle=operation.lifecycle!;
+  const audit=snapshot.crossProfileEvidence;
+  const baseline=audit?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
+  const originalPreviewMatches=typeof baseline==="string"
+    &&/^[a-f0-9]{64}$/.test(baseline)
+    &&erasurePreviewFingerprint({...snapshot,providerSnapshotFingerprint:baseline})
+      ===operation.previewFingerprint;
+  // Wrap optional values in an object so JSON.stringify always has a
+  // stable input; compare immutable digests rather than public descriptions.
+  const same=(original:unknown,current:unknown)=>digest({value:original})===digest({value:current});
+  return {
+    originalPreWritePhase:!lifecycle.evidence.deletionStarted
+      &&!lifecycle.deletionProgress&&recoverableBeforeWrite.has(lifecycle.phase),
+    originalConfirmationIntact:operation.confirmationFingerprint===operation.previewFingerprint
+      &&erasurePreviewFingerprint(operation)===operation.previewFingerprint,
+    auditComplete:!audit||(audit.allProfilesQueried===true
+      &&audit.stateScan?.allPagesReceived===true
+      &&audit.stateScan?.stronglyConsistent===true),
+    freshPreviewSelfConsistent:erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint,
+    primaryProviderMatches:baseline===operation.providerSnapshotFingerprint,
+    originalPreviewMatches,
+    todoistTaskMatches:same(operation.actionPlan.todoistTask,snapshot.actionPlan.todoistTask),
+    calendarEventMatches:same(operation.actionPlan.calendarEvent,snapshot.actionPlan.calendarEvent),
+    commentsMatch:same(operation.actionPlan.comments,snapshot.actionPlan.comments),
+    projectCommentIdsMatch:same(operation.actionPlan.projectCommentIds,snapshot.actionPlan.projectCommentIds),
+    knownCalendarAliasesMatch:same(
+      {aliases:operation.actionPlan.knownCalendarAliases,complete:operation.actionPlan.knownCalendarAliasesComplete},
+      {aliases:snapshot.actionPlan.knownCalendarAliases,complete:snapshot.actionPlan.knownCalendarAliasesComplete}),
+    stateInventoryMatches:same(operation.inventory,snapshot.inventory),
+    providerSafetyBlockerCount:snapshot.blockers.length,
+  };
+}
 function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;state:string}>):Array<{id:string;state:string;originallyEnabled:boolean}> {
   const enabled=new Set(op.lifecycle!.enabledMappingIds);
   return actual.map(x=>({id:x.id,state:x.state,originallyEnabled:enabled.has(x.id)}));
@@ -231,6 +283,7 @@ export class ErasureRecoveryService {
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
       snapshotSafetyBlockerCount:snapshot.blockers.length,
+      evidenceChecks:readOnlyRecoveryEvidenceChecks(op,snapshot),
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
       ...(snapshot.crossProfileEvidence?{crossProfileEvidence:snapshot.crossProfileEvidence}:{})};
