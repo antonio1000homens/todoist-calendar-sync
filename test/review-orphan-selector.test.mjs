@@ -151,3 +151,16 @@ test("only server safety preview can be requested; no deletion or confirmation c
   assert.match(source,/No provider deletion is available/);
   assert.match(source,/recheck\(\)/);
 });
+
+test("guarded recovery inspection has inline progress and actionable, secret-free Todoist 401 feedback",()=>{
+  const recovery=readFileSync(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
+  assert.match(recovery,/setInspectionState\("running"\)/);
+  assert.match(recovery,/Inspecting provider and fence evidence \(read-only\)/);
+  assert.match(recovery,/setInspectionState\("succeeded"\)/);
+  assert.match(recovery,/setInspectionState\("failed"\)/);
+  assert.match(recovery,/HTTP 401/);
+  assert.match(recovery,/Update that account's token in AWS Parameter Store/);
+  assert.match(recovery,/role=\{inspectionState==="failed"\?"alert":"status"\}/);
+  assert.match(recovery,/No recovery was applied/);
+  assert.doesNotMatch(recovery,/retry_after|error_extra|event_id/);
+});
