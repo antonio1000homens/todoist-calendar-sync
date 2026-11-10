@@ -101,6 +101,7 @@ for(const family of fixtures){
     assert.equal(f.state.mapping.recurrenceOwner,"todoist");
     assert.equal(f.state.mapping.originalStart,family.due);
     assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
+    assert.equal(f.state.versions.length,1,"the project layer must not consume the task version before native admission");
     assert.ok(f.reads.length>=2,"outer orphan preflight and final native writer must each GET Todoist");
     await f.sync.process({...f.delivery,id:"duplicate-item-added"});
     assert.equal(f.writes.length,1,"repeat delivery cannot create a second master");
