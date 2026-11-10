@@ -136,6 +136,76 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(external.writes.length,0);
 });
 
+test("pre-write recovery accepts a fully read cross-profile audit without confusing its digest with the original target confirmation",async()=>{
+  const {service,external}=fixture();
+  const primary=external.snapshot.providerSnapshotFingerprint;
+  const withAudit={
+    ...external.snapshot,
+    // The cross-profile evidence digest intentionally differs from the
+    // immutable original, as it covers more provider data.
+    providerSnapshotFingerprint:"a".repeat(64),
+    primaryProviderSnapshotFingerprint:primary,
+    crossProfileEvidence:{allProfilesQueried:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}},
+  };
+  withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+  external.snapshot=withAudit;
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.classification,"pre_write");
+  assert.equal(inspected.preview.allowed,true);
+  assert.equal(external.writes.length,0);
+});
+
+test("cross-profile audit cannot hide changed primary provider data",async()=>{
+  const {service,external}=fixture();
+  const withAudit={...external.snapshot,
+    providerSnapshotFingerprint:"a".repeat(64),
+    primaryProviderSnapshotFingerprint:"b".repeat(64),
+    crossProfileEvidence:{allProfilesQueried:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}}};
+  withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+  external.snapshot=withAudit;
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(inspected.preview.classification,"partial_or_ambiguous");
+  assert.equal(external.writes.length,0);
+});
+
+test("cross-profile audit must be complete and strongly consistent before pre-write admission",async()=>{
+  for(const scan of [{allPagesReceived:false,stronglyConsistent:true},
+                     {allPagesReceived:true,stronglyConsistent:false}]) {
+    const {service,external}=fixture();
+    const withAudit={...external.snapshot,
+      providerSnapshotFingerprint:"a".repeat(64),
+      primaryProviderSnapshotFingerprint:external.snapshot.providerSnapshotFingerprint,
+      crossProfileEvidence:{allProfilesQueried:true,stateScan:scan}};
+    withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+    external.snapshot=withAudit;
+    const inspected=await service.inspect("op-recovery");
+    assert.equal(inspected.preview.allowed,false);
+    assert.equal(external.writes.length,0);
+  }
+});
+
+test("pre-write recovery rejects an incomplete or missing target-only audit baseline",async()=>{
+  for(const {allProfilesQueried,primaryProviderSnapshotFingerprint} of [
+    {allProfilesQueried:false,primaryProviderSnapshotFingerprint:"1".repeat(64)},
+    {allProfilesQueried:true,primaryProviderSnapshotFingerprint:undefined},
+  ]) {
+    const {service,external}=fixture();
+    const snapshot={...external.snapshot,providerSnapshotFingerprint:"a".repeat(64),
+      ...(primaryProviderSnapshotFingerprint?{primaryProviderSnapshotFingerprint}:{}),
+      crossProfileEvidence:{allProfilesQueried,
+        stateScan:{allPagesReceived:true,stronglyConsistent:true}}};
+    snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+    external.snapshot=snapshot;
+    const result=await service.inspect("op-recovery");
+    assert.equal(result.preview.allowed,false);
+    assert.equal(result.preview.classification,"partial_or_ambiguous");
+    assert.equal(external.writes.length,0);
+  }
+});
+
 test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
   const {service,operation,external}=fixture();
   const started=await service.startAutomaticPreWriteRecovery("op-recovery");
