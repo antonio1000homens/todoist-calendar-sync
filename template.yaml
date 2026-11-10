@@ -531,8 +531,8 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
-        # DynamoDBCrudPolicy does not grant TransactWriteItems; recovery
-        # relies on exact conditional operation/fence/epoch transactions.
+        # SAM DynamoDBCrudPolicy omits TransactWriteItems, but guarded
+        # recovery claims and fence release use DynamoDB transactions.
         - Statement:
             - Effect: Allow
               Action: dynamodb:TransactWriteItems

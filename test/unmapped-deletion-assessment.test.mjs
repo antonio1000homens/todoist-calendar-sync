@@ -83,8 +83,9 @@ test("#278 review API refresh and UI use same non-mutating evidence, with no rep
   assert.match(api,/assessUnmappedConflictDeletion\(item,snapshots\)/);
   assert.match(api,/return response\(200,\{item,snapshots,deletionCleanup,unmappedDeletion\}/);
   assert.match(ui,/unmappedDeletion:result\.unmappedDeletion/);
-  assert.match(ui,/!details\.unmappedDeletion\?\.bothGone&&<OrphanDeletionPanel/);
-  assert.match(ui,/!details\?\.unmappedDeletion\?\.bothGone&&<div className="preview">/);
+  assert.match(ui,/orphanItemsForCase\(\{item:details\.item,snapshots:details\.snapshots\|\|\[\]\}\)\.length>0/);
+  assert.match(ui,/<OrphanDeletionPanel/);
+  assert.match(ui,/\(hasProviderIds\|\|hasLiveIdentity\)&&<div className="preview">/);
   assert.match(ui,/One-sided deletion — no automatic purge/);
   assert.match(ui,/Run guarded cleanup for/);
 });

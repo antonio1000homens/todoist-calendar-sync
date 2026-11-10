@@ -32,6 +32,10 @@ import {
   readProfileLookup,
 } from "./profile-lookup.js";
 import type { CompletedCalendarProjection, Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
+import {phaseBNativeMoveBeginTransaction,phaseBNativeMoveCommitTransaction,
+  phaseBNativeMoveControlKeys,phaseBNativeMoveStage,phaseBNativeMoveStageKey,
+  type PhaseBNativeMoveHandoff,type PhaseBNativeMoveStage,
+} from "./todoist-phase-b-move-handoff.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
 const allProfiles: Profile[] = ["home", "antonio", "work"];
@@ -203,6 +207,77 @@ export class StateRepository {
       { profile, side:"todoist", id:taskId },
       { profile, side:"calendar", id:eventId },
     ], operationId);
+  }
+
+  /** A verified two-calendar native split must fence both profiles before
+   * either provider is changed. The stage has no TTL while unresolved. */
+  async getPhaseBNativeMoveStage(taskId: string): Promise<PhaseBNativeMoveStage | undefined> {
+    const result = await client.send(new GetCommand({
+      TableName:this.ensureTable(),Key:phaseBNativeMoveStageKey(taskId),ConsistentRead:true,
+    }));
+    return result.Item?.operationId ? result.Item as PhaseBNativeMoveStage : undefined;
+  }
+
+  async beginPhaseBNativeMove(input: Pick<PhaseBNativeMoveHandoff,
+    "plan"|"sourceMapping"|"sourceLink">): Promise<"claimed"|"resumed"> {
+    const stage=phaseBNativeMoveStage(input);
+    await Promise.all([
+      assertReplayAdmissionIfEnabled({profile:stage.sourceProfile,taskId:stage.taskId,
+        eventIds:[stage.sourceMasterId]}),
+      assertReplayAdmissionIfEnabled({profile:stage.destinationProfile,taskId:stage.taskId,
+        eventIds:[stage.successorMasterId]}),
+    ]);
+    try {
+      await client.send(new TransactWriteCommand({
+        TransactItems:phaseBNativeMoveBeginTransaction(this.ensureTable(),input,now()) as never,
+      }));
+      return "claimed";
+    } catch(error) {
+      const cancelled=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      if(!conditionalFailure(error) && !(cancelled.name==="TransactionCanceledException"
+        && cancelled.CancellationReasons?.some(c=>c.Code==="ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every(c=>c.Code==="None"||c.Code==="ConditionalCheckFailed")))throw error;
+      const existing=await this.getPhaseBNativeMoveStage(stage.taskId);
+      if(!existing || Object.entries(stage).some(([k,v])=>
+        (existing as unknown as Record<string,unknown>)[k]!==v))
+        throw new Error("Phase B move stage differs or another writer owns the task");
+      const controls=new SyncControls();
+      for(const ref of phaseBNativeMoveControlKeys(stage)) {
+        const parts=ref.pk.slice("SYNC_CONTROL#".length).split(":");
+        const p=parts[0] as Profile,side=parts[1] as "todoist"|"calendar";
+        const id=parts.slice(2).join(":");
+        const control=await controls.control({profile:p,side,id});
+        if(control?.activeRepair!==stage.operationId)
+          throw new Error("Phase B move stage has an incomplete durable write fence");
+      }
+      return "resumed";
+    }
+  }
+
+  /** Once BOTH Calendar masters and recurrence windows have been independently
+   * verified by the executor, this is the sole allowed cross-profile commit.
+   * The old owner, indexes and recurrence link are replaced atomically with
+   * the new owner and all barriers are released in the same transaction. */
+  async commitPhaseBNativeMoveIfUnchanged(input: PhaseBNativeMoveHandoff): Promise<boolean> {
+    const stage=phaseBNativeMoveStage(input);
+    await Promise.all([
+      assertReplayAdmissionIfEnabled({profile:stage.sourceProfile,taskId:stage.taskId,
+        eventIds:[stage.sourceMasterId]}),
+      assertReplayAdmissionIfEnabled({profile:stage.destinationProfile,taskId:stage.taskId,
+        eventIds:[stage.successorMasterId]}),
+    ]);
+    try {
+      await client.send(new TransactWriteCommand({
+        TransactItems:phaseBNativeMoveCommitTransaction(this.ensureTable(),input,now()) as never,
+      }));
+      return true;
+    } catch(error) {
+      const cancelled=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      if(conditionalFailure(error) || cancelled.name==="TransactionCanceledException"
+        && cancelled.CancellationReasons?.some(c=>c.Code==="ConditionalCheckFailed")
+        && cancelled.CancellationReasons.every(c=>c.Code==="None"||c.Code==="ConditionalCheckFailed"))return false;
+      throw error;
+    }
   }
 
   async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {

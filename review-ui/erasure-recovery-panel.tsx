@@ -11,6 +11,8 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [operationId,setOperationId]=useState("");
   const [operation,setOperation]=useState<Operation>();
   const [busy,setBusy]=useState(false),[notice,setNotice]=useState("");
+  const [inspectionState,setInspectionState]=useState<"idle"|"running"|"succeeded"|"failed">("idle");
+  const [inspectionMessage,setInspectionMessage]=useState("");
   const [preview,setPreview]=useState<any>(),[confirmation,setConfirmation]=useState<any>();
   const [postWriteAssessment,setPostWriteAssessment]=useState<any>();
   const [postWriteToken,setPostWriteToken]=useState<any>();
@@ -20,6 +22,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const lookup=async()=>{
     if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
     setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
+    setInspectionState("idle");setInspectionMessage("");
     setPostWriteTyped({phrase:"",operationId:"",profile:""});
     setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
     try{
@@ -38,9 +41,23 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const inspect=async()=>{
     if(!operation||busy)return;
     setBusy(true);setPreview(undefined);setConfirmation(undefined);setNotice("");
-    try{const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId));setPreview(result.preview);}
-    catch(e:any){setNotice(e.message||"Recovery inspection failed");}
-    finally{setBusy(false);}
+    setInspectionState("running");
+    setInspectionMessage("Inspecting provider and fence evidence (read-only). No recovery changes are being made.");
+    try{
+      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId));
+      setPreview(result.preview);
+      setInspectionState("succeeded");
+      setInspectionMessage(result.preview?.allowed
+        ?"Inspection completed: guarded recovery is eligible. Review the evidence before requesting confirmation."
+        :"Inspection completed: guarded recovery is blocked. Review the reasons below; protections remain unchanged.");
+    }catch(e:any){
+      setInspectionState("failed");
+      const message=typeof e?.message==="string"?e.message:"";
+      const unauthorized=message.includes("Provider request failed: 401 https://api.todoist.com/");
+      setInspectionMessage(unauthorized
+        ?`Inspection failed: Todoist rejected the ${operation.profile||"selected"} profile's API token (HTTP 401). Update that account's token in AWS Parameter Store, then inspect again. No recovery was applied.`
+        :"Inspection failed; no recovery was applied. "+(message||"The provider or recovery service could not be verified."));
+    }finally{setBusy(false);}
   };
   const inspectPostWrite=async()=>{
     if(!operation||busy)return;
@@ -133,7 +150,8 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
       {operation.status==="review_required"&&<>
         <h4>Inspect independent recovery evidence</h4>
         <p>Recovery never resumes an old provider deletion or creates replacements.</p>
-        <button disabled={busy} onClick={()=>void inspect()}>Inspect guarded recovery</button>
+        <button disabled={busy} onClick={()=>void inspect()} aria-label="Inspect guarded recovery">{inspectionState==="running"?"Inspecting guarded recovery…":"Inspect guarded recovery"}</button>
+        {inspectionMessage&&<p role={inspectionState==="failed"?"alert":"status"} className={inspectionState==="failed"?"warning":"info"}>{inspectionMessage}</p>}
         {preview&&<>
           <p>Classification: {preview.classification} · Profile: {preview.profile} · fence owned: {preview.fenceOwned?"yes":"no"} · leases: {preview.leaseCount}</p>
           <p>Provider items absent: {preview.providerItemsAbsent?"yes":"no"} · attributable state absent: {preview.stateRowsAbsent?"yes":"no"}</p>

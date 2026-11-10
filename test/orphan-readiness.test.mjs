@@ -101,7 +101,8 @@ test("UI readiness remains GET-only; independent POST issues a safety preview bu
   assert.match(panel,/\/orphan-readiness/);
   assert.match(panel,/Inspect deletion readiness \(read-only\)/);
   assert.match(panel,/no deletion is enabled/);
-  assert.match(panel,/\/orphan-previews/);
-  assert.match(panel,/method:"POST"/);
+  assert.doesNotMatch(panel,/\/orphan-previews/);
+  assert.doesNotMatch(panel,/method:"POST"/);
+  assert.match(panel,/Orphan identity inspection \(read-only\)/);
   assert.doesNotMatch(panel,/orphan-confirmations|deleteTask\(|deleteEvent\(|startErasure|enqueueErasure/);
 });

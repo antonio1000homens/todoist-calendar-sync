@@ -49,6 +49,13 @@ test("erasure worker reads only configured Google and Todoist credential paramet
   assert.doesNotMatch(worker,/ssm:\*/);
 });
 
+test("guarded erasure recovery can use DynamoDB transactions on only its state table",()=>{
+  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ErasureRecoveryWatchdogFunction:\n")[0];
+  assert.ok(worker);
+  assert.match(worker,/Action: dynamodb:TransactWriteItems\s*\n\s*Resource: !GetAtt SyncState\.Arn/);
+  assert.doesNotMatch(worker,/dynamodb:\*/);
+});
+
 test("pre-write recovery watchdog has independent, disabled-by-default schedule and no mapping-write IAM",()=>{
   const watchdog=template.split("\n  ErasureRecoveryWatchdogFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
   assert.ok(watchdog,"independent watchdog Lambda exists");

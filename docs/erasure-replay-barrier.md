@@ -72,9 +72,11 @@ npm run cleanup:erasure-tombstones -- --profile=work --apply \
 
 The apply path re-reads each candidate and deletes only the unchanged, expired comment in the configured project. It does not scan or delete DynamoDB rows, task comments, active markers, or unrelated project comments.
 
-## Legacy HMAC code and release status
+## Legacy HMAC admission compatibility (disabled)
 
-The repository still contains the earlier DynamoDB/HMAC replay-barrier code for compatibility and historical review. It is not the selected #349 completed-erasure storage model, and no new #349 completion writes those HMAC marker rows. Keep the existing `ERASURE_REPLAY_BARRIER_VERSION` configuration off; do not enable the legacy mechanism as a substitute for the Todoist project comment. Review any pre-existing legacy rows separately before changing their lifecycle.
+The permanent-DynamoDB-HMAC **writer, orphan installer and staged post-write marker/fence release implementation have been retired**. They have no active production callers and are not part of #349's bounded 18-day project-comment tombstone workflow. The separate current `atomicConfirmedErasureCompletion` transaction is retained and writes **no permanent HMAC replay identity**.
+
+The **legacy HMAC admission reader** remains compiled because existing mapping, provider, queue and worker call paths reference it, and previously installed marker rows cannot be assumed absent. The reader is still controlled by the existing `ERASURE_REPLAY_BARRIER_VERSION` gate. **Keep that gate off.** Do not enable this legacy mechanism or clear historical HMAC rows based on this source-only cleanup. Auditing any historical marker rows, qualified Lambda versions, IAM permissions, rollback and removing the remaining dormant reader is a separate #347/#349 review, not a safe automatic follow-up to this change.
 
 The bounded project-comment implementation from #403–#405 is deployed to current production master. Deployment run 42536045650 succeeded. The `todoist-calendar-sync` stack is `UPDATE_COMPLETE` with `ErasureExecutionEnabled=false`; the live Review API execution setting is false, and the replay-barrier setting remains absent. The erasure worker mapping is enabled.
 
