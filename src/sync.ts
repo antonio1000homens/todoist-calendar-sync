@@ -1842,7 +1842,8 @@ export class Synchronizer {
     const shared = master.extendedProperties?.shared;
     if (!master.etag || master.status !== "confirmed" || !master.start?.date
       || master.recurrence?.length !== 1 || !task.due?.is_recurring
-      || shared?.taskId !== task.id) {
+      || shared?.syncRecurrenceOwner !== "todoist" || shared.todoistPhaseBVersion !== "1"
+      || shared.taskId !== task.id) {
       await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
         taskId: task.id, eventId: master.id, reason: "master_or_current_recurrence_unverified",
       });
