@@ -187,6 +187,25 @@ test("cross-profile audit must be complete and strongly consistent before pre-wr
   }
 });
 
+test("pre-write recovery rejects an incomplete or missing target-only audit baseline",async()=>{
+  for(const {allProfilesQueried,primaryProviderSnapshotFingerprint} of [
+    {allProfilesQueried:false,primaryProviderSnapshotFingerprint:"1".repeat(64)},
+    {allProfilesQueried:true,primaryProviderSnapshotFingerprint:undefined},
+  ]) {
+    const {service,external}=fixture();
+    const snapshot={...external.snapshot,providerSnapshotFingerprint:"a".repeat(64),
+      ...(primaryProviderSnapshotFingerprint?{primaryProviderSnapshotFingerprint}:{}),
+      crossProfileEvidence:{allProfilesQueried,
+        stateScan:{allPagesReceived:true,stronglyConsistent:true}}};
+    snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+    external.snapshot=snapshot;
+    const result=await service.inspect("op-recovery");
+    assert.equal(result.preview.allowed,false);
+    assert.equal(result.preview.classification,"partial_or_ambiguous");
+    assert.equal(external.writes.length,0);
+  }
+});
+
 test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
   const {service,operation,external}=fixture();
   const started=await service.startAutomaticPreWriteRecovery("op-recovery");
