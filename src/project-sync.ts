@@ -208,6 +208,13 @@ export class ProjectAwareSynchronizer {
       const currentProfile = profileForTodoistProject(task.project_id);
       if (currentProfile === delivery.profile) return false;
       const mapping = await this.state.getMappingByEvent(delivery.profile, orphan.eventId);
+      const tagged = await this.phaseBNativeSource(orphan.taskId, [delivery.profile]);
+      if (mapping?.todoistPhaseBVersion === 1 || tagged) {
+        await this.state.audit(delivery.profile, "todoist_phase_b_cross_profile_move_requires_review", {
+          taskId: orphan.taskId, eventId: tagged?.master.id || mapping?.eventId, toProfile: currentProfile,
+        });
+        return true;
+      }
       await this.state.putCalendarProjectionTombstone(
         delivery.profile,
         orphan.taskId,
@@ -339,6 +346,26 @@ export class ProjectAwareSynchronizer {
     return true;
   }
 
+  /** A missing/stale DynamoDB mapping must not authorize deleting a native
+   * provider master. Check exact linked identity across managed source profiles
+   * before any project-move/delete/create transition. Provider errors fail closed. */
+  private async phaseBNativeSource(taskId: string, candidates: Profile[]): Promise<{profile: Profile; master: CalendarEvent} | undefined> {
+    for (const profile of [...new Set(candidates)]) {
+      const { calendar } = await this.clients(profile);
+      const alias = await calendar.findByTodoistTaskId(taskId);
+      if (!alias) continue;
+      const master = alias.recurringEventId ? await calendar.getEvent(alias.recurringEventId) : alias;
+      if (master.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
+        // Do not act on mismatched/ambiguous provider identity.
+        if (master.extendedProperties.shared.taskId !== taskId
+          || master.extendedProperties.shared.syncRecurrenceOwner !== "todoist")
+          throw new Error("Tagged Phase B source master identity is inconsistent");
+        return { profile, master };
+      }
+    }
+    return undefined;
+  }
+
   private async processTodoist(delivery: Delivery): Promise<void> {
     const rawPayload = JSON.parse(delivery.body) as TodoistWebhookPayload;
     if (!rawPayload.event_data?.id) return;
@@ -455,6 +482,27 @@ export class ProjectAwareSynchronizer {
       && transition.action === "create_projection"
       && transition.toProfile,
     );
+
+    // Moving the backing Calendar master across profile calendars needs its
+    // own deterministic native-master copy/readback protocol. Keep the source
+    // mapping/master intact until that migration can be verified; never let
+    // the ordinary rolling projection writer flatten this Phase B recurrence.
+    if (["move_projection", "delete_projection", "create_projection"].includes(transition.action)) {
+      // Destination identity is checked once by applyProjectMove's preflight;
+      // never consume that lookup early or repeat it after source deletion.
+      const nativeSourceProfiles = (["home", "antonio", "work"] as Profile[])
+        .filter(profile => transition.action !== "move_projection" || profile !== transition.toProfile);
+      const nativeSource = await this.phaseBNativeSource(task.id,
+        [mapping?.profile, transition.fromProfile, ...nativeSourceProfiles]
+          .filter((value): value is Profile => Boolean(value)));
+      if (mapping?.todoistPhaseBVersion === 1 || nativeSource) {
+        const fromProfile = nativeSource?.profile || mapping?.profile || transition.fromProfile || delivery.profile;
+        return this.state.audit(fromProfile, "todoist_phase_b_cross_profile_move_requires_review", {
+          taskId: task.id, eventId: nativeSource?.master.id || mapping?.masterEventId || mapping?.eventId,
+          fromProfile, toProfile: transition.toProfile, reason: "native_master_copy_not_implemented",
+        });
+      }
+    }
 
     if (transition.action === "skip") {
       return this.state.audit(delivery.profile, "todoist_calendar_skipped_unmapped_project", {

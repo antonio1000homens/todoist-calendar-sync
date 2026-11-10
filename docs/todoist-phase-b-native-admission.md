@@ -1,6 +1,6 @@
 # Phase B follow-up: Todoist-owned native recurrence admission
 
-Issue #290 was closed on 7 November 2026 but still contains a broader Phase B Todoist→Calendar native-write requirement. This follow-up does **not** reopen the issue or change any production translator/writer.
+Issue #290 was closed on 7 November 2026 but still contains a broader Phase B Todoist→Calendar native-write requirement. This follow-up does **not** reopen the issue. It adds a guarded writer for newly created tasks; the production switch is default OFF.
 
 ## Provider observations (8 November 2026)
 
@@ -26,8 +26,10 @@ Previous 7 November tests also demonstrated that Todoist `every 29,30,31` change
 
 `verifyInitialPhaseBCalendarWrite()` is the second, independent post-write gate. It requires a persisted confirmed master/etag with matching owner, task ID, original anchor and rule; a **complete, empty explicit exception inventory**; at least three consecutive Google `originalStartTime` provider instances with no moved/cancelled override, and matching independently verified timezone.
 
-Both return explicit negative reasons and **perform no provider writes or mapping changes**. Reconciliation, webhook and recovery paths remain as they were. The later, separately reviewed writer integration must call both gates, guard the provider mutation with the existing FIFO/write fence and retirement controls, re-read actual Google state after POST, rollback only a newly created master if validation fails, and commit the same Todoist-owned link only after success. Do not migrate an existing rolling mapping or modify historical Calendar series.
+Both return explicit negative reasons and **perform no provider writes or mapping changes**. The `item:added` writer calls them under the existing task write fence and mutation budget, creates a deterministic Calendar master ID, independently GETs the saved master, expands provider instances and inventories explicit exceptions, then commits the Todoist-owned mapping only after verification. An invalid newly created master is deleted and audited; if rollback fails, the exact identity is quarantined and later deliveries stop before replacement. Existing tagged Phase B masters remain native when Todoist advances due; the sync updates the active occurrence mapping and only patches master summary/description with an ETag. Disabling new creation does not flatten an already committed native master.
+
+The deployment control is `PhaseBNativeEnabled` / `PHASE_B_NATIVE_ENABLED`, default `false`. In tests the equivalent runtime variable is `TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED`. Keep it off until the managed-profile disposable E2E has verified all three recurrence families, completion progression, repeat delivery, rollback and recurrence preservation. Cross-profile moves currently fail closed with a review audit while retaining the source master; deterministic destination-master copy/readback is still required before the feature is production-ready. Do not migrate an existing rolling mapping or modify historical Calendar series.
 
 ## Rollout state
 
-Read-only safeguards only. This PR does **not** turn on Todoist→Calendar native Phase B in production. Existing Phase C Calendar→Todoist native support and flag are unchanged. Next milestone: guarded writer integration plus a disposable managed-profile end-to-end fixture with confirmed rollback/replay behaviour.
+Code-level validation: the focused policy/writer/provider-surface tests and full suite pass. This PR does **not** turn on Todoist→Calendar native Phase B in production. Managed-profile disposable provider acceptance has not been run, and cross-profile native-master copying remains unimplemented; the switch stays OFF. Existing Phase C Calendar→Todoist native support and flag are unchanged.

@@ -196,6 +196,7 @@ parameter_overrides=(
   "ProfileLookupIndexWriteCapacity=$profile_lookup_index_write_capacity"
   "CompletedHistoryCleanupApply=$completed_history_cleanup_apply"
   "PhaseCNativeEnabled=${PHASE_C_NATIVE_ENABLED:-true}"
+  "PhaseBNativeEnabled=${PHASE_B_NATIVE_ENABLED:-false}"
   "ErasureExecutionEnabled=$erasure_execution_enabled"
   "CalendarWatchTokenParameter=$calendar_watch_token_parameter"
   "TodoistWebhookSecretParameter=$todoist_webhook_secret_parameter"

@@ -419,6 +419,27 @@ test("Todoist-owned RRULE move binds the destination master and current instance
   assert.ok(state.recurrenceLinks.some((link) => link.profile === "work" && link.owner === "todoist" && link.activeInstanceId === "work-event-1-instance"));
 });
 
+test("Phase B native master stays intact when cross-profile copy protocol is unavailable", async () => {
+  const previous = { id:"phase-b-move", project_id:HOME, content:"Quarterly", description:"",
+    due:{date:"2027-04-10",string:"every quarter",is_recurring:true},updated_at:"2027-01-10T09:00:00Z" };
+  const task={...previous,project_id:WORK,updated_at:"2027-01-10T10:00:00Z"};
+  const calendars=calendarSet();
+  calendars.home.events.set("phase-b-master",{id:"phase-b-master",summary:task.content,status:"confirmed",
+    start:{date:"2027-01-10"},end:{date:"2027-01-11"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],
+    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}}});
+  const mapping={profile:"home",projectId:HOME,eventId:"phase-b-master",taskId:task.id,
+    recurrenceOwner:"todoist",seriesId:task.id,masterEventId:"phase-b-master",activeInstanceId:"phase-b-apr",
+    originalStart:"2027-04-10",activeEffectiveStart:"2027-04-10",todoistPhaseBVersion:1,updatedAt:previous.updated_at};
+  const state=new FakeState(mapping);
+  const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));
+  await sync.process(delivery("phase-b-move",task,previous));
+  assert.deepEqual(calendars.home.deleted,[]);
+  assert.deepEqual(calendars.work.created,[]);
+  assert.equal(state.mapping.profile,"home");
+  assert.equal(state.mapping.todoistPhaseBVersion,1);
+  assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+});
+
 test("moved orphan writes a source tombstone before dropping ownership mapping", async () => {
   const task = { id: "task-8", project_id: WORK, content: "Moved orphan", due: { date: "2026-09-11" }, updated_at: "2026-09-03T10:00:00Z" };
   const mapping = { profile: "home", projectId: HOME, eventId: "home-orphan", taskId: task.id, updatedAt: "2026-09-03T09:00:00Z" };
@@ -538,4 +559,37 @@ test("pending approved future split blocks ordinary Todoist webhook projection c
   assert.deepEqual(calendars.home.deleted, []);
   assert.equal(state.mapping, undefined);
   assert.ok(state.audits.some((x) => x.action === "todoist_webhook_future_series_split_pending"));
+});
+
+test("Phase B tagged source blocks cross-profile move even when the mapping was lost",async()=>{
+  const previous={id:"phase-b-unmapped-move",project_id:HOME,content:"Quarter",description:"",
+    due:{date:"2027-04-10",string:"every quarter",is_recurring:true},updated_at:"2027-01-10T09:00:00Z"};
+  const task={...previous,project_id:WORK,updated_at:"2027-01-10T10:00:00Z"};
+  const calendars=calendarSet();
+  calendars.home.events.set("phase-b-unmapped-master",{id:"phase-b-unmapped-master",
+    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],start:{date:"2027-01-10"}});
+  for(const mapping of [undefined,{profile:"home",eventId:"phase-b-unmapped-master",
+    taskId:task.id,updatedAt:previous.updated_at}]){
+    const state=new FakeState(mapping);
+    const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));
+    await sync.process(delivery("unmapped-phase-b-move",task,previous));
+    assert.deepEqual(calendars.home.deleted,[]);
+    assert.deepEqual(calendars.work.created,[]);
+    assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+  }
+});
+
+test("Phase B tagged orphan cannot be stripped when its mapping has vanished",async()=>{
+  const task={id:"phase-b-orphan",project_id:WORK,content:"Quarter",due:{date:"2027-04-10"}};
+  const calendars=calendarSet();
+  calendars.home.events.set("phase-b-orphan-master",{id:"phase-b-orphan-master",
+    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    start:{date:"2027-01-10"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"]});
+  const state=new FakeState();
+  const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));
+  await sync.process({...delivery("phase-b-orphan",task),kind:"orphan",
+    orphan:{taskId:task.id,eventId:"phase-b-orphan-master"}});
+  assert.equal(state.tombstones.size,0);
+  assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
 });

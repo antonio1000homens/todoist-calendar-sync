@@ -440,6 +440,31 @@ export class GoogleCalendar {
     }
   }
 
+  /** Create a deterministic, newly admitted Todoist-owned Phase B master once.
+   * A conflict returns the exact persisted identity for independent readback;
+   * it never updates or adopts a different event. */
+  async createTodoistPhaseBNativeMasterOnce(
+    event: CalendarEvent,
+  ): Promise<{ event: CalendarEvent; created: boolean }> {
+    const shared = event.extendedProperties?.shared;
+    if (!/^[a-f0-9]{32}$/.test(event.id) || !event.start?.date
+      || event.start.dateTime || event.recurrence?.length !== 1
+      || shared?.syncRecurrenceOwner !== "todoist" || !shared.taskId
+      || shared.todoistAnchorStart !== event.start.date
+      || shared.todoistPhaseBVersion !== "1") {
+      throw new Error("Phase B master create requires an anchored deterministic identity");
+    }
+    try {
+      return { event: await this.request<CalendarEvent>(
+        `/calendars/${encodeURIComponent(this.calendarId)}/events`,
+        { method: "POST", body: JSON.stringify(event) },
+      ), created: true };
+    } catch (error) {
+      if (Number((error as { status?: number }).status) !== 409) throw error;
+      return { event: await this.getEvent(event.id), created: false };
+    }
+  }
+
   async upsertEvent(event: CalendarEvent, existingId?: string): Promise<CalendarEvent> {
     const path = `/calendars/${encodeURIComponent(this.calendarId)}/events${existingId ? `/${encodeURIComponent(existingId)}` : ""}`;
     return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
