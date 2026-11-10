@@ -56,9 +56,10 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
     async createTodoistPhaseBNativeMasterOnce(e){
       creates.push(structuredClone(e));
       events.set(e.id,{...structuredClone(e),etag:"etag-1",status:"confirmed"});
+      const creationReadback=structuredClone(events.get(e.id));
       if(missingVersion) delete events.get(e.id).extendedProperties.shared.todoistPhaseBVersion;
       if(unconfirmedCreation) throw new Error("connection dropped after POST");
-      return {event:structuredClone(events.get(e.id)),created:!createdConflict};
+      return {event:creationReadback,created:!createdConflict};
     },
     async listInstancesInWindow(masterId){return instances.map(x=>({...structuredClone(x),recurringEventId:masterId}));},
     async listInstances(masterId){return instances.map(x=>({...structuredClone(x),recurringEventId:masterId}));},
