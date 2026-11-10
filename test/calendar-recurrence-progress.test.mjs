@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { profiles } from "../dist/config.js";
+import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 import {
   Synchronizer,
   selectCalendarRecurrenceInstance,
@@ -143,7 +145,7 @@ class FakeState {
   async audit(_profile, action, detail) { this.audits.push({ action, detail }); }
 }
 
-function fakeClients(state, instances, link, masterDelta, recurrenceString) {
+function fakeClients(state, instances, link, masterDelta, recurrenceString, projectComments = []) {
   const failures = {};
   const tasks = new Map();
   if (link) {
@@ -196,7 +198,7 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
       async upsertEvent(event) { calendarUpserts.push(structuredClone(event)); return { ...structuredClone(event), id: event.id || "stored" }; },
     },
     todoist: {
-      async listProjectComments() { return []; },
+      async listProjectComments() { return projectComments; },
       async getTask(id) {
         const task = tasks.get(id);
         if (!task) throw Object.assign(new Error("missing"), { status: 404 });
@@ -241,6 +243,30 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString) {
     },
   };
 }
+
+test("project-comment erasure tombstone suppresses stale recurrence reconciliation before provider readback", async () => {
+  const active = instance("active", "2026-11-11", "2026-11-12");
+  const link = linkFor(active);
+  const state = new FakeState(link);
+  const createdAt = new Date(Date.now() - 60_000).toISOString();
+  const marker = serializeDeletionTombstoneComment({
+    schemaVersion: 1, profile: PROFILE, projectId: profiles[PROFILE].todoistProjectId,
+    taskId: link.taskId, eventIds: [MASTER, active.id], createdAt,
+    expiresAt: new Date(Date.parse(createdAt) + 18 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const clients = fakeClients(state, [active], link, undefined, undefined,
+    [{ id: "erasure-marker", project_id: profiles[PROFILE].todoistProjectId, content: marker }]);
+  clients.calendar.getEvent = async () => { throw new Error("must not read a tombstoned recurrence master"); };
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.reconcile(PROFILE);
+
+  assert.equal(state.operations.length, 0);
+  assert.deepEqual(state.audits.at(-1), {
+    action: "erasure_project_comment_replay_suppressed",
+    detail: { side: "recurrence_reconciliation" },
+  });
+});
 
 function masterEvent() {
   return {

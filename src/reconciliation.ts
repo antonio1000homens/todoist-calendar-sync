@@ -6,7 +6,7 @@ import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
 import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries, verifyCancelledSeriesInstances } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
-import { attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
@@ -762,7 +762,17 @@ export class SnapshotReconciler {
     mapping: Mapping,
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
+    projectComments: Awaited<ReturnType<Todoist["listProjectComments"]>> = [],
   ): Promise<ReconcileOutcome> {
+    if (activeProjectDeletionTombstone(projectComments, {
+      profile, projectId: profiles[profile].todoistProjectId,
+      taskId: mapping.taskId,
+      eventIds: [...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId]
+        .filter((id): id is string => Boolean(id)))],
+    })) {
+      await this.state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "todoist_reconciliation" });
+      return "deleted_retired";
+    }
     // Operator retirement is a terminal no-op, not another blocked or deferred
     // diagnostic. The future Apply transaction will remove this mapping.
     if (await this.state.isRetired?.({profile,taskId:mapping.taskId,
@@ -882,7 +892,18 @@ export class SnapshotReconciler {
     return this.applyCalendarChange(profile, mapping, task, event, clients);
   }
 
-  private async reconcileUnmappedTask(profile: Profile, task: TodoistTask, clients: ClientPair): Promise<ReconcileOutcome> {
+  private async reconcileUnmappedTask(
+    profile: Profile,
+    task: TodoistTask,
+    clients: ClientPair,
+    projectComments: Awaited<ReturnType<Todoist["listProjectComments"]>> = [],
+  ): Promise<ReconcileOutcome> {
+    if (activeProjectDeletionTombstone(projectComments, {
+      profile, projectId: profiles[profile].todoistProjectId, taskId: task.id,
+    })) {
+      await this.state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "todoist_reconciliation" });
+      return "deleted_retired";
+    }
     if (await this.state.isRetired?.({profile,taskId:task.id})) return "noop";
     if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
@@ -1109,9 +1130,16 @@ export class SnapshotReconciler {
         reviewCursor = page.cursor as Record<string, unknown> | undefined;
       } while (reviewCursor);
     }
+    const clients = await this.clients(profile);
+    // Snapshot reconciliation is a separate admitted writer path from the
+    // SQS webhook preflight. Read the bounded erasure tombstones while the
+    // worker holds this profile's writer lease, then suppress stale listTasks
+    // results before they can create provider state or DynamoDB baselines.
+    const projectComments = clients.todoist.listProjectComments
+      ? await clients.todoist.listProjectComments(profiles[profile].todoistProjectId, true)
+      : [];
     if (!continuation) await this.reconcileExistingRecurrence(profile);
 
-    const clients = await this.clients(profile);
     const tasks = (await clients.todoist.listTasks()).slice().sort((a, b) => a.id.localeCompare(b.id));
     const taskById = new Map(tasks.map((task) => [task.id, task]));
     const mappings = (await this.store.listMappings(profile)).slice().sort((a, b) => a.taskId.localeCompare(b.taskId));
@@ -1138,7 +1166,7 @@ export class SnapshotReconciler {
       const candidates = mappings.filter((mapping) => !afterTaskId || mapping.taskId > afterTaskId);
       for (let index = 0; index < candidates.length; index += 1) {
         const mapping = candidates[index];
-        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients)
+        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients, projectComments)
           .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "mapped", taskId: mapping.taskId, eventId: mapping.eventId }));
         counts[outcome] += 1;
         if (isResolvedConflictOutcome(outcome)) {
@@ -1163,7 +1191,7 @@ export class SnapshotReconciler {
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-      const outcome = await this.reconcileUnmappedTask(profile, task, clients)
+      const outcome = await this.reconcileUnmappedTask(profile, task, clients, projectComments)
         .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "unmapped", taskId: task.id }));
       counts[outcome] += 1;
       if (isResolvedConflictOutcome(outcome)) {
