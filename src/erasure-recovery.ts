@@ -335,15 +335,22 @@ export class ErasureRecoveryService {
    * A refused or inconclusive inspection leaves every fence and mapping alone.
    */
   async startAutomaticPreWriteRecovery(id:string):Promise<{queued:boolean;blockerCount:number}> {
-    const inspected=await this.inspect(id);
-    if(!inspected.preview.allowed||inspected.preview.classification!=="pre_write")
-      return {queued:false,blockerCount:inspected.preview.blockers.length};
     const actor="system:erasure-prewrite-watchdog";
-    const issued=await this.issueConfirmation(id,actor);
+    let issued:{preview:RecoveryPreview;confirmationId:string;expiresAt:number};
+    try {
+      // This is the same operator-only pre-write inspection and short-lived
+      // confirmation issuance, without a third expensive provider scan.
+      issued=await this.issueConfirmation(id,actor);
+    } catch(error) {
+      if(error instanceof Error && (error as {status?:number}).status===409
+        &&error.message==="Recovery is blocked; inspect safety evidence")
+        return {queued:false,blockerCount:1};
+      throw error; // A provider/IAM/timeout failure is not proof of safety.
+    }
     if(!issued.preview.allowed||issued.preview.classification!=="pre_write")
-      throw new Error("Automatic recovery evidence changed before confirmation");
-    // apply() repeats the independent evidence inspection and conditionally
-    // locks the exact original operation/fence/epoch. This cannot delete an item.
+      throw new Error("Automatic recovery requires independently verified pre-write evidence");
+    // apply() re-inspects all sources, then locks the exact operation/fence/
+    // epoch through the existing CAS. No new provider deletion is possible.
     await this.apply(id,issued.confirmationId,actor);
     return {queued:true,blockerCount:0};
   }
