@@ -83,6 +83,9 @@ function fixture(options={}) {
           return {};
         }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET recovery=:recovery"))) {
+          const confirmationUpdate=input.TransactItems.find(x=>x.Update?.Key?.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery").Update;
+          assert.match(confirmationUpdate.ConditionExpression,/#operator=:operator/);
+          assert.equal(confirmationUpdate.ExpressionAttributeNames["#operator"],"operator");
           assert.equal(operation.status,"review_required");
           assert.equal(operation.recovery,undefined,"confirmation must not be reused");
           assert.equal(confirmation.status,"issued");
