@@ -6,31 +6,17 @@ import {SQSClient,SendMessageCommand} from "@aws-sdk/client-sqs";
 import {GetCommand,DeleteCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {handler} from "../dist/handler.js";
+import {enableReplayBarrierFixture} from "./helpers/replay-barrier-env.mjs";
 
-const before={
-  version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
-  protocol:process.env.ERASURE_PROTOCOL_VERSION,
-  keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
-  current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
-  proxy:process.env.PROXY_SHARED_SECRET_PARAMETER,
-  todoist:process.env.TODOIST_WEBHOOK_SECRET_PARAMETER,
-};
-process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
-process.env.ERASURE_PROTOCOL_VERSION="1";
-process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,9).toString("base64")});
-process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
-process.env.PROXY_SHARED_SECRET_PARAMETER="/test/replay/proxy";
-process.env.TODOIST_WEBHOOK_SECRET_PARAMETER="/test/replay/todoist";
-test.after(()=>{
-  for(const [key,value] of [
-    ["ERASURE_REPLAY_BARRIER_VERSION",before.version],
-    ["ERASURE_PROTOCOL_VERSION",before.protocol],
-    ["ERASURE_REPLAY_HMAC_KEYS",before.keys],
-    ["ERASURE_REPLAY_HMAC_CURRENT_KEY",before.current],
-    ["PROXY_SHARED_SECRET_PARAMETER",before.proxy],
-    ["TODOIST_WEBHOOK_SECRET_PARAMETER",before.todoist],
-  ])if(value===undefined)delete process.env[key];else process.env[key]=value;
+const restoreReplay=enableReplayBarrierFixture({
+  keySeed:9,
+  extra:{
+    PROXY_SHARED_SECRET_PARAMETER:"/test/replay/proxy",
+    TODOIST_WEBHOOK_SECRET_PARAMETER:"/test/replay/todoist",
+  },
 });
+test.after(restoreReplay);
+
 function webhook(body){
   const signature=createHmac("sha256","todoist-secret").update(body).digest("base64");
   return {rawPath:"/todoist-work",headers:{
@@ -38,11 +24,14 @@ function webhook(body){
     "x-todoist-delivery-id":"delayed-replay",
   },body,isBase64Encoded:false,requestContext:{http:{method:"POST"}}};
 }
-function setup(t,read){
+function mockWebhookSecrets(t) {
   t.mock.method(SSMClient.prototype,"send",async command=>{
     assert.ok(command instanceof GetParameterCommand);
     return {Parameter:{Value:command.input.Name==="/test/replay/proxy"?"proxy-secret":"todoist-secret"}};
   });
+}
+function setup(t,read){
+  mockWebhookSecrets(t);
   const writes=[];
   t.mock.method(documentClient,"send",async command=>{
     if(command instanceof GetCommand&&command.input.Key.pk==="ERASURE_REPLAY#work"){
@@ -90,10 +79,7 @@ function setupLeasedEnqueue(t, markerAfterIngress=false) {
       ["QUEUE_URL",previous.queue],
     ])if(value===undefined)delete process.env[name];else process.env[name]=value;
   });
-  t.mock.method(SSMClient.prototype,"send",async command=>{
-    assert.ok(command instanceof GetParameterCommand);
-    return {Parameter:{Value:command.input.Name==="/test/replay/proxy"?"proxy-secret":"todoist-secret"}};
-  });
+  mockWebhookSecrets(t);
   const counts={reads:0,leases:0,releases:0,sends:0};
   let leaseHeld=false;
   t.mock.method(documentClient,"send",async command=>{
@@ -153,10 +139,7 @@ test("a replay-enabled Todoist ingress refuses to enqueue without the erasure le
   const previous=process.env.ERASURE_PROTOCOL_VERSION;
   process.env.ERASURE_PROTOCOL_VERSION="0";
   t.after(()=>{if(previous===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=previous;});
-  t.mock.method(SSMClient.prototype,"send",async command=>{
-    assert.ok(command instanceof GetParameterCommand);
-    return {Parameter:{Value:command.input.Name==="/test/replay/proxy"?"proxy-secret":"todoist-secret"}};
-  });
+  mockWebhookSecrets(t);
   let reads=0;
   t.mock.method(documentClient,"send",async command=>{
     assert.ok(command instanceof GetCommand);
