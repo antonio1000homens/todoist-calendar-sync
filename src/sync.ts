@@ -1,4 +1,5 @@
 import {defaultProviderClientFactory} from "./mutation-budget.js";
+import { createHash } from "node:crypto";
 import {calendarReplaySourceIds,guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
@@ -22,6 +23,7 @@ import { protectUnmappedCompletedHistory } from "./completed-history-policy.js";
 import { attemptCancelledAnnualRecovery } from "./cancelled-annual-recovery.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFingerprint } from "./cancelled-mapping-recovery-policy.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
+import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "./todoist-phase-b-native-admission.js";
 import { calendarPhaseCCandidate, matchesCalendarPhaseCTask } from "./calendar-todoist-phase-c.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -1556,6 +1558,10 @@ export class Synchronizer {
     }
 
     const { calendar } = await this.clients(delivery.profile);
+    if (master.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
+      await this.preserveTodoistPhaseBNativeMaster(delivery, task, master, mapping, todoist);
+      return;
+    }
     const instancesBefore = await calendar.listInstances(master.id);
     const activeBefore = mapping?.activeInstanceId
       ? instancesBefore.find((instance) => instance.id === mapping.activeInstanceId && instance.status !== "cancelled")
@@ -1812,9 +1818,103 @@ export class Synchronizer {
     return removed;
   }
 
+  /** Preserve an already committed #389 master through Todoist echoes and
+   * Calendar reconciliation. Unsupported recurrence text never falls through
+   * to the rolling writer, which would flatten the verified series. */
+  private async preserveTodoistPhaseBNativeMaster(
+    delivery: Delivery,
+    task: TodoistTask,
+    observedMaster: CalendarEvent,
+    mapping: Mapping | undefined,
+    todoist: Todoist,
+  ): Promise<boolean> {
+    if (observedMaster.extendedProperties?.shared?.todoistPhaseBVersion !== "1") return false;
+    const { calendar } = await this.clients(delivery.profile);
+    let master: CalendarEvent;
+    try { master = await calendar.getEvent(observedMaster.id); }
+    catch (error) {
+      if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: observedMaster.id, reason: "master_readback_missing",
+      });
+      return true;
+    }
+    const shared = master.extendedProperties?.shared;
+    if (!master.etag || master.status !== "confirmed" || !master.start?.date
+      || master.recurrence?.length !== 1 || !task.due?.is_recurring
+      || shared?.syncRecurrenceOwner !== "todoist" || shared.todoistPhaseBVersion !== "1"
+      || shared.taskId !== task.id) {
+      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: master.id, reason: "master_or_current_recurrence_unverified",
+      });
+      return true;
+    }
+    const [calendarTimeZone, todoistTimeZone] = await Promise.all([
+      calendar.getTimeZone(), todoist.getTimeZone(),
+    ]);
+    const candidate = todoistPhaseBCandidate(task, {
+      start: master.start.date, source: "verified_original_schedule", timeZone: calendarTimeZone,
+    });
+    if (calendarTimeZone !== todoistTimeZone || candidate.candidateRrule !== master.recurrence[0]
+      || shared.todoistAnchorStart !== master.start.date) {
+      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: master.id, reason: "current_due_or_rule_drift",
+      });
+      return true;
+    }
+    const due = task.due.date || "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) {
+      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: master.id, reason: "all_day_due_unverified",
+      });
+      return true;
+    }
+    const instances = await calendar.listInstancesInWindow(master.id,
+      `${due}T00:00:00Z`, `${addDays(due, 3)}T00:00:00Z`);
+    const active = selectTodoistCurrentInstance(instances, task);
+    if (!active || active.status === "cancelled" || !startsMatch(active, task)) {
+      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+        taskId: task.id, eventId: master.id, reason: "active_provider_instance_unresolved",
+      });
+      return true;
+    }
+    if (master.summary !== (normalizedText(task.content) || "Untitled Todoist task")
+      || normalizedDescription(master.description) !== normalizedDescription(task.description)) {
+      if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
+        await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_metadata_write_suppressed", {
+          taskId: task.id, eventId: master.id,
+        });
+        return true;
+      }
+      const patched = await calendar.patchEventMetadataIfUnchanged(master.id, master.etag, {
+        summary: normalizedText(task.content) || "Untitled Todoist task",
+        description: normalizedDescription(task.description),
+      });
+      await this.state.recordMutation(delivery.profile);
+      if (patched.id !== master.id || patched.start?.date !== master.start.date
+        || JSON.stringify(patched.recurrence) !== JSON.stringify(master.recurrence)
+        || patched.extendedProperties?.shared?.todoistPhaseBVersion !== "1") {
+        await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+          taskId: task.id, eventId: master.id, reason: "metadata_patch_readback_mismatch",
+        });
+        return true;
+      }
+    }
+    const base = mapping || { profile: delivery.profile, eventId: master.id, taskId: task.id,
+      updatedAt: new Date().toISOString() };
+    const nextMapping = { ...todoistOwnedMapping(base, master.id, task.id, active), todoistPhaseBVersion: 1 as const };
+    await this.state.putMapping(nextMapping);
+    await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
+    await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_preserved", {
+      taskId: task.id, eventId: master.id, activeInstanceId: active.id,
+    });
+    return true;
+  }
+
   private async processTodoist(delivery: Delivery): Promise<void> {
     const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
     let task = payload.event_data;
+    const webhookTask = task;
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
     // Exact retired Todoist IDs short-circuit stale webhook replay before
@@ -1954,6 +2054,12 @@ export class Synchronizer {
     let mapping = await this.state.getMappingByTask(delivery.profile, task.id);
     const pendingAnnualRecovery = lifecycle.action==="upsert"
       ? await this.state.getCancelledAnnualRecoveryReceipt?.(delivery.profile,task.id)
+      : undefined;
+    const pendingFutureSplit = lifecycle.action === "upsert"
+      && payload.event_name === "item:added"
+      && process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true"
+      && !existingMapping
+      ? await this.state.getFutureSeriesSplitAnyProfile?.(task.id)
       : undefined;
     if (pendingAnnualRecovery && !recoveryReceiptMatchesTask(pendingAnnualRecovery,task)) {
       return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_source_changed",{
@@ -2293,9 +2399,26 @@ export class Synchronizer {
         return this.state.audit(delivery.profile, "todoist_recurrence_completion_suppressed_cancelled_calendar", { taskId: task.id, eventId: mapping.eventId });
       }
 
-      if (current?.due?.is_recurring && todoistRecurrenceToRrule(current) && mappedEvent?.recurrence?.length) {
-        const instances = await calendar.listInstances(mappedEvent.id);
+      const hasVerifiedPhaseBNativeMaster = mappedEvent?.extendedProperties?.shared?.todoistPhaseBVersion === "1"
+        && mappedEvent.extendedProperties.shared.taskId === task.id;
+      if (current?.due?.is_recurring && (todoistRecurrenceToRrule(current) || hasVerifiedPhaseBNativeMaster)
+        && mappedEvent?.recurrence?.length) {
         const completedTask = payload.event_data_extra?.old_item || task;
+        let instances: CalendarEvent[];
+        if (hasVerifiedPhaseBNativeMaster) {
+          const completedDue = taskDateTime(completedTask) || completedTask.due?.date || "";
+          const completedMs = Date.parse(completedDue);
+          if (!calendar.listInstancesInWindow || !Number.isFinite(completedMs)) {
+            return this.state.audit(delivery.profile, "todoist_recurrence_completion_occurrence_unresolved", {
+              taskId: task.id, masterEventId: mappedEvent.id, reason: "bounded_instance_window_unavailable",
+            });
+          }
+          instances = await calendar.listInstancesInWindow(mappedEvent.id,
+            new Date(completedMs - 24 * 60 * 60_000).toISOString(),
+            new Date(completedMs + 3 * 366 * 24 * 60 * 60_000).toISOString());
+        } else {
+          instances = await calendar.listInstances(mappedEvent.id);
+        }
         const completed = selectTodoistCurrentInstance(instances, completedTask);
         if (!completed) {
           return this.state.audit(delivery.profile, "todoist_recurrence_completion_occurrence_unresolved", {
@@ -2585,11 +2708,196 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "todoist_pair_sync_control_blocked", { taskId: task.id, eventId: existingEvent?.id || mapping?.eventId });
     }
 
+    // A provider lookup may recreate a temporary unmarked mapping after a
+    // create-before-mapping interruption. Route tagged masters through the
+    // native verifier, never through ordinary canonical-state recovery.
+    if (lifecycle.action === "upsert"
+      && existingEvent?.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
+      if (existingEvent.extendedProperties.shared.taskId !== task.id) {
+        return this.state.audit(delivery.profile, "todoist_phase_b_native_identity_conflict", {
+          taskId: task.id, eventId: existingEvent.id,
+        });
+      }
+      const nativeMaster = existingEvent.recurringEventId
+        ? await calendar.getEvent(existingEvent.recurringEventId) : existingEvent;
+      await this.preserveTodoistPhaseBNativeMaster(delivery, task, nativeMaster, mapping, todoist);
+      return;
+    }
+
+    if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "todoist" && mapping.masterEventId) {
+      let phaseBMaster: CalendarEvent | undefined;
+      try { phaseBMaster = await calendar.getEvent(mapping.masterEventId); }
+      catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
+      if (mapping.todoistPhaseBVersion === 1
+        || phaseBMaster?.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
+        if (!phaseBMaster) return this.state.audit(delivery.profile,
+          "todoist_phase_b_existing_series_requires_review", {
+            taskId: task.id, eventId: mapping.masterEventId, reason: "master_readback_missing",
+          });
+        await this.preserveTodoistPhaseBNativeMaster(delivery, task, phaseBMaster, mapping, todoist);
+        return;
+      }
+    }
+
     // Revalidate after all remote lookups. The write fence prevents a new
     // completion from racing this check until the provider write is finished.
     if (existingEvent && await this.calendarMutationBlockedByCompletion(delivery, existingEvent.id)) return;
     const desiredRrule = todoistRecurrenceToRrule(task);
     const phaseBPreview = phaseBProjectionPreview(task, desiredRrule);
+    if (!mapping && existingEvent?.extendedProperties?.shared?.todoistPhaseBVersion === "1"
+      && existingEvent.extendedProperties.shared.taskId === task.id) {
+      return this.state.audit(delivery.profile, "todoist_phase_b_orphan_native_master_requires_review", {
+        taskId: task.id, eventId: existingEvent.id,
+      });
+    }
+    // #389: the writer is independently gated and admits only a brand-new
+    // item:added with no persisted/provider counterpart. Rejected candidates
+    // continue through the existing rolling projection below.
+    if (process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true"
+      && payload.event_name === "item:added" && webhookTask && !mapping && !existingEvent
+      && !pendingAnnualRecovery && !recurringDateEdit
+      && modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
+      const projectId = profiles[delivery.profile].todoistProjectId;
+      let nativePlan;
+      let verifiedCalendarTimeZone: string | undefined;
+      try {
+        const [calendarTimeZone, todoistTimeZone] = await Promise.all([
+          calendar.getTimeZone(), todoist.getTimeZone(),
+        ]);
+        verifiedCalendarTimeZone = calendarTimeZone;
+        nativePlan = admitNewTodoistPhaseBNative({
+          source: webhookTask, providerReadback: task, eventName: payload.event_name,
+          receivedAt: delivery.receivedAt, projectId, calendarTimeZone,
+          todoistTimeZone, hasMapping: Boolean(existingMapping), hasCalendarAlias: false,
+          hasPendingRecovery: Boolean(pendingAnnualRecovery || pendingFutureSplit?.status === "pending"),
+        });
+      } catch (error) {
+        await this.state.audit(delivery.profile, "todoist_phase_b_native_admission_rejected", {
+          taskId: task.id, reason: "provider_evidence_unavailable",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (nativePlan?.admitted) {
+        const phaseBTask = task;
+        const nativeEvent = toCalendarEvent(task);
+        nativeEvent.id = createHash("sha256")
+          .update(`todoist-phase-b:${delivery.profile}:${task.id}`).digest("hex").slice(0, 32);
+        nativeEvent.recurrence = [nativePlan.rule];
+        nativeEvent.extendedProperties ||= {};
+        nativeEvent.extendedProperties.shared ||= {};
+        Object.assign(nativeEvent.extendedProperties.shared, {
+          syncRecurrenceOwner: "todoist",
+          todoistRecurrence: todoistRecurrenceKey(task)!,
+          todoistAnchorStart: nativePlan.anchor.start,
+          todoistAnchorEnd: addDays(nativePlan.anchor.start, 1),
+          todoistAnchorAllDay: "true",
+          todoistAnchorTimeZone: nativePlan.anchor.timeZone,
+          todoistPhaseBVersion: "1",
+        });
+        // A lost POST response is not proof no master exists. Fence the exact
+        // deterministic identity before any retry can rediscover/adopt it.
+        let creation: Awaited<ReturnType<typeof calendar.createTodoistPhaseBNativeMasterOnce>>;
+        try {
+          creation = await calendar.createTodoistPhaseBNativeMasterOnce(nativeEvent);
+        } catch (error) {
+          await this.state.quarantinePhaseBNative(delivery.profile, task.id, nativeEvent.id,
+            "native_creation_outcome_unknown");
+          await this.state.audit(delivery.profile, "todoist_phase_b_native_create_quarantined", {
+            taskId: task.id, eventId: nativeEvent.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+        const rejectCreatedMaster = async (reason: string): Promise<void> => {
+          let rollback = "not_owned";
+          const createdShared = creation.event.extendedProperties?.shared;
+          const exactUncommittedIdentity = creation.event.id === nativeEvent.id
+            && createdShared?.taskId === phaseBTask.id
+            && createdShared?.todoistPhaseBVersion === "1"
+            && createdShared?.todoistAnchorStart === nativePlan.anchor.start
+            && JSON.stringify(creation.event.recurrence) === JSON.stringify(nativeEvent.recurrence);
+          // A previous delivery's 409 conflict never authorizes this delivery
+          // to delete the pre-existing master, even on verification failure.
+          if (exactUncommittedIdentity && creation.created && creation.event.etag) {
+            try {
+              await calendar.deleteEventIfUnchanged(nativeEvent.id, creation.event.etag);
+              rollback = "deleted";
+            } catch (error) {
+              rollback = "failed";
+            }
+            if (rollback === "deleted") {
+              try { await this.state.recordMutation(delivery.profile); }
+              catch { rollback = "deleted_budget_record_failed"; }
+            }
+          }
+          if (rollback !== "deleted") {
+            // Includes 409 conflicts, ETag precondition failures, missing
+            // ETags and mutation-budget uncertainty. Never fall back to
+            // rolling projection while provider ownership is unresolved.
+            await this.state.quarantinePhaseBNative(delivery.profile, phaseBTask.id, nativeEvent.id,
+              `native_write_rejected:${reason}:${rollback}`);
+          }
+          await this.state.audit(delivery.profile, "todoist_phase_b_native_write_rejected", {
+            taskId: phaseBTask.id, eventId: nativeEvent.id, reason, rollback,
+          });
+        };
+        if (creation.created) {
+          try { await this.state.recordMutation(delivery.profile); }
+          catch {
+            await rejectCreatedMaster("provider_write_budget_record_failed");
+            return;
+          }
+        }
+        let readback: CalendarEvent;
+        let instances: CalendarEvent[];
+        let active: CalendarEvent | undefined;
+        try {
+          readback = await calendar.getEvent(nativeEvent.id);
+          const windowEnd = addDays(nativePlan.anchor.start, 400);
+          const [observedInstances, explicitExceptions] = await Promise.all([
+            calendar.listInstancesInWindow(nativeEvent.id,
+              `${nativePlan.anchor.start}T00:00:00Z`, `${windowEnd}T00:00:00Z`),
+            calendar.listExplicitSeriesExceptions(nativeEvent.id),
+          ]);
+          instances = observedInstances;
+          const verification = verifyInitialPhaseBCalendarWrite(nativePlan, task, {
+            master: readback, instances, explicitExceptions, exceptionInventoryComplete: true,
+            calendarTimeZone: verifiedCalendarTimeZone || "",
+          });
+          if (!verification.accepted) {
+            await rejectCreatedMaster(verification.reason);
+            return;
+          }
+          active = selectTodoistCurrentInstance(instances, task);
+          if (!active) {
+            await rejectCreatedMaster("active_instance_unresolved");
+            return;
+          }
+        } catch {
+          await rejectCreatedMaster("provider_readback_failed");
+          return;
+        }
+        const nextMapping: Mapping = {
+          profile: delivery.profile, eventId: readback.id, taskId: task.id,
+          projectId: task.project_id, recurrenceId: active.recurringEventId,
+          recurrenceOwner: "todoist", seriesId: task.id, masterEventId: readback.id,
+          activeInstanceId: active.id, originalStart: eventStart(active),
+          activeEffectiveStart: eventEffectiveStart(active), todoistPhaseBVersion: 1,
+          updatedAt: new Date().toISOString(),
+        };
+        await this.state.putMapping(nextMapping);
+        await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
+        return this.state.audit(delivery.profile, "todoist_phase_b_native_calendar_created", {
+          taskId: task.id, eventId: readback.id, activeInstanceId: active.id,
+          family: nativePlan.family, rule: nativePlan.rule,
+        });
+      }
+      if (nativePlan && !nativePlan.admitted) {
+        await this.state.audit(delivery.profile, "todoist_phase_b_native_admission_rejected", {
+          taskId: task.id, reason: nativePlan.reason,
+        });
+      }
+    }
     const previousSeriesId = mapping?.recurrenceOwner === "todoist" ? mapping.seriesId : undefined;
     // Even when the DynamoDB mapping is missing, the provider master may
     // retain a verified Todoist ownership marker. Never overwrite/delete
