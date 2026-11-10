@@ -144,7 +144,7 @@ function calendarDriftFixture(){
   operation.confirmationFingerprint=operation.previewFingerprint;
   const snap={...external.snapshot,
     target:{...operation.target},selectedActions:{...operation.selectedActions},
-    actionPlan:{...operation.actionPlan,calendarEvent:{...originalCalendar,
+    actionPlan:{...operation.actionPlan,todoistTask:{...operation.actionPlan.todoistTask},calendarEvent:{...originalCalendar,
       digest:"4".repeat(64),etag:"etag-after"}},
     providerSnapshotFingerprint:"5".repeat(64),
     primaryProviderSnapshotFingerprint:"6".repeat(64),
