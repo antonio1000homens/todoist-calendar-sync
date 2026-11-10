@@ -1,239 +1,383 @@
-import React, {useEffect,useState} from "react";
+import React, {useEffect,useRef,useState} from "react";
 import {canAcknowledgeFencedPostWrite,canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
+import {
+  originalInventoryExplanation,recoveryClassificationExplanation,recoveryDiagnosticRows,
+  recoveryExecutionSummary,workerMappingSummary,
+} from "./erasure-recovery-explanations.mjs";
 
-// Historical erasure operations must remain inspectable/recoverable after the
-// arbitrary item-erasure UI is removed. Never start or resume provider deletes.
+// Historical operations remain inspectable, but this panel never resumes provider deletion.
 type ErasureApi=(route:string,options?:RequestInit)=>Promise<any>;
 type Operation={operationId:string;profile?:string;status:string;phase?:string;
-  providerDeletionReady?:boolean;recoveryStatus?:string;operatorRecoveryRequired?:boolean;
-  message?:string;backupRetentionNotice?:string};
+  recoveryStatus?:string;operatorRecoveryRequired?:boolean;message?:string};
+type ActionKey="load"|"refreshOperation"|"inspect"|"inspectPostWrite"|"postWriteToken"
+  |"acknowledgePostWrite"|"confirm"|"confirmDrift"|"apply"|"applyDrift"|"refreshRecovery"|"dispatch";
+type ActionResult={action:string;mode:string;at:string;message:string;failed:boolean};
+const actionNames:Record<ActionKey,string>={
+  load:"Load operation status",refreshOperation:"Refresh operation status",
+  inspect:"Inspect guarded recovery",inspectPostWrite:"Inspect post-write evidence",
+  postWriteToken:"Request fenced-review token",acknowledgePostWrite:"Record fenced review",
+  confirm:"Request recovery confirmation",confirmDrift:"Request reviewed Calendar-drift cancellation",
+  apply:"Confirm guarded recovery",applyDrift:"Confirm reviewed erasure cancellation",
+  refreshRecovery:"Refresh recovery status",dispatch:"Retry existing recovery dispatch",
+};
+const now=()=>new Date().toISOString();
+const formatTime=(value?:string)=>value?new Date(value).toLocaleString():"not yet checked";
+function LocalResult({result}:{result?:ActionResult}) {
+  return result?<p role={result.failed?"alert":"status"} aria-live="polite"
+    className={"recovery-action-result "+(result.failed?"warning":"info")}>
+    <strong>{result.action}</strong> · {result.mode} · Completed <time dateTime={result.at}>{formatTime(result.at)}</time>.
+    {" "}{result.message}
+  </p>:null;
+}
+
 export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [operationId,setOperationId]=useState("");
   const [operation,setOperation]=useState<Operation>();
-  const [busy,setBusy]=useState(false),[notice,setNotice]=useState("");
-  const [inspectionState,setInspectionState]=useState<"idle"|"running"|"succeeded"|"failed">("idle");
-  const [inspectionMessage,setInspectionMessage]=useState("");
-  const [preview,setPreview]=useState<any>(),[confirmation,setConfirmation]=useState<any>();
-  const [postWriteAssessment,setPostWriteAssessment]=useState<any>();
-  const [postWriteToken,setPostWriteToken]=useState<any>();
+  const [operationAt,setOperationAt]=useState<string>();
+  const [preview,setPreview]=useState<any>(),[inspectionAt,setInspectionAt]=useState<string>();
+  const [postWriteAssessment,setPostWriteAssessment]=useState<any>(),[postWriteAt,setPostWriteAt]=useState<string>();
+  const [confirmation,setConfirmation]=useState<any>(),[postWriteToken,setPostWriteToken]=useState<any>();
   const [postWriteTyped,setPostWriteTyped]=useState({phrase:"",operationId:"",profile:""});
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
-  const [recoveryStatus,setRecoveryStatus]=useState<string>();
-  const lookup=async()=>{
-    if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
-    setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
-    setInspectionState("idle");setInspectionMessage("");
+  const [recoveryStatus,setRecoveryStatus]=useState<string>(),[recoveryAt,setRecoveryAt]=useState<string>();
+  const [results,setResults]=useState<Partial<Record<ActionKey,ActionResult>>>({});
+  const [busy,setBusy]=useState(false),[pending,setPending]=useState<ActionKey>();
+  // Ignore responses from requests issued for an ID that has since been edited.
+  const generation=useRef(0);
+  const clearOperation=()=>{
+    setOperation(undefined);setOperationAt(undefined);
+    setPreview(undefined);setInspectionAt(undefined);
+    setPostWriteAssessment(undefined);setPostWriteAt(undefined);
+    setConfirmation(undefined);setPostWriteToken(undefined);
+    setTyped({phrase:"",operationId:"",profile:""});
     setPostWriteTyped({phrase:"",operationId:"",profile:""});
-    setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
-    try{
-      const result=await api("erasure-operations/"+encodeURIComponent(operationId));
-      setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);
-    }catch(e:any){setNotice(e.message||"Operation lookup failed");}
-    finally{setBusy(false);}
+    setRecoveryStatus(undefined);setRecoveryAt(undefined);
+    setResults({});setBusy(false);setPending(undefined);
   };
-  const refresh=async()=>{
+  const changeOperationId=(id:string)=>{
+    if(id===operationId)return;
+    generation.current++;
+    clearOperation();
+    setOperationId(id);
+  };
+  const execute=async(
+    key:ActionKey,mode:string,request:()=>Promise<any>,
+    succeed:(data:any)=>string,failed:(error:any)=>string,
+  )=>{
+    if(busy)return;
+    const version=generation.current;
+    setBusy(true);setPending(key);
+    try {
+      const data=await request();
+      if(version!==generation.current)return;
+      const message=succeed(data);
+      setResults(value=>({...value,[key]:{action:actionNames[key],mode,at:now(),message,failed:false}}));
+    }catch(error:any){
+      if(version!==generation.current)return;
+      setResults(value=>({...value,[key]:{action:actionNames[key],mode,at:now(),message:failed(error),failed:true}}));
+    }finally {
+      if(version===generation.current){setBusy(false);setPending(undefined);}
+    }
+  };
+  const messageOf=(error:any,fallback:string)=>error?.message||fallback;
+  const lookup=()=>{
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
+    generation.current++;
+    clearOperation();
+    const id=operationId;
+    void execute("load","Read-only",()=>api("erasure-operations/"+encodeURIComponent(id)),
+      result=>{
+        setOperation(result.operation);setOperationAt(now());
+        setRecoveryStatus(result.operation?.recoveryStatus);setRecoveryAt(undefined);
+        return "Operation record loaded. No inspection, recovery execution or provider state changed.";
+      },error=>messageOf(error,"Operation lookup failed. No state changed."));
+  };
+  const refresh=()=>{
     if(!operation||busy)return;
-    try{
-      const result=await api("erasure-operations/"+encodeURIComponent(operation.operationId));
-      setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);
-    }catch(e:any){setNotice(e.message||"Operation status unavailable; no deletion success can be inferred");}
+    const id=operation.operationId;
+    setConfirmation(undefined);
+    void execute("refreshOperation","Read-only",()=>api("erasure-operations/"+encodeURIComponent(id)),
+      result=>{
+        setOperation(result.operation);setOperationAt(now());
+        setRecoveryStatus(result.operation?.recoveryStatus);setRecoveryAt(undefined);
+        return "Operation record refreshed. Existing recovery evidence was not re-inspected; no state changed.";
+      },error=>messageOf(error,"Operation status unavailable; no deletion success can be inferred."));
   };
-  const inspect=async()=>{
+  const inspect=()=>{
     if(!operation||busy)return;
-    setBusy(true);setPreview(undefined);setConfirmation(undefined);setNotice("");
-    setInspectionState("running");
-    setInspectionMessage("Inspecting provider and fence evidence (read-only). No recovery changes are being made.");
-    try{
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId));
-      setPreview(result.preview);
-      setInspectionState("succeeded");
-      setInspectionMessage(result.preview?.allowed
-        ?"Inspection completed: guarded recovery is eligible. Review the evidence before requesting confirmation."
-        :result.preview?.calendarDriftReview?.candidateForSeparateApproval
-          ?"Inspection completed: Calendar-only drift is eligible for separately confirmed erasure cancellation. No recovery has started."
-          :"Inspection completed: guarded recovery is blocked. Review the reasons below; protections remain unchanged.");
-    }catch(e:any){
-      setInspectionState("failed");
-      const message=typeof e?.message==="string"?e.message:"";
-      const unauthorized=message.includes("Provider request failed: 401 https://api.todoist.com/");
-      setInspectionMessage(unauthorized
-        ?`Inspection failed: Todoist rejected the ${operation.profile||"selected"} profile's API token (HTTP 401). Update that account's token in AWS Parameter Store, then inspect again. No recovery was applied.`
-        :"Inspection failed; no recovery was applied. "+(message||"The provider or recovery service could not be verified."));
-    }finally{setBusy(false);}
-  };
-  const inspectPostWrite=async()=>{
-    if(!operation||busy)return;
-    setBusy(true);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
-    setPostWriteTyped({phrase:"",operationId:"",profile:""});setNotice("");
-    try{
-      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId));
-      setPostWriteAssessment(result.assessment);
-    }catch(e:any){setNotice(e.message||"Post-write evidence inspection failed; fence remains protected");}
-    finally{setBusy(false);}
-  };
-  const requestPostWriteToken=async()=>{
-    if(!operation||busy
-      ||postWriteAssessment?.classification!=="fully_deleted_candidate"
-      ||postWriteAssessment?.reviewStatus==="reviewed_fenced")return;
-    setBusy(true);setPostWriteToken(undefined);setNotice("");
-    try{
-      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/review-token",
-        {method:"POST",body:"{}"});
-      setPostWriteToken(result);
-    }catch(e:any){setNotice(e.message||"Post-write review token unavailable; preserve fence");}
-    finally{setBusy(false);}
-  };
-  const acknowledgePostWrite=async()=>{
-    if(!operation||busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation))return;
-    setBusy(true);
-    try{
-      const result=await api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/acknowledge",{
-        method:"POST",body:JSON.stringify({...postWriteTyped,confirmationId:postWriteToken.confirmationId}),
+    setConfirmation(undefined);
+    void execute("inspect","Read-only",()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)),
+      result=>{
+        setPreview(result.preview);setInspectionAt(now());
+        return result.preview?.allowed
+          ?"Guarded recovery is eligible. Only the inspection evidence changed; no operation, fence, mapping or provider state changed."
+          :"Guarded recovery is blocked. Only the inspection evidence changed; no operation, fence, mapping or provider state changed.";
+      },error=>{
+        const message=typeof error?.message==="string"?error.message:"";
+        return error?.status===401||message.includes("Provider request failed: 401 https://api.todoist.com/")
+          ?"Todoist authentication failed (HTTP 401). Check the selected profile's token in AWS Parameter Store, then re-inspect. No recovery was applied; any earlier inspection is historical."
+          :"Inspection failed: the provider or recovery service could not be verified. Review protected server logs for details. No recovery was applied; any earlier inspection is historical.";
       });
-      setPostWriteToken(undefined);setPostWriteTyped({phrase:"",operationId:"",profile:""});
-      setPostWriteAssessment((value:any)=>({...value,reviewStatus:result.review?.status||"reviewed_fenced"}));
-      setNotice("Review recorded. Profile remains fenced; no deletion, worker dispatch or sync restoration was performed.");
-    }catch(e:any){setPostWriteToken(undefined);setNotice(e.message||"Post-write review rejected; fence remains protected");}
-    finally{setBusy(false);}
   };
-  const requestConfirmation=async(mode:"strict_pre_write"|"calendar_drift_cancel"="strict_pre_write")=>{
-    if(!operation||busy||!(mode==="strict_pre_write"?preview?.allowed
-      :preview?.calendarDriftReview?.candidateForSeparateApproval))return;
-    setBusy(true);
-    try{
-      const route=mode==="calendar_drift_cancel"?"confirm-calendar-drift":"confirm";
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/"+route,{method:"POST",body:"{}"});
-      setPreview(result.preview);setConfirmation({confirmationId:result.confirmationId,expiresAt:result.expiresAt,mode:result.mode});
-    }catch(e:any){setConfirmation(undefined);setNotice(e.message||"Recovery confirmation failed");}
-    finally{setBusy(false);}
+  const inspectPostWrite=()=>{
+    if(!operation||busy)return;
+    setPostWriteToken(undefined);
+    setPostWriteTyped({phrase:"",operationId:"",profile:""});
+    void execute("inspectPostWrite","Read-only",()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)),
+      result=>{
+        setPostWriteAssessment(result.assessment);setPostWriteAt(now());
+        return "Post-write evidence refreshed. No provider, operation, worker or fence state changed.";
+      },error=>messageOf(error,"Post-write inspection failed; fence remains protected."));
+  };
+  const requestPostWriteToken=()=>{
+    if(!operation||busy||postWriteAssessment?.classification!=="fully_deleted_candidate"
+      ||postWriteAssessment?.reviewStatus==="reviewed_fenced")return;
+    void execute("postWriteToken","Creates review token (metadata write)",
+      ()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/review-token",{method:"POST",body:"{}"}),
+      result=>{setPostWriteToken(result);return "Single-use fenced-review token issued. No deletion, recovery or fence release started.";},
+      error=>{setPostWriteToken(undefined);return messageOf(error,"Post-write review token unavailable; preserve fence.");});
+  };
+  const acknowledgePostWrite=()=>{
+    if(!operation||busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation))return;
+    void execute("acknowledgePostWrite","Records review (metadata write)",
+      ()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/acknowledge",{
+        method:"POST",body:JSON.stringify({...postWriteTyped,confirmationId:postWriteToken.confirmationId}),
+      }),result=>{
+        setPostWriteToken(undefined);setPostWriteTyped({phrase:"",operationId:"",profile:""});
+        setPostWriteAssessment((value:any)=>({...value,reviewStatus:result.review?.status||"reviewed_fenced"}));
+        return "Evidence review recorded. Profile remains fenced; no sync restoration, provider write or dispatch occurred.";
+      },error=>{setPostWriteToken(undefined);return messageOf(error,"Post-write review rejected; fence remains protected.");});
+  };
+  const requestConfirmation=(mode:"strict_pre_write"|"calendar_drift_cancel"="strict_pre_write")=>{
+    const drift=mode==="calendar_drift_cancel";
+    if(!operation||busy||recoveryStatus||confirmation||!(drift
+      ?preview?.calendarDriftReview?.candidateForSeparateApproval===true
+      :preview?.allowed===true&&preview.classification==="pre_write"))return;
+    const key:ActionKey=drift?"confirmDrift":"confirm";
+    setTyped({phrase:"",operationId:"",profile:""});
+    void execute(key,"Creates operator-bound confirmation token (metadata write)",
+      ()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+
+        (drift?"/confirm-calendar-drift":"/confirm"),{method:"POST",body:"{}"}),
+      result=>{
+        setPreview(result.preview);setInspectionAt(now());
+        setConfirmation({confirmationId:result.confirmationId,expiresAt:result.expiresAt,
+          mode:result.mode||mode});
+        return (drift?"Single-use Calendar-drift cancellation":"Single-use strict recovery")+
+          " confirmation issued after a new read-only inspection. No sync or provider state changed.";
+      },error=>{setConfirmation(undefined);return messageOf(error,"Recovery confirmation failed. No recovery applied.");});
   };
   const canConfirm=()=>{
-    if(!operation||!confirmation)return false;
+    if(!operation||!confirmation||recoveryStatus)return false;
     if(confirmation.mode!=="calendar_drift_cancel")
       return canApplyRecovery(preview,confirmation,typed,operation);
     return preview?.calendarDriftReview?.candidateForSeparateApproval===true
+      &&preview.classification==="partial_or_ambiguous"
       &&typed.phrase==="CANCEL ERASURE AND RESTORE SYNC"
       &&typed.operationId===operation.operationId
       &&typed.profile===operation.profile
       &&typeof confirmation.confirmationId==="string"
-      &&Number.isFinite(confirmation.expiresAt)&&confirmation.expiresAt>Date.now();
+      &&Number(confirmation.expiresAt)>Date.now();
   };
-  const apply=async()=>{
+  const apply=()=>{
     if(!operation||busy||!canConfirm())return;
     const drift=confirmation.mode==="calendar_drift_cancel";
     if(!window.confirm(drift
       ?"Cancel the interrupted erasure and restore original synchronization? The existing Calendar revision and Todoist task will be kept. The server will recheck every safety condition."
       :"Restore synchronization for exactly this profile? This will not resume or undo provider deletion."))return;
-    setBusy(true);
-    try{
-      const route=drift?"apply-calendar-drift":"apply";
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/"+route,{
+    void execute(drift?"applyDrift":"apply","Guarded recovery request (mutating)",
+      ()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+
+        (drift?"/apply-calendar-drift":"/apply"),{
         method:"POST",body:JSON.stringify({...typed,confirmationId:confirmation.confirmationId}),
-      });
-      setRecoveryStatus(result.recovery?.status||"queued");setConfirmation(undefined);setNotice("Guarded recovery accepted. No provider deletion was started.");
-    }catch(e:any){setConfirmation(undefined);setNotice(e.message||"Recovery was rejected");}
-    finally{setBusy(false);}
+      }),result=>{
+        setRecoveryStatus(result.recovery?.status||"queued");setRecoveryAt(now());
+        setConfirmation(undefined);
+        return (drift?"Separately reviewed Calendar-drift cancellation":"Strict guarded recovery")+
+          " accepted and queued. No provider deletion was started or resumed; track execution separately.";
+      },error=>{setConfirmation(undefined);return messageOf(error,"Recovery was rejected; protections remain in place.");});
   };
-  const refreshRecovery=async()=>{
-    if(!operation)return;
-    try{
-      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/status");
-      setRecoveryStatus(result.recovery?.status);
-      if(result.recovery?.lastError)setNotice(result.recovery.lastError);
-    }catch(e:any){setNotice(e.message||"Recovery status unavailable");}
+  const recoveryRead=async(id:string)=>{
+    try{return await api("erasure-recoveries/"+encodeURIComponent(id)+"/status");}
+    catch(error:any){
+      if(error?.status===404&&error?.data?.error==="recovery_not_started")return {notStarted:true};
+      throw error;
+    }
   };
-  const dispatch=async()=>{
+  const refreshRecovery=()=>{
+    if(!operation||busy)return;
+    void execute("refreshRecovery","Read-only",()=>recoveryRead(operation.operationId),
+      result=>{
+        setRecoveryStatus(result.notStarted?undefined:result.recovery?.status);setRecoveryAt(now());
+        return result.notStarted?"Recovery has not started. No execution or provider state changed."
+          :"Recovery execution status refreshed: "+(result.recovery?.status||"unknown")+
+            (result.recovery?.lastError?"; error recorded (inspect operational logs)":"")+". No state changed.";
+      },error=>messageOf(error,"Recovery status unavailable. No state changed."));
+  };
+  const dispatch=()=>{
     if(!operation||busy||!recoveryNeedsDispatch(recoveryStatus))return;
-    setBusy(true);
-    try{
-      await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/dispatch",{method:"POST",body:"{}"});
-      setNotice("Existing recovery redispatched. No provider deletion was queued.");
-    }catch(e:any){setNotice(e.message||"Recovery dispatch failed. Preserve the fence.");}
-    finally{setBusy(false);}
+    void execute("dispatch","Redispatches existing recovery (mutating)",
+      ()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/dispatch",{method:"POST",body:"{}"}),
+      ()=>"Existing guarded recovery redispatched. No provider deletion was queued.",
+      error=>messageOf(error,"Recovery dispatch failed. Preserve the fence."));
   };
   useEffect(()=>{
-    if(!operation||!recoveryNeedsDispatch(recoveryStatus))return;
-    const timer=setInterval(()=>{void refreshRecovery();},10000);
+    if(!operation||!recoveryNeedsDispatch(recoveryStatus)||busy)return;
+    const id=operation.operationId,version=generation.current;
+    const timer=setInterval(()=>{
+      void recoveryRead(id).then(result=>{
+        if(version!==generation.current)return;
+        setRecoveryStatus(result.notStarted?undefined:result.recovery?.status);
+        setRecoveryAt(now());
+      }).catch(()=>{/* A polling failure is not a recovery outcome; use explicit refresh. */});
+    },10000);
     return()=>clearInterval(timer);
-  },[operation?.operationId,recoveryStatus]);
+  },[operation?.operationId,recoveryStatus,busy]);
+  const evidenceRows=recoveryDiagnosticRows(preview);
+  const unresolvedRows=evidenceRows.filter(item=>item.status!=="verified");
+  const executionAt=recoveryAt||operationAt;
   return <details className="preview erasure-recovery" aria-label="Existing erasure operation status and recovery">
     <summary>Existing erasure operation status / recovery</summary>
-    <p>Inspect or recover an already-recorded operation. This panel cannot preview, create, start or resume provider deletion. A prior partially completed erasure may require break-glass recovery.</p>
-    <label>Recorded operation ID<input autoComplete="off" value={operationId} onChange={e=>setOperationId(e.target.value)}/></label>
-    <button className="secondary" disabled={busy||!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)} onClick={()=>void lookup()}>Load operation status</button>
-    {notice&&<p role="status" className="warning">{notice}</p>}
-    {operation&&<div className="erasure-results">
-      <p>Operation <code>{operation.operationId}</code> · profile <strong>{operation.profile}</strong> · status <strong>{operation.status}</strong> · phase {operation.phase||"not recorded"}</p>
-      <button className="secondary" disabled={busy} onClick={()=>void refresh()}>Refresh operation status</button>
-      {operation.operatorRecoveryRequired&&<p className="warning" role="alert">{operation.message||"Independent recovery is required. Do not clear a fence manually."}</p>}
+    <p>Read an already-recorded operation, inspect its safety evidence, or request independently guarded recovery. No action here can resume historical provider deletion.</p>
+    <section className="recovery-scope" aria-label="Operation lookup">
+      <h4>1. Load a recorded operation</h4>
+      <label htmlFor="recovery-operation-id">Recorded operation ID
+        <input id="recovery-operation-id" autoComplete="off" value={operationId} onChange={event=>changeOperationId(event.target.value)}/>
+      </label>
+      <button className="secondary" disabled={busy||!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)}
+        onClick={lookup}>Load operation status</button>
+      {pending==="load"&&<p role="status" aria-live="polite">Loading the operation record (read-only)…</p>}
+      <LocalResult result={results.load}/>
+    </section>
+    {operation&&<div className="recovery-operation">
+      <section className="recovery-scope" aria-label="Authoritative state and operation refresh">
+        <h4>2. Operation overview</h4>
+        <p>Operation <code>{operation.operationId}</code> · profile <strong>{operation.profile}</strong> · lifecycle phase <strong>{operation.phase||"not recorded"}</strong></p>
+        <dl className="recovery-summary">
+          <dt>Operation status</dt><dd><strong>{operation.status}</strong> <small>Operation record, {formatTime(operationAt)}</small></dd>
+          <dt>Guarded inspection</dt><dd><strong>{inspectionAt?(preview?.allowed?"eligible":"blocked"):"not inspected"}</strong>
+            <small>{inspectionAt?"Inspection evidence, "+formatTime(inspectionAt):"No inspection source read yet"}</small></dd>
+          <dt>Recovery execution</dt><dd><strong>{recoveryExecutionSummary(recoveryStatus,true)}</strong>
+            <small>{recoveryAt?"Recovery endpoint, "+formatTime(recoveryAt):"Operation record, "+formatTime(operationAt)}</small></dd>
+          <dt>SQS worker mappings</dt><dd><strong>{workerMappingSummary(preview)}</strong>
+            <small>{inspectionAt?"Mapping read during inspection, "+formatTime(inspectionAt):"Unknown until guarded inspection"}</small></dd>
+        </dl>
+        <button className="secondary" disabled={busy} onClick={refresh}>Refresh operation status</button>
+        {pending==="refreshOperation"&&<p role="status" aria-live="polite">Refreshing the operation record (read-only)…</p>}
+        <LocalResult result={results.refreshOperation}/>
+        {operation.operatorRecoveryRequired&&<p className="warning">{operation.message||"Independent recovery may be required. Never clear a fence manually."}</p>}
+      </section>
       {operation.status==="review_required"&&<>
-        <h4>Inspect independent recovery evidence</h4>
-        <p>Recovery never resumes an old provider deletion or creates replacements.</p>
-        <button disabled={busy} onClick={()=>void inspect()} aria-label="Inspect guarded recovery">{inspectionState==="running"?"Inspecting guarded recovery…":"Inspect guarded recovery"}</button>
-        {inspectionMessage&&<p role={inspectionState==="failed"?"alert":"status"} className={inspectionState==="failed"?"warning":"info"}>{inspectionMessage}</p>}
-        {preview&&<>
-          <p>Classification: {preview.classification} · Profile: {preview.profile} · fence owned: {preview.fenceOwned?"yes":"no"} · leases: {preview.leaseCount}</p>
-          <p>Provider items absent: {preview.providerItemsAbsent?"yes":"no"} · attributable state absent: {preview.stateRowsAbsent?"yes":"no"}</p>
-          {preview.blockers?.length>0&&<ul>{preview.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>}
-          {preview.evidenceChecks&&!preview.allowed&&<details className="erasure-results">
-            <summary>Why is guarded recovery blocked? (read-only checks)</summary>
-            <p>These comparisons explain the restriction; they do not authorize admission, deletion or fence release.</p>
-            <ul>{([
-              ["No provider deletion recorded",preview.evidenceChecks.originalPreWritePhase],
-              ["Original confirmation integrity",preview.evidenceChecks.originalConfirmationIntact],
-              ["Cross-profile audit complete",preview.evidenceChecks.auditComplete],
-              ["Fresh inspection internally consistent",preview.evidenceChecks.freshPreviewSelfConsistent],
-              ["Work provider snapshot unchanged",preview.evidenceChecks.primaryProviderMatches],
-              ["Original preview fingerprint unchanged",preview.evidenceChecks.originalPreviewMatches],
-              ["Todoist task unchanged",preview.evidenceChecks.todoistTaskMatches],
-              ["Calendar event unchanged",preview.evidenceChecks.calendarEventMatches],
-              ["Todoist mapping comments unchanged",preview.evidenceChecks.commentsMatch],
-              ["Project comment identities unchanged",preview.evidenceChecks.projectCommentIdsMatch],
-              ["Calendar aliases unchanged",preview.evidenceChecks.knownCalendarAliasesMatch],
-              ["DynamoDB state inventory unchanged",preview.evidenceChecks.stateInventoryMatches],
-            ] as Array<[string,boolean]>).map(([label,passed])=>
-              <li key={label} className={passed?"":"warning"}>{label}: {passed?"passed":"changed or unverified"}</li>)}</ul>
-            <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
-          </details>}
-          {preview.calendarDriftReview?.candidateForSeparateApproval&&<div className="erasure-results" role="status">
-            <p><strong>Reviewed Calendar-drift cancellation available.</strong> The original Todoist task, its mapping comment, Calendar aliases, and state inventory are unchanged. The Calendar event has a different revision. This cancels the interrupted erasure and preserves both provider items; it does not delete either item.</p>
-            <p>Before acceptance the server independently rereads provider, mapping, fence, lease, and cross-profile evidence. It rechecks the exact Calendar revision again during worker restoration. If anything changes, recovery is refused and the fence is preserved.</p>
-            {!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation("calendar_drift_cancel")}>Request reviewed Calendar-drift cancellation</button>}
+        <section className="recovery-scope" aria-label="Guarded pre-write inspection">
+          <h4>3. Inspect guarded recovery (read-only)</h4>
+          <p>This re-reads provider, state, fence and mapping evidence. It does not unlock sync, issue confirmation or change the operation. A blocked result is not proof that deletion happened.</p>
+          <button disabled={busy} onClick={inspect}>{pending==="inspect"?"Inspecting guarded recovery…":"Inspect guarded recovery"}</button>
+          {pending==="inspect"&&<p role="status" aria-live="polite">Inspecting provider and fence evidence (read-only). No recovery changes are being made.</p>}
+          <LocalResult result={results.inspect}/>
+          {preview&&<div className="recovery-evidence">
+            <h5>Last successful guarded inspection · <time dateTime={inspectionAt}>{formatTime(inspectionAt)}</time></h5>
+            <p><strong>{preview.allowed?"Eligible for guarded confirmation":"Blocked"}</strong> · phase {preview.phase||"unknown"} · profile {preview.profile}</p>
+            <p>{recoveryClassificationExplanation(preview)}</p>
+            {preview.calendarDriftReview?.candidateForSeparateApproval&&<p role="status" className="warning">
+              Calendar-only provider revision is eligible for a separately confirmed cancellation path. Inspection has made no changes: the Work fence and mapping remain protected. Review all evidence below before requesting the distinct operator-bound cancellation token.
+            </p>}
+            {!preview.allowed&&<>
+              <h5>Why the evidence is insufficient</h5>
+              <p>Each status describes the latest read-only check, not permission to override a guard. Missing means required evidence was unavailable; mismatched means a comparison or condition failed.</p>
+              <ul className="recovery-diagnostics">{unresolvedRows.length?unresolvedRows.map(item=>
+                <li key={item.key}><strong>{item.label}</strong> — {item.status.replaceAll("_"," ")}</li>)
+                :<li>No individual mismatch was identified in the available checks; inspect the guard blockers below.</li>}</ul>
+              <p className="warning"><strong>Next action:</strong> Remain fenced. Inspect which source changed; re-read exact provider data and the stored original evidence, then escalate for manual review. Do not retry deletion or manually release the fence.</p>
+            </>}
+            <details className="recovery-technical">
+              <summary>Technical details and all read-only checks</summary>
+              <ul className="recovery-diagnostics">{evidenceRows.map(item=>
+                <li key={item.key}><strong>{item.label}</strong> — {item.status}</li>)}</ul>
+              <dl className="recovery-summary">
+                <dt>Classification</dt><dd>{preview.classification}</dd>
+                <dt>Fence owned</dt><dd>{preview.fenceOwned?"yes":"no"}</dd>
+                <dt>Active leases</dt><dd>{preview.leaseCount}</dd>
+                <dt>Provider items absent</dt><dd>{preview.providerItemsAbsent?"yes":"no"}</dd>
+                <dt>Attributable state absent</dt><dd>{preview.stateRowsAbsent?"yes":"no"}</dd>
+                <dt>Exact Todoist readback</dt><dd>{preview.knownTargetReadback?.todoist||"unknown"}</dd>
+                <dt>Exact Calendar readback</dt><dd>{preview.knownTargetReadback?.calendar||"unknown"}</dd>
+              </dl>
+              <p>{originalInventoryExplanation}</p>
+              {preview.blockers?.length>0&&<><h5>Server safety blockers</h5>
+                <ul>{preview.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul></>}
+            </details>
           </div>}
-          {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation("strict_pre_write")}>Request recovery confirmation</button>}
-        </>}
-        <h4>Post-write evidence (read-only)</h4>
-        <p>Inspect evidence after an erasure may have deleted a provider item. This assessment cannot confirm, resume or finish deletion, restore worker mappings, or release a fence.</p>
-        <button className="secondary" disabled={busy} onClick={()=>void inspectPostWrite()}>Inspect post-write evidence</button>
-        {postWriteAssessment&&<div className="erasure-results" aria-label="Post-write recovery evidence">
-          <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile <strong>{postWriteAssessment.profile}</strong> · fence release: <strong>not authorised</strong></p>
-          <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · both original targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · matching fence: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"}</p>
-          <p>Provider items absent: {postWriteAssessment.evidence?.providersAbsent?"yes":"no"} · state rows absent: {postWriteAssessment.evidence?.stateRowsAbsent?"yes":"no"} · original worker mappings restored: {postWriteAssessment.evidence?.workerMappingsRestored?"yes":"no"}</p>
-          <p className="warning">Only safe action: preserve the existing fence. Recording a review does not authorise provider changes, recovery, or fence release.</p>
-          {postWriteAssessment.reviewStatus==="reviewed_fenced"&&<p role="status">Post-write evidence review recorded; still fenced.</p>}
-          {postWriteAssessment.classification==="fully_deleted_candidate"
-            &&!postWriteAssessment.reviewStatus&&!postWriteToken&&
-            <button className="secondary" disabled={busy} onClick={()=>void requestPostWriteToken()}>Request fenced-review token</button>}
-          {postWriteToken&&<div className="erasure-results" aria-label="Post-write review acknowledgement">
-            <p>This records a single-use evidence acknowledgement ONLY. It cannot resume deletion, restore synchronization or remove the fence. Token expires {new Date(postWriteToken.expiresAt).toLocaleString()}.</p>
-            <label>Type REVIEW AND KEEP FENCED<input autoComplete="off" value={postWriteTyped.phrase} onChange={e=>setPostWriteTyped(v=>({...v,phrase:e.target.value}))}/></label>
-            <label>Repeat operation ID<input autoComplete="off" value={postWriteTyped.operationId} onChange={e=>setPostWriteTyped(v=>({...v,operationId:e.target.value}))}/></label>
-            <label>Repeat profile<input autoComplete="off" value={postWriteTyped.profile} onChange={e=>setPostWriteTyped(v=>({...v,profile:e.target.value}))}/></label>
-            <button disabled={busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation)}
-              onClick={()=>void acknowledgePostWrite()}>Record review (remain fenced)</button>
+        </section>
+        <section className="recovery-scope" aria-label="Guarded recovery confirmation and execution">
+          <h4>4. Request and apply guarded recovery (writes only after verification)</h4>
+          <p>Strict RESTORE SYNC requires a verified pre-write inspection. A Calendar-only revision may instead qualify for a <strong>separate, explicitly reviewed erasure cancellation</strong>, with its own token and typed phrase. The backend rechecks all guards before and during recovery.</p>
+          {preview?.allowed===true&&preview.classification==="pre_write"&&!recoveryStatus&&!confirmation&&
+            <button disabled={busy} onClick={()=>requestConfirmation("strict_pre_write")}>Request recovery confirmation</button>}
+          {preview?.calendarDriftReview?.candidateForSeparateApproval===true&&!recoveryStatus&&!confirmation&&<>
+            <p><strong>Reviewed Calendar-drift cancellation available.</strong> This cancels the interrupted erasure while keeping both provider items. It does not delete either item; the server must still verify the exact current Calendar revision, unchanged Todoist task, mappings, fence, epoch and state before acceptance and at each worker transition.</p>
+            <button disabled={busy} onClick={()=>requestConfirmation("calendar_drift_cancel")}>Request reviewed Calendar-drift cancellation</button>
+          </>}
+          {(pending==="confirm"||pending==="confirmDrift")&&<p role="status" aria-live="polite">Issuing an operator-bound confirmation token; no sync restoration yet…</p>}
+          <LocalResult result={results.confirm}/>
+          <LocalResult result={results.confirmDrift}/>
+          {confirmation&&!recoveryStatus&&
+            (confirmation.mode==="calendar_drift_cancel"
+              ?preview?.calendarDriftReview?.candidateForSeparateApproval===true
+              :preview?.allowed===true&&preview.classification==="pre_write")&&<>
+            <p>Single-use confirmation expires <time dateTime={new Date(confirmation.expiresAt).toISOString()}>{new Date(confirmation.expiresAt).toLocaleString()}</time>.</p>
+            <label>Type {confirmation.mode==="calendar_drift_cancel"?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC"}<input value={typed.phrase} autoComplete="off" onChange={event=>setTyped(value=>({...value,phrase:event.target.value}))}/></label>
+            <label>Repeat operation ID<input value={typed.operationId} autoComplete="off" onChange={event=>setTyped(value=>({...value,operationId:event.target.value}))}/></label>
+            <label>Repeat profile<input value={typed.profile} autoComplete="off" onChange={event=>setTyped(value=>({...value,profile:event.target.value}))}/></label>
+            <button disabled={busy||!canConfirm()} onClick={apply}>
+              {confirmation.mode==="calendar_drift_cancel"?"Confirm reviewed erasure cancellation":"Confirm guarded recovery"}
+            </button>
+          </>}
+          {(pending==="apply"||pending==="applyDrift")&&<p role="status" aria-live="polite">Applying independently verified recovery guards…</p>}
+          <LocalResult result={results.apply}/>
+          <LocalResult result={results.applyDrift}/>
+          {preview&&!preview.allowed&&!preview.calendarDriftReview?.candidateForSeparateApproval&&
+            <p>Recovery confirmation is not offered while the independent safety guards are blocked.</p>
+        </section>
+        <details className="recovery-scope recovery-postwrite">
+          <summary>5. Post-write evidence — only when provider writes may have begun (read-only inspection)</summary>
+          <p>Expand this only to assess possible deletion progress. Inspecting does not imply deletion happened; review acknowledgement never restores sync or releases the fence.</p>
+          <button className="secondary" disabled={busy} onClick={inspectPostWrite}>Inspect post-write evidence</button>
+          {pending==="inspectPostWrite"&&<p role="status" aria-live="polite">Reading post-write evidence only…</p>}
+          <LocalResult result={results.inspectPostWrite}/>
+          {postWriteAssessment&&<div className="recovery-evidence">
+            <h5>Last successful post-write inspection · <time dateTime={postWriteAt}>{formatTime(postWriteAt)}</time></h5>
+            <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · fence release: <strong>not authorised</strong></p>
+            <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · original targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · matching fence: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"}</p>
+            <p className="warning">Only safe action: preserve the existing fence. Recording a review cannot approve provider changes, recovery, or fence release.</p>
+            {postWriteAssessment.reviewStatus==="reviewed_fenced"&&<p role="status">Post-write evidence review recorded; still fenced.</p>}
+            {postWriteAssessment.classification==="fully_deleted_candidate"&&!postWriteAssessment.reviewStatus&&!postWriteToken&&
+              <button className="secondary" disabled={busy} onClick={requestPostWriteToken}>Request fenced-review token</button>}
+            {pending==="postWriteToken"&&<p role="status">Requesting a fenced-review token…</p>}
+            <LocalResult result={results.postWriteToken}/>
+            {postWriteToken&&<div className="recovery-evidence">
+              <p>Single-use evidence acknowledgement only. Token expires {new Date(postWriteToken.expiresAt).toLocaleString()}.</p>
+              <label>Type REVIEW AND KEEP FENCED<input autoComplete="off" value={postWriteTyped.phrase} onChange={event=>setPostWriteTyped(value=>({...value,phrase:event.target.value}))}/></label>
+              <label>Repeat operation ID<input autoComplete="off" value={postWriteTyped.operationId} onChange={event=>setPostWriteTyped(value=>({...value,operationId:event.target.value}))}/></label>
+              <label>Repeat profile<input autoComplete="off" value={postWriteTyped.profile} onChange={event=>setPostWriteTyped(value=>({...value,profile:event.target.value}))}/></label>
+              <button disabled={busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation)}
+                onClick={acknowledgePostWrite}>Record review (remain fenced)</button>
+            </div>}
+            {pending==="acknowledgePostWrite"&&<p role="status">Recording fenced evidence acknowledgement…</p>}
+            <LocalResult result={results.acknowledgePostWrite}/>
+            {postWriteAssessment.blockers?.length>0&&<details className="recovery-technical">
+              <summary>Post-write safety blockers</summary>
+              <ul>{postWriteAssessment.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>
+            </details>}
           </div>}
-          {postWriteAssessment.blockers?.length>0&&<ul>{postWriteAssessment.blockers.map((message:string,i:number)=><li key={i} className="warning">{message}</li>)}</ul>}
-        </div>}
-        {confirmation&&<>
-          <p>Confirmation expires {new Date(confirmation.expiresAt).toLocaleString()}.</p>
-          <label>Type {confirmation.mode==="calendar_drift_cancel"?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC"}<input value={typed.phrase} autoComplete="off" onChange={e=>setTyped(v=>({...v,phrase:e.target.value}))}/></label>
-          <label>Repeat operation ID<input value={typed.operationId} autoComplete="off" onChange={e=>setTyped(v=>({...v,operationId:e.target.value}))}/></label>
-          <label>Repeat profile<input value={typed.profile} autoComplete="off" onChange={e=>setTyped(v=>({...v,profile:e.target.value}))}/></label>
-          <button disabled={busy||!canConfirm()} onClick={()=>void apply()}>{confirmation.mode==="calendar_drift_cancel"?"Confirm reviewed erasure cancellation":"Confirm guarded recovery"}</button>
-        </>}
-        {recoveryStatus&&<p role="status">Recovery state: {recoveryStatus.replaceAll("_"," ")}</p>}
-        <button className="secondary" onClick={()=>void refreshRecovery()}>Refresh recovery status</button>
-        {recoveryNeedsDispatch(recoveryStatus)&&<button className="secondary" disabled={busy} onClick={()=>void dispatch()}>Retry existing recovery dispatch</button>}
+        </details>
+        <section className="recovery-scope" aria-label="Recovery execution status">
+          <h4>6. Track recovery execution (read-only status)</h4>
+          <p>Inspection eligibility is not execution. The execution endpoint reports queued, restoring, verifying, completed or blocked; the operation record may report that no recovery has started.</p>
+          <button className="secondary" disabled={busy} onClick={refreshRecovery}>Refresh recovery status</button>
+          {pending==="refreshRecovery"&&<p role="status">Refreshing execution state (read-only)…</p>}
+          <LocalResult result={results.refreshRecovery}/>
+          {recoveryNeedsDispatch(recoveryStatus)&&<button className="secondary" disabled={busy} onClick={dispatch}>Retry existing recovery dispatch</button>}
+          {pending==="dispatch"&&<p role="status">Redispatching existing recovery…</p>}
+          <LocalResult result={results.dispatch}/>
+        </section>
       </>}
     </div>}
   </details>;

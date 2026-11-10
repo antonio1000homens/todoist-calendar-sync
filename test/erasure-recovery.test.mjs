@@ -831,3 +831,59 @@ test("conditional review transaction failure leaves token issued and fence untou
   assert.equal(f.postwriteToken.status,"issued");
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
 });
+
+test("read-only structured diagnostics verify every pre-write condition without issuing writes",async()=>{
+  const {service,external}=fixture();
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.classification,"pre_write");
+  assert.ok(Object.values(inspected.preview.diagnostics).every(value=>value==="verified"));
+  assert.equal(external.writes.length,0);
+});
+
+test("ready-for-delete without deletion can still be blocked solely by provider snapshot drift",async()=>{
+  const {service,operation,external}=fixture();
+  const receipt=phase=>({operationId:"op-recovery",phase,receiptId,completedAt:2000});
+  operation.lifecycle.phase="ready_for_delete";
+  operation.lifecycle.evidence.workerTimeoutElapsed=receipt("workerTimeoutElapsed");
+  operation.lifecycle.evidence.postTimeoutDrain=receipt("postTimeoutDrain");
+  external.snapshot={...external.snapshot,providerSnapshotFingerprint:"9".repeat(64)};
+  external.snapshot.previewFingerprint=erasurePreviewFingerprint(external.snapshot);
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(inspected.preview.classification,"partial_or_ambiguous");
+  assert.equal(inspected.preview.diagnostics.lifecycle,"verified","no deletion was started");
+  assert.equal(inspected.preview.diagnostics.originalProviderSnapshot,"mismatched");
+  assert.equal(inspected.preview.diagnostics.operationFingerprint,"mismatched");
+  assert.equal(external.writes.length,0);
+});
+
+test("missing fence, epoch and live mapping drift are classified independently",async()=>{
+  const {service,external}=fixture();
+  external.control=external.control.filter(row=>!["FENCE","EPOCH"].includes(row.sk));
+  external.mappingInventory=[enabledId];
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(inspected.preview.diagnostics.fence,"missing");
+  assert.equal(inspected.preview.diagnostics.epoch,"missing");
+  assert.equal(inspected.preview.diagnostics.mappingInventory,"mismatched");
+  assert.equal(inspected.preview.diagnostics.workerLeases,"verified");
+  assert.equal(external.writes.length,0);
+});
+
+test("active leases are independently marked mismatched and block admission",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"ADMISSION#ongoing",operationId:"another"});
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.diagnostics.workerLeases,"mismatched");
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(external.writes.length,0);
+});
+
+test("provider authentication failure never generates a diagnostic success or write",async()=>{
+  const {service,external}=fixture();
+  service.adapters.readSnapshot=async()=>{
+    throw Object.assign(new Error("Provider request failed: 401 https://api.todoist.com/"),{status:401});
+  };
+  await assert.rejects(service.inspect("op-recovery"),/401/);
+  assert.equal(external.writes.length,0);
+});
