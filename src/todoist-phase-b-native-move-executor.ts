@@ -13,9 +13,9 @@ import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } fro
 /**
  * #389: guarded Phase B cross-profile provider-side cutover.
  *
- * This executor is NOT wired into the worker and DOES NOT enable the default-
- * off Phase B flag. It exists for isolated fault-injection tests before the
- * runtime routing and independent live-provider acceptance are reviewed.
+ * The verified item:updated cross-profile path is wired behind the default-
+ * off Phase B switch. Independently reviewed interrupted-stage recovery is
+ * separate; ordinary webhook replays must never clear its durable controls.
  *
  * A crash after the durable stage deliberately stays BLOCKED; this code never
  * automatically releases a fence, guesses the next operation, rewinds a source
@@ -48,13 +48,13 @@ export interface PhaseBNativeMoveResult {
   operationId: string;
 }
 
-function plusDays(value: string, days: number): string {
+export function plusDays(value: string, days: number): string {
   const epoch = Date.parse(value + "T00:00:00Z");
   if (!Number.isFinite(epoch)) throw new Error("Invalid all-day Phase B move date");
   const date = new Date(epoch + 86400000 * days);
   return date.toISOString().slice(0, 10);
 }
-function sameTask(left: TodoistTask, right: TodoistTask): boolean {
+export function sameTask(left: TodoistTask, right: TodoistTask): boolean {
   return JSON.stringify([
     left.id, left.project_id, left.content, left.description || "",
     left.updated_at, left.is_completed || false, left.is_deleted || false,
@@ -74,7 +74,7 @@ function equivalentMapping(before: Mapping, after: Mapping | undefined): boolean
     && before.updatedAt === after.updatedAt
     && before.todoistPhaseBVersion === after.todoistPhaseBVersion);
 }
-function instancesAreExact(
+export function instancesAreExact(
   instances: CalendarEvent[], masterId: string, expected: string[],
   title: string, description: string,
 ): boolean {
@@ -91,7 +91,7 @@ function instancesAreExact(
       && instance.summary === title && (instance.description || "") === description)
   ));
 }
-function newNativeMaster(task: TodoistTask, plan: PhaseBNativeMovePlan, zone: string): CalendarEvent {
+export function newNativeMaster(task: TodoistTask, plan: PhaseBNativeMovePlan, zone: string): CalendarEvent {
   const key = todoistRecurrenceKey(task);
   if (!key) throw new Error("Todoist recurring rule disappeared after preflight");
   return {
@@ -129,7 +129,7 @@ function historyOnlySource(master: CalendarEvent, plan: PhaseBNativeMovePlan): C
   return { ...master, recurrence: [plan.historyRule],
     extendedProperties: { ...master.extendedProperties, shared } };
 }
-function verifyDestinationMaster(master: CalendarEvent, intended: CalendarEvent): void {
+export function verifyDestinationMaster(master: CalendarEvent, intended: CalendarEvent): void {
   const shared = master.extendedProperties?.shared;
   const target = intended.extendedProperties!.shared!;
   if (!master.etag || master.status !== "confirmed"
@@ -143,7 +143,7 @@ function verifyDestinationMaster(master: CalendarEvent, intended: CalendarEvent)
     || Object.keys(target).some(field => shared?.[field] !== target[field]))
     throw new Error("Destination Calendar master readback does not prove exact Phase B migration lineage");
 }
-function verifyHistoryMaster(master: CalendarEvent, original: CalendarEvent, plan: PhaseBNativeMovePlan): void {
+export function verifyHistoryMaster(master: CalendarEvent, original: CalendarEvent, plan: PhaseBNativeMovePlan): void {
   const s = master.extendedProperties?.shared;
   if (!master.etag || master.status !== "confirmed"
     || master.id !== plan.sourceMasterId
@@ -163,7 +163,7 @@ function verifyHistoryMaster(master: CalendarEvent, original: CalendarEvent, pla
 /** An erasure for either profile may start at any time. Lease acquisition is
  * conditional on a current, unchanged epoch and no active erasure fence.
  * Hold both leases across the whole non-transactional provider cutover. */
-async function acquireCrossProfileWriterLeases(
+async export function acquireCrossProfileWriterLeases(
   sourceProfile: Profile, destinationProfile: Profile,
 ): Promise<() => Promise<void>> {
   if (process.env.ERASURE_PROTOCOL_VERSION !== "1")
