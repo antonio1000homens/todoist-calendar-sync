@@ -125,6 +125,127 @@ function fixture(options={}) {
     get postwriteToken(){return postwriteToken;}};
 }
 
+function calendarDriftFixture(){
+  const f=fixture();
+  const {operation,external}=f;
+  const eventId="disposable-event-1";
+  const originalCalendar={id:eventId,calendarId:"work-calendar",digest:"3".repeat(64),etag:"etag-before"};
+  operation.target={taskId:"disposable-1",eventId,deleteCalendar:true};
+  operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:originalCalendar,
+    comments:[],
+    projectCommentIds:["comment-id-1"],
+    knownCalendarAliases:[{profile:"work",calendarId:"work-calendar",eventId}],
+    knownCalendarAliasesComplete:true,
+  };
+  operation.previewFingerprint=erasurePreviewFingerprint(operation);
+  operation.confirmationFingerprint=operation.previewFingerprint;
+  const snap={...external.snapshot,
+    target:{...operation.target},selectedActions:{...operation.selectedActions},
+    actionPlan:{...operation.actionPlan,calendarEvent:{...originalCalendar,
+      digest:"4".repeat(64),etag:"etag-after"}},
+    providerSnapshotFingerprint:"5".repeat(64),
+    primaryProviderSnapshotFingerprint:"6".repeat(64),
+    knownTargetReadback:{todoist:"present",calendar:"present",configuredCalendarLink:"found"},
+    crossProfileEvidence:{allProfilesQueried:true,closureComplete:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}},
+  };
+  snap.previewFingerprint=erasurePreviewFingerprint(snap);
+  external.snapshot=snap;
+  return f;
+}
+
+test("Calendar revision-only drift is reviewable but never automatically recoverable",async()=>{
+  const f=calendarDriftFixture();
+  const inspection=await f.service.inspect("op-recovery");
+  assert.equal(inspection.preview.classification,"partial_or_ambiguous");
+  assert.equal(inspection.preview.allowed,false);
+  assert.equal(inspection.preview.calendarDriftReview.candidateForSeparateApproval,true);
+  assert.equal(inspection.preview.calendarDriftReview.releaseAllowed,false);
+  await assert.rejects(()=>f.service.issueConfirmation("op-recovery","operator"),/Recovery is blocked/);
+  const watchdog=await f.service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(watchdog.queued,false);
+  assert.equal(f.external.writes.length,0);
+});
+
+test("explicit Calendar-drift cancellation rechecks and restores only the original mapping, keeping both providers",async()=>{
+  const f=calendarDriftFixture();
+  const issued=await f.service.issueConfirmation("op-recovery","operator","calendar_drift_cancel");
+  assert.equal(issued.mode,"calendar_drift_cancel");
+  assert.equal(f.confirmation.mode,"calendar_drift_cancel");
+  await assert.rejects(
+    ()=>f.service.apply("op-recovery",issued.confirmationId,"operator"),
+    /expired, changed, or consumed/);
+  await f.service.apply("op-recovery",issued.confirmationId,"operator","calendar_drift_cancel");
+  assert.equal(f.operation.recovery.mode,"calendar_drift_cancel");
+  assert.equal(f.operation.recovery.calendarDigest,"4".repeat(64));
+  assert.equal(f.operation.recovery.calendarEtag,"etag-after");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  assert.deepEqual(f.external.restored,[]);
+  assert.equal((await f.service.process("op-recovery")).status,"restoring");
+  assert.equal((await f.service.process("op-recovery")).status,"restoring");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal((await f.service.process("op-recovery")).status,"verifying");
+  assert.equal((await f.service.process("op-recovery")).status,"completed");
+  assert.ok(!f.external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(f.operation.recovery.status,"completed");
+});
+
+test("Calendar-drift cancellation rejects altered provider revisions and preserves the original fence",async()=>{
+  const f=calendarDriftFixture();
+  const issued=await f.service.issueConfirmation("op-recovery","operator","calendar_drift_cancel");
+  f.external.snapshot.actionPlan.calendarEvent={
+    ...f.external.snapshot.actionPlan.calendarEvent,digest:"7".repeat(64),etag:"etag-next"};
+  f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+  await assert.rejects(
+    ()=>f.service.apply("op-recovery",issued.confirmationId,"operator","calendar_drift_cancel"),
+    /Safety evidence drifted/);
+  assert.equal(f.operation.recovery,undefined);
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("Calendar-drift worker fails closed if the Calendar revision changes after acceptance",async()=>{
+  const f=calendarDriftFixture();
+  const issued=await f.service.issueConfirmation("op-recovery","operator","calendar_drift_cancel");
+  await f.service.apply("op-recovery",issued.confirmationId,"operator","calendar_drift_cancel");
+  f.external.snapshot.actionPlan.calendarEvent={
+    ...f.external.snapshot.actionPlan.calendarEvent,digest:"7".repeat(64)};
+  f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+  const outcome=await f.service.process("op-recovery");
+  assert.equal(outcome.status,"blocked");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  assert.deepEqual(f.external.restored,[]);
+});
+
+test("Calendar-drift cancellation is refused when any independent pre-write evidence is unsafe",async()=>{
+  const mutations=[
+    f=>{f.external.snapshot.actionPlan.todoistTask.digest="9".repeat(64);},
+    f=>{f.external.snapshot.inventory=[{type:"TASK",key:{pk:"unrelated",sk:"x"},digest:"0".repeat(64)}];},
+    f=>{f.external.snapshot.crossProfileEvidence.allProfilesQueried=false;},
+    f=>{f.external.snapshot.crossProfileEvidence.stateScan.allPagesReceived=false;},
+    f=>{f.external.snapshot.actionPlan.calendarEvent=undefined;},
+    f=>{f.external.snapshot.blockers.push("conflicting provider identity");},
+    f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#other",operationId:"other"});},
+    f=>{f.external.mappingStates.set(enabledId,"Enabled");},
+    f=>{f.operation.lifecycle.evidence.deletionStarted={operationId:"op-recovery",phase:"deletionStarted",receiptId,completedAt:1000};},
+  ];
+  for(const alter of mutations){
+    const f=calendarDriftFixture();
+    alter(f);
+    f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+    const inspection=await f.service.inspect("op-recovery");
+    assert.notEqual(inspection.preview.calendarDriftReview?.candidateForSeparateApproval,true);
+    await assert.rejects(
+      ()=>f.service.issueConfirmation("op-recovery","operator","calendar_drift_cancel"),
+      /Recovery is blocked/);
+    assert.equal(f.operation.recovery,undefined);
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+    assert.equal(f.external.restored.length,0);
+  }
+});
+
 test("read-only preview paginates controls and checks original mappings and immutable provider inventory",async()=>{
   const {service,external}=fixture({paginated:true});
   const a=await service.inspect("op-recovery");
