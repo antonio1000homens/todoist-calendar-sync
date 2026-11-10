@@ -38,6 +38,10 @@ test("review API publishes a new live-alias version on reviewed function-propert
   assert.match(review,/ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled/);
 });
 
+test("CloudFormation resolves gate parameters before SAM computes alias version fingerprints",()=>{
+  assert.match(template,/^Transform:\n\s+- AWS::LanguageExtensions\n\s+- AWS::Serverless-2016-10-31/m);
+});
+
 test("erasure worker reads only configured Google and Todoist credential parameters",()=>{
   const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ErasureRecoveryWatchdogFunction:\n")[0];
   assert.ok(worker,"ErasureWorkerFunction SAM resource is defined");
