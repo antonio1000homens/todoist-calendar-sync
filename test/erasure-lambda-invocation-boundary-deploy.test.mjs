@@ -23,3 +23,14 @@ test("deployment role can read and replace Lambda policies only under the app fu
   assert.match(statement,/arn:\$\{AWS::Partition\}:lambda:\$\{AWS::Region\}:\$\{AWS::AccountId\}:function:\$\{ResourceNamePrefix\}-\*/);
   assert.doesNotMatch(statement,/Resource:\s*"\*"/);
 });
+
+test("deployment role can create change sets with only the two named SAM transforms",()=>{
+  const start=deploymentRole.indexOf("- Sid: UseSamTransform");
+  const end=deploymentRole.indexOf("- Sid: ValidateCloudFormationTemplates",start);
+  assert.ok(start>=0&&end>start);
+  const statement=deploymentRole.slice(start,end);
+  assert.match(statement,/cloudformation:CreateChangeSet/);
+  assert.match(statement,/transform\/Serverless-2016-10-31/);
+  assert.match(statement,/transform\/LanguageExtensions/);
+  assert.doesNotMatch(statement,/Resource:\s*"\*"/);
+});

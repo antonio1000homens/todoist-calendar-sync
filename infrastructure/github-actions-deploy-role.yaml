@@ -73,7 +73,9 @@ Resources:
           - Sid: UseSamTransform
             Effect: Allow
             Action: cloudformation:CreateChangeSet
-            Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+            Resource:
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/LanguageExtensions
 
           - Sid: ValidateCloudFormationTemplates
             Effect: Allow
