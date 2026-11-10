@@ -206,6 +206,45 @@ test("pre-write recovery rejects an incomplete or missing target-only audit base
   }
 });
 
+test("read-only recovery diagnostics report exact unchanged pre-write evidence",async()=>{
+  const {service,external}=fixture();
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,true);
+  const checks=inspection.preview.evidenceChecks;
+  assert.ok(checks);
+  assert.deepEqual(Object.entries(checks).filter(([key,value])=>key!=="providerSafetyBlockerCount"&&value!==true),[]);
+  assert.equal(checks.providerSafetyBlockerCount,0);
+  assert.equal(external.writes.length,0);
+});
+
+test("read-only recovery diagnostics isolate task snapshot drift without authorizing release",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,actionPlan:{...external.snapshot.actionPlan,
+    todoistTask:{id:"disposable-1",digest:"9".repeat(64)}}};
+  external.snapshot.previewFingerprint=erasurePreviewFingerprint(external.snapshot);
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,false);
+  assert.equal(inspection.preview.classification,"partial_or_ambiguous");
+  assert.equal(inspection.preview.evidenceChecks.todoistTaskMatches,false);
+  assert.equal(inspection.preview.evidenceChecks.calendarEventMatches,true);
+  assert.equal(inspection.preview.evidenceChecks.stateInventoryMatches,true);
+  assert.equal(inspection.preview.evidenceChecks.originalPreviewMatches,false);
+  assert.equal(external.writes.length,0);
+});
+
+test("read-only recovery diagnostics isolate DynamoDB inventory drift",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,inventory:[{
+    type:"TASK",key:{pk:"TASK#disposable-1",sk:"STATE"},
+    digest:"0".repeat(64),classification:"selected-only"}]};
+  external.snapshot.previewFingerprint=erasurePreviewFingerprint(external.snapshot);
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,false);
+  assert.equal(inspection.preview.evidenceChecks.stateInventoryMatches,false);
+  assert.equal(inspection.preview.evidenceChecks.todoistTaskMatches,true);
+  assert.equal(external.writes.length,0);
+});
+
 test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
   const {service,operation,external}=fixture();
   const started=await service.startAutomaticPreWriteRecovery("op-recovery");
