@@ -733,6 +733,12 @@ export class ErasureRecoveryService {
       return {safe:false,mappings:[]};
     const mapped=expectedMappingStates(op,states);
     if(mapped.some(x=>!x.originallyEnabled&&x.state!=="Disabled"))return {safe:false,mappings:mapped};
+    // A queued operator cancellation has not yet requested any mapping changes.
+    // Detect external early re-enablement before the worker starts restoration.
+    if(recovery.mode==="calendar_drift_cancel"&&recovery.status==="queued"
+      &&mapped.some(x=>x.state!=="Disabled"))return {safe:false,mappings:mapped};
+    if(recovery.mode!==undefined&&recovery.mode!=="calendar_drift_cancel")
+      return {safe:false,mappings:mapped};
     // Only pre-write recoveries are automated. Every worker step must still
     // observe the *original* provider and DynamoDB contents.
     const unchanged=snapshot.blockers.length===0
