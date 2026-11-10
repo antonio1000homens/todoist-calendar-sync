@@ -57,6 +57,7 @@ test("pre-write recovery watchdog has independent, disabled-by-default schedule 
   assert.match(watchdog,/ReservedConcurrentExecutions: 1/);
   assert.match(watchdog,/Schedule: rate\(5 minutes\)/);
   assert.match(watchdog,/Enabled: false/);
+  assert.match(watchdog,/Action: dynamodb:TransactWriteItems\s*\n\s*Resource: !GetAtt SyncState\.Arn/);
   assert.match(watchdog,/Action: lambda:GetEventSourceMapping/);
   assert.doesNotMatch(watchdog,/lambda:UpdateEventSourceMapping/);
   assert.doesNotMatch(watchdog,/Type: SQS/);
