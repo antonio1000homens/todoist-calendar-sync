@@ -121,19 +121,16 @@ test("terminal alert statuses cannot enable deletion and exact selection is immu
   assert.equal(chosenOrphan(candidates,{...item,profile:"work"},candidates[0].key),undefined);
 });
 
-test("new UI includes one case-bound provider/title/ID dropdown with no second-ID field",()=>{
+test("review UI hides no-ID orphan controls and exposes only read-only identity inspection",()=>{
   const panel=readFileSync(new URL("../review-ui/orphan-deletion-panel.tsx",import.meta.url),"utf8");
   const main=readFileSync(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
   const recovery=readFileSync(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
-  assert.match(panel,/<label>Item to delete/);
-  assert.match(panel,/disabled=\{!candidate.live\}/);
-  assert.match(panel,/Request verified deletion preview \(no changes\)/);
-  assert.match(panel,/blocked:.*candidate.reason/);
-  assert.match(panel,/All case-recorded items are blocked/);
-  assert.equal((panel.match(/<select /g)||[]).length,1);
-  assert.doesNotMatch(panel,/Exact Todoist task ID|Exact Calendar event ID|Separately delete|delete both/);
-  assert.match(panel,/setPreview\(undefined\);setPreviewError\(""\)/);
-  assert.doesNotMatch(panel,/setTyped|onClick=\{.*deleteTask/);
+  assert.match(panel,/if\(candidates\.length===0\)return null/);
+  assert.match(panel,/Orphan identity inspection \(read-only\)/);
+  assert.match(panel,/No deletion is enabled/);
+  assert.match(panel,/Inspect deletion readiness \(read-only\)/);
+  assert.doesNotMatch(panel,/<select|<label>Item to delete|Request verified deletion preview/);
+  assert.match(main,/orphanItemsForCase\(\{item:details\.item,snapshots:details\.snapshots\|\|\[\]\}\)\.length>0/);
   assert.match(main,/<OrphanDeletionPanel key=/);
   assert.match(main,/item=\{details\.item\} snapshots=\{details\.snapshots\|\|\[\]\}/);
   assert.match(main,/<ErasureRecoveryPanel api=\{api\}/);
@@ -143,11 +140,9 @@ test("new UI includes one case-bound provider/title/ID dropdown with no second-I
   assert.match(recovery,/erasure-operations/);
 });
 
-test("only server safety preview can be requested; no deletion or confirmation can start from the panel",()=>{
+test("read-only orphan inspections never offer selection, provider writes or delete previews",()=>{
   const source=readFileSync(new URL("../review-ui/orphan-deletion-panel.tsx",import.meta.url),"utf8");
-  assert.match(source,/method:"POST"/);
-  assert.match(source,/\/orphan-previews/);
-  assert.doesNotMatch(source,/orphan-confirmations|deleteTask\(|deleteEvent\(|Start guarded erasure|executeDeletion/);
-  assert.match(source,/No provider deletion is available/);
+  assert.match(source,/\/orphan-readiness/);
   assert.match(source,/recheck\(\)/);
+  assert.doesNotMatch(source,/method:"POST"|\/orphan-previews|orphan-confirmations|deleteTask\(|deleteEvent\(|executeDeletion/);
 });
