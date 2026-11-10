@@ -63,10 +63,12 @@ export function recoveryAdapters(canRestore=false):RecoveryAdapters {
 }
 
 async function readErasureSnapshot(operation:ErasureOperation,auditCrossProfileIdentity:boolean,scanDeadlineMs:number) {
+  const deadlineSignal=AbortSignal.timeout(scanDeadlineMs);
       return buildErasurePreview({profile:operation.profile,taskId:operation.target.taskId,
         ...(operation.target.eventId?{eventId:operation.target.eventId}:{}),
         deleteCalendar:operation.selectedActions.deleteCalendar},
-      {db:documentClient,clients:await defaultProviderClientFactory(operation.profile),
+      {db:documentClient,clients:await defaultProviderClientFactory(operation.profile,{signal:deadlineSignal,timeoutMs:15_000}),
+        providerFactory:profile=>defaultProviderClientFactory(profile,{signal:deadlineSignal,timeoutMs:15_000}),
         auditCrossProfileIdentity,
         inspectFence:async profile=>{
           const value=await inspectErasureFence(profile);
@@ -76,5 +78,5 @@ async function readErasureSnapshot(operation:ErasureOperation,auditCrossProfileI
         allowFenceOperationId:operation.operationId,allowJournalOperationId:operation.operationId,
         // Bounded by the caller's Lambda timeout; any partial scan throws,
         // leaving the fence and mappings untouched.
-        scanDeadlineMs});
+        scanDeadlineMs,scanAbortSignal:deadlineSignal});
 }

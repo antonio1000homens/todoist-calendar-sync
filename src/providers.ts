@@ -63,6 +63,21 @@ async function responseJson<T>(response: Response): Promise<T> {
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
+type ProviderRequestOptions = { signal?: AbortSignal; timeoutMs?: number };
+
+async function fetchProvider(
+  input: RequestInfo | URL,
+  init: RequestInit = {},
+  options: ProviderRequestOptions = {},
+): Promise<Response> {
+  if(options.timeoutMs!==undefined&&(!Number.isInteger(options.timeoutMs)||options.timeoutMs<1))
+    throw new Error("Invalid provider request timeout");
+  const signals=[init.signal,options.signal,
+    ...(options.timeoutMs===undefined?[]:[AbortSignal.timeout(options.timeoutMs)])]
+    .filter((signal):signal is AbortSignal=>signal!==null&&signal!==undefined);
+  return fetch(input,signals.length?{...init,signal:AbortSignal.any(signals)}:init);
+}
+
 /**
  * A task ID can occur on several live, legacy or cancelled Calendar
  * projections. This is a safety boundary: callers must not mutate a guessed
@@ -91,7 +106,8 @@ export function selectLinkedCalendarEvent(taskId: string, candidates: CalendarEv
 export class GoogleCalendar {
   private accessToken?: string;
 
-  constructor(private readonly credentials: GoogleCredentials, private readonly calendarId: string) {}
+  constructor(private readonly credentials: GoogleCredentials, private readonly calendarId: string,
+    private readonly requestOptions:ProviderRequestOptions={}) {}
 
   private async token(): Promise<string> {
     if (this.accessToken) return this.accessToken;
@@ -107,7 +123,7 @@ export class GoogleCalendar {
           grant_type: "refresh_token",
         });
     const tokenUrl = "private_key" in this.credentials ? this.credentials.token_uri || GOOGLE_TOKEN_URL : GOOGLE_TOKEN_URL;
-    const response = await fetch(tokenUrl, { method: "POST", body });
+    const response = await fetchProvider(tokenUrl, { method: "POST", body },this.requestOptions);
     const result = await responseJson<{ access_token?: string }>(response);
     if (!result.access_token) throw new Error("Google token response did not include an access token");
     this.accessToken = result.access_token;
@@ -136,7 +152,7 @@ export class GoogleCalendar {
     const headers = new Headers(init.headers);
     headers.set("authorization", `Bearer ${await this.token()}`);
     if (init.body) headers.set("content-type", "application/json");
-    return responseJson<T>(await fetch(`${CALENDAR_ROOT}${path}`, { ...init, headers }));
+    return responseJson<T>(await fetchProvider(`${CALENDAR_ROOT}${path}`, { ...init, headers },this.requestOptions));
   }
 
   async listDelta(syncToken?: string): Promise<{ items: CalendarEvent[]; nextSyncToken?: string }> {
@@ -553,7 +569,7 @@ export class GoogleCalendar {
 export class Todoist {
   private readonly projectCommentCache = new Map<string, TodoistCommentRecord[]>();
 
-  constructor(private readonly token: string) {}
+  constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {}
 
   private async request<T>(path: string, init: RequestInit = {}, comments = false): Promise<T> {
     const headers = new Headers(init.headers);
@@ -563,8 +579,10 @@ export class Todoist {
     const readOnly = (init.method || "GET").toUpperCase() === "GET";
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await responseJson<T>(await fetch(url, { ...init, headers }));
+        return await responseJson<T>(await fetchProvider(url, { ...init, headers },this.requestOptions));
       } catch (error) {
+        const name=(error as {name?:string})?.name;
+        if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
         const transient = !status || status === 408 || status === 429 || status >= 500;
         if (!readOnly || !transient || attempt >= 2) throw error;
@@ -581,7 +599,7 @@ export class Todoist {
       commands: JSON.stringify([{ type, uuid, args }]),
     });
     const result = await responseJson<{ sync_status?: Record<string, unknown> }>(
-      await fetch(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body }),
+      await fetchProvider(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body },this.requestOptions),
     );
     const status = result.sync_status?.[uuid];
     if (status !== "ok") {
@@ -595,7 +613,7 @@ export class Todoist {
     headers.set("content-type", "application/x-www-form-urlencoded");
     const body = new URLSearchParams({ sync_token: "*", resource_types: JSON.stringify(["user"]) });
     const result = await responseJson<{ user?: { timezone?: string; tz_info?: { timezone?: string } } }>(
-      await fetch(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body }),
+      await fetchProvider(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body },this.requestOptions),
     );
     const timeZone = result?.user?.tz_info?.timezone || result?.user?.timezone;
     if (!timeZone) throw new Error("Todoist account timezone is missing");
@@ -630,9 +648,11 @@ export class Todoist {
       try {
         snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;
           sync_token?:unknown;full_sync_date_utc?:unknown}>(
-          await fetch(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body}));
+          await fetchProvider(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body},this.requestOptions));
         break;
       } catch(error) {
+        const name=(error as {name?:string})?.name;
+        if(name==="AbortError"||name==="TimeoutError")throw error;
         const status=Number((error as {status?:number}).status);
         const transient=!status||status===408||status===429||status>=500;
         if(!transient||attempt>=2)throw error;

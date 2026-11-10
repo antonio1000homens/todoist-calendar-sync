@@ -6,7 +6,8 @@ import type { Profile } from "./types.js";
 export const DEFAULT_RECONCILIATION_MUTATION_LIMIT = 10;
 
 export type ProviderClients = { calendar: GoogleCalendar; todoist: Todoist };
-export type ProviderClientFactory = (profile: Profile) => Promise<ProviderClients>;
+export type ProviderClientOptions = { signal?:AbortSignal; timeoutMs?:number };
+export type ProviderClientFactory = (profile: Profile, options?:ProviderClientOptions) => Promise<ProviderClients>;
 
 export class MutationBudgetExhaustedError extends Error {
   constructor(
@@ -138,9 +139,9 @@ export function createObservedProviderClientFactory(
   };
 }
 
-export const defaultProviderClientFactory: ProviderClientFactory = async (profile) => guardReplayProviderClients(profile,{
-  calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId),
-  todoist: new Todoist(await todoistToken(profile)),
+export const defaultProviderClientFactory: ProviderClientFactory = async (profile,options) => guardReplayProviderClients(profile,{
+  calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId,options),
+  todoist: new Todoist(await todoistToken(profile),options),
 });
 
 export function createBudgetedClientFactory(

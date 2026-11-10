@@ -92,6 +92,22 @@ test("strong state scan rejects a repeated pagination cursor instead of acceptin
   assert.equal(scans,2);
 });
 
+test("an aborted in-flight state page fails the preview closed within its inspection deadline",async t=>{
+  const controller=new AbortController();
+  const abortTimer=setTimeout(()=>controller.abort(new Error("test deadline elapsed")),10);
+  t.after(()=>clearTimeout(abortTimer));
+  const db={send:async(command,options)=>{
+    if(command.constructor.name!=="ScanCommand")return {};
+    await new Promise((resolve,reject)=>{
+      if(options.abortSignal.aborted)return reject(options.abortSignal.reason);
+      options.abortSignal.addEventListener("abort",()=>reject(options.abortSignal.reason),{once:true});
+    });
+  }};
+  await assert.rejects(buildErasurePreview({profile:"home",taskId:"task-123",deleteCalendar:false},
+    {db,clients:{},scanDeadlineMs:1000,scanAbortSignal:controller.signal}),
+  /Full inventory did not finish within the preview window/);
+});
+
 test("malformed live provider responses cannot produce an exact preview", async t => {
   for (const [name, todoistTask, calendarEvent, target] of [
     ["empty Todoist response", {}, undefined, { profile:"home", taskId:"task-123", deleteCalendar:false }],

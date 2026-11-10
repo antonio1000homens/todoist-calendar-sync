@@ -126,6 +126,7 @@ async function scanAll(db: Pick<DynamoDBDocumentClient, "send">, dependencies: D
         dependencies.scanAbortSignal?{abortSignal:dependencies.scanAbortSignal}:undefined);
         break;
       } catch(error) {
+        if(dependencies.scanAbortSignal?.aborted)throw new ErasurePreviewDeadlineError();
         const name=(error as {name?:string})?.name;
         if(!["ThrottlingException","ProvisionedThroughputExceededException","RequestLimitExceeded"].includes(name||"")
           ||attempt>=6) throw error;
