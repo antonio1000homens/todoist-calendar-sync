@@ -27,7 +27,7 @@ const CALENDAR_ID=/^[^\u0000-\u001f\u007f]{1,1024}$/;
 const MAX_EVENT_ALIASES=32;
 const SHA256=/^[a-f0-9]{64}$/;
 const OPERATION_ID=/^[A-Za-z0-9_-]{1,128}$/;
-const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class ErasureReplayBlockedError extends Error {
   constructor() {
