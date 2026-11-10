@@ -160,6 +160,9 @@ export function planPhaseBNativeFutureOnlyMove(
     return reject("destination_reanchor_progression_mismatch");
   const past=occurrences.slice(0,next);
   const previous=past[past.length-1];
+  // Only genuinely elapsed occurrences may remain on the old calendar as
+  // history. Never mislabel a still-future occurrence as a completed cutover.
+  if (previous>=e.today) return reject("source_history_not_yet_elapsed");
   if (!e.historyInventoryComplete || !e.exceptionInventoryComplete
     || !Array.isArray(e.historicalInstances) || !Array.isArray(e.explicitExceptions)
     || e.explicitExceptions.length)
