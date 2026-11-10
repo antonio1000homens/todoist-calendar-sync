@@ -6,7 +6,7 @@ import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureGateDriftError, ErasureOperationStore } from "../dist/erasure-executor.js";
 import {ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 import {ErasureRecoveryService} from "../dist/erasure-recovery.js";
-import { handler, inspectStuckErasureRecovery, parseErasureQueueRecord } from "../dist/erasure-worker.js";
+import { handler, watchdogHandler, inspectStuckErasureRecovery, parseErasureQueueRecord } from "../dist/erasure-worker.js";
 
 // The existing worker integration cases exercise an explicitly approved deployment.
 process.env.ERASURE_PROTOCOL_VERSION = "1";
@@ -31,16 +31,16 @@ test("scheduled watchdog uses three fixed fence reads, not a DynamoDB scan", asy
     return {Responses:{"test-state":[]}};
   });
   try {
-    const result=await handler({source:"aws.events","detail-type":"Scheduled Event"});
-    assert.deepEqual(result,{batchItemFailures:[]});
+    const result=await watchdogHandler({source:"aws.events","detail-type":"Scheduled Event"});
+    assert.equal(result,undefined);
     assert.equal(inputs.length,1);
     const batch=inputs[0].RequestItems["test-state"];
     assert.equal(batch.ConsistentRead,true);
     assert.deepEqual(new Set(batch.Keys.map(k=>k.pk)),
       new Set(["ERASURE#antonio","ERASURE#home","ERASURE#work"]));
     assert.equal(batch.Keys.length,3);
-    await assert.rejects(handler({source:"untrusted","detail-type":"Scheduled Event"}),
-      /Unsupported erasure worker event source/);
+    await assert.rejects(watchdogHandler({source:"untrusted","detail-type":"Scheduled Event"}),
+      /Unsupported erasure recovery watchdog event/);
   } finally {
     if(old===undefined)delete process.env.STATE_TABLE_NAME;
     else process.env.STATE_TABLE_NAME=old;
