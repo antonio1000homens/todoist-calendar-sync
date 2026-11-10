@@ -2812,7 +2812,7 @@ export class Synchronizer {
           let rollback = "not_owned";
           const createdShared = creation.event.extendedProperties?.shared;
           const exactUncommittedIdentity = creation.event.id === nativeEvent.id
-            && createdShared?.taskId === task.id
+            && createdShared?.taskId === phaseBTask.id
             && createdShared?.todoistPhaseBVersion === "1"
             && createdShared?.todoistAnchorStart === nativePlan.anchor.start
             && JSON.stringify(creation.event.recurrence) === JSON.stringify(nativeEvent.recurrence);
@@ -2834,11 +2834,11 @@ export class Synchronizer {
             // Includes 409 conflicts, ETag precondition failures, missing
             // ETags and mutation-budget uncertainty. Never fall back to
             // rolling projection while provider ownership is unresolved.
-            await this.state.quarantinePhaseBNative(delivery.profile, task.id, nativeEvent.id,
+            await this.state.quarantinePhaseBNative(delivery.profile, phaseBTask.id, nativeEvent.id,
               `native_write_rejected:${reason}:${rollback}`);
           }
           await this.state.audit(delivery.profile, "todoist_phase_b_native_write_rejected", {
-            taskId: task.id, eventId: nativeEvent.id, reason, rollback,
+            taskId: phaseBTask.id, eventId: nativeEvent.id, reason, rollback,
           });
         };
         if (creation.created) {
