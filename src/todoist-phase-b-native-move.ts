@@ -24,6 +24,8 @@ export interface PhaseBNativeMoveEvidence {
   sourceMaster: CalendarEvent;
   sourceProfile: Profile;
   destinationProfile: Profile;
+  /** Exact configured managed Todoist project for the destination profile. */
+  destinationProjectId: string;
   /** Independently read IANA timezones for both Google calendars and Todoist. */
   sourceTimeZone: string;
   destinationTimeZone: string;
@@ -103,12 +105,13 @@ export function planPhaseBNativeFutureOnlyMove(
     return reject("cross_profile_timezone_not_verified");
   if (!date(e.today) || !date(current) || current<e.today
     || !task.due?.is_recurring || task.is_completed || task.is_deleted || task.completed_at
-    || task.project_id===undefined)
+    || !e.destinationProjectId || task.project_id!==e.destinationProjectId)
     return reject("active_future_todoist_due_not_verified");
   if (mapping.todoistPhaseBVersion!==1 || mapping.profile!==e.sourceProfile
     || mapping.taskId!==task.id || mapping.recurrenceOwner!=="todoist"
     || mapping.seriesId!==task.id || mapping.masterEventId!==master.id
-    || mapping.eventId!==master.id)
+    || mapping.eventId!==master.id || !mapping.activeInstanceId
+    || mapping.originalStart!==current || mapping.activeEffectiveStart!==current)
     return reject("source_mapping_not_native_owned");
   if (!master.id || !master.etag || master.status!=="confirmed"
     || master.recurringEventId || master.recurrence?.length!==1
@@ -120,7 +123,9 @@ export function planPhaseBNativeFutureOnlyMove(
     || shared?.todoistAnchorStart!==master.start?.date
     || shared?.todoistAnchorEnd!==master.end?.date
     || shared?.todoistAnchorTimeZone!==e.sourceTimeZone
-    || shared?.todoistRecurrence!==todoistRecurrenceKey(task))
+    || shared?.todoistRecurrence!==todoistRecurrenceKey(task)
+    || master.summary!==task.content
+    || (master.description||"")!==(task.description||""))
     return reject("source_master_identity_or_anchor_drift");
 
   const candidate=todoistPhaseBCandidate(task,{
@@ -143,6 +148,16 @@ export function planPhaseBNativeFutureOnlyMove(
   const next=occurrences.indexOf(current);
   if (next<=0 || next>=occurrences.length-3)
     return reject("cutover_without_proven_history_or_future");
+  // A destination with the same RRULE but a new DTSTART can change interval
+  // phase. Independently expand the re-anchored rule before allowing a split.
+  const successor=classifyCalendarRule(master.recurrence[0],{
+    start:current,timeZone:e.destinationTimeZone,
+  });
+  const destinationOccurrences=successor.semantic
+    ? occurrenceDates(successor.semantic,3) : [];
+  if (destinationOccurrences.length!==3 || !destinationOccurrences.every((value,i)=>
+    value===occurrences[next+i]))
+    return reject("destination_reanchor_progression_mismatch");
   const past=occurrences.slice(0,next);
   const previous=past[past.length-1];
   if (!e.historyInventoryComplete || !e.exceptionInventoryComplete
