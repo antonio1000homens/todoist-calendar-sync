@@ -35,6 +35,9 @@ export interface ErasurePreviewResult {
   selectedActions: ErasureOperation["selectedActions"];
   previewFingerprint: string;
   providerSnapshotFingerprint: string;
+  /** Only present for cross-profile audits; retains the original target-only
+   * fingerprint required to compare pre-write recovery with its confirmation. */
+  primaryProviderSnapshotFingerprint?: string;
   inventoryDigest: string;
   inventory: ErasureOperation["inventory"];
   actionPlan: NonNullable<ErasureOperation["actionPlan"]>;
@@ -293,8 +296,14 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     readerForProfile:async profile=>profile===target.profile?providerClients
       :(dependencies.providerFactory || defaultProviderClientFactory)(profile),
   }):undefined;
-  const providerSnapshotFingerprint = fingerprint(crossProfileEvidence
-    ?{primary:providerData,crossProfileEvidence}:providerData);
+  // The original submitted preview fingerprints only the primary target.
+  // Cross-profile recovery audits must not silently replace this baseline
+  // with a different fingerprint domain, or every intact pre-write operation
+  // will be misclassified as ambiguous regardless of provider state.
+  const primaryProviderSnapshotFingerprint=fingerprint(providerData);
+  const providerSnapshotFingerprint = crossProfileEvidence
+    ?fingerprint({primary:providerData,crossProfileEvidence})
+    :primaryProviderSnapshotFingerprint;
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
     calendarEvent: event ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
       digest: fingerprint(event), etag:event.etag as string } : undefined,
@@ -327,7 +336,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, receiptSanitizationRequirements:plan.receiptSanitizationRequirements,
     blockers: [...new Set(blockers)].sort(),
-    ...(crossProfileEvidence?{crossProfileEvidence}:{}),
+    ...(crossProfileEvidence?{crossProfileEvidence,primaryProviderSnapshotFingerprint}:{}),
     ...(deliveryReceiptAudit?{deliveryReceiptAudit}:{}),
   };
 }

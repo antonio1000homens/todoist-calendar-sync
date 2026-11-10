@@ -39,7 +39,7 @@ test("review API publishes a new live-alias version on reviewed function-propert
 });
 
 test("erasure worker reads only configured Google and Todoist credential parameters",()=>{
-  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
+  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ErasureRecoveryWatchdogFunction:\n")[0];
   assert.ok(worker,"ErasureWorkerFunction SAM resource is defined");
   assert.match(worker,/GOOGLE_CREDENTIALS_PARAMETER_PREFIX: !Ref GoogleCredentialsParameterPrefix/);
   assert.match(worker,/TODOIST_TOKEN_PARAMETER_PREFIX: !Ref TodoistTokenParameterPrefix/);
@@ -50,8 +50,28 @@ test("erasure worker reads only configured Google and Todoist credential paramet
 });
 
 test("guarded erasure recovery can use DynamoDB transactions on only its state table",()=>{
-  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
+  const worker=template.split("\n  ErasureWorkerFunction:\n")[1]?.split("\n  ErasureRecoveryWatchdogFunction:\n")[0];
   assert.ok(worker);
   assert.match(worker,/Action: dynamodb:TransactWriteItems\s*\n\s*Resource: !GetAtt SyncState\.Arn/);
   assert.doesNotMatch(worker,/dynamodb:\*/);
+});
+
+test("pre-write recovery watchdog has independent, disabled-by-default schedule and no mapping-write IAM",()=>{
+  const watchdog=template.split("\n  ErasureRecoveryWatchdogFunction:\n")[1]?.split("\n  ReconcilerFunction:\n")[0];
+  assert.ok(watchdog,"independent watchdog Lambda exists");
+  assert.match(watchdog,/Handler: erasure-worker\.watchdogHandler/);
+  assert.match(watchdog,/Timeout: 300/);
+  assert.match(watchdog,/ReservedConcurrentExecutions: 1/);
+  assert.match(watchdog,/Schedule: rate\(5 minutes\)/);
+  assert.match(watchdog,/Enabled: false/);
+  assert.match(watchdog,/Action: dynamodb:TransactWriteItems\s*\n\s*Resource: !GetAtt SyncState\.Arn/);
+  assert.match(watchdog,/Action: lambda:GetEventSourceMapping/);
+  assert.doesNotMatch(watchdog,/lambda:UpdateEventSourceMapping/);
+  assert.doesNotMatch(watchdog,/Type: SQS/);
+});
+
+test("current production deployment does not enable the retired HMAC replay marker mechanism",()=>{
+  assert.doesNotMatch(workflow,/^\s*ERASURE_REPLAY_BARRIER_VERSION:\s*["']?1\b/m);
+  assert.doesNotMatch(template,/^\s*(?:ERASURE_REPLAY_HMAC_KEYS|ERASURE_REPLAY_HMAC_CURRENT_KEY):/m);
+  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'false'/);
 });

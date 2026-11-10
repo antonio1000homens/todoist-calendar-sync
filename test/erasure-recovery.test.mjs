@@ -136,6 +136,157 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(external.writes.length,0);
 });
 
+test("pre-write recovery accepts a fully read cross-profile audit without confusing its digest with the original target confirmation",async()=>{
+  const {service,external}=fixture();
+  const primary=external.snapshot.providerSnapshotFingerprint;
+  const withAudit={
+    ...external.snapshot,
+    // The cross-profile evidence digest intentionally differs from the
+    // immutable original, as it covers more provider data.
+    providerSnapshotFingerprint:"a".repeat(64),
+    primaryProviderSnapshotFingerprint:primary,
+    crossProfileEvidence:{allProfilesQueried:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}},
+  };
+  withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+  external.snapshot=withAudit;
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.classification,"pre_write");
+  assert.equal(inspected.preview.allowed,true);
+  assert.equal(external.writes.length,0);
+});
+
+test("cross-profile audit cannot hide changed primary provider data",async()=>{
+  const {service,external}=fixture();
+  const withAudit={...external.snapshot,
+    providerSnapshotFingerprint:"a".repeat(64),
+    primaryProviderSnapshotFingerprint:"b".repeat(64),
+    crossProfileEvidence:{allProfilesQueried:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}}};
+  withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+  external.snapshot=withAudit;
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(inspected.preview.classification,"partial_or_ambiguous");
+  assert.equal(external.writes.length,0);
+});
+
+test("cross-profile audit must be complete and strongly consistent before pre-write admission",async()=>{
+  for(const scan of [{allPagesReceived:false,stronglyConsistent:true},
+                     {allPagesReceived:true,stronglyConsistent:false}]) {
+    const {service,external}=fixture();
+    const withAudit={...external.snapshot,
+      providerSnapshotFingerprint:"a".repeat(64),
+      primaryProviderSnapshotFingerprint:external.snapshot.providerSnapshotFingerprint,
+      crossProfileEvidence:{allProfilesQueried:true,stateScan:scan}};
+    withAudit.previewFingerprint=erasurePreviewFingerprint(withAudit);
+    external.snapshot=withAudit;
+    const inspected=await service.inspect("op-recovery");
+    assert.equal(inspected.preview.allowed,false);
+    assert.equal(external.writes.length,0);
+  }
+});
+
+test("pre-write recovery rejects an incomplete or missing target-only audit baseline",async()=>{
+  for(const {allProfilesQueried,primaryProviderSnapshotFingerprint} of [
+    {allProfilesQueried:false,primaryProviderSnapshotFingerprint:"1".repeat(64)},
+    {allProfilesQueried:true,primaryProviderSnapshotFingerprint:undefined},
+  ]) {
+    const {service,external}=fixture();
+    const snapshot={...external.snapshot,providerSnapshotFingerprint:"a".repeat(64),
+      ...(primaryProviderSnapshotFingerprint?{primaryProviderSnapshotFingerprint}:{}),
+      crossProfileEvidence:{allProfilesQueried,
+        stateScan:{allPagesReceived:true,stronglyConsistent:true}}};
+    snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+    external.snapshot=snapshot;
+    const result=await service.inspect("op-recovery");
+    assert.equal(result.preview.allowed,false);
+    assert.equal(result.preview.classification,"partial_or_ambiguous");
+    assert.equal(external.writes.length,0);
+  }
+});
+
+test("read-only recovery diagnostics report exact unchanged pre-write evidence",async()=>{
+  const {service,external}=fixture();
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,true);
+  const checks=inspection.preview.evidenceChecks;
+  assert.ok(checks);
+  assert.deepEqual(Object.entries(checks).filter(([key,value])=>key!=="providerSafetyBlockerCount"&&value!==true),[]);
+  assert.equal(checks.providerSafetyBlockerCount,0);
+  assert.equal(external.writes.length,0);
+});
+
+test("read-only recovery diagnostics isolate task snapshot drift without authorizing release",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,actionPlan:{...external.snapshot.actionPlan,
+    todoistTask:{id:"disposable-1",digest:"9".repeat(64)}}};
+  external.snapshot.previewFingerprint=erasurePreviewFingerprint(external.snapshot);
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,false);
+  assert.equal(inspection.preview.classification,"partial_or_ambiguous");
+  assert.equal(inspection.preview.evidenceChecks.todoistTaskMatches,false);
+  assert.equal(inspection.preview.evidenceChecks.calendarEventMatches,true);
+  assert.equal(inspection.preview.evidenceChecks.stateInventoryMatches,true);
+  assert.equal(inspection.preview.evidenceChecks.originalPreviewMatches,false);
+  assert.equal(external.writes.length,0);
+});
+
+test("read-only recovery diagnostics isolate DynamoDB inventory drift",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,inventory:[{
+    type:"TASK",key:{pk:"TASK#disposable-1",sk:"STATE"},
+    digest:"0".repeat(64),classification:"selected-only"}]};
+  external.snapshot.previewFingerprint=erasurePreviewFingerprint(external.snapshot);
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.allowed,false);
+  assert.equal(inspection.preview.evidenceChecks.stateInventoryMatches,false);
+  assert.equal(inspection.preview.evidenceChecks.todoistTaskMatches,true);
+  assert.equal(external.writes.length,0);
+});
+
+test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
+  const {service,operation,external}=fixture();
+  const started=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.deepEqual(started,{queued:true,blockerCount:0});
+  assert.equal(operation.status,"review_required");
+  assert.equal(operation.recovery.status,"queued");
+  assert.ok(external.control.some(row=>row.sk==="FENCE"),
+    "automatic recovery must not release a fence directly");
+  assert.deepEqual(external.restored,[],
+    "mapping restore must wait for the independently guarded recovery worker");
+  assert.ok(external.providerCalls>=2,
+    "confirmation issuance and apply each independently reread provider evidence");
+});
+
+test("automatic recovery refuses a drifted provider snapshot without writes",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,previewFingerprint:"0".repeat(64)};
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.ok(outcome.blockerCount>0);
+  assert.equal(external.writes.length,0);
+});
+
+test("automatic recovery never starts after provider deletion began",async()=>{
+  const {service,operation,external}=fixture();
+  operation.lifecycle.phase="verify_deletion";
+  operation.lifecycle.evidence.deletionStarted={operationId:"op-recovery",
+    phase:"deletionStarted",receiptId,completedAt:2000};
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(external.writes.length,0);
+});
+
+test("automatic recovery refuses an active writer lease",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"WRITER#ongoing",operationId:"other"});
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.equal(external.writes.length,0);
+});
+
 test("independent post-write preview never issues a confirmation, writes state, or releases a fence",async()=>{
   const {service,external}=fixture({paginated:true});
   const assessment=await service.inspectPostWrite("op-recovery");

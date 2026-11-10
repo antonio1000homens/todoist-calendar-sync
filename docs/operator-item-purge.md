@@ -310,6 +310,58 @@ continues to apply. Production acceptance requires a disposable Work-profile
 fence/recovery fault-injection rehearsal and independent IAM/invocation review
 before closing issue #239.
 
+## Guarded pre-write recovery watchdog (issue #433, staged)
+
+A source-worker SQS trigger is shared by `antonio`, `home`, and `work`. An
+exceptional erasure can temporarily disable that trigger. The 9 November 2026
+Work-profile acceptance attempt failed while reading an SSM credential after
+its mapping had been disabled. The operation was durably `review_required`
+at `ready_for_delete`, and the protected Work fence remained installed.
+
+The erasure-worker package now includes a **bounded, separate** EventBridge
+watchdog Lambda with its own 300-second timeout, concurrency limit and a
+role that can inspect event-source mappings but **cannot update them**. The
+separate function prevents slow provider-inspection work from starving the
+active erasure SQS worker. Its SAM schedule is **disabled by default** pending
+disposable Work-profile fault-injection acceptance. When enabled it runs every
+five minutes, independently of the disabled ordinary source queue, reading only
+the three fixed `ERASURE#profile/FENCE` rows (strongly consistent
+`BatchGetItem`; **no table scan**). It checks only fence-owner erasure
+operations. For a `review_required` operation with no active recovery,
+it calls the same independent pre-write `inspect`, single-use confirmation
+and conditional `apply` path used by the authenticated operator, with an
+explicit system-watchdog actor. The action is **recovery only**, never a
+new deletion or resumption of a previous destructive step.
+
+The automatic path **must refuse** absent/changed mapping UUIDs, an unmatched
+fence owner/epoch, active leases or missing pages, an altered original provider
+inventory, an uncertain provider read, any `deletionStarted` receipt or
+`deletionProgress`, post-write phases, and any existing blocked recovery.
+No provider delete is invoked. The existing recovery worker restores only
+originally enabled mappings and uses a conditional DynamoDB transaction to
+release the exact operation-owned fence after verifying all sources again.
+If enqueueing the recovery message fails after a durable recovery claim,
+the next watchdog pass re-dispatches the existing recovery identity; it does
+not issue a second confirmation. Operator/manual recovery continues to work.
+
+**Activation gate:** run the source/CI tests and disposable Work-profile
+fault matrix, independently inspect IAM, worker-version/rollback and exact
+provider-fingerprint checks, then explicitly enable the
+`ErasureRecoveryWatchdog` SAM Schedule in a reviewed deployment. Run a
+controlled fault injection (including missing SSM permission) and verify
+normal `home`, `antonio`, and `work` traffic resumes with the correct
+mapping state, no provider mutation and preserved audit evidence. Keep the
+schedule disabled until acceptance; the current live erasure still requires
+the existing authenticated #239 recovery path.
+
+**Failure handling:** watchdog logs only the operation ID, profile and
+blocker counts/types. For inconclusive or post-write recovery the fence is
+retained; investigate the new prompt Windsor Prometheus
+`TodoistErasureReviewRequired` alert and use operator-confirmed recovery.
+Never treat the automated watchdog as a force-unlock facility. To roll back,
+disable the schedule; do not change the existing erasure fence or source
+mapping by hand.
+
 ## Limits
 
 The fence covers repository ingress and worker paths after the protocol

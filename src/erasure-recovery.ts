@@ -37,6 +37,22 @@ export interface RecoveryPreview {
   operationFingerprint:string;
   recoveryStatus?:RecoveryStatus;
   crossProfileEvidence?:CrossProfileErasureEvidence;
+  /** Read-only comparisons only. None of these booleans can grant recovery. */
+  evidenceChecks?:{
+    originalPreWritePhase:boolean;
+    originalConfirmationIntact:boolean;
+    auditComplete:boolean;
+    freshPreviewSelfConsistent:boolean;
+    primaryProviderMatches:boolean;
+    originalPreviewMatches:boolean;
+    todoistTaskMatches:boolean;
+    calendarEventMatches:boolean;
+    commentsMatch:boolean;
+    projectCommentIdsMatch:boolean;
+    knownCalendarAliasesMatch:boolean;
+    stateInventoryMatches:boolean;
+    providerSafetyBlockerCount:number;
+  };
 }
 export interface RecoveryAdapters {
   listWorkerMappings():Promise<FencedMapping[]>;
@@ -82,10 +98,24 @@ export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreview
   const lifecycle=operation.lifecycle!;
   const noWrites=!lifecycle.evidence.deletionStarted && !lifecycle.deletionProgress
     && recoverableBeforeWrite.has(lifecycle.phase);
+  // Guard both domains independently: the fresh cross-profile snapshot must
+  // validate its own fingerprint, while the immutable confirmation was issued
+  // against the *target-only* snapshot before any global audit was requested.
+  // Comparing the global-audit digest directly against the original digest
+  // will always fail even if not one provider item has changed.
+  const freshSelfConsistent=erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint;
+  const targetBaseline=snapshot.crossProfileEvidence
+    ?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
+  const auditVerified=!snapshot.crossProfileEvidence
+    || (snapshot.crossProfileEvidence.allProfilesQueried===true
+      &&snapshot.crossProfileEvidence.stateScan?.allPagesReceived===true
+      &&snapshot.crossProfileEvidence.stateScan?.stronglyConsistent===true);
   const identical=snapshot.blockers.length===0
-    && erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint
-    && snapshot.previewFingerprint===operation.previewFingerprint
-    && snapshot.providerSnapshotFingerprint===operation.providerSnapshotFingerprint;
+    &&freshSelfConsistent&&auditVerified
+    &&typeof targetBaseline==="string"&&/^[a-f0-9]{64}$/.test(targetBaseline)
+    &&targetBaseline===operation.providerSnapshotFingerprint
+    &&erasurePreviewFingerprint({...snapshot,providerSnapshotFingerprint:targetBaseline})
+      ===operation.previewFingerprint;
   if(noWrites&&identical)return "pre_write";
   const noProviders=!snapshot.actionPlan.todoistTask&&!snapshot.actionPlan.calendarEvent
     &&snapshot.actionPlan.comments.length===0;
@@ -148,6 +178,42 @@ function validateLifecycle(op:ErasureOperation):string[] {
     blockers.push("No durable receipt proving the original writer lease drain");
   if(!Number.isFinite(lc.timeoutSeconds)||lc.timeoutSeconds<=0)blockers.push("Invalid original worker timeout");
   return blockers;
+}
+/** Explain an ineligible pre-write inspection without exposing provider content,
+ * credentials, raw IDs, hashes, or authorising any state mutation. */
+function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:ErasurePreviewResult):
+  NonNullable<RecoveryPreview["evidenceChecks"]> {
+  const lifecycle=operation.lifecycle!;
+  const audit=snapshot.crossProfileEvidence;
+  const baseline=audit?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
+  const originalPreviewMatches=typeof baseline==="string"
+    &&/^[a-f0-9]{64}$/.test(baseline)
+    &&erasurePreviewFingerprint({...snapshot,providerSnapshotFingerprint:baseline})
+      ===operation.previewFingerprint;
+  // Wrap optional values in an object so JSON.stringify always has a
+  // stable input; compare immutable digests rather than public descriptions.
+  const same=(original:unknown,current:unknown)=>digest({value:original})===digest({value:current});
+  return {
+    originalPreWritePhase:!lifecycle.evidence.deletionStarted
+      &&!lifecycle.deletionProgress&&recoverableBeforeWrite.has(lifecycle.phase),
+    originalConfirmationIntact:operation.confirmationFingerprint===operation.previewFingerprint
+      &&erasurePreviewFingerprint(operation)===operation.previewFingerprint,
+    auditComplete:!audit||(audit.allProfilesQueried===true
+      &&audit.stateScan?.allPagesReceived===true
+      &&audit.stateScan?.stronglyConsistent===true),
+    freshPreviewSelfConsistent:erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint,
+    primaryProviderMatches:baseline===operation.providerSnapshotFingerprint,
+    originalPreviewMatches,
+    todoistTaskMatches:same(operation.actionPlan.todoistTask,snapshot.actionPlan.todoistTask),
+    calendarEventMatches:same(operation.actionPlan.calendarEvent,snapshot.actionPlan.calendarEvent),
+    commentsMatch:same(operation.actionPlan.comments,snapshot.actionPlan.comments),
+    projectCommentIdsMatch:same(operation.actionPlan.projectCommentIds,snapshot.actionPlan.projectCommentIds),
+    knownCalendarAliasesMatch:same(
+      {aliases:operation.actionPlan.knownCalendarAliases,complete:operation.actionPlan.knownCalendarAliasesComplete},
+      {aliases:snapshot.actionPlan.knownCalendarAliases,complete:snapshot.actionPlan.knownCalendarAliasesComplete}),
+    stateInventoryMatches:same(operation.inventory,snapshot.inventory),
+    providerSafetyBlockerCount:snapshot.blockers.length,
+  };
 }
 function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;state:string}>):Array<{id:string;state:string;originallyEnabled:boolean}> {
   const enabled=new Set(op.lifecycle!.enabledMappingIds);
@@ -217,6 +283,7 @@ export class ErasureRecoveryService {
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
       snapshotSafetyBlockerCount:snapshot.blockers.length,
+      evidenceChecks:readOnlyRecoveryEvidenceChecks(op,snapshot),
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
       ...(snapshot.crossProfileEvidence?{crossProfileEvidence:snapshot.crossProfileEvidence}:{})};
@@ -326,6 +393,33 @@ export class ErasureRecoveryService {
       throw error;
     }
     return {status:"reviewed_fenced",releaseAllowed:false};
+  }
+
+  /**
+   * Bounded unattended recovery ONLY for independently verified pre-provider-write
+   * erasures. Reuses the same three-step inspection, single-use token and CAS
+   * transaction as the operator path; it never resumes provider deletion.
+   * A refused or inconclusive inspection leaves every fence and mapping alone.
+   */
+  async startAutomaticPreWriteRecovery(id:string):Promise<{queued:boolean;blockerCount:number}> {
+    const actor="system:erasure-prewrite-watchdog";
+    let issued:{preview:RecoveryPreview;confirmationId:string;expiresAt:number};
+    try {
+      // This is the same operator-only pre-write inspection and short-lived
+      // confirmation issuance, without a third expensive provider scan.
+      issued=await this.issueConfirmation(id,actor);
+    } catch(error) {
+      if(error instanceof Error && (error as {status?:number}).status===409
+        &&error.message==="Recovery is blocked; inspect safety evidence")
+        return {queued:false,blockerCount:1};
+      throw error; // A provider/IAM/timeout failure is not proof of safety.
+    }
+    if(!issued.preview.allowed||issued.preview.classification!=="pre_write")
+      throw new Error("Automatic recovery requires independently verified pre-write evidence");
+    // apply() re-inspects all sources, then locks the exact operation/fence/
+    // epoch through the existing CAS. No new provider deletion is possible.
+    await this.apply(id,issued.confirmationId,actor);
+    return {queued:true,blockerCount:0};
   }
 
   async issueConfirmation(id:string,operator:string):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number}> {

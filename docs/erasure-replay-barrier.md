@@ -72,6 +72,24 @@ npm run cleanup:erasure-tombstones -- --profile=work --apply \
 
 The apply path re-reads each candidate and deletes only the unchanged, expired comment in the configured project. It does not scan or delete DynamoDB rows, task comments, active markers, or unrelated project comments.
 
+### Repeatable current-runtime retirement audit
+
+Repeat the **current-runtime**, read-only check during rollback or release review:
+
+```bash
+npm run audit:legacy-hmac-retirement -- \
+  --profile=<AWS_PROFILE> \
+  --expected-account=<ACCOUNT_ID> \
+  --region=eu-west-2 \
+  --stack=todoist-calendar-sync
+```
+
+The command validates the exact AWS account, discovers the stack's DynamoDB
+table and Lambda functions, queries the three HMAC partitions, and reads
+`$LATEST`, active aliases and any weighted alias targets. It returns only
+boolean HMAC configuration presence, no environment values or marker identity.
+Any marker, configured legacy setting or incomplete read blocks readiness.
+
 ## Retired HMAC admission and compatibility safety
 
 The obsolete permanent DynamoDB/HMAC marker writers and post-write release code were removed in #437. The historical **admission reader** has now also been retired from current source; the remaining `ERASURE_REPLAY_BARRIER_VERSION` environment switch is a **fail-closed compatibility tripwire**. Unset, empty or `0` allows the current path, while `1` or any unknown nonzero value refuses admission. Do **not** turn on the obsolete switch.
@@ -86,4 +104,4 @@ These observations support removing the dormant HMAC lookup, **not** a claim abo
 
 The bounded project-comment implementation from #403–#405 is deployed to current production master. Deployment run 42536045650 succeeded. The `todoist-calendar-sync` stack is `UPDATE_COMPLETE` with `ErasureExecutionEnabled=false`; the live Review API execution setting is false, and the replay-barrier setting remains absent. The erasure worker mapping is enabled.
 
-This does not close #347: the read-only audit found 71 Review API configurations with execution enabled, including historical qualified versions that remain invocation candidates. The current alias target is false, but the account-local IAM/invoker audit does not establish an enforceable deny for old versions or all external callers. Package-marker strings are not proof of safe check ordering. #349's disposable Work-profile fault-injection acceptance also remains outstanding. Keep execution disabled, keep uncertain operations fenced, and do not enable the replay barrier, restore mappings, release fences, or replay messages until both acceptance tracks and independent review are complete.
+This does not close #347: the 10 November 2026 read-only live check found eight stack Lambda functions, 240 numeric published versions and two aliases. All 250 numeric-version/unqualified/alias resources returned their expected direct-invocation Deny; this does not prove every effective IAM caller, authenticated Function URL, service invocation or rollback/redeployment path is safe. Historical package-marker strings are not proof of check ordering. #349's disposable Work-profile fault-injection acceptance also remains outstanding. Keep exceptional erasure disabled, uncertain operations fenced, and do not force-enable source mappings, release fences or replay messages until independently reviewed acceptance passes.
