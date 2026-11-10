@@ -199,10 +199,10 @@ export class StateRepository {
   /** Manual/verified recovery only: never release on an ordinary webhook. */
   async clearPhaseBNativeQuarantine(profile: Profile, taskId: string, eventId: string): Promise<void> {
     const operationId = `phase-b-native-${createHash("sha256").update(JSON.stringify([profile, taskId, eventId])).digest("hex")}`;
-    const controls = new SyncControls();
-    for (const side of ["todoist", "calendar"] as const) {
-      await controls.release({profile, side, id: side === "todoist" ? taskId : eventId}, operationId);
-    }
+    await new SyncControls().releasePair([
+      { profile, side:"todoist", id:taskId },
+      { profile, side:"calendar", id:eventId },
+    ], operationId);
   }
 
   async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {

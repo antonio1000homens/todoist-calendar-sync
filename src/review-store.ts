@@ -1134,6 +1134,20 @@ export class SyncControls {
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET excluded = :excluded",
       ConditionExpression: "activeRepair = :id", ExpressionAttributeValues: { ":excluded": excluded, ":id": operationId } }));
   }
+  // Release both identities in one DynamoDB transaction. A partial release
+  // would permit task-only retries while the Calendar master remains blocked.
+  async releasePair(refs: EntityRef[], operationId: string): Promise<void> {
+    const unique = [...new Map(refs.map(ref=>[entityKey(ref),ref])).values()];
+    if (unique.length !== 2 || !operationId) throw new Error("Exact two-identity Phase B release required");
+    for (const ref of unique) await admitEntityRef(ref);
+    const at = new Date().toISOString();
+    await client.send(new TransactWriteCommand({ TransactItems: unique.map(ref=>({ Update:{
+      TableName: reviewTable(), Key:key(`SYNC_CONTROL#${entityKey(ref)}`),
+      UpdateExpression:"SET fencedAt = :now, providerUpdatedAt = :version REMOVE activeRepair",
+      ConditionExpression:"activeRepair = :id",
+      ExpressionAttributeValues:{":id":operationId,":now":at,":version":""},
+    } })) }));
+  }
   async release(ref: EntityRef, operationId: string, providerUpdatedAt?: string): Promise<void> {
     await admitEntityRef(ref);
     await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
