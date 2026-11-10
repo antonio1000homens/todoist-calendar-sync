@@ -259,18 +259,16 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
   return {fenced:fences.length,queued,blocked};
 }
 
+/** Isolated, separately bounded Lambda runtime; never shares SQS-worker concurrency. */
+export async function watchdogHandler(event:{source?:string;"detail-type"?:string}):Promise<void> {
+  if(event.source!=="aws.events"||event["detail-type"]!=="Scheduled Event")
+    throw new Error("Unsupported erasure recovery watchdog event");
+  const report=await inspectStuckErasureRecovery();
+  console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+    event:"recovery_watchdog_run",...report}));
+}
+
 export const handler:SQSHandler=async event=>{
-  // SAM EventBridge schedule targets this same worker but is independent of
-  // both ordinary source SQS and the erasure-operation SQS trigger.
-  if(!Array.isArray((event as {Records?:unknown}).Records)) {
-    const tick=event as unknown as {source?:string;"detail-type"?:string};
-    if(tick.source!=="aws.events"||tick["detail-type"]!=="Scheduled Event")
-      throw new Error("Unsupported erasure worker event source");
-    const report=await inspectStuckErasureRecovery();
-    console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
-      event:"recovery_watchdog_run",...report}));
-    return {batchItemFailures:[]};
-  }
   const batchItemFailures=[];
   for(const record of event.Records){
     try {
