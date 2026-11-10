@@ -33,6 +33,8 @@ export interface PhaseBNativeMoveStage{
   sourceMappingUpdatedAt:string;
   sourceLinkUpdatedAt:string;
   sourceEtag:string;
+  /** Captured immutable original master DTSTART; recovery cannot infer it from a modified provider master. */
+  originalAnchor:string;
   sourceRule:string;
   historyRule:string;
   historicalLastOccurrence:string;
@@ -51,7 +53,7 @@ export function phaseBNativeMoveStage(input:Pick<PhaseBNativeMoveHandoff,
   const {plan,sourceMapping:m,sourceLink:l}=input;
   if(!plan.taskId || !plan.sourceMasterId || !plan.successorMasterId
     || plan.sourceProfile===plan.destinationProfile || !plan.historyRule
-    || !plan.sourceEtag || !plan.historicalLastOccurrence
+    || !plan.sourceEtag || !plan.originalAnchor || !plan.historicalLastOccurrence
     || !plan.destinationStart || !plan.destinationRule
     || !m.updatedAt || !l.updatedAt || m.todoistPhaseBVersion!==1
     || m.profile!==plan.sourceProfile || m.taskId!==plan.taskId
@@ -63,13 +65,13 @@ export function phaseBNativeMoveStage(input:Pick<PhaseBNativeMoveHandoff,
     throw new Error("Phase B move handoff requires a verified native source mapping and link");
   const operationId="phase-b-move-"+createHash("sha256").update(JSON.stringify([
     plan.taskId,plan.sourceProfile,plan.destinationProfile,plan.sourceMasterId,
-    plan.successorMasterId,plan.sourceRule,plan.historyRule,
+    plan.successorMasterId,plan.originalAnchor,plan.sourceRule,plan.historyRule,
     plan.destinationStart,plan.destinationRule,plan.sourceEtag,m.updatedAt,l.updatedAt,
   ])).digest("hex").slice(0,32);
   return {operationId,taskId:plan.taskId,sourceProfile:plan.sourceProfile,
     destinationProfile:plan.destinationProfile,sourceMasterId:plan.sourceMasterId,
     successorMasterId:plan.successorMasterId,sourceMappingUpdatedAt:m.updatedAt,
-    sourceLinkUpdatedAt:l.updatedAt,sourceEtag:plan.sourceEtag,sourceRule:plan.sourceRule,
+    sourceLinkUpdatedAt:l.updatedAt,sourceEtag:plan.sourceEtag,originalAnchor:plan.originalAnchor,sourceRule:plan.sourceRule,
     historyRule:plan.historyRule,historicalLastOccurrence:plan.historicalLastOccurrence,
     destinationStart:plan.destinationStart,destinationRule:plan.destinationRule};
 }

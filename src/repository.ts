@@ -218,6 +218,16 @@ export class StateRepository {
     return result.Item?.operationId ? result.Item as PhaseBNativeMoveStage : undefined;
   }
 
+  /** Consistent read of the four immutable stage-owned controls. Recovery
+   * must not infer ownership merely from syncBlocked(), which is also true
+   * for unrelated repairs and explicit exclusions. */
+  async phaseBNativeMoveControlsMatch(stage: PhaseBNativeMoveStage): Promise<boolean> {
+    const controls = await Promise.all(phaseBNativeMoveControlKeys(stage).map(Key =>
+      client.send(new GetCommand({TableName:this.ensureTable(),Key,ConsistentRead:true}))));
+    return controls.every(result => result.Item?.activeRepair === stage.operationId
+      && result.Item?.excluded !== true);
+  }
+
   async beginPhaseBNativeMove(input: Pick<PhaseBNativeMoveHandoff,
     "plan"|"sourceMapping"|"sourceLink">): Promise<"claimed"|"resumed"> {
     const stage=phaseBNativeMoveStage(input);
