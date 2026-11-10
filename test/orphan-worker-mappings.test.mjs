@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {inspectOrphanWorkerMappings} from "../dist/orphan-worker-mappings.js";
+import {createLambdaMappingMock} from "./helpers/lambda-mapping-mock.mjs";
 
 const uuidA="11111111-1111-4111-8111-111111111111";
 const uuidB="22222222-2222-4222-8222-222222222222";
@@ -9,27 +10,17 @@ const arnB="arn:aws:sqs:eu-west-2:123456789012:sync-work";
 const fnArn="arn:aws:lambda:eu-west-2:123456789012:function:sync-worker";
 const first={UUID:uuidA,EventSourceArn:arnA,FunctionArn:fnArn,State:"Enabled"};
 const second={UUID:uuidB,EventSourceArn:arnB,FunctionArn:fnArn,State:"Enabled"};
-function fixture(overrides={}){
-  const calls=[];
-  const lambda={send:async command=>{
-    const kind=command.constructor.name;
-    calls.push({kind,input:command.input});
-    if(kind==="GetFunctionConfigurationCommand")return {
-      FunctionArn:fnArn,Timeout:135,State:"Active",LastUpdateStatus:"Successful",
-      ...overrides.config};
-    if(kind==="ListEventSourceMappingsCommand")
-      return command.input.Marker?{
-        EventSourceMappings:[second],...overrides.secondPage,
-      }:{
-        EventSourceMappings:[first],NextMarker:"second-page",
-        ...overrides.firstPage};
-    if(kind==="GetEventSourceMappingCommand"){
-      const value=command.input.UUID===uuidA?first:second;
-      return {...value,...(overrides.direct||{})};
-    }
-    throw Error("Unexpected or mutating Lambda API "+kind);
-  }};
-  return {lambda,calls};
+function fixture(overrides={}) {
+  return createLambdaMappingMock({
+    functionArn:fnArn,
+    configuration:overrides.config,
+    list:input=>input.Marker
+      ?{EventSourceMappings:[second],...overrides.secondPage}
+      :{EventSourceMappings:[first],NextMarker:"second-page",...overrides.firstPage},
+    readback:input=>({
+      ...(input.UUID===uuidA?first:second),...(overrides.direct||{}),
+    }),
+  });
 }
 test("worker inventory fully paginates, re-reads mapping UUIDs and computes a stable non-identity digest",async()=>{
   const f=fixture();
@@ -46,34 +37,32 @@ test("worker inventory fully paginates, re-reads mapping UUIDs and computes a st
   const b=await inspectOrphanWorkerMappings({lambda:fixture().lambda,functionName:"sync-worker"});
   assert.equal(a.fingerprint,b.fingerprint);
 });
-test("empty, malformed, duplicate and unsupported mapping lists fail closed",async()=>{
-  for(const overrides of [
-    {firstPage:{EventSourceMappings:[],NextMarker:undefined}},
-    {firstPage:{EventSourceMappings:[{...first,UUID:"not-a-uuid"}],NextMarker:undefined}},
-    {firstPage:{EventSourceMappings:[{...first,EventSourceArn:"arn:aws:kinesis:eu-west-2:123:stream/a"}],NextMarker:undefined}},
-    {firstPage:{EventSourceMappings:[first,first],NextMarker:undefined}},
-    {firstPage:{EventSourceMappings:[{...first,State:"Disabled"}],NextMarker:undefined}},
-    {firstPage:{EventSourceMappings:[{...first,State:"Enabling"}],NextMarker:undefined}},
-  ]){
+test("invalid mapping inventories, direct readback drift and inactive workers all fail closed",async()=>{
+  const scenarios=[
+    {name:"empty inventory",overrides:{firstPage:{EventSourceMappings:[],NextMarker:undefined}}},
+    {name:"invalid mapping UUID",overrides:{firstPage:{EventSourceMappings:[{...first,UUID:"not-a-uuid"}],NextMarker:undefined}}},
+    {name:"non-SQS mapping",overrides:{firstPage:{EventSourceMappings:[{...first,EventSourceArn:"arn:aws:kinesis:eu-west-2:123:stream/a"}],NextMarker:undefined}}},
+    {name:"duplicate mapping",overrides:{firstPage:{EventSourceMappings:[first,first],NextMarker:undefined}}},
+    {name:"disabled mapping",overrides:{firstPage:{EventSourceMappings:[{...first,State:"Disabled"}],NextMarker:undefined}}},
+    {name:"transitional listing",overrides:{firstPage:{EventSourceMappings:[{...first,State:"Enabling"}],NextMarker:undefined}}},
+    {name:"transitional readback",overrides:{direct:{State:"Disabling"}}},
+    {name:"changed queue",overrides:{direct:{EventSourceArn:arnB}}},
+    {name:"changed Lambda identity",overrides:{direct:{FunctionArn:fnArn+":stale"}}},
+    {name:"repeated pagination cursor",overrides:{firstPage:{NextMarker:"second-page"},secondPage:{NextMarker:"second-page"}}},
+    {name:"inactive worker",overrides:{config:{State:"Inactive"}}},
+    {name:"worker update in progress",overrides:{config:{LastUpdateStatus:"InProgress"}}},
+    {name:"missing worker timeout",overrides:{config:{Timeout:undefined}}},
+  ];
+  for(const {name,overrides} of scenarios) {
     const f=fixture(overrides);
-    const a=await inspectOrphanWorkerMappings({lambda:f.lambda,functionName:"sync-worker"});
-    assert.equal(a.verified,false,JSON.stringify(overrides));
-    assert.ok(a.blockers.length);
-  }
-});
-test("changed direct readbacks, partial pagination and inactive Lambda are blocked",async()=>{
-  for(const overrides of [
-    {direct:{State:"Disabling"}},
-    {direct:{EventSourceArn:arnB}},
-    {direct:{FunctionArn:fnArn+":stale"}},
-    {firstPage:{NextMarker:"second-page"},secondPage:{NextMarker:"second-page"}},
-    {config:{State:"Inactive"}},
-    {config:{LastUpdateStatus:"InProgress"}},
-    {config:{Timeout:undefined}},
-  ]){
-    const f=fixture(overrides);
-    const a=await inspectOrphanWorkerMappings({lambda:f.lambda,functionName:"sync-worker"});
-    assert.equal(a.verified,false,JSON.stringify(overrides));
+    const inventory=await inspectOrphanWorkerMappings({lambda:f.lambda,functionName:"sync-worker"});
+    assert.equal(inventory.verified,false,name);
+    assert.ok(inventory.blockers.length,name+" should report a blocker");
+    assert.ok(f.calls.every(call=>[
+      "GetFunctionConfigurationCommand",
+      "ListEventSourceMappingsCommand",
+      "GetEventSourceMappingCommand",
+    ].includes(call.kind)),name+" must stay read-only");
   }
 });
 test("missing target configuration never calls Lambda; API failures cannot become false-positive inventories",async()=>{
