@@ -8,8 +8,14 @@ import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.j
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
+export type GuardedRecoveryMode = "strict_pre_write" | "calendar_drift_cancel";
 export interface RecoveryState {
   status:RecoveryStatus;
+  /** A Calendar-drift cancellation is never admitted through the automatic watchdog. */
+  mode?:GuardedRecoveryMode;
+  /** Operation-bound current Calendar revision. Checked at every worker step. */
+  calendarDigest?:string;
+  calendarEtag?:string;
   fingerprint:string;
   lifecycleFingerprint:string;
   epoch:number;
@@ -223,10 +229,12 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
  * snapshots to a one-time token and revalidate before each worker transition. */
 function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:ErasurePreviewResult,
   checks:NonNullable<RecoveryPreview["evidenceChecks"]>,blockingReasons:readonly string[],
-  mappingStates:Array<{id:string;state:string}>):boolean {
+  mappingStates:Array<{id:string;state:string}>,
+  options:{duringRestore?:boolean}={}):boolean {
   const original=operation.actionPlan.calendarEvent,current=snapshot.actionPlan.calendarEvent;
   return blockingReasons.length===0
-    && !operation.recovery&&!operation.postwriteReview
+    && (options.duringRestore?operation.recovery?.mode==="calendar_drift_cancel":!operation.recovery)
+    && !operation.postwriteReview
     && operation.selectedActions.deleteCalendar===true
     && snapshot.crossProfileEvidence!==undefined
     && checks.originalPreWritePhase&&checks.originalConfirmationIntact
@@ -246,7 +254,9 @@ function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:
     && typeof current?.etag==="string"&&current.etag.length>0
     && snapshot.knownTargetReadback?.todoist==="present"
     && snapshot.knownTargetReadback?.calendar==="present"
-    && mappingStates.every(x=>x.state==="Disabled");
+    && mappingStates.every(x=>x.state==="Disabled" || (options.duringRestore
+      &&operation.lifecycle?.enabledMappingIds.includes(x.id)
+      &&["Enabled","Enabling"].includes(x.state)));
 }
 function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;state:string}>):Array<{id:string;state:string;originallyEnabled:boolean}> {
   const enabled=new Set(op.lifecycle!.enabledMappingIds);
@@ -258,7 +268,11 @@ export class ErasureRecoveryService {
     private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db as typeof documentClient),
     private readonly newToken:()=>string=randomUUID) {}
 
-  async inspect(id:string,options:{knownIdentityOnly?:boolean}={}):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean}> {
+  async inspect(id:string,options:{knownIdentityOnly?:boolean}={}):Promise<{
+    preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean;
+    /** Private to server-side callers; never returned through the review API. */
+    snapshot:ErasurePreviewResult;
+  }> {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const op=await this.erasures.get(id);
     if(!op)throw Object.assign(new Error("Erasure operation not found; absence cannot prove success"),{status:404});
@@ -333,7 +347,7 @@ export class ErasureRecoveryService {
       mappingInventory:mappings.sort((a,b)=>a.id.localeCompare(b.id)),mappingStates,
       snapshotFingerprint:snapshot.previewFingerprint,
       crossProfileEvidenceFingerprint:snapshot.crossProfileEvidence?.evidenceFingerprint,classification});
-    return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal)};
+    return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal),snapshot};
   }
 
   /** Post-write review is separate from the pre-write RESTORE SYNC executor.
@@ -462,33 +476,51 @@ export class ErasureRecoveryService {
     return {queued:true,blockerCount:0};
   }
 
-  async issueConfirmation(id:string,operator:string):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number}> {
+  async issueConfirmation(id:string,operator:string,
+    mode:GuardedRecoveryMode="strict_pre_write"):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number;mode:GuardedRecoveryMode}> {
+    if(!["strict_pre_write","calendar_drift_cancel"].includes(mode))throw Object.assign(new Error("Invalid recovery mode"),{status:400});
     const inspected=await this.inspect(id);
-    if(!inspected.preview.allowed)throw Object.assign(new Error("Recovery is blocked; inspect safety evidence"),{status:409});
+    const eligible=mode==="strict_pre_write"?inspected.preview.allowed
+      :inspected.preview.calendarDriftReview?.candidateForSeparateApproval===true
+        &&inspected.preview.classification==="partial_or_ambiguous"
+        &&inspected.preview.blockers.length===1
+        &&inspected.preview.blockers[0]==="Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation";
+    if(!eligible)throw Object.assign(new Error("Recovery is blocked; inspect safety evidence"),{status:409});
     const confirmationId=this.newToken(),expiresAt=Date.now()+5*60_000;
     // DynamoDB TTL requires epoch *seconds*; the UI/action-time clock uses milliseconds.
     await this.db.send(new PutCommand({TableName:table(),Item:{
       ...confirmationKey(id),operationId:id,profile:inspected.operation.profile,operator,
-      confirmationId,inspectedFingerprint:inspected.fingerprint,
+      confirmationId,inspectedFingerprint:inspected.fingerprint,mode,
       expiresAt:Math.ceil(expiresAt/1000),expiresAtMs:expiresAt,status:"issued",
       createdAt:new Date().toISOString(),
     },ConditionExpression:"attribute_not_exists(pk) OR expiresAt < :now",
       ExpressionAttributeValues:{":now":Math.floor(Date.now()/1000)}}));
-    return {preview:inspected.preview,confirmationId,expiresAt};
+    return {preview:inspected.preview,confirmationId,expiresAt,mode};
   }
 
-  async apply(id:string,confirmationId:string,operator:string):Promise<void> {
+  async apply(id:string,confirmationId:string,operator:string,
+    mode:GuardedRecoveryMode="strict_pre_write"):Promise<void> {
     if(!idPattern.test(id)||typeof confirmationId!=="string"||confirmationId.length>256)
       throw Object.assign(new Error("Invalid recovery confirmation"),{status:400});
     const issued=(await this.db.send(new GetCommand({TableName:table(),Key:confirmationKey(id),ConsistentRead:true}))).Item;
     if(!issued||issued.status!=="issued"||issued.operationId!==id||issued.operator!==operator
-      ||issued.confirmationId!==confirmationId||typeof issued.expiresAtMs!=="number"||issued.expiresAtMs<=Date.now())
+      ||issued.confirmationId!==confirmationId||(issued.mode||"strict_pre_write")!==mode
+      ||typeof issued.expiresAtMs!=="number"||issued.expiresAtMs<=Date.now())
       throw Object.assign(new Error("Recovery confirmation is expired, changed, or consumed"),{status:409});
     const current=await this.inspect(id);
-    if(!current.preview.allowed||current.fingerprint!==issued.inspectedFingerprint||!current.preview.epoch)
+    const eligible=mode==="strict_pre_write"?current.preview.allowed
+      :current.preview.calendarDriftReview?.candidateForSeparateApproval===true
+        &&current.preview.classification==="partial_or_ambiguous"
+        &&current.preview.blockers.length===1
+        &&current.preview.blockers[0]==="Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation";
+    if(!eligible||current.fingerprint!==issued.inspectedFingerprint||!current.preview.epoch)
       throw Object.assign(new Error("Safety evidence drifted; obtain a new recovery preview"),{status:409});
+    const event=mode==="calendar_drift_cancel"?current.snapshot.actionPlan.calendarEvent:undefined;
+    if(mode==="calendar_drift_cancel"&&(!event||!/^[0-9a-f]{64}$/.test(event.digest)
+      ||!event.etag))throw Object.assign(new Error("Current Calendar revision cannot be securely bound"),{status:409});
     const now=Date.now();
-    const recovery:RecoveryState={status:"queued",fingerprint:current.fingerprint,
+    const recovery:RecoveryState={status:"queued",mode,fingerprint:current.fingerprint,
+      ...(event?{calendarDigest:event.digest,calendarEtag:event.etag}:{}),
       lifecycleFingerprint:digest(current.operation.lifecycle),
       epoch:current.preview.epoch,hasJournal:current.hasJournal,startedAt:new Date(now).toISOString()};
     // Lock the durable operation before SQS dispatch. No pre-existing fence/epoch may be changed.
@@ -623,13 +655,31 @@ export class ErasureRecoveryService {
       return {safe:false,mappings:[]};
     const mapped=expectedMappingStates(op,states);
     if(mapped.some(x=>!x.originallyEnabled&&x.state!=="Disabled"))return {safe:false,mappings:mapped};
-    // Only pre-write recoveries are automated. Every worker step must still
-    // observe the *original* provider and DynamoDB contents.
+    // All restorations are pre-deletion only. For explicitly approved Calendar
+    // drift cancellation, bind the current event revision from the single-use
+    // confirmation and check the unchanged task, project comments, aliases,
+    // strongly-consistent state and original fence every worker step.
+    // The automatic watchdog can ONLY request strict_pre_write mode.
+    if(recovery.mode==="calendar_drift_cancel"){
+      const checks=readOnlyRecoveryEvidenceChecks(op,snapshot);
+      const current=snapshot.actionPlan.calendarEvent;
+      const safe=calendarOnlyPreWriteDriftCandidate(op,snapshot,checks,[],mapped,
+        {duringRestore:true})
+        &&typeof recovery.calendarDigest==="string"
+        &&current?.digest===recovery.calendarDigest
+        &&typeof recovery.calendarEtag==="string"
+        &&current?.etag===recovery.calendarEtag;
+      return {safe,mappings:mapped};
+    }
+    // The cross-profile audit digest deliberately differs from the immutable
+    // target-only preview hash. Compare like-for-like, as operator inspection does.
+    const baseline=snapshot.crossProfileEvidence
+      ?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
     const unchanged=snapshot.blockers.length===0
       &&erasurePreviewFingerprint(snapshot)===snapshot.previewFingerprint
       &&recoveryMode(op,snapshot)==="pre_write"
-      &&snapshot.previewFingerprint===op.previewFingerprint
-      &&snapshot.providerSnapshotFingerprint===op.providerSnapshotFingerprint;
+      &&baseline===op.providerSnapshotFingerprint
+      &&erasurePreviewFingerprint({...snapshot,providerSnapshotFingerprint:baseline})===op.previewFingerprint;
     return {safe:unchanged,mappings:mapped};
   }
 }
