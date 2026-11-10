@@ -8,6 +8,7 @@ import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.j
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
+export const CALENDAR_DRIFT_CANCEL_PHRASE="CANCEL ERASURE AND RESTORE SYNC";
 export interface RecoveryState {
   status:RecoveryStatus;
   fingerprint:string;
@@ -16,6 +17,8 @@ export interface RecoveryState {
   hasJournal:boolean;
   startedAt:string;
   lastError?:string;
+  mode?:"calendar_drift_cancel";
+  approvedCalendarDriftCommitment?:string;
 }
 export interface RecoveryPreview {
   operationId:string;
@@ -78,6 +81,7 @@ function table():string {
 }
 const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
+const driftConfirmationKey=(id:string)=>({pk:"ERASURE_CALENDAR_DRIFT_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
 function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
@@ -223,7 +227,7 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
  * snapshots to a one-time token and revalidate before each worker transition. */
 function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:ErasurePreviewResult,
   checks:NonNullable<RecoveryPreview["evidenceChecks"]>,blockingReasons:readonly string[],
-  mappingStates:Array<{id:string;state:string}>):boolean {
+  mappingStates:Array<{id:string;state:string}>,requireAllDisabled=true):boolean {
   const original=operation.actionPlan.calendarEvent,current=snapshot.actionPlan.calendarEvent;
   return blockingReasons.length===0
     && !operation.recovery&&!operation.postwriteReview
@@ -246,7 +250,19 @@ function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:
     && typeof current?.etag==="string"&&current.etag.length>0
     && snapshot.knownTargetReadback?.todoist==="present"
     && snapshot.knownTargetReadback?.calendar==="present"
-    && mappingStates.every(x=>x.state==="Disabled");
+    && (!requireAllDisabled||mappingStates.every(x=>x.state==="Disabled"));
+}
+/** Stable fingerprint of current target/provider revision, not global audit time. */
+function calendarDriftCommitment(operation:ErasureOperation,snapshot:ErasurePreviewResult,epoch:number):string {
+  return digest({domain:"calendar-drift-cancellation-v1",operationId:operation.operationId,
+    profile:operation.profile,epoch,originalPreview:operation.previewFingerprint,
+    target:snapshot.target,actions:snapshot.selectedActions,
+    primaryProvider:snapshot.primaryProviderSnapshotFingerprint,
+    todoist:snapshot.actionPlan.todoistTask,calendar:snapshot.actionPlan.calendarEvent,
+    comments:snapshot.actionPlan.comments,projectCommentIds:snapshot.actionPlan.projectCommentIds,
+    calendarAliases:snapshot.actionPlan.knownCalendarAliases,
+    aliasesComplete:snapshot.actionPlan.knownCalendarAliasesComplete,
+    inventory:snapshot.inventory,readback:snapshot.knownTargetReadback});
 }
 function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;state:string}>):Array<{id:string;state:string;originallyEnabled:boolean}> {
   const enabled=new Set(op.lifecycle!.enabledMappingIds);
@@ -258,7 +274,7 @@ export class ErasureRecoveryService {
     private readonly erasures:ErasureOperationStore=new ErasureOperationStore(db as typeof documentClient),
     private readonly newToken:()=>string=randomUUID) {}
 
-  async inspect(id:string,options:{knownIdentityOnly?:boolean}={}):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean}> {
+  async inspect(id:string,options:{knownIdentityOnly?:boolean}={}):Promise<{preview:RecoveryPreview;fingerprint:string;operation:ErasureOperation;hasJournal:boolean;calendarDriftCommitment?:string}> {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const op=await this.erasures.get(id);
     if(!op)throw Object.assign(new Error("Erasure operation not found; absence cannot prove success"),{status:404});
@@ -333,7 +349,10 @@ export class ErasureRecoveryService {
       mappingInventory:mappings.sort((a,b)=>a.id.localeCompare(b.id)),mappingStates,
       snapshotFingerprint:snapshot.previewFingerprint,
       crossProfileEvidenceFingerprint:snapshot.crossProfileEvidence?.evidenceFingerprint,classification});
-    return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal)};
+    return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal),
+      ...(calendarDriftCandidate&&control.epoch
+        ?{calendarDriftCommitment:calendarDriftCommitment(op,snapshot,control.epoch)}:{}),
+    };
   }
 
   /** Post-write review is separate from the pre-write RESTORE SYNC executor.
