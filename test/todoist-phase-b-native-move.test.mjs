@@ -44,7 +44,9 @@ const variants=[
 ];
 for(const v of variants){
   test(`admit history-preserving native move: ${v.name}`,()=>{
-    const e=fixture(v);e.today="2027-01-01";
+    const e=fixture(v);
+    e.today=v.name==="quarterly"?"2027-02-15"
+      :v.name==="monthly-days"?"2027-01-10":"2027-01-15";
     const decision=planPhaseBNativeFutureOnlyMove(e);
     assert.equal(decision.accepted,true,decision.reason);
     assert.equal(decision.plan.sourceRule,v.rule);
@@ -61,6 +63,7 @@ for(const v of variants){
 test("reject provider history loss or altered instance without rewriting source",()=>{
   const e=fixture();
   const faultCases=[
+    {today:"2027-01-01"},
     {historicalInstances:[]},
     {historyInventoryComplete:false},
     {exceptionInventoryComplete:false},
