@@ -1,5 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Transform: AWS::Serverless-2016-10-31
+# Resolve stack parameters before SAM computes published-version fingerprints.
+# Otherwise a parameter-only gate change updates $LATEST but leaves live aliases
+# pinned to versions with the old gate value.
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
 Description: Durable Google Calendar and Todoist synchronization owned by todoist-calendar-sync.
 
 Parameters:
