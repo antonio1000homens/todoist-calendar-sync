@@ -156,6 +156,26 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           <p>Classification: {preview.classification} · Profile: {preview.profile} · fence owned: {preview.fenceOwned?"yes":"no"} · leases: {preview.leaseCount}</p>
           <p>Provider items absent: {preview.providerItemsAbsent?"yes":"no"} · attributable state absent: {preview.stateRowsAbsent?"yes":"no"}</p>
           {preview.blockers?.length>0&&<ul>{preview.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>}
+          {preview.evidenceChecks&&!preview.allowed&&<details className="erasure-results">
+            <summary>Why is guarded recovery blocked? (read-only checks)</summary>
+            <p>These comparisons explain the restriction; they do not authorize admission, deletion or fence release.</p>
+            <ul>{([
+              ["No provider deletion recorded",preview.evidenceChecks.originalPreWritePhase],
+              ["Original confirmation integrity",preview.evidenceChecks.originalConfirmationIntact],
+              ["Cross-profile audit complete",preview.evidenceChecks.auditComplete],
+              ["Fresh inspection internally consistent",preview.evidenceChecks.freshPreviewSelfConsistent],
+              ["Work provider snapshot unchanged",preview.evidenceChecks.primaryProviderMatches],
+              ["Original preview fingerprint unchanged",preview.evidenceChecks.originalPreviewMatches],
+              ["Todoist task unchanged",preview.evidenceChecks.todoistTaskMatches],
+              ["Calendar event unchanged",preview.evidenceChecks.calendarEventMatches],
+              ["Todoist mapping comments unchanged",preview.evidenceChecks.commentsMatch],
+              ["Project comment identities unchanged",preview.evidenceChecks.projectCommentIdsMatch],
+              ["Calendar aliases unchanged",preview.evidenceChecks.knownCalendarAliasesMatch],
+              ["DynamoDB state inventory unchanged",preview.evidenceChecks.stateInventoryMatches],
+            ] as Array<[string,boolean]>).map(([label,passed])=>
+              <li key={label} className={passed?"":"warning"}>{label}: {passed?"passed":"changed or unverified"}</li>)}</ul>
+            <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
+          </details>}
           {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation()}>Request recovery confirmation</button>}
         </>}
         <h4>Post-write evidence (read-only)</h4>
