@@ -387,7 +387,8 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
       operationId:stage.operationId,reason:error instanceof Error?error.message:String(error),
     });
     throw error;
-    } finally {
+  }
+  } finally {
     await releaseWriterLeases();
   }
 }
