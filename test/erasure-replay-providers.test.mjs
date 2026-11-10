@@ -4,6 +4,7 @@ import {documentClient} from "../dist/dynamodb-capacity.js";
 import {calendarReplaySourceIds,guardReplayProviderClients} from "../dist/erasure-replay-providers.js";
 import {ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 import {RetirementDispositionBlockedError} from "../dist/recurrence-retirement-disposition.js";
+import {serializeDeletionTombstoneComment} from "../dist/mapping-comments.js";
 
 function configure(t,values){
   const previous=Object.fromEntries(Object.keys(values).map(k=>[k,process.env[k]]));
@@ -24,6 +25,7 @@ function fixture(){
     todoist:{
       async upsertTask(...args){calls.push(["todoist.upsertTask",...args]);return {id:"task-new"};},
       async createTaskOnce(...args){calls.push(["todoist.createTaskOnce",...args]);return {id:"task-new"};},
+      async updateComment(...args){calls.push(["todoist.updateComment",...args]);},
     },
   });
   return {clients,calls};
@@ -70,6 +72,35 @@ test("recurrence retirement receipt still blocks matched provider writes without
   await assert.rejects(clients.calendar.deleteEvent("event-1"),RetirementDispositionBlockedError);
   await assert.rejects(clients.todoist.upsertTask({content:"changed"},"task-1"),RetirementDispositionBlockedError);
   assert.deepEqual(reads,["RETIREMENT#work#EVENT#event-1","RETIREMENT#work#TASK#task-1"]);
+  assert.deepEqual(calls,[]);
+});
+
+test("project tombstone update is admitted using its task and Calendar identity",async t=>{
+  configure(t,{STATE_TABLE_NAME:"test-state",ERASURE_REPLAY_BARRIER_VERSION:"0",
+    RETIREMENT_DISPOSITION_VERSION:"1"});
+  const reads=[];
+  t.mock.method(documentClient,"send",async command=>{
+    reads.push(command.input.Key.pk);
+    return {};
+  });
+  const tombstone=serializeDeletionTombstoneComment({schemaVersion:1,profile:"work",projectId:"project-work",
+    taskId:"task-1",eventIds:["event-1","master-1"],createdAt:"2026-11-10T12:00:00.000Z",
+    expiresAt:"2026-11-28T12:00:00.000Z"});
+  const {clients,calls}=fixture();
+  await clients.todoist.updateComment("comment-1",tombstone);
+  assert.deepEqual(reads,["RETIREMENT#work#TASK#task-1","RETIREMENT#work#EVENT#event-1",
+    "RETIREMENT#work#EVENT#master-1"]);
+  assert.deepEqual(calls.map(call=>call[0]),["todoist.updateComment"]);
+});
+
+test("project tombstone update rejects a mismatched profile before the provider call",async t=>{
+  configure(t,{STATE_TABLE_NAME:"test-state",ERASURE_REPLAY_BARRIER_VERSION:"0",
+    RETIREMENT_DISPOSITION_VERSION:"1"});
+  const {clients,calls}=fixture();
+  const tombstone=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId:"project-home",
+    taskId:"task-1",eventIds:["event-1"],createdAt:"2026-11-10T12:00:00.000Z",
+    expiresAt:"2026-11-28T12:00:00.000Z"});
+  await assert.rejects(clients.todoist.updateComment("comment-1",tombstone),ErasureReplayUnavailableError);
   assert.deepEqual(calls,[]);
 });
 

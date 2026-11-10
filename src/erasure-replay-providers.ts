@@ -6,7 +6,7 @@
  * Callers must hold the applicable erasure writer leases; these checks alone
  * do not make external HTTP mutations transactional with marker installation.
  */
-import {parseMappingComment} from "./mapping-comments.js";
+import {parseDeletionTombstoneComment, parseMappingComment} from "./mapping-comments.js";
 import { assertRetirementAdmissionIfEnabled, retirementDispositionEnabled } from "./recurrence-retirement-disposition.js";
 import {
   assertReplayAdmission, ErasureReplayUnavailableError, mappingReplayIdentity, replayAdmissionEnabled,
@@ -52,7 +52,14 @@ function eventIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdent
 }
 function commentIdentity(profile:Profile,content:unknown):ReplayIdentity {
   if(typeof content!=="string")throw new ErasureReplayUnavailableError("Unidentifiable Todoist comment mutation");
-  const parsed=parseMappingComment({id:"replay-admission",content});
+  const comment={id:"replay-admission",content};
+  const tombstone=parseDeletionTombstoneComment(comment);
+  if(tombstone) {
+    if(tombstone.profile!==profile)
+      throw new ErasureReplayUnavailableError("Unidentifiable or wrong-profile project comment mutation");
+    return {profile,taskId:tombstone.taskId,eventIds:tombstone.eventIds};
+  }
+  const parsed=parseMappingComment(comment);
   if(!parsed||"error" in parsed||parsed.payload.profile!==profile)
     throw new ErasureReplayUnavailableError("Unidentifiable or wrong-profile project comment mutation");
   return mappingReplayIdentity(parsed.payload);
