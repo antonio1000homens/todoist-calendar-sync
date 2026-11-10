@@ -531,6 +531,12 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
+        # DynamoDBCrudPolicy does not grant TransactWriteItems; recovery
+        # relies on exact conditional operation/fence/epoch transactions.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt SyncState.Arn
         - SQSPollerPolicy:
             QueueName: !GetAtt ErasureOperationQueue.QueueName
         - SQSSendMessagePolicy:
@@ -591,6 +597,12 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref SyncState
+        # DynamoDBCrudPolicy does not grant TransactWriteItems; recovery
+        # relies on exact conditional operation/fence/epoch transactions.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt SyncState.Arn
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ErasureOperationQueue.QueueName
         - Statement:
