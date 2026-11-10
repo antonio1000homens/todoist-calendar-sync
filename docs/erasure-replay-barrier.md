@@ -72,6 +72,42 @@ npm run cleanup:erasure-tombstones -- --profile=work --apply \
 
 The apply path re-reads each candidate and deletes only the unchanged, expired comment in the configured project. It does not scan or delete DynamoDB rows, task comments, active markers, or unrelated project comments.
 
+### Current-runtime retirement-readiness evidence (10 November 2026)
+
+A read-only check of the `todoist-calendar-sync` CloudFormation stack in
+`eu-west-2` found `UPDATE_COMPLETE` and `ErasureExecutionEnabled=false`.
+All seven current Lambda functions and both `live` aliases had **no**
+`ERASURE_REPLAY_BARRIER_VERSION`, `ERASURE_REPLAY_HMAC_KEYS` or
+`ERASURE_REPLAY_HMAC_CURRENT_KEY` environment setting. Strongly consistent
+DynamoDB queries of the exact `ERASURE_REPLAY#home`,
+`ERASURE_REPLAY#antonio` and `ERASURE_REPLAY#work` partitions each returned
+zero records. No keys, task IDs or event IDs were retrieved or logged.
+
+Repeat the **current-runtime**, read-only check before retiring the remaining
+reader or reviewing a rollback:
+
+```bash
+npm run audit:legacy-hmac-retirement -- \
+  --profile=<AWS_PROFILE> \
+  --expected-account=<ACCOUNT_ID> \
+  --region=eu-west-2 \
+  --stack=todoist-calendar-sync
+```
+
+The command validates the exact AWS account, discovers the stack's DynamoDB
+table and Lambda functions, queries the three HMAC partitions, and reads
+`$LATEST`, active aliases and any weighted alias targets. It returns only
+boolean HMAC configuration presence, no environment values or marker identity.
+Any marker, configured legacy setting or incomplete read blocks readiness.
+
+**This is not the full #347 invoker or rollback audit.** The tool deliberately
+does not enumerate every historical published Lambda version, independent
+stacks/accounts, IAM callers, CloudTrail access, or pre-existing marker rows
+stored under unexpected partition keys. Zero recognized records and a disabled
+gate alone do **not** permit deleting the admission reader, dropping the
+qualified-version Deny boundary, enabling exceptional erasure, unfencing a
+recovery operation or replaying queued deliveries.
+
 ## Legacy HMAC admission compatibility (disabled)
 
 The permanent-DynamoDB-HMAC **writer, orphan installer and staged post-write marker/fence release implementation have been retired**. They have no active production callers and are not part of #349's bounded 18-day project-comment tombstone workflow. The separate current `atomicConfirmedErasureCompletion` transaction is retained and writes **no permanent HMAC replay identity**.
