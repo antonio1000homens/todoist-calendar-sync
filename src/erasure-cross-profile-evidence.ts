@@ -19,7 +19,6 @@ type ProviderPair={
   };
   todoist:{
     getTask(taskId:string):Promise<TodoistTask>;
-    listAllTasksForErasureAudit():Promise<TodoistTask[]>;
     listAllProjectCommentsForErasureAudit(snapshotPromise?:Promise<{
       projectComments?:TodoistCommentRecord[];projectIds?:string[];
     }|undefined>):Promise<{
@@ -27,7 +26,7 @@ type ProviderPair={
       complete?:boolean;unavailableProjectCommentCount?:number;
     }>;
     listAllTaskCommentsForErasureAudit?():Promise<{comments:TodoistCommentRecord[];
-      projectComments?:TodoistCommentRecord[];projectIds?:string[];fullSyncDateUtc:string}>;
+      projectComments?:TodoistCommentRecord[];tasks?:TodoistTask[];projectIds?:string[];fullSyncDateUtc:string}>;
     listTaskComments(taskId:string):Promise<TodoistCommentRecord[]>;
   };
 };
@@ -326,10 +325,9 @@ export async function observeCrossProfileErasureEvidence(input:{
     })();
     const taskCommentsPromise=taskCommentAudit
       ?taskCommentAudit.call(profileReaders[profile].todoist):Promise.resolve(undefined);
-    const [projectAudit,calendarAudit,tasks,taskComments]=await Promise.all([
+    const [projectAudit,calendarAudit,taskComments]=await Promise.all([
       profileReaders[profile].todoist.listAllProjectCommentsForErasureAudit(taskCommentsPromise),
       calendarInventoryPromise,
-      profileReaders[profile].todoist.listAllTasksForErasureAudit(),
       taskCommentsPromise,
     ]);
     if(!projectAudit||!Array.isArray(projectAudit.projects)||!Array.isArray(projectAudit.comments))
@@ -350,8 +348,10 @@ export async function observeCrossProfileErasureEvidence(input:{
     projectInventoryFingerprints[profile]=fingerprint(projectAudit.projects);
     projectCommentInventoryComplete[profile]=projectAudit.complete!==false;
     unavailableProjectCommentCounts[profile]=projectAudit.unavailableProjectCommentCount||0;
+    if(!Array.isArray(taskComments?.tasks))
+      throw new Error("Todoist full sync task inventory is unavailable");
     taskInventories[profile]=new Map();
-    for(const task of tasks) {
+    for(const task of taskComments.tasks) {
       if(!task||!validId(task.id))throw new Error("Todoist audit inventory contains an invalid task");
       const previous=taskInventories[profile].get(task.id);
       if(previous&&JSON.stringify(previous)!==JSON.stringify(task))

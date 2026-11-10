@@ -74,7 +74,7 @@ function readers(options={}) {
       async getTask(){throw denied();},
       async listAllTasksForErasureAudit(){return[];},
       async listAllProjectCommentsForErasureAudit(){return {projects:[],comments:[],complete:true};},
-      async listAllTaskCommentsForErasureAudit(){return {comments:[],fullSyncDateUtc:new Date().toISOString()};},
+      async listAllTaskCommentsForErasureAudit(){return {comments:[],tasks:[],fullSyncDateUtc:new Date().toISOString()};},
       async listTaskComments(){return[];},
     },
   });

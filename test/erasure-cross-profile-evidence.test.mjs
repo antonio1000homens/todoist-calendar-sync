@@ -70,12 +70,12 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
           async listEventInstances(id){assert.equal(id,master);return [homeInstance];},
         },
         todoist:{
-          async listAllTasksForErasureAudit(){return activeTaskIds.map(id=>tasks.get(id));},
+          async listAllTasksForErasureAudit(){throw new Error("Cross-profile audit must reuse the full Sync snapshot");},
           async getTask(id){const value=activeTaskIds.includes(id)?tasks.get(id):undefined;if(!value)throw missing();return value;},
           async listAllProjectCommentsForErasureAudit(){return {
             projects:[{id:`project-${profile}`}],comments,
           };},
-          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date(Date.now()+taskCommentSnapshotOffsetMs).toISOString(),comments:profile==="work"?[{
+          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date(Date.now()+taskCommentSnapshotOffsetMs).toISOString(),tasks:activeTaskIds.map(id=>tasks.get(id)),comments:profile==="work"?[{
             id:"legacy-comment",task_id:taskTwo,content:"todoist-calendar-sync\ncalendarEventId=legacy-event",
           }]:[]};},
           async listTaskComments(id){return profile==="work"&&id===taskTwo?[{
@@ -139,6 +139,7 @@ test("profile read failures and bounded identity overflow fail closed",async()=>
     calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
       async getEvent(){throw missing();},async listEventInstances(){return[];}},
     todoist:{async listAllTasksForErasureAudit(){return[];},async getTask(){throw missing();},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],tasks:[],fullSyncDateUtc:new Date().toISOString()};},
       async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},async listTaskComments(){return[];}},
   });
   await assert.rejects(observeCrossProfileErasureEvidence({taskId:"task-one",rows:[],fullRows:[],readerForProfile:async profile=>{
@@ -173,7 +174,7 @@ test("stale Todoist task-comment full-sync snapshots cannot establish absence",a
       async getEvent(){throw missing();},async listEventInstances(){return[];}},
     todoist:{async listAllTasksForErasureAudit(){return[{id:taskOne,content:"task"}];},
       async getTask(id){return{id,content:"task"};},async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
-      async listAllTaskCommentsForErasureAudit(){return{comments:[],fullSyncDateUtc:new Date(Date.now()-6*60_000).toISOString()};},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],tasks:[{id:taskOne,content:"task"}],fullSyncDateUtc:new Date(Date.now()-6*60_000).toISOString()};},
       async listTaskComments(){return[];}},
   });
   const report=await observeCrossProfileErasureEvidence({taskId:taskOne,rows:[],fullRows:[],readerForProfile:reader});
@@ -189,6 +190,7 @@ test("Todoist 429/5xx direct identity reads fail the cross-profile audit closed"
       calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
         async getEvent(){throw missing();},async listEventInstances(){return[];}},
       todoist:{async listAllTasksForErasureAudit(){return[];},
+        async listAllTaskCommentsForErasureAudit(){return{comments:[],tasks:[],fullSyncDateUtc:new Date().toISOString()};},
         async getTask(){throw missing(status);},async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
         async listTaskComments(){return[];}},
     });
@@ -204,7 +206,7 @@ test("Todoist task-comment 404 is retained as incomplete provenance without abor
       async getEvent(){throw missing();},async listEventInstances(){return[];}},
     todoist:{async listAllTasksForErasureAudit(){return[];},async getTask(){throw missing();},
       async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},
-      async listAllTaskCommentsForErasureAudit(){return{comments:[],fullSyncDateUtc:new Date().toISOString()};},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],tasks:[],fullSyncDateUtc:new Date().toISOString()};},
       async listTaskComments(){throw missing();}},
   });
   const report=await observeCrossProfileErasureEvidence({taskId:"deleted-task",rows:[],fullRows:[],readerForProfile:reader});
@@ -219,6 +221,7 @@ test("Calendar 410 remains ambiguous while Calendar 429/5xx fail the cross-profi
     calendar:{async listAllEventsForErasureAudit(){return[];},async listLinkedEventsByTodoistTaskId(){return[];},
       async getEvent(){throw missing(status);},async listEventInstances(){return[];}},
     todoist:{async listAllTasksForErasureAudit(){return[];},async getTask(){throw missing();},
+      async listAllTaskCommentsForErasureAudit(){return{comments:[],tasks:[],fullSyncDateUtc:new Date().toISOString()};},
       async listAllProjectCommentsForErasureAudit(){return{projects:[],comments:[]};},async listTaskComments(){return[];}},
   });
   const rows=[{pk:"EVENT#home#expired-event",sk:"MAP",profile:"home",eventId:"expired-event"}];
@@ -419,7 +422,7 @@ test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rej
   globalThis.fetch=async(raw,init)=>{
     const url=new URL(String(raw));calls.push({url,init});
     return new Response(JSON.stringify({full_sync:true,sync_token:"opaque-sync-token",
-      full_sync_date_utc:new Date().toISOString(),projects:[{id:"project-one"}],project_notes:[
+      full_sync_date_utc:new Date().toISOString(),items:[{id:"task-one",content:"task one"}],projects:[{id:"project-one"}],project_notes:[
         {id:"project-note-one",project_id:"project-one",content:"calendarEventId=project-event"},
       ],notes:[
       {id:"note-one",item_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
@@ -433,6 +436,7 @@ test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rej
       {id:"note-one",task_id:"task-one",content:"todoist-calendar-sync\ncalendarEventId=event-one",is_deleted:false},
       {id:"note-two",task_id:"task-two",content:"old mapping",is_deleted:true},
     ]);
+    assert.deepEqual(audit.tasks,[{id:"task-one",content:"task one"}]);
     assert.deepEqual(audit.projectIds,["project-one"]);
     assert.deepEqual(audit.projectComments,[{
       id:"project-note-one",project_id:"project-one",content:"calendarEventId=project-event",

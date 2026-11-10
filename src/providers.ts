@@ -631,22 +631,21 @@ export class Todoist {
     return this.readTasks(undefined);
   }
 
-  /** Complete read-only task-comment inventory from Todoist's full Sync snapshot. */
+  /** Complete active-task and comment inventory from one Todoist full Sync snapshot. */
   async listAllTaskCommentsForErasureAudit(): Promise<{
-    comments:TodoistCommentRecord[];projectComments:TodoistCommentRecord[];
+    comments:TodoistCommentRecord[];projectComments:TodoistCommentRecord[];tasks:TodoistTask[];
     projectIds:string[];fullSyncDateUtc:string;
   }> {
     const headers=new Headers({authorization:`Bearer ${this.token}`});
     headers.set("content-type","application/x-www-form-urlencoded");
-    // Todoist only exposes project_notes alongside notes in the full "all"
-    // resource response. Reuse that snapshot to avoid one REST comments call
-    // for every active project during cross-profile erasure audits.
+    // The full snapshot contains items, notes and project_notes. Reusing it
+    // avoids a second paginated task inventory and per-project comment reads.
     const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["all"])});
-    let snapshot: {full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;
+    let snapshot: {full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
       sync_token?:unknown;full_sync_date_utc?:unknown};
     for(let attempt=0;;attempt++) {
       try {
-        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;
+        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
           sync_token?:unknown;full_sync_date_utc?:unknown}>(
           await fetchProvider(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body},this.requestOptions));
         break;
@@ -660,10 +659,22 @@ export class Todoist {
       }
     }
     if(snapshot.full_sync!==true||typeof snapshot.sync_token!=="string"||!snapshot.sync_token
-      ||!Array.isArray(snapshot.notes)||!Array.isArray(snapshot.project_notes)||!Array.isArray(snapshot.projects)
+      ||!Array.isArray(snapshot.items)||!Array.isArray(snapshot.notes)||!Array.isArray(snapshot.project_notes)||!Array.isArray(snapshot.projects)
       ||typeof snapshot.full_sync_date_utc!=="string"
       ||!Number.isFinite(Date.parse(snapshot.full_sync_date_utc)))
       throw new Error("Todoist task-comment full sync was incomplete");
+    const tasks=new Map<string,TodoistTask>();
+    for(const value of snapshot.items) {
+      if(!value||typeof value!=="object")throw new Error("Todoist task full sync returned an invalid item");
+      const task=value as TodoistTask;
+      if(typeof task.id!=="string"||!task.id)
+        throw new Error("Todoist task full sync returned an unidentified item");
+      const previous=tasks.get(task.id);
+      if(previous&&JSON.stringify(previous)!==JSON.stringify(task))
+        throw new Error("Todoist task changed within its full sync snapshot");
+      tasks.set(task.id,task);
+      if(tasks.size>100000)throw new Error("Todoist task full sync exceeded the audit result limit");
+    }
     const comments=new Map<string,TodoistCommentRecord>();
     for(const value of snapshot.notes) {
       if(!value||typeof value!=="object")throw new Error("Todoist task-comment full sync returned an invalid note");
@@ -707,7 +718,7 @@ export class Todoist {
       if(projectIds.size>MAX_ERASURE_AUDIT_PROJECTS)
         throw new Error("Todoist project full sync exceeded the audit project limit");
     }
-    return {comments:[...comments.values()],projectComments:[...projectComments.values()],
+    return {comments:[...comments.values()],projectComments:[...projectComments.values()],tasks:[...tasks.values()],
       projectIds:[...projectIds],fullSyncDateUtc:snapshot.full_sync_date_utc};
   }
 
