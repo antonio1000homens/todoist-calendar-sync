@@ -227,10 +227,10 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
  * snapshots to a one-time token and revalidate before each worker transition. */
 function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:ErasurePreviewResult,
   checks:NonNullable<RecoveryPreview["evidenceChecks"]>,blockingReasons:readonly string[],
-  mappingStates:Array<{id:string;state:string}>,requireAllDisabled=true):boolean {
+  mappingStates:Array<{id:string;state:string}>,requireAllDisabled=true,allowApprovedRecovery=false):boolean {
   const original=operation.actionPlan.calendarEvent,current=snapshot.actionPlan.calendarEvent;
   return blockingReasons.length===0
-    && !operation.recovery&&!operation.postwriteReview
+    && (!operation.recovery||allowApprovedRecovery)&&!operation.postwriteReview
     && operation.selectedActions.deleteCalendar===true
     && snapshot.crossProfileEvidence!==undefined
     && checks.originalPreWritePhase&&checks.originalConfirmationIntact
@@ -749,7 +749,7 @@ export class ErasureRecoveryService {
     const driftSafelyApproved=recovery.mode==="calendar_drift_cancel"
       &&typeof recovery.approvedCalendarDriftCommitment==="string"
       &&calendarOnlyPreWriteDriftCandidate(op,snapshot,
-        readOnlyRecoveryEvidenceChecks(op,snapshot),[],states,false)
+        readOnlyRecoveryEvidenceChecks(op,snapshot),[],states,false,true)
       &&calendarDriftCommitment(op,snapshot,recovery.epoch)===recovery.approvedCalendarDriftCommitment;
     return {safe:unchanged||driftSafelyApproved,mappings:mapped};
   }
