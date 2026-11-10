@@ -356,7 +356,15 @@ export class ErasureRecoveryService {
       throw Object.assign(new Error("Only a persisted review_required erasure can be inspected for recovery"),{status:409});
     const blockers=validateLifecycle(op);
     // Read each source even if another is blocked; never issue confirmation on a partial read or exception.
-    const readSnapshot=options.knownIdentityOnly&&this.adapters.readKnownTargetSnapshot
+    // A timed-out claim on the very first project-comment tombstone is
+    // recoverable only before provider deletion can begin. For this one exact
+    // lifecycle shape, the immutable operation already binds the target-only
+    // provider snapshot; re-reading every profile's full task inventory adds
+    // no evidence to the no-write proof and can exhaust the review deadline.
+    // The exact target, comment set and full DDB inventory are still reread,
+    // and every later deletion stage continues to require the full audit.
+    const knownTargetOnly=options.knownIdentityOnly||initialProjectCommentAttempt(op);
+    const readSnapshot=knownTargetOnly&&this.adapters.readKnownTargetSnapshot
       ?this.adapters.readKnownTargetSnapshot.bind(this.adapters):this.adapters.readSnapshot.bind(this.adapters);
     const [control,mappings,snapshot]=await Promise.all([
       readControl(this.db,op.profile),this.adapters.listWorkerMappings(),readSnapshot(op),

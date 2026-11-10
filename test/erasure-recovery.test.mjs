@@ -472,8 +472,15 @@ test("timed-out first project-comment attempt is proof of no deletion when every
   assert.equal(inspection.preview.classification,"pre_write");
   assert.equal(inspection.preview.allowed,true);
   assert.equal(inspection.preview.evidenceChecks.originalPreWritePhase,true);
+  assert.equal(external.knownTargetCalls,1,
+    "the exact first-comment attempt uses the target snapshot already bound to the original confirmation");
+  assert.equal(external.providerCalls,0,
+    "pre-write recovery does not wait on unrelated full cross-profile task inventories");
   const recovery=await service.startAutomaticPreWriteRecovery("op-recovery");
   assert.deepEqual(recovery,{queued:true,blockerCount:0});
+  assert.equal(external.knownTargetCalls,3,
+    "confirmation and apply each repeat the exact target-only proof");
+  assert.equal(external.providerCalls,0);
   assert.equal(operation.recovery.mode,"strict_pre_write");
   assert.equal(operation.recovery.status,"queued");
   assert.ok(external.control.some(row=>row.sk==="FENCE"),"sync restoration worker owns fence release");
@@ -488,6 +495,10 @@ test("initial-comment recovery refuses recent claims, later stages, and any chan
   const later=timedOutProjectCommentFixture({stage:"todoist"});
   assert.equal((await later.service.inspect("op-recovery")).preview.allowed,false);
   assert.equal((await later.service.startAutomaticPreWriteRecovery("op-recovery")).queued,false);
+  assert.equal(later.external.knownTargetCalls||0,0,
+    "later deletion stages cannot use the target-only pre-write recovery path");
+  assert.equal(later.external.providerCalls,2,
+    "later stages repeat the complete cross-profile audit for inspection and confirmation");
 
   const drift=timedOutProjectCommentFixture();
   drift.external.snapshot.actionPlan={...drift.external.snapshot.actionPlan,
