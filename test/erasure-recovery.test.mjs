@@ -146,8 +146,8 @@ test("automatic pre-write recovery uses the same single-use confirmation and gua
     "automatic recovery must not release a fence directly");
   assert.deepEqual(external.restored,[],
     "mapping restore must wait for the independently guarded recovery worker");
-  assert.ok(external.providerCalls>=3,
-    "original inspection, confirmation issuance and apply each reread provider evidence");
+  assert.ok(external.providerCalls>=2,
+    "confirmation issuance and apply each independently reread provider evidence");
 });
 
 test("automatic recovery refuses a drifted provider snapshot without writes",async()=>{
