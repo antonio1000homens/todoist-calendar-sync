@@ -488,8 +488,12 @@ export class ProjectAwareSynchronizer {
     // mapping/master intact until that migration can be verified; never let
     // the ordinary rolling projection writer flatten this Phase B recurrence.
     if (["move_projection", "delete_projection", "create_projection"].includes(transition.action)) {
+      // Destination identity is checked once by applyProjectMove's preflight;
+      // never consume that lookup early or repeat it after source deletion.
+      const nativeSourceProfiles: Profile[] = ["home", "antonio", "work"]
+        .filter(profile => transition.action !== "move_projection" || profile !== transition.toProfile);
       const nativeSource = await this.phaseBNativeSource(task.id,
-        [mapping?.profile, transition.fromProfile, "home", "antonio", "work"]
+        [mapping?.profile, transition.fromProfile, ...nativeSourceProfiles]
           .filter((value): value is Profile => Boolean(value)));
       if (mapping?.todoistPhaseBVersion === 1 || nativeSource) {
         const fromProfile = nativeSource?.profile || mapping?.profile || transition.fromProfile || delivery.profile;
