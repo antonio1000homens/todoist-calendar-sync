@@ -146,6 +146,7 @@ export function verifyInitialPhaseBCalendarWrite(
     return reject("calendar_master_or_instances_missing");
   const shared = master.extendedProperties?.shared;
   if (shared?.syncRecurrenceOwner !== "todoist"
+    || shared?.todoistPhaseBVersion !== "1"
     || shared?.taskId !== task.id
     || shared?.todoistRecurrence !== todoistRecurrenceKey(task)
     || shared?.todoistAnchorStart !== plan.anchor.start)

@@ -183,6 +183,28 @@ export class StateRepository {
     return false;
   }
 
+  /** Failed/ambiguous Phase B creation uses the existing durable pair controls.
+   * No tombstone or permanent historical mapping is created. An operator may
+   * release the exact pair only after independently verifying provider state. */
+  async quarantinePhaseBNative(profile: Profile, taskId: string, eventId: string, reason: string): Promise<void> {
+    if (!taskId || !eventId || !reason) throw new Error("Phase B quarantine requires exact identities and reason");
+    const operationId = `phase-b-native-${createHash("sha256").update(JSON.stringify([profile, taskId, eventId])).digest("hex")}`;
+    await new SyncControls().claim([
+      { profile, side: "todoist", id: taskId },
+      { profile, side: "calendar", id: eventId },
+    ], operationId);
+    await this.audit(profile, "todoist_phase_b_native_pair_quarantined", { taskId, eventId, reason, operationId });
+  }
+
+  /** Manual/verified recovery only: never release on an ordinary webhook. */
+  async clearPhaseBNativeQuarantine(profile: Profile, taskId: string, eventId: string): Promise<void> {
+    const operationId = `phase-b-native-${createHash("sha256").update(JSON.stringify([profile, taskId, eventId])).digest("hex")}`;
+    const controls = new SyncControls();
+    for (const side of ["todoist", "calendar"] as const) {
+      await controls.release({profile, side, id: side === "todoist" ? taskId : eventId}, operationId);
+    }
+  }
+
   async pendingRefreshRefs(refs: Array<{profile:Profile; side:"todoist"|"calendar"; id:string}>) {
     return new SyncControls().pendingRefreshRefs(refs);
   }

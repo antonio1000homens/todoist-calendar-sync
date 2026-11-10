@@ -2708,6 +2708,22 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "todoist_pair_sync_control_blocked", { taskId: task.id, eventId: existingEvent?.id || mapping?.eventId });
     }
 
+    // A provider lookup may recreate a temporary unmarked mapping after a
+    // create-before-mapping interruption. Route tagged masters through the
+    // native verifier, never through ordinary canonical-state recovery.
+    if (lifecycle.action === "upsert"
+      && existingEvent?.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
+      if (existingEvent.extendedProperties.shared.taskId !== task.id) {
+        return this.state.audit(delivery.profile, "todoist_phase_b_native_identity_conflict", {
+          taskId: task.id, eventId: existingEvent.id,
+        });
+      }
+      const nativeMaster = existingEvent.recurringEventId
+        ? await calendar.getEvent(existingEvent.recurringEventId) : existingEvent;
+      await this.preserveTodoistPhaseBNativeMaster(delivery, task, nativeMaster, mapping, todoist);
+      return;
+    }
+
     if (lifecycle.action === "upsert" && mapping?.recurrenceOwner === "todoist" && mapping.masterEventId) {
       let phaseBMaster: CalendarEvent | undefined;
       try { phaseBMaster = await calendar.getEvent(mapping.masterEventId); }
@@ -2778,32 +2794,51 @@ export class Synchronizer {
           todoistAnchorTimeZone: nativePlan.anchor.timeZone,
           todoistPhaseBVersion: "1",
         });
-        const creation = await calendar.createTodoistPhaseBNativeMasterOnce(nativeEvent);
+        // A lost POST response is not proof no master exists. Fence the exact
+        // deterministic identity before any retry can rediscover/adopt it.
+        let creation: Awaited<ReturnType<typeof calendar.createTodoistPhaseBNativeMasterOnce>>;
+        try {
+          creation = await calendar.createTodoistPhaseBNativeMasterOnce(nativeEvent);
+        } catch (error) {
+          await this.state.quarantinePhaseBNative(delivery.profile, task.id, nativeEvent.id,
+            "native_creation_outcome_unknown");
+          await this.state.audit(delivery.profile, "todoist_phase_b_native_create_quarantined", {
+            taskId: task.id, eventId: nativeEvent.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
         const rejectCreatedMaster = async (reason: string): Promise<void> => {
           let rollback = "not_owned";
           const createdShared = creation.event.extendedProperties?.shared;
           const exactUncommittedIdentity = creation.event.id === nativeEvent.id
-            && createdShared?.taskId === task?.id
+            && createdShared?.taskId === task.id
             && createdShared?.todoistPhaseBVersion === "1"
             && createdShared?.todoistAnchorStart === nativePlan.anchor.start
             && JSON.stringify(creation.event.recurrence) === JSON.stringify(nativeEvent.recurrence);
-if (exactUncommittedIdentity && creation.created) {
+          // A previous delivery's 409 conflict never authorizes this delivery
+          // to delete the pre-existing master, even on verification failure.
+          if (exactUncommittedIdentity && creation.created && creation.event.etag) {
             try {
-              await calendar.deleteEvent(nativeEvent.id);
+              await calendar.deleteEventIfUnchanged(nativeEvent.id, creation.event.etag);
               rollback = "deleted";
             } catch (error) {
               rollback = "failed";
-              await this.state.audit(delivery.profile, "todoist_phase_b_native_rollback_quarantined", {
-                taskId: phaseBTask.id, eventId: nativeEvent.id, reason: "calendar_delete_failed",
-              });
             }
             if (rollback === "deleted") {
               try { await this.state.recordMutation(delivery.profile); }
               catch { rollback = "deleted_budget_record_failed"; }
             }
           }
+          if (rollback !== "deleted") {
+            // Includes 409 conflicts, ETag precondition failures, missing
+            // ETags and mutation-budget uncertainty. Never fall back to
+            // rolling projection while provider ownership is unresolved.
+            await this.state.quarantinePhaseBNative(delivery.profile, task.id, nativeEvent.id,
+              `native_write_rejected:${reason}:${rollback}`);
+          }
           await this.state.audit(delivery.profile, "todoist_phase_b_native_write_rejected", {
-            taskId: phaseBTask.id, eventId: nativeEvent.id, reason, rollback,
+            taskId: task.id, eventId: nativeEvent.id, reason, rollback,
           });
         };
         if (creation.created) {
