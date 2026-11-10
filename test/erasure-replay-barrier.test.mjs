@@ -1,65 +1,42 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  assertReplayAdmission, ErasureReplayBlockedError,
-  ErasureReplayUnavailableError, atomicConfirmedErasureCompletion, verifyConfirmedErasureCompletion,
+  ErasureReplayUnavailableError, atomicConfirmedErasureCompletion,
+  verifyConfirmedErasureCompletion, replayAdmissionEnabled,
+  assertReplayAdmission, mappingReplayIdentity,
 } from "../dist/erasure-replay-barrier.js";
 
-const original={table:process.env.STATE_TABLE_NAME,protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
-  current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
-const oldKey=Buffer.alloc(32,1).toString("base64");
-const newKey=Buffer.alloc(32,2).toString("base64");
-process.env.STATE_TABLE_NAME="test-state";
-process.env.ERASURE_PROTOCOL_VERSION="1";
-process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({old:oldKey,current:newKey});
-process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="current";
-test.after(()=>{
-  for(const [env,value] of [
-    ["STATE_TABLE_NAME",original.table],
-    ["ERASURE_PROTOCOL_VERSION",original.protocol],
-    ["ERASURE_REPLAY_HMAC_KEYS",original.keys],
-    ["ERASURE_REPLAY_HMAC_CURRENT_KEY",original.current],
-  ]) if(value===undefined)delete process.env[env];else process.env[env]=value;
-});
-
-test("admission checks each historical key with strongly consistent reads and fails closed on marker",async()=>{
-  const reads=[];
-  const db={async send(command) {
-    assert.equal(command.constructor.name,"GetCommand");
-    assert.equal(command.input.ConsistentRead,true);
-    reads.push(command.input.Key);
-    if(reads.length===2)return {Item:{markerVersion:1}};
-    return {};
-  }};
-  await assert.rejects(assertReplayAdmission({profile:"work",taskId:"deleted-task"},db),ErasureReplayBlockedError);
-  assert.equal(reads.length,2);
-  assert.equal(new Set(reads.map(x=>x.pk)).size,1);
-  assert.equal(new Set(reads.map(x=>x.sk)).size,2,"historical key IDs must remain readable");
-});
-
-test("unavailable storage, absent HMAC keyring and unidentified identity are denied without provider writes",async()=>{
-  const identity={profile:"work",taskId:"deleted-task"};
-  const unavailable={async send(){throw new Error("provider unavailable");}};
-  await assert.rejects(assertReplayAdmission(identity,unavailable),ErasureReplayUnavailableError);
-  const keys=process.env.ERASURE_REPLAY_HMAC_KEYS;
-  delete process.env.ERASURE_REPLAY_HMAC_KEYS;
-  try {
-    await assert.rejects(assertReplayAdmission(identity,{async send(){throw new Error("must not read");}}),ErasureReplayUnavailableError);
-  } finally {
-    process.env.ERASURE_REPLAY_HMAC_KEYS=keys;
+test("legacy HMAC replay gate stays disabled and any attempted reactivation fails closed",async t=>{
+  const prior=process.env.ERASURE_REPLAY_BARRIER_VERSION;
+  t.after(()=>{if(prior===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=prior;});
+  for(const disabled of [undefined,"","0"]) {
+    if(disabled===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=disabled;
+    assert.equal(replayAdmissionEnabled(),false);
   }
-  await assert.rejects(assertReplayAdmission({profile:"work"},{}),ErasureReplayUnavailableError);
-  await assert.rejects(assertReplayAdmission({profile:"work",eventIds:["x","x"]},{}),ErasureReplayUnavailableError);
+  for(const unexpected of ["1","2","unrecognised"]) {
+    process.env.ERASURE_REPLAY_BARRIER_VERSION=unexpected;
+    assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
+  }
 });
 
-test("calendar IDs are profile-scoped: unrelated profile event IDs are not rejected",async()=>{
-  const reads=[];
-  await assertReplayAdmission({profile:"home",eventIds:["shared-calendar-id"]},{
-    async send(command){reads.push(command.input.Key);return {};}
+test("direct HMAC marker admission is retired and performs no DynamoDB reads",async()=>{
+  let reads=0;
+  await assert.rejects(assertReplayAdmission({profile:"work",taskId:"task-1"},{
+    async send(){reads++;throw new Error("a legacy marker must not be read");}
+  }),ErasureReplayUnavailableError);
+  assert.equal(reads,0);
+});
+
+test("mapping identity retains all known recurrence aliases for retirement admission",()=>{
+  assert.deepEqual(mappingReplayIdentity({
+    profile:"work",taskId:"task-203",eventId:"event-203",
+    masterEventId:"master-203",activeInstanceId:"instance-203",
+  }),{
+    profile:"work",taskId:"task-203",
+    eventIds:["event-203","master-203","instance-203"],
   });
-  assert.equal(reads.length,4,"check calendar-scoped and legacy markers for both retained keys");
-  assert.ok(reads.every(row=>row.pk==="ERASURE_REPLAY#home"));
-  assert.ok(reads.every(row=>row.sk.startsWith("EVENT#")));
 });
 
 test("confirmed erasure releases its fence only against recorded project tombstones and writes no DynamoDB identity",async()=>{
