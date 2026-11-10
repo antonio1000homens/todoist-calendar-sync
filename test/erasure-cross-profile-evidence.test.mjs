@@ -23,6 +23,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   const workEvent=linked(eventTwo,taskTwo);
   const calendarByProfile={home:[homeMaster,homeEvent],antonio:[],work:[workEvent]};
   const calls=[],calendarDirectReads=[];
+  let taskCommentSnapshotsStarted=0;
   let taskCommentSnapshotOffsetMs=0;
   const observe=()=>observeCrossProfileErasureEvidence({
     taskId:taskOne,eventId:eventOne,
@@ -72,10 +73,13 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
         todoist:{
           async listAllTasksForErasureAudit(){throw new Error("Cross-profile audit must reuse the full Sync snapshot");},
           async getTask(id){const value=activeTaskIds.includes(id)?tasks.get(id):undefined;if(!value)throw missing();return value;},
-          async listAllProjectCommentsForErasureAudit(){return {
+          async listAllProjectCommentsForErasureAudit(){
+            assert.equal(taskCommentSnapshotsStarted,profiles.length,
+              "all profile task/comment snapshots start before project-comment inventory waits begin");
+            return {
             projects:[{id:`project-${profile}`}],comments,
           };},
-          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date(Date.now()+taskCommentSnapshotOffsetMs).toISOString(),tasks:activeTaskIds.map(id=>tasks.get(id)),comments:profile==="work"?[{
+          async listAllTaskCommentsForErasureAudit(){taskCommentSnapshotsStarted++;return {fullSyncDateUtc:new Date(Date.now()+taskCommentSnapshotOffsetMs).toISOString(),tasks:activeTaskIds.map(id=>tasks.get(id)),comments:profile==="work"?[{
             id:"legacy-comment",task_id:taskTwo,content:"todoist-calendar-sync\ncalendarEventId=legacy-event",
           }]:[]};},
           async listTaskComments(id){return profile==="work"&&id===taskTwo?[{
@@ -117,6 +121,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   taskCommentSnapshotOffsetMs=10_000;
   calls.length=0;
   calendarDirectReads.length=0;
+  taskCommentSnapshotsStarted=0;
   const repeated=await observe();
   assert.deepEqual(calls,profiles);
   assert.notEqual(repeated.profiles.work.taskCommentInventorySnapshotAt,

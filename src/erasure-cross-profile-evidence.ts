@@ -254,9 +254,21 @@ export async function observeCrossProfileErasureEvidence(input:{
     index(calendarByHistoryMaster[profile],event.extendedProperties?.shared?.syncHistoryMasterId);
     index(calendarBySeries[profile],event.iCalUID);
   };
+  // Start each profile's full Todoist snapshot as soon as its credentials are
+  // available. This audit needs all three inventories, but serially fetching
+  // them can consume the guarded-inspection deadline before the last profile
+  // is read. The evidence requirements remain unchanged and fail closed.
+  const taskCommentSnapshots=new Map<Profile,Promise<{
+    comments:TodoistCommentRecord[];projectComments?:TodoistCommentRecord[];tasks?:TodoistTask[];
+    projectIds?:string[];fullSyncDateUtc:string;
+  }|undefined>>();
+  await Promise.all(PROFILES.map(async profile=>{
+    const reader=await input.readerForProfile(profile);
+    profileReaders[profile]=reader;
+    const audit=reader.todoist.listAllTaskCommentsForErasureAudit;
+    taskCommentSnapshots.set(profile,audit?audit.call(reader.todoist):Promise.resolve(undefined));
+  }));
   for(const profile of PROFILES) {
-    profileReaders[profile]=await input.readerForProfile(profile);
-    const taskCommentAudit=profileReaders[profile].todoist.listAllTaskCommentsForErasureAudit;
     const calendarReader=profileReaders[profile].calendar;
     const calendarInventoryPromise=(async()=>{
       const declared=input.calendarProvenance?.profiles[profile];
@@ -323,8 +335,7 @@ export async function observeCrossProfileErasureEvidence(input:{
         directIdCount:all.filter(calendar=>!listed.some(item=>item.id===calendar.id)).length,
         unregisteredListedCount,inaccessibleCount,accessRoleConflicts};
     })();
-    const taskCommentsPromise=taskCommentAudit
-      ?taskCommentAudit.call(profileReaders[profile].todoist):Promise.resolve(undefined);
+    const taskCommentsPromise=taskCommentSnapshots.get(profile)!;
     const [projectAudit,calendarAudit,taskComments]=await Promise.all([
       profileReaders[profile].todoist.listAllProjectCommentsForErasureAudit(taskCommentsPromise),
       calendarInventoryPromise,
