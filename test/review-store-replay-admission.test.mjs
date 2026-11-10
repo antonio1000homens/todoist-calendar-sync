@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import test from "node:test";
 import { SSMClient } from "@aws-sdk/client-ssm";
 import { documentClient } from "../dist/dynamodb-capacity.js";
@@ -9,36 +8,38 @@ import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 import { profiles } from "../dist/config.js";
 import { Todoist } from "../dist/providers.js";
 
-const secret = Buffer.alloc(32, 41);
-function markerKey(profile, kind, id) {
-  const digest = createHmac("sha256", secret)
-    .update(JSON.stringify(["erasure-replay-v1", profile, kind, id])).digest("hex");
-  return `${kind}#v1#${digest}`;
-}
 function enableBarrier(t) {
-  const previous = {
-    barrier: process.env.ERASURE_REPLAY_BARRIER_VERSION,
-    protocol: process.env.ERASURE_PROTOCOL_VERSION,
-    keys: process.env.ERASURE_REPLAY_HMAC_KEYS,
-    current: process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
-    table: process.env.STATE_TABLE_NAME,
-  };
-  process.env.ERASURE_REPLAY_BARRIER_VERSION = "1";
-  process.env.ERASURE_PROTOCOL_VERSION = "1";
-  process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: secret.toString("base64") });
-  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
-  process.env.STATE_TABLE_NAME = "review-replay-admission-test";
-  t.mock.method(SSMClient.prototype, "send", async () => ({Parameter:{Value:"test-todoist-token"}}));
-  const projectCommentReader = t.mock.method(Todoist.prototype, "listProjectComments", async () => []);
-  t.after(() => {
-    for (const [key, value] of Object.entries({
-      ERASURE_REPLAY_BARRIER_VERSION: previous.barrier,
-      ERASURE_PROTOCOL_VERSION: previous.protocol,
-      ERASURE_REPLAY_HMAC_KEYS: previous.keys,
-      ERASURE_REPLAY_HMAC_CURRENT_KEY: previous.current,
-      STATE_TABLE_NAME: previous.table,
-    })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
-  });
+  const names=["ERASURE_REPLAY_BARRIER_VERSION","ERASURE_PROTOCOL_VERSION",
+    "RETIREMENT_DISPOSITION_VERSION","STATE_TABLE_NAME"];
+  const previous=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
+  process.env.RETIREMENT_DISPOSITION_VERSION="0";
+  process.env.STATE_TABLE_NAME="review-replay-admission-test";
+  t.mock.method(SSMClient.prototype,"send",async()=>({Parameter:{Value:"test-todoist-token"}}));
+  const projectId=profiles.home.todoistProjectId;
+  const createdAt=new Date().toISOString();
+  const expiresAt=new Date(Date.parse(createdAt)+18*24*60*60*1000).toISOString();
+  // Retired HMAC markers are not part of the current release contract.
+  // Each historical regression identity is represented by a bounded,
+  // exact existing-project tombstone rather than an imaginary DynamoDB row.
+  const erasedIds=[
+    "erased-context-task","erased-candidate-object","erased-master-alias",
+    "erased-embedded-master","erased-history-master","erased-candidate-task",
+    "erased-dismiss-task","erased-update-event","erased-cleanup-master",
+    "erased-closure-task","erased-case-task","erased-control-task",
+  ];
+  const comments=erasedIds.map((id,index)=>({
+    id:"erased-project-comment-"+index,project_id:projectId,
+    content:serializeDeletionTombstoneComment({
+      schemaVersion:1,profile:"home",projectId,taskId:id,
+      eventIds:[id],createdAt,expiresAt,
+    }),
+  }));
+  const projectCommentReader=t.mock.method(Todoist.prototype,"listProjectComments",async()=>comments);
+  t.after(()=>{for(const [name,value] of Object.entries(previous)){
+    if(value===undefined)delete process.env[name];else process.env[name]=value;
+  }});
   return projectCommentReader;
 }
 function decision(overrides = {}) {
@@ -103,12 +104,10 @@ test("decision context provider IDs are checked before a review case can be seed
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-context-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   await assert.rejects(new ReviewStore().observeDecision(decision({context: {providerTaskId: "erased-context-task"}})), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "no review state read or write may follow the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("manual decision candidate object IDs are checked before review seeding", async t => {
@@ -116,14 +115,12 @@ test("manual decision candidate object IDs are checked before review seeding", a
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-candidate-object")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(new ReviewStore().observeDecision(decision({context:{candidates:[
     {id:"erased-candidate-object",content:"opaque fixture",due:""},
   ]}})),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"the erased candidate is rejected before any review state access");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("mapping snapshot recurrence aliases are checked before a decision is persisted", async t => {
@@ -131,14 +128,12 @@ test("mapping snapshot recurrence aliases are checked before a decision is persi
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-master-alias")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const mapping = {profile:"home",taskId:"safe-task",eventId:"safe-occurrence",masterEventId:"erased-master-alias",
     activeInstanceId:"safe-occurrence",seriesId:"erased-master-alias",updatedAt:new Date().toISOString()};
   await assert.rejects(new ReviewStore().observeDecision(decision({mappingSnapshot:mapping})), ErasureReplayBlockedError);
-  assert.equal(calls.length, 5, "task, source, and legacy/current master markers are checked before persistence is blocked");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("queued repair admission walks embedded decision and review aliases", async t => {
@@ -146,8 +141,6 @@ test("queued repair admission walks embedded decision and review aliases", async
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-embedded-master")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {
@@ -157,7 +150,7 @@ test("queued repair admission walks embedded decision and review aliases", async
       masterEventId:"erased-embedded-master"}}},
   };
   await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
-  assert.equal(calls.length, 5, "embedded historical aliases are checked before the operation can resume");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 for (const [field, erasedId] of [
@@ -168,8 +161,6 @@ for (const [field, erasedId] of [
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", erasedId)) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {
@@ -177,8 +168,7 @@ for (const [field, erasedId] of [
     snapshots: [{ref:{profile:"home",side:"todoist",id:"safe-task"},[field]:erasedId}], itemPlan: [],
   };
   await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
-  assert.ok(calls.some(command => command.constructor.name === "GetCommand"
-    && command.input.Key.sk === markerKey("home", "EVENT", erasedId)));
+  assert.equal(calls.length,0,"nested aliases are rejected by the project-comment tombstone");
 });
 
 test("review admission checks recurring master aliases carried by history plans", async t => {
@@ -186,15 +176,13 @@ test("review admission checks recurring master aliases carried by history plans"
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-history-master")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {intent:{profile:"home",action:"link",taskId:"safe-task",eventId:"safe-event"},snapshots:[],itemPlan:[],
     case:{decision:{profile:"home",elapsedCalendarHistoryPlan:{taskId:"safe-task",eventId:"safe-event",
       recurringMasterId:"erased-history-master"}}}};
   await assert.rejects(assertRepairPreviewReplayAdmission(preview),ErasureReplayBlockedError);
-  assert.equal(calls.length,5,"the erased historical master is admitted before any repair state is read or written");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {
@@ -202,14 +190,12 @@ test("candidate IDs in conflict audit arrays are checked before an incident case
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-candidate-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const audit = { pk: "AUDIT#conflict", action: "todoist_snapshot_reconcile_unmapped_conflict",
     detail: { candidateTaskIds: ["erased-candidate-task"] }, createdAt: new Date().toISOString() };
   await assert.rejects(new ReviewStore().observeConflictIncident("home", "fingerprint", "incident", audit), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "no incident case or pointer may be written after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("dismissal refuses to mutate a review case that references an erased identity", async t => {
@@ -220,12 +206,10 @@ test("dismissal refuses to mutate a review case that references an erased identi
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-dismiss-task")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.dismissCase("case-1","acknowledged"),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"the case is not read or mutated after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("case status transitions refuse to mutate a case that references an erased identity", async t => {
@@ -236,12 +220,10 @@ test("case status transitions refuse to mutate a case that references an erased 
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-update-event")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
-  assert.equal(calls.length,2,"no case status write follows the legacy marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("deferred deletion cleanup refuses to update a case that references an erased identity", async t => {
@@ -252,12 +234,10 @@ test("deferred deletion cleanup refuses to update a case that references an eras
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-cleanup-master")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.noteVerifiedDeletionCleanupDeferred("case-1",new Date().toISOString()),ErasureReplayBlockedError);
-  assert.equal(calls.length,2,"no deferred-cleanup status write follows the legacy marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("verified-deleted case closure refuses an erased identity before cleanup reads", async t => {
@@ -268,12 +248,10 @@ test("verified-deleted case closure refuses an erased identity before cleanup re
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-closure-task")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.resolveVerifiedDeletedCase("case-1",{profile:"home",taskIds:["erased-closure-task"],eventIds:["safe-event"]}),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"no deletion evidence or review state is read after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("coalescing refuses to close an open case that references an erased candidate", async t => {
@@ -288,8 +266,6 @@ test("coalescing refuses to close an open case that references an erased candida
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-case-task")) return { Item: { markerVersion: 1 } };
     if (command.constructor.name === "QueryCommand" && command.input.KeyConditionExpression.startsWith("pk ="))
       return { Items: [{ incidentId: candidate.id }] };
     return {};
@@ -317,10 +293,8 @@ for (const [name, invoke] of syncControlWrites) test(`SyncControls refuses ${nam
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-control-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   await assert.rejects(invoke(new SyncControls()), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "only the strongly consistent replay-marker lookup may run");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });

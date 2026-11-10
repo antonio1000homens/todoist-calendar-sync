@@ -328,38 +328,33 @@ test("cleanup report rejects a mismatched ID without writing any audit record", 
   assert.deepEqual(fake.deletes, []);
 });
 
-test("apply migration holds a writer lease and checks replay markers before provider mutation", async (t) => {
-  const env = Object.fromEntries(["ERASURE_PROTOCOL_VERSION", "ERASURE_REPLAY_BARRIER_VERSION",
-    "ERASURE_REPLAY_HMAC_KEYS", "ERASURE_REPLAY_HMAC_CURRENT_KEY"].map(key => [key, process.env[key]]));
-  t.after(() => {
-    for (const [key, value] of Object.entries(env)) {
-      if (value === undefined) delete process.env[key]; else process.env[key] = value;
-    }
+test("unexpected legacy HMAC configuration fails migration closed after acquiring the writer lease",async t=>{
+  const previous=process.env.ERASURE_REPLAY_BARRIER_VERSION;
+  const priorProtocol=process.env.ERASURE_PROTOCOL_VERSION;
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
+  t.after(()=>{
+    if(previous===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=previous;
+    if(priorProtocol===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;
+    else process.env.ERASURE_PROTOCOL_VERSION=priorProtocol;
   });
-  process.env.ERASURE_PROTOCOL_VERSION = "1";
-  process.env.ERASURE_REPLAY_BARRIER_VERSION = "1";
-  process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: Buffer.alloc(32, 9).toString("base64") });
-  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
-  const sends = [];
-  t.mock.method(documentClient, "send", async command => {
+  const sends=[];
+  t.mock.method(documentClient,"send",async command=>{
     sends.push(command.constructor.name);
-    if (command.constructor.name === "GetCommand"
-      && String(command.input.Key?.pk).startsWith("ERASURE_REPLAY#")) return { Item: { markerVersion: 1 } };
-    if (["GetCommand", "TransactWriteCommand", "DeleteCommand"].includes(command.constructor.name)) return {};
-    throw new Error(`Unexpected DynamoDB command ${command.constructor.name}`);
+    if(["GetCommand","TransactWriteCommand","DeleteCommand"].includes(command.constructor.name))return {};
+    throw Error("Unexpected DynamoDB operation "+command.constructor.name);
   });
-
-  const state = new FakeState();
-  const fake = fakeClients();
-  const summary = await migrateProjectComments("home", [mapping()], state, fake.clients, true);
-  assert.equal(summary.failures, 1);
-  assert.equal(fake.creates, 0);
-  assert.deepEqual(fake.deletes, []);
-  assert.deepEqual(state.saved, []);
-  assert.ok(sends.includes("TransactWriteCommand"), "writer lease was acquired");
-  assert.ok(sends.includes("DeleteCommand"), "writer lease was released");
-  assert.ok(sends.includes("GetCommand"), "replay marker was read");
-  assert.ok(state.audits.some(entry => String(entry.detail?.error || "").includes("Erasure replay admission refused")));
+  const state=new FakeState(),fake=fakeClients();
+  const summary=await migrateProjectComments("home",[mapping()],state,fake.clients,true);
+  assert.equal(summary.failures,1);
+  assert.equal(fake.creates,0);
+  assert.deepEqual(fake.deletes,[]);
+  assert.deepEqual(state.saved,[]);
+  assert.ok(sends.includes("TransactWriteCommand"),"writer lease must be acquired");
+  assert.ok(sends.includes("DeleteCommand"),"writer lease must be released");
+  assert.equal(sends.includes("PutCommand"),false,"no mapping writes allowed");
+  assert.ok(state.audits.some(entry=>String(entry.detail?.error||"").includes("Legacy HMAC replay admission was retired")));
 });
 
 test("project-comment migration refuses mappings from another profile", async () => {
