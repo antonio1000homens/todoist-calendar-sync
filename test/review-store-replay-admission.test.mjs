@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import test from "node:test";
 import { SSMClient } from "@aws-sdk/client-ssm";
 import { documentClient } from "../dist/dynamodb-capacity.js";
@@ -9,12 +8,6 @@ import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 import { profiles } from "../dist/config.js";
 import { Todoist } from "../dist/providers.js";
 
-const secret = Buffer.alloc(32, 41);
-function markerKey(profile, kind, id) {
-  const digest = createHmac("sha256", secret)
-    .update(JSON.stringify(["erasure-replay-v1", profile, kind, id])).digest("hex");
-  return `${kind}#v1#${digest}`;
-}
 function enableBarrier(t) {
   const names=["ERASURE_REPLAY_BARRIER_VERSION","ERASURE_PROTOCOL_VERSION",
     "RETIREMENT_DISPOSITION_VERSION","STATE_TABLE_NAME"];
@@ -111,8 +104,6 @@ test("decision context provider IDs are checked before a review case can be seed
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-context-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   await assert.rejects(new ReviewStore().observeDecision(decision({context: {providerTaskId: "erased-context-task"}})), ErasureReplayBlockedError);
@@ -124,8 +115,6 @@ test("manual decision candidate object IDs are checked before review seeding", a
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-candidate-object")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(new ReviewStore().observeDecision(decision({context:{candidates:[
@@ -139,8 +128,6 @@ test("mapping snapshot recurrence aliases are checked before a decision is persi
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-master-alias")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const mapping = {profile:"home",taskId:"safe-task",eventId:"safe-occurrence",masterEventId:"erased-master-alias",
@@ -154,8 +141,6 @@ test("queued repair admission walks embedded decision and review aliases", async
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-embedded-master")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {
@@ -176,8 +161,6 @@ for (const [field, erasedId] of [
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", erasedId)) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {
@@ -193,8 +176,6 @@ test("review admission checks recurring master aliases carried by history plans"
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-history-master")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const preview = {intent:{profile:"home",action:"link",taskId:"safe-task",eventId:"safe-event"},snapshots:[],itemPlan:[],
@@ -209,8 +190,6 @@ test("candidate IDs in conflict audit arrays are checked before an incident case
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-candidate-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   const audit = { pk: "AUDIT#conflict", action: "todoist_snapshot_reconcile_unmapped_conflict",
@@ -227,8 +206,6 @@ test("dismissal refuses to mutate a review case that references an erased identi
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-dismiss-task")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.dismissCase("case-1","acknowledged"),ErasureReplayBlockedError);
@@ -243,8 +220,6 @@ test("case status transitions refuse to mutate a case that references an erased 
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-update-event")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
@@ -259,8 +234,6 @@ test("deferred deletion cleanup refuses to update a case that references an eras
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "EVENT", "erased-cleanup-master")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.noteVerifiedDeletionCleanupDeferred("case-1",new Date().toISOString()),ErasureReplayBlockedError);
@@ -275,8 +248,6 @@ test("verified-deleted case closure refuses an erased identity before cleanup re
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-closure-task")) return {Item:{markerVersion:1}};
     return {};
   });
   await assert.rejects(store.resolveVerifiedDeletedCase("case-1",{profile:"home",taskIds:["erased-closure-task"],eventIds:["safe-event"]}),ErasureReplayBlockedError);
@@ -295,8 +266,6 @@ test("coalescing refuses to close an open case that references an erased candida
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-case-task")) return { Item: { markerVersion: 1 } };
     if (command.constructor.name === "QueryCommand" && command.input.KeyConditionExpression.startsWith("pk ="))
       return { Items: [{ incidentId: candidate.id }] };
     return {};
@@ -324,8 +293,6 @@ for (const [name, invoke] of syncControlWrites) test(`SyncControls refuses ${nam
   const calls = [];
   t.mock.method(documentClient, "send", async command => {
     calls.push(command);
-    if (command.constructor.name === "GetCommand"
-      && command.input.Key.sk === markerKey("home", "TASK", "erased-control-task")) return { Item: { markerVersion: 1 } };
     return {};
   });
   await assert.rejects(invoke(new SyncControls()), ErasureReplayBlockedError);
