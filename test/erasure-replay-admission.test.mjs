@@ -3,108 +3,64 @@ import test from "node:test";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {StateRepository} from "../dist/repository.js";
 import {
-  assertReplayAdmissionIfEnabled, mappingReplayIdentity, ErasureReplayBlockedError,
-  ErasureReplayUnavailableError, replayAdmissionEnabled,
+  assertReplayAdmissionIfEnabled, mappingReplayIdentity,
+  ErasureReplayUnavailableError,
 } from "../dist/erasure-replay-barrier.js";
-
-const before={
-  version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
-  protocol:process.env.ERASURE_PROTOCOL_VERSION,
-  keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
-  current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
-};
-process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
-process.env.ERASURE_PROTOCOL_VERSION="1";
-process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,3).toString("base64")});
-process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
-test.after(()=>{
-  for(const [key,value] of [
-    ["ERASURE_REPLAY_BARRIER_VERSION",before.version],
-    ["ERASURE_PROTOCOL_VERSION",before.protocol],
-    ["ERASURE_REPLAY_HMAC_KEYS",before.keys],
-    ["ERASURE_REPLAY_HMAC_CURRENT_KEY",before.current],
-  ]) if(value===undefined)delete process.env[key];else process.env[key]=value;
-});
+import {RetirementDispositionBlockedError} from "../dist/recurrence-retirement-disposition.js";
 
 const mapping={
   profile:"work",taskId:"task-203",eventId:"event-203",
   masterEventId:"master-203",activeInstanceId:"instance-203",
   updatedAt:"2026-10-29T14:30:00.000Z",
 };
-const link={profile:"work",taskId:mapping.taskId,eventId:mapping.eventId,
-  masterEventId:mapping.masterEventId,seriesId:mapping.taskId,owner:"todoist",updatedAt:mapping.updatedAt};
 
-test("mapping identity protects task and every resolved master/instance alias",()=>{
+function setEnvironment(t,entries){
+  const before=Object.fromEntries(Object.keys(entries).map(key=>[key,process.env[key]]));
+  for(const [key,value] of Object.entries(entries)) {
+    if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }
+  t.after(()=>{for(const [key,value] of Object.entries(before)){
+    if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }});
+}
+
+test("mapping identity protects the task and every resolved master/instance alias",()=>{
   assert.deepEqual(mappingReplayIdentity(mapping),{profile:"work",taskId:"task-203",
     eventIds:["event-203","master-203","instance-203"]});
 });
 
-test("mapping, flatten, recurrence and metadata entrypoints share a fail-closed barrier",async t=>{
+test("retirement admission remains enforced when the obsolete HMAC gate is disabled",async t=>{
+  setEnvironment(t,{
+    STATE_TABLE_NAME:"test-state",RETIREMENT_DISPOSITION_VERSION:"1",
+    ERASURE_REPLAY_BARRIER_VERSION:"0",
+  });
   let reads=0,writes=0;
   t.mock.method(documentClient,"send",async command=>{
-    if(command.constructor.name==="GetCommand"&&String(command.input.Key?.pk).startsWith("ERASURE_REPLAY#")){
-      assert.equal(command.input.ConsistentRead,true);
+    if(command.constructor.name==="GetCommand"){
       reads++;
-      return {Item:{markerVersion:1}};
+      assert.equal(command.input.ConsistentRead,true);
+      assert.match(command.input.Key.pk,/^RETIREMENT#work#/);
+      return {Item:{
+        profile:"work",operationId:"op-203",status:"retired",
+        taskId:mapping.taskId,seriesId:"series-203",masterEventId:mapping.masterEventId,
+        createdAt:"2026-11-10T12:00:00.000Z",
+      }};
     }
-    writes++;
-    throw new Error("Unauthorized state write");
+    writes++;throw new Error("unexpected state mutation");
   });
-  const store=new StateRepository();
-  const invocations=[
-    ()=>store.putMapping(mapping),
-    ()=>store.putRecurrenceLink(link),
-    ()=>store.putNewRecurrenceMappingIfUnowned({...mapping,recurrenceOwner:"todoist",seriesId:mapping.taskId,masterEventId:mapping.eventId},
-      {...link,masterEventId:mapping.eventId}),
-    ()=>store.commitFlattenMapping({operationId:"op-203",mapping:{...mapping,masterEventId:undefined,activeInstanceId:undefined},
-      previous:[],links:[]}),
-    ()=>store.updateCalendarOwnedMetadataIfUnchanged(
-      {...mapping,recurrenceOwner:"calendar",seriesId:"series-203"},
-      {...link,owner:"calendar",seriesId:"series-203"},
-      {...mapping,recurrenceOwner:"calendar",seriesId:"series-203"}),
-    ()=>store.advanceCalendarSeriesMapping({previous:mapping,mapping,expectedLink:link,link}),
-    ()=>store.transferCalendarSeriesMapping({mapping,link}),
-    ()=>store.beginFutureSeriesSplit("work",mapping.taskId,"master-old","master-new"),
-    ()=>store.putConsolidationGuard("work","task-discarded",mapping.taskId,"decision-1","event-203",mapping),
-    ()=>store.commitRecurrenceConsolidation({mapping,link,previousMapping:mapping,previousLink:link,discardedTaskId:"task-discarded",decisionId:"decision-1"}),
-    ()=>store.restoreMappingIndexesIfOwned(mapping,link),
-    ()=>store.putCompletedCalendarProjection({profile:"work",taskId:mapping.taskId,eventId:mapping.eventId,completedAt:"2026-10-01T00:00:00Z"}),
-    ()=>store.recordRecurrence("work",mapping.eventId,["RRULE:FREQ=DAILY"]),
-  ];
-  for(const invoke of invocations)await assert.rejects(invoke(),ErasureReplayBlockedError);
-  assert.equal(reads,invocations.length);
-  assert.equal(writes,0,"no provider/state mutation may occur after marker discovery");
-});
-
-test("barrier read errors deny mapping writes, not silently fall back to a stale mapping",async t=>{
-  let writes=0;
-  t.mock.method(documentClient,"send",async command=>{
-    if(command.constructor.name==="GetCommand")throw new Error("DynamoDB unavailable");
-    writes++;return {};
-  });
-  await assert.rejects(new StateRepository().putMapping(mapping),ErasureReplayUnavailableError);
+  await assert.rejects(new StateRepository().putMapping(mapping),RetirementDispositionBlockedError);
+  assert.equal(reads,1);
   assert.equal(writes,0);
 });
 
-test("rollout is explicitly gated and a bad version fails closed",async t=>{
-  const old=process.env.ERASURE_REPLAY_BARRIER_VERSION;
-  t.after(()=>{process.env.ERASURE_REPLAY_BARRIER_VERSION=old;});
-  process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
-  assert.equal(replayAdmissionEnabled(),false);
-  await assertReplayAdmissionIfEnabled({profile:"work",taskId:"task-203"},{
-    async send(){throw new Error("disabled gate must not attempt a lookup");},
+test("obsolete HMAC gate reactivation cannot permit new state writes or reads",async t=>{
+  setEnvironment(t,{
+    STATE_TABLE_NAME:"test-state",RETIREMENT_DISPOSITION_VERSION:"0",
+    ERASURE_REPLAY_BARRIER_VERSION:"1",
   });
-  process.env.ERASURE_REPLAY_BARRIER_VERSION="unrecognised";
-  assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
-  await assert.rejects(assertReplayAdmissionIfEnabled({profile:"work",taskId:"task-203"}),ErasureReplayUnavailableError);
-});
-
-test("replay marker admission requires the profile lease protocol",()=>{
-  const old=process.env.ERASURE_PROTOCOL_VERSION;
-  try {
-    process.env.ERASURE_PROTOCOL_VERSION="0";
-    assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
-  } finally {
-    if(old===undefined)delete process.env.ERASURE_PROTOCOL_VERSION;else process.env.ERASURE_PROTOCOL_VERSION=old;
-  }
+  let accesses=0;
+  t.mock.method(documentClient,"send",async()=>{accesses++;throw Error("legacy DDB access");});
+  await assert.rejects(new StateRepository().putMapping(mapping),ErasureReplayUnavailableError);
+  await assert.rejects(assertReplayAdmissionIfEnabled({profile:"work",taskId:mapping.taskId}),ErasureReplayUnavailableError);
+  assert.equal(accesses,0);
 });
