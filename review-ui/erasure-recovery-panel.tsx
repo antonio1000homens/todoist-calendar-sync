@@ -196,7 +196,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
             <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
           </details>}
           {preview.calendarDriftReview?.candidateForSeparateApproval&&<div className="erasure-results" role="status">
-            <p>**Reviewed Calendar-drift cancellation available.** The original Todoist task, its mapping comment, Calendar aliases, and state inventory are unchanged. The Calendar event has a different revision. This cancels the interrupted erasure and preserves both provider items; it does not delete either item.</p>
+            <p><strong>Reviewed Calendar-drift cancellation available.</strong> The original Todoist task, its mapping comment, Calendar aliases, and state inventory are unchanged. The Calendar event has a different revision. This cancels the interrupted erasure and preserves both provider items; it does not delete either item.</p>
             <p>Before acceptance the server independently rereads provider, mapping, fence, lease, and cross-profile evidence. It rechecks the exact Calendar revision again during worker restoration. If anything changes, recovery is refused and the fence is preserved.</p>
             {!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation("calendar_drift_cancel")}>Request reviewed Calendar-drift cancellation</button>}
           </div>}
