@@ -4,7 +4,7 @@ import {QueryCommand} from "@aws-sdk/lib-dynamodb";
 import {ListAliasesCommand,GetFunctionConfigurationCommand} from "@aws-sdk/client-lambda";
 import {auditLegacyHmacCurrentRuntime} from "../scripts/audit-legacy-hmac-retirement.mjs";
 
-function fixture({markerProfile,env={},aliases=[],configOverrides={},invalidMarkerPage}={}) {
+function fixture({markerProfile,env={ERASURE_PROTOCOL_VERSION:"1"},aliases=[],configOverrides={},invalidMarkerPage}={}) {
   const requests={markers:[],functions:[],aliases:[]};
   const db={async send(command) {
     assert.ok(command instanceof QueryCommand);
@@ -26,7 +26,7 @@ function fixture({markerProfile,env={},aliases=[],configOverrides={},invalidMark
     assert.ok(command instanceof GetFunctionConfigurationCommand);
     requests.functions.push(command.input);
     const qualifier=command.input.Qualifier;
-    return {FunctionName:command.input.FunctionName,Version:qualifier&&qualifier!=="live"?qualifier:"2",
+    return {FunctionName:command.input.FunctionName,Version:qualifier?(qualifier==="live"?"2":qualifier):"$LATEST",
       Environment:{Variables:env},...configOverrides};
   }};
   return {db,lambda,tableName:"test-state",
@@ -65,7 +65,7 @@ test("legacy HMAC settings on an alias or weighted target block current-runtime 
   f.lambda.send=async command=>{
     if(command instanceof GetFunctionConfigurationCommand&&command.input.Qualifier==="1")
       return {FunctionName:"test-worker",Version:"1",
-        Environment:{Variables:{ERASURE_REPLAY_BARRIER_VERSION:"0",
+        Environment:{Variables:{ERASURE_PROTOCOL_VERSION:"1",ERASURE_REPLAY_BARRIER_VERSION:"0",
           ERASURE_REPLAY_HMAC_KEYS:"NEVER_INCLUDE_KEY_CONTENT"}}};
     return send(command);
   };
