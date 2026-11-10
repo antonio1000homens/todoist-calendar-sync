@@ -53,6 +53,27 @@ test("unsafe recurrence or active fence blocks confirmation-ready preview", asyn
   assert.ok(preview.blockers.some(value=>value.includes("fence is active")));
 });
 
+test("erasure refuses to retain a Calendar event linked to the deleted Todoist task",async()=>{
+  const taskId="task-retained-calendar",eventId="event-retained-calendar";
+  const event={id:eventId,status:"confirmed",etag:"etag-retained-calendar",
+    extendedProperties:{shared:{taskId}}};
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[],ScannedCount:0}:{}};
+  const clients={
+    todoist:{getTask:async id=>({id,project_id:"test-home-project",content:"disposable"}),
+      listProjectComments:async()=>[{id:"project-comment",content:serializeMappingComment({
+        profile:"home",taskId,eventId,updatedAt:"2026-11-08T12:00:00.000Z",
+      },"test-home-project")}],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event},
+  };
+  const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:false},
+    {db,clients,inspectFence:async()=>({leases:[]}),newOperationId:()=>"retained-calendar"});
+  assert.ok(preview.blockers.includes(
+    "Calendar item exists; select and confirm its exact deletion or handle re-import risk manually"));
+  assert.ok(preview.blockers.includes(
+    "A live Calendar projection would recreate the Todoist task unless separately deleted"));
+  assert.equal(preview.confirmation,undefined);
+});
+
 test("strong state scan rejects a repeated pagination cursor instead of accepting an incomplete inventory",async()=>{
   const cursor={pk:"AUDIT#home#one",sk:"STATE"};
   let scans=0;
