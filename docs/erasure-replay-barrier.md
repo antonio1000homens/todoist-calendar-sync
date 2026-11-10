@@ -72,11 +72,17 @@ npm run cleanup:erasure-tombstones -- --profile=work --apply \
 
 The apply path re-reads each candidate and deletes only the unchanged, expired comment in the configured project. It does not scan or delete DynamoDB rows, task comments, active markers, or unrelated project comments.
 
-## Legacy HMAC admission compatibility (disabled)
+## Retired HMAC admission and compatibility safety
 
-The permanent-DynamoDB-HMAC **writer, orphan installer and staged post-write marker/fence release implementation have been retired**. They have no active production callers and are not part of #349's bounded 18-day project-comment tombstone workflow. The separate current `atomicConfirmedErasureCompletion` transaction is retained and writes **no permanent HMAC replay identity**.
+The obsolete permanent DynamoDB/HMAC marker writers and post-write release code were removed in #437. The historical **admission reader** has now also been retired from current source; the remaining `ERASURE_REPLAY_BARRIER_VERSION` environment switch is a **fail-closed compatibility tripwire**. Unset, empty or `0` allows the current path, while `1` or any unknown nonzero value refuses admission. Do **not** turn on the obsolete switch.
 
-The **legacy HMAC admission reader** remains compiled because existing mapping, provider, queue and worker call paths reference it, and previously installed marker rows cannot be assumed absent. The reader is still controlled by the existing `ERASURE_REPLAY_BARRIER_VERSION` gate. **Keep that gate off.** Do not enable this legacy mechanism or clear historical HMAC rows based on this source-only cleanup. Auditing any historical marker rows, qualified Lambda versions, IAM permissions, rollback and removing the remaining dormant reader is a separate #347/#349 review, not a safe automatic follow-up to this change.
+Read-only production verification on **10 November 2026** (`eu-west-2`) found:
+- Strongly consistent DynamoDB queries for `ERASURE_REPLAY#antonio`, `ERASURE_REPLAY#home` and `ERASURE_REPLAY#work`: **zero rows**, no pagination;
+- A strongly consistent full-table scan (2,791 evaluated items) with all three historical prefixes `ERASURE_REPLAY#`, `ORPHAN_REPLAY_GUARD#` and `ERASURE_POSTWRITE_RESTORE#`: **zero matches**;
+- All seven current stack Lambda configurations and the Review API `live` alias had `ERASURE_REPLAY_BARRIER_VERSION` unset and neither old HMAC keyring variable configured. The Review API and erasure worker retained `ERASURE_EXECUTION_ENABLED=false`.
+
+These observations support removing the dormant HMAC lookup, **not** a claim about every historical Lambda version, AWS principal or future rollback. Current production invokes only the bounded Todoist project-comment tombstone and independently retained profile writer/retirement-admission protections. Do not delete live DynamoDB records or weaken the separate #347 historical-invocation review based solely on this inspection. Historical Lambda package/alias, IAM and rollback acceptance and the #349 disposable-erasure E2E remain separate requirements.
+
 
 The bounded project-comment implementation from #403–#405 is deployed to current production master. Deployment run 42536045650 succeeded. The `todoist-calendar-sync` stack is `UPDATE_COMPLETE` with `ErasureExecutionEnabled=false`; the live Review API execution setting is false, and the replay-barrier setting remains absent. The erasure worker mapping is enabled.
 
