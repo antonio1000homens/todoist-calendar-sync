@@ -860,8 +860,17 @@ export class Synchronizer {
 
   async reconcile(profile: Profile): Promise<void> {
     const { calendar, todoist } = await this.clients(profile);
+    const projectComments = await todoist.listProjectComments(profiles[profile].todoistProjectId, true);
     for (const link of await this.state.listRecurrenceLinks(profile)) {
       if (link.owner !== "calendar" || !link.masterEventId) continue;
+      if (activeProjectDeletionTombstone(projectComments, {
+        profile, projectId: profiles[profile].todoistProjectId, taskId: link.taskId,
+        eventIds: [...new Set([link.masterEventId, link.eventId, link.activeInstanceId]
+          .filter((id): id is string => Boolean(id)))],
+      })) {
+        await this.state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "recurrence_reconciliation" });
+        continue;
+      }
       if (await this.state.isRetired?.({profile,taskId:link.taskId,
         eventIds:[...new Set([link.masterEventId,link.eventId,link.activeInstanceId]
           .filter((id):id is string=>Boolean(id)))],
