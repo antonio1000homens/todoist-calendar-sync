@@ -360,7 +360,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
     const link:RecurrenceLink={
       ...sourceLink,profile:destinationProfile,taskId:task.id,
       eventId:plan.successorMasterId,masterEventId:plan.successorMasterId,
-      seriesId:task.id,activeInstanceId:destinationInstances[0].id,
+      seriesId:task.id,activeInstanceId:activeDestination.id,
       originalStart:plan.destinationStart,activeEffectiveStart:plan.destinationStart,
       updatedAt:timestamp,
     };
