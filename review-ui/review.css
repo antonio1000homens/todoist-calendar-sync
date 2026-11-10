@@ -47,3 +47,5 @@
 .operational-actions button+button{margin-left:8px}
 @media(max-width:980px){.profile-report-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:680px){.profile-report-grid{grid-template-columns:minmax(0,1fr)}.orphan-evidence button+button,.operational-actions button+button{margin:8px 0 0}}
+
+.reconciliation-items>summary{cursor:pointer;font-weight:650}
