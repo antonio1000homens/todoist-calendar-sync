@@ -17,7 +17,7 @@ import { ReviewStore } from "./review-store.js";
 import { enqueueDelivery, requestReconciliation } from "./queue.js";
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { enqueueErasureOperation, enqueueErasureRecovery } from "./erasure-queue.js";
-import { ErasureRecoveryService } from "./erasure-recovery.js";
+import { ErasureRecoveryService, CALENDAR_DRIFT_CANCEL_PHRASE } from "./erasure-recovery.js";
 import { recoveryAdapters } from "./erasure-recovery-adapters.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, ERASURE_REVIEW_REQUIRED_MESSAGE, ErasureOperationStore } from "./erasure-executor.js";
 import { buildErasurePreview } from "./erasure-preview.js";
@@ -337,6 +337,29 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         catch {return response(503,{error:"recovery_enqueue_failed",
           message:"Recovery was accepted durably but its queue send failed. Retry dispatch for the same recovery, never confirm erasure again."});}
         return response(202,{recovery:{status:"queued",operationId:id}});
+      }
+      if(method==="POST"&&action==="calendar-drift-confirm") {
+        if(Object.keys(body||{}).length)fail(400,"Drift-cancellation confirmation accepts no request fields");
+        const issued=await recovery.issueCalendarDriftCancellation(id,actor.subject);
+        return response(200,{...issued});
+      }
+      if(method==="POST"&&action==="calendar-drift-apply") {
+        if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
+          ||typeof body?.confirmationId!=="string"||body.confirmationId.length>256
+          ||body.operationId!==id||body.phrase!==CALENDAR_DRIFT_CANCEL_PHRASE
+          ||!REVIEW_PROFILES.includes(body.profile as Profile))
+          fail(400,"Calendar drift cancellation requires the exact operation, profile, and distinct typed phrase");
+        const operation=await erasureStore().get(id);
+        if(!operation||operation.profile!==body.profile)fail(409,"Recovery profile or operation changed");
+        await recovery.applyCalendarDriftCancellation(id,body.confirmationId,actor.subject,{
+          operationId:body.operationId,profile:body.profile as Profile,phrase:body.phrase,
+        });
+        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
+          event:"calendar_drift_cancellation_accepted",operationId:id,profile:operation.profile}));
+        try { await (dependencies.enqueueErasureRecovery||enqueueErasureRecovery)(id); }
+        catch {return response(503,{error:"recovery_enqueue_failed",
+          message:"Cancellation accepted durably; retry dispatch only, never replay the erasure"});}
+        return response(202,{recovery:{status:"queued",operationId:id,mode:"calendar_drift_cancel"}});
       }
       if(method==="POST"&&action==="dispatch") {
         if(Object.keys(body||{}).length)fail(400,"Recovery dispatch accepts no request fields");
