@@ -75,7 +75,7 @@ test("production provider construction has only guarded identity routes or class
     "watch.ts":["GoogleCalendar"],
   });
   const factory=await readFile(path.join(sourceRoot,"mutation-budget.ts"),"utf8");
-  assert.match(factory,/defaultProviderClientFactory[^=]*=\s*async\s*\(profile\)\s*=>\s*guardReplayProviderClients\(profile,\{/,
+  assert.match(factory,/defaultProviderClientFactory[^=]*=\s*async\s*\(profile,options\)\s*=>\s*guardReplayProviderClients\(profile,\{/,
     "default runtime clients must enter through the replay provider guard");
   const cleanup=await readFile(path.join(sourceRoot,"completed-project-comment-cleanup.ts"),"utf8");
   assert.match(cleanup,/guardReplayProviderClients\(profile,\s*\{[\s\S]{0,120}new Todoist/,
