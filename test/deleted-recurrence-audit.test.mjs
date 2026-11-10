@@ -43,7 +43,7 @@ function fixture({task=gone,eventMaster=master,eventActive=active,foreign=false,
   return {provider:{calendar,todoist},state,reads,writes};
 }
 
-test("#292 legacy both-deleted dry-run derives master by readback and is repeatable and read-only",async()=>{
+test("deleted-series dry-run derives master by readback, remains repeatable and read-only",async()=>{
   const f=fixture();
   const one=await auditDeletedRecurrenceCase(item,f.provider,f.state);
   const two=await auditDeletedRecurrenceCase(item,f.provider,f.state);
@@ -60,25 +60,36 @@ test("#292 legacy both-deleted dry-run derives master by readback and is repeata
   assert.deepEqual(f.writes,[],"the audit cannot mutate provider or DynamoDB state");
 });
 
-test("#292 one-sided deletion, foreign owner and unverified provider never produce a cleanup candidate",async()=>{
-  const cases=[
-    fixture({task:async()=>({id:taskId,due:{is_recurring:true}})}),
-    fixture({eventMaster:{...master,status:"confirmed"}}),
-    fixture({eventActive:{...active,status:"confirmed"}}),
-    fixture({foreign:true}),
-    fixture({eventActive:{...active,recurringEventId:"different-master"}}),
-    fixture({eventMaster:null}),
-    fixture({task:async()=>{throw Object.assign(new Error("throttled"),{status:429});}}),
+async function expectReadOnlyManualReview(f, label, checkInvalidInstances = false) {
+  const result = await auditDeletedRecurrenceCase(item, f.provider, f.state);
+  assert.equal(result.action, "retain_for_manual_review", label);
+  if (checkInvalidInstances) {
+    assert.equal(result.instanceAssessment?.valid, false, label);
+  } else {
+    assert.equal(result.deletion.bothGone, false, label);
+  }
+  assert.deepEqual(f.writes, [], label + " must never mutate provider or state");
+  return result;
+}
+
+test("deleted-series audit fails closed for live, foreign or unverified references", async t => {
+  const scenarios = [
+    { name: "Todoist task is still live", input: { task: async () => ({ id: taskId, due: { is_recurring: true } }) } },
+    { name: "Calendar master is confirmed", input: { eventMaster: { ...master, status: "confirmed" } } },
+    { name: "Calendar occurrence is confirmed", input: { eventActive: { ...active, status: "confirmed" } } },
+    { name: "another profile owns the series", input: { foreign: true } },
+    { name: "occurrence points at a different master", input: { eventActive: { ...active, recurringEventId: "different-master" } } },
+    { name: "direct master lookup is missing", input: { eventMaster: null } },
+    { name: "Todoist read is rate-limited", input: { task: async () => { throw Object.assign(new Error("throttled"), { status: 429 }); } } },
   ];
-  for(const f of cases){
-    const result=await auditDeletedRecurrenceCase(item,f.provider,f.state);
-    assert.equal(result.action,"retain_for_manual_review");
-    assert.equal(result.deletion.bothGone,false);
-    assert.deepEqual(f.writes,[]);
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      await expectReadOnlyManualReview(fixture(scenario.input), scenario.name);
+    });
   }
 });
 
-test("#292 unrecorded master cannot be inferred from an occurrence ID or missing direct child",async()=>{
+test("deleted-series audit never guesses an unrecorded master from occurrence ID",async()=>{
   const f=fixture({eventActive:null});
   const result=await auditDeletedRecurrenceCase(item,f.provider,f.state);
   assert.equal(result.action,"retain_for_manual_review");
@@ -87,18 +98,23 @@ test("#292 unrecorded master cannot be inferred from an occurrence ID or missing
     "the master must not be guessed by stripping an instance ID suffix");
 });
 
-test("#292 read-only audit does not suggest cleanup for active, missing or incomplete series instances",async()=>{
-  for(const instances of [
-    [], 
-    [{id:activeId,status:"confirmed",recurringEventId:masterId,iCalUID:uid}],
-    [{id:"future",status:"confirmed",recurringEventId:masterId,iCalUID:uid,
-      start:{date:"2026-12-16"}},{id:activeId,status:"cancelled",recurringEventId:masterId,iCalUID:uid}],
-    [{id:activeId,status:"cancelled",recurringEventId:"foreign",iCalUID:uid}],
-  ]){
-    const f=fixture({instances});
-    const result=await auditDeletedRecurrenceCase(item,f.provider,f.state);
-    assert.equal(result.action,"retain_for_manual_review");
-    assert.equal(result.instanceAssessment?.valid,false);
-    assert.deepEqual(f.writes,[]);
+test("deleted-series audit rejects missing, active and incomplete instance lists", async t => {
+  const scenarios = [
+    { name: "empty instance enumeration", instances: [] },
+    { name: "active instance remains confirmed", instances: [
+      { id: activeId, status: "confirmed", recurringEventId: masterId, iCalUID: uid },
+    ] },
+    { name: "future confirmed instance remains", instances: [
+      { id: "future", status: "confirmed", recurringEventId: masterId, iCalUID: uid, start: { date: "2026-12-16" } },
+      { id: activeId, status: "cancelled", recurringEventId: masterId, iCalUID: uid },
+    ] },
+    { name: "instance belongs to a different master", instances: [
+      { id: activeId, status: "cancelled", recurringEventId: "foreign", iCalUID: uid },
+    ] },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      await expectReadOnlyManualReview(fixture({ instances: scenario.instances }), scenario.name, true);
+    });
   }
 });

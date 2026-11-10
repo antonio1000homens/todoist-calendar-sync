@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { emptyOrphanProviderInventories } from "./helpers/orphan-provider-inventory.mjs";
 import {evaluateOrphanEvidence} from "../dist/orphan-proof-reader.js";
 import {reviewHash} from "../dist/review-store.js";
 import {profiles} from "../dist/config.js";
@@ -24,9 +25,7 @@ function inventory(side="calendar") {
     item:caseItem(side),
     target:{side,item:side==="calendar"?calendar:todoist},
     counterparts:[],
-    providers:["home","antonio","work"].map(profile=>({
-      profile,tasks:[],events:[],comments:[],
-    })),
+    providers:emptyOrphanProviderInventories(),
     stateRows:[{pk:"REVIEW_CASE#alert-287",sk:"STATE",eventId:"cal-1",taskId:"task-1"}],
   };
 }

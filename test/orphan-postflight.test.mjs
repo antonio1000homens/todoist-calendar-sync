@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { emptyOrphanProviderInventories, emptyOrphanProviderCatalog } from "./helpers/orphan-provider-inventory.mjs";
 import {evaluateOrphanPostflight,collectOrphanPostflight} from "../dist/orphan-postflight.js";
 
 const stamp="2026-11-03T20:00:00.000Z";
@@ -17,9 +18,7 @@ function inventory(side="todoist") {
       ...(side==="todoist"?{taskId:op.targetId}:{eventId:op.targetId}),
       sourceAuditKey:"AUDIT#home#alert-source"},
     target:null,counterparts:[],
-    providers:["home","antonio","work"].map(profile=>({
-      profile,tasks:[],events:[],comments:[],
-    })),
+    providers:emptyOrphanProviderInventories(),
     stateRows:[
       {pk:"REVIEW_CASE#alert-287",sk:"STATE",taskId:"task-orphan",eventId:"event-orphan"},
       {pk:"ORPHAN_DELETE#orphan-op",sk:"STATE",caseId:"alert-287",profile:"home",
@@ -129,9 +128,7 @@ function liveFixture(side="todoist") {
   const rows=[{pk:"REVIEW_CASE#alert-287",sk:"STATE",taskId:op.targetId,eventId:op.targetId},
     {pk:"ORPHAN_DELETE#orphan-op",sk:"STATE",caseId:op.caseId,profile:op.profile,
       side:op.side,targetId:op.targetId}];
-  const catalog=Object.fromEntries(["home","antonio","work"].map(profile=>[profile,{
-    tasks:[],events:[],comments:[],
-  }]));
+  const catalog=emptyOrphanProviderCatalog();
   const calls={getTask:[],getEvent:[],listTasks:[],listDelta:[],scan:0,writes:0};
   let directOverride;
   const clients=async profile=>({

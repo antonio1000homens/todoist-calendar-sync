@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Synchronizer } from "../dist/sync.js";
+import {
+  atCompletionBoundary, completedProjection,
+} from "./helpers/completed-history-fixtures.mjs";
 
-const history = {
-  profile: "home", taskId: "completed-task", eventId: "historical-event",
-  completedAt: "2026-10-01T12:00:00Z",
-};
+const history = completedProjection({ taskId: "completed-task", eventId: "historical-event" });
 const event = {
   id: history.eventId, status: "confirmed",
   start: { date: "2026-10-01" }, end: { date: "2026-10-02" },
@@ -13,7 +13,7 @@ const event = {
 };
 const task = { id: history.taskId, content: "Completed", is_deleted: true, project_id: "home-test" };
 
-async function runLateDelete(withTaskIndex, receivedAt) {
+async function runLateDelete(withTaskIndex, receivedAt, recordedHistory = history) {
   let deleted = 0;
   let removedHistory = 0;
   let audits = [];
@@ -22,8 +22,8 @@ async function runLateDelete(withTaskIndex, receivedAt) {
     async getMappingByTaskAnyProfile() { return undefined; },
     async getMappingByTask() { return undefined; },
     async getMappingByEvent() { return undefined; },
-    async getCompletedCalendarProjectionByEvent(_profile, eventId) { return eventId === history.eventId ? history : undefined; },
-    async listCompletedCalendarProjectionsByTask() { return withTaskIndex ? [history] : []; },
+    async getCompletedCalendarProjectionByEvent(_profile, eventId) { return eventId === recordedHistory.eventId ? recordedHistory : undefined; },
+    async listCompletedCalendarProjectionsByTask() { return withTaskIndex ? [recordedHistory] : []; },
     async deleteCompletedCalendarProjection() { removedHistory++; },
     async mutationAllowed() { return true; },
     async recordMutation() {},
@@ -42,28 +42,49 @@ async function runLateDelete(withTaskIndex, receivedAt) {
   return { deleted, removedHistory, actions: audits.map((a) => a.action) };
 }
 
-test("delayed Todoist auto-deletion preserves one-off Calendar history before seven-day maintenance", async () => {
-  const result = await runLateDelete(true, "2026-10-08T12:00:00Z");
-  assert.equal(result.deleted, 0);
-  assert.equal(result.removedHistory, 0);
-  assert.ok(result.actions.includes("todoist_late_completed_deletion_ignored"));
-});
+// Run the same late-delete contract with and without the task-facing index.
+// Keep each scenario separately reported so a regression identifies the gap.
+for (const scenario of [
+  {
+    name: "at the seven-day boundary with the task index present",
+    withTaskIndex: true, offsetMs: 0, audit: true,
+  },
+  {
+    name: "after the task-facing index has retired",
+    withTaskIndex: false, offsetMs: 24 * 60 * 60_000,
+  },
+]) {
+  test(`completed Calendar history survives late Todoist deletion: ${scenario.name}`, async () => {
+    const result = await runLateDelete(
+      scenario.withTaskIndex, atCompletionBoundary(scenario.offsetMs),
+    );
+    assert.equal(result.deleted, 0);
+    assert.equal(result.removedHistory, 0);
+    if (scenario.audit) {
+      assert.ok(result.actions.includes("todoist_late_completed_deletion_ignored"));
+    }
+  });
+}
 
-test("deletion after task-side index retirement still respects event-side historical guard", async () => {
-  const result = await runLateDelete(false, "2026-10-09T12:00:00Z");
-  assert.equal(result.deleted, 0);
-  assert.equal(result.removedHistory, 0);
-});
-
-test("explicit deletion within the grace retains its existing documented behaviour", async () => {
-  const result = await runLateDelete(true, "2026-10-08T11:59:59Z");
+test("explicit deletion before seven full days retains its existing behaviour", async () => {
+  const result = await runLateDelete(true, atCompletionBoundary(-1));
   assert.equal(result.deleted, 1);
   assert.equal(result.removedHistory, 1);
 });
 
-test("an earlier completed recurrence remains protected from delayed deletion if mapping was lost", async () => {
-  // Without a live recurrence link no finality can be inferred. Preserve
-  // Calendar rather than treating an old instance as an active-task delete.
-  const result = await runLateDelete(true, "2026-10-11T12:00:00Z");
+test("older completed recurring occurrence stays protected without a live recurrence mapping", async () => {
+  // A terminally completed occurrence must not be mistaken for an active-task
+  // deletion after the recurring mapping has gone missing.
+  const recurringHistory = {
+    ...history,
+    recurrenceOwner: "calendar",
+    seriesId: "yearly-series",
+    masterEventId: "yearly-master",
+    originalStart: "2026-10-01",
+  };
+  const result = await runLateDelete(
+    true, atCompletionBoundary(3 * 24 * 60 * 60_000), recurringHistory,
+  );
   assert.equal(result.deleted, 0);
+  assert.equal(result.removedHistory, 0);
 });
