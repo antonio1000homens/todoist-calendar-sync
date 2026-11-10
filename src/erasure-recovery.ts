@@ -328,6 +328,26 @@ export class ErasureRecoveryService {
     return {status:"reviewed_fenced",releaseAllowed:false};
   }
 
+  /**
+   * Bounded unattended recovery ONLY for independently verified pre-provider-write
+   * erasures. Reuses the same three-step inspection, single-use token and CAS
+   * transaction as the operator path; it never resumes provider deletion.
+   * A refused or inconclusive inspection leaves every fence and mapping alone.
+   */
+  async startAutomaticPreWriteRecovery(id:string):Promise<{queued:boolean;blockerCount:number}> {
+    const inspected=await this.inspect(id);
+    if(!inspected.preview.allowed||inspected.preview.classification!=="pre_write")
+      return {queued:false,blockerCount:inspected.preview.blockers.length};
+    const actor="system:erasure-prewrite-watchdog";
+    const issued=await this.issueConfirmation(id,actor);
+    if(!issued.preview.allowed||issued.preview.classification!=="pre_write")
+      throw new Error("Automatic recovery evidence changed before confirmation");
+    // apply() repeats the independent evidence inspection and conditionally
+    // locks the exact original operation/fence/epoch. This cannot delete an item.
+    await this.apply(id,issued.confirmationId,actor);
+    return {queued:true,blockerCount:0};
+  }
+
   async issueConfirmation(id:string,operator:string):Promise<{preview:RecoveryPreview;confirmationId:string;expiresAt:number}> {
     const inspected=await this.inspect(id);
     if(!inspected.preview.allowed)throw Object.assign(new Error("Recovery is blocked; inspect safety evidence"),{status:409});
