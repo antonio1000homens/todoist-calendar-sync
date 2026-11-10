@@ -49,3 +49,29 @@
 @media(max-width:680px){.profile-report-grid{grid-template-columns:minmax(0,1fr)}.orphan-evidence button+button,.operational-actions button+button{margin:8px 0 0}}
 
 .reconciliation-items>summary{cursor:pointer;font-weight:650}
+
+/* #445: independent recovery evidence and action boundaries. */
+.erasure-recovery .recovery-scope{margin:16px 0;padding:16px;border:1px solid #d9e2eb;border-radius:8px;background:#fff}
+.erasure-recovery .recovery-scope>h4{margin:0 0 10px}
+.erasure-recovery .recovery-scope>label{max-width:600px;margin:8px 0 12px}
+.erasure-recovery .recovery-scope>button{margin:6px 8px 6px 0}
+.erasure-recovery .recovery-scope p{overflow-wrap:anywhere}
+.erasure-recovery .recovery-action-result{margin:12px 0 0;padding:10px 12px;border-left:3px solid #3f729c;background:#f4f8fc;border-radius:4px}
+.erasure-recovery .recovery-action-result.warning{border-left-color:#996100;background:#fff8eb}
+.erasure-recovery .recovery-summary{display:grid;grid-template-columns:minmax(150px,220px) minmax(0,1fr);gap:8px 18px;margin:14px 0}
+.erasure-recovery .recovery-summary dt{font-weight:650}
+.erasure-recovery .recovery-summary dd{margin:0;overflow-wrap:anywhere}
+.erasure-recovery .recovery-summary small{display:block;font-weight:400;color:#5b6570}
+.erasure-recovery .recovery-evidence{border-top:1px solid #e4eaf0;margin-top:16px;padding-top:14px}
+.erasure-recovery .recovery-evidence h5{margin:8px 0;font-size:14px}
+.erasure-recovery .recovery-diagnostics{margin:8px 0 16px;padding-left:22px}
+.erasure-recovery .recovery-diagnostics li{margin:6px 0;overflow-wrap:anywhere}
+.erasure-recovery .recovery-postwrite>summary{font-weight:650;cursor:pointer}
+.erasure-recovery .recovery-technical{padding:12px 0}
+.erasure-recovery .recovery-technical summary{font-weight:650;cursor:pointer}
+@media(max-width:650px){
+ .erasure-recovery .recovery-scope{padding:12px}
+ .erasure-recovery .recovery-summary{grid-template-columns:minmax(0,1fr);gap:3px}
+ .erasure-recovery .recovery-summary dd{margin-bottom:10px}
+ .erasure-recovery .recovery-scope>button{display:block;width:100%;margin:8px 0}
+}
