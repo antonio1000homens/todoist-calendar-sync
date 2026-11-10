@@ -24,6 +24,7 @@ function fixture({name="quarterly",start="2027-01-10",due="2027-04-10",
     summary:master.summary,description:master.description,
   }));
   return {task,mapping,sourceMaster:master,sourceProfile:"home",destinationProfile:"work",
+    destinationProjectId:"destination-project",
     sourceTimeZone:"Europe/London",destinationTimeZone:"Europe/London",
     todoistTimeZone:"Europe/London",today:"2027-02-15",historicalInstances,
     historyInventoryComplete:true,exceptionInventoryComplete:true,explicitExceptions:[],
@@ -77,6 +78,8 @@ test("reject unsafe ownership or pending repair before any Calendar write",()=>{
   for(const change of [
     {destinationHasLinkedEvent:true},{destinationHasMapping:true},
     {destinationHasTombstone:true},{activeRepairOrErasure:true},
+    {destinationProjectId:"another-project"},
+    {mapping:{...e.mapping,originalStart:"2027-01-10"}},
     {sourceProfile:"work"}, {destinationProfile:"home"},
     {sourceTimeZone:"UTC"},{todoistTimeZone:"UTC"},{destinationTimeZone:"UTC"},
     {today:"2027-05-01"}, {task:{...e.task,project_id:undefined}},
