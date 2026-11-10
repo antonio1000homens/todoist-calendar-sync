@@ -2,29 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {StateRepository} from "../dist/repository.js";
+import {enableReplayBarrierFixture} from "./helpers/replay-barrier-env.mjs";
 import {
   assertReplayAdmissionIfEnabled, mappingReplayIdentity, ErasureReplayBlockedError,
   ErasureReplayUnavailableError, replayAdmissionEnabled,
 } from "../dist/erasure-replay-barrier.js";
 
-const before={
-  version:process.env.ERASURE_REPLAY_BARRIER_VERSION,
-  protocol:process.env.ERASURE_PROTOCOL_VERSION,
-  keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
-  current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
-};
-process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
-process.env.ERASURE_PROTOCOL_VERSION="1";
-process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,3).toString("base64")});
-process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
-test.after(()=>{
-  for(const [key,value] of [
-    ["ERASURE_REPLAY_BARRIER_VERSION",before.version],
-    ["ERASURE_PROTOCOL_VERSION",before.protocol],
-    ["ERASURE_REPLAY_HMAC_KEYS",before.keys],
-    ["ERASURE_REPLAY_HMAC_CURRENT_KEY",before.current],
-  ]) if(value===undefined)delete process.env[key];else process.env[key]=value;
-});
+const restoreReplay=enableReplayBarrierFixture({keySeed:3});
+test.after(restoreReplay);
 
 const mapping={
   profile:"work",taskId:"task-203",eventId:"event-203",
