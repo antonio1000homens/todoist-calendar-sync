@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { calendarReviewSnapshot } from "./helpers/review-provider-snapshot.mjs";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "../review-ui/item-identity.mjs";
 
-const calendar = (id, start, extra={})=>({
-  ref:{profile:"home",side:"calendar",id},
-  object:{id,summary:"Write letter for Gabriel and Lennox",status:"confirmed",start:{date:start},
-    end:{date:start.slice(0,8)+"08"},...extra},
-});
+const calendar = calendarReviewSnapshot;
 
 test("same-title standalone and yearly Calendar events have distinct visible dates and exact copyable IDs",()=>{
   const standalone=providerIdentity(calendar("standalone-2026","2026-03-01"));
