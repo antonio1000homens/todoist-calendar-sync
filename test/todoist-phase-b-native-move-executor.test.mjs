@@ -26,12 +26,12 @@ function fixture(options={}){
   const mapping={profile:"home",taskId:task.id,projectId:home,eventId:sourceMaster.id,
     masterEventId:sourceMaster.id,seriesId:task.id,recurrenceOwner:"todoist",
     activeInstanceId:"source-apr",originalStart:currentDue,
-    activeEffectiveStart:currentDue,todoistPhaseBVersion:1,updatedAt:"source-mapping-v1",
+    activeEffectiveStart:currentDue,todoistPhaseBVersion:1,updatedAt:"2027-02-15T10:01:00Z",
     projectCommentId:"source-comment"};
   const link={profile:"home",taskId:task.id,eventId:sourceMaster.id,
     masterEventId:sourceMaster.id,seriesId:task.id,owner:"todoist",
     activeInstanceId:"source-apr",originalStart:currentDue,
-    activeEffectiveStart:currentDue,updatedAt:"source-link-v1"};
+    activeEffectiveStart:currentDue,updatedAt:"2027-02-15T10:02:00Z"};
   const originalHistory=[occurrence("source-jan",sourceMaster.id,oldStart)];
   let sourceVersion=structuredClone(sourceMaster),destinationVersion;
   let sourceComments=[{id:"source-comment",project_id:home,content:serializeMappingComment(mapping,home)}];
