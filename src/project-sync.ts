@@ -490,7 +490,7 @@ export class ProjectAwareSynchronizer {
     if (["move_projection", "delete_projection", "create_projection"].includes(transition.action)) {
       // Destination identity is checked once by applyProjectMove's preflight;
       // never consume that lookup early or repeat it after source deletion.
-      const nativeSourceProfiles: Profile[] = ["home", "antonio", "work"]
+      const nativeSourceProfiles = (["home", "antonio", "work"] as Profile[])
         .filter(profile => transition.action !== "move_projection" || profile !== transition.toProfile);
       const nativeSource = await this.phaseBNativeSource(task.id,
         [mapping?.profile, transition.fromProfile, ...nativeSourceProfiles]
