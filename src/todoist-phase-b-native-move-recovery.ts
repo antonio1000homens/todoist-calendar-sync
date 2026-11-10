@@ -83,7 +83,7 @@ function exactHistoryLineage(master: CalendarEvent, stage: PhaseBNativeMoveStage
   const s=master.extendedProperties?.shared;
   return Boolean(master.id===stage.sourceMasterId
     && master.status==="confirmed" && master.etag && master.etag!==stage.sourceEtag
-    && !master.recurringEventId && master.start?.date && !master.start?.dateTime
+    && !master.recurringEventId && master.start?.date===stage.originalAnchor && !master.start?.dateTime
     && master.end?.date===plusDays(master.start.date,1) && !master.end?.dateTime
     && master.recurrence?.length===1 && master.recurrence[0]===stage.historyRule
     && s?.syncHistoryOnly==="true" && s.syncHistoryTaskId===stage.taskId
@@ -164,7 +164,7 @@ export async function inspectInterruptedPhaseBNativeMove(
     const plan: PhaseBNativeMovePlan={
       taskId,sourceProfile,destinationProfile,sourceMasterId:stage.sourceMasterId,
       sourceEtag:stage.sourceEtag,successorMasterId:stage.successorMasterId,
-      originalAnchor:sourceMaster.start!.date!,sourceRule:stage.sourceRule,
+      originalAnchor:stage.originalAnchor,sourceRule:stage.sourceRule,
       historyRule:stage.historyRule,historicalLastOccurrence:stage.historicalLastOccurrence,
       destinationStart:stage.destinationStart,destinationRule:stage.destinationRule,
       firstThreeDestinationOccurrences:next as [string,string,string],historyTaskId:taskId,
