@@ -53,7 +53,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     }catch(e:any){
       setInspectionState("failed");
       const message=typeof e?.message==="string"?e.message:"";
-      const unauthorized=/Provider request failed:\\s*401\\s+https:\\/\\/api\\.todoist\\.com\\//i.test(message);
+      const unauthorized=message.includes("Provider request failed: 401 https://api.todoist.com/");
       setInspectionMessage(unauthorized
         ?`Inspection failed: Todoist rejected the ${operation.profile||"selected"} profile's API token (HTTP 401). Update that account's token in AWS Parameter Store, then inspect again. No recovery was applied.`
         :"Inspection failed; no recovery was applied. "+(message||"The provider or recovery service could not be verified."));
