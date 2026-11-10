@@ -97,7 +97,7 @@ const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
  * recoverable only while its original mapping, task, Calendar event, comments,
  * and DynamoDB inventory all still match the confirmed snapshot. Recovery
  * restores sync and never resumes deletion. */
-function initialProjectCommentAttempt(operation:ErasureOperation):boolean {
+function initialProjectCommentAttempt(operation:ErasureOperation,allowDriftCancellation=false):boolean {
   const lifecycle=operation.lifecycle;
   const progress=lifecycle?.deletionProgress;
   const deletionStarted=lifecycle?.evidence?.deletionStarted;
@@ -113,7 +113,8 @@ function initialProjectCommentAttempt(operation:ErasureOperation):boolean {
       &&attempt.startedAt>=deletionStarted!.completedAt
       &&attempt.startedAt+((lifecycle.timeoutSeconds*1000)+2000)<=Date.now())
     &&!operation.postwriteReview
-    &&(!operation.recovery||recoveryMode==="strict_pre_write");
+    &&(!operation.recovery||recoveryMode==="strict_pre_write"
+      ||(allowDriftCancellation&&recoveryMode==="calendar_drift_cancel"));
 }
 function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
   const {operation,preview,fingerprint}=inspection;
@@ -233,7 +234,7 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
   return {
     originalPreWritePhase:(!lifecycle.evidence.deletionStarted
       &&!lifecycle.deletionProgress&&recoverableBeforeWrite.has(lifecycle.phase))
-      ||initialProjectCommentAttempt(operation),
+      ||initialProjectCommentAttempt(operation,operation.recovery?.mode==="calendar_drift_cancel"),
     originalConfirmationIntact:operation.confirmationFingerprint===operation.previewFingerprint
       &&erasurePreviewFingerprint(operation)===operation.previewFingerprint,
     auditComplete:!audit||(audit.allProfilesQueried===true
@@ -300,19 +301,26 @@ function readOnlyRecoveryDiagnostics(
   };
 }
 /** Triage only. A Calendar revision can make the original full-body digest differ
- * even when no erasure deletion was attempted. This never authorises recovery.
- * A future distinct typed cancellation must independently bind fresh provider
- * snapshots to a one-time token and revalidate before each worker transition. */
+ * even when no erasure deletion was attempted. A candidate is never strict
+ * recovery: cancellation uses a distinct one-time confirmation and revalidates
+ * the exact current Calendar revision before every worker transition. */
 function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:ErasurePreviewResult,
   checks:NonNullable<RecoveryPreview["evidenceChecks"]>,blockingReasons:readonly string[],
   mappingStates:Array<{id:string;state:string}>,
-  options:{duringRestore?:boolean}={}):boolean {
+  options:{duringRestore?:boolean;targetOnlySnapshot?:boolean}={}):boolean {
   const original=operation.actionPlan.calendarEvent,current=snapshot.actionPlan.calendarEvent;
+  // The exact first project-comment attempt proves deletion could not yet have
+  // started. For that one cancellation path, exact target reads plus the full
+  // strongly consistent DynamoDB identity inventory are sufficient: this
+  // path preserves both provider objects and never resumes deletion. Later
+  // stages and every deletion proof still require the complete cross-profile audit.
+  const targetOnlyCancellation=options.targetOnlySnapshot===true
+    &&initialProjectCommentAttempt(operation,options.duringRestore===true);
   return blockingReasons.length===0
     && (options.duringRestore?operation.recovery?.mode==="calendar_drift_cancel":!operation.recovery)
     && !operation.postwriteReview
     && operation.selectedActions.deleteCalendar===true
-    && snapshot.crossProfileEvidence!==undefined
+    && (snapshot.crossProfileEvidence!==undefined||targetOnlyCancellation)
     && checks.originalPreWritePhase&&checks.originalConfirmationIntact
     && checks.auditComplete&&checks.freshPreviewSelfConsistent
     && checks.todoistTaskMatches&&Boolean(snapshot.actionPlan.todoistTask)
@@ -393,7 +401,7 @@ export class ErasureRecoveryService {
     const structuralBlockers=[...blockers];
     const evidenceChecks=readOnlyRecoveryEvidenceChecks(op,snapshot);
     const calendarDriftCandidate=calendarOnlyPreWriteDriftCandidate(
-      op,snapshot,evidenceChecks,structuralBlockers,active);
+      op,snapshot,evidenceChecks,structuralBlockers,active,{targetOnlySnapshot:knownTargetOnly});
     const classification=op.lifecycle?recoveryMode(op,snapshot):"partial_or_ambiguous";
     if(classification==="partial_or_ambiguous")
       blockers.push("Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation");
@@ -730,8 +738,12 @@ export class ErasureRecoveryService {
       ||Boolean(control.journal)!==recovery.hasJournal
       ||(control.journal&&control.journal.operationId!==op.operationId))return {safe:false,mappings:[]};
     const original=op.lifecycle?.mappingIds||[];
+    const targetOnlySnapshot=recovery.mode==="calendar_drift_cancel"
+      &&initialProjectCommentAttempt(op,true)&&Boolean(this.adapters.readKnownTargetSnapshot);
+    const readSnapshot=targetOnlySnapshot
+      ?this.adapters.readKnownTargetSnapshot!.bind(this.adapters):this.adapters.readSnapshot.bind(this.adapters);
     const [live,states,snapshot]=await Promise.all([
-      this.adapters.listWorkerMappings(),this.adapters.mappingStates(original),this.adapters.readSnapshot(op)]);
+      this.adapters.listWorkerMappings(),this.adapters.mappingStates(original),readSnapshot(op)]);
     if(live.length!==original.length||new Set(live.map(x=>x.id)).size!==original.length
       ||live.some(x=>!original.includes(x.id)||!x.eventSourceArn.includes(":sqs:"))
       ||states.length!==original.length||new Set(states.map(x=>x.id)).size!==original.length
@@ -749,7 +761,7 @@ export class ErasureRecoveryService {
       const checks=readOnlyRecoveryEvidenceChecks(op,snapshot);
       const current=snapshot.actionPlan.calendarEvent;
       const safe=calendarOnlyPreWriteDriftCandidate(op,snapshot,checks,[],mapped,
-        {duringRestore:true})
+        {duringRestore:true,targetOnlySnapshot})
         &&typeof recovery.calendarDigest==="string"
         &&current?.digest===recovery.calendarDigest
         &&typeof recovery.calendarEtag==="string"

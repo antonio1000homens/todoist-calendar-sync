@@ -413,6 +413,33 @@ function calendarOnlyDriftFixture() {
   return f;
 }
 
+function firstCommentTargetOnlyCalendarDriftFixture() {
+  const f=timedOutProjectCommentFixture();
+  const {operation,external}=f;
+  const eventId="event-first-comment-drift";
+  const original={id:eventId,calendarId:"work-calendar",digest:"a".repeat(64),etag:"etag-before"};
+  operation.target={profile:"work",taskId:"disposable-1",eventId,deleteCalendar:true};
+  operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  operation.actionPlan={...operation.actionPlan,
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:original,
+    knownCalendarAliases:[{profile:"work",calendarId:"work-calendar",eventId}],
+    knownCalendarAliasesComplete:true};
+  operation.providerSnapshotFingerprint="1".repeat(64);
+  operation.previewFingerprint=erasurePreviewFingerprint(operation);
+  operation.confirmationFingerprint=operation.previewFingerprint;
+  const snapshot={...operation,
+    actionPlan:{...operation.actionPlan,calendarEvent:{...original,digest:"b".repeat(64),etag:"etag-after"}},
+    providerSnapshotFingerprint:"5".repeat(64),
+    knownTargetReadback:{todoist:"present",calendar:"present",configuredCalendarLink:"present"},
+    blockers:[]};
+  delete snapshot.crossProfileEvidence;
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  external.snapshot=snapshot;
+  external.knownTargetSnapshot=snapshot;
+  return f;
+}
+
 test("Calendar-only provider revision is triaged read-only, not admitted for recovery",async()=>{
   const f=calendarOnlyDriftFixture();
   const result=await f.service.inspect("op-recovery");
@@ -449,6 +476,57 @@ test("Calendar drift triage rejects other identity/state drift, incomplete audit
     assert.equal(result.preview.allowed,false);
     assert.deepEqual(f.external.writes,[]);
     assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  }
+});
+
+test("first-comment Calendar drift cancellation uses exact target proof and never starts a full cross-profile audit",async()=>{
+  const {service,operation,external}=firstCommentTargetOnlyCalendarDriftFixture();
+  const inspected=await service.inspect("op-recovery");
+  assert.equal(inspected.preview.calendarDriftReview.candidateForSeparateApproval,true);
+  assert.equal(inspected.preview.allowed,false);
+  assert.equal(inspected.preview.evidenceChecks.originalPreWritePhase,true);
+  assert.equal(external.knownTargetCalls,1);
+  assert.equal(external.providerCalls,0);
+
+  const issued=await service.issueConfirmation("op-recovery","operator","calendar_drift_cancel");
+  await service.apply("op-recovery",issued.confirmationId,"operator","calendar_drift_cancel");
+  assert.equal(operation.recovery.mode,"calendar_drift_cancel");
+  assert.equal(operation.recovery.calendarDigest,"b".repeat(64));
+  assert.equal(operation.recovery.calendarEtag,"etag-after");
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+  assert.deepEqual(external.restored,[]);
+  assert.equal((await service.process("op-recovery")).status,"restoring");
+  assert.deepEqual(external.restored,[]);
+  assert.equal((await service.process("op-recovery")).status,"restoring");
+  assert.deepEqual(external.restored,[enabledId]);
+  assert.equal((await service.process("op-recovery")).status,"verifying");
+  assert.equal((await service.process("op-recovery")).status,"completed");
+  assert.ok(!external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(external.providerCalls,0,"cancellation must not wait on unrelated full provider inventories");
+  assert.ok(external.knownTargetCalls>=5,"inspection, confirmation, apply and worker steps recheck the exact target");
+});
+
+test("first-comment target-only Calendar cancellation rejects any non-Calendar drift",async()=>{
+  for(const mutate of [
+    f=>{f.external.knownTargetSnapshot.actionPlan.todoistTask.digest="9".repeat(64);},
+    f=>{f.external.knownTargetSnapshot.inventory=[{type:"TASK",key:{pk:"unrelated",sk:"x"},digest:"0".repeat(64)}];},
+    f=>{f.external.knownTargetSnapshot.actionPlan.comments[0].digest="8".repeat(64);},
+    f=>{f.external.knownTargetSnapshot.actionPlan.knownCalendarAliasesComplete=false;},
+    f=>{f.external.knownTargetSnapshot.knownTargetReadback.calendar="absent";},
+    f=>{f.external.knownTargetSnapshot.blockers.push("conflicting provider identity");},
+  ]) {
+    const f=firstCommentTargetOnlyCalendarDriftFixture();
+    mutate(f);
+    f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);
+    f.external.snapshot=f.external.knownTargetSnapshot;
+    const result=await f.service.inspect("op-recovery");
+    assert.equal(result.preview.calendarDriftReview.candidateForSeparateApproval,false);
+    await assert.rejects(()=>f.service.issueConfirmation("op-recovery","operator","calendar_drift_cancel"),
+      /Recovery is blocked/);
+    assert.equal(f.operation.recovery,undefined);
+    assert.deepEqual(f.external.writes,[]);
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+    assert.deepEqual(f.external.restored,[]);
   }
 });
 
