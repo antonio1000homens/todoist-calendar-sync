@@ -111,7 +111,7 @@ export async function inspectInterruptedPhaseBNativeMove(
       "missing_or_mismatched_immutable_stage");
     requireEvidence(await state.phaseBNativeMoveControlsMatch(stage),
       "stage_controls_incomplete_or_owned_by_another_operation");
-    const [allowedFrom,allowedTo,mapping,link,destinationLink,sourceTombstone,destinationTombstone]=await Promise.all([
+    const [allowedFrom,allowedTo,mapping,link,existingDestinationLink,sourceTombstone,destinationTombstone]=await Promise.all([
       state.mutationAllowed(sourceProfile),state.mutationAllowed(destinationProfile),
       state.getMappingByTaskAnyProfile(taskId),state.getRecurrenceLink(sourceProfile,taskId),
       state.getRecurrenceLink(destinationProfile,taskId),
@@ -120,7 +120,7 @@ export async function inspectInterruptedPhaseBNativeMove(
     ]);
     requireEvidence(allowedFrom && allowedTo && !sourceTombstone && !destinationTombstone,
       "erasure_or_tombstone_prevents_stage_recovery");
-    requireEvidence(mapping && link && !destinationLink && stageMatchedMapping(stage,mapping,link),
+    requireEvidence(mapping && link && !existingDestinationLink && stageMatchedMapping(stage,mapping,link),
       "source_mapping_or_recurrence_link_version_drift");
     const [task,sourceMaster,destinationMaster,sourceZone,destinationZone,todoistZone,
       sourceComments,destinationComments]=await Promise.all([
