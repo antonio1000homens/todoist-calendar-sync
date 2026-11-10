@@ -69,3 +69,9 @@ test("pre-write recovery watchdog has independent, disabled-by-default schedule 
   assert.doesNotMatch(watchdog,/lambda:UpdateEventSourceMapping/);
   assert.doesNotMatch(watchdog,/Type: SQS/);
 });
+
+test("current production deployment does not enable the retired HMAC replay marker mechanism",()=>{
+  assert.doesNotMatch(workflow,/^\s*ERASURE_REPLAY_BARRIER_VERSION:\s*["']?1\b/m);
+  assert.doesNotMatch(template,/^\s*(?:ERASURE_REPLAY_HMAC_KEYS|ERASURE_REPLAY_HMAC_CURRENT_KEY):/m);
+  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'false'/);
+});
