@@ -23,3 +23,21 @@ test("the future post-write marker+fence transaction stays offline, not invoked 
   }
   assert.equal(foundDeclaration,1);
 });
+
+test("superseded orphan HMAC marker installation and verification remain offline",async()=>{
+  // Issue #349 uses a bounded Todoist project-comment tombstone, not the
+  // historical, permanent DynamoDB HMAC marker design. These legacy exports
+  // remain in the barrier module pending a separate source-code retirement.
+  // Reintroducing a live consumer is a policy regression, not a reason to
+  // re-enable the former orphan marker test matrix.
+  const obsolete=["orphanReplayInstallTransaction","assertOrphanReplayGuard"];
+  for(const file of await listTypeScriptSources(root)) {
+    const relative=path.relative(root,file);
+    if(relative==="erasure-replay-barrier.ts")continue;
+    const source=await readFile(file,"utf8");
+    for(const symbol of obsolete) {
+      assert.ok(!source.includes(symbol),
+        "Legacy orphan HMAC replay helper must not be used by live source: "+symbol+" in "+relative);
+    }
+  }
+});
