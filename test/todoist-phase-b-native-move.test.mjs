@@ -12,7 +12,7 @@ function fixture({name="quarterly",start="2027-01-10",due="2027-04-10",
     summary:task.content,description:task.description,start:{date:start},end:{date:nextDay(start)},
     recurrence:[rule],extendedProperties:{shared:{
       taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1",
-      todoistRecurrence:phrase,todoistAnchorStart:start,todoistAnchorEnd:nextDay(start),
+      todoistRecurrence:phrase.toLowerCase(),todoistAnchorStart:start,todoistAnchorEnd:nextDay(start),
       todoistAnchorTimeZone:"Europe/London",
     }}};
   const mapping={profile:"home",taskId:task.id,eventId:master.id,seriesId:task.id,
