@@ -133,10 +133,7 @@ export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCom
   if(operation||confirmation||fence||journal||epoch?.epoch!==proof.epoch)return false;
   return true;
 }
-/** Deployment gate is intentionally OFF until all producer/worker versions
- * participate. Enabling with absent keys never degrades to allow. This gate
- * MUST become permanently ON before any markers/fence releases go live.
- */
+
 
 /**
  * Legacy HMAC marker admission cannot be re-enabled: #349 superseded it with
