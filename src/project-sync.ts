@@ -8,6 +8,7 @@ import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository, type CalendarProjectionTombstone, type CalendarProjectionTombstoneReason } from "./repository.js";
 import { canRecreateCalendarProjection, hasCanonicalState, Synchronizer, toCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch.js";
+import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import {
   calendarRecurrenceMatchesTodoist,
   recurrenceEffectiveStart,
@@ -516,6 +517,35 @@ export class ProjectAwareSynchronizer {
       const releaseMoveLeases = await acquireMoveWriterLeases(
         [transition.fromProfile, transition.toProfile, mapping?.profile], delivery.profile);
       try {
+      // New item:added tasks are normally handled by createDestinationProjection.
+      // That ordinary projection path bypassed the verified Phase B native
+      // writer entirely. Admit only the three proven all-day families to the
+      // final Synchronizer, which independently GETs the Todoist source,
+      // verifies timezones/provider identity, and owns all write/quarantine
+      // safeguards. Crucially this runs BEFORE the project-move version claim:
+      // the final writer must accept that version exactly once.
+      if (transition.action === "create_projection"
+        && transition.toProfile && lifecycle.action === "upsert"
+        && payload.event_name === "item:added" && !oldProjectId
+        && !mapping && !explicitProjectReentry
+        && process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true") {
+        const originalTask = rawPayload.event_data;
+        const due = originalTask?.due?.date;
+        const candidate = due && /^\d{4}-\d{2}-\d{2}$/.test(due)
+          ? todoistPhaseBCandidate(originalTask, {
+            start: due, source: "verified_original_schedule",
+          }) : undefined;
+        if (candidate?.reason === "provider_readback_required"
+          && !(await this.state.getCalendarProjectionTombstone(transition.toProfile, task.id))) {
+          return this.delegate.process({
+            ...delivery,
+            profile: transition.toProfile,
+            // Keep original source evidence; providerReadback must be a
+            // separate authenticated GET in Synchronizer.processTodoist.
+            body: JSON.stringify(rawPayload),
+          });
+        }
+      }
       const versionAccepted = await this.state.acceptTaskVersion(delivery.profile, task.id, task.updated_at, delivery.id);
       if (!versionAccepted && !explicitProjectChange) {
         return this.state.audit(delivery.profile, "todoist_stale_project_move_suppressed", {

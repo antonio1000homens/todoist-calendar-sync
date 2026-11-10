@@ -382,7 +382,14 @@ export class OrphanRecoveringSynchronizer {
         if (currentTask.id !== task.id) throw new Error("Todoist returned a different task identity for an unmapped webhook");
         task = currentTask;
         payload = { ...payload, event_data: currentTask };
-        delivery = { ...delivery, body: JSON.stringify(payload) };
+        // Preserve the signed item:added source separately from this fresh GET
+        // when Phase B admission is opted in. Replacing the delivery body with
+        // currentTask would make the supposedly independent evidence identical
+        // and could promote an already-advanced/edited recurrence.
+        if (!(payload.event_name === "item:added"
+          && process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true")) {
+          delivery = { ...delivery, body: JSON.stringify(payload) };
+        }
       } catch (error) {
         if (Number((error as { status?: number }).status) === 404) return;
         throw error;
