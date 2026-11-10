@@ -5,6 +5,8 @@ import { Todoist } from "../dist/providers.js";
 test("provider reads abort on the configured request deadline without hidden retries",async t=>{
   const original=globalThis.fetch;
   t.after(()=>{globalThis.fetch=original;});
+  const keepAlive=setTimeout(()=>{},100);
+  t.after(()=>clearTimeout(keepAlive));
   let calls=0;
   globalThis.fetch=async(_url,init)=>{
     calls++;
@@ -21,6 +23,8 @@ test("provider reads abort on the configured request deadline without hidden ret
 test("Todoist full-sync erasure inventory stops retrying after its request deadline",async t=>{
   const original=globalThis.fetch;
   t.after(()=>{globalThis.fetch=original;});
+  const keepAlive=setTimeout(()=>{},100);
+  t.after(()=>clearTimeout(keepAlive));
   let calls=0;
   globalThis.fetch=async(_url,init)=>{
     calls++;
