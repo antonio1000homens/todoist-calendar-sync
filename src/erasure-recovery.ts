@@ -61,6 +61,13 @@ export interface RecoveryPreview {
     stateInventoryMatches:boolean;
     providerSafetyBlockerCount:number;
   };
+  /** Explanation-only statuses from this inspection, never used to grant recovery. */
+  diagnostics?:Record<
+    "lifecycle"|"originalConfirmation"|"audit"|"freshPreview"|"originalProviderSnapshot"
+    |"operationFingerprint"|"snapshotBlockers"|"todoistTask"|"calendarEvent"
+    |"comments"|"projectCommentIds"|"calendarAliases"|"stateInventory"
+    |"fence"|"epoch"|"mappingInventory"|"mappingStates"|"workerLeases",
+    "verified"|"missing"|"mismatched">;
 }
 export interface RecoveryAdapters {
   listWorkerMappings():Promise<FencedMapping[]>;
@@ -223,6 +230,52 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
     providerSafetyBlockerCount:snapshot.blockers.length,
   };
 }
+/** Diagnostic comparisons deliberately cannot influence the existing recoveryMode/guards. */
+function readOnlyRecoveryDiagnostics(
+  op:ErasureOperation,snapshot:ErasurePreviewResult,
+  checks:NonNullable<RecoveryPreview["evidenceChecks"]>,
+  control:{fence?:Record<string,unknown>;epoch?:number;leases:Record<string,unknown>[]},
+  mappings:FencedMapping[],active:Array<{id:string;state:string}>,id:string,
+):NonNullable<RecoveryPreview["diagnostics"]> {
+  type Status="verified"|"missing"|"mismatched";
+  const original=op.lifecycle!.mappingIds||[];
+  const baseline=snapshot.crossProfileEvidence
+    ?snapshot.primaryProviderSnapshotFingerprint:snapshot.providerSnapshotFingerprint;
+  const status=(ok:boolean,missing:boolean):Status=>ok?"verified":missing?"missing":"mismatched";
+  const compare=(ok:boolean,expected:unknown,current:unknown):Status=>
+    status(ok,expected!==undefined&&expected!==null&&(current===undefined||current===null));
+  const currentIds=mappings.map(item=>item.id).sort();
+  const exactMappingInventory=currentIds.length===original.length
+    &&currentIds.every((value,i)=>value===[...original].sort()[i])
+    &&mappings.every(value=>/^[0-9a-f-]{36}$/i.test(value.id)
+      &&value.eventSourceArn?.includes(":sqs:")&&["Enabled","Disabled"].includes(value.state));
+  const originallyEnabled=new Set(Array.isArray(op.lifecycle!.enabledMappingIds)
+    ?op.lifecycle!.enabledMappingIds:[]);
+  const mapped=active.length===original.length&&new Set(active.map(value=>value.id)).size===original.length
+    &&active.every(value=>original.includes(value.id)&&["Enabled","Disabled"].includes(value.state))
+    &&active.every(value=>originallyEnabled.has(value.id)||value.state==="Disabled");
+  return {
+    lifecycle:status(checks.originalPreWritePhase,!op.lifecycle?.phase),
+    originalConfirmation:status(checks.originalConfirmationIntact,!op.confirmationId||!op.confirmationFingerprint),
+    audit:status(checks.auditComplete,Boolean(snapshot.crossProfileEvidence
+      &&(!snapshot.crossProfileEvidence.stateScan||snapshot.crossProfileEvidence.allProfilesQueried===undefined))),
+    freshPreview:status(checks.freshPreviewSelfConsistent,!snapshot.previewFingerprint),
+    originalProviderSnapshot:compare(checks.primaryProviderMatches,op.providerSnapshotFingerprint,baseline),
+    operationFingerprint:compare(checks.originalPreviewMatches,op.previewFingerprint,baseline),
+    snapshotBlockers:status(checks.providerSafetyBlockerCount===0,false),
+    todoistTask:compare(checks.todoistTaskMatches,op.actionPlan.todoistTask,snapshot.actionPlan.todoistTask),
+    calendarEvent:compare(checks.calendarEventMatches,op.actionPlan.calendarEvent,snapshot.actionPlan.calendarEvent),
+    comments:compare(checks.commentsMatch,op.actionPlan.comments,snapshot.actionPlan.comments),
+    projectCommentIds:compare(checks.projectCommentIdsMatch,op.actionPlan.projectCommentIds,snapshot.actionPlan.projectCommentIds),
+    calendarAliases:status(checks.knownCalendarAliasesMatch,false),
+    stateInventory:compare(checks.stateInventoryMatches,op.inventory,snapshot.inventory),
+    fence:status(control.fence?.operationId===id&&control.fence.state==="active",!control.fence),
+    epoch:status(typeof control.epoch==="number"&&Number.isFinite(control.epoch)&&control.epoch>0,control.epoch===undefined),
+    mappingInventory:status(exactMappingInventory,mappings.length===0),
+    mappingStates:status(mapped,active.length===0),
+    workerLeases:status(control.leases.length===0,false),
+  };
+}
 /** Triage only. A Calendar revision can make the original full-body digest differ
  * even when no erasure deletion was attempted. This never authorises recovery.
  * A future distinct typed cancellation must independently bind fresh provider
@@ -321,6 +374,7 @@ export class ErasureRecoveryService {
     if(op.recovery?.status==="blocked")
       blockers.push("Recovery previously blocked due to drift; operator escalation required");
     const mappingStates=expectedMappingStates(op,active);
+    const diagnostics=readOnlyRecoveryDiagnostics(op,snapshot,evidenceChecks,control,mappings,active,id);
     const preview:RecoveryPreview={operationId:id,profile:op.profile,phase:op.lifecycle?.phase||"unknown",classification,
       blockers:[...new Set(blockers)].sort(),allowed:blockers.length===0,
       mappingStates,epoch:control.epoch,fenceOwned:control.fence?.operationId===id,
@@ -336,7 +390,7 @@ export class ErasureRecoveryService {
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
       snapshotSafetyBlockerCount:snapshot.blockers.length,
-      evidenceChecks,
+      evidenceChecks,diagnostics,
       calendarDriftReview:{candidateForSeparateApproval:calendarDriftCandidate,releaseAllowed:false},
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
