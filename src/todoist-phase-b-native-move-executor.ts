@@ -185,7 +185,7 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
     || currentLink.masterEventId !== sourceLink.masterEventId)
     throw new Error("Phase B move state ownership, suppression, or repair evidence changed");
   const [liveTask, master, sourceZone, destinationZone, todoistZone,
-    destinationAlias, existingDestinationMapping, sourceComments, destinationComments] = await Promise.all([
+    destinationAlias, sourceTombstone, sourceComments, destinationComments] = await Promise.all([
       destination.todoist.getTask(task.id),
       source.calendar.getEvent(sourceMapping.masterEventId!),
       source.calendar.getTimeZone(), destination.calendar.getTimeZone(),
@@ -206,7 +206,9 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
   if (matchingSource.length!==1
     || (sourceIndex.byTaskId.get(task.id)||[]).length!==1
     || (destinationIndex.byTaskId.get(task.id)||[]).length
-    || destinationAlias || existingDestinationMapping)
+    || sourceIndex.malformed.some(x=>String(x.comment.content||"").includes(task.id))
+    || destinationIndex.malformed.some(x=>String(x.comment.content||"").includes(task.id))
+    || destinationAlias || sourceTombstone)
     throw new Error("Phase B native move source or destination project breadcrumb conflicts");
   const historicalInstances = await source.calendar.listInstancesInWindow(
     master.id, `${master.start?.date}T00:00:00Z`, `${task.due?.date}T00:00:00Z`,
@@ -264,9 +266,13 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
       destination.calendar.listExplicitSeriesExceptions(plan.successorMasterId),
     ]);
     verifyDestinationMaster(destinationReadback,wanted);
+    const orderedDestinationInstances=[...destinationInstances].sort((a,b)=>
+      (a.originalStartTime?.date||"").localeCompare(b.originalStartTime?.date||""));
+    const activeDestination=orderedDestinationInstances.find(e=>
+      e.originalStartTime?.date===plan.destinationStart);
     if (destinationExceptions.length
-      || destinationInstances.length < 3
-      || !instancesAreExact(destinationInstances.slice(0,3),plan.successorMasterId,
+      || orderedDestinationInstances.length < 3 || !activeDestination
+      || !instancesAreExact(orderedDestinationInstances.slice(0,3),plan.successorMasterId,
         plan.firstThreeDestinationOccurrences,current.content,current.description||""))
       throw new Error("Destination provider did not prove the next three exact native occurrences");
     if (!sameTask(await destination.todoist.getTask(task.id),observed.task))
@@ -285,7 +291,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
     verifyHistoryMaster(retained,master,plan);
     if (sourceExceptions.length || upcoming.length
       || !instancesAreExact(retainedInstances,master.id,
-        historicalInstances.map(x=>x.originalStartTime?.date||""),
+        historicalInstances.map(x=>x.originalStartTime?.date||"").sort(),
         master.summary||"",master.description||""))
       throw new Error("Source provider did not preserve exact elapsed history or remove future projections");
     verifyDestinationMaster(await destination.calendar.getEvent(plan.successorMasterId),wanted);
@@ -297,7 +303,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
       ...sourceMapping,profile:destinationProfile,taskId:task.id,
       projectId:profiles[destinationProfile].todoistProjectId,
       eventId:plan.successorMasterId,masterEventId:plan.successorMasterId,
-      seriesId:task.id,activeInstanceId:destinationInstances[0].id,
+      seriesId:task.id,activeInstanceId:activeDestination.id,
       originalStart:plan.destinationStart,activeEffectiveStart:plan.destinationStart,
       todoistPhaseBVersion:1,updatedAt:timestamp,
     };
