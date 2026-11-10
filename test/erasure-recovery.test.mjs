@@ -245,6 +245,68 @@ test("read-only recovery diagnostics isolate DynamoDB inventory drift",async()=>
   assert.equal(external.writes.length,0);
 });
 
+
+function calendarOnlyDriftFixture() {
+  const f=fixture();
+  const original={id:"event-1",calendarId:"work-calendar",digest:"a".repeat(64),etag:"v1"};
+  f.operation.target={profile:"work",taskId:"disposable-1",eventId:"event-1",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={...f.operation.actionPlan,calendarEvent:original};
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  const snapshot={...f.external.snapshot,
+    profile:"work",target:{...f.operation.target},selectedActions:{...f.operation.selectedActions},
+    actionPlan:{...f.operation.actionPlan,calendarEvent:{...original,digest:"b".repeat(64),etag:"v2"}},
+    providerSnapshotFingerprint:"c".repeat(64),primaryProviderSnapshotFingerprint:"d".repeat(64),
+    crossProfileEvidence:{allProfilesQueried:true,
+      stateScan:{allPagesReceived:true,stronglyConsistent:true}},
+    knownTargetReadback:{todoist:"present",calendar:"present",configuredCalendarLink:"present"},
+    blockers:[],inventory:[],
+  };
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  return f;
+}
+
+test("Calendar-only provider revision is triaged read-only, not admitted for recovery",async()=>{
+  const f=calendarOnlyDriftFixture();
+  const result=await f.service.inspect("op-recovery");
+  assert.equal(result.preview.classification,"partial_or_ambiguous");
+  assert.equal(result.preview.allowed,false);
+  assert.deepEqual(result.preview.calendarDriftReview,
+    {candidateForSeparateApproval:true,releaseAllowed:false});
+  assert.equal(result.preview.evidenceChecks.calendarEventMatches,false);
+  assert.equal(result.preview.evidenceChecks.todoistTaskMatches,true);
+  await assert.rejects(f.service.issueConfirmation("op-recovery","operator"),
+    /Recovery is blocked/);
+  assert.deepEqual(f.external.writes,[]);
+  assert.deepEqual(f.external.restored,[]);
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("Calendar drift triage rejects other identity/state drift, incomplete audits and live writers",async()=>{
+  for(const mutate of [
+    f=>{f.external.snapshot.actionPlan.todoistTask.digest="9".repeat(64);},
+    f=>{f.external.snapshot.inventory=[{type:"TASK",key:{pk:"TASK#other",sk:"STATE"},digest:"0".repeat(64)}];},
+    f=>{f.external.snapshot.crossProfileEvidence.stateScan.allPagesReceived=false;},
+    f=>{f.external.snapshot.actionPlan.calendarEvent.id="different-event";},
+    f=>{f.external.snapshot.knownTargetReadback.calendar="absent";},
+    f=>{f.external.snapshot.blockers=["Provider identity mismatch"];},
+    f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#active",operationId:"other"});},
+    f=>{f.external.mappingStates.set(enabledId,"Enabled");},
+    f=>{f.operation.lifecycle.evidence.deletionStarted={operationId:"op-recovery",phase:"deletionStarted",receiptId,completedAt:1000};},
+  ]) {
+    const f=calendarOnlyDriftFixture();
+    mutate(f);
+    f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+    const result=await f.service.inspect("op-recovery");
+    assert.equal(result.preview.calendarDriftReview.candidateForSeparateApproval,false);
+    assert.equal(result.preview.allowed,false);
+    assert.deepEqual(f.external.writes,[]);
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  }
+});
+
 test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
   const {service,operation,external}=fixture();
   const started=await service.startAutomaticPreWriteRecovery("op-recovery");
