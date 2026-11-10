@@ -114,7 +114,8 @@ function fixture(options={}){
     async getEvent(){calls.push("destination-get");return structuredClone(destinationVersion);},
     async listInstancesInWindow(){
       const seq=options.missingDestinationInstance?firstThree.slice(0,2):firstThree;
-      return seq.map((date,i)=>occurrence("destination-"+i,destinationVersion.id,date));
+      const list=seq.map((date,i)=>occurrence("destination-"+i,destinationVersion.id,date));
+      return options.shuffleDestination?list.reverse():list;
     },
     async listExplicitSeriesExceptions(){return options.destinationException?
       [{id:"exception",status:"cancelled",recurringEventId:destinationVersion.id}]:[];},
@@ -139,6 +140,7 @@ test("full staged provider cutover preserves history and atomically moves owners
   const result=await executePhaseBNativeMove(f);
   assert.equal(result.mapping.profile,"work");
   assert.equal(result.mapping.todoistPhaseBVersion,1);
+  assert.equal(result.mapping.activeInstanceId,"destination-0");
   assert.equal(f.state.committed,true);
   assert.equal(f.state.stage,false);
   assert.equal(f.read().sourceVersion.recurrence[0],
@@ -157,6 +159,13 @@ test("full staged provider cutover preserves history and atomically moves owners
   assert.ok(f.calls.indexOf("cap-source")<f.calls.indexOf("commit"));
   assert.ok(f.calls.indexOf("delete-source-comment")<f.calls.indexOf("commit"));
   assert.equal(f.audits.at(-1).action,"todoist_phase_b_native_future_only_move_succeeded");
+}));
+test("out-of-order Calendar instance inventory still selects the exact active occurrence",()=>withGate(true,async()=>{
+  const f=fixture({shuffleDestination:true});
+  const r=await executePhaseBNativeMove(f);
+  assert.equal(r.mapping.originalStart,currentDue);
+  assert.equal(r.mapping.activeInstanceId,"destination-0");
+  assert.equal(f.state.committed,true);
 }));
 test("default-off Phase B cannot claim a stage or touch providers",()=>withGate(false,async()=>{
   const f=fixture();
