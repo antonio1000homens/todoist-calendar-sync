@@ -3,6 +3,8 @@ import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { serializeMappingComment } from "../dist/mapping-comments.js";
 import { executePhaseBNativeMove, inspectPhaseBNativeMove } from "../dist/todoist-phase-b-native-move-executor.js";
+import { phaseBNativeMoveStage } from "../dist/todoist-phase-b-move-handoff.js";
+import { inspectInterruptedPhaseBNativeMove, completeVerifiedPhaseBNativeMoveStage } from "../dist/todoist-phase-b-native-move-recovery.js";
 
 const home=profiles.home.todoistProjectId,work=profiles.work.todoistProjectId;
 const currentDue="2027-04-10",oldStart="2027-01-10";
@@ -37,22 +39,26 @@ function fixture(options={}){
   let sourceComments=[{id:"source-comment",project_id:home,content:serializeMappingComment(mapping,home)}];
   let destinationComments=[];
   const calls=[],audits=[],state={
-    stage:false, mapping,link,committed:false,
-    async getPhaseBNativeMoveStage(){return this.stage?{operationId:"staged"}:undefined;},
+    stage:false,stagePayload:null,mapping,link,committed:false,approveCommit:false,
+    async getPhaseBNativeMoveStage(){return this.stage?this.stagePayload:undefined;},
+    async phaseBNativeMoveControlsMatch(stage){
+      return this.stage && this.stagePayload?.operationId===stage.operationId && !options.missingControl;
+    },
     async getMappingByTaskAnyProfile(){return this.mapping;},
-    async getRecurrenceLink(){return this.link;},
+    async getRecurrenceLink(profile){return this.link?.profile===profile?this.link:undefined;},
     async getCalendarProjectionTombstone(){return undefined;},
     async syncBlocked(){return false;},
-    async mutationAllowed(){return true;},
+    async mutationAllowed(){return !options.erasureBlocked;},
     async beginPhaseBNativeMove(input){
       calls.push("stage");
       this.stage=true;
+      this.stagePayload=phaseBNativeMoveStage(input);
       if(options.staleAfterStage)sourceVersion.etag="other-etag";
       return "claimed";
     },
     async commitPhaseBNativeMoveIfUnchanged(input){
       calls.push("commit");
-      if(options.rejectCommit)return false;
+      if(options.rejectCommit&&!this.approveCommit)return false;
       this.mapping=input.destinationMapping;this.link=input.destinationLink;
       this.stage=false;this.committed=true;return true;
     },
@@ -219,3 +225,96 @@ test("every ambiguous provider state stays staged, never releases locks or overw
       "repeated worker delivery must not create/rewrite a second master");
   }
 }));
+
+async function withRecoveryApproval(enabled,fn){
+  const old=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED;
+  if(enabled)process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED="true";
+  else delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED;
+  try{return await fn();}finally{
+    if(old===undefined)delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED;
+    else process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED=old;
+  }
+}
+const recoveryRequest=(f)=>({
+  taskId:f.task.id,expectedOperationId:f.state.stagePayload.operationId,
+  sourceProfile:f.sourceProfile,destinationProfile:f.destinationProfile,
+  state:f.state,source:f.source,destination:f.destination,
+  acquireWriterLeases:f.acquireWriterLeases,
+});
+test("after a lost CAS response, recovery reads exact provider split and commits ONLY the state handoff",
+  ()=>withGate(true,()=>withRecoveryApproval(true,async()=>{
+    const f=fixture({rejectCommit:true,shuffleDestination:true});
+    await assert.rejects(()=>executePhaseBNativeMove(f),/CAS failed/);
+    assert.equal(f.state.stage,true);
+    assert.equal(f.state.committed,false);
+    const before=f.calls.filter(x=>["create-destination","cap-source","destination-comment",
+      "delete-source-comment"].includes(x));
+    const request=recoveryRequest(f);
+    const inspection=await inspectInterruptedPhaseBNativeMove(request);
+    assert.equal(inspection.status,"ready_to_commit",inspection.reason);
+    assert.equal(f.state.committed,false,"read-only inspection must never change mapping state");
+    f.state.approveCommit=true;
+    const completed=await completeVerifiedPhaseBNativeMoveStage(request);
+    assert.equal(completed.status,"ready_to_commit");
+    assert.equal(f.state.committed,true);
+    assert.equal(f.state.stage,false);
+    assert.equal(f.state.mapping.profile,"work");
+    assert.equal(f.state.mapping.activeInstanceId,"destination-0");
+    assert.equal(f.state.link.activeInstanceId,"destination-0");
+    assert.deepEqual(f.calls.filter(x=>["create-destination","cap-source",
+      "destination-comment","delete-source-comment"].includes(x)),before,
+      "recovery must never repeat a provider write");
+    assert.deepEqual(f.read().sourceComments,[]);
+    assert.equal(f.read().destinationComments.length,1);
+    assert.equal((await inspectInterruptedPhaseBNativeMove(request)).status,"quarantined",
+      "a completed stage must never be implicitly replayed");
+  })));
+test("recovery remains disabled without explicit operation-specific operator invocation",
+  ()=>withGate(true,()=>withRecoveryApproval(false,async()=>{
+    const f=fixture({rejectCommit:true});
+    await assert.rejects(()=>executePhaseBNativeMove(f),/CAS failed/);
+    await assert.rejects(()=>completeVerifiedPhaseBNativeMoveStage(recoveryRequest(f)),/approval/);
+    assert.equal(f.state.stage,true);
+    assert.equal(f.state.committed,false);
+  })));
+test("incomplete and ambiguous provider stages never become eligible for recovery",
+  ()=>withGate(true,()=>withRecoveryApproval(true,async()=>{
+    const scenarios=[
+      {createLostResponse:true},{badReadbackMarker:true},{missingDestinationInstance:true},
+      {destinationException:true},{failCap:true},{futureNotCapped:true},
+      {historyMissingAfterCap:true},{failSourceComment:true},{duplicateComment:true},
+      {rejectCommit:true,missingControl:true},{rejectCommit:true,erasureBlocked:true},
+    ];
+    for(const options of scenarios){
+      const f=fixture(options);
+      await assert.rejects(()=>executePhaseBNativeMove(f),JSON.stringify(options));
+      const request=recoveryRequest(f);
+      const before=f.calls.filter(x=>["create-destination","cap-source","destination-comment",
+        "delete-source-comment"].includes(x));
+      const result=await inspectInterruptedPhaseBNativeMove(request);
+      assert.equal(result.status,"quarantined",JSON.stringify(options));
+      await assert.rejects(()=>completeVerifiedPhaseBNativeMoveStage(request),/quarantined/);
+      assert.equal(f.state.stage,true,JSON.stringify(options));
+      assert.equal(f.state.committed,false,JSON.stringify(options));
+      assert.deepEqual(f.calls.filter(x=>["create-destination","cap-source",
+        "destination-comment","delete-source-comment"].includes(x)),before);
+    }
+  })));
+test("stage fingerprint and mapping/version drift reject recovery even with complete provider split",
+  ()=>withGate(true,()=>withRecoveryApproval(true,async()=>{
+    for(const change of [
+      f=>{f.state.mapping={...f.state.mapping,updatedAt:"unrelated-new-revision"};},
+      f=>{f.state.stagePayload={...f.state.stagePayload,destinationStart:"2027-07-10"};},
+      f=>{f.state.stagePayload={...f.state.stagePayload,operationId:"other-operation"};},
+    ]){
+      const f=fixture({rejectCommit:true});
+      await assert.rejects(()=>executePhaseBNativeMove(f),/CAS failed/);
+      const request=recoveryRequest(f);
+      change(f);
+      const result=await inspectInterruptedPhaseBNativeMove(request);
+      assert.equal(result.status,"quarantined");
+      await assert.rejects(()=>completeVerifiedPhaseBNativeMoveStage(request));
+      assert.equal(f.state.stage,true);
+      assert.equal(f.state.committed,false);
+    }
+  })));
