@@ -38,6 +38,8 @@ export interface RecoveryPreview {
   recoveryStatus?:RecoveryStatus;
   crossProfileEvidence?:CrossProfileErasureEvidence;
   /** Read-only comparisons only. None of these booleans can grant recovery. */
+  /** Review-only triage: cannot issue recovery confirmation or release a fence. */
+  calendarDriftReview?:{candidateForSeparateApproval:boolean;releaseAllowed:false};
   evidenceChecks?:{
     originalPreWritePhase:boolean;
     originalConfirmationIntact:boolean;
@@ -215,6 +217,37 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
     providerSafetyBlockerCount:snapshot.blockers.length,
   };
 }
+/** Triage only. A Calendar revision can make the original full-body digest differ
+ * even when no erasure deletion was attempted. This never authorises recovery.
+ * A future distinct typed cancellation must independently bind fresh provider
+ * snapshots to a one-time token and revalidate before each worker transition. */
+function calendarOnlyPreWriteDriftCandidate(operation:ErasureOperation,snapshot:ErasurePreviewResult,
+  checks:NonNullable<RecoveryPreview["evidenceChecks"]>,blockingReasons:readonly string[],
+  mappingStates:Array<{id:string;state:string}>):boolean {
+  const original=operation.actionPlan.calendarEvent,current=snapshot.actionPlan.calendarEvent;
+  return blockingReasons.length===0
+    && !operation.recovery&&!operation.postwriteReview
+    && operation.selectedActions.deleteCalendar===true
+    && snapshot.crossProfileEvidence!==undefined
+    && checks.originalPreWritePhase&&checks.originalConfirmationIntact
+    && checks.auditComplete&&checks.freshPreviewSelfConsistent
+    && checks.todoistTaskMatches&&Boolean(snapshot.actionPlan.todoistTask)
+    && checks.commentsMatch&&checks.projectCommentIdsMatch
+    && checks.knownCalendarAliasesMatch&&checks.stateInventoryMatches
+    && checks.providerSafetyBlockerCount===0
+    && !checks.calendarEventMatches&&!checks.primaryProviderMatches&&!checks.originalPreviewMatches
+    && Boolean(original&&current)
+    && operation.profile===snapshot.profile
+    && operation.target.taskId===snapshot.target.taskId
+    && operation.target.eventId===snapshot.target.eventId
+    && operation.target.eventId===original?.id
+    && original?.id===current?.id&&original?.calendarId===current?.calendarId
+    && typeof original?.etag==="string"&&original.etag.length>0
+    && typeof current?.etag==="string"&&current.etag.length>0
+    && snapshot.knownTargetReadback?.todoist==="present"
+    && snapshot.knownTargetReadback?.calendar==="present"
+    && mappingStates.every(x=>x.state==="Disabled");
+}
 function expectedMappingStates(op:ErasureOperation, actual:Array<{id:string;state:string}>):Array<{id:string;state:string;originallyEnabled:boolean}> {
   const enabled=new Set(op.lifecycle!.enabledMappingIds);
   return actual.map(x=>({id:x.id,state:x.state,originallyEnabled:enabled.has(x.id)}));
@@ -257,6 +290,12 @@ export class ErasureRecoveryService {
     if(active.some(x=>!enabled.has(x.id)&&x.state!=="Disabled"))
       blockers.push("A mapping originally disabled has become enabled");
     if(snapshot.blockers.length)blockers.push("Exact provider, comments, recurrence, or DynamoDB inventory is unsafe");
+    // Take a structural snapshot before adding the expected generic digest-drift
+    // blocker. Candidate assessment is informational and cannot change allowed.
+    const structuralBlockers=[...blockers];
+    const evidenceChecks=readOnlyRecoveryEvidenceChecks(op,snapshot);
+    const calendarDriftCandidate=calendarOnlyPreWriteDriftCandidate(
+      op,snapshot,evidenceChecks,structuralBlockers,active);
     const classification=op.lifecycle?recoveryMode(op,snapshot):"partial_or_ambiguous";
     if(classification==="partial_or_ambiguous")
       blockers.push("Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation");
@@ -283,7 +322,8 @@ export class ErasureRecoveryService {
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
       snapshotSafetyBlockerCount:snapshot.blockers.length,
-      evidenceChecks:readOnlyRecoveryEvidenceChecks(op,snapshot),
+      evidenceChecks,
+      calendarDriftReview:{candidateForSeparateApproval:calendarDriftCandidate,releaseAllowed:false},
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
       ...(snapshot.crossProfileEvidence?{crossProfileEvidence:snapshot.crossProfileEvidence}:{})};

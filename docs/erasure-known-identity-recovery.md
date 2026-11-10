@@ -43,3 +43,26 @@ disable those old versions. #347's enforceable writer/IAM boundary and #349's
 disposable Work-profile fault-injection acceptance are not complete. The gate
 therefore remains disabled and no fence-release or recovery action is
 authorized by this rollout.
+
+### Calendar-only drift triage (read-only; not yet a cancellation authorization)
+
+A pre-write operation can be blocked because the Google Calendar full-provider body
+(including revision metadata) changed after the original deletion confirmation.
+The recovery inspector now reports `calendarDriftReview.candidateForSeparateApproval`
+only when the original confirmation is intact, **no deletion receipt or progress**
+exists, the exact operation-owned fence/epoch and mapping inventory are valid,
+no writer lease is active, the complete strongly consistent cross-profile audit
+succeeds, the original Todoist item and all comments/aliases/attributable state
+match, and both exact original/current Calendar event identities remain present
+in the same configured Calendar. Any unrelated drift, ambiguous provider identity,
+missing ETag, incomplete audit, enabled source mapping or provider blocker rules
+out the candidate.
+
+**No mutation or permission change:** This is explanatory read-only evidence.
+It cannot issue a `RESTORE SYNC` token, invoke the recovery worker, restore
+mappings, resume a pending deletion, change a tombstone or release a fence.
+A future separately reviewed, explicitly operator-confirmed **cancel erasure
+with provider drift** operation must bind a fresh Calendar/provider read to a
+single-use confirmation and recheck the provider revision before every writer
+transition. A changed Calendar digest alone is **not** proof a safe cancellation
+can be performed. Keep the operation fenced if any doubt remains.
