@@ -674,11 +674,16 @@ export class ErasureRecoveryService {
       const items:any[]=[
         {Update:{TableName:table(),Key:operationKey(id),
           UpdateExpression:"SET recovery.#status=:done, recovery.completedAt=:now, updatedAt=:now",
-          ConditionExpression:"#status=:review AND recovery.#status=:verify AND recovery.fingerprint=:digest AND recovery.epoch=:epoch AND previewFingerprint=:preview AND lifecycle.#phase=:phase",
-          ExpressionAttributeNames:{"#status":"status","#phase":"phase"},
+          ConditionExpression:"#status=:review AND recovery.#status=:verify AND recovery.fingerprint=:digest AND recovery.epoch=:epoch AND previewFingerprint=:preview AND lifecycle.#phase=:phase"
+            +(recovery.mode==="calendar_drift_cancel"
+              ?" AND recovery.#mode=:mode AND recovery.approvedCalendarDriftCommitment=:approved":""),
+          ExpressionAttributeNames:{"#status":"status","#phase":"phase",
+            ...(recovery.mode==="calendar_drift_cancel"?{"#mode":"mode"}:{})},
           ExpressionAttributeValues:{":review":"review_required",":verify":"verifying",":done":"completed",
             ":digest":recovery.fingerprint,":epoch":recovery.epoch,":preview":op.previewFingerprint,
-            ":phase":op.lifecycle!.phase,":now":new Date().toISOString()}}},
+            ":phase":op.lifecycle!.phase,":now":new Date().toISOString(),
+            ...(recovery.mode==="calendar_drift_cancel"
+              ?{":mode":"calendar_drift_cancel",":approved":recovery.approvedCalendarDriftCommitment}:{})}}},
         {Delete:{TableName:table(),Key:profileKey(op.profile,"FENCE"),
           ConditionExpression:"operationId=:id AND #state=:active",
           ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
