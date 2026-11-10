@@ -4,7 +4,7 @@ import {readFile,readdir} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {documentClient} from "../dist/dynamodb-capacity.js";
-import {ErasureReplayBlockedError} from "../dist/erasure-replay-barrier.js";
+import {ErasureReplayUnavailableError} from "../dist/erasure-replay-barrier.js";
 import {calendarForProfile,GoogleCalendar,Todoist} from "../dist/providers.js";
 import {REPLAY_GUARDED_PROVIDER_WRITES} from "../dist/erasure-replay-providers.js";
 
@@ -98,29 +98,16 @@ test("production provider construction has only guarded identity routes or class
   assert.match(watch,/\.stopWatch\(/);
 });
 
-test("calendarForProfile checks the exact profile marker before its provider write",async t=>{
-  const prior={version:process.env.ERASURE_REPLAY_BARRIER_VERSION,protocol:process.env.ERASURE_PROTOCOL_VERSION,keys:process.env.ERASURE_REPLAY_HMAC_KEYS,
-    current:process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY};
+test("calendarForProfile refuses obsolete HMAC gate before any provider write",async t=>{
+  const prior=process.env.ERASURE_REPLAY_BARRIER_VERSION;
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
-  process.env.ERASURE_PROTOCOL_VERSION="1";
-  process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({v1:Buffer.alloc(32,7).toString("base64")});
-  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="v1";
-  t.after(()=>{
-    for(const [key,value] of Object.entries({ERASURE_REPLAY_BARRIER_VERSION:prior.version,ERASURE_PROTOCOL_VERSION:prior.protocol,
-      ERASURE_REPLAY_HMAC_KEYS:prior.keys,ERASURE_REPLAY_HMAC_CURRENT_KEY:prior.current}))
-      if(value===undefined)delete process.env[key];else process.env[key]=value;
-  });
-  const reads=[];let providerRequests=0;
-  t.mock.method(documentClient,"send",async command=>{
-    reads.push(command.input.Key);
-    return {Item:{markerVersion:1}};
-  });
-  const originalFetch=globalThis.fetch;
-  globalThis.fetch=async()=>{providerRequests++;throw new Error("provider call must be blocked before HTTP");};
-  t.after(()=>{globalThis.fetch=originalFetch;});
+  t.after(()=>{if(prior===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
+    else process.env.ERASURE_REPLAY_BARRIER_VERSION=prior;});
+  let reads=0,providerRequests=0;
+  t.mock.method(documentClient,"send",async()=>{reads++;throw Error("legacy marker lookup");});
+  t.mock.method(globalThis,"fetch",async()=>{providerRequests++;throw Error("provider write");});
   const calendar=calendarForProfile({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"work","calendar-id");
-  await assert.rejects(calendar.deleteEvent("erased-event","etag"),ErasureReplayBlockedError);
-  assert.equal(reads.length,1);
-  assert.equal(reads[0].pk,"ERASURE_REPLAY#work");
+  await assert.rejects(calendar.deleteEvent("event-1","etag"),ErasureReplayUnavailableError);
+  assert.equal(reads,0);
   assert.equal(providerRequests,0);
 });
