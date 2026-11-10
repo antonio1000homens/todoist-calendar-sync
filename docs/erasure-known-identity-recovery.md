@@ -44,25 +44,41 @@ disposable Work-profile fault-injection acceptance are not complete. The gate
 therefore remains disabled and no fence-release or recovery action is
 authorized by this rollout.
 
-### Calendar-only drift triage (read-only; not yet a cancellation authorization)
+### Separately reviewed Calendar-drift erasure cancellation (pre-provider-write only)
 
-A pre-write operation can be blocked because the Google Calendar full-provider body
-(including revision metadata) changed after the original deletion confirmation.
-The recovery inspector now reports `calendarDriftReview.candidateForSeparateApproval`
-only when the original confirmation is intact, **no deletion receipt or progress**
-exists, the exact operation-owned fence/epoch and mapping inventory are valid,
-no writer lease is active, the complete strongly consistent cross-profile audit
-succeeds, the original Todoist item and all comments/aliases/attributable state
-match, and both exact original/current Calendar event identities remain present
-in the same configured Calendar. Any unrelated drift, ambiguous provider identity,
-missing ETag, incomplete audit, enabled source mapping or provider blocker rules
-out the candidate.
+The original `RESTORE SYNC` route is unchanged and requires an exact immutable
+provider snapshot. The additional Calendar-drift cancellation path is **never
+available to the unattended recovery watchdog**. It can only be issued by an
+authenticated operator when read-only `calendarDriftReview.candidateForSeparateApproval`
+passes all original-operation, fence, epoch, worker-mapping, zero-lease,
+no-provider-delete, cross-profile, Todoist task, comment, alias and DynamoDB
+inventory checks. The current Calendar event must have the same exact event
+ID/calendar ID and a valid ETag; the current provider revision is not silently
+treated as the original deletion confirmation.
 
-**No mutation or permission change:** This is explanatory read-only evidence.
-It cannot issue a `RESTORE SYNC` token, invoke the recovery worker, restore
-mappings, resume a pending deletion, change a tombstone or release a fence.
-A future separately reviewed, explicitly operator-confirmed **cancel erasure
-with provider drift** operation must bind a fresh Calendar/provider read to a
-single-use confirmation and recheck the provider revision before every writer
-transition. A changed Calendar digest alone is **not** proof a safe cancellation
-can be performed. Keep the operation fenced if any doubt remains.
+1. Open Existing erasure operation status / recovery and inspect the original
+   operation. For a qualifying Calendar-only drift, review the failed comparison
+   labels and use **Request reviewed Calendar-drift cancellation**.
+2. This issues an operator-bound, five-minute, single-use confirmation in the
+   `calendar_drift_cancel` mode. It is **not** the original erasure confirmation.
+   Type **CANCEL ERASURE AND RESTORE SYNC**, the exact original operation ID and
+   profile. The normal `RESTORE SYNC` confirmation cannot consume this token.
+3. Application independently inspects all evidence again and binds the precise
+   *current* Calendar digest and ETag, the original lifecycle, fence epoch,
+   mapping inventory and inspection fingerprint in a conditional transaction.
+   Any drift aborts the action and leaves the fence unchanged.
+4. The existing worker restores **only** originally enabled mapping UUIDs
+   then releases the original operation-owned fence through the existing
+   conditional ownership/epoch transaction. On *every* worker step it rereads
+   provider, task, comment, alias, DynamoDB and cross-profile inventory,
+   and verifies the exact accepted Calendar digest and ETag. Any change blocks
+   the recovery and preserves the fence. Provider deletion is never resumed.
+5. Verify `recovery.status=completed`, the original SQS mapping Enabled,
+   the Work fence removed, queue drainage and all three profiles reconciled.
+   Do not close #349 before this verification.
+
+Only the Calendar item's provider revision is eligible for this distinct
+exception. Missing items, missing ETags, any source mapping enabled early,
+other provider/state changes, ambiguous identities, deletion-start receipts,
+incomplete scans, active leases or operation ownership changes remain blocked.
+Automatic recovery remains strict. Production erasure execution stays disabled.
