@@ -1,43 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { formatDecisionRenderSummary, renderPendingDecisionCards } from '../dist/status-inbox.js';
-
-const TEST_SLACK_CHANNEL = 'CTESTCHANNEL';
-
-function decision(id, type = 'operational_dlq') {
-  return {
-    decisionId: id,
-    profile: 'antonio',
-    type,
-    severity: 'warning',
-    status: 'pending',
-    createdAt: '2026-09-07T20:00:00.000Z',
-    decisionDeadline: '2026-09-14T20:00:00.000Z',
-    context: {},
-    fingerprint: id,
-    permittedActions: [{ id: 'reconcile_now', label: 'Reconcile now' }],
-  };
-}
-
-class FakeStore {
-  constructor(decisions) {
-    this.decisions = new Map(decisions.map((item) => [item.decisionId, { ...item }]));
-    this.failNextReadFor = new Set();
-  }
-
-  async get(id) {
-    if (this.failNextReadFor.delete(id)) throw new Error(`read failed for ${id}`);
-    const item = this.decisions.get(id);
-    return item ? { ...item } : undefined;
-  }
-
-  async finish() {}
-  async listPending() { return [...this.decisions.values()]; }
-
-  markPosted(id, ts) {
-    this.decisions.set(id, { ...this.decisions.get(id), slackMessageTs: ts, slackChannelId: TEST_SLACK_CHANNEL });
-  }
-}
+import { decision, FakeStore, TEST_SLACK_CHANNEL } from './helpers/status-inbox-fixtures.mjs';
 
 test('status inbox attempts and confirms every pending decision card', async () => {
   const decisions = [decision('decision-one'), decision('decision-two')];
