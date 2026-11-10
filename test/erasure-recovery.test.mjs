@@ -136,6 +136,48 @@ test("read-only preview paginates controls and checks original mappings and immu
   assert.equal(external.writes.length,0);
 });
 
+test("automatic pre-write recovery uses the same single-use confirmation and guarded transaction",async()=>{
+  const {service,operation,external}=fixture();
+  const started=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.deepEqual(started,{queued:true,blockerCount:0});
+  assert.equal(operation.status,"review_required");
+  assert.equal(operation.recovery.status,"queued");
+  assert.ok(external.control.some(row=>row.sk==="FENCE"),
+    "automatic recovery must not release a fence directly");
+  assert.deepEqual(external.restored,[],
+    "mapping restore must wait for the independently guarded recovery worker");
+  assert.ok(external.providerCalls>=2,
+    "confirmation issuance and apply each independently reread provider evidence");
+});
+
+test("automatic recovery refuses a drifted provider snapshot without writes",async()=>{
+  const {service,external}=fixture();
+  external.snapshot={...external.snapshot,previewFingerprint:"0".repeat(64)};
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.ok(outcome.blockerCount>0);
+  assert.equal(external.writes.length,0);
+});
+
+test("automatic recovery never starts after provider deletion began",async()=>{
+  const {service,operation,external}=fixture();
+  operation.lifecycle.phase="verify_deletion";
+  operation.lifecycle.evidence.deletionStarted={operationId:"op-recovery",
+    phase:"deletionStarted",receiptId,completedAt:2000};
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.ok(external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(external.writes.length,0);
+});
+
+test("automatic recovery refuses an active writer lease",async()=>{
+  const {service,external}=fixture();
+  external.control.push({pk:"ERASURE#work",sk:"WRITER#ongoing",operationId:"other"});
+  const outcome=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.equal(outcome.queued,false);
+  assert.equal(external.writes.length,0);
+});
+
 test("independent post-write preview never issues a confirmation, writes state, or releases a fence",async()=>{
   const {service,external}=fixture({paginated:true});
   const assessment=await service.inspectPostWrite("op-recovery");

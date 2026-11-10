@@ -2,6 +2,7 @@ import type { SQSHandler, SQSRecord } from "aws-lambda";
 import { GetEventSourceMappingCommand, GetFunctionConfigurationCommand, LambdaClient,
   ListEventSourceMappingsCommand, UpdateEventSourceMappingCommand } from "@aws-sdk/client-lambda";
 import { documentClient } from "./dynamodb-capacity.js";
+import {BatchGetCommand} from "@aws-sdk/lib-dynamodb";
 import { ErasureGateDriftError, ErasureOperationStore, type ErasureOperation, type ErasureWorkerAdapters, type FencedMapping } from "./erasure-executor.js";
 import {ErasureReplayBlockedError,ErasureReplayUnavailableError} from "./erasure-replay-barrier.js";
 import { beginErasureFence, finishErasureFence, inspectErasureFence } from "./erasure-protocol.js";
@@ -187,6 +188,84 @@ export async function processErasureOperation(operationId: string): Promise<{
   if(result.phase!=="complete"&&result.status!=="succeeded"&&result.status!=="review_required")
     await enqueueErasureOperation(operationId,result.nextRunAt);
   return {...result,scheduled:result.phase!=="complete"&&result.status!=="succeeded"&&result.status!=="review_required"};
+}
+
+const WATCHDOG_PROFILES=["antonio","home","work"] as const;
+const WATCHDOG_UUID=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+/**
+ * This runs independently of the disabled source SQS trigger (EventBridge
+ * invokes the erasure worker itself). Enumerates exactly three known fence
+ * records; never scans, replays deletions or bypasses the existing recovery CAS.
+ */
+export async function inspectStuckErasureRecovery():Promise<{fenced:number;queued:number;blocked:number}> {
+  const table=process.env.STATE_TABLE_NAME;
+  if(!table)throw new Error("STATE_TABLE_NAME is required for erasure recovery watchdog");
+  const response=await documentClient.send(new BatchGetCommand({RequestItems:{
+    [table]:{Keys:WATCHDOG_PROFILES.map(profile=>({pk:`ERASURE#${profile}`,sk:"FENCE"})),
+      ConsistentRead:true},
+  }}));
+  if(response.UnprocessedKeys&&Object.keys(response.UnprocessedKeys).length)
+    throw new Error("Incomplete erasure fence inventory; no automatic recovery attempted");
+  const fences=response.Responses?.[table]||[];
+  let queued=0,blocked=0;
+  for(const fence of fences) {
+    const profile=String(fence.pk||"").replace(/^ERASURE#/,"");
+    const id=fence.operationId;
+    if(!WATCHDOG_PROFILES.includes(profile as typeof WATCHDOG_PROFILES[number])
+       ||typeof id!=="string"||!WATCHDOG_UUID.test(id)) {
+      blocked++;
+      console.warn(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+        event:"recovery_watchdog_blocked",profile:WATCHDOG_PROFILES.includes(profile as typeof WATCHDOG_PROFILES[number])?profile:"unknown",
+        reason:"invalid_fence_owner"}));
+      continue;
+    }
+    try {
+      const operation=await store.get(id);
+      if(!operation||operation.profile!==profile) {
+        blocked++;
+        console.warn(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"recovery_watchdog_blocked",operationId:id,profile,reason:"missing_or_wrong_operation"}));
+        continue;
+      }
+      if(operation.recovery&&["queued","restoring","verifying"].includes(operation.recovery.status)) {
+        // Idempotent recovery redelivery if a previous SQS send was lost.
+        await enqueueErasureRecovery(id);
+        queued++;
+        continue;
+      }
+      if(operation.status!=="review_required"||operation.recovery)continue;
+      const result=await recoveryService.startAutomaticPreWriteRecovery(id);
+      if(result.queued) {
+        await enqueueErasureRecovery(id);
+        queued++;
+        console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"recovery_watchdog_queued",operationId:id,profile,mode:"verified_pre_write"}));
+      } else {
+        blocked++;
+        console.warn(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"recovery_watchdog_blocked",operationId:id,profile,
+          reason:"independent_evidence_blocked",blockerCount:result.blockerCount}));
+      }
+    } catch(error) {
+      blocked++;
+      // A provider, IAM, or DDB failure must never become permission to
+      // release a fence. Alert through state monitoring, not via a retry loop.
+      console.error(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+        event:"recovery_watchdog_failed",operationId:id,profile,
+        errorType:error instanceof Error?error.name:"UnknownError"}));
+    }
+  }
+  return {fenced:fences.length,queued,blocked};
+}
+
+/** Isolated, separately bounded Lambda runtime; never shares SQS-worker concurrency. */
+export async function watchdogHandler(event:{source?:string;"detail-type"?:string}):Promise<void> {
+  if(event.source!=="aws.events"||event["detail-type"]!=="Scheduled Event")
+    throw new Error("Unsupported erasure recovery watchdog event");
+  const report=await inspectStuckErasureRecovery();
+  console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+    event:"recovery_watchdog_run",...report}));
 }
 
 export const handler:SQSHandler=async event=>{

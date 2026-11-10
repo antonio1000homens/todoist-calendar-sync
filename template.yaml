@@ -578,6 +578,62 @@ Resources:
         Target: es2022
         Minify: true
 
+  # Separate concurrency/timeout boundary: an expensive exact provider
+  # inspection must never starve the normal erasure-operations SQS worker.
+  ErasureRecoveryWatchdogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-erasure-recovery-watchdog-${Stage}
+      Handler: erasure-worker.watchdogHandler
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      CodeUri: .
+      Environment:
+        Variables:
+          ERASURE_OPERATION_QUEUE_URL: !Ref ErasureOperationQueue
+          ERASURE_TARGET_WORKER_FUNCTION_NAME: !Ref WorkerFunction
+          GOOGLE_CREDENTIALS_PARAMETER_PREFIX: !Ref GoogleCredentialsParameterPrefix
+          TODOIST_TOKEN_PARAMETER_PREFIX: !Ref TodoistTokenParameterPrefix
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SyncState
+        # DynamoDBCrudPolicy does not grant TransactWriteItems; recovery
+        # relies on exact conditional operation/fence/epoch transactions.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:TransactWriteItems
+              Resource: !GetAtt SyncState.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ErasureOperationQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterPrefix}/*
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TodoistTokenParameterPrefix}/*
+        - Statement:
+            - Effect: Allow
+              Action: lambda:ListEventSourceMappings
+              Resource: "*"
+            - Effect: Allow
+              Action: lambda:GetEventSourceMapping
+              Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
+      Events:
+        # Staged OFF until separate disposable Work-profile acceptance.
+        ErasureRecoveryWatchdog:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: false
+            Description: Independently inspect fenced pre-write erasures for safe recovery
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/erasure-worker.ts]
+        Format: cjs
+        Target: es2022
+        Minify: true
+
   ReconcilerFunction:
     Type: AWS::Serverless::Function
     Properties:
