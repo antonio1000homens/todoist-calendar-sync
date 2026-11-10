@@ -340,7 +340,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           <LocalResult result={results.apply}/>
           <LocalResult result={results.applyDrift}/>
           {preview&&!preview.allowed&&!preview.calendarDriftReview?.candidateForSeparateApproval&&
-            <p>Recovery confirmation is not offered while the independent safety guards are blocked.</p>
+            <p>Recovery confirmation is not offered while the independent safety guards are blocked.</p>}
         </section>
         <details className="recovery-scope recovery-postwrite">
           <summary>5. Post-write evidence — only when provider writes may have begun (read-only inspection)</summary>
