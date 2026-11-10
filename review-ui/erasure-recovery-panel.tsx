@@ -23,7 +23,9 @@ const actionNames:Record<ActionKey,string>={
 const now=()=>new Date().toISOString();
 const formatTime=(value?:string)=>value?new Date(value).toLocaleString():"not yet checked";
 function LocalResult({result}:{result?:ActionResult}) {
-  return result?<p role={result.failed?"alert":"status"} aria-live="polite"
+  const resultRef=useRef<HTMLParagraphElement|null>(null);
+  useEffect(()=>{if(result)resultRef.current?.focus({preventScroll:true});},[result?.at]);
+  return result?<p ref={resultRef} tabIndex={-1} role={result.failed?"alert":"status"} aria-live="polite"
     className={"recovery-action-result "+(result.failed?"warning":"info")}>
     <strong>{result.action}</strong> · {result.mode} · Completed <time dateTime={result.at}>{formatTime(result.at)}</time>.
     {" "}{result.message}
@@ -285,7 +287,11 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
               <ul className="recovery-diagnostics">{unresolvedRows.length?unresolvedRows.map(item=>
                 <li key={item.key}><strong>{item.label}</strong> — {item.status.replaceAll("_"," ")}</li>)
                 :<li>No individual mismatch was identified in the available checks; inspect the guard blockers below.</li>}</ul>
-              <p className="warning"><strong>Next action:</strong> Remain fenced. Inspect which source changed; re-read exact provider data and the stored original evidence, then escalate for manual review. Do not retry deletion or manually release the fence.</p>
+              <p className="warning"><strong>Next action:</strong> Remain fenced. Inspect which source changed and re-read the exact provider and original evidence.
+                {preview.calendarDriftReview?.candidateForSeparateApproval
+                  ?" If the Calendar-only revision is the sole verified exception, use the separately reviewed cancellation action below; no recovery has started."
+                  :" Escalate for manual review; do not retry deletion or manually release the fence."}
+              </p>
             </>}
             <details className="recovery-technical">
               <summary>Technical details and all read-only checks</summary>
