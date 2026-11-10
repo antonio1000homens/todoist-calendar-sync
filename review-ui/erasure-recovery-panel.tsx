@@ -176,6 +176,9 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
               <li key={label} className={passed?"":"warning"}>{label}: {passed?"passed":"changed or unverified"}</li>)}</ul>
             <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
           </details>}
+          {preview.calendarDriftReview?.candidateForSeparateApproval&&<p role="status" className="warning">
+            Calendar-only provider revision is a candidate for separately reviewed pre-write cancellation. This inspection is read-only: cancellation is not implemented or authorised, no recovery confirmation is available, and the Work fence and worker mapping remain unchanged. Do not force-enable synchronization or delete the fence.
+          </p>}
           {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation()}>Request recovery confirmation</button>}
         </>}
         <h4>Post-write evidence (read-only)</h4>
