@@ -365,6 +365,19 @@ test("operator-approved Calendar drift cancellation restores only originally ena
   assert.equal(f.external.providerCalls>4,true,"worker must reread provider evidence at each step");
 });
 
+test("external mapping re-enable before drift recovery worker starts cannot release the fence",async()=>{
+  const f=calendarOnlyDriftFixture();
+  const issued=await f.service.issueCalendarDriftCancellation("op-recovery","operator");
+  await f.service.applyCalendarDriftCancellation("op-recovery",issued.confirmationId,"operator",
+    {operationId:"op-recovery",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"});
+  f.external.mappingStates.set(enabledId,"Enabled");
+  const response=await f.service.process("op-recovery");
+  assert.equal(response.status,"blocked");
+  assert.equal(f.operation.recovery.status,"blocked");
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+  assert.deepEqual(f.external.restored,[],"no restore call should be made");
+});
+
 test("Calendar/provider revision drift before approval or during worker recovery leaves fence installed",async()=>{
   for(const stage of ["before-apply","worker","db-inventory"]) {
     const f=calendarOnlyDriftFixture();
