@@ -9,10 +9,11 @@ import {profiles} from "../dist/config.js";
 import {serializeDeletionTombstoneComment} from "../dist/mapping-comments.js";
 
 function enableCurrentTombstoneAdmission(t) {
-  const keys=["ERASURE_REPLAY_BARRIER_VERSION","RETIREMENT_DISPOSITION_VERSION"];
+  const keys=["ERASURE_REPLAY_BARRIER_VERSION","RETIREMENT_DISPOSITION_VERSION","ERASURE_PROTOCOL_VERSION"];
   const previous=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
   process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
   process.env.RETIREMENT_DISPOSITION_VERSION="0";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
   t.mock.method(SSMClient.prototype,"send",async()=>({Parameter:{Value:"test-todoist-token"}}));
   t.after(()=>{for(const [key,value] of Object.entries(previous)){
     if(value===undefined)delete process.env[key];else process.env[key]=value;
