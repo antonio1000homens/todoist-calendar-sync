@@ -318,10 +318,13 @@ Work-profile acceptance attempt failed while reading an SSM credential after
 its mapping had been disabled. The operation was durably `review_required`
 at `ready_for_delete`, and the protected Work fence remained installed.
 
-The erasure-worker package now includes a **bounded, independent** EventBridge
-watchdog. Its SAM schedule is **disabled by default** pending disposable
-Work-profile fault-injection acceptance. When enabled it runs every five
-minutes, independently of the disabled ordinary source queue, reading only
+The erasure-worker package now includes a **bounded, separate** EventBridge
+watchdog Lambda with its own 300-second timeout, concurrency limit and a
+role that can inspect event-source mappings but **cannot update them**. The
+separate function prevents slow provider-inspection work from starving the
+active erasure SQS worker. Its SAM schedule is **disabled by default** pending
+disposable Work-profile fault-injection acceptance. When enabled it runs every
+five minutes, independently of the disabled ordinary source queue, reading only
 the three fixed `ERASURE#profile/FENCE` rows (strongly consistent
 `BatchGetItem`; **no table scan**). It checks only fence-owner erasure
 operations. For a `review_required` operation with no active recovery,
