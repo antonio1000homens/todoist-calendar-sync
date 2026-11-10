@@ -16,29 +16,37 @@ function markerKey(profile, kind, id) {
   return `${kind}#v1#${digest}`;
 }
 function enableBarrier(t) {
-  const previous = {
-    barrier: process.env.ERASURE_REPLAY_BARRIER_VERSION,
-    protocol: process.env.ERASURE_PROTOCOL_VERSION,
-    keys: process.env.ERASURE_REPLAY_HMAC_KEYS,
-    current: process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY,
-    table: process.env.STATE_TABLE_NAME,
-  };
-  process.env.ERASURE_REPLAY_BARRIER_VERSION = "1";
-  process.env.ERASURE_PROTOCOL_VERSION = "1";
-  process.env.ERASURE_REPLAY_HMAC_KEYS = JSON.stringify({ v1: secret.toString("base64") });
-  process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY = "v1";
-  process.env.STATE_TABLE_NAME = "review-replay-admission-test";
-  t.mock.method(SSMClient.prototype, "send", async () => ({Parameter:{Value:"test-todoist-token"}}));
-  const projectCommentReader = t.mock.method(Todoist.prototype, "listProjectComments", async () => []);
-  t.after(() => {
-    for (const [key, value] of Object.entries({
-      ERASURE_REPLAY_BARRIER_VERSION: previous.barrier,
-      ERASURE_PROTOCOL_VERSION: previous.protocol,
-      ERASURE_REPLAY_HMAC_KEYS: previous.keys,
-      ERASURE_REPLAY_HMAC_CURRENT_KEY: previous.current,
-      STATE_TABLE_NAME: previous.table,
-    })) if (value === undefined) delete process.env[key]; else process.env[key] = value;
-  });
+  const names=["ERASURE_REPLAY_BARRIER_VERSION","ERASURE_PROTOCOL_VERSION",
+    "RETIREMENT_DISPOSITION_VERSION","STATE_TABLE_NAME"];
+  const previous=Object.fromEntries(names.map(name=>[name,process.env[name]]));
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.ERASURE_PROTOCOL_VERSION="1";
+  process.env.RETIREMENT_DISPOSITION_VERSION="0";
+  process.env.STATE_TABLE_NAME="review-replay-admission-test";
+  t.mock.method(SSMClient.prototype,"send",async()=>({Parameter:{Value:"test-todoist-token"}}));
+  const projectId=profiles.home.todoistProjectId;
+  const createdAt=new Date().toISOString();
+  const expiresAt=new Date(Date.parse(createdAt)+18*24*60*60*1000).toISOString();
+  // Retired HMAC markers are not part of the current release contract.
+  // Each historical regression identity is represented by a bounded,
+  // exact existing-project tombstone rather than an imaginary DynamoDB row.
+  const erasedIds=[
+    "erased-context-task","erased-candidate-object","erased-master-alias",
+    "erased-embedded-master","erased-history-master","erased-candidate-task",
+    "erased-dismiss-task","erased-update-event","erased-cleanup-master",
+    "erased-closure-task","erased-case-task","erased-control-task",
+  ];
+  const comments=erasedIds.map((id,index)=>({
+    id:"erased-project-comment-"+index,project_id:projectId,
+    content:serializeDeletionTombstoneComment({
+      schemaVersion:1,profile:"home",projectId,taskId:id,
+      eventIds:[id],createdAt,expiresAt,
+    }),
+  }));
+  const projectCommentReader=t.mock.method(Todoist.prototype,"listProjectComments",async()=>comments);
+  t.after(()=>{for(const [name,value] of Object.entries(previous)){
+    if(value===undefined)delete process.env[name];else process.env[name]=value;
+  }});
   return projectCommentReader;
 }
 function decision(overrides = {}) {
