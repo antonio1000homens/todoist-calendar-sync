@@ -9,6 +9,7 @@ import { StateRepository, type CalendarProjectionTombstone, type CalendarProject
 import { canRecreateCalendarProjection, hasCanonicalState, Synchronizer, toCalendarEvent, todoistCalendarLifecycle } from "./sync.js";
 import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
+import { executePhaseBNativeMove } from "./todoist-phase-b-native-move-executor.js";
 import {
   calendarRecurrenceMatchesTodoist,
   recurrenceEffectiveStart,
@@ -177,6 +178,9 @@ export class ProjectAwareSynchronizer {
     private readonly state = new StateRepository(),
     scheduleOrphan?: ScheduleOrphan,
     private readonly clientFactory?: ClientFactory,
+    // Tests inject a no-write runner; production always uses the verified
+    // provider executor, which claims durable two-profile controls first.
+    private readonly nativeMoveRunner: typeof executePhaseBNativeMove = executePhaseBNativeMove,
   ) {
     this.delegate = new Synchronizer(state, scheduleOrphan, clientFactory);
   }
@@ -498,9 +502,49 @@ export class ProjectAwareSynchronizer {
           .filter((value): value is Profile => Boolean(value)));
       if (mapping?.todoistPhaseBVersion === 1 || nativeSource) {
         const fromProfile = nativeSource?.profile || mapping?.profile || transition.fromProfile || delivery.profile;
+        // Only the original, signed project-move delivery may enter the
+        // native provider executor. A routine update or stale/replayed webhook
+        // must not infer a cross-calendar move merely from project mismatch.
+        // Missing provider identity, durable mapping or recurrence link stays
+        // review-required; never fall through to the rolling project writer.
+        if (process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true"
+          && delivery.mode === "aws" && rawPayload.event_name === "item:updated"
+          && transition.action === "move_projection" && transition.toProfile
+          && fromProfile !== transition.toProfile
+          && explicitProjectChange
+          && oldProjectId === profiles[fromProfile].todoistProjectId
+          && lifecycle.action === "upsert"
+          && mapping?.todoistPhaseBVersion === 1
+          && mapping.profile === fromProfile
+          && mapping.masterEventId === nativeSource?.master.id
+          && nativeSource?.profile === fromProfile) {
+          const sourceLink = await this.state.getRecurrenceLink(fromProfile, task.id);
+          if (sourceLink?.owner === "todoist"
+            && sourceLink.taskId === task.id
+            && sourceLink.profile === fromProfile
+            && sourceLink.masterEventId === mapping.masterEventId
+            && sourceLink.eventId === mapping.eventId
+            && sourceLink.seriesId === task.id) {
+            // The executor separately reads both providers, checks erasure
+            // leases, stages an immutable operation, verifies three successor
+            // instances and source history, then atomically hands off indexes.
+            // Errors are intentionally propagated so an interrupted stage
+            // stays fenced, without a normal-project fallback.
+            await this.nativeMoveRunner({
+              task, sourceProfile: fromProfile,
+              destinationProfile: transition.toProfile,
+              sourceMapping: mapping, sourceLink,
+              source: await this.clients(fromProfile),
+              destination: await this.clients(transition.toProfile),
+              state: this.state,
+            });
+            return;
+          }
+        }
         return this.state.audit(fromProfile, "todoist_phase_b_cross_profile_move_requires_review", {
           taskId: task.id, eventId: nativeSource?.master.id || mapping?.masterEventId || mapping?.eventId,
-          fromProfile, toProfile: transition.toProfile, reason: "native_master_copy_not_implemented",
+          fromProfile, toProfile: transition.toProfile,
+          reason: "native_move_not_admitted_or_flag_disabled",
         });
       }
     }
