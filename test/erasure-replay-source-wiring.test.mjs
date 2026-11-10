@@ -1,19 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {readFile,readdir} from "node:fs/promises";
+import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
+import {listTypeScriptSources} from "./helpers/source-files.mjs";
 
 const src=path.join(path.dirname(fileURLToPath(import.meta.url)),"../src");
-async function sourceFiles(dir) {
-  const files=[];
-  for(const entry of await readdir(dir,{withFileTypes:true})) {
-    const full=path.join(dir,entry.name);
-    if(entry.isDirectory())files.push(...await sourceFiles(full));
-    else if(entry.isFile()&&entry.name.endsWith(".ts"))files.push(full);
-  }
-  return files;
-}
 
 /** Lightweight bounded call scanner, independent of TypeScript's removed JS
  * compiler APIs in v7. Only the explicit Todoist provider call signatures
@@ -67,7 +59,7 @@ function callArguments(source,method,file) {
 test("production Todoist creation paths must supply checked Calendar provenance",async()=>{
   let creators=0;
   let repairs=0;
-  for(const file of await sourceFiles(src)) {
+  for(const file of await listTypeScriptSources(src)) {
     const source=await readFile(file,"utf8");
     const location=path.relative(src,file);
     for(const args of callArguments(source,"upsertTask",location)) {
