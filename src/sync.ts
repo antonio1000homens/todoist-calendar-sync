@@ -2787,7 +2787,7 @@ export class Synchronizer {
             && createdShared?.todoistPhaseBVersion === "1"
             && createdShared?.todoistAnchorStart === nativePlan.anchor.start
             && JSON.stringify(creation.event.recurrence) === JSON.stringify(nativeEvent.recurrence);
-          if (exactUncommittedIdentity && (creation.created || !mapping)) {
+if (exactUncommittedIdentity && creation.created) {
             try {
               await calendar.deleteEvent(nativeEvent.id);
               rollback = "deleted";
