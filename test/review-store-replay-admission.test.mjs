@@ -116,7 +116,7 @@ test("decision context provider IDs are checked before a review case can be seed
     return {};
   });
   await assert.rejects(new ReviewStore().observeDecision(decision({context: {providerTaskId: "erased-context-task"}})), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "no review state read or write may follow the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("manual decision candidate object IDs are checked before review seeding", async t => {
@@ -131,7 +131,7 @@ test("manual decision candidate object IDs are checked before review seeding", a
   await assert.rejects(new ReviewStore().observeDecision(decision({context:{candidates:[
     {id:"erased-candidate-object",content:"opaque fixture",due:""},
   ]}})),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"the erased candidate is rejected before any review state access");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("mapping snapshot recurrence aliases are checked before a decision is persisted", async t => {
@@ -146,7 +146,7 @@ test("mapping snapshot recurrence aliases are checked before a decision is persi
   const mapping = {profile:"home",taskId:"safe-task",eventId:"safe-occurrence",masterEventId:"erased-master-alias",
     activeInstanceId:"safe-occurrence",seriesId:"erased-master-alias",updatedAt:new Date().toISOString()};
   await assert.rejects(new ReviewStore().observeDecision(decision({mappingSnapshot:mapping})), ErasureReplayBlockedError);
-  assert.equal(calls.length, 5, "task, source, and legacy/current master markers are checked before persistence is blocked");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("queued repair admission walks embedded decision and review aliases", async t => {
@@ -165,7 +165,7 @@ test("queued repair admission walks embedded decision and review aliases", async
       masterEventId:"erased-embedded-master"}}},
   };
   await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
-  assert.equal(calls.length, 5, "embedded historical aliases are checked before the operation can resume");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 for (const [field, erasedId] of [
@@ -185,8 +185,7 @@ for (const [field, erasedId] of [
     snapshots: [{ref:{profile:"home",side:"todoist",id:"safe-task"},[field]:erasedId}], itemPlan: [],
   };
   await assert.rejects(assertRepairPreviewReplayAdmission(preview), ErasureReplayBlockedError);
-  assert.ok(calls.some(command => command.constructor.name === "GetCommand"
-    && command.input.Key.sk === markerKey("home", "EVENT", erasedId)));
+  assert.equal(calls.length,0,"nested aliases are rejected by the project-comment tombstone");
 });
 
 test("review admission checks recurring master aliases carried by history plans", async t => {
@@ -202,7 +201,7 @@ test("review admission checks recurring master aliases carried by history plans"
     case:{decision:{profile:"home",elapsedCalendarHistoryPlan:{taskId:"safe-task",eventId:"safe-event",
       recurringMasterId:"erased-history-master"}}}};
   await assert.rejects(assertRepairPreviewReplayAdmission(preview),ErasureReplayBlockedError);
-  assert.equal(calls.length,5,"the erased historical master is admitted before any repair state is read or written");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("candidate IDs in conflict audit arrays are checked before an incident case is seeded", async t => {
@@ -217,7 +216,7 @@ test("candidate IDs in conflict audit arrays are checked before an incident case
   const audit = { pk: "AUDIT#conflict", action: "todoist_snapshot_reconcile_unmapped_conflict",
     detail: { candidateTaskIds: ["erased-candidate-task"] }, createdAt: new Date().toISOString() };
   await assert.rejects(new ReviewStore().observeConflictIncident("home", "fingerprint", "incident", audit), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "no incident case or pointer may be written after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("dismissal refuses to mutate a review case that references an erased identity", async t => {
@@ -233,7 +232,7 @@ test("dismissal refuses to mutate a review case that references an erased identi
     return {};
   });
   await assert.rejects(store.dismissCase("case-1","acknowledged"),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"the case is not read or mutated after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("case status transitions refuse to mutate a case that references an erased identity", async t => {
@@ -249,7 +248,7 @@ test("case status transitions refuse to mutate a case that references an erased 
     return {};
   });
   await assert.rejects(store.updateCase("case-1","dismissed","acknowledged"),ErasureReplayBlockedError);
-  assert.equal(calls.length,2,"no case status write follows the legacy marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("deferred deletion cleanup refuses to update a case that references an erased identity", async t => {
@@ -265,7 +264,7 @@ test("deferred deletion cleanup refuses to update a case that references an eras
     return {};
   });
   await assert.rejects(store.noteVerifiedDeletionCleanupDeferred("case-1",new Date().toISOString()),ErasureReplayBlockedError);
-  assert.equal(calls.length,2,"no deferred-cleanup status write follows the legacy marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("verified-deleted case closure refuses an erased identity before cleanup reads", async t => {
@@ -281,7 +280,7 @@ test("verified-deleted case closure refuses an erased identity before cleanup re
     return {};
   });
   await assert.rejects(store.resolveVerifiedDeletedCase("case-1",{profile:"home",taskIds:["erased-closure-task"],eventIds:["safe-event"]}),ErasureReplayBlockedError);
-  assert.equal(calls.length,1,"no deletion evidence or review state is read after the marker hit");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
 
 test("coalescing refuses to close an open case that references an erased candidate", async t => {
@@ -330,5 +329,5 @@ for (const [name, invoke] of syncControlWrites) test(`SyncControls refuses ${nam
     return {};
   });
   await assert.rejects(invoke(new SyncControls()), ErasureReplayBlockedError);
-  assert.equal(calls.length, 1, "only the strongly consistent replay-marker lookup may run");
+  assert.equal(calls.length,0,"bounded project-comment tombstone blocks before any DynamoDB access");
 });
