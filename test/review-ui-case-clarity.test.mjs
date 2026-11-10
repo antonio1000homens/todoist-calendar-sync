@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
+import { providerLink } from "../review-ui/item-identity.mjs";
+import { calendarReviewSnapshot } from "./helpers/review-provider-snapshot.mjs";
 import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "../review-ui/case-url.mjs";
 
 test("case URL follows case selection and removes stale case parameters",()=>{
@@ -66,35 +68,57 @@ test("cancelled recurrence master and occurrence are grouped without losing exac
   assert.equal(groups.length,2);
 });
 
-test("cancelled Calendar tombstones are verified as deleted, not mislabelled live",()=>{
-  const item={eventId:"4qqousburkrnq07abcq9chu8dg"};
-  const cancelled={ref:{profile:"home",side:"calendar",id:item.eventId},object:{
-    id:item.eventId,status:"cancelled",htmlLink:"https://www.google.com/calendar/event?eid=stale",
-  }};
-  const identity=caseIdentityState(item,[cancelled]);
-  assert.deepEqual(identity.verifiedEventIds,[]);
-  assert.equal(recordedProviderState("calendar",item.eventId,[cancelled],"home"),"cancelled / deleted in Google Calendar");
-  assert.equal(recordedProviderState("calendar",item.eventId,[{...cancelled,object:null}],"home"),"missing (404/410)");
-  assert.equal(recordedProviderState("calendar",item.eventId,[],"home"),"candidate / unverified");
-  const confirmed={...cancelled,object:{...cancelled.object,status:"confirmed"}};
-  assert.deepEqual(caseIdentityState(item,[confirmed]).verifiedEventIds,[item.eventId]);
-  assert.equal(recordedProviderState("calendar",item.eventId,[confirmed],"home"),"verified live");
-});
-
-test("cancelled Calendar identities are never presented as verified live or linked to stale htmlLinks",async()=>{
-  const caseItem={eventId:"annual-master",taskId:"missing-task",decision:{context:{}}};
-  const snapshots=[
-    {ref:{profile:"home",side:"calendar",id:"annual-master"},object:{
-      id:"annual-master",status:"cancelled",htmlLink:"https://calendar.google.com/calendar/event?eid=obsolete"}},
-    {ref:{profile:"home",side:"todoist",id:"missing-task"},object:null},
+test("review Calendar evidence distinguishes confirmed, cancelled, missing and unverified snapshots", async () => {
+  const eventId = "4qqousburkrnq07abcq9chu8dg";
+  const item = { eventId };
+  const live = calendarReviewSnapshot(eventId, "2027-03-01", {
+    htmlLink: "https://calendar.google.com/calendar/event?eid=obsolete",
+  });
+  const cases = [
+    {
+      name: "confirmed",
+      snapshots: [live],
+      state: "verified live",
+      verifiedIds: [eventId],
+    },
+    {
+      name: "cancelled",
+      snapshots: [{ ...live, object: { ...live.object, status: "cancelled" } }],
+      state: "cancelled / deleted in Google Calendar",
+      verifiedIds: [],
+    },
+    {
+      name: "missing",
+      snapshots: [{ ...live, object: null }],
+      state: "missing (404/410)",
+      verifiedIds: [],
+    },
+    {
+      name: "unknown",
+      snapshots: [],
+      state: "candidate / unverified",
+      verifiedIds: [],
+    },
+    {
+      name: "mismatched identity",
+      snapshots: [{ ...live, object: { ...live.object, id: "another-id" } }],
+      state: "identity mismatch / unverified",
+      verifiedIds: [],
+    },
   ];
-  const identity=caseIdentityState(caseItem,snapshots);
-  assert.deepEqual(identity.verifiedEventIds,[]);
-  assert.equal(providerSnapshotLink(snapshots[0].object,"calendar"),undefined);
-  assert.equal(providerSnapshotLink({...snapshots[0].object,status:"confirmed"},"calendar"),
-    "https://calendar.google.com/calendar/event?eid=obsolete");
-  assert.equal(providerSnapshotLink({id:"occ",status:"confirmed",htmlLink:"javascript:alert(1)"},"calendar"),undefined);
-  const source=await readFile(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
-  assert.match(source,/Cancelled \/ deleted in Google Calendar/);
-  assert.match(source,/providerLink\(item,sideName\)/);
+  for (const { name, snapshots, state, verifiedIds } of cases) {
+    assert.deepEqual(caseIdentityState(item, snapshots).verifiedEventIds, verifiedIds, name);
+    assert.equal(recordedProviderState("calendar", eventId, snapshots, "home"), state, name);
+  }
+
+  // case-url deliberately re-exports the same policy tested with statuses,
+  // deleted Todoist objects and unsafe URLs in review-ui-identity.test.mjs.
+  // Do not duplicate its full URL matrix here.
+  assert.strictEqual(providerSnapshotLink, providerLink);
+
+  // Keep one review-page wiring/copy guard: a cancelled event must not be
+  // displayed as an active Google Calendar event or linked unconditionally.
+  const source = await readFile(new URL("../review-ui/main.tsx", import.meta.url), "utf8");
+  assert.match(source, /Cancelled \/ deleted in Google Calendar/);
+  assert.match(source, /providerLink\(item,sideName\)/);
 });
