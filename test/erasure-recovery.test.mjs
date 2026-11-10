@@ -128,6 +128,27 @@ function fixture(options={}) {
     get postwriteToken(){return postwriteToken;}};
 }
 
+function timedOutProjectCommentFixture({ageMs=60_000,stage="comments"}={}) {
+  const f=fixture();
+  const attemptId="dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const startedAt=Date.now()-ageMs;
+  const projectComment={id:"project-comment-1",kind:"project",digest:"3".repeat(64)};
+  const base={...f.operation,actionPlan:{...f.operation.actionPlan,
+    comments:[projectComment],projectCommentIds:[projectComment.id]}};
+  const fingerprint=erasurePreviewFingerprint(base);
+  f.operation.actionPlan=base.actionPlan;
+  f.operation.previewFingerprint=fingerprint;
+  f.operation.confirmationFingerprint=fingerprint;
+  f.operation.lifecycle={...f.operation.lifecycle,phase:"delete",nextRunAt:0,
+    evidence:{...f.operation.lifecycle.evidence,
+      deletionStarted:{operationId:"op-recovery",phase:"deletionStarted",receiptId,completedAt:startedAt-1000}},
+    deletionProgress:{stage,commentIndex:0,stateIndex:0,startedAt,
+      attempt:{id:attemptId,startedAt}}};
+  f.operation.updatedAt=new Date().toISOString();
+  f.external.snapshot={...base,operationId:"op-recovery",previewFingerprint:fingerprint,blockers:[]};
+  return f;
+}
+
 function calendarDriftFixture(){
   const f=fixture();
   const {operation,external}=f;
@@ -443,6 +464,37 @@ test("automatic pre-write recovery uses the same single-use confirmation and gua
     "mapping restore must wait for the independently guarded recovery worker");
   assert.ok(external.providerCalls>=2,
     "confirmation issuance and apply each independently reread provider evidence");
+});
+
+test("timed-out first project-comment attempt is proof of no deletion when every original identity still matches",async()=>{
+  const {service,operation,external}=timedOutProjectCommentFixture();
+  const inspection=await service.inspect("op-recovery");
+  assert.equal(inspection.preview.classification,"pre_write");
+  assert.equal(inspection.preview.allowed,true);
+  assert.equal(inspection.preview.evidenceChecks.originalPreWritePhase,true);
+  const recovery=await service.startAutomaticPreWriteRecovery("op-recovery");
+  assert.deepEqual(recovery,{queued:true,blockerCount:0});
+  assert.equal(operation.recovery.mode,"strict_pre_write");
+  assert.equal(operation.recovery.status,"queued");
+  assert.ok(external.control.some(row=>row.sk==="FENCE"),"sync restoration worker owns fence release");
+  assert.deepEqual(external.restored,[],"inspection and scheduling do not restore mappings synchronously");
+});
+
+test("initial-comment recovery refuses recent claims, later stages, and any changed confirmed snapshot",async()=>{
+  const recent=timedOutProjectCommentFixture({ageMs:1000});
+  assert.equal((await recent.service.inspect("op-recovery")).preview.allowed,false);
+  assert.equal((await recent.service.startAutomaticPreWriteRecovery("op-recovery")).queued,false);
+
+  const later=timedOutProjectCommentFixture({stage:"todoist"});
+  assert.equal((await later.service.inspect("op-recovery")).preview.allowed,false);
+  assert.equal((await later.service.startAutomaticPreWriteRecovery("op-recovery")).queued,false);
+
+  const drift=timedOutProjectCommentFixture();
+  drift.external.snapshot.actionPlan={...drift.external.snapshot.actionPlan,
+    todoistTask:{...drift.external.snapshot.actionPlan.todoistTask,digest:"9".repeat(64)}};
+  drift.external.snapshot.previewFingerprint=erasurePreviewFingerprint(drift.external.snapshot);
+  assert.equal((await drift.service.inspect("op-recovery")).preview.allowed,false);
+  assert.equal((await drift.service.startAutomaticPreWriteRecovery("op-recovery")).queued,false);
 });
 
 test("automatic recovery refuses a drifted provider snapshot without writes",async()=>{

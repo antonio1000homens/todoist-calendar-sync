@@ -93,6 +93,28 @@ const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
+/** A timed-out write-ahead claim on the first project-comment tombstone is
+ * recoverable only while its original mapping, task, Calendar event, comments,
+ * and DynamoDB inventory all still match the confirmed snapshot. Recovery
+ * restores sync and never resumes deletion. */
+function initialProjectCommentAttempt(operation:ErasureOperation):boolean {
+  const lifecycle=operation.lifecycle;
+  const progress=lifecycle?.deletionProgress;
+  const deletionStarted=lifecycle?.evidence?.deletionStarted;
+  const item=operation.actionPlan.comments?.[0];
+  const attempt=progress?.attempt;
+  const recoveryMode=operation.recovery?.mode;
+  return operation.status==="review_required"&&lifecycle?.phase==="delete"
+    &&Boolean(deletionStarted)
+    &&progress?.stage==="comments"&&progress.commentIndex===0&&progress.stateIndex===0
+    &&progress.finalCommentIndex===undefined
+    &&item?.kind==="project"&&item.id===operation.actionPlan.projectCommentIds?.[0]
+    &&Boolean(attempt&&uuid.test(attempt.id)&&Number.isFinite(attempt.startedAt)
+      &&attempt.startedAt>=deletionStarted!.completedAt
+      &&attempt.startedAt+((lifecycle.timeoutSeconds*1000)+2000)<=Date.now())
+    &&!operation.postwriteReview
+    &&(!operation.recovery||recoveryMode==="strict_pre_write");
+}
 function postwriteEvidenceDigest(inspection:{fingerprint:string;operation:ErasureOperation;preview:RecoveryPreview}):string {
   const {operation,preview,fingerprint}=inspection;
   return digest({mode:"post_write",fingerprint,epoch:preview.epoch,profile:operation.profile,
@@ -111,8 +133,8 @@ function digest(value:unknown):string {
 }
 export function recoveryMode(operation:ErasureOperation, snapshot:ErasurePreviewResult):RecoveryPreview["classification"] {
   const lifecycle=operation.lifecycle!;
-  const noWrites=!lifecycle.evidence.deletionStarted && !lifecycle.deletionProgress
-    && recoverableBeforeWrite.has(lifecycle.phase);
+  const noWrites=(!lifecycle.evidence.deletionStarted && !lifecycle.deletionProgress
+    && recoverableBeforeWrite.has(lifecycle.phase))||initialProjectCommentAttempt(operation);
   // Guard both domains independently: the fresh cross-profile snapshot must
   // validate its own fingerprint, while the immutable confirmation was issued
   // against the *target-only* snapshot before any global audit was requested.
@@ -209,8 +231,9 @@ function readOnlyRecoveryEvidenceChecks(operation:ErasureOperation,snapshot:Eras
   // stable input; compare immutable digests rather than public descriptions.
   const same=(original:unknown,current:unknown)=>digest({value:original})===digest({value:current});
   return {
-    originalPreWritePhase:!lifecycle.evidence.deletionStarted
-      &&!lifecycle.deletionProgress&&recoverableBeforeWrite.has(lifecycle.phase),
+    originalPreWritePhase:(!lifecycle.evidence.deletionStarted
+      &&!lifecycle.deletionProgress&&recoverableBeforeWrite.has(lifecycle.phase))
+      ||initialProjectCommentAttempt(operation),
     originalConfirmationIntact:operation.confirmationFingerprint===operation.previewFingerprint
       &&erasurePreviewFingerprint(operation)===operation.previewFingerprint,
     auditComplete:!audit||(audit.allProfilesQueried===true
