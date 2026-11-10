@@ -70,6 +70,17 @@ type Dependencies = {
   sleep?: (ms: number) => Promise<void>;
 };
 
+/** Capture times stay available in diagnostics but must not create replay-digest
+ * drift. The cross-profile evidence fingerprint already binds content, state
+ * and the freshness decision. */
+export function erasureProviderSnapshotFingerprint(
+  providerData:unknown,crossProfileEvidence?:CrossProfileErasureEvidence,
+):string {
+  return crossProfileEvidence
+    ?fingerprint({primary:providerData,crossProfileEvidenceFingerprint:crossProfileEvidence.evidenceFingerprint})
+    :fingerprint(providerData);
+}
+
 function tableName(): string {
   const value = process.env.STATE_TABLE_NAME?.trim();
   if (!value) throw new Error("STATE_TABLE_NAME is required");
@@ -301,9 +312,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   // with a different fingerprint domain, or every intact pre-write operation
   // will be misclassified as ambiguous regardless of provider state.
   const primaryProviderSnapshotFingerprint=fingerprint(providerData);
-  const providerSnapshotFingerprint = crossProfileEvidence
-    ?fingerprint({primary:providerData,crossProfileEvidence})
-    :primaryProviderSnapshotFingerprint;
+  const providerSnapshotFingerprint=erasureProviderSnapshotFingerprint(providerData,crossProfileEvidence);
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
     calendarEvent: event ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
       digest: fingerprint(event), etag:event.etag as string } : undefined,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {observeCrossProfileErasureEvidence} from "../dist/erasure-cross-profile-evidence.js";
+import {erasureProviderSnapshotFingerprint} from "../dist/erasure-preview.js";
 import {serializeMappingComment} from "../dist/mapping-comments.js";
 import {GoogleCalendar,Todoist} from "../dist/providers.js";
 
@@ -22,7 +23,8 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   const workEvent=linked(eventTwo,taskTwo);
   const calendarByProfile={home:[homeMaster,homeEvent],antonio:[],work:[workEvent]};
   const calls=[],calendarDirectReads=[];
-  const report=await observeCrossProfileErasureEvidence({
+  let taskCommentSnapshotOffsetMs=0;
+  const observe=()=>observeCrossProfileErasureEvidence({
     taskId:taskOne,eventId:eventOne,
     rows:[
       {pk:"EVENT#home#event-one",sk:"MAP",profile:"home",taskId:taskOne,eventId:eventOne,
@@ -73,7 +75,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
           async listAllProjectCommentsForErasureAudit(){return {
             projects:[{id:`project-${profile}`}],comments,
           };},
-          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date().toISOString(),comments:profile==="work"?[{
+          async listAllTaskCommentsForErasureAudit(){return {fullSyncDateUtc:new Date(Date.now()+taskCommentSnapshotOffsetMs).toISOString(),comments:profile==="work"?[{
             id:"legacy-comment",task_id:taskTwo,content:"todoist-calendar-sync\ncalendarEventId=legacy-event",
           }]:[]};},
           async listTaskComments(id){return profile==="work"&&id===taskTwo?[{
@@ -83,6 +85,7 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
       };
     },
   });
+  const report=await observe();
 
   assert.deepEqual(calls,profiles);
   assert.equal(report.phase,"read_only_cross_profile_observation");
@@ -111,6 +114,21 @@ test("all-profile evidence follows database/comment/provider aliases and recurri
   assert.ok(report.missingProof.some(reason=>reason.includes("404/410")));
   assert.ok(report.missingProof.some(reason=>reason.includes("free/busy")));
   assert.ok(report.missingProof.some(reason=>reason.includes("never constitute")));
+  taskCommentSnapshotOffsetMs=10_000;
+  calls.length=0;
+  calendarDirectReads.length=0;
+  const repeated=await observe();
+  assert.deepEqual(calls,profiles);
+  assert.notEqual(repeated.profiles.work.taskCommentInventorySnapshotAt,
+    report.profiles.work.taskCommentInventorySnapshotAt);
+  assert.equal(repeated.profiles.work.taskCommentInventoryFresh,true);
+  assert.equal(repeated.profiles.work.evidenceFingerprint,report.profiles.work.evidenceFingerprint,
+    "a refreshed but content-identical task-comment inventory keeps its per-profile evidence fingerprint");
+  assert.equal(repeated.evidenceFingerprint,report.evidenceFingerprint,
+    "capture time does not make an unchanged all-profile inspection appear to drift");
+  assert.equal(erasureProviderSnapshotFingerprint({taskId:taskOne,eventId:eventOne},repeated),
+    erasureProviderSnapshotFingerprint({taskId:taskOne,eventId:eventOne},report),
+    "the erasure preview digest consumes stable evidence, not its refreshed diagnostic timestamp");
   const serialized=JSON.stringify(report);
   for(const privateValue of [taskOne,taskTwo,eventOne,eventTwo,master,instance,"private task title","legacy-event"])
     assert.equal(serialized.includes(privateValue),false,"raw identity/content must not appear in redacted evidence");

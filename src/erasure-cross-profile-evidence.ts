@@ -801,7 +801,6 @@ export async function observeCrossProfileErasureEvidence(input:{
       taskCommentInventoryFingerprint:stats[profile].taskCommentInventoryFingerprint,
       taskCommentInventoryComplete:stats[profile].taskCommentInventoryComplete,
       taskCommentInventoryFresh:stats[profile].taskCommentInventoryFresh,
-      taskCommentInventorySnapshotAt:stats[profile].taskCommentInventorySnapshotAt,
       taskCommentReadConflicts:stats[profile].taskCommentReadConflicts,
     });
   }
@@ -860,6 +859,14 @@ export async function observeCrossProfileErasureEvidence(input:{
     ...(!closureComplete?["Identity reference closure did not converge within its bounded passes"]:[]),
   ];
   const profileEvidence=Object.fromEntries(PROFILES.map(profile=>[profile,stats[profile]])) as CrossProfileErasureEvidence["profiles"];
+  // The snapshot timestamp proves that the task-comment inventory is fresh,
+  // but each read naturally gets a different timestamp. Keep it in the
+  // operator-facing report while excluding it from identity/content hashes so
+  // an unchanged inspection remains confirmable on its immediate re-read.
+  const fingerprintProfileEvidence=Object.fromEntries(PROFILES.map(profile=>{
+    const {taskCommentInventorySnapshotAt:_snapshotAt,...stableEvidence}=profileEvidence[profile];
+    return [profile,stableEvidence];
+  }));
   return {
     phase:"read_only_cross_profile_observation",eligibleForPostWriteRelease:false,
     allProfilesQueried,closureComplete,allAccessibleCalendarCoverageProven,knownIdentitiesAbsentFromCurrentProviders,
@@ -868,7 +875,7 @@ export async function observeCrossProfileErasureEvidence(input:{
     identities:{taskCount:taskIds.size,eventCount:eventIds.size,seriesCount:seriesIds.size,overflowCount:overflow.count,
       fingerprint:fingerprint(aliases)},
     profiles:profileEvidence,
-    evidenceFingerprint:fingerprint({stateFingerprint,aliases,profileEvidence,closureComplete,
+    evidenceFingerprint:fingerprint({stateFingerprint,aliases,profileEvidence:fingerprintProfileEvidence,closureComplete,
       allAccessibleCalendarCoverageProven}),
     missingProof,
   };
