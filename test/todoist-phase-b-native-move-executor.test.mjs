@@ -48,7 +48,7 @@ function fixture(options={}){
     async getRecurrenceLink(profile){return this.link?.profile===profile?this.link:undefined;},
     async getCalendarProjectionTombstone(){return undefined;},
     async syncBlocked(){return false;},
-    async mutationAllowed(){return !options.erasureBlocked;},
+    async mutationAllowed(){return !options.erasureBlocked && !this.blockRecovery;},
     async beginPhaseBNativeMove(input){
       calls.push("stage");
       this.stage=true;
@@ -130,6 +130,7 @@ function fixture(options={}){
     sourceMapping:mapping,sourceLink:link,source:{calendar:srcCalendar,todoist:srcTodoist},
     destination:{calendar:dstCalendar,todoist:dstTodoist},
     state,now:new Date("2027-02-15T12:00:00Z"),
+    changeSourceAnchor(date){sourceVersion.start.date=date;},
     async acquireWriterLeases(){
       calls.push("erasure-lease");
       if(options.leaseDenied)throw new Error("Active Work erasure fence");
@@ -283,7 +284,7 @@ test("incomplete and ambiguous provider stages never become eligible for recover
       {createLostResponse:true},{badReadbackMarker:true},{missingDestinationInstance:true},
       {destinationException:true},{failCap:true},{futureNotCapped:true},
       {historyMissingAfterCap:true},{failSourceComment:true},{duplicateComment:true},
-      {rejectCommit:true,missingControl:true},{rejectCommit:true,erasureBlocked:true},
+      {rejectCommit:true,missingControl:true},
     ];
     for(const options of scenarios){
       const f=fixture(options);
@@ -306,6 +307,8 @@ test("stage fingerprint and mapping/version drift reject recovery even with comp
       f=>{f.state.mapping={...f.state.mapping,updatedAt:"unrelated-new-revision"};},
       f=>{f.state.stagePayload={...f.state.stagePayload,destinationStart:"2027-07-10"};},
       f=>{f.state.stagePayload={...f.state.stagePayload,operationId:"other-operation"};},
+      f=>{f.changeSourceAnchor("2026-10-10");},
+      f=>{f.state.blockRecovery=true;},
     ]){
       const f=fixture({rejectCommit:true});
       await assert.rejects(()=>executePhaseBNativeMove(f),/CAS failed/);
