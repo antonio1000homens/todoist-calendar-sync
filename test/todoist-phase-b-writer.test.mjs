@@ -12,13 +12,18 @@ function eventInstance(id,date,masterId="phase-b-master") {
     extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist"}}};
 }
 class State {
-  constructor(){this.mapping=undefined;this.audits=[];this.mutations=0;this.links=[];this.completed=[];}
+  constructor(){this.mapping=undefined;this.audits=[];this.mutations=0;this.links=[];this.completed=[];this.quarantine=[];}
   async isRetired(){return false;}
   async getMappingByTaskAnyProfile(){return this.mapping;}
   async getMappingByTask(){return this.mapping;}
   async getCalendarProjectionTombstone(){return undefined;}
   async getCancelledAnnualRecoveryReceipt(){return undefined;}
-  async syncBlocked(){return false;}
+  async syncBlocked(profile,{taskId,eventId}={}){
+    return this.quarantine.some(q=>q.profile===profile&&(q.taskId===taskId||q.eventId===eventId));
+  }
+  async quarantinePhaseBNative(profile,taskId,eventId,reason){
+    this.quarantine.push({profile,taskId,eventId,reason});
+  }
   async acceptTaskVersion(){return true;}
   async mutationAllowed(){return true;}
   async putMapping(mapping){this.mapping=structuredClone(mapping);}
@@ -33,7 +38,9 @@ class State {
   async recordRecurrence(){}
   async audit(_profile,action,detail){this.audits.push({action,detail});}
 }
-function setup({exception=false}={}){
+function setup({exception=false, lookupExisting=false, missingVersion=false,
+  changedBeforeRollback=false, rollbackFailure=false, createdConflict=false,
+  unconfirmedCreation=false}={}){
   const state=new State(), instances=["2027-01-10","2027-04-10","2027-07-10"].map((d,i)=>eventInstance(`phase-b-instance-${i}`,d));
   const master={id:"phase-b-master",etag:"etag-1",status:"confirmed",summary:task.content,description:task.description,
     start:{date:"2027-01-10"},end:{date:"2027-01-11"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],
@@ -42,15 +49,30 @@ function setup({exception=false}={}){
       todoistAnchorTimeZone:"Europe/London",todoistPhaseBVersion:"1"}}};
   const events=new Map([[master.id,master]]), creates=[], upserts=[], deletes=[];
   const calendar={
-    async findByTodoistTaskId(){return undefined;},
+    async findByTodoistTaskId(){return lookupExisting ? [...events.values()].find(
+      e=>e.extendedProperties?.shared?.taskId===task.id) : undefined;},
     async getTimeZone(){return "Europe/London";},
     async getEvent(id){const e=events.get(id);if(!e){const err=new Error("missing");err.status=404;throw err;}return structuredClone(e);},
-    async createTodoistPhaseBNativeMasterOnce(e){creates.push(structuredClone(e));events.set(e.id,{...structuredClone(e),etag:"etag-1",status:"confirmed"});return {event:structuredClone(events.get(e.id)),created:true};},
+    async createTodoistPhaseBNativeMasterOnce(e){
+      creates.push(structuredClone(e));
+      events.set(e.id,{...structuredClone(e),etag:"etag-1",status:"confirmed"});
+      if(missingVersion) delete events.get(e.id).extendedProperties.shared.todoistPhaseBVersion;
+      if(unconfirmedCreation) throw new Error("connection dropped after POST");
+      return {event:structuredClone(events.get(e.id)),created:!createdConflict};
+    },
     async listInstancesInWindow(masterId){return instances.map(x=>({...structuredClone(x),recurringEventId:masterId}));},
     async listInstances(masterId){return instances.map(x=>({...structuredClone(x),recurringEventId:masterId}));},
     async listExplicitSeriesExceptions(){return exception?[{id:"unexpected-exception",recurringEventId:"unused",status:"cancelled"}]:[];},
     async upsertEvent(e){upserts.push(structuredClone(e));return {...structuredClone(e),id:"rolling-event",status:"confirmed"};},
     async deleteEvent(id){deletes.push(id);events.delete(id);},
+    async deleteEventIfUnchanged(id,etag){
+      const current=events.get(id);
+      if(changedBeforeRollback&&current)current.etag="user-edit-etag";
+      if(rollbackFailure||!current||current.etag!==etag){
+        const e=new Error("Calendar ETag conflict");e.status=412;throw e;
+      }
+      deletes.push(id);events.delete(id);
+    },
     async patchEventMetadataIfUnchanged(id,etag,metadata){const saved=events.get(id);assert.equal(etag,saved.etag);Object.assign(saved,metadata);saved.etag="etag-2";return structuredClone(saved);},
   };
   const todoist={async listProjectComments(){return [];},async getTask(){return structuredClone(task);},async getTimeZone(){return "Europe/London";}};
@@ -148,3 +170,48 @@ test("Todoist completion retains the finished occurrence and advances within the
   task.due={...task.due,date:"2027-01-10"};
   task.updated_at="2026-11-09T11:59:00Z";
 }));
+
+test("mapping loss rediscovers the tagged master and restores a versioned native mapping",()=>withGate(true,async()=>{
+  const f=setup({lookupExisting:true});
+  // Do not rely on a durable mapping: provider master is the independent proof.
+  await f.sync.process({...f.delivery,id:"provider-native-recovery",
+    body:JSON.stringify({event_name:"item:updated",event_data:task})});
+  assert.equal(f.creates.length,0);
+  assert.equal(f.upserts.length,0,"never flatten a tagged provider master");
+  assert.equal(f.state.mapping?.todoistPhaseBVersion,1);
+  assert.equal(f.state.mapping?.masterEventId,"phase-b-master");
+}));
+
+test("initial native readback without version marker never commits a mapping",()=>withGate(true,async()=>{
+  const f=setup({missingVersion:true});
+  await f.sync.process(f.delivery);
+  assert.equal(f.state.mapping,undefined);
+  assert.equal(f.upserts.length,0);
+  assert.deepEqual(f.deletes,[f.creates[0].id]);
+  assert.equal(f.state.audits.at(-1).detail.reason,"master_identity_or_anchor_drift");
+}));
+
+test("rollback is ETag conditional and quarantines user edits instead of deleting them",()=>withGate(true,async()=>{
+  const f=setup({exception:true,changedBeforeRollback:true});
+  await f.sync.process(f.delivery);
+  assert.deepEqual(f.deletes,[]);
+  assert.equal(f.events.has(f.creates[0].id),true);
+  assert.equal(f.state.mapping,undefined);
+  assert.equal(f.state.quarantine.length,1);
+  await f.sync.process({...f.delivery,id:"replayed-after-failed-rollback"});
+  assert.equal(f.creates.length,1);
+  assert.equal(f.upserts.length,0);
+  assert.equal(f.state.audits.at(-1).action,"todoist_task_sync_control_blocked");
+}));
+
+test("failed rollback and deterministic conflict quarantine instead of adopting a master",()=>withGate(true,async()=>{
+  for(const options of [{exception:true,rollbackFailure:true},{exception:true,createdConflict:true},
+    {unconfirmedCreation:true}]){
+    const f=setup(options);
+    await f.sync.process(f.delivery);
+    assert.equal(f.state.mapping,undefined);
+    assert.equal(f.state.quarantine.length,1);
+    assert.deepEqual(f.deletes,[]);
+  }
+}));
+

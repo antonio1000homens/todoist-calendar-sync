@@ -99,7 +99,7 @@ test("strict Phase B Calendar provider admission requires exact master and insta
     extendedProperties:{shared:{
       taskId:source.id,syncRecurrenceOwner:"todoist",
       todoistRecurrence:source.due.string,
-      todoistAnchorStart:"2027-01-02",todoistAnchorEnd:"2027-01-03",
+      todoistAnchorStart:"2027-01-02",todoistAnchorEnd:"2027-01-03",todoistPhaseBVersion:"1",
     }},
   };
   const instances=["2027-01-02","2027-01-15","2027-01-27"].map((date,i)=>({
@@ -112,6 +112,9 @@ test("strict Phase B Calendar provider admission requires exact master and insta
   assert.deepEqual(good,{accepted:true,reason:"calendar_provider_readback_verified"});
   const bad=[
     {master:{...master,etag:undefined}},
+    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,todoistPhaseBVersion:undefined}}}},
+    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,todoistPhaseBVersion:"2"}}}},
+    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,syncRecurrenceOwner:"calendar"}}}},
     {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,taskId:"other"}}}},
     {master:{...master,recurrence:["RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15"]}},
     {master:{...master,start:{date:"2027-01-15"}}},

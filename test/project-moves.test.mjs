@@ -560,3 +560,36 @@ test("pending approved future split blocks ordinary Todoist webhook projection c
   assert.equal(state.mapping, undefined);
   assert.ok(state.audits.some((x) => x.action === "todoist_webhook_future_series_split_pending"));
 });
+
+test("Phase B tagged source blocks cross-profile move even when the mapping was lost",async()=>{
+  const previous={id:"phase-b-unmapped-move",project_id:HOME,content:"Quarter",description:"",
+    due:{date:"2027-04-10",string:"every quarter",is_recurring:true},updated_at:"2027-01-10T09:00:00Z"};
+  const task={...previous,project_id:WORK,updated_at:"2027-01-10T10:00:00Z"};
+  const calendars=calendarSet();
+  calendars.home.events.set("phase-b-unmapped-master",{id:"phase-b-unmapped-master",
+    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],start:{date:"2027-01-10"}});
+  for(const mapping of [undefined,{profile:"home",eventId:"phase-b-unmapped-master",
+    taskId:task.id,updatedAt:previous.updated_at}]){
+    const state=new FakeState(mapping);
+    const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));
+    await sync.process(delivery("unmapped-phase-b-move",task,previous));
+    assert.deepEqual(calendars.home.deleted,[]);
+    assert.deepEqual(calendars.work.created,[]);
+    assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+  }
+});
+
+test("Phase B tagged orphan cannot be stripped when its mapping has vanished",async()=>{
+  const task={id:"phase-b-orphan",project_id:WORK,content:"Quarter",due:{date:"2027-04-10"}};
+  const calendars=calendarSet();
+  calendars.home.events.set("phase-b-orphan-master",{id:"phase-b-orphan-master",
+    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    start:{date:"2027-01-10"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"]});
+  const state=new FakeState();
+  const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));
+  await sync.process({...delivery("phase-b-orphan",task),kind:"orphan",
+    orphan:{taskId:task.id,eventId:"phase-b-orphan-master"}});
+  assert.equal(state.tombstones.size,0);
+  assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+});
