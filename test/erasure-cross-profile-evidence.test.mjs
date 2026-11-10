@@ -446,7 +446,7 @@ test("Todoist all-task-comment audit uses a complete Sync notes snapshot and rej
     assert.equal(calls[0].init.method,"POST");
     const body=new URLSearchParams(calls[0].init.body);
     assert.equal(body.get("sync_token"),"*");
-    assert.equal(body.get("resource_types"),'["all"]');
+    assert.equal(body.get("resource_types"),'["items","notes","projects"]');
 
     globalThis.fetch=async()=>new Response(JSON.stringify({full_sync:false,sync_token:"partial",
       full_sync_date_utc:new Date().toISOString(),notes:[]}));

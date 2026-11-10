@@ -640,7 +640,7 @@ export class Todoist {
     headers.set("content-type","application/x-www-form-urlencoded");
     // The full snapshot contains items, notes and project_notes. Reusing it
     // avoids a second paginated task inventory and per-project comment reads.
-    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["all"])});
+    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["items","notes","projects"])});
     let snapshot: {full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
       sync_token?:unknown;full_sync_date_utc?:unknown};
     for(let attempt=0;;attempt++) {
