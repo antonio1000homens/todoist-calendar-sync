@@ -18,13 +18,16 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [postWriteToken,setPostWriteToken]=useState<any>();
   const [postWriteTyped,setPostWriteTyped]=useState({phrase:"",operationId:"",profile:""});
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
+  const [driftConfirmation,setDriftConfirmation]=useState<any>();
+  const [driftTyped,setDriftTyped]=useState({phrase:"",operationId:"",profile:""});
   const [recoveryStatus,setRecoveryStatus]=useState<string>();
   const lookup=async()=>{
     if(!/^[A-Za-z0-9_-]{1,128}$/.test(operationId)||busy)return;
     setBusy(true);setNotice("");setOperation(undefined);setPreview(undefined);setPostWriteAssessment(undefined);setPostWriteToken(undefined);
     setInspectionState("idle");setInspectionMessage("");
     setPostWriteTyped({phrase:"",operationId:"",profile:""});
-    setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
+    setConfirmation(undefined);setTyped({phrase:"",operationId:"",profile:""});
+    setDriftConfirmation(undefined);setDriftTyped({phrase:"",operationId:"",profile:""});setRecoveryStatus(undefined);
     try{
       const result=await api("erasure-operations/"+encodeURIComponent(operationId));
       setOperation(result.operation);setRecoveryStatus(result.operation?.recoveryStatus);
@@ -40,7 +43,8 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   };
   const inspect=async()=>{
     if(!operation||busy)return;
-    setBusy(true);setPreview(undefined);setConfirmation(undefined);setNotice("");
+    setBusy(true);setPreview(undefined);setConfirmation(undefined);
+    setDriftConfirmation(undefined);setDriftTyped({phrase:"",operationId:"",profile:""});setNotice("");
     setInspectionState("running");
     setInspectionMessage("Inspecting provider and fence evidence (read-only). No recovery changes are being made.");
     try{
@@ -115,6 +119,34 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     }catch(e:any){setConfirmation(undefined);setNotice(e.message||"Recovery was rejected");}
     finally{setBusy(false);}
   };
+
+  const requestDriftConfirmation=async()=>{
+    if(!operation||busy||!preview?.calendarDriftReview?.candidateForSeparateApproval||recoveryStatus)return;
+    setBusy(true);setDriftConfirmation(undefined);setNotice("");
+    try{
+      const issued=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/calendar-drift-confirm",
+        {method:"POST",body:"{}"});
+      setPreview(issued.preview);
+      setDriftConfirmation({confirmationId:issued.confirmationId,expiresAt:issued.expiresAt});
+      setDriftTyped({phrase:"",operationId:"",profile:""});
+    }catch(e:any){setNotice(e.message||"Calendar drift cancellation cannot be confirmed; fence retained");}
+    finally{setBusy(false);}
+  };
+  const applyDriftCancellation=async()=>{
+    if(!operation||busy||!driftConfirmation||!preview?.calendarDriftReview?.candidateForSeparateApproval
+      ||driftTyped.phrase!=="CANCEL ERASURE AND RESTORE SYNC"
+      ||driftTyped.operationId!==operation.operationId||driftTyped.profile!==operation.profile)return;
+    if(!window.confirm("Cancel this unstarted erasure and restore sync without deleting provider items? The selected Calendar event has changed. The operation and all safety checks will be re-read."))return;
+    setBusy(true);setNotice("");
+    try{
+      const result=await api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+"/calendar-drift-apply",{
+        method:"POST",body:JSON.stringify({...driftTyped,confirmationId:driftConfirmation.confirmationId}),
+      });
+      setRecoveryStatus(result.recovery?.status||"queued");
+      setDriftConfirmation(undefined);setNotice("Calendar drift cancellation queued under the existing fence. No deletion was requested; inspect the recovery status until completed.");
+    }catch(e:any){setDriftConfirmation(undefined);setNotice(e.message||"Calendar drift cancellation rejected; fence preserved");}
+    finally{setBusy(false);}
+  };
   const refreshRecovery=async()=>{
     if(!operation)return;
     try{
@@ -176,9 +208,20 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
               <li key={label} className={passed?"":"warning"}>{label}: {passed?"passed":"changed or unverified"}</li>)}</ul>
             <p>Other provider/state safety blockers: {preview.evidenceChecks.providerSafetyBlockerCount}</p>
           </details>}
-          {preview.calendarDriftReview?.candidateForSeparateApproval&&<p role="status" className="warning">
-            Calendar-only provider revision is a candidate for separately reviewed pre-write cancellation. This inspection is read-only: cancellation is not implemented or authorised, no recovery confirmation is available, and the Work fence and worker mapping remain unchanged. Do not force-enable synchronization or delete the fence.
-          </p>}
+          {preview.calendarDriftReview?.candidateForSeparateApproval&&<div className="erasure-results" aria-label="Calendar drift cancellation">
+            <p className="warning">Calendar-only provider revision detected. This is <strong>not ordinary RESTORE SYNC</strong>: review the current Calendar event independently. A separate single-use confirmation binds its fresh version and every guarded recovery step rechecks it. Provider deletion is never resumed.</p>
+            {!driftConfirmation&&!recoveryStatus&&
+              <button className="secondary" disabled={busy} onClick={()=>void requestDriftConfirmation()}>Request Calendar drift cancellation confirmation</button>}
+            {driftConfirmation&&<div className="erasure-results">
+              <p>Confirmation expires {new Date(driftConfirmation.expiresAt).toLocaleString()}. Do not continue if you have not independently reviewed the current Calendar event. All existing fences remain installed until the worker verifies recovery.</p>
+              <label>Type CANCEL ERASURE AND RESTORE SYNC<input autoComplete="off" value={driftTyped.phrase} onChange={e=>setDriftTyped(v=>({...v,phrase:e.target.value}))}/></label>
+              <label>Repeat operation ID<input autoComplete="off" value={driftTyped.operationId} onChange={e=>setDriftTyped(v=>({...v,operationId:e.target.value}))}/></label>
+              <label>Repeat profile<input autoComplete="off" value={driftTyped.profile} onChange={e=>setDriftTyped(v=>({...v,profile:e.target.value}))}/></label>
+              <button disabled={busy||driftTyped.phrase!=="CANCEL ERASURE AND RESTORE SYNC"
+                ||driftTyped.operationId!==operation.operationId||driftTyped.profile!==operation.profile}
+                onClick={()=>void applyDriftCancellation()}>Cancel unstarted erasure and restore sync</button>
+            </div>}
+          </div>}
           {preview.allowed&&!recoveryStatus&&!confirmation&&<button disabled={busy} onClick={()=>void requestConfirmation()}>Request recovery confirmation</button>}
         </>}
         <h4>Post-write evidence (read-only)</h4>
