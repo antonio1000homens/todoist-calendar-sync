@@ -28,7 +28,8 @@
     "purge:item": "npm run build --silent && node scripts/purge-item.mjs",
     "check:public": "bash scripts/check-public-source.sh",
     "check:capacity": "node scripts/check-dynamodb-capacity.mjs",
-    "cost:audit": "node scripts/monthly-cost-audit.mjs"
+    "cost:audit": "node scripts/monthly-cost-audit.mjs",
+    "audit:legacy-hmac-retirement": "node scripts/audit-legacy-hmac-retirement.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-codedeploy": "^3.1163.0",
