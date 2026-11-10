@@ -3,14 +3,15 @@ import assert from "node:assert/strict";
 import {
   COMPLETED_TASK_GRACE_MS, terminalCompletionDecision, protectUnmappedCompletedHistory,
 } from "../dist/completed-history-policy.js";
+import {
+  COMPLETION_BOUNDARY_MS, SEVEN_DAYS_MS, completedProjection,
+} from "./helpers/completed-history-fixtures.mjs";
 
-const completedAt = "2026-10-01T12:00:00.000Z";
-const boundary = Date.parse(completedAt) + COMPLETED_TASK_GRACE_MS;
-const oneOff = (extra = {}) => ({
-  profile: "home", taskId: "task-1", eventId: "event-1", completedAt, ...extra,
-});
+const boundary = COMPLETION_BOUNDARY_MS;
+const oneOff = completedProjection;
 
 test("seven full days, not calendar days or last updatedAt, determine eligibility", () => {
+  assert.equal(COMPLETED_TASK_GRACE_MS, SEVEN_DAYS_MS, "the policy must use seven full days");
   const projection = oneOff({ updatedAt: "2026-10-08T13:00:00Z" });
   assert.equal(terminalCompletionDecision([projection], boundary - 1), "too_recent");
   assert.equal(terminalCompletionDecision([projection], boundary), "eligible");
