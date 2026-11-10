@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { profiles } from "./config.js";
+import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import { buildProjectMappingIndex, attachProjectCommentReference } from "./mapping-comments.js";
 import { calendarLocalDay } from "./recurrence-split.js";
 import { planPhaseBNativeFutureOnlyMove, type PhaseBNativeMovePlan } from "./todoist-phase-b-native-move.js";
@@ -36,6 +38,9 @@ export interface PhaseBNativeMoveExecution {
   destination: ProviderClients;
   state: PhaseBNativeMoveState;
   now?: Date;
+  /** Fault-injection seam only: runtime callers must omit this so the executor
+   * acquires real DynamoDB writer leases for BOTH managed profiles. */
+  acquireWriterLeases?: (source: Profile, destination: Profile) => Promise<() => Promise<void>>;
 }
 export interface PhaseBNativeMoveResult {
   plan: PhaseBNativeMovePlan;
@@ -155,6 +160,36 @@ function verifyHistoryMaster(master: CalendarEvent, original: CalendarEvent, pla
     throw new Error("Source Calendar history cap readback is incomplete or changed");
 }
 
+/** An erasure for either profile may start at any time. Lease acquisition is
+ * conditional on a current, unchanged epoch and no active erasure fence.
+ * Hold both leases across the whole non-transactional provider cutover. */
+async function acquireCrossProfileWriterLeases(
+  sourceProfile: Profile, destinationProfile: Profile,
+): Promise<() => Promise<void>> {
+  if (process.env.ERASURE_PROTOCOL_VERSION !== "1")
+    throw new Error("Phase B cross-profile migration requires erasure protocol v1");
+  const releases: Array<() => Promise<void>> = [];
+  try {
+    for (const profile of [...new Set([sourceProfile, destinationProfile])].sort()) {
+      let release: (() => Promise<void>) | undefined;
+      for (let attempt=0;attempt<3 && !release;attempt++) {
+        const epoch=await getErasureEpoch(profile);
+        try {
+          release=await acquireErasureProtocolLease(profile,"writer",randomUUID(),epoch);
+        } catch (error) {
+          if (!(error instanceof ErasureEpochChangedError) || attempt===2) throw error;
+        }
+      }
+      if (!release) throw new Error("Phase B migration could not establish the required writer lease");
+      releases.push(release);
+    }
+    return async()=>{for(const release of releases.reverse()) await release();};
+  } catch(error) {
+    for(const release of releases.reverse()) await release();
+    throw error;
+  }
+}
+
 /** Read-only provider verification, before creating any durable stage. */
 export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution): Promise<{
   plan: PhaseBNativeMovePlan; master: CalendarEvent; task: TodoistTask;
@@ -241,6 +276,9 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
  * This function refuses to resume; recovery is a separately approved flow.
  */
 export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution): Promise<PhaseBNativeMoveResult> {
+  const releaseWriterLeases=await (input.acquireWriterLeases || acquireCrossProfileWriterLeases)(
+    input.sourceProfile,input.destinationProfile);
+  try {
   const observed=await inspectPhaseBNativeMove(input);
   const {plan, master, historicalInstances}=observed;
   const {sourceProfile, destinationProfile, sourceMapping, sourceLink,
@@ -349,5 +387,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
       operationId:stage.operationId,reason:error instanceof Error?error.message:String(error),
     });
     throw error;
+    } finally {
+    await releaseWriterLeases();
   }
 }
