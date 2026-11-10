@@ -46,6 +46,14 @@ test("authenticated recovery is separate from fenced admission, requires exact t
       preview:{operationId:id,profile:"work",classification:"pre_write",allowed:true,blockers:[]},
       confirmationId:"fresh-recovery",expiresAt:Date.now()+60_000};},
     async apply(id,token,operator){calls.push(["apply",id,token,operator]);},
+    async issueCalendarDriftCancellation(id,operator){calls.push(["drift-issue",id,operator]);return {
+      preview:{operationId:id,profile:"work",classification:"partial_or_ambiguous",allowed:false,
+        calendarDriftReview:{candidateForSeparateApproval:true,releaseAllowed:false}},
+      confirmationId:"drift-123",expiresAt:Date.now()+60_000,mode:"calendar_drift_cancel"};},
+    async applyCalendarDriftCancellation(id,token,operator,typed){
+      assert.equal(token,"drift-123","normal recovery token cannot authorise Calendar drift");
+      calls.push(["drift-apply",id,token,operator,typed]);
+    },
     async status(){return {status:"queued",startedAt:"now"};},
   };
   const run=e=>handler(e,{createErasureRecoveryService:()=>recovery,
@@ -115,4 +123,27 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   const wrongOrigin=await run(request("/review/api/erasure-recoveries/op-1/apply","POST",
     {"cf-access-jwt-assertion":jwt},{confirmationId:"fresh-recovery",operationId:"op-1",phrase:"RESTORE SYNC",profile:"work"}));
   assert.equal(wrongOrigin.statusCode,403);
+  const noDriftAuth=await run(request("/review/api/erasure-recoveries/op-1/calendar-drift-confirm","POST",
+    {origin:"https://calendar-sync.alf-broadcast.co.uk"},{}));
+  assert.equal(noDriftAuth.statusCode,401);
+  const driftIssued=await run(request("/review/api/erasure-recoveries/op-1/calendar-drift-confirm","POST",headers,{}));
+  assert.equal(driftIssued.statusCode,200);
+  assert.equal(JSON.parse(driftIssued.body).mode,"calendar_drift_cancel");
+  assert.deepEqual(calls.find(x=>x[0]==="drift-issue"),["drift-issue","op-1","operator-recovery"]);
+  for(const bad of [
+    {confirmationId:"drift-123",operationId:"op-1",profile:"work",phrase:"RESTORE SYNC"},
+    {confirmationId:"drift-123",operationId:"op-1",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC",extra:true},
+    {confirmationId:"drift-123",operationId:"op-1",profile:"home",phrase:"CANCEL ERASURE AND RESTORE SYNC"},
+  ]) {
+    const result=await run(request("/review/api/erasure-recoveries/op-1/calendar-drift-apply","POST",headers,bad));
+    assert.ok([400,409].includes(result.statusCode));
+  }
+  assert.equal(calls.filter(x=>x[0]==="drift-apply").length,0);
+  const driftApplied=await run(request("/review/api/erasure-recoveries/op-1/calendar-drift-apply","POST",headers,{
+    confirmationId:"drift-123",operationId:"op-1",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"}));
+  assert.equal(driftApplied.statusCode,202);
+  assert.equal(JSON.parse(driftApplied.body).recovery.mode,"calendar_drift_cancel");
+  assert.deepEqual(calls.find(x=>x[0]==="drift-apply"),["drift-apply","op-1","drift-123","operator-recovery",
+    {operationId:"op-1",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"}]);
+  assert.deepEqual(messages,["op-1","op-1","op-1"]);
 });
