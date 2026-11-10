@@ -31,7 +31,7 @@ function fixture(options={}) {
   Object.assign(operation,options.operation||{});
   Object.assign(external,options.external||{});
   const opKey="ERASURE_OPERATION#op-recovery";
-  let confirmation,postwriteToken;
+  let confirmation,postwriteToken,driftToken;
   const db={
     async send(command) {
       const kind=command.constructor.name;
@@ -40,6 +40,7 @@ function fixture(options={}) {
         if(input.Key.pk===opKey)return {Item:operation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
         if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
+        if(input.Key.pk==="ERASURE_CALENDAR_DRIFT_CONFIRMATION#op-recovery")return {Item:driftToken};
         return {Item:undefined};
       }
       if(kind==="QueryCommand") {
@@ -52,6 +53,9 @@ function fixture(options={}) {
         if(input.Item.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery"){
           if(postwriteToken&&postwriteToken.status==="consumed")throw new Error("Reviewed token is already consumed");
           postwriteToken={...input.Item};return {};
+        }
+        if(input.Item.pk==="ERASURE_CALENDAR_DRIFT_CONFIRMATION#op-recovery") {
+          driftToken={...input.Item};return {};
         }
         confirmation={...input.Item};
         return {};
@@ -85,9 +89,17 @@ function fixture(options={}) {
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET recovery=:recovery"))) {
           assert.equal(operation.status,"review_required");
           assert.equal(operation.recovery,undefined,"confirmation must not be reused");
-          assert.equal(confirmation.status,"issued");
+          const mode=input.TransactItems[0].Update.ExpressionAttributeValues[":recovery"].mode;
+          if(mode==="calendar_drift_cancel") {
+            assert.equal(driftToken.status,"issued");
+            assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="FENCE"));
+            assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="JOURNAL"));
+            driftToken.status="consumed";
+          } else {
+            assert.equal(confirmation.status,"issued");
+            confirmation.status="consumed";
+          }
           operation.recovery=input.TransactItems[0].Update.ExpressionAttributeValues[":recovery"];
-          confirmation.status="consumed";
           return {};
         }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.includes("completedAt"))) {
@@ -96,6 +108,10 @@ function fixture(options={}) {
           assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="FENCE"));
           assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
           assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="JOURNAL"));
+          if(operation.recovery.mode==="calendar_drift_cancel") {
+            assert.equal(driftToken.status,"consumed");
+            assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_CALENDAR_DRIFT_CONFIRMATION#op-recovery"));
+          }
           operation.recovery.status="completed";
           external.control=external.control.filter(x=>!["FENCE","JOURNAL"].includes(x.sk));
           return {};
@@ -122,7 +138,7 @@ function fixture(options={}) {
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
   return {service,operation,external,db,get confirmation(){return confirmation;},
-    get postwriteToken(){return postwriteToken;}};
+    get postwriteToken(){return postwriteToken;},get driftToken(){return driftToken;}};
 }
 
 test("read-only preview paginates controls and checks original mappings and immutable provider inventory",async()=>{
@@ -304,6 +320,73 @@ test("Calendar drift triage rejects other identity/state drift, incomplete audit
     assert.equal(result.preview.allowed,false);
     assert.deepEqual(f.external.writes,[]);
     assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  }
+});
+
+
+test("distinct Calendar drift token requires exact operator phrase and reinspection before CAS",async()=>{
+  const f=calendarOnlyDriftFixture();
+  const issued=await f.service.issueCalendarDriftCancellation("op-recovery","operator-1");
+  assert.equal(issued.mode,"calendar_drift_cancel");
+  assert.equal(issued.preview.allowed,false,"ordinary recovery remains blocked");
+  assert.equal(f.driftToken.mode,"calendar_drift_cancel");
+  assert.equal(f.operation.recovery,undefined);
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  const typed={operationId:"op-recovery",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"};
+  await assert.rejects(f.service.applyCalendarDriftCancellation(
+    "op-recovery",issued.confirmationId,"operator-1",{...typed,phrase:"RESTORE SYNC"}),/Exact CANCEL/);
+  await assert.rejects(f.service.applyCalendarDriftCancellation(
+    "op-recovery",issued.confirmationId,"different-operator",typed),/expired, mismatched or consumed/);
+  assert.equal(f.operation.recovery,undefined);
+  await f.service.applyCalendarDriftCancellation("op-recovery",issued.confirmationId,"operator-1",typed);
+  assert.equal(f.operation.recovery.mode,"calendar_drift_cancel");
+  assert.equal(f.operation.recovery.status,"queued");
+  assert.equal(f.driftToken.status,"consumed");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  assert.deepEqual(f.external.restored,[],"no mapping is restored before guarded worker");
+  await assert.rejects(f.service.applyCalendarDriftCancellation(
+    "op-recovery",issued.confirmationId,"operator-1",typed),/expired, mismatched or consumed/);
+});
+
+test("operator-approved Calendar drift cancellation restores only originally enabled mapping then releases owned fence",async()=>{
+  const f=calendarOnlyDriftFixture();
+  const issued=await f.service.issueCalendarDriftCancellation("op-recovery","operator");
+  await f.service.applyCalendarDriftCancellation("op-recovery",issued.confirmationId,"operator",
+    {operationId:"op-recovery",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"});
+  assert.equal((await f.service.process("op-recovery")).status,"restoring");
+  assert.equal((await f.service.process("op-recovery")).status,"restoring");
+  assert.deepEqual(f.external.restored,[enabledId],"only previously enabled mapping is restored");
+  assert.equal(f.external.mappingStates.get(disabledId),"Disabled");
+  assert.ok(f.external.control.some(x=>x.sk==="FENCE"),"fence remains during mapping restoration");
+  assert.equal((await f.service.process("op-recovery")).status,"verifying");
+  assert.equal((await f.service.process("op-recovery")).status,"completed");
+  assert.equal(f.operation.recovery.status,"completed");
+  assert.equal(f.external.control.some(x=>x.sk==="FENCE"),false);
+  assert.equal(f.external.providerCalls>4,true,"worker must reread provider evidence at each step");
+});
+
+test("Calendar/provider revision drift before approval or during worker recovery leaves fence installed",async()=>{
+  for(const stage of ["before-apply","worker","db-inventory"]) {
+    const f=calendarOnlyDriftFixture();
+    const issued=await f.service.issueCalendarDriftCancellation("op-recovery","operator");
+    const typed={operationId:"op-recovery",profile:"work",phrase:"CANCEL ERASURE AND RESTORE SYNC"};
+    if(stage==="before-apply") {
+      f.external.snapshot.actionPlan.calendarEvent.digest="e".repeat(64);
+      f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+      await assert.rejects(f.service.applyCalendarDriftCancellation(
+        "op-recovery",issued.confirmationId,"operator",typed),/drifted/);
+      assert.equal(f.operation.recovery,undefined);
+    }else{
+      await f.service.applyCalendarDriftCancellation("op-recovery",issued.confirmationId,"operator",typed);
+      if(stage==="worker")f.external.snapshot.actionPlan.calendarEvent.digest="f".repeat(64);
+      else f.external.snapshot.inventory=[{type:"TASK",key:{pk:"TASK#other",sk:"STATE"},digest:"a".repeat(64)}];
+      f.external.snapshot.previewFingerprint=erasurePreviewFingerprint(f.external.snapshot);
+      const outcome=await f.service.process("op-recovery");
+      assert.equal(outcome.status,"blocked");
+      assert.equal(f.operation.recovery.status,"blocked");
+    }
+    assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
+    assert.deepEqual(f.external.restored,[]);
   }
 });
 
