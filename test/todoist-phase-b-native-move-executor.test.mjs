@@ -172,6 +172,8 @@ test("out-of-order Calendar instance inventory still selects the exact active oc
   const r=await executePhaseBNativeMove(f);
   assert.equal(r.mapping.originalStart,currentDue);
   assert.equal(r.mapping.activeInstanceId,"destination-0");
+  assert.equal(f.state.link.activeInstanceId,"destination-0",
+    "recurrence link must use sorted active instance, not provider response order");
   assert.equal(f.state.committed,true);
 }));
 test("default-off Phase B cannot claim a stage or touch providers",()=>withGate(false,async()=>{

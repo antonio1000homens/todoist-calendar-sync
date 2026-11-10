@@ -73,6 +73,7 @@ class FakeState {
     this.completedProjections = [];
   }
   async getMappingByTaskAnyProfile() { return this.mapping; }
+  async getRecurrenceLink(profile, taskId) { return this.recurrenceLinks.find(link => link.profile === profile && link.taskId === taskId); }
   async listCompletedCalendarProjectionsByTaskAnyProfile(taskId) {
     return this.completedProjections.filter((projection) => projection.taskId === taskId).map((projection) => structuredClone(projection));
   }
@@ -438,6 +439,96 @@ test("Phase B native master stays intact when cross-profile copy protocol is una
   assert.equal(state.mapping.profile,"home");
   assert.equal(state.mapping.todoistPhaseBVersion,1);
   assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+});
+
+test("Phase B native project move routes only verified signed transition through staged executor", async () => {
+  const saved = process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+  const previous = { id: "phase-b-routed", project_id: HOME, content: "Quarterly", description: "",
+    due: { date: "2027-04-10", string: "every quarter", is_recurring: true },
+    updated_at: "2027-02-15T09:00:00Z" };
+  const task = { ...previous, project_id: WORK, updated_at: "2027-02-15T10:00:00Z" };
+  const makeCase = (options = {}) => {
+    const calendars = calendarSet();
+    const master = { id: "phase-b-master", summary: task.content, status: "confirmed",
+      start: { date: "2027-01-10" }, end: { date: "2027-01-11" },
+      recurrence: ["RRULE:FREQ=MONTHLY;INTERVAL=3"], etag: "old-etag",
+      extendedProperties: { shared: { taskId: task.id, syncRecurrenceOwner: "todoist",
+        todoistPhaseBVersion: "1" } } };
+    calendars.home.events.set(master.id, master);
+    const mapping = { profile: "home", projectId: HOME, eventId: master.id, taskId: task.id,
+      masterEventId: master.id, recurrenceOwner: "todoist", todoistPhaseBVersion: 1,
+      seriesId: task.id, activeInstanceId: "phase-b-apr", originalStart: "2027-04-10",
+      activeEffectiveStart: "2027-04-10", updatedAt: previous.updated_at,
+      projectCommentId: "source-project-comment" };
+    const link = { profile: "home", taskId: task.id, eventId: master.id,
+      masterEventId: master.id, owner: "todoist", seriesId: task.id,
+      activeInstanceId: mapping.activeInstanceId, originalStart: mapping.originalStart,
+      updatedAt: previous.updated_at };
+    const state = new FakeState(options.missingMapping ? undefined : mapping);
+    if (!options.missingLink) state.recurrenceLinks.push(link);
+    const called = [];
+    const runner = async input => {
+      called.push(input);
+      if (options.failExecutor) throw new Error("staged provider cutover failed");
+      return { plan: {}, mapping, operationId: "verified-stage" };
+    };
+    const sync = new ProjectAwareSynchronizer(state, undefined,
+      fakeClients({ value: task }, calendars), runner);
+    const source = delivery("phase-b-move-delivery", task,
+      options.staleOldProject ? { ...previous, project_id: ANTONIO } : previous);
+    return { sync, source, state, called, calendars, mapping, link };
+  };
+  try {
+    process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED = "true";
+    const good = makeCase();
+    await good.sync.process(good.source);
+    assert.equal(good.called.length, 1);
+    assert.equal(good.called[0].task.id, task.id);
+    assert.equal(good.called[0].sourceProfile, "home");
+    assert.equal(good.called[0].destinationProfile, "work");
+    assert.equal(good.called[0].sourceMapping, good.mapping);
+    assert.equal(good.called[0].sourceLink, good.link);
+    assert.equal(good.called[0].state, good.state);
+    assert.deepEqual(good.calendars.home.deleted, []);
+    assert.deepEqual(good.calendars.work.created, []);
+    assert.deepEqual(good.state.operations, []);
+    assert.equal(good.state.audits.length, 0, "no legacy fallback should run after native handoff");
+    for (const options of [{ missingMapping: true }, { missingLink: true }, { staleOldProject: true }]) {
+      const blocked = makeCase(options);
+      await blocked.sync.process(blocked.source);
+      assert.equal(blocked.called.length, 0);
+      assert.deepEqual(blocked.calendars.home.deleted, []);
+      assert.deepEqual(blocked.calendars.work.created, []);
+      assert.equal(blocked.state.audits.at(-1).action,
+        "todoist_phase_b_cross_profile_move_requires_review");
+    }
+    const failed = makeCase({ failExecutor: true });
+    await assert.rejects(() => failed.sync.process(failed.source), /staged provider cutover failed/);
+    assert.equal(failed.called.length, 1);
+    assert.deepEqual(failed.calendars.home.deleted, []);
+    assert.deepEqual(failed.calendars.work.created, []);
+    assert.deepEqual(failed.state.operations, [], "provider failure must not invoke legacy fallback");
+    const wrongEvent = makeCase();
+    wrongEvent.source = { ...wrongEvent.source, body: JSON.stringify({
+      event_name: "item:added", event_data: task,
+      event_data_extra: { old_item: previous },
+    }) };
+    await wrongEvent.sync.process(wrongEvent.source);
+    assert.equal(wrongEvent.called.length, 0);
+    assert.equal(wrongEvent.state.audits.at(-1).action,
+      "todoist_phase_b_cross_profile_move_requires_review");
+    process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED = "false";
+    const disabled = makeCase();
+    await disabled.sync.process(disabled.source);
+    assert.equal(disabled.called.length, 0);
+    assert.deepEqual(disabled.calendars.home.deleted, []);
+    assert.deepEqual(disabled.calendars.work.created, []);
+    assert.equal(disabled.state.audits.at(-1).action,
+      "todoist_phase_b_cross_profile_move_requires_review");
+  } finally {
+    if (saved === undefined) delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+    else process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED = saved;
+  }
 });
 
 test("moved orphan writes a source tombstone before dropping ownership mapping", async () => {
