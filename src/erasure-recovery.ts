@@ -687,10 +687,15 @@ export class ErasureRecoveryService {
       ];
       if(recovery.hasJournal)items.push({Delete:{TableName:table(),Key:profileKey(op.profile,"JOURNAL"),
         ConditionExpression:"operationId=:id",ExpressionAttributeValues:{":id":id}}});
-      items.push({Delete:{TableName:table(),Key:confirmationKey(id),
-        ConditionExpression:"#status=:consumed AND operationId=:id AND inspectedFingerprint=:digest",
+      items.push({Delete:{TableName:table(),
+        Key:recovery.mode==="calendar_drift_cancel"?driftConfirmationKey(id):confirmationKey(id),
+        ConditionExpression:recovery.mode==="calendar_drift_cancel"
+          ?"#status=:consumed AND operationId=:id AND currentEvidenceCommitment=:digest"
+          :"#status=:consumed AND operationId=:id AND inspectedFingerprint=:digest",
         ExpressionAttributeNames:{"#status":"status"},
-        ExpressionAttributeValues:{":consumed":"consumed",":id":id,":digest":recovery.fingerprint}}});
+        ExpressionAttributeValues:{":consumed":"consumed",":id":id,
+          ":digest":recovery.mode==="calendar_drift_cancel"
+            ?recovery.approvedCalendarDriftCommitment:recovery.fingerprint}}});
       await this.db.send(new TransactWriteCommand({TransactItems:items}));
       console.log(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
         event:"recovery_fence_released",operationId:id,profile:op.profile,epoch:recovery.epoch}));
@@ -735,6 +740,11 @@ export class ErasureRecoveryService {
       &&recoveryMode(op,snapshot)==="pre_write"
       &&snapshot.previewFingerprint===op.previewFingerprint
       &&snapshot.providerSnapshotFingerprint===op.providerSnapshotFingerprint;
-    return {safe:unchanged,mappings:mapped};
+    const driftSafelyApproved=recovery.mode==="calendar_drift_cancel"
+      &&typeof recovery.approvedCalendarDriftCommitment==="string"
+      &&calendarOnlyPreWriteDriftCandidate(op,snapshot,
+        readOnlyRecoveryEvidenceChecks(op,snapshot),[],states,false)
+      &&calendarDriftCommitment(op,snapshot,recovery.epoch)===recovery.approvedCalendarDriftCommitment;
+    return {safe:unchanged||driftSafelyApproved,mappings:mapped};
   }
 }
