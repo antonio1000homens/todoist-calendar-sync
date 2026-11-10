@@ -272,7 +272,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
     if (!sameTask(await destination.todoist.getTask(task.id),observed.task))
       throw new Error("Todoist recurrence changed before capping source history");
 
-    await source.calendar.upsertEventIfUnchanged(historyOnlySource(prior,plan),master.id,master.etag);
+    await source.calendar.upsertEventIfUnchanged(historyOnlySource(prior,plan),plan.sourceMasterId,plan.sourceEtag);
     await state.recordMutation(sourceProfile);
     const [retained,retainedInstances,sourceExceptions,upcoming] = await Promise.all([
       source.calendar.getEvent(master.id),
