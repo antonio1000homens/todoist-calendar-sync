@@ -163,7 +163,7 @@ export function verifyHistoryMaster(master: CalendarEvent, original: CalendarEve
 /** An erasure for either profile may start at any time. Lease acquisition is
  * conditional on a current, unchanged epoch and no active erasure fence.
  * Hold both leases across the whole non-transactional provider cutover. */
-async export function acquireCrossProfileWriterLeases(
+export async function acquireCrossProfileWriterLeases(
   sourceProfile: Profile, destinationProfile: Profile,
 ): Promise<() => Promise<void>> {
   if (process.env.ERASURE_PROTOCOL_VERSION !== "1")
