@@ -532,6 +532,92 @@ export class ErasureRecoveryService {
     ]}));
   }
 
+
+  /** Distinct 5-minute token: only a proved untouched pre-write operation with
+   * exact Calendar-only revision drift can be considered. This does not queue work. */
+  async issueCalendarDriftCancellation(id:string,operator:string):Promise<{
+    preview:RecoveryPreview;confirmationId:string;expiresAt:number;mode:"calendar_drift_cancel";
+  }> {
+    if(!operator||operator.length>256)throw Object.assign(new Error("Operator identity required"),{status:400});
+    const inspected=await this.inspect(id);
+    if(!inspected.preview.calendarDriftReview?.candidateForSeparateApproval
+      ||!inspected.calendarDriftCommitment||!inspected.preview.epoch||inspected.preview.allowed)
+      throw Object.assign(new Error("Exact Calendar-only drift inspection is not eligible"),{status:409});
+    const now=Date.now(),expiresAt=now+5*60_000,confirmationId=this.newToken();
+    await this.db.send(new PutCommand({TableName:table(),Item:{
+      ...driftConfirmationKey(id),operationId:id,profile:inspected.operation.profile,
+      mode:"calendar_drift_cancel",status:"issued",operator,confirmationId,
+      currentEvidenceCommitment:inspected.calendarDriftCommitment,
+      originalPreviewFingerprint:inspected.operation.previewFingerprint,
+      epoch:inspected.preview.epoch,expiresAt:Math.ceil(expiresAt/1000),
+      expiresAtMs:expiresAt,createdAt:new Date(now).toISOString(),
+    },ConditionExpression:"attribute_not_exists(pk) OR expiresAt < :now",
+      ExpressionAttributeValues:{":now":Math.floor(now/1000)}}));
+    return {preview:inspected.preview,confirmationId,expiresAt,mode:"calendar_drift_cancel"};
+  }
+
+  /** Cancel an erasure that NEVER attempted provider deletion. The operator must
+   * type a distinct phrase; the worker subsequently rechecks every invariant. */
+  async applyCalendarDriftCancellation(id:string,confirmationId:string,operator:string,
+    typed:{operationId:string;profile:string;phrase:string}):Promise<void> {
+    if(!idPattern.test(id)||typeof confirmationId!=="string"
+      ||!confirmationId||confirmationId.length>256||!operator||operator.length>256
+      ||typed?.operationId!==id||typed.phrase!==CALENDAR_DRIFT_CANCEL_PHRASE)
+      throw Object.assign(new Error("Exact CANCEL ERASURE AND RESTORE SYNC confirmation required"),{status:400});
+    const issued=(await this.db.send(new GetCommand({TableName:table(),
+      Key:driftConfirmationKey(id),ConsistentRead:true}))).Item;
+    if(!issued||issued.status!=="issued"||issued.mode!=="calendar_drift_cancel"
+      ||issued.operator!==operator||issued.operationId!==id||issued.profile!==typed.profile
+      ||issued.confirmationId!==confirmationId
+      ||typeof issued.expiresAtMs!=="number"||issued.expiresAtMs<=Date.now())
+      throw Object.assign(new Error("Calendar drift token expired, mismatched or consumed"),{status:409});
+    const current=await this.inspect(id);
+    if(!current.preview.calendarDriftReview?.candidateForSeparateApproval
+      ||!current.calendarDriftCommitment||current.calendarDriftCommitment!==issued.currentEvidenceCommitment
+      ||current.operation.profile!==typed.profile
+      ||current.operation.previewFingerprint!==issued.originalPreviewFingerprint
+      ||current.preview.epoch!==issued.epoch)
+      throw Object.assign(new Error("Calendar/provider/fence evidence drifted; inspect again"),{status:409});
+    const now=Date.now(),time=new Date(now).toISOString();
+    const recovery:RecoveryState={status:"queued",mode:"calendar_drift_cancel",
+      fingerprint:current.fingerprint,lifecycleFingerprint:digest(current.operation.lifecycle),
+      approvedCalendarDriftCommitment:current.calendarDriftCommitment,
+      epoch:current.preview.epoch!,hasJournal:current.hasJournal,startedAt:time};
+    const tx:any[]=[
+      {Update:{TableName:table(),Key:operationKey(id),
+        UpdateExpression:"SET recovery=:recovery, updatedAt=:now",
+        ConditionExpression:"#status=:review AND attribute_not_exists(recovery) AND previewFingerprint=:fingerprint AND lifecycle.#phase=:phase AND updatedAt=:observedUpdatedAt",
+        ExpressionAttributeNames:{"#status":"status","#phase":"phase"},
+        ExpressionAttributeValues:{":review":"review_required",":recovery":recovery,
+          ":fingerprint":current.operation.previewFingerprint,":phase":current.operation.lifecycle!.phase,
+          ":observedUpdatedAt":current.operation.updatedAt,":now":time}}},
+      {Update:{TableName:table(),Key:driftConfirmationKey(id),
+        UpdateExpression:"SET #status=:consumed, consumedAt=:now",
+        ConditionExpression:"#status=:issued AND mode=:mode AND operator=:operator AND confirmationId=:token AND currentEvidenceCommitment=:digest AND expiresAtMs>:time",
+        ExpressionAttributeNames:{"#status":"status"},
+        ExpressionAttributeValues:{":issued":"issued",":consumed":"consumed",":mode":"calendar_drift_cancel",
+          ":operator":operator,":token":confirmationId,":digest":current.calendarDriftCommitment,
+          ":time":now,":now":time}}},
+      {ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"FENCE"),
+        ConditionExpression:"operationId=:id AND #state=:active",
+        ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
+      {ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"EPOCH"),
+        ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":current.preview.epoch}}},
+      current.hasJournal
+        ?{ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"JOURNAL"),
+          ConditionExpression:"operationId=:id",ExpressionAttributeValues:{":id":id}}}
+        :{ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"JOURNAL"),
+          ConditionExpression:"attribute_not_exists(pk)"}},
+    ];
+    try {await this.db.send(new TransactWriteCommand({TransactItems:tx}));}
+    catch(error) {
+      if(["TransactionCanceledException","ConditionalCheckFailedException"]
+        .includes((error as {name?:string})?.name||""))
+        throw Object.assign(new Error("Calendar drift cancellation lost operation/fence CAS; no recovery was queued"),{status:409});
+      throw error;
+    }
+  }
+
   async status(id:string):Promise<RecoveryState|undefined> {
     return (await this.erasures.get(id))?.recovery;
   }
