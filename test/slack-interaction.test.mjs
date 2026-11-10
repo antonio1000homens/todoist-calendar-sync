@@ -75,6 +75,24 @@ test("policy buttons preserve legacy IDs while profile, mode and catalog are val
   assert.equal(denied.manual?.command, "invalid_request");
 });
 
+test("every policy button emitted on current and already-posted decision cards decodes compatibly", () => {
+  const cases = [
+    ["gcp_sync_policy", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "profile", policyMode: "prompt" }, { scope: "profile", mode: "prompt" }],
+    ["gcp_sync_policy_profile_prompt", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "profile", policyMode: "prompt", policyAction: "todoist_wins" }, { scope: "profile", mode: "prompt", defaultAction: "todoist_wins" }],
+    ["gcp_sync_policy_series_prompt", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "series", policyMode: "prompt", policyAction: "todoist_wins", seriesId: "series-7" }, { scope: "series", mode: "prompt", defaultAction: "todoist_wins", seriesId: "series-7" }],
+    ["gcp_sync_policy_profile_auto", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "profile", policyMode: "auto", policyAction: "todoist_wins" }, { scope: "profile", mode: "auto", defaultAction: "todoist_wins" }],
+    ["gcp_sync_policy_series_auto", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "series", policyMode: "auto", policyAction: "todoist_wins", seriesId: "series-7" }, { scope: "series", mode: "auto", defaultAction: "todoist_wins", seriesId: "series-7" }],
+    ["gcp_sync_policy_always_ask", { profile: "home", decisionType: "both_sides_changed", policyOperation: "set", policyScope: "profile", policyMode: "prompt" }, { scope: "profile", mode: "prompt" }],
+  ];
+
+  for (const [actionId, value, expectedPolicy] of cases) {
+    const decoded = decodeSlackInteractionDelivery(envelope({ type: "block_action", commandText: undefined, actionId, value }));
+    assert.equal(decoded.manual?.command, "set_policy", actionId);
+    assert.equal(decoded.manual?.targetId, "both_sides_changed", actionId);
+    assert.deepEqual(decoded.manual?.policy, { decisionType: "both_sides_changed", ...expectedPolicy }, actionId);
+  }
+});
+
 test("decision and preexisting confirmation buttons produce one worker-owned manual action", () => {
   const decision = decodeSlackInteractionDelivery(envelope({
     type: "block_action", commandText: undefined, actionId: "gcp_sync_decision_confirm",
