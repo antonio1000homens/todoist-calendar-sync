@@ -555,8 +555,8 @@ function App() {
             </details>
           </>}
         </section>
-        {view?.status==="ready"&&latestRun?.generation&&(view.diagnostics.some((item:any)=>history||item.caseStatus!=="retired")||Boolean(view.cursor))&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
-          <h4>Sync findings · {runProfile}</h4>
+        {view?.status==="ready"&&latestRun?.generation&&(view.diagnostics.some((item:any)=>history||item.caseStatus!=="retired")||Boolean(view.cursor))&&<details className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
+          <summary>Sync findings · {runProfile} ({view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").length}{view.cursor?"+":""})</summary>
           <p>Generation {latestRun.generation} · {latestRunAt?`activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These per-run diagnostics are not open-alert counts and this report does not change provider data.</p>
           {view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").length===0?
              <p>More diagnostic results may be available on the next page.</p>:<ul>
@@ -573,7 +573,7 @@ function App() {
             </li>)}
           </ul>}
           {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
-        </section>}
+        </details>}
       </div>;
     })}
       </div>
