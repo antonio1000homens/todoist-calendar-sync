@@ -564,6 +564,15 @@ Resources:
             BatchSize: 1
             Enabled: true
             FunctionResponseTypes: [ReportBatchItemFailures]
+        # Recovery safety acceptance requires disposable Work-profile E2E before
+        # activating the independent watchdog in production. It must still run
+        # when ERASURE_EXECUTION_ENABLED=false after a failed deletion.
+        ErasureRecoveryWatchdog:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: false
+            Description: Bounded independent inspection of fenced pre-write erasure recovery
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
