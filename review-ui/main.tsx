@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { availableRepairActions, actionFormFields } from "./repair-action-capabilities.mjs";
 import { ErasureRecoveryPanel } from "./erasure-recovery-panel";
 import { OrphanDeletionPanel } from "./orphan-deletion-panel";
+import { orphanItemsForCase } from "./orphan-selection.mjs";
 import { RecurrenceRetirementInspector } from "./recurrence-retirement-inspector";
 import { RetirementHistory } from "./retirement-history";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
@@ -43,9 +44,9 @@ function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,upda
   </div>;
 }
 function App() {
-  const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("home"), [history,setHistory] = useState(false);
+  const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("all"), [history,setHistory] = useState(false);
   const [inboxStatus,setInboxStatus]=useState<"loading"|"ready"|"error">("loading");
-  const requestGate=useRef(createScopedRequestGate("home")).current;
+  const requestGate=useRef(createScopedRequestGate("all")).current;
   const navigationSequence=useRef(0);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
   const [action,setAction] = useState(""), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
@@ -54,7 +55,7 @@ function App() {
   const [searchSide,setSearchSide] = useState("todoist"), [searchText,setSearchText] = useState(""), [searchResults,setSearchResults] = useState<any[]>([]);
   const [preview,setPreview] = useState<RepairPreview>(), [operation,setOperation] = useState<RepairOperation>();
   const [submitKey,setSubmitKey] = useState("");
-  const [reconcileProfile,setReconcileProfile] = useState("home");
+  const [reconcileProfile,setReconcileProfile] = useState("");
   type RunView={status:"loading"|"ready"|"error"; data?:any; diagnostics:any[]; cursor?:string; error?:string};
   const [runViews,setRunViews]=useState<Record<string,RunView>>({});
   const [terminalInboxRefreshPending,setTerminalInboxRefreshPending] = useState(false);
@@ -72,7 +73,7 @@ function App() {
     setDetailRetry(value=>value+1);
   };
   const taskId=repairSelection.taskId, eventId=repairSelection.eventId;
-  const overviewProfiles=reconciliationScopes(profile);
+  const overviewProfiles=reconciliationScopes("all");
   const manualTarget=manualReconciliationTarget({filter:profile,selectedProfile:selected?.profile,chosenProfile:reconcileProfile});
   // A detail response from the previously selected case must never be displayed.
   const details=selected?.id===loadedDetails?.item?.id && selected?.profile===loadedDetails?.item?.profile ? loadedDetails : undefined;
@@ -116,10 +117,13 @@ function App() {
     navigationSequence.current++;
     invalidatePreview();
     if(item){
-      requestGate.switchScope(item.profile);
-      if(item.profile!==profile){setProfile(item.profile);setCases([]);setInboxStatus("loading");setRunViews({});}
+      // Selecting an alert from the combined inbox does not change its scope.
+      if(item.profile!==profile&&profile!=="all"){
+        requestGate.switchScope(item.profile);
+        setProfile(item.profile);setCases([]);setInboxStatus("loading");setRunViews({});
+      }
       setReconcileProfile(item.profile);
-    }
+    }else if(profile==="all")setReconcileProfile("");
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
@@ -262,7 +266,7 @@ function App() {
     requestGate.switchScope(profile);
     setRunViews({});
     const controller=new AbortController();
-    for(const target of reconciliationScopes(profile)) {
+    for(const target of overviewProfiles) {
       refreshReconciliation(target,{signal:controller.signal}).catch(e=>{
         if(!controller.signal.aborted&&!isAbortError(e))setMessage(`Could not load reconciliation for ${target}: ${e.message}`);
       });
@@ -509,24 +513,31 @@ function App() {
   const openCaseCount=cases.filter(item=>item.status==="open"||item.status==="repairing").length;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
-      <div className="header-actions"><label>Review alerts — profile <select aria-label="Review alerts — profile" value={profile} onChange={e=>changeReviewProfile(e.target.value)}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All profiles":p}</option>)}</select></label>
+      <div className="header-actions"><details className="review-filter"><summary>Filter alerts</summary><label>Review alerts — profile <select aria-label="Review alerts — profile" value={profile} onChange={e=>changeReviewProfile(e.target.value)}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All profiles":p}</option>)}</select></label></details>
         <a className="logout" href="https://alf1000.cloudflareaccess.com/cdn-cgi/access/logout">Sign out</a></div>
     </header>
     {message&&<p className="notice" role="status">{message}</p>}
-    {profile==="all"&&<p className="notice">All profiles shows separate reconciliation runs for home, antonio and work. The combined review-alert list is not a reconciliation run and does not trigger any provider actions.</p>}
+    <section className="sync-reports" aria-label="Sync reports for all profiles">
+      <h2>Sync reports</h2>
+      <div className="profile-report-grid">
     {overviewProfiles.map(runProfile=>{
       const view=runViews[runProfile];
       const reconciliation=view?.data;
       const latestRun=reconciliation?.reconciliation;
       const summary=reconciliation?.summary;
       const latestRunAt=latestRun?.lastCompletedAt||latestRun?.lastFailedAt||latestRun?.lastStartedAt||latestRun?.requestedAt;
-      return <React.Fragment key={runProfile}>
+      return <div className="profile-report-item" key={runProfile}>
         <section className="preview reconciliation-overview" aria-label={`Latest reconciliation for ${runProfile}`}>
-          <h2>Latest reconciliation · {runProfile}</h2>
+          <h3>{runProfile==="antonio"?"Antonio":runProfile==="home"?"Home":"Work"}</h3>
           {(!view||view.status==="loading")&&<p role="status">Loading reconciliation state for {runProfile}…</p>}
           {view?.status==="error"&&<p className="warning" role="status">Could not load reconciliation for {runProfile}: {view.error}. This is not evidence of a successful or failed run.</p>}
           {view?.status==="ready"&&!summary&&<p>No recorded reconciliation summary for {runProfile}.</p>}
           {view?.status==="ready"&&summary&&<>
+            <p className="run-headline"><strong>{(summary.runStatus||"unknown").replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</strong></p>
+            <p className="run-activity">Last activity: {latestRunAt?new Date(latestRunAt).toLocaleString():"Not recorded"}</p>
+            {typeof summary.actionableCaseCount==="number"&&summary.actionableCaseCount>0&&<p className="warning">{summary.actionableCaseCount} open review {summary.actionableCaseCount===1?"case":"cases"} for this profile</p>}
+            {view.error&&<p className="warning">Latest status refresh failed: {view.error}</p>}
+            <details className="run-technical"><summary>Technical run details</summary>
             <dl className="overview-grid">
               <dt>Run status</dt><dd>{(summary.runStatus||"unknown").replaceAll("_"," ")}{latestRun?.pending?" · in progress":""}</dd>
               <dt>Generation</dt><dd>{latestRun?.generation||"Not recorded"}</dd>
@@ -535,14 +546,15 @@ function App() {
               <dt>Items counted as blocked in this run</dt><dd>{typeof latestRun?.result?.blocked==="number"?latestRun.result.blocked:"Not recorded"}</dd>
               <dt>Actionable review cases for {runProfile}</dt><dd>{summary.actionableCaseCount??"Not recorded"}</dd>
             </dl>
-            <p>These are {runProfile}-only reconciliation results. The unresolved and blocked figures describe run diagnostics, not the number of open alerts in the review filter. Actionable cases are counted separately from run results and from the inbox list.</p>
+            <p>These run diagnostics are separate from the combined review-alert inbox.</p>
+            </details>
           </>}
         </section>
-        {view?.status==="ready"&&latestRun?.generation&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
-          <h3>Run diagnostics · {runProfile}</h3>
+        {view?.status==="ready"&&latestRun?.generation&&(view.diagnostics.some((item:any)=>history||item.caseStatus!=="retired")||Boolean(view.cursor))&&<section className="preview reconciliation-items" aria-label={`Run diagnostics for ${runProfile}`}>
+          <h4>Sync findings · {runProfile}</h4>
           <p>Generation {latestRun.generation} · {latestRunAt?`activity ${new Date(latestRunAt).toLocaleString()}`:"run timestamp not recorded"}. These per-run diagnostics are not open-alert counts and this report does not change provider data.</p>
           {view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").length===0?
-             <p>No unresolved or non-actionable per-item diagnostics remain in this generation. Retired associations are available in history.</p>:<ul>
+             <p>More diagnostic results may be available on the next page.</p>:<ul>
             {view.diagnostics.filter((item:any)=>history||item.caseStatus!=="retired").map((item:any,index:number)=><li key={`${item.action}:${item.taskId||""}:${item.eventId||""}:${index}`}>
               <strong>{item.caseStatus==="retired"?"Association retired by operator":item.outcome.replaceAll("_"," ")+" diagnostic"}</strong> · {item.reason.replaceAll("_"," ")}<br/>
               <span>{item.profile} · task {item.taskId||"unknown"} · event {item.eventId||"unknown"} · series {item.seriesId||"unknown"}</span><br/>
@@ -557,12 +569,19 @@ function App() {
           </ul>}
           {view.cursor&&<button className="secondary" onClick={()=>loadMoreReconciliationDiagnostics(runProfile)}>Load more diagnostics for {runProfile}</button>}
         </section>}
-        <RetirementHistory api={api} profile={runProfile}/>
-      </React.Fragment>;
+      </div>;
     })}
-    <ErasureRecoveryPanel api={api} />
-    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Open review alerts"}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span>{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
-      <section className="detail">{!selected?<><p>Select a conflict to inspect its live provider data.</p><div className="preview"><h3>Manual reconciliation · single profile</h3>
+      </div>
+    </section>
+    <details className="preview history-tools">
+      <summary>History and advanced tools</summary>
+      <h3>Retired associations (history)</h3>
+      <p>Receipts for previously retired Todoist–Calendar mappings. Provider items were preserved; these are not open conflicts.</p>
+      {overviewProfiles.map(runProfile=><RetirementHistory key={runProfile} api={api} profile={runProfile}/>)}
+      <ErasureRecoveryPanel api={api} />
+    </details>
+    <div className="layout"><nav aria-label="Open review alerts"><h2>{history?"Review alert history":"Review alerts"}{profile==="all"?" · all profiles":""}</h2><p>{inboxStatus==="loading"?`Loading review alerts for ${reviewScopeLabel(profile)}…`:inboxStatus==="error"?`Unable to load review alerts for ${reviewScopeLabel(profile)}.`:`${openCaseCount} open or repairing review alerts shown in ${reviewScopeLabel(profile)}${history?` · ${cases.length} total history entries shown`:""}.`}</p><label className="history-toggle"><input type="checkbox" checked={history} onChange={e=>{setCases([]);setInboxStatus("loading");setHistory(e.target.checked);selectCase(undefined);}} /> Show dismissed and resolved cases</label>{cases.map(item=><button className={`case ${selected?.id===item.id?"active":""}`} key={item.id} onClick={()=>selectCase(item)}><strong>{item.title}</strong><span className="case-profile">{item.profile} · {item.status}</span><small>{item.reason}</small></button>)}{inboxStatus==="ready"&&cases.length===0&&<p>{history?"No conflict history.":"No open review alerts."}</p>}</nav>
+      <section className="detail">{!selected?<><p>Select an alert to review its details and available actions.</p><details className="preview manual-sync"><summary>Run a manual sync check</summary><h3>Manual reconciliation · single profile</h3>
           {profile==="all"&&<label>Choose reconciliation target<select aria-label="Manual reconciliation target" value={reconcileProfile} onChange={e=>setReconcileProfile(e.target.value)}>
             <option value="">Select a profile — no reconciliation requested</option>
             {SYNC_PROFILES.map(p=><option key={p} value={p}>{p}</option>)}
@@ -570,7 +589,7 @@ function App() {
           <p>Target sync profile: <strong>{manualTarget||"Choose one profile above"}</strong>. This action runs only for the indicated profile; changing the review-alert filter never starts reconciliation.</p>
           <button onClick={runReconciliation} disabled={busy||!manualTarget}>Run reconciliation {manualTarget?`for ${manualTarget}`:"(select profile)"}</button>
           {manualTarget&&runViews[manualTarget]?.data&&<details><summary>Latest status for {manualTarget}</summary><pre>{JSON.stringify(runViews[manualTarget].data,null,2)}</pre></details>}
-        </div></>:<>
+        </details></>:<>
         <div className="title"><div><h2>{selected.title}</h2><p>{selected.profile} · {selected.reason.replaceAll("_"," ")} · opened {new Date(selected.createdAt).toLocaleString()}</p></div></div>
         <section className="preview alert-evidence">
           <details><summary>Recorded alert evidence</summary>
@@ -630,9 +649,12 @@ function App() {
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
         {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
-        {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&<OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
-          item={details.item} snapshots={details.snapshots||[]} loading={busy}
-          recheck={refreshAffected} api={api}/>}
+        {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&orphanItemsForCase({item:details.item,snapshots:details.snapshots||[]}).length>0&&
+          <details className="preview orphan-inspection"><summary>Inspect recorded orphan identities (read-only)</summary>
+            <OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
+              item={details.item} snapshots={details.snapshots||[]} loading={busy}
+              recheck={refreshAffected} api={api}/>
+          </details>}
         {details?.unmappedDeletion?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Recorded provider items deleted — guarded cleanup pending</h3>
           <p>The exact Todoist and Calendar identities on this unmapped conflict have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
@@ -677,7 +699,7 @@ function App() {
           <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Retry guarded cleanup via reconciliation</button>
           <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
         </section>}
-        {!details?.deletionCleanup?.bothGone&&!details?.unmappedDeletion?.bothGone&&<div className="preview">
+        {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&(hasProviderIds||hasLiveIdentity)&&<div className="preview">
           <h3>Repair this conflict</h3>
           <p>Repair changes provider or mapping state only after you verify the exact IDs and review a preview. Selecting a candidate by title alone never applies a repair.</p>
           <div className="formgrid">
@@ -715,10 +737,10 @@ function App() {
                 </label>
               </details>}
             </>}
-            <details><summary>Why aren't other actions shown?</summary>
+            {capabilities.actions.length>0&&capabilities.unavailable.length>0&&<details><summary>Why aren't other actions shown?</summary>
               <p>Only options with verified current provider evidence are selectable. Backend preview and apply checks still decide whether they are safe.</p>
               <ul>{capabilities.unavailable.map((item:any)=><li key={item.id}><strong>{item.label}:</strong> {item.reason}</li>)}</ul>
-            </details>
+            </details>}
             {Boolean(action&&taskId)&&(!recordedTaskId||Boolean(taskId&&taskId!==recordedTaskId))&&<label>Todoist task for repair<input value={taskId} readOnly placeholder="Find a verified Todoist task" aria-invalid={validationError?.field==="taskId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="taskId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {Boolean(action&&eventId&&action!=="move")&&(!recordedEventId||Boolean(eventId&&eventId!==recordedEventId))&&<label>Calendar event for repair<input value={eventId} readOnly placeholder="Find a verified Calendar event" aria-invalid={validationError?.field==="eventId"} /><small>Exact verified ID. Use Find existing item to choose another.</small>{validationError?.field==="eventId"&&<small className="field-error" role="alert">{validationError.message}</small>}</label>}
             {selectedPairIsStale&&<p className="warning">The selected IDs do not match the live mapping. Current pair: Todoist {liveMapping.taskId} ↔ Calendar {mappedEventIds.join(", ")}. Refresh affected items, then use the current mapped pair or search for the correct event.</p>}
@@ -752,6 +774,15 @@ function App() {
           {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
           {selected&&runViews[selected.profile]?.data&&<details><summary>Reconciliation status · {selected.profile}</summary><pre>{JSON.stringify(runViews[selected.profile].data,null,2)}</pre></details>}
         </div>}
+        {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&!hasProviderIds&&!hasLiveIdentity&&
+          <section className="preview operational-actions">
+            <h3>No provider item to repair</h3>
+            <p>This alert has no verified Todoist task or Calendar event. Review the recorded failure above; there is no item here to delete, link or repair.</p>
+            <p>Reconciliation checks the selected profile and may clear quarantined deliveries. It does not replay the failed delivery or apply an item-specific repair.</p>
+            <button className="secondary" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Request reconciliation for {selected.profile}</button>
+            {selected.status==="open"&&<button className="secondary dismiss-button" onClick={dismissAlert} disabled={busy}>Dismiss alert only</button>}
+            <p className="action-explanation">Dismissing hides this alert; it does not fix the underlying failure.</p>
+          </section>}
         {validPreview&&<section className="preview"><h3>Review planned changes</h3><p>This preview expires at {new Date(validPreview.expiresAt*1000).toLocaleString()}.</p>{formFields.scope&&<p>Selected recurrence scope: <strong>{scopeLabel(validPreview.intent.scope)}</strong></p>}<h4>Affected provider items and their outcomes</h4><ul className="preview-items">{validPreview.snapshots.map((item:any)=>{const plan=previewEffect(item,validPreview.intent,validPreview.itemPlan?.find((entry:any)=>choiceKey(entry)===choiceKey(item)));return <li key={choiceKey(item)}><IdentityDetails value={item} scope={formFields.scope?validPreview.intent.scope:undefined} />{item.includedBy?.length>0&&<p className="relationship-reasons">Included because: {item.includedBy.join("; ")}</p>}<div><strong>Operation:</strong> {plan.operation}</div><div><strong>Resulting disposition / mapping:</strong> {plan.result}</div>{item.mapping&&<div>Existing mapping: Todoist {item.mapping.taskId} ↔ Calendar {item.mapping.eventId}{item.mapping.masterEventId&&` · master ${item.mapping.masterEventId}`}</div>}{item.control?.excluded&&<div>Currently excluded</div>}{item.checkedAt&&<small>Checked {new Date(item.checkedAt).toLocaleString()}</small>}</li>;})}</ul><h4>Planned changes</h4><ul>{validPreview.changes.map((change,i)=><li key={i}>{change}</li>)}</ul>{validPreview.splitPlan&&<dl><dt>Historical Calendar rule</dt><dd>{validPreview.splitPlan.originalRule}</dd><dt>Rule after repair</dt><dd>{validPreview.splitPlan.truncatedRule}</dd><dt>Future recurrence starts</dt><dd>{validPreview.splitPlan.newStart}</dd><dt>Future RRULE</dt><dd>{validPreview.splitPlan.newRule}</dd><dt>Calendar timezone</dt><dd>{validPreview.splitPlan.calendarTimeZone}</dd>{validPreview.splitPlan.expiredUntil&&<><dt>Existing series expired</dt><dd>{validPreview.splitPlan.expiredUntil}; historical rule will not be extended</dd></>}</dl>}<h4>Warnings</h4><ul>{validPreview.warnings.map((warning,i)=><li className="warning" key={i}>{warning}</li>)}</ul><button onClick={applyPreview} disabled={busy||!canPreview}>{busy?"Submitting…":"Apply repair"}</button><button className="secondary" onClick={()=>setPreview(undefined)}>Cancel</button></section>}
         {operation&&<section className="preview"><h3>Repair status: {operation.status.replaceAll("_"," ")}</h3><p>Operation {operation.id} · attempt {operation.attempt}</p>{operation.error&&<p className="warning">{operation.error}</p>}{operation.nextAction&&<p>{operation.nextAction}</p>}{operation.notificationText&&<p>{operation.notificationText}</p>}{operation.status==="queued"&&<p>This repair is serialized with other work for {selected?.profile||"this profile"}. Retrying creates a fresh queue delivery; completed repair steps remain checkpointed.</p>}{operation.steps&&<ul>{Object.entries(operation.steps).map(([name,step])=><li key={name}>{name}: {step.status}</li>)}</ul>}{operation.outcomes&&<ul>{operation.outcomes.map(item=><li key={item.entity}>{item.entity}: {item.outcome}</li>)}</ul>}{operationResumeEligibility(operation)==="fresh-preview"?<><p>This failed operation has no recorded provider write. Refresh affected items and create a new preview; the old operation will remain available for audit.</p><button className="secondary" onClick={refreshAffected} disabled={busy}>Refresh and create new preview</button></>:operationResumeEligibility(operation)==="resume"&&<button onClick={resume} disabled={busy}>{operation.status==="queued"?"Retry queue delivery":"Resume operation"}</button>}</section>}
       </>}</section>
