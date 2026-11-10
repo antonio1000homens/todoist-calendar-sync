@@ -124,6 +124,11 @@ function fixture(options={}){
     sourceMapping:mapping,sourceLink:link,source:{calendar:srcCalendar,todoist:srcTodoist},
     destination:{calendar:dstCalendar,todoist:dstTodoist},
     state,now:new Date("2027-02-15T12:00:00Z"),
+    async acquireWriterLeases(){
+      calls.push("erasure-lease");
+      if(options.leaseDenied)throw new Error("Active Work erasure fence");
+      return async()=>{calls.push("release-erasure-lease");};
+    },
     calls,audits,read:()=>({sourceVersion,destinationVersion,sourceComments,destinationComments})};
 }
 async function withGate(enabled,fn){
@@ -154,10 +159,12 @@ test("full staged provider cutover preserves history and atomically moves owners
     "source-master");
   assert.deepEqual(f.read().sourceComments,[]);
   assert.equal(f.read().destinationComments.length,1);
+  assert.ok(f.calls.indexOf("erasure-lease")<f.calls.indexOf("stage"));
   assert.ok(f.calls.indexOf("stage")<f.calls.indexOf("create-destination"));
   assert.ok(f.calls.indexOf("create-destination")<f.calls.indexOf("cap-source"));
   assert.ok(f.calls.indexOf("cap-source")<f.calls.indexOf("commit"));
   assert.ok(f.calls.indexOf("delete-source-comment")<f.calls.indexOf("commit"));
+  assert.ok(f.calls.indexOf("commit")<f.calls.indexOf("release-erasure-lease"));
   assert.equal(f.audits.at(-1).action,"todoist_phase_b_native_future_only_move_succeeded");
 }));
 test("out-of-order Calendar instance inventory still selects the exact active occurrence",()=>withGate(true,async()=>{
@@ -170,6 +177,12 @@ test("out-of-order Calendar instance inventory still selects the exact active oc
 test("default-off Phase B cannot claim a stage or touch providers",()=>withGate(false,async()=>{
   const f=fixture();
   await assert.rejects(()=>executePhaseBNativeMove(f),/disabled/);
+  assert.equal(f.state.stage,false);
+  assert.equal(f.calls.includes("create-destination"),false);
+}));
+test("active erasure fence blocks the native cutover before staging or provider writes",()=>withGate(true,async()=>{
+  const f=fixture({leaseDenied:true});
+  await assert.rejects(()=>executePhaseBNativeMove(f),/Active Work erasure fence/);
   assert.equal(f.state.stage,false);
   assert.equal(f.calls.includes("create-destination"),false);
 }));
