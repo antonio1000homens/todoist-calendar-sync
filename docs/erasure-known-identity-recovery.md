@@ -44,25 +44,49 @@ disposable Work-profile fault-injection acceptance are not complete. The gate
 therefore remains disabled and no fence-release or recovery action is
 authorized by this rollout.
 
-### Calendar-only drift triage (read-only; not yet a cancellation authorization)
+### Calendar-only pre-write drift cancellation (operator-only)
 
-A pre-write operation can be blocked because the Google Calendar full-provider body
-(including revision metadata) changed after the original deletion confirmation.
-The recovery inspector now reports `calendarDriftReview.candidateForSeparateApproval`
-only when the original confirmation is intact, **no deletion receipt or progress**
-exists, the exact operation-owned fence/epoch and mapping inventory are valid,
-no writer lease is active, the complete strongly consistent cross-profile audit
-succeeds, the original Todoist item and all comments/aliases/attributable state
-match, and both exact original/current Calendar event identities remain present
-in the same configured Calendar. Any unrelated drift, ambiguous provider identity,
-missing ETag, incomplete audit, enabled source mapping or provider blocker rules
-out the candidate.
+This mode is **not** ordinary `RESTORE SYNC` and cannot be invoked by the
+unattended pre-write watchdog. It exists for a provider revision that changed
+the exact Google Calendar event **after** the original deletion confirmation,
+when the original Todoist task, mappings, comments, known aliases and all
+attributable DynamoDB rows are still intact. Do not use it if a provider delete
+was attempted, the original identity or revision cannot be verified, an
+unowned fence/lease exists, or the cross-profile scan is incomplete.
 
-**No mutation or permission change:** This is explanatory read-only evidence.
-It cannot issue a `RESTORE SYNC` token, invoke the recovery worker, restore
-mappings, resume a pending deletion, change a tombstone or release a fence.
-A future separately reviewed, explicitly operator-confirmed **cancel erasure
-with provider drift** operation must bind a fresh Calendar/provider read to a
-single-use confirmation and recheck the provider revision before every writer
-transition. A changed Calendar digest alone is **not** proof a safe cancellation
-can be performed. Keep the operation fenced if any doubt remains.
+1. Load the existing operation and run **Inspect guarded recovery**. Review
+   the content-free evidence checks and independently inspect the current
+   exact Google Calendar event in its actual configured Calendar. An altered
+   event is **not** a reason to resume deletion.
+2. Only when `calendarDriftReview.candidateForSeparateApproval=true`,
+   request **Calendar drift cancellation confirmation**. The backend makes a
+   fresh provider/state/fence inspection and issues a **distinct five-minute,
+   one-use** token bound to the original operation, profile, epoch and current
+   task/Calendar revision, aliases, comments and state inventory.
+3. After review, type **CANCEL ERASURE AND RESTORE SYNC**, the exact operation
+   ID and profile. The handler re-inspects and transactionally consumes that
+   token while recording a special `calendar_drift_cancel` recovery state
+   under the existing operation-owned fence and unchanged profile epoch.
+   It queues **recovery only**, not the old erasure/deletion.
+4. The recovery worker independently re-reads the provider and strongly
+   consistent cross-profile/state inventory **at every step**. If the approved
+   provider revision or any invariant changes, it marks the recovery blocked
+   and **retains the fence**. Only the originally enabled SQS mapping is
+   restored. The disabled-by-design mappings remain disabled.
+5. Once the original worker mapping is fully restored, a final owned-fence,
+   epoch and no-lease CAS marks recovery completed and removes that operation's
+   fence and confirmation token. Verify the original SQS source mapping,
+   queue drain, and fresh synchronization in all three profiles before
+   declaring operational recovery.
+
+The mode never deletes or changes Todoist/Google Calendar provider records,
+does not create a tombstone or remove an original DynamoDB mapping, and does
+not implicitly re-enable `ERASURE_EXECUTION_ENABLED`. It is a **cancel** of
+an unstarted deletion, not a way to finish a partially completed erasure.
+The separate E2E destructive-erasure acceptance for #349 must still be run
+using disposable provider objects after operational sync is recovered.
+
+Before first production use, require independent code/security review,
+staged test of stale-queue, altered Calendar revision, lost provider reads,
+mapping/epoch races, failed SQS dispatch and rollback. Never remove the fence
+or manually enable an SQS mapping as a shortcut.
