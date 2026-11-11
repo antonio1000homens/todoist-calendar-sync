@@ -58,41 +58,15 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   assert.equal(inspect.statusCode,200);assert.equal(JSON.parse(inspect.body).preview.allowed,true);
   const postWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",headers));
   assert.equal(postWrite.statusCode,200);
-  assert.deepEqual(JSON.parse(postWrite.body).assessment.onlyAvailableAction,"keep_fenced");
+  assert.deepEqual(JSON.parse(postWrite.body).assessment.onlyAvailableAction,"automatic_completion_pending");
+  assert.equal(JSON.parse(postWrite.body).assessment.completionEligible,true);
   assert.deepEqual(calls.find(x=>x[0]==="postwrite"),["postwrite","op-1"]);
-  for(const action of ["confirm","apply","dispatch"]){
+  for(const action of ["confirm","apply","dispatch","review-token","acknowledge"]){
     const refused=await run(request("/review/api/erasure-postwrite-recoveries/op-1/"+action,"POST",headers,{}));
-    assert.equal(refused.statusCode,404,"Post-write must never expose a mutating route");
+    assert.equal(refused.statusCode,404,"Post-write exposes no per-operation approval or mutating route");
   }
   const refusedRoot=await run(request("/review/api/erasure-postwrite-recoveries/op-1","POST",headers,{}));
   assert.equal(refusedRoot.statusCode,404);
-  const badIssue=await run(request("/review/api/erasure-postwrite-recoveries/op-1/review-token","POST",headers,
-    {oldDeletionConfirmation:"old"}));
-  assert.equal(badIssue.statusCode,400);
-  const reviewIssued=await run(request("/review/api/erasure-postwrite-recoveries/op-1/review-token","POST",headers,{}));
-  assert.equal(reviewIssued.statusCode,200);
-  assert.equal(JSON.parse(reviewIssued.body).releaseAllowed,false);
-  assert.deepEqual(calls.find(x=>x[0]==="postwrite-token"),["postwrite-token","op-1","operator-recovery"]);
-  for(const payload of [
-    {operationId:"op-1",profile:"work",phrase:"RESTORE SYNC",confirmationId:"token-123"},
-    {operationId:"op-1",profile:"home",phrase:"REVIEW AND KEEP FENCED",confirmationId:"token-123",extra:"invalid"},
-    {operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED",confirmationId:"token-123",resumeDeletion:true},
-  ]){
-    const bad=await run(request("/review/api/erasure-postwrite-recoveries/op-1/acknowledge","POST",headers,payload));
-    assert.equal(bad.statusCode,400);
-  }
-  assert.equal(calls.filter(x=>x[0]==="postwrite-ack").length,0);
-  const acknowledged=await run(request("/review/api/erasure-postwrite-recoveries/op-1/acknowledge",
-    "POST",headers,{operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED",confirmationId:"token-123"}));
-  assert.equal(acknowledged.statusCode,200);
-  assert.deepEqual(JSON.parse(acknowledged.body).review,{status:"reviewed_fenced",releaseAllowed:false});
-  assert.equal(messages.length,0,"post-write acknowledgement MUST NOT dispatch recovery");
-  assert.deepEqual(calls.find(x=>x[0]==="postwrite-ack"),[
-    "postwrite-ack","op-1","token-123","operator-recovery",
-    {operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED"}]);
-  const unauthenticatedAcknowledge=await run(request("/review/api/erasure-postwrite-recoveries/op-1/acknowledge",
-    "POST",{}, {operationId:"op-1",profile:"work",phrase:"REVIEW AND KEEP FENCED",confirmationId:"token-123"}));
-  assert.equal(unauthenticatedAcknowledge.statusCode,403,"POST without trusted origin must fail CSRF validation");
   const unauthorizedPostWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",{}));
   assert.equal(unauthorizedPostWrite.statusCode,401);
   const issued=await run(request("/review/api/erasure-recoveries/op-1/confirm","POST",headers,{}));
