@@ -134,7 +134,7 @@ test("the scoped candidate does not claim global Calendar erasure",()=>{
   preview.crossProfileEvidence={profiles:{home:{taskReadsFound:1}},
     missingProof:["Unrecorded Calendar copies remain outside scope"]};
   const result=assessPostWriteRecovery(operation,preview);
-  assert.equal(result.classification,"fully_deleted_candidate");
+  assert.equal(result.classification,"fully_deleted_candidate",JSON.stringify({blockers:result.blockers,completionBlockers:result.completionBlockers,evidence:result.evidence}));
   assert.equal(result.completionEligible,true);
   assert.ok(!result.blockers.some(item=>item.includes("Unrecorded Calendar copies")));
 });
