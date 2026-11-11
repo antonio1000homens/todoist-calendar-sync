@@ -13,7 +13,7 @@ export interface UnmappedDeletionAssessment {
 }
 
 /**
- * Presentation-only, current-read assessment for an *unmapped conflict*.
+ * Presentation-only, current-read assessment for a deleted-pair review alert.
  * This NEVER grants cleanup eligibility: complete mapping/index/repair/series
  * ownership is still independently checked inside guarded reconciliation.
  * It uses only IDs recorded by the alert, not a repair-selected replacement.
@@ -21,7 +21,8 @@ export interface UnmappedDeletionAssessment {
 export function assessUnmappedConflictDeletion(
   item:ReviewCase,snapshots:ReviewSnapshot[],
 ):UnmappedDeletionAssessment | undefined {
-  const applicable=item.decision?.type==="todoist_unmapped_conflict"
+  const standaloneDeletedPair=item.decision?.type==="standalone_todoist_task_deleted";
+  const applicable=standaloneDeletedPair||item.decision?.type==="todoist_unmapped_conflict"
     || ["todoist_unmapped_conflict","calendar_snapshot_recurring_identity_conflict"].includes(item.reason);
   if(!applicable)return undefined;
   const {taskIds,eventIds}=reviewCaseEvidenceIds(item);
@@ -54,7 +55,9 @@ export function assessUnmappedConflictDeletion(
       reason:"A required direct provider read failed, changed identity, or returned incomplete status"};
   if(all.every(ref=>ref.state==="deleted"))
     return {...base,taskStates,eventStates,state:"providers_deleted",bothGone:true,
-      reason:"Recorded provider identities are deleted. Mapping, recurrence, audit and repair state still require guarded reconciliation"};
+      reason:standaloneDeletedPair
+        ?"Recorded one-off provider identities are deleted. Mapping, audit and repair state still require guarded reconciliation"
+        :"Recorded provider identities are deleted. Mapping, recurrence, audit and repair state still require guarded reconciliation"};
   return {...base,taskStates,eventStates,state:"partial",bothGone:false,
     reason:"At least one recorded provider item or Calendar series remains live; do not remove or recreate it based on stale evidence"};
 }

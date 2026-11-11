@@ -653,7 +653,14 @@ function App() {
         {["resolved","excluded"].includes(selected.status)&&<p className="notice">To change a previous decision, select the exact current provider IDs and create a fresh preview. Exclude the Todoist task to keep it Todoist-only; Leave unchanged permits normal syncing.</p>}
         {selected.status==="dismissed"&&<p className="notice">This alert was dismissed separately from a verified repair. It remains in history until the live relationship is verified or the affected items are explicitly excluded.</p>}
         <p className="change-summary">{alertChanges.length?<>Changed since the alert:<ul>{alertChanges.map((change,i)=><li key={i}>{change}</li>)}</ul></>:originalMapping?mappingChanges.length?`Association changed since the alert: ${mappingChanges.join(", ")}.`:"Association matches the alert snapshot.":"The original alert did not capture comparable provider fields; compare the live provider details above."}</p>
-        {selected.result&&<p className="notice">Latest case outcome: {selected.result}</p>}
+        {selected.result?.startsWith("deletion_cleanup_deferred:")&&<p className="warning" role="status">
+          Guarded deletion retirement is still open. The last attempt reported <code>{selected.result.slice("deletion_cleanup_deferred:".length).trim().replace(/; automatic_retry=.*/,"").replaceAll("_"," ")}</code>.
+          {" "}No automatic retry is scheduled. {selected.result.includes("next_action=retry_after_fresh_recheck")
+            ?"Recheck this alert's provider items, then retry guarded reconciliation with fresh reads."
+            :"Inspect the exact blocking state before retrying."}
+        </p>}
+        {selected.result&&!selected.result.startsWith("deletion_cleanup_deferred:")&&<p className="notice">Latest case outcome: {selected.result}</p>}
+        {selected.status==="resolved"&&selected.reason==="verified_deletion"&&<p className="notice" role="status">Resolved — verified deletion / stale state retired.</p>}
         {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&orphanItemsForCase({item:details.item,snapshots:details.snapshots||[]}).length>0&&
           <details className="preview orphan-inspection"><summary>Inspect recorded orphan identities (read-only)</summary>
             <OrphanDeletionPanel key={`${selected.profile}:${selected.id}`}
@@ -662,7 +669,7 @@ function App() {
           </details>}
         {details?.unmappedDeletion?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Recorded provider items deleted — guarded cleanup pending</h3>
-          <p>The exact Todoist and Calendar identities on this unmapped conflict have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
+          <p>The exact Todoist and Calendar identities on this alert have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
           <p>Todoist IDs: <code>{details.unmappedDeletion.taskIds.join(", ")}</code></p>
           <p>Calendar event/master IDs: <code>{details.unmappedDeletion.eventIds.join(", ")}</code></p>
           <ol>
@@ -671,9 +678,9 @@ function App() {
             <li>Attributable audit, review and manual decisions — retire only after independent state checks</li>
             <li>Terminal conflict receipt — pending successful atomic cleanup</li>
           </ol>
-          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck provider deletion (read-only)</button>
-          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Run guarded cleanup for {selected.profile}</button>
-          <p>No provider object is created or deleted by viewing or rechecking this alert. If the current reconciliation profile does not match this case, select the case's profile before starting cleanup.</p>
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck this alert&apos;s provider items (read-only)</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Retry guarded cleanup for this alert via {selected.profile} reconciliation</button>
+          <p>The worker rechecks this exact case using fresh provider reads and conditional state checks. No provider object is created or deleted by viewing or rechecking this alert; if another item or owner is live, the alert stays actionable.</p>
         </section>}
         {details?.unmappedDeletion?.state==="partial"&&<p className="notice" role="status">
           <strong>One-sided deletion — no automatic purge.</strong> {details.unmappedDeletion.reason}

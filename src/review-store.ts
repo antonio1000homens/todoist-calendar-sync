@@ -132,6 +132,8 @@ export async function assertRepairPreviewReplayAdmission(preview: RepairPreview,
   await admitReviewIdentities([...refs.values(), ...intent], clientFactory);
 }
 export class ReviewStore {
+  /** Safe, case-scoped reason from the most recent verified-deletion attempt. */
+  lastVerifiedDeletionBlocker?: string;
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
     return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
@@ -487,18 +489,20 @@ export class ReviewStore {
       legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
     },
   ): Promise<boolean> {
+    this.lastVerifiedDeletionBlocker = undefined;
+    const blocked = (reason: string): false => { this.lastVerifiedDeletionBlocker = reason; return false; };
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
-      || current.operationId || current.result?.startsWith("resolved_deleted")) return false;
+      || current.operationId || current.result?.startsWith("resolved_deleted")) return blocked("case_status_revision_or_operation_changed");
     await admitNestedReviewIdentities(current,current.profile);
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
-      || eventIds.some(id => !expected.eventIds.includes(id))) return false;
+      || eventIds.some(id => !expected.eventIds.includes(id))) return blocked("case_provider_identity_changed_or_incomplete");
 
     const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
     if (manual && (!["pending", "resolved"].includes(manual.status) || manual.profile !== expected.profile
-      || manual.decisionId !== caseId)) return false;
+      || manual.decisionId !== caseId)) return blocked("manual_decision_status_or_identity_changed");
     const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
     const detail = source?.detail && typeof source.detail === "object"
@@ -513,6 +517,8 @@ export class ReviewStore {
     const pointer = pointerKey ? (await this.db.send(new GetCommand({
       TableName: reviewTable(), Key: pointerKey, ConsistentRead: true,
     }))).Item as { incidentId?: string } | undefined : undefined;
+    if (pointerKey && pointer && pointer.incidentId !== caseId)
+      return blocked("conflict_pointer_claimed_by_another_case");
     // This method is the final transaction authority, not the classifier.
     // A caller MUST provide the complete exact recurring identity and its
     // Calendar iCalUID recurrence key before closure of a recurring decision.
@@ -534,7 +540,7 @@ export class ReviewStore {
           ===expected.masterSeriesId);
     const seriesKeys = [...new Set(expected.seriesKeys || [...expected.taskIds, ...expected.eventIds])];
     if (!seriesKeys.length || seriesKeys.length > 20
-      || [...expected.taskIds, ...expected.eventIds].some(id => !seriesKeys.includes(id))) return false;
+      || [...expected.taskIds, ...expected.eventIds].some(id => !seriesKeys.includes(id))) return blocked("exact_identity_inventory_incomplete_or_over_limit");
     if (recurring && (!expected.masterId || !expected.activeInstanceId || !expected.masterSeriesId
       || (recordedMaster ? recordedMaster !== expected.masterId : !verifiedLegacyMaster)
       || recordedActive !== expected.activeInstanceId
@@ -546,7 +552,7 @@ export class ReviewStore {
       || !seriesKeys.includes(expected.activeInstanceId)
       || current.decision?.seriesId && !seriesKeys.includes(current.decision.seriesId)
       || current.decision?.mappingSnapshot?.seriesId && !seriesKeys.includes(current.decision.mappingSnapshot.seriesId)))
-      return false;
+      return blocked("recurrence_ownership_proof_incomplete_or_changed");
     const staleLinks = expected.staleLinks || [];
     const seenLinks = new Set<string>();
     for (const link of staleLinks) {
@@ -563,7 +569,7 @@ export class ReviewStore {
           && !(verifiedLegacyMaster && !link.masterEventId
             && link.eventId===expected.activeInstanceId)
           || link.activeInstanceId !== expected.activeInstanceId)
-        || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return false;
+        || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return blocked("recurrence_link_ownership_or_revision_changed");
       seenLinks.add(identity);
     }
     const now = new Date().toISOString();
@@ -660,7 +666,7 @@ export class ReviewStore {
         KeyConditionExpression:"pk = :pk AND begins_with(sk, :prefix)",
         ExpressionAttributeValues:{":pk":conflictPk,":prefix":"INCIDENT#"},
       }));
-      if(page.LastEvaluatedKey)return false; // never perform a partial cleanup
+      if(page.LastEvaluatedKey)return blocked("audit_pointer_inventory_exceeds_safe_bound"); // never perform a partial cleanup
       const visited=new Set<string>();
       const auditDeletes=new Set(items.filter(op=>op.Delete).map(op=>op.Delete?.Key?.pk));
       for(const entry of page.Items || []){
@@ -669,7 +675,7 @@ export class ReviewStore {
         if(!id||!id.startsWith("incident-")||visited.has(id)
           ||pointer.pk!==conflictPk||pointer.sk!==`INCIDENT#${id}`
           ||pointer.profile!==expected.profile||pointer.conflictKey!==current.conflictKey)
-          return false; // an inconsistent pointer must not be orphaned
+          return blocked("coalesced_case_pointer_inconsistent"); // an inconsistent pointer must not be orphaned
         visited.add(id);
         if(id===caseId)continue; // the original case pointer is handled above
         const child=await this.getCase(id);
@@ -733,7 +739,7 @@ export class ReviewStore {
       if (!currentIdentity) continue;
       if (currentIdentity.profile !== expected.profile || currentIdentity.side !== ref.side
         || currentIdentity.providerId !== ref.id
-        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return false;
+        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return blocked("canonical_identity_record_inconsistent");
       items.push({ Delete: { TableName: reviewTable(), Key: key(pk),
         ConditionExpression: "#profile = :profile AND #side = :side AND providerId = :id AND updatedAt = :updated AND #identity = :identity",
         ExpressionAttributeNames: { "#profile": "profile", "#side": "side", "#identity": "identity" },
@@ -747,7 +753,7 @@ export class ReviewStore {
         TableName: reviewTable(), Key: baselineKey, ConsistentRead: true,
       }))).Item;
       if (!currentBaseline) continue;
-      if (typeof currentBaseline.updatedAt !== "string" || !currentBaseline.baseline) return false;
+      if (typeof currentBaseline.updatedAt !== "string" || !currentBaseline.baseline) return blocked("reconciliation_baseline_inconsistent");
       items.push({ Delete: { TableName: reviewTable(), Key: baselineKey,
         ConditionExpression: "updatedAt = :updated AND baseline = :baseline",
         ExpressionAttributeValues: { ":updated": currentBaseline.updatedAt, ":baseline": currentBaseline.baseline },
@@ -770,7 +776,7 @@ export class ReviewStore {
         KeyConditionExpression: "pk = :pk AND begins_with(sk, :prefix)",
         ExpressionAttributeValues: { ":pk": pk, ":prefix": "AUDIT#" },
         ConsistentRead: true, Limit: 50 }));
-      if (page.LastEvaluatedKey) return false; // no partially attributed cleanup
+      if (page.LastEvaluatedKey) return blocked("audit_pointer_inventory_exceeds_safe_bound"); // no partially attributed cleanup
       for (const row of page.Items || []) {
         if (typeof row.auditKey !== "string" || !row.auditKey.startsWith(`AUDIT#${expected.profile}#`)
           || typeof row.sk !== "string") continue;
@@ -853,17 +859,31 @@ export class ReviewStore {
         ExpressionAttributeValues: { ":no": false },
       } });
     }
-    if (items.length > 95) return false; // leave open for safe bounded retry
+    if (items.length > 95) return blocked("transaction_item_limit_exceeded"); // leave open for safe bounded retry
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
       return true;
     } catch (error) {
-      if (conditional(error) || (error as { name?: string }).name === "TransactionCanceledException") return false;
+      if (conditional(error) || (error as { name?: string }).name === "TransactionCanceledException") {
+        const cancellationReasons=(error as { CancellationReasons?: Array<{Code?:string}> }).CancellationReasons;
+        const failedIndex=cancellationReasons?.findIndex(reason=>reason.Code&&reason.Code!=="None")??-1;
+        const failedItem=failedIndex>=0?items[failedIndex]:undefined;
+        const failedKey=failedItem?.ConditionCheck?.Key||failedItem?.Delete?.Key||failedItem?.Update?.Key;
+        const pk=typeof failedKey?.pk==="string"?failedKey.pk:"";
+        const category=pk.startsWith("REVIEW_CASE#")?"case_revision_or_status_changed"
+          :pk.startsWith("MANUAL#")?"manual_decision_revision_or_status_changed"
+          :pk.startsWith("RECURRENCE#")?"recurrence_link_revision_or_owner_changed"
+          :pk.startsWith("AUDIT")?"audit_or_pointer_revision_changed"
+          :pk.startsWith("SYNC_CONTROL#")?"repair_or_exclusion_guard_changed"
+          :pk.startsWith("TASK")||pk.startsWith("EVENT")?"live_mapping_or_owner_appeared"
+          :"conditional_state_changed";
+        return blocked(`${category}_retry_required`);
+      }
       throw error;
     }
   }
 
-  async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string): Promise<void> {
+  async noteVerifiedDeletionCleanupDeferred(caseId: string, expectedUpdatedAt: string, blocker = "provider_or_state_precondition_unavailable"): Promise<void> {
     const current = await this.getCase(caseId);
     if (!current) return;
     await admitNestedReviewIdentities(current,current.profile);
@@ -874,7 +894,7 @@ export class ReviewStore {
         ConditionExpression: "#status = :open AND updatedAt = :version AND attribute_not_exists(operationId)",
         ExpressionAttributeNames: { "#status": "status", "#result": "result" },
         ExpressionAttributeValues: { ":open": "open", ":version": expectedUpdatedAt,
-          ":message": "deletion_cleanup_deferred: current provider, mapping or audit state changed; retry is required",
+          ":message": `deletion_cleanup_deferred: ${blocker}; automatic_retry=not_scheduled; next_action=${blocker.endsWith("_retry_required")?"retry_after_fresh_recheck":"inspect_exact_blocking_state"}`,
           ":now": new Date().toISOString() },
       }));
     } catch (error) {

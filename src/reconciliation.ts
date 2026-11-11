@@ -745,10 +745,11 @@ export class SnapshotReconciler {
             retiredRecurrenceLinks: classification.stale.map(link => link.seriesId),
           });
         } else {
-          await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt);
+          await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt,
+            review.lastVerifiedDeletionBlocker || "case_or_provider_snapshot_changed_before_cleanup");
           await this.state.audit(profile, "verified_deletion_cleanup_deferred", {
             taskId: taskIds[0], eventId: eventIds[0],
-            reason: "case_state_mapping_repair_or_recurrence_changed_during_verified_deletion",
+            reason: review.lastVerifiedDeletionBlocker || "case_or_provider_snapshot_changed_before_cleanup",
           });
         }
       }
