@@ -8,6 +8,7 @@ const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
 process.env.ERASURE_PROTOCOL_VERSION="1";
+process.env.ERASURE_EXECUTION_ENABLED="true";
 
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
