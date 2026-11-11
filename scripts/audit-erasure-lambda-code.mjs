@@ -25,6 +25,9 @@ const MARKERS={
   projectTombstone:"todoist-calendar-sync:deleted:v1",
   projectTombstoneReader:"activeProjectDeletionTombstone",
   projectTombstoneSuppression:"erasure_project_comment_replay_suppressed",
+  retainedCalendarUnlink:"unlinkTodoistTask",
+  retainedCalendarEtagWrite:"updateSharedEventPropertiesIfUnchanged",
+  retainedCalendarPostimage:"unlinkDigest",
   replayGate:"ERASURE_REPLAY_BARRIER_VERSION",
   fencedReview:"reviewed_fenced",
 };
