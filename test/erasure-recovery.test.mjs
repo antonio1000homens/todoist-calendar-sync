@@ -775,6 +775,18 @@ test("strong exact postflight is a read-only candidate only with complete deleti
   assert.equal(f.external.writes.length,0);
 });
 
+test("read-only inspection identifies exact state cleanup as automatic pending work",async()=>{
+  const f=postWriteStateCleanupFixture();
+  const assessment=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"partial_or_ambiguous");
+  assert.equal(assessment.completionEligible,false);
+  assert.equal(assessment.stateCleanupPending,true);
+  assert.equal(assessment.onlyAvailableAction,"automatic_state_cleanup_pending");
+  assert.match(assessment.completionBlockers[0],/watchdog will remove or scrub only the remaining recorded rows/i);
+  assert.equal(f.advances,0,"inspection never advances a deletion checkpoint");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+});
+
 test("automatic post-write completion restores only recorded mappings and atomically retires identities",async()=>{
   const f=postWriteCompletionFixture();
   const result=await f.service.completePostWriteIfSafe("op-recovery");
