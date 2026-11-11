@@ -112,7 +112,8 @@ export function assessPostWriteRecovery(operation:ErasureOperation,inspection:Re
     &&operation.actionPlan?.todoistTask?.id===operation.target.taskId
     &&operation.actionPlan?.calendarEvent?.id===operation.target.eventId
     &&operation.actionPlan?.calendarEvent?.calendarId);
-  const aliasesComplete=completeAliasInventory(operation);
+  const aliasesComplete=completeAliasInventory(operation)
+    &&inspection.evidenceChecks?.knownCalendarAliasesMatch===true;
   const projectCommentsExact=exactProjectCommentInventory(operation);
   const checkpointComplete=deletionCheckpointComplete(operation);
   const tombstone=inspection.projectTombstone;
