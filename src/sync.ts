@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import {calendarReplaySourceIds,guardReplayProviderClients} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, googleCredentials, todoistToken } from "./config.js";
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
-import { activeProjectDeletionTombstone, attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, attachProjectCommentReference, deleteExactTaskProjectMappingComments, deleteMappingComments } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
@@ -2000,7 +2000,17 @@ export class Synchronizer {
         await (await this.clients(delivery.profile)).todoist.getTask(task.id);
       } catch (error) {
         if (Number((error as { status?: number }).status) === 404) {
-          return this.state.audit(delivery.profile, "todoist_erased_item_replay_suppressed", {});
+          let commentsRemoved = 0;
+          if (lifecycle.reason === "deleted"
+            && modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))
+            && !await this.state.syncBlocked(delivery.profile, { taskId: task.id })) {
+            commentsRemoved = await deleteExactTaskProjectMappingComments(projectCommentClient, projectComments, {
+              profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
+            });
+          }
+          return this.state.audit(delivery.profile,
+            commentsRemoved ? "todoist_deleted_task_project_comments_cleaned" : "todoist_erased_item_replay_suppressed",
+            commentsRemoved ? { commentsRemoved } : {});
         }
         throw error;
       }
@@ -2666,11 +2676,17 @@ export class Synchronizer {
             taskId: task.id, retainedHistory: history.length,
           });
         }
+        await deleteExactTaskProjectMappingComments(todoist, projectComments, {
+          profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
+        });
         const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, task.id, calendar);
         if (!removedHistory) return;
         return this.state.audit(delivery.profile, "todoist_deleted_completed_calendar_history", { taskId: task.id, removedHistory });
       }
       if (mapping.recurrenceOwner === "calendar" && mapping.masterEventId && lifecycle.reason === "deleted") {
+        await deleteExactTaskProjectMappingComments(todoist, projectComments, {
+          profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
+        });
         await calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => {
           if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
         });
@@ -2680,6 +2696,9 @@ export class Synchronizer {
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "todoist_deleted_calendar_recurrence", { taskId: task.id, masterEventId: mapping.masterEventId, removedHistory });
       }
+      await deleteExactTaskProjectMappingComments(todoist, projectComments, {
+        profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
+      });
       await calendar.deleteEvent(mapping.eventId).catch((error: unknown) => {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
