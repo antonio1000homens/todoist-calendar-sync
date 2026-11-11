@@ -366,7 +366,11 @@ export class ErasureOperationStore {
   }> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
-    if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
+    const postWriteStateOnly=operation?.status==="review_required"&&current?.phase==="delete"
+      &&["state","verify"].includes(current.deletionProgress?.stage||"")
+      &&!current.deletionProgress?.attempt&&operation.providerDeletionReady===true;
+    if(!operation || !current
+      ||(!["fencing","deleting","verifying"].includes(operation.status)&&!postWriteStateOnly))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
     if(operation.providerDeletionReady!==true) throw new Error("Erasure executor is disabled; the active fence must remain for break-glass review");
     const adapters=this.#worker();
@@ -425,7 +429,7 @@ export class ErasureOperationStore {
           }
           const progress=current.deletionProgress
             ||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now};
-          const attempt=await this.#claimDeletionAttempt(operation,current,progress,now);
+          const attempt=await this.#claimDeletionAttempt(operation,current,progress,now,operation.status);
           operation.lifecycle={...current,deletionProgress:{...progress,attempt}};
           const result=await adapters.executeDeletionStep(operation,operation.lifecycle.deletionProgress!);
           if(result.complete) {
@@ -610,19 +614,21 @@ export class ErasureOperationStore {
   }
 
   async #claimDeletionAttempt(operation:ErasureOperation,current:FencedLifecycle,
-    progress:ErasureDeletionProgress,now:number):Promise<{id:string;startedAt:number}> {
+    progress:ErasureDeletionProgress,now:number,expectedStatus:ErasureOperationStatus):Promise<{id:string;startedAt:number}> {
     const attempt={id:randomUUID(),startedAt:now};
     try {
       await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
         UpdateExpression:"SET lifecycle.#progress.#attempt=:attempt, updatedAt=:updatedAt",
-        ConditionExpression:"#status=:deleting AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex"
+        ConditionExpression:"#status=:expectedStatus AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex"
           +(progress.finalCommentIndex===undefined?" AND attribute_not_exists(lifecycle.#progress.#finalCommentIndex)"
             :" AND lifecycle.#progress.#finalCommentIndex=:finalCommentIndex")
-          +" AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
+          +" AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint"
+          +(expectedStatus==="review_required"?" AND lifecycle.#progress.#stage IN (:state,:verify)":""),
         ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress",
           "#attempt":"attempt","#stage":"stage","#commentIndex":"commentIndex","#stateIndex":"stateIndex",
           "#finalCommentIndex":"finalCommentIndex"},
-        ExpressionAttributeValues:{":deleting":"deleting",":delete":"delete",":stage":progress.stage,
+        ExpressionAttributeValues:{":expectedStatus":expectedStatus,":delete":"delete",":stage":progress.stage,
+          ...(expectedStatus==="review_required"?{":state":"state",":verify":"verify"}:{}),
           ":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,
           ...(progress.finalCommentIndex===undefined?{}:{":finalCommentIndex":progress.finalCommentIndex}),
           ":attempt":attempt,
