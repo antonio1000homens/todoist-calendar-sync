@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { buildErasurePreview } from "../dist/erasure-preview.js";
 import { MAPPING_COMMENT_MARKER, projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment,
   serializeMappingComment } from "../dist/mapping-comments.js";
+import { fingerprint } from "../scripts/item-purge-policy.mjs";
 
 test("erasure preview scans complete state and providers read-only and returns a canonical exact inventory", async () => {
   const commands=[];
@@ -227,9 +228,11 @@ test("an active tombstone for another task that overlaps a known alias blocks de
     expiresAt:projectDeletionTombstoneExpiry(createdAt)}),project_id:"test-home-project"};
   const selected={id:"selected-project-comment",content:serializeMappingComment({profile:"home",taskId,eventId,
     updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")};
+  const selectedAlias={id:"selected-alias-comment",content:serializeMappingComment({profile:"home",taskId,eventId:otherEventId,
+    updatedAt:"2026-11-08T12:01:00.000Z"},"test-home-project")};
   const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
   const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
-      listProjectComments:async()=>[selected,tombstone],listTaskComments:async()=>[]},
+      listProjectComments:async()=>[selected,selectedAlias,tombstone],listTaskComments:async()=>[]},
     calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
   const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
     {db,clients,inspectFence:async()=>({leases:[]})});
@@ -250,7 +253,8 @@ test("an unparseable project comment mentioning a known alias blocks deletion",a
   ];
   const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
   const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
-      listProjectComments:async()=>comments,listTaskComments:async()=>[]},
+    listProjectComments:async()=>[...comments,{id:"selected-alias-comment",content:serializeMappingComment({profile:"home",taskId,eventId:otherEventId,
+      updatedAt:"2026-11-08T12:01:00.000Z"},"test-home-project")}],listTaskComments:async()=>[]},
     calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
   const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
     {db,clients,inspectFence:async()=>({leases:[]})});
@@ -260,9 +264,11 @@ test("an unparseable project comment mentioning a known alias blocks deletion",a
 
 test("erasure preview binds completed delivery identity scrubbing to post-tombstone cleanup",async()=>{
   const receipt={pk:"DELIVERY#exact",sk:"COMPLETED",profile:"home",kind:"calendar",
-    identityRefs:{taskIds:["task-123"],eventIds:["event-123"],seriesIds:[]},
+    identityRefs:{taskIds:["task-123","unrelated-task"],eventIds:["event-123","alias-123","unrelated-event"],seriesIds:["unrelated-series"]},
     completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
-  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[
+    {pk:"EVENT#home#task-123",sk:"alias-123",profile:"home",taskId:"task-123",eventId:"alias-123"},receipt,
+  ]}:{}};
   const event={id:"event-123",etag:"etag-123",extendedProperties:{shared:{taskId:"task-123"}}};
   const comment={id:"project-comment",content:serializeMappingComment({profile:"home",taskId:"task-123",
     eventId:"event-123",updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")};
@@ -274,6 +280,10 @@ test("erasure preview binds completed delivery identity scrubbing to post-tombst
   assert.deepEqual(preview.blockers,[]);
   assert.equal(preview.inventory.some(item=>item.type==="DELIVERY"&&item.key.sk==="COMPLETED"
     &&item.receiptCleanup==="scrub_identity_refs"&&/^[a-f0-9]{64}$/.test(item.scrubbedDigest)),true);
+  assert.ok(preview.actionPlan.knownCalendarAliases.some(alias=>alias.eventId==="alias-123"));
+  assert.equal(preview.inventory.find(item=>item.type==="DELIVERY").scrubbedDigest,
+    fingerprint({...receipt,identityRefs:{...receipt.identityRefs,
+      taskIds:["unrelated-task"],eventIds:["unrelated-event"],seriesIds:["unrelated-series"]}}));
   assert.equal(preview.actionPlan.scrubCompletedDeliveryIdentityRefsAfterTombstone,true);
   assert.equal(preview.receiptSanitizationRequirements.length,1);
 });

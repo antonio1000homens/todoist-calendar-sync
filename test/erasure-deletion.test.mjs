@@ -78,7 +78,7 @@ test("provider deletion leaves a bounded Todoist tombstone and scrubs completed 
     {pk:"BASELINE#home#TASK#task-1",sk:"RECONCILE",taskId:"task-1",lastEventId:"event-1",profile:"home"},
     {pk:"CANONICAL#home#calendar#event-1",sk:"EVENT",eventId:"event-1",profile:"home"},
     {pk:"DELIVERY#opaque-receipt",sk:"COMPLETED",profile:"home",kind:"calendar",
-      identityRefs:{taskIds:["task-1"],eventIds:["event-1"],seriesIds:[]},
+      identityRefs:{taskIds:["task-1","unrelated-task"],eventIds:["event-1","alias-2","alias-3","unrelated-event"],seriesIds:["unrelated-series"]},
       completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000},
     {pk:"AUDIT#home#event-1",sk:"STATE",detail:{taskId:"task-1",eventId:"event-1"}},
   ];
@@ -118,9 +118,11 @@ test("provider deletion leaves a bounded Todoist tombstone and scrubs completed 
     selectedActions:{deleteTodoist:true,deleteCalendar:true},
     inventory:identityRows.map(row=>({type:row.pk.split("#")[0],key:{pk:row.pk,sk:row.sk},digest:fingerprint(row),classification:"selected-only",
       ...(row.pk.startsWith("DELIVERY#")?{receiptCleanup:"scrub_identity_refs",
-        scrubbedDigest:fingerprint({...row,identityRefs:{...row.identityRefs,taskIds:[],eventIds:[]}})}:{})})),
+        scrubbedDigest:fingerprint({...row,identityRefs:{...row.identityRefs,
+          taskIds:["unrelated-task"],eventIds:["unrelated-event"],seriesIds:["unrelated-series"]}})}:{})})),
     actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:"event-1",etag:"etag-approved",digest:fingerprint(event)},
-      knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+      knownCalendarAliases:["event-1","alias-2","alias-3"].map(eventId=>({profile:"home",calendarId:"home@example.test",eventId})),
+      knownCalendarAliasesComplete:true,
       projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
       comments:[{id:"project-1",kind:"project",digest:fingerprint(original)}]}};
   const dependencies={db,clients:{todoist,calendar},inspectFence:async()=>({fence:{operationId:"erase-1"},leases:[]})};
@@ -135,10 +137,10 @@ test("provider deletion leaves a bounded Todoist tombstone and scrubs completed 
   assert.equal(rows.size,2,"identity-bearing mappings are removed while unrelated state and an identity-free receipt remain");
   assert.equal(rows.get(`${unrelatedRow.pk}|${unrelatedRow.sk}`),unrelatedRow);
   const receipt=[...rows.values()].find(row=>row.pk.startsWith("DELIVERY#"));
-  assert.deepEqual(receipt.identityRefs,{taskIds:[],eventIds:[],seriesIds:[]});
+  assert.deepEqual(receipt.identityRefs,{taskIds:["unrelated-task"],eventIds:["unrelated-event"],seriesIds:["unrelated-series"]});
   const remainingDynamoRows=JSON.stringify([...rows.values()]);
-  assert.doesNotMatch(remainingDynamoRows,/task-1|event-1/,
-    "DynamoDB no longer contains the deleted task or Calendar event identity");
+  assert.doesNotMatch(remainingDynamoRows,/task-1|event-1|alias-2|alias-3/,
+    "DynamoDB no longer contains the deleted task or any known Calendar alias");
   assert.equal(comment.id,"project-1","existing comment identity is preserved for tombstone lifecycle cleanup");
 });
 
@@ -185,6 +187,7 @@ test("completed receipt identity scrubbing requires the confirmed active project
     classification:"selected-only"}],actionPlan:{...baseOperation.actionPlan,
     projectCommentIds:["project-1"],scrubCompletedDeliveryIdentityRefsAfterTombstone:true,
     knownCalendarAliases:[{profile:"home",calendarId:"home@example.test",eventId:"event-1"}],
+    knownCalendarAliasesComplete:true,
     comments:[{id:"project-1",kind:"project",digest:fingerprint("mapping")}]} };
   const db={send:async command=>command.constructor.name.includes("Get")?{Item:receipt}:({})};
   const noMarker={todoist:{getComment:async()=>({id:"project-1",project_id:"test-home-project",content:"mapping"})},calendar:{}};

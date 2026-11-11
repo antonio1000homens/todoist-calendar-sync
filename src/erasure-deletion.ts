@@ -212,9 +212,14 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
         if(fingerprint(existing)!==record.digest)throw new ErasureGateDriftError();
         const refs=existing.identityRefs as Record<string,unknown>|undefined;
         if(!Array.isArray(refs?.taskIds)||!Array.isArray(refs?.eventIds))throw new ErasureGateDriftError();
+        if(operation.actionPlan.knownCalendarAliasesComplete!==true
+          ||!Array.isArray(operation.actionPlan.knownCalendarAliases))throw new ErasureGateDriftError();
+        const knownEventIds=new Set(operation.actionPlan.knownCalendarAliases
+          .filter(alias=>alias.profile===operation.profile&&alias.calendarId===profiles[operation.profile].calendarId)
+          .map(alias=>alias.eventId));
         const scrubbed={...existing,identityRefs:{...refs,
           taskIds:refs.taskIds.filter(id=>id!==operation.target.taskId),
-          eventIds:refs.eventIds.filter(id=>id!==operation.target.eventId)}};
+          eventIds:refs.eventIds.filter(id=>id!==operation.target.eventId&&!knownEventIds.has(String(id)))}};
         if(fingerprint(scrubbed)!==record.scrubbedDigest)throw new ErasureGateDriftError();
         const names={"#profile":"profile","#kind":"kind","#refs":"identityRefs","#tasks":"taskIds","#events":"eventIds"};
         const values:Record<string,unknown>={":profile":existing.profile,":kind":existing.kind,
@@ -223,11 +228,18 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
           ":tasks":scrubbed.identityRefs.taskIds,":events":scrubbed.identityRefs.eventIds};
         const conditions=["#profile=:profile","#kind=:kind","completedAt=:completedAt","expiresAt=:expiresAt",
           "size(#refs.#tasks)=:taskCount","size(#refs.#events)=:eventCount"];
-        if((refs.taskIds as unknown[]).includes(operation.target.taskId)) {
-          conditions.push("contains(#refs.#tasks,:taskId)");values[":taskId"]=operation.target.taskId;
+        // The size checks plus membership checks for every old list member
+        // prevent overwriting a concurrently changed receipt with the plan's
+        // stale retained values.
+        for(const [index,id] of (refs.taskIds as unknown[]).entries()) {
+          if(typeof id!=="string")throw new ErasureGateDriftError();
+          const token=":expectedTask"+index;
+          conditions.push("contains(#refs.#tasks,"+token+")");values[token]=id;
         }
-        if(operation.target.eventId&&(refs.eventIds as unknown[]).includes(operation.target.eventId)) {
-          conditions.push("contains(#refs.#events,:eventId)");values[":eventId"]=operation.target.eventId;
+        for(const [index,id] of (refs.eventIds as unknown[]).entries()) {
+          if(typeof id!=="string")throw new ErasureGateDriftError();
+          const token=":expectedEvent"+index;
+          conditions.push("contains(#refs.#events,"+token+")");values[token]=id;
         }
         try {
           await db.send(new UpdateCommand({TableName:tableName(),Key:record.key,
