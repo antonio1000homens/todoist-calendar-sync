@@ -23,9 +23,62 @@ const diagnosticLabels = [
 export function recoveryDiagnosticRows(preview) {
   return diagnosticLabels.map(([key, label]) => ({
     key, label,
-    status: ["verified", "missing", "mismatched"].includes(preview?.diagnostics?.[key])
-      ? preview.diagnostics[key] : "unavailable",
+    // An expected deletion is a lifecycle transition, not generic drift.
+    status: preview?.comparisonDetails?.[key]?.result ||
+      (["verified", "missing", "mismatched"].includes(preview?.diagnostics?.[key])
+        ? preview.diagnostics[key] : "unavailable"),
   }));
+}
+
+export const recoveryComparisonRows = preview =>
+  diagnosticLabels.filter(([key]) => preview?.comparisonDetails?.[key])
+    .map(([key,label]) => ({key,label,...preview.comparisonDetails[key]}));
+
+export function recoveryTombstoneStatus(preview) {
+  const evidence=preview?.projectTombstone;
+  if (!evidence) return {status:"not_checked",recordedCommentFound:null,
+    markerMatchesTaskAndCalendar:null,
+    explanation:"The exact recorded project comment has not been inspected."};
+  return evidence;
+}
+
+export function recoveryIndependentGuard(preview) {
+  if (!preview) return "No inspection yet; read the current state before taking any action.";
+  const d=preview.diagnostics||{};
+  if (d.fence && d.fence!=="verified")
+    return "The exact operation-owned fence is not verified. Recovery and mapping restoration remain blocked.";
+  if (d.epoch && d.epoch!=="verified")
+    return "The monotonic profile epoch is missing or altered. Recovery remains blocked.";
+  if ((d.mappingInventory&&d.mappingInventory!=="verified")||
+      (d.mappingStates&&d.mappingStates!=="verified"))
+    return "Original worker SQS mapping inventory/state is not verified. Recovery remains blocked.";
+  if (d.workerLeases&&d.workerLeases!=="verified")
+    return "An active writer/admission lease blocks recovery.";
+  if (d.originalConfirmation&&d.originalConfirmation!=="verified")
+    return "The immutable original erasure confirmation is not verified.";
+  if (d.audit&&d.audit!=="verified")
+    return "The independent provider/state audit is incomplete.";
+  if (preview.snapshotSafetyBlockerCount>0)
+    return "Provider or DynamoDB snapshot safety blockers remain. The original contents must be verified privately.";
+  if (preview.classification!=="pre_write"&& !preview.allowed)
+    return "Strict recovery is blocked by the original pre-write equality and deletion-stage guards; a diagnostic lifecycle change is not permission to unfence.";
+  if (!preview.allowed)
+    return "At least one server-side recovery guard remains blocked; inspect the recorded blockers.";
+  return "Local pre-write checks are eligible, but separate writer-boundary, deployment and rollback acceptance under #347/#349 is not proven by this inspection.";
+}
+
+export function recoveryNextSafeAction(preview) {
+  if (!preview) return "Load the operation and run a read-only guarded inspection.";
+  const marker=recoveryTombstoneStatus(preview);
+  if (marker.status==="ambiguous"||marker.status==="missing")
+    return "Keep the fence. Re-read the exact recorded Todoist project comment and escalate changed or missing marker evidence; do not invent a replacement or force a recovery.";
+  if (marker.status==="not_checked" && preview.classification!=="pre_write")
+    return "Keep the fence. Obtain a complete exact project-comment readback before assessing post-deletion recovery.";
+  if (preview.calendarDriftReview?.candidateForSeparateApproval)
+    return "Review the isolated Calendar revision and use only the separately guarded Calendar-drift cancellation, with fresh server verification.";
+  if (!preview.allowed)
+    return "Repeat the read-only provider/state inspection or escalate an independent guarded review. Do not release the fence, replay deletion or enable production gates.";
+  return "Before any guarded recovery, complete independent #347 writer-boundary and #349 deployment/rollback acceptance; this inspection cannot establish those approvals.";
 }
 
 export function recoveryClassificationExplanation(preview) {
