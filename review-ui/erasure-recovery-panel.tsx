@@ -387,12 +387,14 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
             {postWriteAssessment.classification==="completed"?
               <p role="status">Cleanup completed at {formatTime(postWriteAssessment.completion?.completedAt)}. The original worker mapping states were restored, the operation-owned fence was released, no provider delete was replayed, and the 18-day project-comment tombstone was left untouched for normal expiry cleanup.</p>
               :<>
-                <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · automatic completion: <strong>{postWriteAssessment.completionEligible?"eligible":"blocked"}</strong></p>
+                <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · automatic completion: <strong>{postWriteAssessment.stateCleanupPending?"state cleanup pending":postWriteAssessment.completionEligible?"eligible":"blocked"}</strong></p>
                 <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · exact targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · active fence owned: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"} · tombstone verified: {postWriteAssessment.evidence?.projectTombstonePresent?"yes":"no"} · deletion checkpoints complete: {postWriteAssessment.evidence?.deletionCheckpointComplete?"yes":"no"}</p>
-                {postWriteAssessment.completionEligible?
-                  <p role="status">All operation-scoped evidence is satisfied. The existing scheduled watchdog will finish cleanup automatically; no new queue or per-operation approval is needed.</p>
-                  :<p className="warning">The operation remains fenced. The watchdog will not restore sync or release the fence while any completion condition is uncertain.</p>}
-                {postWriteAssessment.completionBlockers?.length>0&&<details className="recovery-technical">
+                {postWriteAssessment.stateCleanupPending?
+                  <p role="status">The exact provider targets are already absent. The existing watchdog is continuing only the original DynamoDB state checkpoint (including eligible delivery-receipt scrubbing), up to ten recorded entries per run. It will not replay a Todoist or Calendar delete. Refresh to see the next checkpoint; uncertain attempts or inventory drift remain fenced.</p>
+                  :postWriteAssessment.completionEligible?
+                    <p role="status">All operation-scoped evidence is satisfied. The existing scheduled watchdog will finish cleanup automatically; no new queue or per-operation approval is needed.</p>
+                    :<p className="warning">The operation remains fenced. The watchdog will not restore sync or release the fence while any completion condition is uncertain.</p>}
+                {!postWriteAssessment.stateCleanupPending&&postWriteAssessment.completionBlockers?.length>0&&<details className="recovery-technical">
                   <summary>Post-write completion blockers</summary>
                   <ul>{postWriteAssessment.completionBlockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>
                 </details>}
