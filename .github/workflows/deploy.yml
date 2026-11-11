@@ -39,10 +39,10 @@ jobs:
       CF_ACCESS_ISSUER: ${{ vars.CF_ACCESS_ISSUER }}
       CF_ACCESS_AUDIENCE: ${{ vars.CF_ACCESS_AUDIENCE }}
       REVIEW_OPERATOR_EMAILS: ${{ vars.REVIEW_OPERATOR_EMAILS }}
-      # Keep item erasure execution disabled until #347 writer-boundary and #349
-      # disposable acceptance/release gates are complete. This reuses the
-      # existing two-Lambda gate; it does not add another feature flag.
-      ERASURE_EXECUTION_ENABLED: 'false'
+      # Explicit operator direction on 11 Nov 2026 enables the existing
+      # two-Lambda execution gate irrespective of #347/#349 ticket status.
+      # Per-operation guards and profile fences remain enforced.
+      ERASURE_EXECUTION_ENABLED: 'true'
       # Set this production environment variable to true ONLY after #277
       # (seven-day retained mappings) has been deployed and verified.
       # Unset/false keeps the destructive cleanup OFF; revert without code edits.

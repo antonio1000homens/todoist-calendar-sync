@@ -7,8 +7,8 @@ const deploy=readText("../deploy.sh");
 const workflow=readText("../.github/workflows/deploy.yml");
 const template=readText("../template.yaml");
 
-test("production deployment keeps item erasure disabled until guarded acceptance is complete",()=>{
-  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'false'/);
+test("production deployment enables the existing erasure gate when explicitly approved",()=>{
+  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'true'/);
   assert.match(deploy,/erasure_execution_enabled="\$\{ERASURE_EXECUTION_ENABLED:-false\}"/);
   assert.match(deploy,/ErasureExecutionEnabled=\$erasure_execution_enabled/);
   assert.match(deploy,/ERASURE_EXECUTION_ENABLED must be exactly true or false/);
@@ -77,5 +77,5 @@ test("pre-write recovery watchdog has independent, disabled-by-default schedule 
 test("current production deployment does not enable the retired HMAC replay marker mechanism",()=>{
   assert.doesNotMatch(workflow,/^\s*ERASURE_REPLAY_BARRIER_VERSION:\s*["']?1\b/m);
   assert.doesNotMatch(template,/^\s*(?:ERASURE_REPLAY_HMAC_KEYS|ERASURE_REPLAY_HMAC_CURRENT_KEY):/m);
-  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'false'/);
+  assert.match(workflow,/ERASURE_EXECUTION_ENABLED:\s*'true'/);
 });
