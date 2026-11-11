@@ -1,84 +1,115 @@
-# #349 — Known-identity post-write assessment (bounded assurance)
+# #349 / #484 — Known-identity post-write completion
 
 ## Purpose
 
-An erasure with a persisted `review_required` operation can now report a **read-only** scoped assessment for its **exact original** Todoist task and Google Calendar event, even when a universal signed Calendar provenance register is absent. This is a deliberately weaker operational claim than `allAccessibleCalendarCoverageProven`.
+A persisted `review_required` erasure can be assessed against its **exact original**
+Todoist task and Calendar event even when a universal signed Calendar provenance
+register is unavailable. This is a bounded operational claim, not proof that
+unknown, historical, shared or independently-created Calendar copies are absent.
 
-The existing global-absence report is unchanged, including its fail-closed treatment of unknown historical, shared and direct-ID-only Calendars. The new `knownIdentity.status` field on the authenticated post-write recovery GET response is an *additional* diagnostic; it never converts global absence into success or grants write/release permission.
+Issue #484 adds an operation-scoped completion path. When the exact deletion
+checkpoints and post-write evidence are satisfied, the existing erasure watchdog
+restores the original worker mapping states and atomically retires the operation.
+It does not resume deletion, create a new queue, or require a separate
+per-operation typed review/signoff.
 
-## Inputs and outcome
+## Completion evidence
 
-The existing provider snapshot issues fresh exact task/event GETs, checks the configured Calendar's task-linked event lookup, and performs its existing read-only DynamoDB inventory. The scoped decision requires:
+The finalizer accepts only the original operation and its owning profile. It
+requires all of the following:
 
-- An immutable original **both-side** deletion selection, exact action-plan identities, and matching durable deletion-start receipt.
-- Explicit direct not-found response for both **recorded** provider targets (a bare empty response is not accepted). Calendar's existing exact cancelled-event handling applies only when the ID matches.
-- No linked projection found in the **configured profile Calendar**, no positive cross-profile identity observation, and no original snapshot/provider safety blocker.
-- Original operation-owned active profile fence, valid epoch, no active lease, and absence of attributable state rows.
+- The operation remains `review_required`, has `providerDeletionReady=true`,
+  and records a valid `deletionStarted` receipt.
+- The original action plan selected both Todoist and Calendar deletion and
+  retains the exact task, event, configured calendar and complete bounded alias
+  inventory.
+- The deletion progress is at the terminal `verify` checkpoint (or the
+  compatible completed `state` checkpoint), all comment/state indexes are
+  complete, and no write-ahead attempt remains.
+- Strong exact provider readback proves the recorded Todoist task and Calendar
+  event absent and the configured Calendar task-link lookup not found.
+- The exact original project-comment inventory matches an active, read-back
+  18-day tombstone. The tombstone is retained for its normal expiry cleanup.
+- Any remaining DynamoDB rows are an exact subset of the original
+  operation inventory at or after its durable state checkpoint. The existing
+  fenced deletion adapter resumes only this state phase (including eligible
+  delivery-receipt identity-reference scrubbing); it never resumes a
+  Todoist/Calendar delete. Unrecorded, changed or already-processed rows block.
+  Before release, a fresh attributable inventory must be empty and the
+  snapshot must have no safety blockers.
+- The operation-owned fence and epoch are valid, and no admission/writer
+  leases remain.
+- The live worker mapping inventory exactly matches the original recorded
+  UUIDs. Originally-disabled mappings remain disabled; only originally-enabled
+  mappings may be restored.
+- The existing `ERASURE_EXECUTION_ENABLED` gate is true and
+  `ERASURE_PROTOCOL_VERSION=1`. These are existing release controls, not new
+  flags. They preserve the #347 writer/IAM release boundary; this change does
+  not enable the production gate.
 
-All of these conditions yield `knownIdentity.status=known_identity_deleted`, with explicit scope `recorded_original_targets_in_configured_profile`. Any missing/ambiguous evidence yields `partial_or_ambiguous`; a lifecycle that never reached deletion yields `not_post_write`.
+A global Calendar absence scan is not required for these **known recorded
+targets**. The result never claims `allAccessibleCalendarCoverageProven`.
 
-The read-only outcome intentionally **does not** imply the absence of unknown Calendar aliases, historical backups, unrecorded shared calendars, or independently created copies. It is not an authorization to overwrite state, install tombstones, restore mappings, replay DLQ, or release the fence.
+## Automatic completion
 
-## Execution and review remain separate
+The existing scheduled EventBridge erasure watchdog already enumerates the
+three known profile fences. For each `review_required` operation:
 
-The GET endpoint continues to expose `releaseAllowed:false` and `onlyAvailableAction:keep_fenced`. Existing typed-review/deletion confirmation paths are unchanged. No new feature flag was added for this read-only reporting.
+1. It tries the post-write finalizer before considering pre-write recovery.
+   Partial or ambiguous post-write operations are not passed to pre-write
+   recovery.
+2. If provider deletion is complete but the durable state checkpoint is
+   still at `state`, it resumes at most ten original inventory entries per
+   invocation through the existing fenced deletion adapter. This removes
+   only recorded rows and scrubs eligible delivery receipts while preserving
+   unrelated identity references. It persists each checkpoint and continues
+   on the next watchdog pass if needed. A write-ahead attempt, changed row or
+   non-matching inventory remains fenced.
+3. It re-reads the exact provider/state evidence and checks the fence/epoch/
+   lease owner immediately before restoring mappings.
+4. It re-enables only the UUIDs in the original `enabledMappingIds` list.
+   It then verifies the complete mapping inventory and exact original enabled /
+   disabled state.
+5. One conditional DynamoDB transaction checks the unchanged operation,
+   deletion receipt/checkpoints, original confirmation, operation-owned fence,
+   epoch and journal ownership. It removes the original confirmation, any
+   operation-bound pre-write or legacy post-write review tokens, the
+   operation-owned fence and journal, and replaces the identity-bearing
+   operation with an identity-free terminal receipt.
+6. The Todoist project-comment tombstone is deliberately left untouched for
+   its normal 18-day expiry cleanup.
 
-The existing Todoist project mapping comment is rewritten as a **bounded replay tombstone** and retained after successful provider and DynamoDB deletion. Current workers consult that exact project marker under the profile writer lease before processing matching webhooks, Calendar deltas, or orphan rechecks. The marker expires after 18 days and is removed by the tombstone cleanup job. Completed DynamoDB delivery receipts retain their normal 14-day idempotency keys, but the selected task and event IDs are scrubbed only after the project tombstone is read back under the erasure fence. No deleted-task identity remains in DynamoDB after success. The marker does not protect against historical versions that ignore it or arbitrary invocation after expiry; #347's qualified-writer boundary remains required. Keep incomplete operations fenced.
+The terminal operation record retains only the operation ID, owning profile,
+terminal status, completion time, epoch, mapping counts and non-identifying
+completion flags/timestamps. It contains no Todoist task ID, Calendar event ID,
+title, comment body, target digest, preview fingerprint, inventory or
+confirmation. The original confirmation and any operation-bound review-token
+rows are deleted. No deleted task/event identity remains in DynamoDB after
+success.
 
-The existing seven-day terminal completed-task mapping cleanup and ordinary no-confirmation sync deletion are unaffected.
+The receipt records that provider deletes were **not** replayed and that the
+tombstone was left untouched for its normal expiry. A repeated watchdog pass
+or post-write inspection is a terminal no-op and reports
+`classification=completed`; it cannot reopen the operation or release a
+later operation's fence.
 
-## Ambiguous provider deletion errors
+## Failure handling and release boundary
 
-A provider failure during the `delete` or `verify_deletion` lifecycle phase moves the durable operation directly to `review_required` while preserving its original phase, checkpoint and profile fence. Even an apparent 429/5xx or timeout can be a lost acknowledgement of a completed remote write; automatically resending that same destructive step is unsafe. Before each delete-stage action, the worker conditionally stores a unique write-ahead attempt claim tied to the exact progress checkpoint. A successful action advances the checkpoint and clears that claim in the same lifecycle write. If the checkpoint write or its acknowledgement is lost, later SQS deliveries see the claim and never repeat the provider action; after the configured worker timeout they move the operation to `review_required`. The original fence and claim remain for operator inspection. This closes the ambiguous DynamoDB checkpoint-acknowledgement replay window in the current source path. It does not prove historical Lambda versions or direct invokers use the path; #347 remains a release blocker. Unrelated pre-deletion and non-destructive mapping-state polling keep the existing retry logic. The erasure operation queue's existing 14-day DLQ still captures delivery/transport failures, without introducing a second queue.
+Any missing, stale, partial, ambiguous or conflicting evidence leaves the
+operation fenced. The watchdog reports a blocker and does not guess, retry a
+provider delete, or start a new queue. If mapping restoration succeeds but the
+final conditional transaction conflicts, the fence remains active; a later
+watchdog pass re-inspects and retries idempotently.
 
+The existing production erasure gate must remain disabled until #347's
+historical writer/invocation/IAM boundary and the remaining #349 disposable
+Work-profile acceptance and security review are independently satisfied.
+This implementation does not authorize enabling that gate, enabling
+`ERASURE_REPLAY_BARRIER_VERSION`, running a live destructive test, or
+manually editing mappings/fences.
 
-## Production gate status after PRs #403–#405 (8 Nov 2026)
-
-The project-comment marker implementation is deployed to current master. The
-production stack and live Review API have `ERASURE_EXECUTION_ENABLED=false`;
-the replay barrier remains absent. A fresh version audit still found 71 Review
-API configurations with execution enabled, including historical qualified
-versions that are invocation candidates. Current alias configuration does not
-disable those old versions. #347's enforceable writer/IAM boundary and #349's
-disposable Work-profile fault-injection acceptance are not complete. The gate
-therefore remains disabled and no fence-release or recovery action is
-authorized by this rollout.
-
-### Separately reviewed Calendar-drift erasure cancellation (pre-provider-write only)
-
-The original `RESTORE SYNC` route is unchanged and requires an exact immutable
-provider snapshot. The additional Calendar-drift cancellation path is **never
-available to the unattended recovery watchdog**. It can only be issued by an
-authenticated operator when read-only `calendarDriftReview.candidateForSeparateApproval`
-passes all original-operation, fence, epoch, worker-mapping, zero-lease,
-no-provider-delete, cross-profile, Todoist task, comment, alias and DynamoDB
-inventory checks. The current Calendar event must have the same exact event
-ID/calendar ID and a valid ETag; the current provider revision is not silently
-treated as the original deletion confirmation.
-
-1. Open Existing erasure operation status / recovery and inspect the original
-   operation. For a qualifying Calendar-only drift, review the failed comparison
-   labels and use **Request reviewed Calendar-drift cancellation**.
-2. This issues an operator-bound, five-minute, single-use confirmation in the
-   `calendar_drift_cancel` mode. It is **not** the original erasure confirmation.
-   Type **CANCEL ERASURE AND RESTORE SYNC**, the exact original operation ID and
-   profile. The normal `RESTORE SYNC` confirmation cannot consume this token.
-3. Application independently inspects all evidence again and binds the precise
-   *current* Calendar digest and ETag, the original lifecycle, fence epoch,
-   mapping inventory and inspection fingerprint in a conditional transaction.
-   Any drift aborts the action and leaves the fence unchanged.
-4. The existing worker restores **only** originally enabled mapping UUIDs
-   then releases the original operation-owned fence through the existing
-   conditional ownership/epoch transaction. On *every* worker step it rereads
-   provider, task, comment, alias, DynamoDB and cross-profile inventory,
-   and verifies the exact accepted Calendar digest and ETag. Any change blocks
-   the recovery and preserves the fence. Provider deletion is never resumed.
-5. Verify `recovery.status=completed`, the original SQS mapping Enabled,
-   the Work fence removed, queue drainage and all three profiles reconciled.
-   Do not close #349 before this verification.
-
-Only the Calendar item's provider revision is eligible for this distinct
-exception. Missing items, missing ETags, any source mapping enabled early,
-other provider/state changes, ambiguous identities, deletion-start receipts,
-incomplete scans, active leases or operation ownership changes remain blocked.
-Automatic recovery remains strict. Production erasure execution stays disabled.
+The former fenced-review token and acknowledgement routes have been retired
+(HTTP 404); they are no longer a required step or an alternative completion
+path. The review UI exposes the automatic completion state and precise
+blockers. The existing watchdog performs the guarded completion when the
+existing release gate and all operation-scoped evidence are satisfied.

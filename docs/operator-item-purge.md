@@ -188,13 +188,16 @@ ingress versions 89–92 and Review API versions 135–139 do not carry those
 version-specific Denies; they contain the current tombstone-related code, and
 the Review API versions are configured with execution disabled. Marker strings
 and configuration readback do not prove that every check dominates every write
-or that every caller and rollback path is covered. Keep the production gate
-disabled, do not release an erasure fence, and do not start recovery until the
-#347 invocation boundary and independent security/rollback review, plus #349
-disposable Work-profile acceptance, are complete. This model is known-identity
-recovery only; it does not prove absence of unknown Calendar copies, backups, or
-external integrations. Normal sync, recurrence, and seven-day completed-task
-retention remain separate behavior.
+or that every caller and rollback path is covered. Issue #484 now implements a
+bounded, operation-scoped post-write finalizer, but it honours the existing
+`ERASURE_EXECUTION_ENABLED` gate and `ERASURE_PROTOCOL_VERSION=1`. Keep the
+production gate disabled until the #347 invocation/writer/IAM boundary and
+independent security/rollback review, plus #349 disposable Work-profile
+acceptance, are complete. The finalizer does not require a global Calendar
+absence proof for exact recorded targets and does not require a separate
+per-operation typed signoff. It does not prove absence of unknown Calendar
+copies, backups, or external integrations. Normal sync, recurrence, and
+seven-day completed-task retention remain separate behavior.
 
 The API scan stops after its bounded 80-second preview window and returns no
 confirmation if it cannot finish. It uses the configured DynamoDB scan page
@@ -379,87 +382,75 @@ backups. Historical repair and forensic evidence for the item is intentionally
 lost.
 
 
-## Post-write evidence inspection (issue #243; read-only staging)
+## Post-write evidence and automatic completion (issues #349 / #484)
 
-Following the staged replay-admission foundation (#251) and Calendar-source
-identity propagation (#299), an operator can inspect a *recorded*
-`review_required` erasure using the **Post-write evidence (read-only)** section
-of the review portal. The authenticated endpoint is
-`GET /review/api/erasure-postwrite-recoveries/{operationId}`.
+The authenticated review portal exposes
+`GET /review/api/erasure-postwrite-recoveries/{operationId}` for a redacted,
+read-only inspection of an already-recorded `review_required` operation. The
+inspection is limited to the exact original Todoist task, Calendar event,
+configured calendar and recorded alias inventory; it does not require a global
+Calendar provenance register and does not claim that unknown copies are absent.
 
-This endpoint reuses the strongly consistent, paginated provider/DynamoDB
-snapshot, owner-fence and epoch inspection, and original SQS worker mapping
-inventory used by pre-write inspection. It produces **only a redacted evidence
-assessment**: no Todoist/Calendar IDs, titles, timestamps, mapping UUIDs,
-comment bodies or underlying operation inventory are returned in the result.
+A `fully_deleted_candidate` means the exact original selection and
+deletion-start receipt are present, deletion checkpoints are complete with no
+uncertain write-ahead attempt, both recorded provider targets are absent, the
+configured Calendar link is not found, attributable DynamoDB rows are absent,
+and the exact active 18-day project-comment tombstone is read back. Before
+release, any remaining rows must first be an exact subset of the original
+inventory at the persisted state checkpoint; the watchdog resumes only that
+state phase, including eligible delivery-receipt scrubbing, and preserves
+unrelated records. The owned fence, epoch, drained leases, complete alias
+manifest and original mapping inventory must also be consistent. Missing or
+conflicting evidence is `partial_or_ambiguous` and remains fenced.
 
-- **Not post-write:** no durable write stage was indicated. The existing,
-  independently verified *pre-write* procedure is the only possible recovery.
-- **Fully deleted candidate:** original selected actions and both exact
-  targets, a durable original deletion-start receipt, strong provider and
-  DynamoDB absence, an owned fence, epoch and drained leases have been
-  observed with no unexpected inspection blockers. This is a classification,
-  **not** authorisation for a recovery, mapping write or fence release.
-- **Partial or ambiguous:** an original deletion target, alias, worker
-  mapping, fence, snapshot integrity or another safety criterion is missing
-  or inconsistent. A future attempt to finish deletion will require a
-  **new**, independently reviewed deletion authorisation and action-time
-  provider version/digest checks. An old confirmation must not be reused.
+The existing scheduled EventBridge erasure watchdog performs the completion;
+there is no new queue or feature flag. It runs only when the existing
+`ERASURE_EXECUTION_ENABLED=true` and `ERASURE_PROTOCOL_VERSION=1` controls
+are active, and the original operation has `providerDeletionReady=true`.
+This preserves the #347 release boundary; the code does not enable those
+controls or authorize production erasure.
 
-The endpoint does **not** have `POST /confirm`, `/apply`, or `/dispatch`
-routes. The assessment always returns `releaseAllowed: false` and
-`onlyAvailableAction: keep_fenced`. The legacy `RESTORE SYNC` flow
-continues to require `pre_write` classification and cannot act on a
-post-write assessment.
+For an eligible exact operation the watchdog:
 
-**Still blocked:** source alias and cross-profile coverage, qualified old
-Lambda versions, privacy and IAM review, an independently verified
-postflight tied to an immutable new single-use typed confirmation, a fully
-conditional marker+fence release with no early admission, a newly authorised
-partial deletion flow, fault-injection matrix and disposable Work-profile
-staging. Do not enable `ERASURE_REPLAY_BARRIER_VERSION`, restore worker
-event-source mappings, remove fences, replay the DLQ, or run a live destructive
-test based solely on this preview.
+1. Re-inspects the immutable operation, exact provider readback, tombstone,
+   attributable state inventory, fence, epoch, leases and worker mappings.
+2. If the durable deletion checkpoint is at `state`, resumes at most ten
+   original inventory entries per invocation through the existing fenced
+   deletion adapter. It deletes only exact recorded rows and scrubs eligible
+   delivery-receipt identity references while preserving unrelated references.
+   It persists each checkpoint and continues on the next watchdog pass if
+   needed. A write-ahead attempt, changed row or non-matching inventory remains
+   fenced. It never resumes the Todoist or Calendar provider-delete stages.
+3. Restores **only** the UUIDs recorded in the original
+   `lifecycle.enabledMappingIds`; mappings originally disabled remain disabled.
+4. Rechecks the live mapping inventory and the same operation/fence/epoch
+   immediately before release.
+5. Uses one conditional DynamoDB transaction to remove the original
+   confirmation, any operation-bound pre-write or legacy post-write review
+   tokens, operation-owned fence and journal, while replacing the
+   identity-bearing operation with an identity-free terminal receipt. The
+   epoch and operation/checkpoint conditions are checked in the same
+   transaction.
+6. Leaves the original project-comment tombstone untouched for its normal
+   18-day expiry cleanup. It never repeats a Todoist or Calendar delete.
 
+The terminal receipt retains only operation/profile/status, completion time,
+epoch and mapping counts; it contains no deleted task/event IDs, titles,
+comments, hashes, preview fingerprints or inventory. The review API reports
+`classification=completed`, and repeated inspection/watchdog runs are
+terminal no-ops. The UI no longer requests a per-operation review token or
+typed acknowledgement.
 
-## Post-write fenced-review acknowledgement (issue #243, staged)
+If any evidence is stale, partial, ambiguous or conflicting, the watchdog
+leaves the fence active and reports a specific blocker. If mapping restoration
+has begun but the final transaction conflicts, the fence remains active and
+the next pass retries idempotently after fresh inspection. Never manually
+remove the fence or edit worker mappings.
 
-An independently verified `fully_deleted_candidate` may now be bound to a
-**new, distinct, single-use review acknowledgement**, but this is NOT an
-authorisation to execute a post-write recovery.
-
-The authenticated review portal offers `POST
-/review/api/erasure-postwrite-recoveries/{operationId}/review-token` to issue
-a 5-minute token and `POST .../{operationId}/acknowledge` to consume it,
-after typing **REVIEW AND KEEP FENCED**, the exact original operation ID,
-and profile. The service checks full recovery evidence afresh before each
-action. The token is bound to operator, immutable original selections,
-provider action plan, exact target/alias inventory, operation revision,
-strong postflight snapshot, epoch and fenced worker state. Confirmation
-consumption is a conditional DynamoDB transaction, including the owned
-fence, epoch and journal, that persists only
-`postwriteReview.status=reviewed_fenced` and consumes a post-write-specific
-confirmation row. The operator identifier is removed when its token is consumed. The expired token can be replaced before consumption;
-a consumed token cannot be reissued or replayed.
-
-No additional rollout flag is needed to record a fenced evidence review. The API
-can only record an operator's review while preserving the original
-`review_required` operation, all provider data/absence evidence, the
-existing erasure fence, writer mappings and the monotonic epoch.
-
-No SQS dispatch, provider mutation, replay-marker installation or fence
-release is possible through this acknowledgement. The future privileged
-post-write executor will need **new independent verification and staged
-review** before any recovery. The pre-write `RESTORE SYNC` confirmation
-and the original erasure confirmation are not accepted.
-
-The partial/ambiguous cases do not qualify for this acknowledgement:
-they remain fenced until a separately reviewed, newly authorised
-action-time deletion/completion implementation exists. Keep #243 open
-until the full replay barrier, qualified Lambda/version audit, fault
-matrix, privacy/IAM approval and disposable Work-profile staging are
-complete. No production erasure or recovery is part of this increment.
-
+The former fenced-review token and acknowledgement endpoints are retired
+(HTTP 404); no per-operation review token is required. The pre-write
+`RESTORE SYNC` confirmation is never reused and cannot act on a post-write
+operation.
 
 ## Production status after PRs #403–#405 (8 Nov 2026)
 

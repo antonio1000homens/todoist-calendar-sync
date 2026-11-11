@@ -46,12 +46,82 @@ function storedQueuedOperation(){
     providerDeletionReady:true,status:"queued",createdAt:"now",updatedAt:"now"};
 }
 
- test("erasure operation contract permits only the resumable forward lifecycle",()=>{
+ function postWriteStateOperation(stage="state") {
+  const preview={
+    operationId:"op",profile:"home",target:{taskId:"task",eventId:"event",deleteCalendar:true},
+    selectedActions:{deleteTodoist:true,deleteCalendar:true},providerSnapshotFingerprint:"a".repeat(64),
+    actionPlan:{
+      todoistTask:{id:"task",digest:"b".repeat(64)},
+      calendarEvent:{id:"event",calendarId:"calendar",digest:"c".repeat(64),etag:"etag"},
+      projectCommentIds:[],comments:[],
+      knownCalendarAliases:[{profile:"home",calendarId:"calendar",eventId:"event"}],
+      knownCalendarAliasesComplete:true,
+    },
+    inventory:[{type:"DELIVERY",key:{pk:"DELIVERY#one",sk:"STATE"},digest:"d".repeat(64),
+      classification:"attributable",receiptCleanup:"scrub_identity_refs",scrubbedDigest:"e".repeat(64)}],
+  };
+  const fingerprint=erasurePreviewFingerprint(preview);
+  return {...preview,previewFingerprint:fingerprint,confirmationFingerprint:fingerprint,
+    confirmationId:"11111111-1111-4111-8111-111111111111",providerDeletionReady:true,
+    status:"review_required",createdAt:"now",updatedAt:"now",
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{
+        fenceInstalled:{operationId:"op",phase:"fenceInstalled",
+          receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:Date.now()-60_000},
+        deletionStarted:{operationId:"op",phase:"deletionStarted",
+          receiptId:"123e4567-e89b-12d3-a456-426614174001",completedAt:Date.now()-10_000},
+      },deletionProgress:{stage,commentIndex:0,stateIndex:0,startedAt:Date.now()-5_000}}};
+}
+
+test("erasure operation contract permits only the resumable forward lifecycle",()=>{
   assert.equal(advanceErasureOperation(operation,"queued").status,"queued");
   assert.throws(()=>advanceErasureOperation(operation,"deleting"),/Invalid erasure operation transition/);
   const partial=advanceErasureOperation({...operation,status:"queued"},"partial_failure",{error:"lease timeout"});
   assert.equal(advanceErasureOperation(partial,"queued").status,"queued");
   assert.throws(()=>advanceErasureOperation({...operation,status:"succeeded"},"queued"),/Invalid/);
+});
+
+test("review-required recovery can advance only an exact state/verify checkpoint",async()=>{
+  const item=postWriteStateOperation("state"),db=memoryDb(item),calls=[];
+  const adapters={
+    listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},
+    restoreMappings:async()=>{},finishFence:async()=>{},
+    verifyDeletion:async()=>({providersAbsent:true,stateAbsent:true}),
+    readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
+    executeDeletionStep:async(operation,progress)=>{
+      calls.push({operationId:operation.operationId,stage:progress.stage,attempt:progress.attempt?.id,
+        receiptCleanup:operation.inventory[0].receiptCleanup});
+      const {attempt,...checkpoint}=progress;
+      return {complete:false,progress:{...checkpoint,stateIndex:1}};
+    },
+  };
+  const store=new ErasureOperationStore(db,()=> "unused",adapters);
+  const result=await store.advanceFencedLifecycle("op");
+  assert.equal(result.phase,"delete");
+  assert.equal(result.status,"review_required");
+  assert.equal(result.waiting,false);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].operationId,"op");
+  assert.equal(calls[0].stage,"state");
+  assert.equal(calls[0].receiptCleanup,"scrub_identity_refs");
+  assert.ok(calls[0].attempt,"the state step is protected by a write-ahead attempt");
+  assert.equal(db.item.lifecycle.deletionProgress.stateIndex,1);
+  assert.equal(db.item.lifecycle.deletionProgress.attempt,undefined);
+  assert.equal(db.item.status,"review_required");
+  assert.equal(db.item.lifecycle.phase,"delete");
+  const claim=db.calls.find(command=>command.constructor.name.includes("Update")
+    &&command.input.ExpressionAttributeValues[":attempt"]);
+  assert.equal(claim.input.ExpressionAttributeValues[":expectedStatus"],"review_required");
+  assert.match(claim.input.ConditionExpression,/lifecycle\.#progress\.#stage IN \(:state,:verify\)/);
+});
+
+test("review-required recovery refuses to resume any provider-delete stage",async()=>{
+  const item=postWriteStateOperation("todoist"),db=memoryDb(item),calls=[];
+  const store=new ErasureOperationStore(db,{executeDeletionStep:async()=>{calls.push("provider-delete");return {complete:true};}});
+  await assert.rejects(store.advanceFencedLifecycle("op"),/not in a resumable fenced lifecycle state/);
+  assert.deepEqual(calls,[]);
+  assert.equal(db.calls.filter(command=>command.constructor.name.includes("Update")).length,0);
 });
 
 test("deletion gate drift is persisted as review-required with a CAS and cannot be restarted",async()=>{
@@ -196,60 +266,6 @@ test("gate drift during release-fence verification persists review-required with
     ||command.constructor.name.includes("Delete")),false,"operation and fence cleanup must not run");
 });
 
-test("post-write finalizer promotes only exact verified completion and condition-checks its fence",async()=>{
-  const old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
-  const digest=erasurePreviewFingerprint(preview),receipt="123e4567-e89b-12d3-a456-426614174000";
-  const item={...storedQueuedOperation(),status:"review_required",previewFingerprint:digest,confirmationFingerprint:digest,
-    lifecycle:{phase:"verify_deletion",mappingIds:["123e4567-e89b-12d3-a456-426614174001","123e4567-e89b-12d3-a456-426614174002"],
-      enabledMappingIds:["123e4567-e89b-12d3-a456-426614174001"],
-      timeoutSeconds:30,pollMs:5000,nextRunAt:10,evidence:{deletionStarted:{operationId:"op",phase:"deletionStarted",
-        receiptId:receipt,completedAt:10}},deletionProgress:{stage:"verify",commentIndex:0,stateIndex:1,startedAt:11}}};
-  const calls=[],db={async send(command){calls.push(command);
-    if(command.constructor.name.includes("Get"))return {Item:command.input.Key.sk==="EPOCH"?{epoch:7}:item};
-    if(command.constructor.name.includes("TransactWrite")){
-      const tx=command.input.TransactItems;
-      assert.equal(tx[0].ConditionCheck.ConditionExpression,"operationId=:operationId");
-      assert.equal(tx[0].ConditionCheck.ExpressionAttributeValues[":operationId"],"op");
-      assert.equal(tx[1].ConditionCheck.ConditionExpression,"epoch=:epoch");
-      assert.equal(tx[1].ConditionCheck.ExpressionAttributeValues[":epoch"],7);
-      const update=tx[2].Update;
-      assert.match(update.ConditionExpression,/status=:review/);
-      item.status=update.ExpressionAttributeValues[":verifying"];
-      item.lifecycle=update.ExpressionAttributeValues[":lifecycle"];
-      return {};
-    }
-    throw new Error("Unexpected database command");
-  }};
-  const adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
-    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},restoreMappings:async()=>{},
-    finishFence:async()=>{},readFreshSnapshot:async()=>({}),readMappingStates:async ids=>ids.map(id=>({id,state:"Disabled"})),
-    verifyDeletion:async()=>({providersAbsent:true,stateAbsent:true})};
-  try{
-    const store=new ErasureOperationStore(db,()=>"unused",adapters);
-    assert.equal(await store.finalizeVerifiedPostwrite("op"),true);
-    assert.equal(item.status,"verifying");assert.equal(item.lifecycle.phase,"restore_mappings");
-    assert.equal(item.lifecycle.evidence.providerDeletionVerified.operationId,"op");
-    assert.equal(calls.filter(command=>command.constructor.name.includes("TransactWrite")).length,1);
-  }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
-});
-
-test("post-write finalizer leaves ambiguous provider or mapping state fenced",async()=>{
-  const digest=erasurePreviewFingerprint(preview),item={...storedQueuedOperation(),status:"review_required",
-    previewFingerprint:digest,confirmationFingerprint:digest,lifecycle:{phase:"verify_deletion",
-      mappingIds:["123e4567-e89b-12d3-a456-426614174001"],enabledMappingIds:["123e4567-e89b-12d3-a456-426614174001"],timeoutSeconds:30,pollMs:5000,nextRunAt:10,
-      evidence:{deletionStarted:{operationId:"op",phase:"deletionStarted",
-        receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:10}},
-      deletionProgress:{stage:"verify",commentIndex:0,stateIndex:1,startedAt:11}}};
-  const db=memoryDb(item),adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
-    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},restoreMappings:async()=>{},
-    finishFence:async()=>{},readFreshSnapshot:async()=>({}),readMappingStates:async ids=>ids.map(id=>({id,state:"Enabled"})),
-    verifyDeletion:async()=>({providersAbsent:false,stateAbsent:true})};
-  const store=new ErasureOperationStore(db,()=>"unused",adapters);
-  assert.equal(await store.finalizeVerifiedPostwrite("op"),false);
-  assert.equal(db.item.status,"review_required");assert.equal(db.item.lifecycle.phase,"verify_deletion");
-  assert.equal(db.calls.some(command=>command.constructor.name.includes("TransactWrite")),false);
-});
-
 test("fenced executor disables admission, drains, fences, waits out old workers, then drains again",async()=>{
   const events=[];
   await enterFencedErasure({profile:"home",operationId:"op",mappings:["uuid"],timeoutSeconds:30,
@@ -290,7 +306,10 @@ test("worker adapters are bound at construction and request arguments cannot rep
     readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
       providerSnapshotFingerprint:db.item.providerSnapshotFingerprint,inventory:db.item.inventory,actionPlan:db.item.actionPlan}),
     verifyDeletion:async()=>deletionReadback,
-    executeDeletionStep:async(_operation,progress)=>({complete:true,progress:{...progress,stage:"state",stateIndex:0}}),
+    executeDeletionStep:async(_operation,progress)=>{
+      const {attempt,...checkpoint}=progress;
+      return {complete:true,progress:{...checkpoint,stage:"state",stateIndex:0}};
+    },
     beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
     restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
       for(const id of ids)states.set(id,"Enabled");},
@@ -359,6 +378,10 @@ test("worker adapters are bound at construction and request arguments cannot rep
     deletionReadback={providersAbsent:true,stateAbsent:true};
     result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"verify_deletion");
+    assert.equal(db.item.lifecycle.deletionProgress.stage,"state",
+      "the final completed deletion checkpoint is persisted with the phase transition");
+    assert.equal(db.item.lifecycle.deletionProgress.attempt,undefined,
+      "the terminal checkpoint clears the provider write-ahead claim");
     await store.advanceFencedLifecycle("op",attacker);
     assert.equal(db.item.lifecycle.phase,"restore_mappings");assert.equal(db.item.status,"verifying");
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified.operationId,"op");

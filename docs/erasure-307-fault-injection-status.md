@@ -12,7 +12,7 @@ authorization to run deletion/recovery.
 | Calendar 410 and ETag drift | `test/erasure-cross-profile-evidence.test.mjs`; `test/erasure-deletion.test.mjs` | Covered for ambiguous 410 responses and changed event snapshots before deletion. |
 | Missing or repeated scan page | `test/erasure-cross-profile-evidence.test.mjs`; `test/erasure-protocol.test.mjs`; `test/erasure-lambda-inventory.test.mjs` | Covered for pagination loops, incomplete reads and denied Lambda policy reads. |
 | Token replay, expiry or stale evidence | `test/erasure-executor.test.mjs`; `test/erasure-recovery.test.mjs` | Covered for single-use confirmation, expiry and action-time state drift. |
-| Lost commit acknowledgement | `test/erasure-protocol.test.mjs` | Mapping-update acknowledgement loss is covered and retried with readback. **The future post-write marker/fence transaction has no executor, so a lost DynamoDB commit acknowledgement for that transaction is not injectable yet.** |
+| Lost commit acknowledgement | `test/erasure-protocol.test.mjs`; `test/erasure-recovery.test.mjs` | Mapping-update acknowledgement loss and the #484 post-write terminal transaction are covered with readback. The terminal receipt, confirmation removal and fence/journal release are resolved atomically; this is source-level fault injection, not live AWS evidence. |
 | Marker race | `test/erasure-replay-ingress.test.mjs` | Covered for a marker installed between webhook admission and leased enqueue. |
 | Stale/missing leases and fence changes | `test/erasure-protocol.test.mjs`; `test/erasure-executor.test.mjs`; `test/erasure-recovery.test.mjs` | Covered for concurrent fence, active lease, ownership and drain changes. |
 | Cross-profile move | `test/erasure-cross-profile-evidence.test.mjs`; `test/erasure-replay-alias-observation.test.mjs` | Read-only identity following and profile-scoped aliases are covered. A live moved Work-profile item has not been staged. |
@@ -20,11 +20,15 @@ authorization to run deletion/recovery.
 | Qualified Lambda versions | `test/erasure-lambda-inventory.test.mjs`; read-only Windsor IAM simulation report | Inventory and IAM policy simulation cover the current standard qualifiers. Historical bundle admission has not been proven by source tests; live identity paths still need separate review and approved retirement/denial. |
 | Transitional mapping states | `test/erasure-recovery.test.mjs`; `test/erasure-executor.test.mjs` | Reconciliation of original enabled/disabled mappings before fence release is covered at source level. |
 
-The missing post-write executor is intentional while the earlier issue gates
-remain open. Do not treat this matrix as acceptance of that executor. Keep
-`ERASURE_REPLAY_BARRIER_VERSION` off and preserve all active fences until the
-independent writer/IAM review, security approvals and disposable Work-profile
-staging evidence are complete.
+The operation-scoped post-write finalizer from #484 is now implemented and
+covered by source-level tests for complete checkpoints, exact tombstone/provider
+evidence, mapping restoration, transaction conflicts and lost acknowledgements.
+It runs only behind the existing `ERASURE_EXECUTION_ENABLED` gate and protocol
+version 1; it does not introduce a queue or a new feature flag. This matrix is
+not live AWS or disposable Work-profile acceptance. Keep the production gate
+and `ERASURE_REPLAY_BARRIER_VERSION` disabled, and preserve all active fences
+until the independent writer/IAM review, security approvals and remaining
+disposable Work-profile staging evidence are complete.
 
 ## Targeted source-level fault-injection suites (4 Nov 2026, 17:46 UTC)
 
@@ -32,10 +36,10 @@ The 11 test files listed in the fault matrix were run together with the
 repository test environment. The result was 107 tests passed, zero failed,
 zero skipped. Coverage includes the source-level provider failure, paging,
 ETag drift, single-use confirmation, replay marker race, lease/fence, mapping
-state and qualified-inventory regressions described above. This is not live
-queue/DLQ replay, does not inject a lost acknowledgement into the future
-post-write marker/fence transaction (there is no executor for it), and does
-not verify a live cross-profile move or production deployment.
+state, post-write completion transaction conflicts/lost acknowledgements and
+qualified-inventory regressions described above. This is not live queue/DLQ
+replay, does not verify a live cross-profile move or production deployment,
+and does not replace the #347 writer/IAM release review.
 
 Command:
 

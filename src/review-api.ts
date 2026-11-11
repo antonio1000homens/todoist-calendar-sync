@@ -267,34 +267,16 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
 
-    // Rollout-gated, state-only review: never queues recovery or releases a fence.
+    // Post-write inspection is read-only. The existing worker watchdog owns
+    // automatic completion; no per-operation review token or mutating route exists.
     if(segments[0]==="erasure-postwrite-recoveries"&&segments[1]) {
-      const id=segments[1],action=segments[2];
-      const recovery=recoveryService();
+      const id=segments[1],recovery=recoveryService();
       if(method==="GET"&&segments.length===2) {
         const assessment=await recovery.inspectPostWrite(id);
         console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
           event:"postwrite_recovery_evidence_inspected",operationId:id,
           classification:assessment.classification,blockerCount:assessment.blockers.length}));
         return response(200,{assessment});
-      }
-      if(method==="POST"&&segments.length===3&&action==="review-token") {
-        if(Object.keys(body||{}).length)fail(400,"Post-write review token accepts no request fields");
-        const issued=await recovery.issuePostWriteReviewToken(id,actor.subject);
-        return response(200,{...issued});
-      }
-      if(method==="POST"&&segments.length===3&&action==="acknowledge") {
-        if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
-          ||typeof body?.confirmationId!=="string"||body.operationId!==id
-          ||body.phrase!=="REVIEW AND KEEP FENCED"
-          ||!REVIEW_PROFILES.includes(body.profile as Profile))
-          fail(400,"Post-write review requires exact operation, profile and REVIEW AND KEEP FENCED phrase");
-        const reviewed=await recovery.acknowledgePostWriteReview(id,body.confirmationId,actor.subject,{
-          operationId:body.operationId,profile:body.profile as Profile,phrase:body.phrase,
-        });
-        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
-          event:"postwrite_review_recorded_fenced",operationId:id}));
-        return response(200,{review:reviewed});
       }
       return response(404,{error:"not_found"});
     }
@@ -367,14 +349,25 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         executionEnabled:erasureExecutionEnabled(),
         queueReady:erasureExecutionEnabled()&&operation.providerDeletionReady===true,
         backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE,
-        phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
+        phase:operation.postWriteCompletion?"complete":operation.lifecycle?.phase,
+        nextRunAt:operation.lifecycle?.nextRunAt,
         deletionProgress:operation.lifecycle?.deletionProgress?{
           stage:operation.lifecycle.deletionProgress.stage,
           commentsCompleted:operation.lifecycle.deletionProgress.commentIndex,
           stateRowsCompleted:operation.lifecycle.deletionProgress.stateIndex,
         }:undefined,
+        ...(operation.postWriteCompletion?{postWriteCompletion:{
+          completedAt:operation.postWriteCompletion.completedAt,epoch:operation.postWriteCompletion.epoch,
+          originalMappingCount:operation.postWriteCompletion.originalMappingCount,
+          restoredMappingCount:operation.postWriteCompletion.restoredMappingCount,
+          tombstoneRetained:operation.postWriteCompletion.tombstoneRetained,
+          providerDeletesReplayed:operation.postWriteCompletion.providerDeletesReplayed,
+        }}:{}),
         ...(operation.lifecycle?.lastError?{lastError:operation.lifecycle.lastError}:{}),
-        ...(operation.status==="review_required"?{
+        ...(operation.postWriteCompletion?{
+          operatorRecoveryRequired:false,
+          message:"Verified post-write cleanup completed. The operation-owned fence was released, only originally enabled worker mappings were restored, and the 18-day project-comment tombstone was left untouched for normal expiry cleanup."
+        }:operation.status==="review_required"?{
           operatorRecoveryRequired:operation.recovery?.status!=="completed",
           message:operation.recovery?.status==="completed"
             ?"This original erasure was stopped. Profile admission has been safely restored; the previous deletion is never resumed."

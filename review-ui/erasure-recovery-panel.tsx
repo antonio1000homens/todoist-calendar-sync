@@ -1,5 +1,5 @@
 import React, {useEffect,useRef,useState} from "react";
-import {canAcknowledgeFencedPostWrite,canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
+import {canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
 import {
   originalInventoryExplanation,recoveryClassificationExplanation,recoveryDiagnosticRows,
   recoveryComparisonRows,recoveryTombstoneStatus,recoveryIndependentGuard,recoveryNextSafeAction,
@@ -9,20 +9,36 @@ import {
 // Historical operations remain inspectable, but this panel never resumes provider deletion.
 type ErasureApi=(route:string,options?:RequestInit)=>Promise<any>;
 type Operation={operationId:string;profile?:string;status:string;phase?:string;
-  recoveryStatus?:string;operatorRecoveryRequired?:boolean;message?:string};
-type ActionKey="load"|"refreshOperation"|"inspect"|"inspectPostWrite"|"postWriteToken"
-  |"acknowledgePostWrite"|"confirm"|"confirmDrift"|"apply"|"applyDrift"|"refreshRecovery"|"dispatch";
+  recoveryStatus?:string;operatorRecoveryRequired?:boolean;message?:string;
+  postWriteCompletion?:{completedAt:string;epoch:number;originalMappingCount:number;
+    restoredMappingCount:number;tombstoneRetained:boolean;providerDeletesReplayed:boolean}};
+type ActionKey="load"|"refreshOperation"|"inspect"|"inspectPostWrite"
+  |"confirm"|"confirmDrift"|"apply"|"applyDrift"|"refreshRecovery"|"dispatch";
 type ActionResult={action:string;mode:string;at:string;message:string;failed:boolean};
 const actionNames:Record<ActionKey,string>={
   load:"Load operation status",refreshOperation:"Refresh operation status",
   inspect:"Inspect guarded recovery",inspectPostWrite:"Inspect post-write evidence",
-  postWriteToken:"Request fenced-review token",acknowledgePostWrite:"Record fenced review",
   confirm:"Request recovery confirmation",confirmDrift:"Request reviewed Calendar-drift cancellation",
   apply:"Confirm guarded recovery",applyDrift:"Confirm reviewed erasure cancellation",
   refreshRecovery:"Refresh recovery status",dispatch:"Retry existing recovery dispatch",
 };
 const now=()=>new Date().toISOString();
 const formatTime=(value?:string)=>value?new Date(value).toLocaleString():"not yet checked";
+function terminalPostWriteAssessment(operation?:Operation):any {
+  const receipt=operation?.postWriteCompletion;
+  if(!receipt)return undefined;
+  return {
+    operationId:operation!.operationId,profile:operation!.profile,classification:"completed",
+    completionEligible:false,completionBlockers:[],blockers:[],onlyAvailableAction:"completed",
+    completion:{...receipt,status:"completed",automatic:true,tombstoneRetained:true,
+      providerDeletesReplayed:false,fenceReleased:true},
+    evidence:{originalProviderWriteIndicated:true,originalCalendarDeletionSelected:true,
+      exactTodoistAndCalendarTargetsRecorded:true,matchingFence:true,epochVerified:true,
+      leasesDrained:true,providersAbsent:true,stateRowsAbsent:true,mappingStateCount:receipt.originalMappingCount,
+      workerMappingsRestored:true,deletionCheckpointComplete:true,projectTombstonePresent:true,
+      knownCalendarAliasesComplete:true},
+  };
+}
 function LocalResult({result}:{result?:ActionResult}) {
   const resultRef=useRef<HTMLParagraphElement|null>(null);
   useEffect(()=>{if(result)resultRef.current?.focus({preventScroll:true});},[result?.at]);
@@ -39,9 +55,8 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [operationAt,setOperationAt]=useState<string>();
   const [preview,setPreview]=useState<any>(),[inspectionAt,setInspectionAt]=useState<string>();
   const [postWriteAssessment,setPostWriteAssessment]=useState<any>(),[postWriteAt,setPostWriteAt]=useState<string>();
-  const [confirmation,setConfirmation]=useState<any>(),[postWriteToken,setPostWriteToken]=useState<any>();
+  const [confirmation,setConfirmation]=useState<any>();
   const [applyReviewReady,setApplyReviewReady]=useState(false);
-  const [postWriteTyped,setPostWriteTyped]=useState({phrase:"",operationId:"",profile:""});
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
   const [recoveryStatus,setRecoveryStatus]=useState<string>(),[recoveryAt,setRecoveryAt]=useState<string>();
   const [results,setResults]=useState<Partial<Record<ActionKey,ActionResult>>>({});
@@ -52,9 +67,8 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     setOperation(undefined);setOperationAt(undefined);
     setPreview(undefined);setInspectionAt(undefined);
     setPostWriteAssessment(undefined);setPostWriteAt(undefined);
-    setConfirmation(undefined);setPostWriteToken(undefined);setApplyReviewReady(false);
+    setConfirmation(undefined);setApplyReviewReady(false);
     setTyped({phrase:"",operationId:"",profile:""});
-    setPostWriteTyped({phrase:"",operationId:"",profile:""});
     setRecoveryStatus(undefined);setRecoveryAt(undefined);
     setResults({});setBusy(false);setPending(undefined);
   };
@@ -92,8 +106,12 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     void execute("load","Read-only",()=>api("erasure-operations/"+encodeURIComponent(id)),
       result=>{
         setOperation(result.operation);setOperationAt(now());
+        setPostWriteAssessment(terminalPostWriteAssessment(result.operation));
+        setPostWriteAt(result.operation?.postWriteCompletion?now():undefined);
         setRecoveryStatus(result.operation?.recoveryStatus);setRecoveryAt(undefined);
-        return "Operation record loaded. No inspection, recovery execution or provider state changed.";
+        return result.operation?.postWriteCompletion
+          ?"Verified post-write cleanup is complete. The original tombstone remains active and no provider delete was replayed."
+          :"Operation record loaded. No inspection, recovery execution or provider state changed.";
       },error=>messageOf(error,"Operation lookup failed. No state changed."));
   };
   const refresh=()=>{
@@ -103,8 +121,12 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     void execute("refreshOperation","Read-only",()=>api("erasure-operations/"+encodeURIComponent(id)),
       result=>{
         setOperation(result.operation);setOperationAt(now());
+        setPostWriteAssessment(terminalPostWriteAssessment(result.operation));
+        setPostWriteAt(result.operation?.postWriteCompletion?now():undefined);
         setRecoveryStatus(result.operation?.recoveryStatus);setRecoveryAt(undefined);
-        return "Operation record refreshed. Existing recovery evidence was not re-inspected; no state changed.";
+        return result.operation?.postWriteCompletion
+          ?"Verified post-write cleanup is complete. The operation is terminal; no provider delete was replayed."
+          :"Operation record refreshed. Existing recovery evidence was not re-inspected; no state changed.";
       },error=>messageOf(error,"Operation status unavailable; no deletion success can be inferred."));
   };
   const inspect=()=>{
@@ -125,32 +147,15 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   };
   const inspectPostWrite=()=>{
     if(!operation||busy)return;
-    setPostWriteToken(undefined);
-    setPostWriteTyped({phrase:"",operationId:"",profile:""});
     void execute("inspectPostWrite","Read-only",()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)),
       result=>{
         setPostWriteAssessment(result.assessment);setPostWriteAt(now());
-        return "Post-write evidence refreshed. No provider, operation, worker or fence state changed.";
+        return result.assessment?.classification==="completed"
+          ?"Verified post-write cleanup completed. Original mappings were restored and the 18-day tombstone remains active."
+          :result.assessment?.completionEligible
+            ?"Exact known-target evidence is complete. The existing watchdog will automatically finish cleanup; no provider delete will be replayed."
+            :"Post-write evidence refreshed. The operation remains fenced until every exact completion condition is satisfied.";
       },error=>messageOf(error,"Post-write inspection failed; fence remains protected."));
-  };
-  const requestPostWriteToken=()=>{
-    if(!operation||busy||postWriteAssessment?.classification!=="fully_deleted_candidate"
-      ||postWriteAssessment?.reviewStatus==="reviewed_fenced")return;
-    void execute("postWriteToken","Creates review token (metadata write)",
-      ()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/review-token",{method:"POST",body:"{}"}),
-      result=>{setPostWriteToken(result);return "Single-use fenced-review token issued. No deletion, recovery or fence release started.";},
-      error=>{setPostWriteToken(undefined);return messageOf(error,"Post-write review token unavailable; preserve fence.");});
-  };
-  const acknowledgePostWrite=()=>{
-    if(!operation||busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation))return;
-    void execute("acknowledgePostWrite","Records review (metadata write)",
-      ()=>api("erasure-postwrite-recoveries/"+encodeURIComponent(operation.operationId)+"/acknowledge",{
-        method:"POST",body:JSON.stringify({...postWriteTyped,confirmationId:postWriteToken.confirmationId}),
-      }),result=>{
-        setPostWriteToken(undefined);setPostWriteTyped({phrase:"",operationId:"",profile:""});
-        setPostWriteAssessment((value:any)=>({...value,reviewStatus:result.review?.status||"reviewed_fenced"}));
-        return "Evidence review recorded. Profile remains fenced; no sync restoration, provider write or dispatch occurred.";
-      },error=>{setPostWriteToken(undefined);return messageOf(error,"Post-write review rejected; fence remains protected.");});
   };
   const requestConfirmation=(mode:"strict_pre_write"|"calendar_drift_cancel"="strict_pre_write")=>{
     const drift=mode==="calendar_drift_cancel";
@@ -372,35 +377,28 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
             <p>Recovery confirmation is not offered while the independent safety guards are blocked.</p>}
         </section>
         <details className="recovery-scope recovery-postwrite">
-          <summary>5. Post-write evidence — only when provider writes may have begun (read-only inspection)</summary>
-          <p>Expand this only to assess possible deletion progress. Inspecting does not imply deletion happened; review acknowledgement never restores sync or releases the fence.</p>
+          <summary>5. Post-write evidence and automatic completion</summary>
+          <p>Inspection is read-only. The existing erasure watchdog automatically completes a fully verified operation: it restores only the originally enabled mappings, then atomically removes the operation-owned fence. It never repeats a Todoist or Calendar delete and does not require a separate per-operation signoff.</p>
           <button className="secondary" disabled={busy} onClick={inspectPostWrite}>Inspect post-write evidence</button>
-          {pending==="inspectPostWrite"&&<p role="status" aria-live="polite">Reading post-write evidence only…</p>}
+          {pending==="inspectPostWrite"&&<p role="status" aria-live="polite">Reading exact post-write evidence only…</p>}
           <LocalResult result={results.inspectPostWrite}/>
           {postWriteAssessment&&<div className="recovery-evidence">
-            <h5>Last successful post-write inspection · <time dateTime={postWriteAt}>{formatTime(postWriteAt)}</time></h5>
-            <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · fence release: <strong>not authorised</strong></p>
-            <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · original targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · matching fence: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"}</p>
-            <p className="warning">Only safe action: preserve the existing fence. Recording a review cannot approve provider changes, recovery, or fence release.</p>
-            {postWriteAssessment.reviewStatus==="reviewed_fenced"&&<p role="status">Post-write evidence review recorded; still fenced.</p>}
-            {postWriteAssessment.classification==="fully_deleted_candidate"&&!postWriteAssessment.reviewStatus&&!postWriteToken&&
-              <button className="secondary" disabled={busy} onClick={requestPostWriteToken}>Request fenced-review token</button>}
-            {pending==="postWriteToken"&&<p role="status">Requesting a fenced-review token…</p>}
-            <LocalResult result={results.postWriteToken}/>
-            {postWriteToken&&<div className="recovery-evidence">
-              <p>Single-use evidence acknowledgement only. Token expires {new Date(postWriteToken.expiresAt).toLocaleString()}.</p>
-              <label>Type REVIEW AND KEEP FENCED<input autoComplete="off" value={postWriteTyped.phrase} onChange={event=>setPostWriteTyped(value=>({...value,phrase:event.target.value}))}/></label>
-              <label>Repeat operation ID<input autoComplete="off" value={postWriteTyped.operationId} onChange={event=>setPostWriteTyped(value=>({...value,operationId:event.target.value}))}/></label>
-              <label>Repeat profile<input autoComplete="off" value={postWriteTyped.profile} onChange={event=>setPostWriteTyped(value=>({...value,profile:event.target.value}))}/></label>
-              <button disabled={busy||!canAcknowledgeFencedPostWrite(postWriteAssessment,postWriteToken,postWriteTyped,operation)}
-                onClick={acknowledgePostWrite}>Record review (remain fenced)</button>
-            </div>}
-            {pending==="acknowledgePostWrite"&&<p role="status">Recording fenced evidence acknowledgement…</p>}
-            <LocalResult result={results.acknowledgePostWrite}/>
-            {postWriteAssessment.blockers?.length>0&&<details className="recovery-technical">
-              <summary>Post-write safety blockers</summary>
-              <ul>{postWriteAssessment.blockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>
-            </details>}
+            <h5>Post-write result · <time dateTime={postWriteAt}>{formatTime(postWriteAt)}</time></h5>
+            {postWriteAssessment.classification==="completed"?
+              <p role="status">Cleanup completed at {formatTime(postWriteAssessment.completion?.completedAt)}. The original worker mapping states were restored, the operation-owned fence was released, no provider delete was replayed, and the 18-day project-comment tombstone was left untouched for normal expiry cleanup.</p>
+              :<>
+                <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · automatic completion: <strong>{postWriteAssessment.stateCleanupPending?"state cleanup pending":postWriteAssessment.completionEligible?"eligible":"blocked"}</strong></p>
+                <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · exact targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · active fence owned: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"} · tombstone verified: {postWriteAssessment.evidence?.projectTombstonePresent?"yes":"no"} · deletion checkpoints complete: {postWriteAssessment.evidence?.deletionCheckpointComplete?"yes":"no"}</p>
+                {postWriteAssessment.stateCleanupPending?
+                  <p role="status">The exact provider targets are already absent. The existing watchdog is continuing only the original DynamoDB state checkpoint (including eligible delivery-receipt scrubbing), up to ten recorded entries per run. It will not replay a Todoist or Calendar delete. Refresh to see the next checkpoint; uncertain attempts or inventory drift remain fenced.</p>
+                  :postWriteAssessment.completionEligible?
+                    <p role="status">All operation-scoped evidence is satisfied. The existing scheduled watchdog will finish cleanup automatically; no new queue or per-operation approval is needed.</p>
+                    :<p className="warning">The operation remains fenced. The watchdog will not restore sync or release the fence while any completion condition is uncertain.</p>}
+                {!postWriteAssessment.stateCleanupPending&&postWriteAssessment.completionBlockers?.length>0&&<details className="recovery-technical">
+                  <summary>Post-write completion blockers</summary>
+                  <ul>{postWriteAssessment.completionBlockers.map((text:string,i:number)=><li key={i} className="warning">{text}</li>)}</ul>
+                </details>}
+              </>}
           </div>}
         </details>
         <section className="recovery-scope" aria-label="Recovery execution status">

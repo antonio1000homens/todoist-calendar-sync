@@ -63,7 +63,7 @@ test("watchdog queues only independently eligible pre-write recovery, never dele
   t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
   try {
     const result=await inspectStuckErasureRecovery();
-    assert.deepEqual(result,{fenced:1,queued:1,blocked:0});
+    assert.deepEqual(result,{fenced:1,queued:1,completed:0,inProgress:0,blocked:0});
     assert.deepEqual(recoveryCalls,[id]);
     assert.equal(sent.length,1);
     assert.deepEqual(JSON.parse(sent[0].MessageBody),
@@ -75,23 +75,80 @@ test("watchdog queues only independently eligible pre-write recovery, never dele
   }
 });
 
-test("watchdog redelivers a promoted post-write restore phase after a lost queue send",async t=>{
+test("watchdog redelivers verified mapping-restore phases after a lost queue send",async t=>{
   const old={table:process.env.STATE_TABLE_NAME,queue:process.env.ERASURE_OPERATION_QUEUE_URL};
-  process.env.STATE_TABLE_NAME="test-state";process.env.ERASURE_OPERATION_QUEUE_URL="https://sqs.example/erasure";
+  process.env.STATE_TABLE_NAME="test-state";
+  process.env.ERASURE_OPERATION_QUEUE_URL="https://sqs.example/erasure";
   const id="44da2340-b5a1-4fe3-b5d4-a0ea146cbf4b",sent=[];
   t.mock.method(documentClient,"send",async()=>({Responses:{"test-state":[
     {pk:"ERASURE#work",sk:"FENCE",operationId:id}
   ]}}));
-  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({operationId:id,profile:"work",status:"verifying",
-    lifecycle:{phase:"restore_mappings"}}));
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({
+    operationId:id,profile:"work",status:"verifying",lifecycle:{phase:"restore_mappings"},
+  }));
   t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
-  try{
+  try {
     const result=await inspectStuckErasureRecovery();
-    assert.deepEqual(result,{fenced:1,queued:1,blocked:0});
+    assert.deepEqual(result,{fenced:1,queued:1,completed:0,inProgress:0,blocked:0});
+    assert.equal(sent.length,1);
     assert.deepEqual(JSON.parse(sent[0].MessageBody),{version:1,operationId:id});
-  }finally{
+  } finally {
     for(const [key,value] of Object.entries({STATE_TABLE_NAME:old.table,ERASURE_OPERATION_QUEUE_URL:old.queue}))
       if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }
+});
+
+test("watchdog automatically completes verified post-write operations without a new queue",async t=>{
+  const old=process.env.STATE_TABLE_NAME;
+  process.env.STATE_TABLE_NAME="test-state";
+  const id="44da2340-b5a1-4fe3-b5d4-a0ea146cbf4b",sent=[],preWriteCalls=[];
+  t.mock.method(documentClient,"send",async()=>({Responses:{"test-state":[
+    {pk:"ERASURE#work",sk:"FENCE",operationId:id}
+  ]}}));
+  t.mock.method(ErasureOperationStore.prototype,"get",async idValue=>({
+    operationId:idValue,profile:"work",status:"review_required",providerDeletionReady:true,
+    lifecycle:{phase:"verify_deletion",evidence:{deletionStarted:{operationId:idValue,phase:"deletionStarted"}}},
+  }));
+  t.mock.method(ErasureRecoveryService.prototype,"completePostWriteIfSafe",
+    async operationId=>({status:operationId===id?"completed":"blocked",blockers:[]}));
+  t.mock.method(ErasureRecoveryService.prototype,"startAutomaticPreWriteRecovery",
+    async operationId=>{preWriteCalls.push(operationId);return {queued:true,blockerCount:0};});
+  t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
+  try {
+    const result=await inspectStuckErasureRecovery();
+    assert.deepEqual(result,{fenced:1,queued:0,completed:1,inProgress:0,blocked:0});
+    assert.deepEqual(preWriteCalls,[]);
+    assert.deepEqual(sent,[],"post-write completion does not create or dispatch a new queue message");
+  } finally {
+    if(old===undefined)delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME=old;
+  }
+});
+
+test("watchdog records bounded state-cleanup progress without creating a new queue",async t=>{
+  const old=process.env.STATE_TABLE_NAME;
+  process.env.STATE_TABLE_NAME="test-state";
+  const id="44da2340-b5a1-4fe3-b5d4-a0ea146cbf4b",sent=[],preWriteCalls=[];
+  t.mock.method(documentClient,"send",async()=>({Responses:{"test-state":[
+    {pk:"ERASURE#work",sk:"FENCE",operationId:id}
+  ]}}));
+  t.mock.method(ErasureOperationStore.prototype,"get",async idValue=>({
+    operationId:idValue,profile:"work",status:"review_required",providerDeletionReady:true,
+    lifecycle:{phase:"delete",deletionProgress:{stage:"state",stateIndex:1}},
+  }));
+  t.mock.method(ErasureRecoveryService.prototype,"completePostWriteIfSafe",
+    async operationId=>({status:operationId===id?"in_progress":"blocked",blockers:["state cleanup advanced"]}));
+  t.mock.method(ErasureRecoveryService.prototype,"startAutomaticPreWriteRecovery",
+    async operationId=>{preWriteCalls.push(operationId);return {queued:true,blockerCount:0};});
+  t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
+  try {
+    const result=await inspectStuckErasureRecovery();
+    assert.deepEqual(result,{fenced:1,queued:0,completed:0,inProgress:1,blocked:0});
+    assert.deepEqual(preWriteCalls,[]);
+    assert.deepEqual(sent,[],"state cleanup is advanced by the existing watchdog, not a new queue");
+  } finally {
+    if(old===undefined)delete process.env.STATE_TABLE_NAME;
+    else process.env.STATE_TABLE_NAME=old;
   }
 });
 

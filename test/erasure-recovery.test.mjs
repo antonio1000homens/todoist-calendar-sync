@@ -7,6 +7,8 @@ const enabledId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
+process.env.ERASURE_PROTOCOL_VERSION="1";
+process.env.ERASURE_EXECUTION_ENABLED="true";
 
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
@@ -31,14 +33,16 @@ function fixture(options={}) {
   Object.assign(operation,options.operation||{});
   Object.assign(external,options.external||{});
   const opKey="ERASURE_OPERATION#op-recovery";
-  let confirmation,postwriteToken;
+  let confirmation,postwriteToken,erasureConfirmation;
   const db={
     async send(command) {
       const kind=command.constructor.name;
       const input=command.input;
       if(kind==="GetCommand") {
         if(input.Key.pk===opKey)return {Item:operation};
+        if(input.Key.pk==="ERASURE_CONFIRMATION#op-recovery")return {Item:erasureConfirmation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
+        if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         return {Item:undefined};
       }
@@ -66,6 +70,30 @@ function fixture(options={}) {
       }
       if(kind==="TransactWriteCommand") {
         external.writes.push(input);
+        if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.includes("postWriteCompletion=:completion"))) {
+          if(options.failPostwriteCompletion)
+            throw Object.assign(new Error("Completion transaction conflict"),{name:"TransactionCanceledException"});
+          const update=input.TransactItems.find(x=>x.Update?.UpdateExpression?.includes("postWriteCompletion=:completion")).Update;
+          assert.match(update.UpdateExpression,/REMOVE #target/);
+          assert.match(update.ConditionExpression,/attribute_not_exists\(lifecycle\.#progress\.#attempt\)/);
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="FENCE"));
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="JOURNAL"));
+          const receipt=update.ExpressionAttributeValues[":completion"];
+          operation.status="succeeded";
+          operation.postWriteCompletion=receipt;
+          operation.updatedAt=receipt.completedAt;
+          for(const key of ["target","selectedActions","previewFingerprint","providerSnapshotFingerprint",
+            "confirmationFingerprint","confirmationId","providerDeletionReady","inventory","actionPlan",
+            "lifecycle","recovery","postwriteReview","requestId","result","error"])delete operation[key];
+          erasureConfirmation=undefined;confirmation=undefined;postwriteToken=undefined;
+          external.control=external.control.filter(x=>!["FENCE","JOURNAL"].includes(x.sk));
+          if(options.losePostwriteCompletionAck)throw new Error("Lost completion acknowledgement");
+          return {};
+        }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET postwriteReview=:review"))){
           if(options.failPostwriteTransaction)throw Object.assign(new Error("Transaction conflict"),{name:"TransactionCanceledException"});
           assert.equal(operation.postwriteReview,undefined);
@@ -124,8 +152,106 @@ function fixture(options={}) {
   };
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
-  return {service,operation,external,db,get confirmation(){return confirmation;},
-    get postwriteToken(){return postwriteToken;}};
+  return {service,operation,external,db,
+    get postwriteToken(){return postwriteToken;},
+    set postwriteToken(value){postwriteToken=value;},
+    get confirmation(){return confirmation;},
+    set confirmation(value){confirmation=value;},
+    get erasureConfirmation(){return erasureConfirmation;},
+    set erasureConfirmation(value){erasureConfirmation=value;}};
+}
+
+function postWriteCompletionFixture(options={}) {
+  const f=fixture(options);
+  const projectCommentId="project-comment-1";
+  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:{id:"disposable-event",calendarId:"work-calendar",digest:"3".repeat(64),etag:"original-etag"},
+    knownCalendarAliases:[{profile:"work",calendarId:"work-calendar",eventId:"disposable-event"}],
+    knownCalendarAliasesComplete:true,
+    projectCommentIds:[projectCommentId],
+    comments:[{id:projectCommentId,kind:"project",digest:"4".repeat(64)}],
+  };
+  f.operation.inventory=[];
+  f.operation.providerSnapshotFingerprint="1".repeat(64);
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.confirmationId="erasure-confirm";
+  f.operation.providerDeletionReady=true;
+  f.operation.status="review_required";
+  const startedAt=Date.now()-60_000;
+  f.operation.lifecycle={
+    phase:"verify_deletion",mappingIds:[enabledId,disabledId],enabledMappingIds:[enabledId],
+    timeoutSeconds:30,pollMs:5000,nextRunAt:0,
+    evidence:{
+      fenceInstalled:{operationId:"op-recovery",phase:"fenceInstalled",receiptId,completedAt:startedAt-40_000},
+      deletionStarted:{operationId:"op-recovery",phase:"deletionStarted",
+        receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:startedAt-10_000},
+    },
+    deletionProgress:{stage:"verify",commentIndex:1,stateIndex:0,startedAt},
+  };
+  f.operation.updatedAt="2026-11-11T20:00:00.000Z";
+  f.erasureConfirmation={pk:"ERASURE_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"consumed",operationId:"op-recovery",confirmationId:"erasure-confirm",
+    consumedBy:"op-recovery",previewFingerprint:f.operation.previewFingerprint};
+  f.confirmation={pk:"ERASURE_RECOVERY_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"issued",operationId:"op-recovery",inspectedFingerprint:"old-recovery-token"};
+  f.postwriteToken={pk:"ERASURE_POSTWRITE_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"issued",operationId:"op-recovery",postflightFingerprint:"old-postwrite-token"};
+  const snapshot={
+    operationId:"op-recovery",profile:"work",target:f.operation.target,
+    selectedActions:f.operation.selectedActions,inventory:[],
+    actionPlan:{comments:[],projectCommentIds:[],knownCalendarAliases:f.operation.actionPlan.knownCalendarAliases,
+      knownCalendarAliasesComplete:true},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
+    projectTombstone:{status:"present",recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
+      recordedCommentCount:1,foundCommentCount:1},
+  };
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  f.external.knownTargetSnapshot=snapshot;
+  Object.assign(f.operation,options.operation||{});
+  Object.assign(f.external,options.external||{});
+  return f;
+}
+
+function postWriteStateCleanupFixture() {
+  const f=postWriteCompletionFixture();
+  const row={type:"DELIVERY",key:{pk:"DELIVERY#original",sk:"STATE"},
+    digest:"e".repeat(64),classification:"attributable",
+    receiptCleanup:"scrub_identity_refs",scrubbedDigest:"f".repeat(64)};
+  f.operation.inventory=[row];
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.lifecycle.phase="delete";
+  f.operation.lifecycle.deletionProgress={stage:"state",commentIndex:1,stateIndex:0,startedAt:Date.now()-60_000};
+  f.erasureConfirmation.previewFingerprint=f.operation.previewFingerprint;
+  f.external.knownTargetSnapshot.inventory=[row];
+  f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);
+  f.external.snapshot=f.external.knownTargetSnapshot;
+  let advances=0;
+  f.service.erasures.advanceFencedLifecycle=async()=>{
+    advances++;
+    if(advances===1) {
+      f.operation.lifecycle.deletionProgress={...f.operation.lifecycle.deletionProgress,stateIndex:1};
+      f.operation.updatedAt="2026-11-11T20:01:00.000Z";
+      f.external.knownTargetSnapshot.inventory=[];
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);
+      return {phase:"delete",nextRunAt:0,status:"review_required",waiting:false};
+    }
+    if(advances===2) {
+      f.operation.lifecycle.deletionProgress={...f.operation.lifecycle.deletionProgress,stage:"verify"};
+      f.operation.updatedAt="2026-11-11T20:02:00.000Z";
+      return {phase:"delete",nextRunAt:0,status:"review_required",waiting:false};
+    }
+    f.operation.lifecycle.phase="verify_deletion";
+    f.operation.updatedAt="2026-11-11T20:03:00.000Z";
+    return {phase:"verify_deletion",nextRunAt:0,status:"review_required",waiting:false};
+  };
+  Object.defineProperty(f,"advances",{get:()=>advances});
+  return f;
 }
 
 function timedOutProjectCommentFixture({ageMs=60_000,stage="comments"}={}) {
@@ -628,44 +754,159 @@ test("independent post-write preview never issues a confirmation, writes state, 
   assert.ok(external.control.some(row=>row.sk==="FENCE"));
 });
 
-test("strong exact postflight is a read-only candidate only with an original deletion receipt",async()=>{
-  const f=fixture();
-  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
-  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
-  f.operation.actionPlan={
-    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
-    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
-    comments:[],
-  };
-  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
-  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
-  f.operation.lifecycle.phase="verify_deletion";
-  f.operation.lifecycle.evidence.deletionStarted={
-    operationId:"op-recovery",phase:"deletionStarted",
-    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
-  };
-  const snapshot={
-    operationId:"op-recovery",profile:"work",target:f.operation.target,
-    selectedActions:f.operation.selectedActions,inventory:[],
-    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
-    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
-  };
-  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
-  f.external.snapshot=snapshot;
-  f.external.knownTargetSnapshot=snapshot;
+test("strong exact postflight is a read-only candidate only with complete deletion checkpoints and its active tombstone",async()=>{
+  const f=postWriteCompletionFixture();
   const assessment=await f.service.inspectPostWrite("op-recovery");
   assert.equal(assessment.classification,"fully_deleted_candidate");
   assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.completionEligible,true);
+  assert.equal(assessment.onlyAvailableAction,"automatic_completion_pending");
   assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(assessment.evidence.deletionCheckpointComplete,true);
+  assert.equal(assessment.evidence.projectTombstonePresent,true);
+  assert.equal(assessment.evidence.knownCalendarAliasesComplete,true);
   assert.equal(f.external.writes.length,0);
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
   assert.equal(f.external.knownTargetCalls,1);
   // A stale or malformed fingerprint must not count as fully verified absence.
-  snapshot.previewFingerprint="0".repeat(64);
+  f.external.knownTargetSnapshot.previewFingerprint="0".repeat(64);
   const unsafe=await f.service.inspectPostWrite("op-recovery");
   assert.equal(unsafe.classification,"partial_or_ambiguous");
-  assert.equal(unsafe.releaseAllowed,false);
+  assert.equal(unsafe.completionEligible,false);
   assert.equal(f.external.writes.length,0);
+});
+
+test("read-only inspection identifies exact state cleanup as automatic pending work",async()=>{
+  const f=postWriteStateCleanupFixture();
+  const assessment=await f.service.inspectPostWrite("op-recovery");
+  assert.equal(assessment.classification,"partial_or_ambiguous");
+  assert.equal(assessment.completionEligible,false);
+  assert.equal(assessment.stateCleanupPending,true);
+  assert.equal(assessment.onlyAvailableAction,"automatic_state_cleanup_pending");
+  assert.match(assessment.completionBlockers[0],/watchdog will remove or scrub only the remaining recorded rows/i);
+  assert.equal(f.advances,0,"inspection never advances a deletion checkpoint");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+});
+
+test("automatic post-write completion restores only recorded mappings and atomically retires identities",async()=>{
+  const f=postWriteCompletionFixture();
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.mappingStates.get(enabledId),"Enabled");
+  assert.equal(f.external.mappingStates.get(disabledId),"Disabled");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.operation.postWriteCompletion.providerDeletesReplayed,false);
+  assert.equal(f.operation.postWriteCompletion.tombstoneRetained,true);
+  assert.equal(f.operation.postWriteCompletion.originalMappingCount,2);
+  assert.equal(f.operation.postWriteCompletion.restoredMappingCount,1);
+  assert.equal(f.operation.target,undefined);
+  assert.equal(f.operation.actionPlan,undefined);
+  assert.equal(f.operation.inventory,undefined);
+  assert.equal(f.operation.previewFingerprint,undefined);
+  assert.equal(JSON.stringify(f.operation).includes("disposable-1"),false);
+  assert.equal(JSON.stringify(f.operation).includes("disposable-event"),false);
+  assert.equal(f.erasureConfirmation,undefined);
+  assert.equal(f.confirmation,undefined,"any old pre-write recovery confirmation is invalidated");
+  assert.equal(f.postwriteToken,undefined,"any legacy post-write token is invalidated");
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.control.some(row=>row.sk==="JOURNAL"),false);
+  assert.equal(f.external.control.find(row=>row.sk==="EPOCH").epoch,7);
+  assert.equal(f.external.knownTargetCalls,1);
+  assert.equal(f.external.providerCalls,0);
+  assert.equal(f.external.snapshot.projectTombstone.status,"present",
+    "the original project-comment tombstone is not removed by completion");
+  assert.equal(f.external.writes.length,1,"only the atomic completion transaction is written");
+  assert.equal((await f.service.inspectPostWrite("op-recovery")).classification,"completed");
+  assert.equal((await f.service.completePostWriteIfSafe("op-recovery")).status,"completed",
+    "repeated completion is a terminal no-op");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.writes.length,1);
+});
+
+test("post-write finalizer resumes only the original state checkpoint and scrubs eligible delivery receipts",async()=>{
+  const f=postWriteStateCleanupFixture();
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.equal(f.advances,3,"one state-row step, one empty-state checkpoint, then the verify checkpoint");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.mappingStates.get(enabledId),"Enabled");
+  assert.equal(f.external.mappingStates.get(disabledId),"Disabled");
+  assert.equal(f.external.providerCalls,0,"no Todoist or Calendar delete is replayed");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.operation.postWriteCompletion.providerDeletesReplayed,false);
+  assert.equal(f.operation.postWriteCompletion.tombstoneRetained,true);
+  assert.equal(f.external.snapshot.inventory.length,0);
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.writes.length,1,"only the final atomic completion transaction is written by the recovery service");
+});
+
+test("post-write completion resolves a lost transaction acknowledgement by terminal readback",async()=>{
+  const f=postWriteCompletionFixture({losePostwriteCompletionAck:true});
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.writes.length,1);
+});
+
+test("post-write completion fails closed for incomplete or ambiguous evidence",async()=>{
+  const cases=[
+    ["write-ahead attempt",f=>{f.operation.lifecycle.deletionProgress.attempt={startedAt:Date.now()};}],
+    ["incomplete checkpoint",f=>{f.operation.lifecycle.deletionProgress.stage="todoist";}],
+    ["missing tombstone",f=>{f.external.knownTargetSnapshot.projectTombstone.status="missing";
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);}],
+    ["provider still present",f=>{f.external.knownTargetSnapshot.knownTargetReadback.calendar="present";
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);}],
+    ["active writer lease",f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#active",operationId:"other"});}],
+    ["wrong fence owner",f=>{f.external.control.find(row=>row.sk==="FENCE").operationId="other";}],
+    ["originally disabled mapping enabled",f=>{f.external.mappingStates.set(disabledId,"Enabled");}],
+    ["missing original mapping",f=>{f.external.mappingInventory=[enabledId];}],
+    ["provider deletion approval missing",f=>{f.operation.providerDeletionReady=false;}],
+    ["recovery already recorded",f=>{f.operation.recovery={status:"queued"};}],
+  ];
+  for(const [name,mutate] of cases) {
+    const f=postWriteCompletionFixture();
+    mutate(f);
+    const result=await f.service.completePostWriteIfSafe("op-recovery");
+    assert.equal(result.status,"blocked",name);
+    assert.ok(result.blockers.length>0,name);
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"),name);
+    assert.equal(f.operation.status,"review_required",name);
+    assert.equal(f.external.restored.length,0,name);
+    assert.equal(f.external.writes.length,0,name);
+  }
+});
+
+test("post-write completion honours the existing deployment gate without a new per-operation signoff",async()=>{
+  const old=process.env.ERASURE_EXECUTION_ENABLED;
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  try {
+    const f=postWriteCompletionFixture();
+    const assessment=await f.service.inspectPostWrite("op-recovery");
+    assert.equal(assessment.classification,"fully_deleted_candidate");
+    assert.equal(assessment.completionEligible,false);
+    assert.ok(assessment.completionBlockers.some(item=>item.includes("existing erasure execution gate")));
+    const result=await f.service.completePostWriteIfSafe("op-recovery");
+    assert.equal(result.status,"blocked");
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+    assert.equal(f.external.restored.length,0);
+    assert.equal(f.external.writes.length,0);
+  } finally {
+    if(old===undefined)delete process.env.ERASURE_EXECUTION_ENABLED;
+    else process.env.ERASURE_EXECUTION_ENABLED=old;
+  }
+});
+
+test("post-write completion stays fenced when the atomic release transaction conflicts",async()=>{
+  const f=postWriteCompletionFixture({failPostwriteCompletion:true});
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"blocked");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(f.operation.status,"review_required");
+  assert.deepEqual(f.external.restored,[enabledId],
+    "only the originally enabled mapping may be restored before the conditional release");
+  assert.equal(f.operation.target.eventId,"disposable-event");
 });
 
 test("post-write inspection with an active lease exposes a blocker but never changes controls",async()=>{
@@ -846,134 +1087,6 @@ test("phase escalation cannot bypass durable timeout and lease-drain receipts",a
     assert.match(inspected.preview.blockers.join(" "),/durable receipt/i);
     assert.equal(f.external.writes.length,0);
   }
-});
-
-const postwriteReviewToken="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
-function fullyDeletedPostWriteFixture(options={}) {
-  const f=fixture({...options,token:postwriteReviewToken});
-  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
-  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
-  f.operation.actionPlan={
-    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
-    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
-    comments:[],
-  };
-  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
-  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
-  f.operation.lifecycle.phase="verify_deletion";
-  f.operation.lifecycle.evidence.deletionStarted={
-    operationId:"op-recovery",phase:"deletionStarted",
-    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
-  };
-  f.external.mappingStates.set(enabledId,"Enabled");
-  const snapshot={operationId:"op-recovery",profile:"work",target:f.operation.target,
-    selectedActions:f.operation.selectedActions,inventory:[],actionPlan:{comments:[]},
-    providerSnapshotFingerprint:"9".repeat(64),blockers:[],
-    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"}};
-  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
-  f.external.snapshot=snapshot;
-  f.external.knownTargetSnapshot=snapshot;
-  return f;
-}
-const typedReview={operationId:"op-recovery",profile:"work",phrase:"REVIEW AND KEEP FENCED"};
-
-test("post-write review token needs no feature flag and never changes the fence",async()=>{
-  const f=fullyDeletedPostWriteFixture();
-  const issued=await f.service.issuePostWriteReviewToken("op-recovery","operator");
-  assert.equal(issued.releaseAllowed,false);
-  assert.equal(f.external.writes.length,1,"only a short-lived review token is written");
-  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
-});
-
-test("single-use post-write review token binds fresh evidence and records only a still-fenced disposition",async()=>{
-  const f=fullyDeletedPostWriteFixture();
-  const issued=await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
-  assert.equal(issued.confirmationId,postwriteReviewToken);
-  assert.equal(issued.releaseAllowed,false);
-  assert.ok(issued.expiresAt>Date.now());
-  assert.equal(f.postwriteToken.status,"issued");
-  assert.equal(f.external.writes.length,1,"issue only an expiring confirmation");
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"wrong-operator",typedReview),
-    /expired, consumed or changed/);
-  for(const invalid of [
-    {...typedReview,phrase:"RESTORE SYNC"},
-    {...typedReview,operationId:"different"},
-  ]) await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",invalid),
-    /Exact typed/);
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",
-      {...typedReview,profile:"home"}),/expired, consumed or changed/);
-  assert.equal(f.operation.postwriteReview,undefined);
-  const result=await f.service.acknowledgePostWriteReview(
-    "op-recovery",postwriteReviewToken,"operator-1",typedReview);
-  assert.deepEqual(result,{status:"reviewed_fenced",releaseAllowed:false});
-  assert.equal(f.operation.postwriteReview.status,"reviewed_fenced");
-  assert.equal(f.operation.postwriteReview.mode,"post_write");
-  assert.equal(f.operation.postwriteReview.epoch,7);
-  assert.equal(f.operation.recovery,undefined,"recovery worker is never started");
-  assert.equal(f.postwriteToken.status,"consumed");
-  assert.equal(f.postwriteToken.operator,undefined,"do not retain operator PII after token consumption");
-  assert.equal(f.postwriteToken.expiresAt,undefined,"consumed proof survives TTL until atomic future release");
-  assert.equal(f.external.restored.length,0);
-  assert.ok(f.external.control.some(x=>x.sk==="FENCE"),"fence must remain active");
-  const receipt=f.external.writes.at(-1);
-  assert.ok(receipt.TransactItems.every(x=>x.Update||x.ConditionCheck));
-  assert.ok(receipt.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="JOURNAL"));
-  const assessment=await f.service.inspectPostWrite("op-recovery");
-  assert.equal(assessment.reviewStatus,"reviewed_fenced");
-  assert.equal(assessment.releaseAllowed,false);
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
-    /expired, consumed or changed/);
-  await assert.rejects(f.service.issuePostWriteReviewToken("op-recovery","operator-1"),/fresh, fully deleted/);
-});
-
-test("expired token and provider snapshot drift are rejected without consuming the token",async()=>{
-  const f=fullyDeletedPostWriteFixture();
-  await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
-  f.postwriteToken.expiresAtMs=Date.now()-1000;
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),/expired/);
-  assert.equal(f.operation.postwriteReview,undefined);
-  f.postwriteToken.expiresAtMs=Date.now()+60000;
-  f.external.snapshot.previewFingerprint="0".repeat(64);
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),/fresh, fully deleted/);
-  assert.equal(f.operation.postwriteReview,undefined);
-  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
-});
-
-test("fence, epoch, lease, mapping, and original selection drift reject token use",async()=>{
-  for(const change of [
-    f=>{f.external.control.find(x=>x.sk==="FENCE").operationId="another-operation";},
-    f=>{f.external.control.find(x=>x.sk==="EPOCH").epoch=8;},
-    f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#late",owner:"late"});},
-    f=>{f.external.mappingStates.set(enabledId,"Disabled");},
-    f=>{f.operation.selectedActions.deleteCalendar=false;},
-    f=>{f.operation.updatedAt="2026-11-03T00:00:00Z";},
-  ]) {
-    const f=fullyDeletedPostWriteFixture();
-    await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
-    change(f);
-    await assert.rejects(
-      f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
-      /fresh, fully deleted|drifted/);
-    assert.equal(f.operation.postwriteReview,undefined);
-    assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
-  }
-});
-
-test("conditional review transaction failure leaves token issued and fence untouched",async()=>{
-  const f=fullyDeletedPostWriteFixture({failPostwriteTransaction:true});
-  await f.service.issuePostWriteReviewToken("op-recovery","operator-1");
-  await assert.rejects(
-    f.service.acknowledgePostWriteReview("op-recovery",postwriteReviewToken,"operator-1",typedReview),
-    /state changed/);
-  assert.equal(f.operation.postwriteReview,undefined);
-  assert.equal(f.postwriteToken.status,"issued");
-  assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
 });
 
 test("read-only structured diagnostics verify every pre-write condition without issuing writes",async()=>{

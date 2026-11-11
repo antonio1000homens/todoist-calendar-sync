@@ -34,6 +34,16 @@ export interface FencedLifecycle {
 export type FencedEvidenceKey = "mappingsDisableRequested" | "mappingsDisabled" | "preFenceDrain" | "fenceInstalled"
   | "workerTimeoutElapsed" | "postTimeoutDrain" | "deletionStarted" | "providerDeletionVerified" | "mappingsRestored" | "fenceReleased";
 export interface FencedReceipt { operationId: string; phase: FencedEvidenceKey; receiptId: string; completedAt: number }
+export interface ErasurePostWriteCompletionReceipt {
+  mode:"known_identity_post_write";
+  status:"completed";
+  completedAt:string;
+  epoch:number;
+  originalMappingCount:number;
+  restoredMappingCount:number;
+  tombstoneRetained:true;
+  providerDeletesReplayed:false;
+}
 export interface ErasureOperation {
   operationId: string;
   profile: Profile;
@@ -42,7 +52,7 @@ export interface ErasureOperation {
   providerSnapshotFingerprint: string;
   confirmationFingerprint: string;
   confirmationId: string;
-  /** Set only by a future trusted executor release that wires provider deletion and readback. */
+  /** Set only by the trusted, deployment-gated provider deletion workflow. */
   providerDeletionReady?: boolean;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
   inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string;
@@ -52,12 +62,14 @@ export interface ErasureOperation {
   status: ErasureOperationStatus;
   lifecycle?: FencedLifecycle;
   recovery?: import("./erasure-recovery.js").RecoveryState;
-  /** Post-write operator acknowledgement only: no executor, admission or fence release. */
+  /** Legacy fenced-only review metadata; never authorises or gates completion. */
   postwriteReview?: {
     mode:"post_write";status:"reviewed_fenced";epoch:number;
     confirmationId:string;inspectedFingerprint:string;postflightFingerprint:string;
     reviewedAt:string;
   };
+  /** Identity-free terminal receipt retained after verified post-write completion. */
+  postWriteCompletion?:ErasurePostWriteCompletionReceipt;
   createdAt: string;
   updatedAt: string;
   requestId?: string;
@@ -83,7 +95,7 @@ export interface FencedLifecycleAdapters {
   listWorkerMappings(): Promise<FencedMapping[]>;
   disableMappings(ids: string[]): Promise<void>;
   mappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
-  inspectFence(profile: string): Promise<{ fence?: { operationId?: string;epoch?:number }; leases: unknown[] }>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
   beginFence(profile: string, operationId: string): Promise<void>;
   restoreMappings(ids: string[]): Promise<void>;
   finishFence(profile: string, operationId: string): Promise<void>;
@@ -94,7 +106,7 @@ export interface ErasureDeletionVerifier {
 export interface ErasureSnapshotReader {
   readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId"> & {blockers?:string[]}>;
   readMappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
-  inspectFence(profile: string): Promise<{ fence?: { operationId?: string;epoch?:number }; leases: unknown[] }>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
 }
 export interface ErasureDeletionStepResult { progress: ErasureDeletionProgress; complete: boolean }
 export interface ErasureDeletionWorker {
@@ -190,7 +202,6 @@ function confirmedCompletionProof(operation:ErasureOperation,epoch:number) {
     confirmationId:operation.confirmationId,previewFingerprint:operation.previewFingerprint,epoch};
 }
 const defaultFencePollMs=5_000;
-const uuidPattern=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   disable_mappings:["disable_mappings","confirm_disabled"],
   confirm_disabled:["confirm_disabled","drain_before_fence"],
@@ -355,8 +366,23 @@ export class ErasureOperationStore {
   }> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
-    if(!operation || !current || !["fencing","deleting","verifying"].includes(operation.status))
+    const deletionStarted=current?.evidence.deletionStarted;
+    const fenceInstalled=current?.evidence.fenceInstalled;
+    const postWriteStateOnly=operation?.status==="review_required"&&current?.phase==="delete"
+      &&["state","verify"].includes(current.deletionProgress?.stage||"")
+      &&!current.deletionProgress?.attempt&&operation.providerDeletionReady===true
+      &&operation.confirmationId!==undefined&&operation.confirmationFingerprint===operation.previewFingerprint
+      &&operation.target.deleteCalendar===true&&operation.selectedActions.deleteTodoist===true
+      &&operation.selectedActions.deleteCalendar===true
+      &&deletionStarted?.operationId===operation.operationId&&deletionStarted.phase==="deletionStarted"
+      &&/^[0-9a-f-]{36}$/i.test(deletionStarted.receiptId)&&Number.isFinite(deletionStarted.completedAt)
+      &&fenceInstalled?.operationId===operation.operationId&&fenceInstalled.phase==="fenceInstalled"
+      &&/^[0-9a-f-]{36}$/i.test(fenceInstalled.receiptId)&&Number.isFinite(fenceInstalled.completedAt);
+    if(!operation || !current
+      ||(!["fencing","deleting","verifying"].includes(operation.status)&&!postWriteStateOnly))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
+    if(postWriteStateOnly&&erasurePreviewFingerprint(operation)!==operation.previewFingerprint)
+      throw new ErasureGateDriftError();
     if(operation.providerDeletionReady!==true) throw new Error("Erasure executor is disabled; the active fence must remain for break-glass review");
     const adapters=this.#worker();
     const now=Date.now();
@@ -414,11 +440,16 @@ export class ErasureOperationStore {
           }
           const progress=current.deletionProgress
             ||{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now};
-          const attempt=await this.#claimDeletionAttempt(operation,current,progress,now);
+          const attempt=await this.#claimDeletionAttempt(operation,current,progress,now,operation.status);
           operation.lifecycle={...current,deletionProgress:{...progress,attempt}};
           const result=await adapters.executeDeletionStep(operation,operation.lifecycle.deletionProgress!);
-          if(result.complete) next=this.#advance(operation.operationId,current,"verify_deletion",now);
-          else next={...current,deletionProgress:result.progress,nextRunAt:now};
+          if(result.complete) {
+            next=this.#advance(operation.operationId,current,"verify_deletion",now);
+            // Preserve the final checkpoint (including the cleared write-ahead
+            // claim). Recovery can distinguish completed steps from an uncertain
+            // provider acknowledgement without replaying a destructive action.
+            next.deletionProgress=result.progress;
+          } else next={...current,deletionProgress:result.progress,nextRunAt:now};
           break;
         }
         case "verify_deletion": {
@@ -482,76 +513,6 @@ export class ErasureOperationStore {
     }
     await this.#persistLifecycle(operation,next,nextStatus,now);
     return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus,waiting:next.nextRunAt>now};
-  }
-
-  /** Promote only a fully completed post-write checkpoint back into the normal
-   * verified restore/release lifecycle. This does not repeat provider writes. */
-  async finalizeVerifiedPostwrite(id:string):Promise<boolean> {
-    const operation=await this.get(id);
-    const current=operation?.lifecycle;
-    const started=current?.evidence?.deletionStarted;
-    const progress=current?.deletionProgress;
-    if(!operation||operation.status!=="review_required"||!current
-      ||current.phase!=="verify_deletion"||progress?.stage!=="verify"||progress.attempt
-      ||progress.commentIndex!==operation.actionPlan.comments.length
-      ||progress.stateIndex!==operation.inventory.length
-      ||(progress.finalCommentIndex!==undefined
-        &&progress.finalCommentIndex!==(operation.actionPlan.projectCommentIds||[]).length)
-      ||!Array.isArray(current.mappingIds)||!current.mappingIds.length
-      ||new Set(current.mappingIds).size!==current.mappingIds.length
-      ||current.mappingIds.some(mappingId=>!uuidPattern.test(mappingId))
-      ||!Array.isArray(current.enabledMappingIds)
-      ||new Set(current.enabledMappingIds).size!==current.enabledMappingIds.length
-      ||current.enabledMappingIds.some(mappingId=>!current.mappingIds.includes(mappingId))
-      ||operation.recovery||operation.postwriteReview||operation.providerDeletionReady!==true
-      ||!started||started.operationId!==id||started.phase!=="deletionStarted"
-      ||!uuidPattern.test(started.receiptId)||!Number.isFinite(started.completedAt)
-      ||progress.startedAt<started.completedAt
-      ||operation.confirmationFingerprint!==operation.previewFingerprint
-      ||operation.previewFingerprint!==erasurePreviewFingerprint(operation))
-      return false;
-    const adapters=this.#worker();
-    const [fence,mappingStates,verified]=await Promise.all([
-      adapters.inspectFence(operation.profile),adapters.readMappingStates(current.mappingIds),adapters.verifyDeletion(operation),
-    ]);
-    const epochResult=await this.db.send(new GetCommand({TableName:stateTable(),
-      Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},ConsistentRead:true}));
-    const epoch=epochResult.Item?.epoch;
-    if(fence.fence?.operationId!==id||fence.leases.length
-      ||typeof epoch!=="number"||!Number.isSafeInteger(epoch)||epoch<1
-      ||(typeof fence.fence.epoch==="number"&&fence.fence.epoch!==epoch)
-      ||!verified.providersAbsent||!verified.stateAbsent
-      ||mappingStates.length!==current.mappingIds.length
-      ||new Set(mappingStates.map(item=>item.id)).size!==current.mappingIds.length
-      ||new Set(current.mappingIds).size!==current.mappingIds.length
-      ||current.mappingIds.some(mappingId=>mappingStates.find(item=>item.id===mappingId)?.state!=="Disabled"))
-      return false;
-    // Restoring mappings is the next lifecycle step. At promotion time every
-    // mapping must still be disabled; the normal restore phase will enable only
-    // those recorded as originally enabled and verify the complete inventory.
-    const next=this.#advance(id,current,"restore_mappings",Date.now(),"providerDeletionVerified");
-    const now=Date.now();
-    next.nextRunAt=now;
-    try {
-      await this.db.send(new TransactWriteCommand({TransactItems:[
-        {ConditionCheck:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"FENCE"},
-          ConditionExpression:"operationId=:operationId",ExpressionAttributeValues:{":operationId":id}}},
-        {ConditionCheck:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},
-          ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":epoch}}},
-        {Update:{TableName:stateTable(),Key:operationKey(id),
-          UpdateExpression:"SET #status=:verifying, lifecycle=:lifecycle, updatedAt=:updatedAt",
-          ConditionExpression:"#status=:review AND lifecycle.#phase=:phase AND lifecycle.#progress.#stage=:stage AND attribute_not_exists(lifecycle.#progress.#attempt) AND attribute_not_exists(recovery) AND attribute_not_exists(postwriteReview) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint AND confirmationFingerprint=:fingerprint",
-          ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress","#stage":"stage"},
-          ExpressionAttributeValues:{":review":"review_required",":verifying":"verifying",":phase":"verify_deletion",
-            ":stage":"verify",":ready":true,":fingerprint":operation.previewFingerprint,
-            ":lifecycle":next,":updatedAt":new Date(now).toISOString()}}},
-      ]}));
-      return true;
-    } catch(error) {
-      if((error as {name?:string})?.name==="TransactionCanceledException"
-        ||(error as {name?:string})?.name==="ConditionalCheckFailedException")return false;
-      throw error;
-    }
   }
 
   async beginDeletion(id:string):Promise<void> {
@@ -664,19 +625,21 @@ export class ErasureOperationStore {
   }
 
   async #claimDeletionAttempt(operation:ErasureOperation,current:FencedLifecycle,
-    progress:ErasureDeletionProgress,now:number):Promise<{id:string;startedAt:number}> {
+    progress:ErasureDeletionProgress,now:number,expectedStatus:ErasureOperationStatus):Promise<{id:string;startedAt:number}> {
     const attempt={id:randomUUID(),startedAt:now};
     try {
       await this.db.send(new UpdateCommand({TableName:stateTable(),Key:operationKey(operation.operationId),
         UpdateExpression:"SET lifecycle.#progress.#attempt=:attempt, updatedAt=:updatedAt",
-        ConditionExpression:"#status=:deleting AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex"
+        ConditionExpression:"#status=:expectedStatus AND lifecycle.#phase=:delete AND lifecycle.#progress.#stage=:stage AND lifecycle.#progress.#commentIndex=:commentIndex AND lifecycle.#progress.#stateIndex=:stateIndex"
           +(progress.finalCommentIndex===undefined?" AND attribute_not_exists(lifecycle.#progress.#finalCommentIndex)"
             :" AND lifecycle.#progress.#finalCommentIndex=:finalCommentIndex")
-          +" AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint",
+          +" AND attribute_not_exists(lifecycle.#progress.#attempt) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint"
+          +(expectedStatus==="review_required"?" AND lifecycle.#progress.#stage IN (:state,:verify)":""),
         ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress",
           "#attempt":"attempt","#stage":"stage","#commentIndex":"commentIndex","#stateIndex":"stateIndex",
           "#finalCommentIndex":"finalCommentIndex"},
-        ExpressionAttributeValues:{":deleting":"deleting",":delete":"delete",":stage":progress.stage,
+        ExpressionAttributeValues:{":expectedStatus":expectedStatus,":delete":"delete",":stage":progress.stage,
+          ...(expectedStatus==="review_required"?{":state":"state",":verify":"verify"}:{}),
           ":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,
           ...(progress.finalCommentIndex===undefined?{}:{":finalCommentIndex":progress.finalCommentIndex}),
           ":attempt":attempt,
