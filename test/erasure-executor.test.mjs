@@ -305,6 +305,10 @@ test("worker adapters are bound at construction and request arguments cannot rep
     deletionReadback={providersAbsent:true,stateAbsent:true};
     result=await store.advanceFencedLifecycle("op",attacker);
     assert.equal(result.phase,"verify_deletion");
+    assert.equal(db.item.lifecycle.deletionProgress.stage,"verify",
+      "the final completed deletion checkpoint is persisted with the phase transition");
+    assert.equal(db.item.lifecycle.deletionProgress.attempt,undefined,
+      "the terminal checkpoint clears the provider write-ahead claim");
     await store.advanceFencedLifecycle("op",attacker);
     assert.equal(db.item.lifecycle.phase,"restore_mappings");assert.equal(db.item.status,"verifying");
     assert.equal(db.item.lifecycle.evidence.providerDeletionVerified.operationId,"op");
