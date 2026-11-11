@@ -59,21 +59,26 @@ three known profile fences. For each `review_required` operation:
    disabled state.
 4. One conditional DynamoDB transaction checks the unchanged operation,
    deletion receipt/checkpoints, original confirmation, operation-owned fence,
-   epoch and journal ownership. It removes the original confirmation, the
+   epoch and journal ownership. It removes the original confirmation, any
+   operation-bound pre-write or legacy post-write review tokens, the
    operation-owned fence and journal, and replaces the identity-bearing
    operation with an identity-free terminal receipt.
-5. The Todoist project-comment tombstone is deliberately untouched.
+5. The Todoist project-comment tombstone is deliberately left untouched for
+   its normal 18-day expiry cleanup.
 
 The terminal operation record retains only the operation ID, owning profile,
-terminal status, completion time, epoch and mapping counts. It contains no
-Todoist task ID, Calendar event ID, title, comment body, target digest,
-preview fingerprint, inventory or confirmation. The original confirmation row
-is deleted. No deleted task/event identity remains in DynamoDB after success.
+terminal status, completion time, epoch, mapping counts and non-identifying
+completion flags/timestamps. It contains no Todoist task ID, Calendar event ID,
+title, comment body, target digest, preview fingerprint, inventory or
+confirmation. The original confirmation and any operation-bound review-token
+rows are deleted. No deleted task/event identity remains in DynamoDB after
+success.
 
 The receipt records that provider deletes were **not** replayed and that the
-tombstone remains. A repeated watchdog pass or post-write inspection is a
-terminal no-op and reports `classification=completed`; it cannot reopen the
-operation or release a later operation's fence.
+tombstone was left untouched for its normal expiry. A repeated watchdog pass
+or post-write inspection is a terminal no-op and reports
+`classification=completed`; it cannot reopen the operation or release a
+later operation's fence.
 
 ## Failure handling and release boundary
 
