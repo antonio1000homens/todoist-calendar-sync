@@ -43,6 +43,7 @@ function fixture(options={}) {
         if(input.Key.pk==="ERASURE_CONFIRMATION#op-recovery")return {Item:erasureConfirmation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
         if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
+        if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         return {Item:undefined};
       }
       if(kind==="QueryCommand") {
@@ -76,6 +77,8 @@ function fixture(options={}) {
           assert.match(update.UpdateExpression,/REMOVE #target/);
           assert.match(update.ConditionExpression,/attribute_not_exists\(lifecycle\.#progress\.#attempt\)/);
           assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery"));
           assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="FENCE"));
           assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
           assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="JOURNAL"));
@@ -86,7 +89,7 @@ function fixture(options={}) {
           for(const key of ["target","selectedActions","previewFingerprint","providerSnapshotFingerprint",
             "confirmationFingerprint","confirmationId","providerDeletionReady","inventory","actionPlan",
             "lifecycle","recovery","postwriteReview","requestId","result","error"])delete operation[key];
-          erasureConfirmation=undefined;
+          erasureConfirmation=undefined;confirmation=undefined;postwriteToken=undefined;
           external.control=external.control.filter(x=>!["FENCE","JOURNAL"].includes(x.sk));
           if(options.losePostwriteCompletionAck)throw new Error("Lost completion acknowledgement");
           return {};
@@ -151,6 +154,9 @@ function fixture(options={}) {
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
   return {service,operation,external,db,get confirmation(){return confirmation;},
     get postwriteToken(){return postwriteToken;},
+    set postwriteToken(value){postwriteToken=value;},
+    get confirmation(){return confirmation;},
+    set confirmation(value){confirmation=value;},
     get erasureConfirmation(){return erasureConfirmation;},
     set erasureConfirmation(value){erasureConfirmation=value;}};
 }
@@ -190,6 +196,10 @@ function postWriteCompletionFixture(options={}) {
   f.erasureConfirmation={pk:"ERASURE_CONFIRMATION#op-recovery",sk:"STATE",
     status:"consumed",operationId:"op-recovery",confirmationId:"erasure-confirm",
     consumedBy:"op-recovery",previewFingerprint:f.operation.previewFingerprint};
+  f.confirmation={pk:"ERASURE_RECOVERY_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"issued",operationId:"op-recovery",inspectedFingerprint:"old-recovery-token"};
+  f.postwriteToken={pk:"ERASURE_POSTWRITE_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"issued",operationId:"op-recovery",postflightFingerprint:"old-postwrite-token"};
   const snapshot={
     operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],
@@ -747,6 +757,8 @@ test("automatic post-write completion restores only recorded mappings and atomic
   assert.equal(JSON.stringify(f.operation).includes("disposable-1"),false);
   assert.equal(JSON.stringify(f.operation).includes("disposable-event"),false);
   assert.equal(f.erasureConfirmation,undefined);
+  assert.equal(f.confirmation,undefined,"any old pre-write recovery confirmation is invalidated");
+  assert.equal(f.postwriteToken,undefined,"any legacy post-write token is invalidated");
   assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
   assert.equal(f.external.control.some(row=>row.sk==="JOURNAL"),false);
   assert.equal(f.external.control.find(row=>row.sk==="EPOCH").epoch,7);
