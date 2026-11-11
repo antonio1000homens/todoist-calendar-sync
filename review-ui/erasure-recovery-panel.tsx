@@ -39,6 +39,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const [preview,setPreview]=useState<any>(),[inspectionAt,setInspectionAt]=useState<string>();
   const [postWriteAssessment,setPostWriteAssessment]=useState<any>(),[postWriteAt,setPostWriteAt]=useState<string>();
   const [confirmation,setConfirmation]=useState<any>(),[postWriteToken,setPostWriteToken]=useState<any>();
+  const [applyReviewReady,setApplyReviewReady]=useState(false);
   const [postWriteTyped,setPostWriteTyped]=useState({phrase:"",operationId:"",profile:""});
   const [typed,setTyped]=useState({phrase:"",operationId:"",profile:""});
   const [recoveryStatus,setRecoveryStatus]=useState<string>(),[recoveryAt,setRecoveryAt]=useState<string>();
@@ -50,7 +51,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     setOperation(undefined);setOperationAt(undefined);
     setPreview(undefined);setInspectionAt(undefined);
     setPostWriteAssessment(undefined);setPostWriteAt(undefined);
-    setConfirmation(undefined);setPostWriteToken(undefined);
+    setConfirmation(undefined);setPostWriteToken(undefined);setApplyReviewReady(false);
     setTyped({phrase:"",operationId:"",profile:""});
     setPostWriteTyped({phrase:"",operationId:"",profile:""});
     setRecoveryStatus(undefined);setRecoveryAt(undefined);
@@ -97,7 +98,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   const refresh=()=>{
     if(!operation||busy)return;
     const id=operation.operationId;
-    setConfirmation(undefined);
+    setConfirmation(undefined);setApplyReviewReady(false);
     void execute("refreshOperation","Read-only",()=>api("erasure-operations/"+encodeURIComponent(id)),
       result=>{
         setOperation(result.operation);setOperationAt(now());
@@ -107,7 +108,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   };
   const inspect=()=>{
     if(!operation||busy)return;
-    setConfirmation(undefined);
+    setConfirmation(undefined);setApplyReviewReady(false);
     void execute("inspect","Read-only",()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)),
       result=>{
         setPreview(result.preview);setInspectionAt(now());
@@ -156,6 +157,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
       ?preview?.calendarDriftReview?.candidateForSeparateApproval===true
       :preview?.allowed===true&&preview.classification==="pre_write"))return;
     const key:ActionKey=drift?"confirmDrift":"confirm";
+    setApplyReviewReady(false);
     setTyped({phrase:"",operationId:"",profile:""});
     void execute(key,"Creates operator-bound confirmation token (metadata write)",
       ()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+
@@ -182,10 +184,9 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
   };
   const apply=()=>{
     if(!operation||busy||!canConfirm())return;
+    if(!applyReviewReady){setApplyReviewReady(true);return;}
+    setApplyReviewReady(false);
     const drift=confirmation.mode==="calendar_drift_cancel";
-    if(!window.confirm(drift
-      ?"Cancel the interrupted erasure and restore original synchronization? The existing Calendar revision and Todoist task will be kept. The server will recheck every safety condition."
-      :"Restore synchronization for exactly this profile? This will not resume or undo provider deletion."))return;
     void execute(drift?"applyDrift":"apply","Guarded recovery request (mutating)",
       ()=>api("erasure-recoveries/"+encodeURIComponent(operation.operationId)+
         (drift?"/apply-calendar-drift":"/apply"),{
@@ -329,11 +330,20 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
               ?preview?.calendarDriftReview?.candidateForSeparateApproval===true
               :preview?.allowed===true&&preview.classification==="pre_write")&&<>
             <p>Single-use confirmation expires <time dateTime={new Date(confirmation.expiresAt).toISOString()}>{new Date(confirmation.expiresAt).toLocaleString()}</time>.</p>
-            <label>Type {confirmation.mode==="calendar_drift_cancel"?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC"}<input value={typed.phrase} autoComplete="off" onChange={event=>setTyped(value=>({...value,phrase:event.target.value}))}/></label>
-            <label>Repeat operation ID<input value={typed.operationId} autoComplete="off" onChange={event=>setTyped(value=>({...value,operationId:event.target.value}))}/></label>
-            <label>Repeat profile<input value={typed.profile} autoComplete="off" onChange={event=>setTyped(value=>({...value,profile:event.target.value}))}/></label>
+            <label>Type {confirmation.mode==="calendar_drift_cancel"?"CANCEL ERASURE AND RESTORE SYNC":"RESTORE SYNC"}<input value={typed.phrase} autoComplete="off" onChange={event=>{setTyped(value=>({...value,phrase:event.target.value}));setApplyReviewReady(false);}}/></label>
+            <label>Repeat operation ID<input value={typed.operationId} autoComplete="off" onChange={event=>{setTyped(value=>({...value,operationId:event.target.value}));setApplyReviewReady(false);}}/></label>
+            <label>Repeat profile<input value={typed.profile} autoComplete="off" onChange={event=>{setTyped(value=>({...value,profile:event.target.value}));setApplyReviewReady(false);}}/></label>
+            {applyReviewReady&&<div role="alert" aria-live="assertive" className="warning">
+              <strong>Review the final recovery action.</strong>
+              <p>{confirmation.mode==="calendar_drift_cancel"
+                ?"This cancels the interrupted erasure, keeps the current Calendar event revision and Todoist task, and restores only the originally enabled sync mapping. It never resumes provider deletion. The server will recheck the evidence."
+                :"This restores synchronization for exactly this profile. It does not resume or undo provider deletion; the server will recheck every safety condition."}</p>
+              <button type="button" disabled={busy} onClick={()=>setApplyReviewReady(false)}>Cancel final confirmation</button>
+            </div>}
             <button disabled={busy||!canConfirm()} onClick={apply}>
-              {confirmation.mode==="calendar_drift_cancel"?"Confirm reviewed erasure cancellation":"Confirm guarded recovery"}
+              {applyReviewReady
+                ?confirmation.mode==="calendar_drift_cancel"?"Apply reviewed erasure cancellation":"Apply guarded recovery"
+                :confirmation.mode==="calendar_drift_cancel"?"Review erasure cancellation":"Review guarded recovery"}
             </button>
           </>}
           {(pending==="apply"||pending==="applyDrift")&&<p role="status" aria-live="polite">Applying independently verified recovery guards…</p>}

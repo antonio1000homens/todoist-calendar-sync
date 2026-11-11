@@ -160,3 +160,13 @@ test("guarded recovery inspection has inline progress and actionable, secret-fre
   assert.match(recovery,/No recovery was applied/);
   assert.doesNotMatch(recovery,/retry_after|error_extra|event_id/);
 });
+
+test("guarded recovery uses an inline final confirmation instead of a blocking browser dialog",()=>{
+  const recovery=readFileSync(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
+  assert.doesNotMatch(recovery,/window\.confirm/);
+  assert.match(recovery,/if\(!applyReviewReady\)\{setApplyReviewReady\(true\);return;\}/);
+  assert.match(recovery,/role="alert" aria-live="assertive" className="warning"/);
+  assert.match(recovery,/Cancel final confirmation/);
+  assert.match(recovery,/Apply reviewed erasure cancellation/);
+  assert.match(recovery,/It never resumes provider deletion/);
+});
