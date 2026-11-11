@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import {inspectRecordedProjectTombstone,type ProjectTombstoneInspection,
+  type RecordedTombstoneExpectation} from "./erasure-recovery-inspection.js";
 import { GetCommand, ScanCommand, type DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { documentClient, pacingDelayMs, scanPageItemLimit } from "./dynamodb-capacity.js";
 import { profiles } from "./config.js";
@@ -50,6 +52,8 @@ export interface ErasurePreviewResult {
   blockers: string[];
   crossProfileEvidence?:CrossProfileErasureEvidence;
   deliveryReceiptAudit?:ErasureDeliveryReceiptAudit;
+  /** Read-only exact recorded comment readback; excluded from preview fingerprints. */
+  projectTombstone?:ProjectTombstoneInspection;
   confirmation?: { confirmationId: string; expiresAt: number };
 }
 
@@ -69,6 +73,8 @@ type Dependencies = {
   auditCrossProfileIdentity?:boolean;
   calendarProvenance?:VerifiedCalendarProvenance;
   auditDeliveryReceipts?:boolean;
+  /** Only recovery inspection supplies the immutable original comment/identity set. */
+  readOnlyTombstoneExpectation?:RecordedTombstoneExpectation;
   sleep?: (ms: number) => Promise<void>;
 };
 
@@ -425,6 +431,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       calendar: !target.eventId ? "not_recorded" : event ? "present" : eventMissing ? "absent" : "unknown",
       configuredCalendarLink: linked ? "present" : "not_found",
     },
+    ...(dependencies.readOnlyTombstoneExpectation?{projectTombstone:inspectRecordedProjectTombstone(
+      projectComments,dependencies.readOnlyTombstoneExpectation)}:{}),
     backupRetentionNotice: ERASURE_BACKUP_RETENTION_NOTICE,
     classificationCounts: plan.counts, receiptSanitizationRequirements:plan.receiptSanitizationRequirements,
     blockers: [...new Set(blockers)].sort(),

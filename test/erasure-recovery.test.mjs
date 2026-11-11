@@ -1031,3 +1031,20 @@ test("provider authentication failure never generates a diagnostic success or wr
   await assert.rejects(service.inspect("op-recovery"),/401/);
   assert.equal(external.writes.length,0);
 });
+
+
+test("read-only inspection exposes exact tombstone and checkpoint comparisons without issuing tokens or releasing fence",async()=>{
+  const f=timedOutProjectCommentFixture();
+  f.external.snapshot.projectTombstone={
+    status:"present",recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
+    recordedCommentCount:1,foundCommentCount:1,explanation:"Exact bounded marker matches"};
+  const inspection=await f.service.inspect("op-recovery");
+  assert.equal(inspection.preview.projectTombstone.status,"present");
+  assert.ok(inspection.preview.comparisonDetails.comments);
+  assert.ok(inspection.preview.comparisonDetails.projectCommentIds);
+  assert.ok(inspection.preview.comparisonDetails.stateInventory);
+  assert.equal(f.external.writes.length,0);
+  assert.equal(f.external.restored.length,0);
+  assert.ok(f.external.control.some(item=>item.sk==="FENCE"),"the profile fence is untouched");
+  assert.equal(f.confirmation,undefined);
+});

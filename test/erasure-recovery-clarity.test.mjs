@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   recoveryClassificationExplanation,recoveryDiagnosticRows,recoveryExecutionSummary,
   workerMappingSummary,originalInventoryExplanation,
+  recoveryComparisonRows,recoveryTombstoneStatus,recoveryIndependentGuard,recoveryNextSafeAction,
 } from "../review-ui/erasure-recovery-explanations.mjs";
 
 const allVerified=Object.fromEntries([
@@ -60,4 +61,43 @@ test("older API responses display unavailable rather than inventing diagnostic o
   assert.equal(recoveryDiagnosticRows({}).length,18);
   assert.ok(recoveryDiagnosticRows({}).every(item=>item.status==="unavailable"));
   assert.match(recoveryClassificationExplanation({allowed:false,classification:"fully_deleted"}),/does not authorise sync restoration/);
+});
+
+
+test("UI separates checkpoint-consistent removal from real drift and shows safe next action",()=>{
+  const preview={allowed:false,classification:"partial_or_ambiguous",
+    diagnostics:{...allVerified,comments:"mismatched",projectCommentIds:"mismatched",
+      stateInventory:"mismatched",calendarAliases:"mismatched"},
+    comparisonDetails:{
+      comments:{expected:"1 comment",observed:"0 mapping comments",
+        result:"expected_lifecycle_change",explanation:"Converted after checkpoint"},
+      projectCommentIds:{expected:"1 mapping",observed:"0 mappings",
+        result:"expected_lifecycle_change",explanation:"Original comment retained as tombstone"},
+      stateInventory:{expected:"1 state row",observed:"2 state rows",
+        result:"unexpected_drift",explanation:"Unrelated row appeared"},
+      calendarAliases:{expected:"1 alias",observed:"unknown",
+        result:"missing_evidence",explanation:"Partial provider audit"},
+    },
+    projectTombstone:{status:"ambiguous",recordedCommentFound:true,
+      markerMatchesTaskAndCalendar:false,
+      explanation:"Recorded comment was altered"},
+  };
+  const rows=recoveryDiagnosticRows(preview);
+  assert.equal(rows.find(item=>item.key==="comments").status,"expected_lifecycle_change");
+  assert.equal(rows.find(item=>item.key==="stateInventory").status,"unexpected_drift");
+  assert.equal(recoveryComparisonRows(preview).length,4);
+  assert.equal(recoveryTombstoneStatus(preview).status,"ambiguous");
+  assert.match(recoveryNextSafeAction(preview),/Keep the fence/);
+  assert.match(recoveryIndependentGuard(preview),/Strict recovery is blocked/);
+});
+
+test("UI identifies unverified fence independent of a matching tombstone",()=>{
+  const preview={allowed:false,classification:"pre_write",
+    diagnostics:{...allVerified,fence:"missing"},projectTombstone:{status:"present",
+      recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
+      explanation:"Exact 18-day marker found"}};
+  assert.match(recoveryIndependentGuard(preview),/fence is not verified/);
+  assert.equal(recoveryTombstoneStatus(preview).status,"present");
+  assert.equal(recoveryTombstoneStatus({}).status,"not_checked");
+  assert.match(recoveryNextSafeAction(preview),/Do not release the fence/);
 });

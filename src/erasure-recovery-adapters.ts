@@ -3,6 +3,7 @@ import {GetEventSourceMappingCommand,ListEventSourceMappingsCommand,UpdateEventS
 import {documentClient} from "./dynamodb-capacity.js";
 import {buildErasurePreview} from "./erasure-preview.js";
 import {defaultProviderClientFactory} from "./mutation-budget.js";
+import {profiles} from "./config.js";
 import {inspectErasureFence} from "./erasure-protocol.js";
 import type {ErasureOperation,FencedMapping} from "./erasure-executor.js";
 import type {RecoveryAdapters} from "./erasure-recovery.js";
@@ -70,6 +71,13 @@ async function readErasureSnapshot(operation:ErasureOperation,auditCrossProfileI
       {db:documentClient,clients:await defaultProviderClientFactory(operation.profile,{signal:deadlineSignal,timeoutMs:15_000}),
         providerFactory:profile=>defaultProviderClientFactory(profile,{signal:deadlineSignal,timeoutMs:15_000}),
         auditCrossProfileIdentity,
+        readOnlyTombstoneExpectation:{profile:operation.profile,
+          projectId:profiles[operation.profile].todoistProjectId,taskId:operation.target.taskId,
+          commentIds:operation.actionPlan.projectCommentIds||[],
+          eventIds:(operation.actionPlan.knownCalendarAliases||[]).map(item=>item.eventId),
+          preConversionConfirmed:!operation.lifecycle?.deletionProgress
+            && !operation.lifecycle?.evidence.deletionStarted,
+          originalProjectComments:operation.actionPlan.comments.filter(item=>item.kind==="project")},
         inspectFence:async profile=>{
           const value=await inspectErasureFence(profile);
           return {fence:value.fence,leases:value.leases};
