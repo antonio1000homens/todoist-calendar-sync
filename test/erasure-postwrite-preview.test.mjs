@@ -35,6 +35,7 @@ function fixture() {
     epoch:4,fenceOwned:true,leaseCount:0,providerItemsAbsent:true,stateRowsAbsent:true,
     snapshotSafetyBlockerCount:0,
     knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
+    evidenceChecks:{knownCalendarAliasesMatch:true},
     projectTombstone:{status:"present",recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
       recordedCommentCount:1,foundCommentCount:1},
     operationFingerprint:"123",
