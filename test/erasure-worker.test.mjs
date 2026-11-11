@@ -75,6 +75,26 @@ test("watchdog queues only independently eligible pre-write recovery, never dele
   }
 });
 
+test("watchdog redelivers a promoted post-write restore phase after a lost queue send",async t=>{
+  const old={table:process.env.STATE_TABLE_NAME,queue:process.env.ERASURE_OPERATION_QUEUE_URL};
+  process.env.STATE_TABLE_NAME="test-state";process.env.ERASURE_OPERATION_QUEUE_URL="https://sqs.example/erasure";
+  const id="44da2340-b5a1-4fe3-b5d4-a0ea146cbf4b",sent=[];
+  t.mock.method(documentClient,"send",async()=>({Responses:{"test-state":[
+    {pk:"ERASURE#work",sk:"FENCE",operationId:id}
+  ]}}));
+  t.mock.method(ErasureOperationStore.prototype,"get",async()=>({operationId:id,profile:"work",status:"verifying",
+    lifecycle:{phase:"restore_mappings"}}));
+  t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
+  try{
+    const result=await inspectStuckErasureRecovery();
+    assert.deepEqual(result,{fenced:1,queued:1,blocked:0});
+    assert.deepEqual(JSON.parse(sent[0].MessageBody),{version:1,operationId:id});
+  }finally{
+    for(const [key,value] of Object.entries({STATE_TABLE_NAME:old.table,ERASURE_OPERATION_QUEUE_URL:old.queue}))
+      if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }
+});
+
 test("watchdog preserves active fence and skips ambiguous, mismatched operations",async t=>{
   const old=process.env.STATE_TABLE_NAME;
   process.env.STATE_TABLE_NAME="test-state";

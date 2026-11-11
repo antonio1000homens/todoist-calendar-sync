@@ -234,6 +234,32 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
         queued++;
         continue;
       }
+      if(operation.status==="verifying"
+        &&["restore_mappings","confirm_restored","release_fence"].includes(operation.lifecycle?.phase||"")) {
+        // The promotion/restore queue send can itself lose its ACK. Re-drive
+        // the normal idempotent restore lifecycle until its atomic completion.
+        await enqueueErasureOperation(id);
+        queued++;
+        continue;
+      }
+      if(operation.status==="review_required"&&operation.lifecycle?.phase==="verify_deletion"
+        &&operation.lifecycle.deletionProgress?.stage==="verify") {
+        // A late provider ACK may have been lost after all writes completed.
+        // Promote only after fresh exact provider/state/tombstone readback,
+        // an operation-owned empty fence, and the original disabled mappings.
+        if(await store.finalizeVerifiedPostwrite(id)) {
+          await enqueueErasureOperation(id);
+          queued++;
+          console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+            event:"recovery_watchdog_queued",operationId:id,profile,mode:"verified_postwrite_completion"}));
+        } else {
+          blocked++;
+          console.warn(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+            event:"recovery_watchdog_blocked",operationId:id,profile,
+            reason:"postwrite_completion_evidence_blocked"}));
+        }
+        continue;
+      }
       if(operation.status!=="review_required"||operation.recovery)continue;
       const result=await recoveryService.startAutomaticPreWriteRecovery(id);
       if(result.queued) {

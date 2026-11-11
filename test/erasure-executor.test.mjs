@@ -196,6 +196,60 @@ test("gate drift during release-fence verification persists review-required with
     ||command.constructor.name.includes("Delete")),false,"operation and fence cleanup must not run");
 });
 
+test("post-write finalizer promotes only exact verified completion and condition-checks its fence",async()=>{
+  const old=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
+  const digest=erasurePreviewFingerprint(preview),receipt="123e4567-e89b-12d3-a456-426614174000";
+  const item={...storedQueuedOperation(),status:"review_required",previewFingerprint:digest,confirmationFingerprint:digest,
+    lifecycle:{phase:"verify_deletion",mappingIds:["123e4567-e89b-12d3-a456-426614174001","123e4567-e89b-12d3-a456-426614174002"],
+      enabledMappingIds:["123e4567-e89b-12d3-a456-426614174001"],
+      timeoutSeconds:30,pollMs:5000,nextRunAt:10,evidence:{deletionStarted:{operationId:"op",phase:"deletionStarted",
+        receiptId:receipt,completedAt:10}},deletionProgress:{stage:"verify",commentIndex:0,stateIndex:1,startedAt:11}}};
+  const calls=[],db={async send(command){calls.push(command);
+    if(command.constructor.name.includes("Get"))return {Item:command.input.Key.sk==="EPOCH"?{epoch:7}:item};
+    if(command.constructor.name.includes("TransactWrite")){
+      const tx=command.input.TransactItems;
+      assert.equal(tx[0].ConditionCheck.ConditionExpression,"operationId=:operationId");
+      assert.equal(tx[0].ConditionCheck.ExpressionAttributeValues[":operationId"],"op");
+      assert.equal(tx[1].ConditionCheck.ConditionExpression,"epoch=:epoch");
+      assert.equal(tx[1].ConditionCheck.ExpressionAttributeValues[":epoch"],7);
+      const update=tx[2].Update;
+      assert.match(update.ConditionExpression,/status=:review/);
+      item.status=update.ExpressionAttributeValues[":verifying"];
+      item.lifecycle=update.ExpressionAttributeValues[":lifecycle"];
+      return {};
+    }
+    throw new Error("Unexpected database command");
+  }};
+  const adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},restoreMappings:async()=>{},
+    finishFence:async()=>{},readFreshSnapshot:async()=>({}),readMappingStates:async ids=>ids.map(id=>({id,state:"Disabled"})),
+    verifyDeletion:async()=>({providersAbsent:true,stateAbsent:true})};
+  try{
+    const store=new ErasureOperationStore(db,()=>"unused",adapters);
+    assert.equal(await store.finalizeVerifiedPostwrite("op"),true);
+    assert.equal(item.status,"verifying");assert.equal(item.lifecycle.phase,"restore_mappings");
+    assert.equal(item.lifecycle.evidence.providerDeletionVerified.operationId,"op");
+    assert.equal(calls.filter(command=>command.constructor.name.includes("TransactWrite")).length,1);
+  }finally{if(old===undefined)delete process.env.STATE_TABLE_NAME;else process.env.STATE_TABLE_NAME=old;}
+});
+
+test("post-write finalizer leaves ambiguous provider or mapping state fenced",async()=>{
+  const digest=erasurePreviewFingerprint(preview),item={...storedQueuedOperation(),status:"review_required",
+    previewFingerprint:digest,confirmationFingerprint:digest,lifecycle:{phase:"verify_deletion",
+      mappingIds:["123e4567-e89b-12d3-a456-426614174001"],enabledMappingIds:["123e4567-e89b-12d3-a456-426614174001"],timeoutSeconds:30,pollMs:5000,nextRunAt:10,
+      evidence:{deletionStarted:{operationId:"op",phase:"deletionStarted",
+        receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:10}},
+      deletionProgress:{stage:"verify",commentIndex:0,stateIndex:1,startedAt:11}}};
+  const db=memoryDb(item),adapters={listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},restoreMappings:async()=>{},
+    finishFence:async()=>{},readFreshSnapshot:async()=>({}),readMappingStates:async ids=>ids.map(id=>({id,state:"Enabled"})),
+    verifyDeletion:async()=>({providersAbsent:false,stateAbsent:true})};
+  const store=new ErasureOperationStore(db,()=>"unused",adapters);
+  assert.equal(await store.finalizeVerifiedPostwrite("op"),false);
+  assert.equal(db.item.status,"review_required");assert.equal(db.item.lifecycle.phase,"verify_deletion");
+  assert.equal(db.calls.some(command=>command.constructor.name.includes("TransactWrite")),false);
+});
+
 test("fenced executor disables admission, drains, fences, waits out old workers, then drains again",async()=>{
   const events=[];
   await enterFencedErasure({profile:"home",operationId:"op",mappings:["uuid"],timeoutSeconds:30,

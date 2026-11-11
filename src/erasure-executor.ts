@@ -83,7 +83,7 @@ export interface FencedLifecycleAdapters {
   listWorkerMappings(): Promise<FencedMapping[]>;
   disableMappings(ids: string[]): Promise<void>;
   mappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
-  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string;epoch?:number }; leases: unknown[] }>;
   beginFence(profile: string, operationId: string): Promise<void>;
   restoreMappings(ids: string[]): Promise<void>;
   finishFence(profile: string, operationId: string): Promise<void>;
@@ -94,7 +94,7 @@ export interface ErasureDeletionVerifier {
 export interface ErasureSnapshotReader {
   readFreshSnapshot(operation: ErasureOperation): Promise<Omit<ErasurePreview,"operationId"> & {blockers?:string[]}>;
   readMappingStates(ids: string[]): Promise<Array<{ id: string; state: string }>>;
-  inspectFence(profile: string): Promise<{ fence?: { operationId?: string }; leases: unknown[] }>;
+  inspectFence(profile: string): Promise<{ fence?: { operationId?: string;epoch?:number }; leases: unknown[] }>;
 }
 export interface ErasureDeletionStepResult { progress: ErasureDeletionProgress; complete: boolean }
 export interface ErasureDeletionWorker {
@@ -190,6 +190,7 @@ function confirmedCompletionProof(operation:ErasureOperation,epoch:number) {
     confirmationId:operation.confirmationId,previewFingerprint:operation.previewFingerprint,epoch};
 }
 const defaultFencePollMs=5_000;
+const uuidPattern=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const lifecyclePhaseEdges: Record<FencedLifecyclePhase,FencedLifecyclePhase[]>={
   disable_mappings:["disable_mappings","confirm_disabled"],
   confirm_disabled:["confirm_disabled","drain_before_fence"],
@@ -481,6 +482,76 @@ export class ErasureOperationStore {
     }
     await this.#persistLifecycle(operation,next,nextStatus,now);
     return {phase:next.phase,nextRunAt:next.nextRunAt,status:nextStatus,waiting:next.nextRunAt>now};
+  }
+
+  /** Promote only a fully completed post-write checkpoint back into the normal
+   * verified restore/release lifecycle. This does not repeat provider writes. */
+  async finalizeVerifiedPostwrite(id:string):Promise<boolean> {
+    const operation=await this.get(id);
+    const current=operation?.lifecycle;
+    const started=current?.evidence?.deletionStarted;
+    const progress=current?.deletionProgress;
+    if(!operation||operation.status!=="review_required"||!current
+      ||current.phase!=="verify_deletion"||progress?.stage!=="verify"||progress.attempt
+      ||progress.commentIndex!==operation.actionPlan.comments.length
+      ||progress.stateIndex!==operation.inventory.length
+      ||(progress.finalCommentIndex!==undefined
+        &&progress.finalCommentIndex!==(operation.actionPlan.projectCommentIds||[]).length)
+      ||!Array.isArray(current.mappingIds)||!current.mappingIds.length
+      ||new Set(current.mappingIds).size!==current.mappingIds.length
+      ||current.mappingIds.some(mappingId=>!uuidPattern.test(mappingId))
+      ||!Array.isArray(current.enabledMappingIds)
+      ||new Set(current.enabledMappingIds).size!==current.enabledMappingIds.length
+      ||current.enabledMappingIds.some(mappingId=>!current.mappingIds.includes(mappingId))
+      ||operation.recovery||operation.postwriteReview||operation.providerDeletionReady!==true
+      ||!started||started.operationId!==id||started.phase!=="deletionStarted"
+      ||!uuidPattern.test(started.receiptId)||!Number.isFinite(started.completedAt)
+      ||progress.startedAt<started.completedAt
+      ||operation.confirmationFingerprint!==operation.previewFingerprint
+      ||operation.previewFingerprint!==erasurePreviewFingerprint(operation))
+      return false;
+    const adapters=this.#worker();
+    const [fence,mappingStates,verified]=await Promise.all([
+      adapters.inspectFence(operation.profile),adapters.readMappingStates(current.mappingIds),adapters.verifyDeletion(operation),
+    ]);
+    const epochResult=await this.db.send(new GetCommand({TableName:stateTable(),
+      Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},ConsistentRead:true}));
+    const epoch=epochResult.Item?.epoch;
+    if(fence.fence?.operationId!==id||fence.leases.length
+      ||typeof epoch!=="number"||!Number.isSafeInteger(epoch)||epoch<1
+      ||(typeof fence.fence.epoch==="number"&&fence.fence.epoch!==epoch)
+      ||!verified.providersAbsent||!verified.stateAbsent
+      ||mappingStates.length!==current.mappingIds.length
+      ||new Set(mappingStates.map(item=>item.id)).size!==current.mappingIds.length
+      ||new Set(current.mappingIds).size!==current.mappingIds.length
+      ||current.mappingIds.some(mappingId=>mappingStates.find(item=>item.id===mappingId)?.state!=="Disabled"))
+      return false;
+    // Restoring mappings is the next lifecycle step. At promotion time every
+    // mapping must still be disabled; the normal restore phase will enable only
+    // those recorded as originally enabled and verify the complete inventory.
+    const next=this.#advance(id,current,"restore_mappings",Date.now(),"providerDeletionVerified");
+    const now=Date.now();
+    next.nextRunAt=now;
+    try {
+      await this.db.send(new TransactWriteCommand({TransactItems:[
+        {ConditionCheck:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"FENCE"},
+          ConditionExpression:"operationId=:operationId",ExpressionAttributeValues:{":operationId":id}}},
+        {ConditionCheck:{TableName:stateTable(),Key:{pk:`ERASURE#${operation.profile}`,sk:"EPOCH"},
+          ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":epoch}}},
+        {Update:{TableName:stateTable(),Key:operationKey(id),
+          UpdateExpression:"SET #status=:verifying, lifecycle=:lifecycle, updatedAt=:updatedAt",
+          ConditionExpression:"#status=:review AND lifecycle.#phase=:phase AND lifecycle.#progress.#stage=:stage AND attribute_not_exists(lifecycle.#progress.#attempt) AND attribute_not_exists(recovery) AND attribute_not_exists(postwriteReview) AND providerDeletionReady=:ready AND previewFingerprint=:fingerprint AND confirmationFingerprint=:fingerprint",
+          ExpressionAttributeNames:{"#status":"status","#phase":"phase","#progress":"deletionProgress","#stage":"stage"},
+          ExpressionAttributeValues:{":review":"review_required",":verifying":"verifying",":phase":"verify_deletion",
+            ":stage":"verify",":ready":true,":fingerprint":operation.previewFingerprint,
+            ":lifecycle":next,":updatedAt":new Date(now).toISOString()}}},
+      ]}));
+      return true;
+    } catch(error) {
+      if((error as {name?:string})?.name==="TransactionCanceledException"
+        ||(error as {name?:string})?.name==="ConditionalCheckFailedException")return false;
+      throw error;
+    }
   }
 
   async beginDeletion(id:string):Promise<void> {
