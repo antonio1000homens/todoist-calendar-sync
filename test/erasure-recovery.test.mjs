@@ -799,6 +799,26 @@ test("post-write completion fails closed for incomplete or ambiguous evidence",a
   }
 });
 
+test("post-write completion honours the existing deployment gate without a new per-operation signoff",async()=>{
+  const old=process.env.ERASURE_EXECUTION_ENABLED;
+  process.env.ERASURE_EXECUTION_ENABLED="false";
+  try {
+    const f=postWriteCompletionFixture();
+    const assessment=await f.service.inspectPostWrite("op-recovery");
+    assert.equal(assessment.classification,"fully_deleted_candidate");
+    assert.equal(assessment.completionEligible,false);
+    assert.ok(assessment.completionBlockers.some(item=>item.includes("existing erasure execution gate")));
+    const result=await f.service.completePostWriteIfSafe("op-recovery");
+    assert.equal(result.status,"blocked");
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+    assert.equal(f.external.restored.length,0);
+    assert.equal(f.external.writes.length,0);
+  } finally {
+    if(old===undefined)delete process.env.ERASURE_EXECUTION_ENABLED;
+    else process.env.ERASURE_EXECUTION_ENABLED=old;
+  }
+});
+
 test("post-write completion stays fenced when the atomic release transaction conflicts",async()=>{
   const f=postWriteCompletionFixture({failPostwriteCompletion:true});
   const result=await f.service.completePostWriteIfSafe("op-recovery");
