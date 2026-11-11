@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildErasurePreview } from "../dist/erasure-preview.js";
-import { serializeMappingComment } from "../dist/mapping-comments.js";
+import { MAPPING_COMMENT_MARKER, projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment,
+  serializeMappingComment } from "../dist/mapping-comments.js";
 
 test("erasure preview scans complete state and providers read-only and returns a canonical exact inventory", async () => {
   const commands=[];
@@ -161,6 +162,72 @@ test("deletion preview captures profile and Calendar-scoped event aliases before
   assert.equal(preview.actionPlan.knownCalendarAliasesComplete,true);
   assert.equal(preview.actionPlan.calendarEvent.calendarId,"home@example.test");
   assert.deepEqual(preview.blockers,[]);
+});
+
+test("a known Calendar alias mapped to another Todoist task blocks deletion before confirmation",async()=>{
+  const taskId="task-alias-owner",eventId="event-alias-primary",otherEventId="event-alias-shared";
+  const receipt={pk:"DELIVERY#home#alias-source",sk:"COMPLETED",profile:"home",kind:"calendar",
+    identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const event={id:eventId,etag:"etag-alias-primary",extendedProperties:{shared:{taskId}}};
+  const comments=[
+    {id:"selected-project-comment",content:serializeMappingComment({profile:"home",taskId,eventId,
+      updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")},
+    {id:"other-task-alias-comment",content:serializeMappingComment({profile:"home",taskId:"other-task",
+      eventId:otherEventId,updatedAt:"2026-11-08T12:01:00.000Z"},"test-home-project")},
+  ];
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>comments,listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.actionPlan.knownCalendarAliases.some(alias=>alias.eventId===otherEventId));
+  assert.ok(preview.blockers.some(value=>value.includes("known Calendar alias is still mapped to another Todoist task")));
+  assert.equal(preview.confirmation,undefined);
+});
+
+test("an active tombstone for another task that overlaps a known alias blocks deletion",async()=>{
+  const taskId="task-alias-owner",eventId="event-alias-primary",otherEventId="event-alias-shared";
+  const receipt={pk:"DELIVERY#home#alias-source",sk:"COMPLETED",profile:"home",kind:"calendar",
+    identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const event={id:eventId,etag:"etag-alias-primary",extendedProperties:{shared:{taskId}}};
+  const createdAt="2026-11-10T12:00:00.000Z";
+  const tombstone={id:"other-task-tombstone",content:serializeDeletionTombstoneComment({schemaVersion:1,
+    profile:"home",projectId:"test-home-project",taskId:"other-task",eventIds:[otherEventId],createdAt,
+    expiresAt:projectDeletionTombstoneExpiry(createdAt)}),project_id:"test-home-project"};
+  const selected={id:"selected-project-comment",content:serializeMappingComment({profile:"home",taskId,eventId,
+    updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")};
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>[selected,tombstone],listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.blockers.some(value=>value.includes("active project deletion tombstone overlaps a known Calendar alias")));
+  assert.equal(preview.confirmation,undefined);
+});
+
+test("an unparseable project comment mentioning a known alias blocks deletion",async()=>{
+  const taskId="task-alias-owner",eventId="event-alias-primary",otherEventId="event-alias-shared";
+  const receipt={pk:"DELIVERY#home#alias-source",sk:"COMPLETED",profile:"home",kind:"calendar",
+    identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const event={id:eventId,etag:"etag-alias-primary",extendedProperties:{shared:{taskId}}};
+  const comments=[
+    {id:"selected-project-comment",content:serializeMappingComment({profile:"home",taskId,eventId,
+      updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")},
+    {id:"malformed-alias-comment",content:`${MAPPING_COMMENT_MARKER}\ninvalid ${otherEventId}`},
+  ];
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>comments,listTaskComments:async()=>[]},
+    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.blockers.some(value=>value.includes("unparseable project comment contains a known Calendar alias")));
+  assert.equal(preview.confirmation,undefined);
 });
 
 test("erasure preview binds completed delivery identity scrubbing to post-tombstone cleanup",async()=>{
