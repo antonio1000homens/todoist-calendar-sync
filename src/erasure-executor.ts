@@ -62,7 +62,7 @@ export interface ErasureOperation {
   status: ErasureOperationStatus;
   lifecycle?: FencedLifecycle;
   recovery?: import("./erasure-recovery.js").RecoveryState;
-  /** Post-write operator acknowledgement only: no executor, admission or fence release. */
+  /** Legacy fenced-only review metadata; never authorises or gates completion. */
   postwriteReview?: {
     mode:"post_write";status:"reviewed_fenced";epoch:number;
     confirmationId:string;inspectedFingerprint:string;postflightFingerprint:string;
