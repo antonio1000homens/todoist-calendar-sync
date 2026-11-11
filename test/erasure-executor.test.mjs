@@ -93,7 +93,10 @@ test("review-required recovery can advance only an exact state/verify checkpoint
   assert.equal(result.phase,"delete");
   assert.equal(result.status,"review_required");
   assert.equal(result.waiting,false);
-  assert.deepEqual(calls,[{operationId:"op",stage:"state",attempt:calls[0]?.attempt,receiptCleanup:"scrub_identity_refs"}]);
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].operationId,"op");
+  assert.equal(calls[0].stage,"state");
+  assert.equal(calls[0].receiptCleanup,"scrub_identity_refs");
   assert.ok(calls[0].attempt,"the state step is protected by a write-ahead attempt");
   assert.equal(item.lifecycle.deletionProgress.stateIndex,1);
   assert.equal(item.lifecycle.deletionProgress.attempt,undefined);
