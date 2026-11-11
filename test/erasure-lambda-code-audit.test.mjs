@@ -11,7 +11,7 @@ test("Lambda code audit verifies one ZIP per unique digest without exposing pack
   const root=await mkdtemp(path.join(tmpdir(),"issue307-code-audit-test-"));
   t.after(()=>rm(root,{recursive:true,force:true}));
   const bundle=path.join(root,"handler.js");
-  const source="const marker='todoist-calendar-sync:deleted:v1'; function activeProjectDeletionTombstone(){}; const suppression='erasure_project_comment_replay_suppressed'; const barrier='ERASURE_REPLAY_BARRIER_VERSION';";
+  const source="const marker='todoist-calendar-sync:deleted:v1'; function activeProjectDeletionTombstone(){}; const suppression='erasure_project_comment_replay_suppressed'; const unlink='unlinkTodoistTask'; const etagWrite='updateSharedEventPropertiesIfUnchanged'; const postimage='unlinkDigest'; const barrier='ERASURE_REPLAY_BARRIER_VERSION';";
   await writeFile(bundle,source);
   const zip=path.join(root,"lambda.zip");
   const zipped=spawnSync("zip",["-q",zip,"handler.js"],{cwd:root});
@@ -44,6 +44,9 @@ test("Lambda code audit verifies one ZIP per unique digest without exposing pack
   assert.equal(fn.digests[0].markerStrings.projectTombstone,true);
   assert.equal(fn.digests[0].markerStrings.projectTombstoneReader,true);
   assert.equal(fn.digests[0].markerStrings.projectTombstoneSuppression,true);
+  assert.equal(fn.digests[0].markerStrings.retainedCalendarUnlink,true);
+  assert.equal(fn.digests[0].markerStrings.retainedCalendarEtagWrite,true);
+  assert.equal(fn.digests[0].markerStrings.retainedCalendarPostimage,true);
   assert.equal(fn.digests[0].markerStrings.replayGate,true);
   assert.equal(report.replayBarrierMayBeEnabled,false);
   assert.equal(report.executableRecoveryMayBeEnabled,false);
