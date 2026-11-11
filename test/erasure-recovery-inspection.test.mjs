@@ -4,6 +4,7 @@ import {
   inspectRecordedProjectTombstone,inspectRecoveryComparisons,
 } from "../dist/erasure-recovery-inspection.js";
 import {serializeDeletionTombstoneComment} from "../dist/mapping-comments.js";
+import {fingerprint} from "../scripts/item-purge-policy.mjs";
 
 const profile="work",projectId="work-project",taskId="private-task",eventId="private-event";
 const commentId="private-recorded-comment";
@@ -129,4 +130,19 @@ test("unchanged pre-write expectations remain unchanged and cannot imply a tombs
   snapshot.knownTargetReadback={todoist:"present",calendar:"present",configuredCalendarLink:"present"};
   const details=inspectRecoveryComparisons(operation,snapshot);
   for(const value of Object.values(details))assert.equal(value.result,"unchanged");
+});
+
+
+test("unchanged original mapping comment before deletion is not reported as altered tombstone",()=>{
+  const original={id:commentId,project_id:projectId,
+    content:"todoist-calendar-sync:mapping:v1\noriginal project mapping evidence"};
+  const expected={...expectation,preConversionConfirmed:true,
+    originalProjectComments:[{id:commentId,digest:fingerprint(original.content)}]};
+  const result=inspectRecordedProjectTombstone([original],expected,at+5_000);
+  assert.equal(result.status,"missing");
+  assert.equal(result.recordedCommentFound,true);
+  assert.equal(result.markerMatchesTaskAndCalendar,false);
+  assert.match(result.explanation,/not yet required/);
+  const changed=inspectRecordedProjectTombstone([{...original,content:original.content+" edited"}],expected,at+5_000);
+  assert.equal(changed.status,"ambiguous");
 });
