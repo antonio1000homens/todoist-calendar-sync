@@ -46,12 +46,71 @@ function storedQueuedOperation(){
     providerDeletionReady:true,status:"queued",createdAt:"now",updatedAt:"now"};
 }
 
- test("erasure operation contract permits only the resumable forward lifecycle",()=>{
+ function postWriteStateOperation(stage="state") {
+  const preview={
+    operationId:"op",profile:"home",target:{taskId:"task",eventId:"event",deleteCalendar:true},
+    selectedActions:{deleteTodoist:true,deleteCalendar:true},providerSnapshotFingerprint:"a".repeat(64),
+    actionPlan:{
+      todoistTask:{id:"task",digest:"b".repeat(64)},
+      calendarEvent:{id:"event",calendarId:"calendar",digest:"c".repeat(64),etag:"etag"},
+      projectCommentIds:[],comments:[],
+      knownCalendarAliases:[{profile:"home",calendarId:"calendar",eventId:"event"}],
+      knownCalendarAliasesComplete:true,
+    },
+    inventory:[{type:"DELIVERY",key:{pk:"DELIVERY#one",sk:"STATE"},digest:"d".repeat(64),
+      classification:"attributable",receiptCleanup:"scrub_identity_refs",scrubbedDigest:"e".repeat(64)}],
+  };
+  const fingerprint=erasurePreviewFingerprint(preview);
+  return {...preview,previewFingerprint:fingerprint,confirmationFingerprint:fingerprint,
+    confirmationId:"11111111-1111-4111-8111-111111111111",providerDeletionReady:true,
+    status:"review_required",createdAt:"now",updatedAt:"now",
+    lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
+      pollMs:5000,nextRunAt:0,evidence:{
+        fenceInstalled:{operationId:"op",phase:"fenceInstalled",
+          receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:Date.now()-60_000},
+        deletionStarted:{operationId:"op",phase:"deletionStarted",
+          receiptId:"123e4567-e89b-12d3-a456-426614174001",completedAt:Date.now()-10_000},
+      },deletionProgress:{stage,commentIndex:0,stateIndex:0,startedAt:Date.now()-5_000}}};
+}
+
+test("erasure operation contract permits only the resumable forward lifecycle",()=>{
   assert.equal(advanceErasureOperation(operation,"queued").status,"queued");
   assert.throws(()=>advanceErasureOperation(operation,"deleting"),/Invalid erasure operation transition/);
   const partial=advanceErasureOperation({...operation,status:"queued"},"partial_failure",{error:"lease timeout"});
   assert.equal(advanceErasureOperation(partial,"queued").status,"queued");
   assert.throws(()=>advanceErasureOperation({...operation,status:"succeeded"},"queued"),/Invalid/);
+});
+
+test("review-required recovery can advance only an exact state/verify checkpoint",async()=>{
+  const item=postWriteStateOperation("state"),db=memoryDb(item),calls=[];
+  const store=new ErasureOperationStore(db,{executeDeletionStep:async(operation,progress)=>{
+    calls.push({operationId:operation.operationId,stage:progress.stage,attempt:progress.attempt?.id,
+      receiptCleanup:operation.inventory[0].receiptCleanup});
+    const {attempt,...checkpoint}=progress;
+    return {complete:false,progress:{...checkpoint,stateIndex:1}};
+  }});
+  const result=await store.advanceFencedLifecycle("op");
+  assert.equal(result.phase,"delete");
+  assert.equal(result.status,"review_required");
+  assert.equal(result.waiting,false);
+  assert.deepEqual(calls,[{operationId:"op",stage:"state",attempt:calls[0]?.attempt,receiptCleanup:"scrub_identity_refs"}]);
+  assert.ok(calls[0].attempt,"the state step is protected by a write-ahead attempt");
+  assert.equal(item.lifecycle.deletionProgress.stateIndex,1);
+  assert.equal(item.lifecycle.deletionProgress.attempt,undefined);
+  assert.equal(item.status,"review_required");
+  assert.equal(item.lifecycle.phase,"delete");
+  const claim=db.calls.find(command=>command.constructor.name.includes("Update")
+    &&command.input.ExpressionAttributeValues[":attempt"]);
+  assert.equal(claim.input.ExpressionAttributeValues[":expectedStatus"],"review_required");
+  assert.match(claim.input.ConditionExpression,/lifecycle\.#progress\.#stage IN \(:state,:verify\)/);
+});
+
+test("review-required recovery refuses to resume any provider-delete stage",async()=>{
+  const item=postWriteStateOperation("todoist"),db=memoryDb(item),calls=[];
+  const store=new ErasureOperationStore(db,{executeDeletionStep:async()=>{calls.push("provider-delete");return {complete:true};}});
+  await assert.rejects(store.advanceFencedLifecycle("op"),/not in a resumable fenced lifecycle state/);
+  assert.deepEqual(calls,[]);
+  assert.equal(db.calls.filter(command=>command.constructor.name.includes("Update")).length,0);
 });
 
 test("deletion gate drift is persisted as review-required with a CAS and cannot be restarted",async()=>{
