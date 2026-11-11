@@ -441,7 +441,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
           const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
           if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
             projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id})) {
-            await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist"});
+            await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist",deliveryId:delivery.id});
             continue;
           }
           suppressCompletionReceipt=false;

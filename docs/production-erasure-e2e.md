@@ -14,8 +14,13 @@ then enqueues the confirmed operation directly to the real erasure queue. It
 does not call the retired unscoped review HTTP routes. It verifies the real
 erasure worker's provider deletions, retained bounded project-comment tombstone, strong full
 DynamoDB identity scan, queue/DLQ counts, fence release and worker mapping
-restoration. The result file and console output contain counts and pass/fail
-state, not provider identities.
+restoration. It then enqueues a synthetic delayed Todoist deletion webhook at
+the current profile epoch and verifies suppression by the active project
+tombstone, correlated by an opaque delivery ID. It repeats provider and
+DynamoDB identity checks after the message drains. This proves the stale-message
+test reaches tombstone admission instead of passing only because an old epoch is
+rejected. The result file and console output contain counts and pass/fail state,
+not provider identities.
 
 Run only after setting `AWS_PROFILE`, `AWS_REGION`, the deployed
 `SYNC_PROFILE_CONFIG_JSON`, `STATE_TABLE_NAME`, `QUEUE_URL`, `SYNC_DLQ_URL`,
