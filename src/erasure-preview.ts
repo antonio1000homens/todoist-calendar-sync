@@ -3,7 +3,8 @@ import { GetCommand, ScanCommand, type DynamoDBDocumentClient } from "@aws-sdk/l
 import { documentClient, pacingDelayMs, scanPageItemLimit } from "./dynamodb-capacity.js";
 import { profiles } from "./config.js";
 import { defaultProviderClientFactory } from "./mutation-budget.js";
-import { activeProjectDeletionTombstone, buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, buildProjectMappingIndex, LEGACY_TASK_COMMENT_MARKERS,
+  parseDeletionTombstoneComment } from "./mapping-comments.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
@@ -304,6 +305,26 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   if(!knownAliasesComplete)
     blockers.push("The operation's exact Calendar alias manifest is incomplete; no deletion confirmation is available");
   const boundedKnownAliases=allKnownAliases.slice(0,32);
+  const targetProjectCommentIds=new Set(indexed.parsed.filter(item=>item.payload.profile===target.profile
+    &&item.payload.projectId===profiles[target.profile].todoistProjectId
+    &&item.payload.taskId===target.taskId).map(item=>item.comment.id));
+  const targetCalendarAliases=new Set(boundedKnownAliases
+    .filter(alias=>alias.profile===target.profile&&alias.calendarId===profiles[target.profile].calendarId)
+    .map(alias=>alias.eventId));
+  if(indexed.parsed.some(item=>targetCalendarAliases.has(item.payload.eventId)
+    &&!targetProjectCommentIds.has(item.comment.id)))
+    blockers.push("A known Calendar alias is still mapped to another Todoist task; manual inspection is required");
+  if(indexed.malformed.some(item=>[...targetCalendarAliases].some(eventId=>item.comment.content?.includes(eventId))))
+    blockers.push("An unparseable project comment contains a known Calendar alias; manual inspection is required");
+  const conflictingTombstone=projectComments.some(comment=>{
+    const marker=parseDeletionTombstoneComment(comment);
+    if(!marker||Date.parse(marker.expiresAt)<=Date.now()
+      ||!marker.eventIds.some(eventId=>targetCalendarAliases.has(eventId)))return false;
+    return marker.profile!==target.profile||marker.projectId!==profiles[target.profile].todoistProjectId
+      ||marker.taskId!==target.taskId||!dependencies.allowFenceOperationId;
+  });
+  if(conflictingTombstone)
+    blockers.push("An active project deletion tombstone overlaps a known Calendar alias; manual inspection is required");
   const crossProfileEvidence=dependencies.auditCrossProfileIdentity?await observeCrossProfileErasureEvidence({
     taskId:target.taskId,eventId:target.eventId,rows,fullRows:allRows,
     calendarProvenance:dependencies.calendarProvenance,
