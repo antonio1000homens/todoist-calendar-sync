@@ -469,6 +469,93 @@ export class ErasureRecoveryService {
       ...(base.completion?{completion:{...base.completion,status:eligible?"pending" as const:"blocked" as const}}:{})};
   }
 
+  /** Validate a partial post-write state checkpoint before allowing the existing
+   * deletion adapter to continue. Only original inventory rows at/after the
+   * durable stateIndex may be touched; provider-delete stages are never resumed. */
+  private postWriteStateCleanupBlockers(
+    inspection:Awaited<ReturnType<ErasureRecoveryService["inspect"]>>,
+  ):string[] {
+    const {operation,snapshot,preview}=inspection;
+    const lifecycle=operation.lifecycle,progress=lifecycle?.deletionProgress;
+    const blockers:string[]=[];
+    if(operation.status!=="review_required"||lifecycle?.phase!=="delete")
+      blockers.push("The original operation is not stopped at the state-cleanup phase.");
+    if(!progress||!["state","verify"].includes(progress.stage)||progress.attempt)
+      blockers.push("The deletion checkpoint is missing, outside state cleanup, or has an uncertain write-ahead attempt.");
+    if(!lifecycle?.evidence.deletionStarted||lifecycle.evidence.deletionStarted.operationId!==operation.operationId
+      ||lifecycle.evidence.deletionStarted.phase!=="deletionStarted")
+      blockers.push("The original provider-deletion start receipt is missing or mismatched.");
+    if(!lifecycle?.evidence.fenceInstalled||lifecycle.evidence.fenceInstalled.operationId!==operation.operationId)
+      blockers.push("The original operation-owned fence receipt is missing or mismatched.");
+    if(operation.providerDeletionReady!==true||!erasureExecutionEnabled()
+      ||process.env.ERASURE_PROTOCOL_VERSION!=="1")
+      blockers.push("The original operation approval or existing deployment/protocol gate is not active.");
+    if(operation.recovery)blockers.push("A separate recovery is already recorded for this operation.");
+    if(operation.target.deleteCalendar!==true||operation.selectedActions.deleteTodoist!==true
+      ||operation.selectedActions.deleteCalendar!==true||!operation.target.taskId||!operation.target.eventId
+      ||operation.actionPlan.todoistTask?.id!==operation.target.taskId
+      ||operation.actionPlan.calendarEvent?.id!==operation.target.eventId
+      ||!operation.actionPlan.calendarEvent?.calendarId)
+      blockers.push("The immutable original Todoist and Calendar deletion targets are incomplete or inconsistent.");
+    if(!preview.providerItemsAbsent||preview.knownTargetReadback?.todoist!=="absent"
+      ||preview.knownTargetReadback.calendar!=="absent"
+      ||preview.knownTargetReadback.configuredCalendarLink!=="not_found")
+      blockers.push("The exact original Todoist task, Calendar event and configured task link are not all proven absent.");
+    if(preview.snapshotSafetyBlockerCount!==0||snapshot.blockers.length)
+      blockers.push("The current attributable state inventory has a safety blocker.");
+    if(!preview.fenceOwned||!Number.isSafeInteger(preview.epoch)||!preview.epoch||preview.leaseCount!==0)
+      blockers.push("The operation-owned fence, epoch or drained lease evidence is incomplete.");
+    const tombstone=preview.projectTombstone;
+    const projectIds=operation.actionPlan.projectCommentIds||[];
+    if(tombstone?.status!=="present"||tombstone.recordedCommentFound!==true
+      ||tombstone.markerMatchesTaskAndCalendar!==true
+      ||tombstone.recordedCommentCount!==projectIds.length||tombstone.foundCommentCount!==projectIds.length)
+      blockers.push("The exact original project-comment inventory does not have a matching active tombstone.");
+    const projectComments=operation.actionPlan.comments.filter(item=>item.kind==="project").map(item=>item.id).sort();
+    if(!Array.isArray(projectIds)||new Set(projectIds).size!==projectIds.length
+      ||projectComments.length!==projectIds.length
+      ||projectComments.some((value,index)=>value!==[...projectIds].sort()[index]))
+      blockers.push("The original project-comment inventory is incomplete or inconsistent.");
+    const event=operation.actionPlan.calendarEvent;
+    const aliases=operation.actionPlan.knownCalendarAliases||[];
+    const aliasKeys=aliases.map(alias=>[alias.profile,alias.calendarId,alias.eventId].join("\u0000"));
+    if(operation.actionPlan.knownCalendarAliasesComplete!==true||!aliases.length||aliases.length>32
+      ||new Set(aliasKeys).size!==aliases.length
+      ||!aliases.some(alias=>alias.profile===operation.profile
+        &&alias.calendarId===event?.calendarId&&alias.eventId===event?.id))
+      blockers.push("The complete bounded original Calendar alias inventory is not proven.");
+    const mappingIds=lifecycle?.mappingIds||[],enabled=new Set(lifecycle?.enabledMappingIds||[]);
+    const mappingStates=inspection.mappingStates||[];
+    if(mappingStates.length!==mappingIds.length||new Set(mappingStates.map(item=>item.id)).size!==mappingIds.length
+      ||mappingIds.some(id=>{
+        const item=mappingStates.find(value=>value.id===id);
+        return !item||!["Enabled","Disabled"].includes(item.state)||(!enabled.has(id)&&item.state!=="Disabled");
+      }))
+      blockers.push("The live worker mapping inventory is missing, transitional or has an originally-disabled mapping enabled.");
+    if(progress&&lifecycle) {
+      if(!Number.isInteger(progress.stateIndex)||progress.stateIndex<0||progress.stateIndex>operation.inventory.length
+        ||progress.commentIndex!==operation.actionPlan.comments.length
+        ||(progress.finalCommentIndex!==undefined&&progress.finalCommentIndex!==projectIds.length))
+        blockers.push("The persisted comment/state indexes do not match the original deletion manifest.");
+      const ordered=[...operation.inventory].sort((a,b)=>
+        Number(a.type==="SYNC_CONTROL")-Number(b.type==="SYNC_CONTROL")
+        ||a.key.pk.localeCompare(b.key.pk)||a.key.sk.localeCompare(b.key.sk));
+      const remaining=new Map(ordered.slice(progress.stateIndex).map(item=>[item.key.pk+"\u0000"+item.key.sk,item]));
+      const currentRows=snapshot.inventory||[];
+      const currentKeys=currentRows.map(item=>item.key.pk+"\u0000"+item.key.sk);
+      if(new Set(currentKeys).size!==currentKeys.length||currentRows.some(item=>{
+        const original=remaining.get(item.key.pk+"\u0000"+item.key.sk);
+        return !original||(item.digest!==original.digest
+          &&!(original.receiptCleanup==="scrub_identity_refs"&&original.scrubbedDigest===item.digest));
+      }))
+        blockers.push("Remaining DynamoDB rows include an unrecorded, already-processed or changed item; preserve the fence.");
+    }
+    const unrelated=inspection.blockers.filter(item=>
+      item!=="Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation");
+    blockers.push(...unrelated);
+    return [...new Set(blockers)].sort();
+  }
+
   private completedPostWriteAssessment(operation:ErasureOperation):PostWriteRecoveryAssessment {
     const receipt=operation.postWriteCompletion!;
     return {
