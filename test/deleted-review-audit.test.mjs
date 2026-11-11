@@ -29,7 +29,8 @@ function fixture({ race = false } = {}) {
     }
     if(command instanceof TransactWriteCommand){
       transaction=command.input.TransactItems;
-      if(race)throw Object.assign(new Error("owner changed"),{name:"TransactionCanceledException"});
+      if(race)throw Object.assign(new Error("owner changed"),{name:"TransactionCanceledException",
+        CancellationReasons:[{Code:"ConditionalCheckFailed"},{Code:"None"}]});
       return {};
     }
     throw new Error("Unexpected DynamoDB operation");
@@ -71,7 +72,19 @@ test("transaction race preserves actionable conflict and all associated audit ev
   const f=fixture({race:true});
   assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",
     {profile:"home",taskIds:["task-a"],eventIds:["event-a"]}),false);
+  assert.equal(f.store.lastVerifiedDeletionBlocker,"case_revision_or_status_changed_retry_required");
   assert.ok(f.getTransaction().some(x=>x.Delete?.Key.pk==="AUDIT#home#new-safe"));
+});
+
+test("verified deletion exposes a bounded transaction-size blocker without attempting partial cleanup",async()=>{
+  const f=fixture();
+  const taskIds=["task-a",...Array.from({length:9},(_,i)=>`task-${i}`)];
+  const eventIds=["event-a",...Array.from({length:9},(_,i)=>`event-${i}`)];
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",{
+    profile:"home",taskIds,eventIds,seriesKeys:[...taskIds,...eventIds],
+  }),false);
+  assert.equal(f.store.lastVerifiedDeletionBlocker,"transaction_item_limit_exceeded");
+  assert.equal(f.getTransaction(),undefined);
 });
 
 test("provider identity not in the exact verified-deleted set refuses cleanup before writes",async()=>{

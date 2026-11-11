@@ -409,6 +409,13 @@ test("project-comment tombstone suppresses stale orphan rechecks before synchron
 test("tombstone lookup failure retries without writing task identity or review state",async t=>{
   const previous={protocol:process.env.ERASURE_PROTOCOL_VERSION,barrier:process.env.ERASURE_REPLAY_BARRIER_VERSION};
   process.env.ERASURE_PROTOCOL_VERSION="0";process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  t.mock.method(documentClient,"send",async()=>({}));
+  t.mock.method(SSMClient.prototype,"send",async command=>{
+    if(command.input.Name==="/test/tombstone-google/home")
+      return {Parameter:{Value:JSON.stringify({client_id:"test",client_secret:"test",refresh_token:"test"})}};
+    if(command.input.Name==="/test/tombstone-todoist/home")return {Parameter:{Value:"test-token"}};
+    throw new Error("unexpected secure parameter read in tombstone lookup failure test");
+  });
   t.mock.method(Todoist.prototype,"listProjectComments",async()=>{throw new Error("Todoist unavailable");});
   const audit=t.mock.method(StateRepository.prototype,"audit",async()=>{});
   const completed=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});

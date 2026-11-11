@@ -33,6 +33,22 @@ test("#278 fully deleted unmapped annual fixture is visible as provider-deleted,
   assert.deepEqual(reverse,result,"the order of provider deletion/readback must not change eligibility");
 });
 
+test("#478 deleted standalone Todoist and one-off Calendar identities become guarded-cleanup evidence",()=>{
+  const oneOffTask="6hxGHMrqcFPwVqFf",oneOffEvent="p1dk5e55fotqv011l4cibo2bt0";
+  const item={id:"work-standalone_todoist_task_deleted-fixture",profile:"work",status:"open",
+    title:"Disposable one-off",reason:"standalone_todoist_task_deleted",taskId:oneOffTask,eventId:oneOffEvent,
+    decision:{type:"standalone_todoist_task_deleted",taskId:oneOffTask,eventId:oneOffEvent}};
+  const evidence=[{...snapshot("todoist",oneOffTask,null),ref:{profile:"work",side:"todoist",id:oneOffTask}},
+    {...snapshot("calendar",oneOffEvent,{id:oneOffEvent,status:"cancelled"}),ref:{profile:"work",side:"calendar",id:oneOffEvent}}];
+  const result=assessUnmappedConflictDeletion(item,evidence);
+  assert.equal(result?.state,"providers_deleted");
+  assert.equal(result?.bothGone,true);
+  assert.match(result.reason,/one-off provider identities are deleted/);
+  assert.deepEqual(result.taskStates,[{id:oneOffTask,state:"deleted"}]);
+  assert.deepEqual(result.eventStates,[{id:oneOffEvent,state:"deleted"}]);
+  assert.equal(assessUnmappedConflictDeletion(item,[evidence[0],{...evidence[1],lookupError:"HTTP 429"}])?.bothGone,false);
+});
+
 test("#278 live Calendar master protects the annual fixture even after Todoist 404 and cancelled occurrence",()=>{
   const liveMaster=snapshot("calendar",masterId,{id:masterId,status:"confirmed",
     recurrence:["RRULE:FREQ=YEARLY"]});
@@ -87,5 +103,7 @@ test("#278 review API refresh and UI use same non-mutating evidence, with no rep
   assert.match(ui,/<OrphanDeletionPanel/);
   assert.match(ui,/\(hasProviderIds\|\|hasLiveIdentity\)&&<div className="preview">/);
   assert.match(ui,/One-sided deletion — no automatic purge/);
-  assert.match(ui,/Run guarded cleanup for/);
+  assert.match(ui,/Retry guarded cleanup for this alert via/);
+  assert.match(ui,/Recheck this alert&apos;s provider items \(read-only\)/);
+  assert.match(ui,/Resolved — verified deletion \/ stale state retired/);
 });
