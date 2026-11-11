@@ -2,7 +2,8 @@
 import {createHash, randomUUID} from "node:crypto";
 import {GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
-import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation, type FencedMapping} from "./erasure-executor.js";
+import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation,
+  type ErasurePostWriteCompletionReceipt,type FencedMapping} from "./erasure-executor.js";
 import type {CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.js";
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
@@ -96,6 +97,7 @@ function table():string {
   return name;
 }
 const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
+const erasureConfirmationKey=(id:string)=>({pk:"ERASURE_CONFIRMATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
 const postwriteReviewPhrase="REVIEW AND KEEP FENCED";
@@ -455,13 +457,230 @@ export class ErasureRecoveryService {
     return {preview,fingerprint,operation:op,hasJournal:Boolean(control.journal),snapshot};
   }
 
-  /** Post-write review is separate from the pre-write RESTORE SYNC executor.
-   * It can persist a fenced acknowledgement but NEVER queues or releases work. */
+  private postWriteAssessment(inspection:Awaited<ReturnType<ErasureRecoveryService["inspect"]>>):PostWriteRecoveryAssessment {
+    const base=assessPostWriteRecovery(inspection.operation,inspection.preview);
+    const completionBlockers=[...base.completionBlockers];
+    if(base.classification==="fully_deleted_candidate") {
+      if(inspection.operation.providerDeletionReady!==true)
+        completionBlockers.push("The original operation was not approved for provider deletion; keep the fence.");
+      if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
+        completionBlockers.push("The existing profile fence/lease protocol is not active; keep the fence.");
+      if(inspection.operation.recovery)
+        completionBlockers.push("A separate recovery is already recorded for this operation; do not run post-write completion.");
+    }
+    const eligible=base.completionEligible&&completionBlockers.length===0;
+    return {...base,completionEligible:eligible,
+      completionBlockers:[...new Set(completionBlockers)].sort(),
+      blockers:eligible?[]:[...new Set(completionBlockers)].sort(),
+      onlyAvailableAction:eligible?"automatic_completion_pending":"keep_fenced",
+      ...(base.completion?{completion:{...base.completion,status:eligible?"pending" as const:"blocked" as const}}:{})};
+  }
+
+  private completedPostWriteAssessment(operation:ErasureOperation):PostWriteRecoveryAssessment {
+    const receipt=operation.postWriteCompletion!;
+    return {
+      operationId:operation.operationId,profile:operation.profile,classification:"completed",
+      releaseAllowed:false,onlyAvailableAction:"completed",potentialDisposition:"completed",
+      completionEligible:false,completionBlockers:[],blockers:[],
+      completion:{status:"completed",automatic:true,tombstoneRetained:true,providerDeletesReplayed:false,
+        completedAt:receipt.completedAt,epoch:receipt.epoch,originalMappingCount:receipt.originalMappingCount,
+        restoredMappingCount:receipt.restoredMappingCount,fenceReleased:true},
+      knownIdentity:{status:"known_identity_deleted",scope:"recorded_original_targets_in_configured_profile",
+        releaseAllowed:false},
+      evidence:{originalProviderWriteIndicated:true,originalCalendarDeletionSelected:true,
+        exactTodoistAndCalendarTargetsRecorded:true,matchingFence:true,epochVerified:true,leasesDrained:true,
+        providersAbsent:true,stateRowsAbsent:true,mappingStateCount:receipt.originalMappingCount,
+        workerMappingsRestored:true,deletionCheckpointComplete:true,projectTombstonePresent:true,
+        knownCalendarAliasesComplete:true},
+    };
+  }
+
+  /** Read-only inspection. The existing worker watchdog performs the bounded
+   * operation-scoped completion when every exact checkpoint is independently proven. */
   async inspectPostWrite(id:string):Promise<PostWriteRecoveryAssessment> {
+    const operation=await this.erasures.get(id);
+    if(!operation)throw Object.assign(new Error("Erasure operation not found; absence cannot prove success"),{status:404});
+    if(operation.status==="succeeded"&&operation.postWriteCompletion?.status==="completed")
+      return this.completedPostWriteAssessment(operation);
     const inspection=await this.inspect(id,{knownIdentityOnly:true});
-    return {...assessPostWriteRecovery(inspection.operation,inspection.preview),
+    return {...this.postWriteAssessment(inspection),
       ...(inspection.operation.postwriteReview?.status==="reviewed_fenced"
         ?{reviewStatus:"reviewed_fenced" as const}:{})};
+  }
+
+  /** Idempotent finalizer for the exact, already-deleted operation. It never
+   * calls a provider delete or starts a new queue; the active tombstone and
+   * operation-owned fence remain in place until mappings are restored and one
+   * conditional DynamoDB transaction retires the identity-bearing operation. */
+  async completePostWriteIfSafe(id:string):Promise<{
+    status:"completed"|"blocked"|"not_applicable";blockers:string[];
+  }> {
+    if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
+    const existing=await this.erasures.get(id);
+    if(!existing)return {status:"blocked",blockers:["The original operation record is missing; absence cannot prove completion."]};
+    if(existing.status==="succeeded"&&existing.postWriteCompletion?.status==="completed")
+      return {status:"completed",blockers:[]};
+    if(existing.status!=="review_required"||!existing.lifecycle)
+      return {status:"not_applicable",blockers:[]};
+    const indicated=Boolean(existing.lifecycle.evidence?.deletionStarted||existing.lifecycle.deletionProgress
+      ||["delete","verify_deletion"].includes(existing.lifecycle.phase));
+    if(!indicated)return {status:"not_applicable",blockers:[]};
+    if(existing.recovery)return {status:"blocked",blockers:["A separate recovery is already recorded; preserve the existing fence."]};
+    if(existing.providerDeletionReady!==true)
+      return {status:"blocked",blockers:["The original operation was not approved for provider deletion; preserve the existing fence."]};
+    if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
+      return {status:"blocked",blockers:["The existing profile fence/lease protocol is not active; preserve the existing fence."]};
+
+    const inspection=await this.inspect(id,{knownIdentityOnly:true});
+    const assessment=this.postWriteAssessment(inspection);
+    if(!assessment.completionEligible)
+      return {status:"blocked",blockers:assessment.completionBlockers};
+    const operation=inspection.operation,lifecycle=operation.lifecycle!,progress=lifecycle.deletionProgress!;
+    const enabledIds=[...lifecycle.enabledMappingIds];
+    // Lambda mapping updates are idempotent. A retry reads the actual state and
+    // only re-enables UUIDs that the original operation recorded as enabled.
+    await this.adapters.restoreMappings(enabledIds);
+
+    const [liveMappings,mappingStates,control,latest]=await Promise.all([
+      this.adapters.listWorkerMappings(),this.adapters.mappingStates(lifecycle.mappingIds),
+      readControl(this.db,operation.profile),this.erasures.get(id),
+    ]);
+    if(latest?.status==="succeeded"&&latest.postWriteCompletion?.status==="completed")
+      return {status:"completed",blockers:[]};
+    const expectedIds=[...lifecycle.mappingIds].sort();
+    const liveIds=liveMappings.map(item=>item.id).sort();
+    const enabled=new Set(enabledIds);
+    const statesById=new Map(mappingStates.map(item=>[item.id,item.state]));
+    const mappingInventoryMatches=liveMappings.length===expectedIds.length
+      &&liveIds.every((value,index)=>value===expectedIds[index])
+      &&liveMappings.every(item=>uuid.test(item.id)&&item.eventSourceArn?.includes(":sqs:")
+        &&["Enabled","Disabled"].includes(item.state));
+    const mappingStatesMatch=mappingStates.length===expectedIds.length
+      &&new Set(mappingStates.map(item=>item.id)).size===expectedIds.length
+      &&expectedIds.every(mappingId=>statesById.get(mappingId)===(enabled.has(mappingId)?"Enabled":"Disabled"));
+    if(!mappingInventoryMatches||!mappingStatesMatch)
+      return {status:"blocked",blockers:["Worker mappings do not match the exact original enablement inventory after restoration; the fence remains active."]};
+    if(control.fence?.operationId!==id||control.fence.state!=="active"
+      ||control.epoch!==inspection.preview.epoch||control.leases.length!==0
+      ||Boolean(control.journal)!==inspection.hasJournal
+      ||(control.journal&&control.journal.operationId!==id))
+      return {status:"blocked",blockers:["The operation-owned fence, epoch, lease drain or journal ownership changed; the fence was not released."]};
+    if(!latest||latest.status!=="review_required"||latest.updatedAt!==operation.updatedAt
+      ||latest.previewFingerprint!==operation.previewFingerprint
+      ||digest(latest.lifecycle)!==digest(operation.lifecycle)||latest.recovery
+      ||latest.postWriteCompletion)
+      return {status:"blocked",blockers:["The recorded operation changed during completion; refresh evidence before retrying."]};
+
+    const deletionStarted=lifecycle.evidence.deletionStarted!;
+    const projectCommentIds=operation.actionPlan.projectCommentIds||[];
+    const completion:ErasurePostWriteCompletionReceipt={
+      mode:"known_identity_post_write",status:"completed",completedAt:new Date().toISOString(),
+      epoch:inspection.preview.epoch!,originalMappingCount:lifecycle.mappingIds.length,
+      restoredMappingCount:enabledIds.length,tombstoneRetained:true,providerDeletesReplayed:false,
+    };
+    const names:Record<string,string>={
+      "#status":"status","#phase":"phase","#progress":"deletionProgress","#stage":"stage",
+      "#commentIndex":"commentIndex","#stateIndex":"stateIndex","#startedAt":"startedAt",
+      "#attempt":"attempt","#deletionStarted":"deletionStarted","#receiptPhase":"phase",
+      "#mappingIds":"mappingIds","#enabledMappingIds":"enabledMappingIds",
+      "#finalCommentIndex":"finalCommentIndex","#error":"error",
+      "#target":"target","#selectedActions":"selectedActions","#previewFingerprint":"previewFingerprint",
+      "#providerSnapshotFingerprint":"providerSnapshotFingerprint","#confirmationFingerprint":"confirmationFingerprint",
+      "#confirmationId":"confirmationId","#providerDeletionReady":"providerDeletionReady",
+      "#inventory":"inventory","#actionPlan":"actionPlan","#lifecycle":"lifecycle","#recovery":"recovery",
+      "#postwriteReview":"postwriteReview","#requestId":"requestId","#result":"result",
+    };
+    const values:Record<string,unknown>={
+      ":review":"review_required",":succeeded":"succeeded",":phase":lifecycle.phase,
+      ":stage":progress.stage,":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,
+      ":startedAt":progress.startedAt,":id":id,":deletionStarted":"deletionStarted",
+      ":deletionReceiptId":deletionStarted.receiptId,":deletionStartedAt":deletionStarted.completedAt,
+      ":ready":true,":fingerprint":operation.previewFingerprint,":confirmationId":operation.confirmationId,
+      ":taskId":operation.target.taskId,":eventId":operation.target.eventId,
+      ":calendarId":operation.actionPlan.calendarEvent!.calendarId,":profile":operation.profile,
+      ":projectCommentCount":projectCommentIds.length,":commentCount":operation.actionPlan.comments.length,
+      ":inventoryCount":operation.inventory.length,":mappingCount":lifecycle.mappingIds.length,
+      ":enabledMappingCount":enabledIds.length,":timeoutSeconds":lifecycle.timeoutSeconds,
+      ":pollMs":lifecycle.pollMs,":updatedAt":operation.updatedAt,
+    };
+    const conditions=[
+      "#status=:review","profile=:profile","lifecycle.#phase=:phase",
+      "lifecycle.#progress.#stage=:stage","lifecycle.#progress.#commentIndex=:commentIndex",
+      "lifecycle.#progress.#stateIndex=:stateIndex","lifecycle.#progress.#startedAt=:startedAt",
+      "attribute_not_exists(lifecycle.#progress.#attempt)",
+      "lifecycle.evidence.#deletionStarted.operationId=:id",
+      "lifecycle.evidence.#deletionStarted.#receiptPhase=:deletionStarted",
+      "lifecycle.evidence.#deletionStarted.receiptId=:deletionReceiptId",
+      "lifecycle.evidence.#deletionStarted.completedAt=:deletionStartedAt",
+      "lifecycle.timeoutSeconds=:timeoutSeconds","lifecycle.pollMs=:pollMs",
+      "size(lifecycle.#mappingIds)=:mappingCount","size(lifecycle.#enabledMappingIds)=:enabledMappingCount",
+      "providerDeletionReady=:ready","previewFingerprint=:fingerprint",
+      "confirmationFingerprint=:fingerprint","confirmationId=:confirmationId",
+      "target.taskId=:taskId","target.eventId=:eventId","target.deleteCalendar=:ready",
+      "selectedActions.deleteTodoist=:ready","selectedActions.deleteCalendar=:ready",
+      "actionPlan.todoistTask.id=:taskId","actionPlan.calendarEvent.id=:eventId",
+      "actionPlan.calendarEvent.calendarId=:calendarId","actionPlan.knownCalendarAliasesComplete=:ready",
+      "size(actionPlan.projectCommentIds)=:projectCommentCount","size(actionPlan.comments)=:commentCount",
+      "size(inventory)=:inventoryCount","updatedAt=:updatedAt","attribute_not_exists(recovery)",
+      "attribute_not_exists(postWriteCompletion)",
+    ];
+    if(progress.finalCommentIndex===undefined)conditions.push("attribute_not_exists(lifecycle.#progress.#finalCommentIndex)");
+    else {values[":finalCommentIndex"]=progress.finalCommentIndex;conditions.push("lifecycle.#progress.#finalCommentIndex=:finalCommentIndex");}
+    lifecycle.mappingIds.forEach((mappingId,index)=>{
+      values[":mapping"+index]=mappingId;conditions.push("contains(lifecycle.#mappingIds, :mapping"+index+")");
+    });
+    enabledIds.forEach((mappingId,index)=>{
+      values[":enabled"+index]=mappingId;conditions.push("contains(lifecycle.#enabledMappingIds, :enabled"+index+")");
+    });
+    projectCommentIds.forEach((commentId,index)=>{
+      values[":projectComment"+index]=commentId;conditions.push("contains(actionPlan.projectCommentIds, :projectComment"+index+")");
+    });
+    const items:any[]=[
+      {Update:{TableName:table(),Key:operationKey(id),
+        UpdateExpression:"SET #status=:succeeded, postWriteCompletion=:completion, updatedAt=:completedAt REMOVE #target, #selectedActions, #previewFingerprint, #providerSnapshotFingerprint, #confirmationFingerprint, #confirmationId, #providerDeletionReady, #inventory, #actionPlan, #lifecycle, #recovery, #postwriteReview, #requestId, #result, #error",
+        ConditionExpression:conditions.join(" AND "),ExpressionAttributeNames:names,
+        ExpressionAttributeValues:{...values,":completion":completion,":completedAt":completion.completedAt}}},
+      {Delete:{TableName:table(),Key:erasureConfirmationKey(id),
+        ConditionExpression:"#status=:consumed AND operationId=:id AND confirmationId=:confirmationId AND consumedBy=:id AND previewFingerprint=:fingerprint",
+        ExpressionAttributeNames:{"#status":"status"},
+        ExpressionAttributeValues:{":consumed":"consumed",":id":id,":confirmationId":operation.confirmationId,
+          ":fingerprint":operation.previewFingerprint}}},
+      {Delete:{TableName:table(),Key:profileKey(operation.profile,"FENCE"),
+        ConditionExpression:"operationId=:id AND #state=:active",
+        ExpressionAttributeNames:{"#state":"state"},
+        ExpressionAttributeValues:{":id":id,":active":"active"}}},
+      {ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"EPOCH"),
+        ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":inspection.preview.epoch}}},
+    ];
+    if(inspection.hasJournal)items.push({Delete:{TableName:table(),Key:profileKey(operation.profile,"JOURNAL"),
+      ConditionExpression:"operationId=:id",ExpressionAttributeValues:{":id":id}}});
+    else items.push({ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"JOURNAL"),
+      ConditionExpression:"attribute_not_exists(pk)"}});
+    try {
+      await this.db.send(new TransactWriteCommand({TransactItems:items}));
+    } catch(error) {
+      try {
+        if(await this.verifyPostWriteCompletion(id,operation.profile,inspection.preview.epoch!))
+          return {status:"completed",blockers:[]};
+      } catch { /* A failed readback is not proof of a committed release. */ }
+      if(["TransactionCanceledException","ConditionalCheckFailedException"].includes((error as {name?:string})?.name||""))
+        return {status:"blocked",blockers:["Final completion conditions changed; the operation-owned fence remains protected. Re-inspect before retrying."]};
+      throw error;
+    }
+    return {status:"completed",blockers:[]};
+  }
+
+  private async verifyPostWriteCompletion(id:string,profile:ErasureOperation["profile"],epoch:number):Promise<boolean> {
+    const [operation,confirmation,control]=await Promise.all([
+      this.db.send(new GetCommand({TableName:table(),Key:operationKey(id),ConsistentRead:true})),
+      this.db.send(new GetCommand({TableName:table(),Key:erasureConfirmationKey(id),ConsistentRead:true})),
+      readControl(this.db,profile),
+    ]);
+    const terminal=operation.Item as ErasureOperation|undefined;
+    return Boolean(terminal?.status==="succeeded"&&terminal.postWriteCompletion?.mode==="known_identity_post_write"
+      &&!terminal.target&&!terminal.actionPlan&&!terminal.inventory&&!terminal.previewFingerprint
+      &&!confirmation.Item&&control.fence?.operationId!==id
+      &&control.journal?.operationId!==id&&typeof control.epoch==="number"&&control.epoch>=epoch);
   }
 
   private async inspectPostWriteCandidate(id:string) {
