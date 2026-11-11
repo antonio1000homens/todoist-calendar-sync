@@ -198,7 +198,7 @@ const WATCHDOG_UUID=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
  * invokes the erasure worker itself). Enumerates exactly three known fence
  * records; never scans, replays deletions or bypasses the existing recovery CAS.
  */
-export async function inspectStuckErasureRecovery():Promise<{fenced:number;queued:number;blocked:number}> {
+export async function inspectStuckErasureRecovery():Promise<{fenced:number;queued:number;completed:number;blocked:number}> {
   const table=process.env.STATE_TABLE_NAME;
   if(!table)throw new Error("STATE_TABLE_NAME is required for erasure recovery watchdog");
   const response=await documentClient.send(new BatchGetCommand({RequestItems:{
@@ -208,7 +208,7 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
   if(response.UnprocessedKeys&&Object.keys(response.UnprocessedKeys).length)
     throw new Error("Incomplete erasure fence inventory; no automatic recovery attempted");
   const fences=response.Responses?.[table]||[];
-  let queued=0,blocked=0;
+  let queued=0,completed=0,blocked=0;
   for(const fence of fences) {
     const profile=String(fence.pk||"").replace(/^ERASURE#/,"");
     const id=fence.operationId;
@@ -235,7 +235,24 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
         continue;
       }
       if(operation.status!=="review_required"||operation.recovery)continue;
-      const result=await recoveryService.startAutomaticPreWriteRecovery(id);
+       // Post-write completion is considered before pre-write recovery. It is
+       // limited to the immutable known-target manifest and never replays a
+       // Todoist/Calendar delete. The existing EventBridge watchdog is the
+       // scheduler; no new queue or per-operation approval is required.
+       const postWrite=await recoveryService.completePostWriteIfSafe(id);
+       if(postWrite.status==="completed") {
+         completed++;
+         console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+           event:"postwrite_completion_completed",operationId:id,profile}));
+         continue;
+       }
+       if(postWrite.status==="blocked") {
+         blocked++;
+         console.warn(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+           event:"postwrite_completion_blocked",operationId:id,profile,blockerCount:postWrite.blockers.length}));
+         continue;
+       }
+       const result=await recoveryService.startAutomaticPreWriteRecovery(id);
       if(result.queued) {
         await enqueueErasureRecovery(id);
         queued++;
@@ -256,7 +273,7 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
         errorType:error instanceof Error?error.name:"UnknownError"}));
     }
   }
-  return {fenced:fences.length,queued,blocked};
+  return {fenced:fences.length,queued,completed,blocked};
 }
 
 /** Isolated, separately bounded Lambda runtime; never shares SQS-worker concurrency. */
