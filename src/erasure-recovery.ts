@@ -545,15 +545,17 @@ export class ErasureRecoveryService {
       const ordered=[...operation.inventory].sort((a,b)=>
         Number(a.type==="SYNC_CONTROL")-Number(b.type==="SYNC_CONTROL")
         ||a.key.pk.localeCompare(b.key.pk)||a.key.sk.localeCompare(b.key.sk));
+      const originalKeys=ordered.map(item=>item.key.pk+"\u0000"+item.key.sk);
       const remaining=new Map(ordered.slice(progress.stateIndex).map(item=>[item.key.pk+"\u0000"+item.key.sk,item]));
       const currentRows=snapshot.inventory||[];
       const currentKeys=currentRows.map(item=>item.key.pk+"\u0000"+item.key.sk);
-      if(new Set(currentKeys).size!==currentKeys.length||currentRows.some(item=>{
-        const original=remaining.get(item.key.pk+"\u0000"+item.key.sk);
-        return !original||(item.digest!==original.digest
-          &&!(original.receiptCleanup==="scrub_identity_refs"&&original.scrubbedDigest===item.digest));
-      }))
-        blockers.push("Remaining DynamoDB rows include an unrecorded, already-processed or changed item; preserve the fence.");
+      if(new Set(originalKeys).size!==originalKeys.length||new Set(currentKeys).size!==currentKeys.length
+        ||currentRows.some(item=>{
+          const original=remaining.get(item.key.pk+"\u0000"+item.key.sk);
+          return !original||item.type!==original.type||(item.digest!==original.digest
+            &&!(original.receiptCleanup==="scrub_identity_refs"&&original.scrubbedDigest===item.digest));
+        }))
+        blockers.push("Remaining DynamoDB rows include an unrecorded, duplicate, already-processed or changed item; preserve the fence.");
     }
     const unrelated=inspection.blockers.filter(item=>
       item!=="Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation");
