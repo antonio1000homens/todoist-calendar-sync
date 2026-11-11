@@ -149,7 +149,9 @@ function fixture(options={}) {
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
   return {service,operation,external,db,get confirmation(){return confirmation;},
-    get postwriteToken(){return postwriteToken;}};
+    get postwriteToken(){return postwriteToken;},
+    get erasureConfirmation(){return erasureConfirmation;},
+    set erasureConfirmation(value){erasureConfirmation=value;}};
 }
 
 function postWriteCompletionFixture(options={}) {
@@ -703,43 +705,25 @@ test("independent post-write preview never issues a confirmation, writes state, 
   assert.ok(external.control.some(row=>row.sk==="FENCE"));
 });
 
-test("strong exact postflight is a read-only candidate only with an original deletion receipt",async()=>{
-  const f=fixture();
-  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
-  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
-  f.operation.actionPlan={
-    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
-    calendarEvent:{id:"disposable-event",digest:"3".repeat(64),etag:"original-etag"},
-    comments:[],
-  };
-  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
-  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
-  f.operation.lifecycle.phase="verify_deletion";
-  f.operation.lifecycle.evidence.deletionStarted={
-    operationId:"op-recovery",phase:"deletionStarted",
-    receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:1000,
-  };
-  const snapshot={
-    operationId:"op-recovery",profile:"work",target:f.operation.target,
-    selectedActions:f.operation.selectedActions,inventory:[],
-    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
-    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
-  };
-  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
-  f.external.snapshot=snapshot;
-  f.external.knownTargetSnapshot=snapshot;
+test("strong exact postflight is a read-only candidate only with complete deletion checkpoints and its active tombstone",async()=>{
+  const f=postWriteCompletionFixture();
   const assessment=await f.service.inspectPostWrite("op-recovery");
   assert.equal(assessment.classification,"fully_deleted_candidate");
   assert.equal(assessment.releaseAllowed,false);
+  assert.equal(assessment.completionEligible,true);
+  assert.equal(assessment.onlyAvailableAction,"automatic_completion_pending");
   assert.equal(assessment.evidence.matchingFence,true);
+  assert.equal(assessment.evidence.deletionCheckpointComplete,true);
+  assert.equal(assessment.evidence.projectTombstonePresent,true);
+  assert.equal(assessment.evidence.knownCalendarAliasesComplete,true);
   assert.equal(f.external.writes.length,0);
   assert.ok(f.external.control.some(x=>x.sk==="FENCE"));
   assert.equal(f.external.knownTargetCalls,1);
   // A stale or malformed fingerprint must not count as fully verified absence.
-  snapshot.previewFingerprint="0".repeat(64);
+  f.external.knownTargetSnapshot.previewFingerprint="0".repeat(64);
   const unsafe=await f.service.inspectPostWrite("op-recovery");
   assert.equal(unsafe.classification,"partial_or_ambiguous");
-  assert.equal(unsafe.releaseAllowed,false);
+  assert.equal(unsafe.completionEligible,false);
   assert.equal(f.external.writes.length,0);
 });
 
