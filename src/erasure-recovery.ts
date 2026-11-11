@@ -542,7 +542,7 @@ export class ErasureRecoveryService {
         &&alias.calendarId===event?.calendarId&&alias.eventId===event?.id))
       blockers.push("The complete bounded original Calendar alias inventory is not proven to match the fresh readback.");
     const mappingIds=lifecycle?.mappingIds||[],enabled=new Set(lifecycle?.enabledMappingIds||[]);
-    const mappingStates=inspection.mappingStates||[];
+    const mappingStates=preview.mappingStates||[];
     if(mappingStates.length!==mappingIds.length||new Set(mappingStates.map(item=>item.id)).size!==mappingIds.length
       ||mappingIds.some(id=>{
         const item=mappingStates.find(value=>value.id===id);
@@ -569,7 +569,7 @@ export class ErasureRecoveryService {
         }))
         blockers.push("Remaining DynamoDB rows include an unrecorded, duplicate, already-processed or changed item; preserve the fence.");
     }
-    const unrelated=inspection.blockers.filter(item=>
+    const unrelated=preview.blockers.filter(item=>
       item!=="Partial or ambiguous provider/record deletion requires a separately reviewed reconciliation");
     blockers.push(...unrelated);
     return [...new Set(blockers)].sort();
