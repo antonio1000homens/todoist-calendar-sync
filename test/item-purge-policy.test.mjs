@@ -260,6 +260,17 @@ test("erasure can scrub an orphan receipt only after the current worker suppress
  assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
 });
 
+test("erasure scrubs only exact known Calendar aliases from completed receipts",()=>{
+ const receipt=record("DELIVERY#alias-only","COMPLETED",{profile:"home",kind:"calendar",
+  identityRefs:{taskIds:["unrelated-task"],eventIds:["old-alias","unrelated-event"],seriesIds:["unrelated-series"]},
+  completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000});
+ const plan=planPurge([receipt],target,{allowCompletedExactDeliveryReceipts:true,knownEventIds:["old-alias"]});
+ assert.deepEqual(plan.blockers,[]);
+ assert.equal(plan.records[0].receiptCleanup,"scrub_identity_refs");
+ assert.equal(plan.records[0].scrubbedDigest,fingerprint({...receipt,identityRefs:{...receipt.identityRefs,
+  eventIds:["unrelated-event"]}}));
+});
+
 test("erasure scrubs selected IDs from shared receipts and keeps unsafe receipts blocked",()=>{
  const base={profile:"home",kind:"todoist",identityRefs:{taskIds:["task-123"],eventIds:["evt_123"],seriesIds:[]},
   completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};

@@ -66,8 +66,16 @@ function providerRefs(row) {
 export function exactCalendarEventIds(row) {
   return [...providerRefs(row).events].sort();
 }
+/** Exact Todoist task IDs present in typed identity fields. */
+export function exactTodoistTaskIds(row) {
+  return [...providerRefs(row).tasks].sort();
+}
 export function planPurge(rows, target, options = {}) {
   const { profile, taskId, eventId } = target;
+  const knownEventIds = new Set(options.knownEventIds ?? []);
+  if (!Array.isArray(options.knownEventIds ?? [])
+      || [...knownEventIds].some(id => typeof id !== "string" || !/^[A-Za-z0-9_.-]{1,1024}$/.test(id)))
+    throw new Error("Known aliases require exact, valid Calendar event IDs");
   const extraProtectedTaskIds = target.protectedTaskIds ?? [];
   const extraProtectedEventIds = target.protectedEventIds ?? [];
   if (!["home", "antonio", "work"].includes(profile) || !/^[A-Za-z0-9_.-]{1,256}$/.test(taskId)
@@ -89,6 +97,7 @@ export function planPurge(rows, target, options = {}) {
   const receiptSanitizationRequirements = new Set();
   const matchedReason = row => {
     const reasons = [];
+    const family = kindOf(row);
     const pk = String(row.pk || "");
     const segments = tokens(pk);
     if (segments.includes(taskId)) reasons.push("task ID in partition key");
@@ -103,6 +112,8 @@ export function planPurge(rows, target, options = {}) {
       const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId|candidateEventIds|identityRefs\.eventIds)(\[\d+\])?$/.test(path);
       if (value === taskId && taskPath) reasons.push("task ID at " + path);
       if (eventId && value === eventId && eventPath) reasons.push("event ID at " + path);
+      if (knownEventIds.has(value) && eventPath)
+        reasons.push("known Calendar alias at " + path);
       const identityField = /(^|[._])[^.[\]]*(?:id|identity)(?:$|\[\d+\])/i.test(path);
       if (value === taskId && !taskPath && identityField) reasons.push("selected identity at unrecognized field " + path);
       if (eventId && value === eventId && !eventPath && identityField) reasons.push("selected identity at unrecognized field " + path);
@@ -124,12 +135,13 @@ export function planPurge(rows, target, options = {}) {
     if (kindOf(row) === "DELIVERY") {
       const refs = providerRefs(row);
       const hasIdentityRefs = Array.isArray(row.identityRefs?.taskIds) || Array.isArray(row.identityRefs?.eventIds);
-      if (hasIdentityRefs && !refs.tasks.has(taskId) && !(eventId && refs.events.has(eventId))) continue;
+      if (hasIdentityRefs && !refs.tasks.has(taskId) && !(eventId && refs.events.has(eventId))
+          && ![...refs.events].some(id => knownEventIds.has(id))) continue;
       if (!hasIdentityRefs && row.profile !== profile) continue;
       const key = keyOf(row);
       if (!included.has(key)) included.set(key, {
         row,
-        reasons: hasIdentityRefs ? ["delivery receipt references selected provider identity"]
+        reasons: hasIdentityRefs ? ["delivery receipt references selected provider identity or known Calendar alias"]
           : ["legacy delivery receipt has no provider identity and requires manual attribution"],
       });
     }
@@ -191,8 +203,9 @@ export function planPurge(rows, target, options = {}) {
     const refs = providerRefs(row);
     const hazards = [];
     const otherTaskIds = [...refs.tasks].filter(id => id !== taskId);
-    const otherEventIds = [...refs.events].filter(id => id !== eventId);
+    const otherEventIds = [...refs.events].filter(id => id !== eventId && !knownEventIds.has(id));
     const directTargetRef = refs.tasks.has(taskId) || (eventId && refs.events.has(eventId))
+      || [...refs.events].some(id => knownEventIds.has(id))
       || tokens(row.pk).includes(taskId) || (eventId && tokens(row.pk).includes(eventId))
       || (family === "CONFLICT_STATE" && reasons.some(reason => reason === "conflict identity hash"));
     let classification = "selected-only";
@@ -207,12 +220,16 @@ export function planPurge(rows, target, options = {}) {
       &&!target.preserveTask&&!extraProtectedTaskIds.includes(taskId)
       &&(!eventId||!extraProtectedEventIds.includes(eventId))
       &&Array.isArray(deliveryTaskIds)&&Array.isArray(deliveryEventIds)&&Array.isArray(deliverySeriesIds)
-      &&(deliveryTaskIds.some(id=>id===taskId)||deliveryEventIds.some(id=>Boolean(eventId)&&id===eventId))
+      &&(deliveryTaskIds.some(id=>id===taskId)||deliveryEventIds.some(id=>Boolean(eventId)&&id===eventId)
+        ||deliveryEventIds.some(id=>knownEventIds.has(id)))
       &&deliveryTaskIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.-]{1,256}$/.test(id))
       &&deliveryEventIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.-]{1,1024}$/.test(id))
       // Google Calendar iCalUIDs conventionally contain one @ separator.
       &&deliverySeriesIds.every(id=>typeof id==="string"&&/^[A-Za-z0-9_.@-]{1,1024}$/.test(id))
       &&!deliverySeriesIds.includes(taskId)&&(!eventId||!deliverySeriesIds.includes(eventId))
+      &&new Set(deliveryTaskIds).size===deliveryTaskIds.length
+      &&new Set(deliveryEventIds).size===deliveryEventIds.length
+      &&new Set(deliverySeriesIds).size===deliverySeriesIds.length
       &&refs.series.size===deliverySeriesIds.length
       &&Number.isFinite(Date.parse(row.completedAt))&&Number.isSafeInteger(row.expiresAt)&&row.expiresAt>0
       &&Object.keys(row).every(name=>["pk","sk","profile","kind","identityRefs","completedAt","expiresAt"].includes(name))
@@ -276,7 +293,8 @@ export function planPurge(rows, target, options = {}) {
     if (otherTaskIds.length) hazards.push("references another Todoist task");
     if (otherEventIds.length) hazards.push("references another Calendar item");
     if (family === "TASKOWNER" && row.taskId !== taskId) { hazards.push("task owner mismatch"); classification = "ambiguous"; }
-    if (family === "EVENT" && (!eventId || row.eventId !== eventId)) { hazards.push("mapping to a different event"); classification = "shared with protected state"; }
+    if (family === "EVENT" && (!eventId || row.eventId !== eventId)
+      && !knownEventIds.has(row.eventId)) { hazards.push("mapping to a different event"); classification = "shared with protected state"; }
     if (family === "TASK" && row.taskId !== taskId) { hazards.push("mapping to a different task"); classification = "shared with protected state"; }
     if ((family!=="DELIVERY"&&refs.series.size) || row.recurrenceOwner || row.owner === "calendar" || row.owner === "todoist")
       hazards.push("recurrence/series ownership needs manual handling");
@@ -291,7 +309,7 @@ export function planPurge(rows, target, options = {}) {
     });
     const sanitizedReceipt=exactCompletedReceipt?{...row,identityRefs:{...deliveryRefs,
       taskIds:deliveryTaskIds.filter(id=>id!==taskId),
-      eventIds:deliveryEventIds.filter(id=>id!==eventId)}}:undefined;
+      eventIds:deliveryEventIds.filter(id=>id!==eventId&&!knownEventIds.has(id))}}:undefined;
     return { pk: row.pk, sk: row.sk, type: family, classification, reasons, hazards: [...new Set(hazards)], digest: fingerprint(row),
       ...(sanitizedReceipt?{receiptCleanup:"scrub_identity_refs",scrubbedDigest:fingerprint(sanitizedReceipt)}:{}) };
   }).sort((a,b) => a.pk.localeCompare(b.pk) || a.sk.localeCompare(b.sk));

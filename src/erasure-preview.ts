@@ -11,7 +11,7 @@ import { inspectErasureFence } from "./erasure-protocol.js";
 import { ERASURE_BACKUP_RETENTION_NOTICE, erasurePreviewFingerprint, type ErasureOperation } from "./erasure-executor.js";
 import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {VerifiedCalendarProvenance} from "./erasure-calendar-provenance.js";
-import { exactCalendarEventIds, fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
+import { exactCalendarEventIds, exactTodoistTaskIds, fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
 import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
 import {todoistCalendarLinkRemovalPatch,unlinkedCalendarEventDigest} from "./erasure-calendar-link.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
@@ -196,7 +196,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const rows = allRows.filter(row => row.pk !== `ERASURE#${target.profile}`
     && !(dependencies.ignoreOperationId && (row.pk===`ERASURE_OPERATION#${dependencies.ignoreOperationId}`
       || row.pk===`ERASURE_CONFIRMATION#${dependencies.ignoreOperationId}`)));
-  const plan = planPurge(rows, target, {allowCompletedExactDeliveryReceipts:true});
+  let plan = planPurge(rows, target, {allowCompletedExactDeliveryReceipts:true});
+  const initialPlanBlockers=new Set(plan.blockers);
   const todoistMissing = (error: unknown) => Number((error as { status?: number })?.status) === 404;
   let task: any, event: any, directEventIdentity:any;
   let taskMissing = false, eventMissing = false;
@@ -217,6 +218,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     providerClients.calendar.findByTodoistTaskId(target.taskId),
     providerClients.todoist.listProjectComments(profiles[target.profile].todoistProjectId, true),
   ]);
+  const previewBlockers:string[]=[];
   const existingDeletionTombstone=activeProjectDeletionTombstone(projectComments,{profile:target.profile,
     projectId:profiles[target.profile].todoistProjectId,taskId:target.taskId,
     eventIds:target.eventId?[target.eventId]:[]});
@@ -228,11 +230,11 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   const indexed = buildProjectMappingIndex(projectComments);
   const relevant = indexed.parsed.filter(item => item.payload.taskId === target.taskId || item.payload.eventId === target.eventId);
   if(existingDeletionTombstone&&!dependencies.allowFenceOperationId)
-    plan.blockers.push("An active project deletion tombstone already exists for this identity");
+    previewBlockers.push("An active project deletion tombstone already exists for this identity");
   if(!relevant.some(item=>item.payload.profile===target.profile
     &&item.payload.projectId===profiles[target.profile].todoistProjectId
     &&item.payload.taskId===target.taskId)&&!(existingDeletionTombstone&&dependencies.allowFenceOperationId))
-    plan.blockers.push("No exact Todoist project mapping comment is available to hold the bounded deletion tombstone");
+    previewBlockers.push("No exact Todoist project mapping comment is available to hold the bounded deletion tombstone");
   const malformed = indexed.malformed.filter(item => item.comment.content?.includes(target.taskId)
     || (target.eventId && item.comment.content?.includes(target.eventId)));
   // Task-scoped comments may outlive a task. Inventory them even when the
@@ -248,7 +250,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       profile: item.payload.profile, taskId: item.payload.taskId, eventId: item.payload.eventId, seriesId: item.payload.seriesId })),
     legacy, malformed: malformed.map(item => ({ id: item.comment.id, error: item.error })),
   };
-  const blockers = [...new Set([...plan.blockers, ...providerBlockers(providerData, target, input.deleteCalendar)])].sort();
+  const blockers = [...new Set([...previewBlockers, ...plan.blockers,
+    ...providerBlockers(providerData, target, input.deleteCalendar)])].sort();
   if (!task && !taskMissing) blockers.push("Todoist returned no task without an explicit not-found response");
   if (target.eventId && !event && !eventMissing)
     blockers.push("Calendar returned no event without an explicit not-found response");
@@ -264,9 +267,6 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
     blockers.push("Provider work leases are active; retry only after they have drained");
   const operationId = (dependencies.newOperationId || randomUUID)();
   const selectedActions = { deleteTodoist: true, deleteCalendar: input.deleteCalendar };
-  const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
-    digest: record.digest, classification: record.classification,
-    ...(record.receiptCleanup?{receiptCleanup:record.receiptCleanup,scrubbedDigest:record.scrubbedDigest}:{}) }));
   const knownAliases=new Map<string,{profile:Profile;calendarId:string;eventId:string}>();
   let knownAliasesComplete=true;
   const addKnownAlias=(profile:Profile,calendarId:string,eventId:string)=>{
@@ -286,6 +286,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   }
   const selectedRowKeys=new Set(plan.records.map(record=>JSON.stringify([record.pk,record.sk])));
   const receiptAliasCandidates:Array<{profile:Profile;calendarId:string;eventId:string}>=[];
+  const targetScopedAliases=new Set<string>();
   for(const row of rows) {
     if(!selectedRowKeys.has(JSON.stringify([row.pk,row.sk])))continue;
     const eventIds=exactCalendarEventIds(row);
@@ -301,8 +302,15 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       continue;
     }
     const calendarId=typeof row.calendarId==="string"?row.calendarId:profiles[rowProfile].calendarId;
+    if(!String(row.pk).startsWith("DELIVERY#")
+      &&exactTodoistTaskIds(row).includes(target.taskId))
+      for(const eventId of eventIds)targetScopedAliases.add(JSON.stringify([rowProfile,calendarId,eventId]));
     for(const eventId of eventIds)receiptAliasCandidates.push({profile:rowProfile,calendarId,eventId});
   }
+  for(const item of relevant)if(item.payload.profile===target.profile
+    &&item.payload.projectId===profiles[target.profile].todoistProjectId
+    &&item.payload.taskId===target.taskId&&item.payload.eventId)
+    addKnownAlias(target.profile,profiles[target.profile].calendarId,item.payload.eventId);
   // Completed receipts can aggregate several Calendar identities. Keep an
   // alias in this deletion only when no different, exact mapping owns it, or
   // a direct Calendar read confirms that mapping's shared taskId. A comment
@@ -347,6 +355,8 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
         continue;
       }
     }
+    if(owner!==target.taskId&&!targetScopedAliases.has(JSON.stringify([
+      candidate.profile,candidate.calendarId,candidate.eventId])))continue;
     addKnownAlias(candidate.profile,candidate.calendarId,candidate.eventId);
   }
   const allKnownAliases=[...knownAliases.values()].sort((a,b)=>
@@ -358,6 +368,18 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   if(!knownAliasesComplete)
     blockers.push("The operation's exact Calendar alias manifest is incomplete; no deletion confirmation is available");
   const boundedKnownAliases=allKnownAliases.slice(0,32);
+  // Re-plan only after the exact, ownership-checked alias set is known. This
+  // allows completed receipts with those aliases to be scrubbed without
+  // widening cleanup to unrelated provider identities.
+  const knownEventIds=knownAliasesComplete?boundedKnownAliases
+    .filter(alias=>alias.profile===target.profile&&alias.calendarId===profiles[target.profile].calendarId)
+    .map(alias=>alias.eventId):[];
+  plan=planPurge(rows,target,{allowCompletedExactDeliveryReceipts:true,knownEventIds});
+  const retainedBlockers=blockers.filter(blocker=>!initialPlanBlockers.has(blocker));
+  blockers.splice(0,blockers.length,...new Set([...retainedBlockers,...plan.blockers]));
+  const inventory = plan.records.map(record => ({ type: record.type, key: { pk: record.pk, sk: record.sk },
+    digest: record.digest, classification: record.classification,
+    ...(record.receiptCleanup?{receiptCleanup:record.receiptCleanup,scrubbedDigest:record.scrubbedDigest}:{}) }));
   const targetProjectCommentIds=new Set(indexed.parsed.filter(item=>item.payload.profile===target.profile
     &&item.payload.projectId===profiles[target.profile].todoistProjectId
     &&item.payload.taskId===target.taskId).map(item=>item.comment.id));
