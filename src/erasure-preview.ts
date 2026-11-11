@@ -10,6 +10,7 @@ import {observeCrossProfileErasureEvidence,type CrossProfileErasureEvidence} fro
 import type {VerifiedCalendarProvenance} from "./erasure-calendar-provenance.js";
 import { exactCalendarEventIds, fingerprint, planPurge, type PurgeTarget } from "../scripts/item-purge-policy.mjs";
 import {summarizeErasureDeliveryReceipts,type ErasureDeliveryReceiptAudit} from "./erasure-delivery-receipt-audit.js";
+import {todoistCalendarLinkRemovalPatch,unlinkedCalendarEventDigest} from "./erasure-calendar-link.js";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
 import type { Profile } from "./types.js";
 
@@ -162,11 +163,12 @@ function providerBlockers(data: {
     blockers.push("Calendar response is missing or has a different event identity");
   if (data.task?.due?.is_recurring) blockers.push("Recurring Todoist task: series must be investigated manually");
   if (data.event?.recurrence?.length || data.event?.recurringEventId) blockers.push("Recurring Calendar item: series/exception requires manual handling");
-  if (data.event && !deleteCalendar) blockers.push("Calendar item exists; select and confirm its exact deletion or handle re-import risk manually");
   if (data.event?.extendedProperties?.shared?.taskId && data.event.extendedProperties.shared.taskId !== target.taskId)
     blockers.push("Selected Calendar event is linked to a different Todoist task");
   if (data.linked && (!target.eventId || typeof data.linked.id !== "string" || data.linked.id !== target.eventId)) blockers.push("Another or unidentifiable Calendar projection links to this task; manual inspection required");
-  if (data.linked && !deleteCalendar) blockers.push("A live Calendar projection would recreate the Todoist task unless separately deleted");
+  if(data.linked&&!deleteCalendar&&(!data.event||data.linked.id!==target.eventId
+    ||data.linked.extendedProperties?.shared?.taskId!==target.taskId))
+    blockers.push("A separate or unverified Calendar projection would recreate the Todoist task");
   if (data.linked?.recurrence?.length || data.linked?.recurringEventId) blockers.push("Linked Calendar recurrence needs manual handling");
   if (data.comments.some(item => item.profile !== target.profile || item.taskId !== target.taskId
     || (target.eventId !== undefined && item.eventId !== target.eventId) || item.seriesId))
@@ -314,9 +316,14 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   // will be misclassified as ambiguous regardless of provider state.
   const primaryProviderSnapshotFingerprint=fingerprint(providerData);
   const providerSnapshotFingerprint=erasureProviderSnapshotFingerprint(providerData,crossProfileEvidence);
+  const calendarLinkPatch=event?todoistCalendarLinkRemovalPatch(event,target.taskId):undefined;
+  if(calendarLinkPatch&&(!target.eventId||typeof event.etag!=="string"||!event.etag))
+    blockers.push("Retained Calendar link cannot be safely changed without its exact ETag");
   const actionPlan = { todoistTask: task ? { id: target.taskId, digest: fingerprint(task) } : undefined,
-    calendarEvent: event ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
-      digest: fingerprint(event), etag:event.etag as string } : undefined,
+    calendarEvent: event&&(input.deleteCalendar||calendarLinkPatch) ? { id: target.eventId!,calendarId:profiles[target.profile].calendarId,
+      digest: fingerprint(event), etag:event.etag as string,
+      ...(!input.deleteCalendar&&calendarLinkPatch?{unlinkTodoistTask:target.taskId,
+        unlinkDigest:unlinkedCalendarEventDigest(event,target.taskId)}:{}) } : undefined,
     knownCalendarAliases:boundedKnownAliases,knownCalendarAliasesComplete:knownAliasesComplete,
     projectCommentIds:relevant.filter(item=>item.payload.profile===target.profile
       &&item.payload.projectId===profiles[target.profile].todoistProjectId

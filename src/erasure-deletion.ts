@@ -7,6 +7,7 @@ import { buildErasurePreview } from "./erasure-preview.js";
 import { ErasureGateDriftError, type ErasureActionPlan, type ErasureOperation } from "./erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
 import { calendarEventGoneOnDirectRead } from "./sync.js";
+import {todoistCalendarLinkRemovalPatch,unlinkedCalendarEventDigest} from "./erasure-calendar-link.js";
 import type { Profile } from "./types.js";
 
 export type ErasureDeletionProgress = {
@@ -166,6 +167,28 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
         if(remaining.id!==operation.target.eventId || remaining.status!=="cancelled")
           throw new Error("Calendar event remains live after delete readback");
       } catch(error) { if(!calendarEventGoneOnDirectRead(error)) throw error; }
+    } else if(plan.calendarEvent?.unlinkTodoistTask===operation.target.taskId) {
+      const approved=plan.calendarEvent;
+      let event:any;
+      try {event=await clients.calendar.getEvent(operation.target.eventId!);}
+      catch {throw new ErasureGateDriftError();}
+      if(!event||event.id!==operation.target.eventId||event.status==="cancelled")
+        throw new ErasureGateDriftError();
+      const afterDigest=unlinkedCalendarEventDigest(event,operation.target.taskId);
+      if(event.extendedProperties?.shared?.taskId===operation.target.taskId) {
+        if(event.etag!==approved.etag||fingerprint(event)!==approved.digest)
+          throw new ErasureGateDriftError();
+        const patch=todoistCalendarLinkRemovalPatch(event,operation.target.taskId);
+        if(!patch)throw new ErasureGateDriftError();
+        await clients.calendar.updateSharedEventPropertiesIfUnchanged(event.id,event.etag,patch);
+      } else if(afterDigest!==approved.unlinkDigest) {
+        throw new ErasureGateDriftError();
+      }
+      const readback=await clients.calendar.getEvent(operation.target.eventId!);
+      if(!readback||readback.id!==operation.target.eventId||readback.status==="cancelled"
+        ||readback.extendedProperties?.shared?.taskId===operation.target.taskId
+        ||unlinkedCalendarEventDigest(readback,operation.target.taskId)!==approved.unlinkDigest)
+        throw new ErasureGateDriftError();
     }
     return {progress:{...progress,stage:"state"},complete:false};
   }

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { executeErasureDeletionStep, erasureProjectTombstonesPresent } from "../dist/erasure-deletion.js";
 import { ErasureGateDriftError } from "../dist/erasure-executor.js";
 import { fingerprint } from "../scripts/item-purge-policy.mjs";
+import { unlinkedCalendarEventDigest } from "../dist/erasure-calendar-link.js";
 import { parseDeletionTombstoneComment, PROJECT_DELETION_TOMBSTONE_RETENTION_MS,
   serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
 
@@ -238,6 +239,35 @@ test("Calendar changes after approval block deletion",async()=>{
     {db:{send:async()=>({})},clients:{todoist:{},calendar:{getEvent:async()=>event,deleteEvent:async()=>{deletes++;}}},inspectFence:async()=>({leases:[]})}),
     ErasureGateDriftError);
   assert.equal(deletes,0);
+});
+
+test("retained Calendar event loses only the exact Todoist link and verifies after a lost patch acknowledgement",async()=>{
+  const taskId="task-1";
+  const original={id:"event-1",calendarId:"home@example.test",etag:"etag-approved",updated:"2026-11-08T12:00:00Z",
+    sequence:3,status:"confirmed",summary:"Keep this event",extendedProperties:{shared:{taskId,taskUrl:"https://app.todoist.com/app/task/task-1",
+      syncSource:"todoist-calendar-sync",customColour:"blue"}}};
+  const retained={...original,etag:"etag-after-patch",updated:"2026-11-08T12:01:00Z",sequence:4,
+    extendedProperties:{shared:{customColour:"blue"}}};
+  const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,calendarEvent:{id:original.id,
+    calendarId:original.calendarId,digest:fingerprint(original),etag:original.etag,unlinkTodoistTask:taskId,
+    unlinkDigest:unlinkedCalendarEventDigest(original,taskId)}}};
+  let current=original,patches=0,reads=0;
+  const calendar={getEvent:async()=>{reads++;return current;},
+    updateSharedEventPropertiesIfUnchanged:async(id,etag,patch)=>{
+      assert.equal(id,original.id);assert.equal(etag,original.etag);
+      assert.deepEqual(patch,{taskId:null,taskUrl:null,syncSource:null});
+      patches++;current=retained;
+      throw new Error("connection dropped after Calendar accepted the patch");
+    }};
+  const progress={stage:"calendar",commentIndex:0,stateIndex:0,startedAt:1};
+  await assert.rejects(executeErasureDeletionStep(operation,progress,
+    {db:{send:async()=>({})},clients:{todoist:{},calendar},inspectFence:async()=>({leases:[]})}),/connection dropped/);
+  const result=await executeErasureDeletionStep(operation,progress,
+    {db:{send:async()=>({})},clients:{todoist:{},calendar:{...calendar,updateSharedEventPropertiesIfUnchanged:async()=>assert.fail("the exact postimage must not be patched twice")}},inspectFence:async()=>({leases:[]})});
+  assert.equal(patches,1);
+  assert.ok(reads>=3,"the uncertain write and retry are checked by direct Calendar readback");
+  assert.deepEqual(current.extendedProperties.shared,{customColour:"blue"});
+  assert.equal(result.progress.stage,"state");
 });
 
 test("Calendar direct read accepts exact 404 and deleted-resource 410 as already absent",async()=>{

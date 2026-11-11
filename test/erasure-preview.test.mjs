@@ -53,7 +53,7 @@ test("unsafe recurrence or active fence blocks confirmation-ready preview", asyn
   assert.ok(preview.blockers.some(value=>value.includes("fence is active")));
 });
 
-test("erasure refuses to retain a Calendar event linked to the deleted Todoist task",async()=>{
+test("erasure confirms removal of the Todoist link when retaining the exact Calendar event",async()=>{
   const taskId="task-retained-calendar",eventId="event-retained-calendar";
   const event={id:eventId,status:"confirmed",etag:"etag-retained-calendar",
     extendedProperties:{shared:{taskId}}};
@@ -67,11 +67,10 @@ test("erasure refuses to retain a Calendar event linked to the deleted Todoist t
   };
   const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:false},
     {db,clients,inspectFence:async()=>({leases:[]}),newOperationId:()=>"retained-calendar"});
-  assert.ok(preview.blockers.includes(
-    "Calendar item exists; select and confirm its exact deletion or handle re-import risk manually"));
-  assert.ok(preview.blockers.includes(
-    "A live Calendar projection would recreate the Todoist task unless separately deleted"));
-  assert.equal(preview.confirmation,undefined);
+  assert.deepEqual(preview.blockers,[]);
+  assert.equal(preview.actionPlan.calendarEvent.unlinkTodoistTask,taskId);
+  assert.match(preview.actionPlan.calendarEvent.unlinkDigest,/^[a-f0-9]{64}$/);
+  assert.equal(preview.actionPlan.calendarEvent.etag,event.etag);
 });
 
 test("strong state scan rejects a repeated pagination cursor instead of accepting an incomplete inventory",async()=>{
