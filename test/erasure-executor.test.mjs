@@ -106,10 +106,10 @@ test("review-required recovery can advance only an exact state/verify checkpoint
   assert.equal(calls[0].stage,"state");
   assert.equal(calls[0].receiptCleanup,"scrub_identity_refs");
   assert.ok(calls[0].attempt,"the state step is protected by a write-ahead attempt");
-  assert.equal(item.lifecycle.deletionProgress.stateIndex,1);
-  assert.equal(item.lifecycle.deletionProgress.attempt,undefined);
-  assert.equal(item.status,"review_required");
-  assert.equal(item.lifecycle.phase,"delete");
+  assert.equal(db.item.lifecycle.deletionProgress.stateIndex,1);
+  assert.equal(db.item.lifecycle.deletionProgress.attempt,undefined);
+  assert.equal(db.item.status,"review_required");
+  assert.equal(db.item.lifecycle.phase,"delete");
   const claim=db.calls.find(command=>command.constructor.name.includes("Update")
     &&command.input.ExpressionAttributeValues[":attempt"]);
   assert.equal(claim.input.ExpressionAttributeValues[":expectedStatus"],"review_required");
