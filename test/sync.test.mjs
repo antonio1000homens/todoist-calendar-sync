@@ -6,7 +6,7 @@ import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
-import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { StateRepository } from "../dist/repository.js";
 import { ReviewStore } from "../dist/review-store.js";
 
@@ -600,6 +600,8 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
     async getMappingByTaskAnyProfile() { return undefined; },
     async listCompletedCalendarProjectionsByTask() { return []; },
+    async mutationAllowed() { return true; },
+    async syncBlocked() { return false; },
   };
   const todoist = {
     async listProjectComments() { return []; },
@@ -620,6 +622,98 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
     assert.equal(Object.hasOwn(audit.detail, "taskId"), false);
     assert.equal(Object.hasOwn(audit.detail, "deliveryId"), false);
   }
+});
+
+test("deleted Todoist task removes its exact project mapping comment even without DynamoDB mapping", async () => {
+  const projectId = profiles.home.todoistProjectId;
+  const taskId = "deleted-task-with-orphan-comment";
+  const eventId = "linked-calendar-event";
+  const content = serializeMappingComment({ profile: "home", projectId, taskId, eventId,
+    updatedAt: "2026-11-11T12:00:00.000Z" }, projectId);
+  const comment = { id: "app-mapping-comment", project_id: projectId, content };
+  const userNote = { id: "user-authored-note", project_id: projectId, content: "Keep these personal notes" };
+  const deletedComments = [];
+  let commentExists = new Set([comment.id, userNote.id]);
+  const state = {
+    async getMappingByTaskAnyProfile() { return undefined; },
+    async syncBlocked() { return false; },
+    async mutationAllowed() { return true; },
+    async listCompletedCalendarProjectionsByTask() { return []; },
+    async audit() {},
+  };
+  const todoist = {
+    async listProjectComments(id) { assert.equal(id, projectId); return [comment, userNote]; },
+    async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
+    async getComment(id) {
+      if (!commentExists.has(id)) { const error = new Error("not found"); error.status = 404; throw error; }
+      return id === comment.id ? comment : userNote;
+    },
+    async deleteComment(id) { deletedComments.push(id); commentExists.delete(id); },
+  };
+  const calendar = { async findByTodoistTaskId() { return undefined; } };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  await sync.process({ id: "deleted-task-orphan-comment", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2026-11-11T12:01:00.000Z", headers: {},
+    body: JSON.stringify({ event_name: "item:deleted", event_data: {
+      id: taskId, content: "Deleted item", project_id: projectId, is_deleted: true,
+    } }),
+  });
+
+  assert.deepEqual(deletedComments, [comment.id]);
+  assert.equal(commentExists.has(comment.id), false);
+  assert.equal(commentExists.has(userNote.id), true);
+});
+
+test("Todoist project-comment cleanup failure retries before deletion is acknowledged", async () => {
+  const projectId = profiles.home.todoistProjectId;
+  const taskId = "deleted-task-comment-retry";
+  const mapping = { profile: "home", eventId: "event-retry", taskId, updatedAt: "2026-11-11T11:00:00.000Z" };
+  const comment = { id: "app-mapping-comment-retry", project_id: projectId,
+    content: serializeMappingComment({ profile: "home", projectId, taskId, eventId: "event-retry",
+      updatedAt: "2026-11-11T12:00:00.000Z" }, projectId) };
+  const effects = [];
+  let commentExists = true;
+  let commentDeleteAttempts = 0;
+  const state = {
+    async getMappingByTaskAnyProfile() { return mapping; },
+    async getMappingByTask() { return mapping; },
+    async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async syncBlocked() { return false; },
+    async mutationAllowed() { return true; },
+    async listCompletedCalendarProjectionsByTask() { return []; },
+    async deleteMapping() { assert.equal(commentExists, false); effects.push("mapping-delete"); },
+    async deleteCalendarProjectionTombstone() {},
+    async recordMutation() {},
+    async audit() {},
+  };
+  const todoist = {
+    async listProjectComments() { return commentExists ? [comment] : []; },
+    async getComment() {
+      if (!commentExists) { const error = new Error("not found"); error.status = 404; throw error; }
+      return comment;
+    },
+    async deleteComment() {
+      effects.push("comment-delete");
+      commentDeleteAttempts++;
+      if (commentDeleteAttempts === 1) { const error = new Error("provider unavailable"); error.status = 503; throw error; }
+      commentExists = false;
+    },
+  };
+  const calendar = { async deleteEvent() { effects.push("calendar-delete"); } };
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
+
+  const delivery = { id: "deleted-task-comment-retry", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2026-11-11T12:01:00.000Z", headers: {},
+    body: JSON.stringify({ event_name: "item:deleted", event_data: {
+      id: taskId, content: "Deleted item", project_id: projectId, is_deleted: true,
+    } }),
+  };
+  await assert.rejects(sync.process(delivery), /provider unavailable/);
+  assert.deepEqual(effects, ["comment-delete"], "do not delete the Calendar event or mapping until comment cleanup can be retried");
+  commentDeleteAttempts = 1;
+  await sync.process(delivery);
+  assert.deepEqual(effects, ["comment-delete", "comment-delete", "calendar-delete", "mapping-delete"]);
 });
 
 test("temporary project tombstone suppresses a stale Todoist webhook before task reads or writes",async()=>{

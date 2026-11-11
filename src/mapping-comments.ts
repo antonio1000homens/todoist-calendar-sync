@@ -476,3 +476,47 @@ export async function deleteMappingComments(client: ProjectCommentClient, mappin
   }
   return deleted;
 }
+
+/** Delete every exact app-owned project mapping for a task, and require provider confirmation. */
+export async function deleteExactTaskProjectMappingComments(
+  client: ProjectCommentClient,
+  comments: TodoistCommentRecord[],
+  identity: { profile: Profile; projectId: string; taskId: string },
+): Promise<number> {
+  const candidates = comments.flatMap(comment => {
+    const parsed = parseMappingComment(comment);
+    return parsed && !("error" in parsed)
+      && comment.project_id === identity.projectId && !comment.task_id
+      && parsed.payload.profile === identity.profile
+      && parsed.payload.projectId === identity.projectId
+      && parsed.payload.taskId === identity.taskId
+      ? [{comment, payload: parsed.payload}] : [];
+  });
+  let deleted = 0;
+  for (const {comment: candidate, payload} of candidates) {
+    let current: TodoistCommentRecord;
+    try { current = await client.getComment(candidate.id); }
+    catch (error) {
+      if (Number((error as { status?: number }).status) === 404) continue;
+      throw error;
+    }
+    const parsed = parseMappingComment(current);
+    if (!parsed || "error" in parsed || current.id !== candidate.id
+      || current.project_id !== identity.projectId || current.task_id
+      || parsed.payload.profile !== identity.profile
+      || parsed.payload.projectId !== identity.projectId
+      || parsed.payload.taskId !== identity.taskId
+      || parsed.payload.eventId !== payload.eventId) {
+      throw new Error(`Todoist project mapping comment ${candidate.id} changed before task deletion cleanup`);
+    }
+    await client.deleteComment(current.id);
+    try {
+      await client.getComment(current.id);
+      throw new Error(`Todoist project mapping comment ${current.id} remains after deletion`);
+    } catch (error) {
+      if (Number((error as { status?: number }).status) !== 404) throw error;
+      deleted++;
+    }
+  }
+  return deleted;
+}
