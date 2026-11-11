@@ -344,7 +344,8 @@ test("project-comment tombstone suppresses deleted Todoist webhooks before manua
     {awsRequestId:"tombstone-delete-request"});
   assert.deepEqual(result.batchItemFailures,[]);
   assert.equal(audits.mock.callCount(),1);
-  assert.deepEqual(audits.mock.calls[0].arguments.slice(1),["erasure_project_comment_replay_suppressed",{side:"todoist"}]);
+  assert.deepEqual(audits.mock.calls[0].arguments.slice(1),["erasure_project_comment_replay_suppressed",
+    {side:"todoist",deliveryId:"stale-deleted-task"}]);
   assert.equal(completed.mock.callCount(),0);
   assert.equal(manual.mock.callCount(),0);
   assert.equal(syncProcess.mock.callCount(),0);

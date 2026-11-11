@@ -32,6 +32,7 @@
     "audit:legacy-hmac-retirement": "node scripts/audit-legacy-hmac-retirement.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudwatch-logs": "^3.1163.0",
     "@aws-sdk/client-codedeploy": "^3.1163.0",
     "@aws-sdk/client-dynamodb": "^3.1156.0",
     "@aws-sdk/client-lambda": "^3.1163.0",

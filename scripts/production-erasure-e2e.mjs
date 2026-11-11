@@ -7,20 +7,22 @@
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { GetFunctionConfigurationCommand, LambdaClient, ListEventSourceMappingsCommand } from "@aws-sdk/client-lambda";
-import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { FilterLogEventsCommand, CloudWatchLogsClient } from "@aws-sdk/client-cloudwatch-logs";
+import { GetQueueAttributesCommand, SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { DeleteCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { googleCredentials, profiles, todoistToken } from "../dist/config.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ErasureOperationStore, erasurePreviewFingerprint } from "../dist/erasure-executor.js";
 import { buildErasurePreview } from "../dist/erasure-preview.js";
 import { verifyErasurePostflight } from "../dist/erasure-deletion.js";
-import { acquireProfileAdmissionLease, inspectErasureFence } from "../dist/erasure-protocol.js";
+import { acquireProfileAdmissionLease, getErasureEpoch, inspectErasureFence } from "../dist/erasure-protocol.js";
 import { enqueueErasureOperation } from "../dist/erasure-queue.js";
 import { erasureExecutionEnabled } from "../dist/erasure-readiness.js";
 import { defaultProviderClientFactory } from "../dist/mutation-budget.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
 import { StateRepository } from "../dist/repository.js";
 import { activeProjectDeletionTombstone, parseDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { syncMessageGroupId } from "../dist/types.js";
 
 const PROFILE = "work";
 const CONFIRMATION = "RUN_DISPOSABLE_WORK_ERASURE_E2E";
@@ -34,6 +36,7 @@ const SYNC_DLQ = process.env.SYNC_DLQ_URL?.trim();
 const TARGET_WORKER = process.env.ERASURE_TARGET_WORKER_FUNCTION_NAME?.trim();
 const REVIEW_FUNCTION = process.env.ERASURE_REVIEW_FUNCTION_NAME?.trim();
 const ERASURE_WORKER = process.env.ERASURE_WORKER_FUNCTION_NAME?.trim();
+const AWS_REGION = process.env.AWS_REGION?.trim() || "eu-west-2";
 
 function assertPreconditions(argv) {
   if (argv.length !== 1 || argv[0] !== `--confirm=${CONFIRMATION}`)
@@ -151,6 +154,34 @@ async function sourceMappings(lambda) {
     .sort((a,b)=>a.id.localeCompare(b.id));
 }
 
+async function enqueueDelayedDeletedWebhook(sqs,taskId) {
+  const deliveryId=randomUUID();
+  const delivery={id:deliveryId,kind:"todoist",profile:PROFILE,mode:"aws",receivedAt:new Date().toISOString(),
+    headers:{},body:JSON.stringify({event_name:"item:deleted",event_data:{id:taskId,
+      project_id:profiles[PROFILE].todoistProjectId,is_deleted:true}}),erasureEpoch:await getErasureEpoch(PROFILE)};
+  await sqs.send(new SendMessageCommand({QueueUrl:SYNC_QUEUE,MessageBody:JSON.stringify(delivery),
+    MessageGroupId:syncMessageGroupId(PROFILE),MessageDeduplicationId:deliveryId}));
+  return deliveryId;
+}
+
+async function waitForSuppressionLog(logs,deliveryId) {
+  const logGroupName=`/aws/lambda/${TARGET_WORKER}`;
+  const startTime=Date.now()-60_000;
+  return poll("identity-free stale webhook suppression log",async()=>logs.send(new FilterLogEventsCommand({
+    logGroupName,startTime,filterPattern:`{ $.event = "erasure_project_comment_replay_suppressed" && $.deliveryId = "${deliveryId}" }`,limit:20,
+  })),result=>{
+    const event=(result.events||[]).find(item=>{
+      try {const value=JSON.parse(item.message||"{}");return value.event==="erasure_project_comment_replay_suppressed"&&value.deliveryId===deliveryId;}
+      catch {return false;}
+    });
+    if(!event)return false;
+    const text=event.message||"";
+    if(text.includes("taskId")||text.includes("eventId"))
+      throw new Error("The stale webhook suppression record exposed provider identity");
+    return event;
+  });
+}
+
 async function createAndQueue(operationStore, target, onCreated) {
   const owner=randomUUID();
   const release=await acquireProfileAdmissionLease(PROFILE,owner);
@@ -199,17 +230,20 @@ async function createAndQueue(operationStore, target, onCreated) {
 
 async function main() {
   assertPreconditions(process.argv.slice(2));
-  const sqs=new SQSClient({});
+  const sqs=new SQSClient({region:AWS_REGION});
+  const logs=new CloudWatchLogsClient({region:AWS_REGION});
   const calendar=new GoogleCalendar(await googleCredentials(PROFILE),profiles[PROFILE].calendarId);
   const todoist=new Todoist(await todoistToken(PROFILE));
   const state=new StateRepository();
   const clients=await defaultProviderClientFactory(PROFILE);
   const operations=new ErasureOperationStore();
-  const lambda=new LambdaClient({});
+  const lambda=new LambdaClient({region:AWS_REGION});
   await verifyLiveExecutionGate(lambda);
   const initialMappings=await sourceMappings(lambda);
   if(!initialMappings.length||initialMappings.some(item=>!["Enabled","Disabled"].includes(item.state)))
     throw new Error("E2E preflight requires a complete, stable SQS mapping inventory for the sync worker");
+  if(!initialMappings.some(item=>item.state==="Enabled"))
+    throw new Error("E2E delayed-webhook acceptance requires the original Work sync mapping to be enabled");
   const initial={sync:await queueDepth(sqs,SYNC_QUEUE),syncDlq:await queueDepth(sqs,SYNC_DLQ),
     erasure:await queueDepth(sqs,OPERATION_QUEUE),erasureDlq:await queueDepth(sqs,OPERATION_DLQ)};
   const existing=await inspectErasureFence(PROFILE);
@@ -273,6 +307,22 @@ async function main() {
     if(restored.current.fence||restored.current.leases.length
       ||JSON.stringify(restored.mappings)!==JSON.stringify(initialMappings))
       throw new Error("Original sync worker mapping states or Work fence were not restored");
+    // Model a delayed provider delivery after deletion. Use the current epoch
+    // so this reaches the tombstone admission check instead of being rejected
+    // by the older epoch guard; the opaque delivery ID permits log correlation
+    // without putting either provider ID in audit metadata.
+    const deliveryId=await enqueueDelayedDeletedWebhook(sqs,taskId);
+    log("delayed_delete_webhook_enqueued",{deliveryId});
+    await poll("delayed deletion webhook drained",()=>queueDepth(sqs,SYNC_QUEUE),depth=>depth===0);
+    const suppression=await waitForSuppressionLog(logs,deliveryId);
+    if(!suppression)throw new Error("The delayed deletion webhook was not observably suppressed by the project tombstone");
+    const afterReplay=await verifyErasurePostflight(operation,{db:documentClient,clients,
+      inspectFence:async profile=>inspectErasureFence(profile)});
+    if(!afterReplay.providersAbsent||!afterReplay.stateAbsent)
+      throw new Error("Delayed webhook changed provider or DynamoDB erasure state");
+    const afterReplayReferences=await scanIdentityReferences(taskId,eventId);
+    if(afterReplayReferences.matches.length)
+      throw new Error("Delayed webhook recreated erased task/event identity in DynamoDB");
     const final={sync:await queueDepth(sqs,SYNC_QUEUE),syncDlq:await queueDepth(sqs,SYNC_DLQ),
       erasure:await queueDepth(sqs,OPERATION_QUEUE),erasureDlq:await queueDepth(sqs,OPERATION_DLQ)};
     if(final.sync!==0||final.erasure!==0)
@@ -281,6 +331,8 @@ async function main() {
       throw new Error("A sync or erasure DLQ grew during the disposable E2E");
     const result={status:"passed",profile:PROFILE,operationCompleted:true,tombstoneVerified:true,
       providerAbsenceVerified:absent.providersAbsent,dynamoIdentityRows:references.matches.length,
+      delayedWebhookSuppressed:true,delayedWebhookObserved:true,
+      postReplayDynamoIdentityRows:afterReplayReferences.matches.length,
       stateScan:{pages:references.pages,rows:references.scanned},fenceReleased:true,
       initialQueueDepths:initial,finalQueueDepths:final};
     await writeFile(process.env.E2E_RESULT_FILE||"production-erasure-e2e-result.json",`${JSON.stringify(result,null,2)}\n`);
