@@ -7,6 +7,7 @@ import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation,
 import type {CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.js";
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
+import {erasureExecutionEnabled} from "./erasure-readiness.js";
 import {inspectRecoveryComparisons,type InspectionComparisons,
   type ProjectTombstoneInspection} from "./erasure-recovery-inspection.js";
 
@@ -463,6 +464,8 @@ export class ErasureRecoveryService {
     if(base.classification==="fully_deleted_candidate") {
       if(inspection.operation.providerDeletionReady!==true)
         completionBlockers.push("The original operation was not approved for provider deletion; keep the fence.");
+      if(!erasureExecutionEnabled())
+        completionBlockers.push("The existing erasure execution gate is disabled; keep the fence until the approved writer/IAM release boundary is enabled.");
       if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
         completionBlockers.push("The existing profile fence/lease protocol is not active; keep the fence.");
       if(inspection.operation.recovery)
@@ -528,6 +531,8 @@ export class ErasureRecoveryService {
     if(existing.recovery)return {status:"blocked",blockers:["A separate recovery is already recorded; preserve the existing fence."]};
     if(existing.providerDeletionReady!==true)
       return {status:"blocked",blockers:["The original operation was not approved for provider deletion; preserve the existing fence."]};
+    if(!erasureExecutionEnabled())
+      return {status:"blocked",blockers:["The existing erasure execution gate is disabled; preserve the fence until the approved writer/IAM release boundary is enabled."]};
     if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
       return {status:"blocked",blockers:["The existing profile fence/lease protocol is not active; preserve the existing fence."]};
 
