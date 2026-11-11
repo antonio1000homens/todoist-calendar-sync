@@ -366,7 +366,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         ...(operation.lifecycle?.lastError?{lastError:operation.lifecycle.lastError}:{}),
         ...(operation.postWriteCompletion?{
           operatorRecoveryRequired:false,
-          message:"Verified post-write cleanup completed. The operation-owned fence was released, only originally enabled worker mappings were restored, and the 18-day project-comment tombstone remains active."
+          message:"Verified post-write cleanup completed. The operation-owned fence was released, only originally enabled worker mappings were restored, and the 18-day project-comment tombstone was left untouched for normal expiry cleanup."
         }:operation.status==="review_required"?{
           operatorRecoveryRequired:operation.recovery?.status!=="completed",
           message:operation.recovery?.status==="completed"
