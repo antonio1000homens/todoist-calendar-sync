@@ -267,34 +267,16 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
 
-    // Rollout-gated, state-only review: never queues recovery or releases a fence.
+    // Post-write inspection is read-only. The existing worker watchdog owns
+    // automatic completion; no per-operation review token or mutating route exists.
     if(segments[0]==="erasure-postwrite-recoveries"&&segments[1]) {
-      const id=segments[1],action=segments[2];
-      const recovery=recoveryService();
+      const id=segments[1],recovery=recoveryService();
       if(method==="GET"&&segments.length===2) {
         const assessment=await recovery.inspectPostWrite(id);
         console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
           event:"postwrite_recovery_evidence_inspected",operationId:id,
           classification:assessment.classification,blockerCount:assessment.blockers.length}));
         return response(200,{assessment});
-      }
-      if(method==="POST"&&segments.length===3&&action==="review-token") {
-        if(Object.keys(body||{}).length)fail(400,"Post-write review token accepts no request fields");
-        const issued=await recovery.issuePostWriteReviewToken(id,actor.subject);
-        return response(200,{...issued});
-      }
-      if(method==="POST"&&segments.length===3&&action==="acknowledge") {
-        if(Object.keys(body||{}).sort().join(",")!=="confirmationId,operationId,phrase,profile"
-          ||typeof body?.confirmationId!=="string"||body.operationId!==id
-          ||body.phrase!=="REVIEW AND KEEP FENCED"
-          ||!REVIEW_PROFILES.includes(body.profile as Profile))
-          fail(400,"Post-write review requires exact operation, profile and REVIEW AND KEEP FENCED phrase");
-        const reviewed=await recovery.acknowledgePostWriteReview(id,body.confirmationId,actor.subject,{
-          operationId:body.operationId,profile:body.profile as Profile,phrase:body.phrase,
-        });
-        console.log(JSON.stringify({service:"todoist-calendar-sync-review-api",
-          event:"postwrite_review_recorded_fenced",operationId:id}));
-        return response(200,{review:reviewed});
       }
       return response(404,{error:"not_found"});
     }
