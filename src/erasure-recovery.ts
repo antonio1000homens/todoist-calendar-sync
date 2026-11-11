@@ -690,15 +690,21 @@ export class ErasureRecoveryService {
       readControl(this.db,profile),
     ]);
     const terminal=operation.Item as ErasureOperation|undefined;
+    const receipt=terminal?.postWriteCompletion;
+    const originalFenceReleased=!control.fence
+      ||(typeof control.fence.operationId==="string"&&control.fence.operationId!==id);
+    const originalJournalReleased=!control.journal
+      ||(typeof control.journal.operationId==="string"&&control.journal.operationId!==id);
     return Boolean(terminal?.operationId===id&&terminal.profile===profile&&terminal.status==="succeeded"
-      &&terminal.postWriteCompletion?.mode==="known_identity_post_write"
-      &&terminal.postWriteCompletion.status==="completed"
+      &&receipt?.mode==="known_identity_post_write"&&receipt.status==="completed"
+      &&receipt.epoch===epoch&&Number.isFinite(Date.parse(receipt.completedAt))
+      &&receipt.tombstoneRetained===true&&receipt.providerDeletesReplayed===false
       &&!terminal.target&&!terminal.selectedActions&&!terminal.actionPlan&&!terminal.inventory
       &&!terminal.previewFingerprint&&!terminal.providerSnapshotFingerprint
       &&!terminal.confirmationFingerprint&&!terminal.confirmationId&&!terminal.lifecycle
       &&!terminal.recovery&&!terminal.postwriteReview&&!terminal.requestId&&!terminal.result&&!terminal.error
       &&!confirmation.Item&&!recoveryToken.Item&&!legacyPostwriteToken.Item
-      &&control.fence?.operationId!==id&&control.journal?.operationId!==id
+      &&originalFenceReleased&&originalJournalReleased
       &&typeof control.epoch==="number"&&control.epoch>=epoch);
   }
 
