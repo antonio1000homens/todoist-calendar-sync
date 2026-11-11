@@ -30,9 +30,15 @@ requires all of the following:
   event absent and the configured Calendar task-link lookup not found.
 - The exact original project-comment inventory matches an active, read-back
   18-day tombstone. The tombstone is retained for its normal expiry cleanup.
-- The fresh attributable DynamoDB inventory is empty, the snapshot has no
-  safety blockers, the operation-owned fence and epoch are valid, and no
-  admission/writer leases remain.
+- Any remaining DynamoDB rows are an exact subset of the original
+  operation inventory at or after its durable state checkpoint. The existing
+  fenced deletion adapter resumes only this state phase (including eligible
+  delivery-receipt identity-reference scrubbing); it never resumes a
+  Todoist/Calendar delete. Unrecorded, changed or already-processed rows block.
+  Before release, a fresh attributable inventory must be empty and the
+  snapshot must have no safety blockers.
+- The operation-owned fence and epoch are valid, and no admission/writer
+  leases remain.
 - The live worker mapping inventory exactly matches the original recorded
   UUIDs. Originally-disabled mappings remain disabled; only originally-enabled
   mappings may be restored.
@@ -52,18 +58,25 @@ three known profile fences. For each `review_required` operation:
 1. It tries the post-write finalizer before considering pre-write recovery.
    Partial or ambiguous post-write operations are not passed to pre-write
    recovery.
-2. It re-reads the exact operation evidence and checks the fence/epoch/lease
-   owner immediately before restoring mappings.
-3. It re-enables only the UUIDs in the original `enabledMappingIds` list.
+2. If provider deletion is complete but the durable state checkpoint is
+   still at `state`, it resumes at most ten original inventory entries per
+   invocation through the existing fenced deletion adapter. This removes
+   only recorded rows and scrubs eligible delivery receipts while preserving
+   unrelated identity references. It persists each checkpoint and continues
+   on the next watchdog pass if needed. A write-ahead attempt, changed row or
+   non-matching inventory remains fenced.
+3. It re-reads the exact provider/state evidence and checks the fence/epoch/
+   lease owner immediately before restoring mappings.
+4. It re-enables only the UUIDs in the original `enabledMappingIds` list.
    It then verifies the complete mapping inventory and exact original enabled /
    disabled state.
-4. One conditional DynamoDB transaction checks the unchanged operation,
+5. One conditional DynamoDB transaction checks the unchanged operation,
    deletion receipt/checkpoints, original confirmation, operation-owned fence,
    epoch and journal ownership. It removes the original confirmation, any
    operation-bound pre-write or legacy post-write review tokens, the
    operation-owned fence and journal, and replaces the identity-bearing
    operation with an identity-free terminal receipt.
-5. The Todoist project-comment tombstone is deliberately left untouched for
+6. The Todoist project-comment tombstone is deliberately left untouched for
    its normal 18-day expiry cleanup.
 
 The terminal operation record retains only the operation ID, owning profile,
