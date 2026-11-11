@@ -518,12 +518,17 @@ export class ErasureRecoveryService {
       blockers.push("The original project-comment inventory is incomplete or inconsistent.");
     const event=operation.actionPlan.calendarEvent;
     const aliases=operation.actionPlan.knownCalendarAliases||[];
-    const aliasKeys=aliases.map(alias=>[alias.profile,alias.calendarId,alias.eventId].join("\u0000"));
-    if(operation.actionPlan.knownCalendarAliasesComplete!==true||!aliases.length||aliases.length>32
-      ||new Set(aliasKeys).size!==aliases.length
+    const aliasKeys=aliases.map(alias=>[alias.profile,alias.calendarId,alias.eventId].join("\u0000")).sort();
+    const snapshotAliases=snapshot.actionPlan.knownCalendarAliases||[];
+    const snapshotAliasKeys=snapshotAliases.map(alias=>[alias.profile,alias.calendarId,alias.eventId].join("\u0000")).sort();
+    if(operation.actionPlan.knownCalendarAliasesComplete!==true
+      ||snapshot.actionPlan.knownCalendarAliasesComplete!==true
+      ||preview.evidenceChecks?.knownCalendarAliasesMatch!==true
+      ||!aliases.length||aliases.length>32||new Set(aliasKeys).size!==aliases.length
+      ||JSON.stringify(aliasKeys)!==JSON.stringify(snapshotAliasKeys)
       ||!aliases.some(alias=>alias.profile===operation.profile
         &&alias.calendarId===event?.calendarId&&alias.eventId===event?.id))
-      blockers.push("The complete bounded original Calendar alias inventory is not proven.");
+      blockers.push("The complete bounded original Calendar alias inventory is not proven to match the fresh readback.");
     const mappingIds=lifecycle?.mappingIds||[],enabled=new Set(lifecycle?.enabledMappingIds||[]);
     const mappingStates=inspection.mappingStates||[];
     if(mappingStates.length!==mappingIds.length||new Set(mappingStates.map(item=>item.id)).size!==mappingIds.length
