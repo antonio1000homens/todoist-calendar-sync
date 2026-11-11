@@ -391,14 +391,17 @@ inspection is limited to the exact original Todoist task, Calendar event,
 configured calendar and recorded alias inventory; it does not require a global
 Calendar provenance register and does not claim that unknown copies are absent.
 
-A `fully_deleted_candidate` now means the exact original selection and
+A `fully_deleted_candidate` means the exact original selection and
 deletion-start receipt are present, deletion checkpoints are complete with no
 uncertain write-ahead attempt, both recorded provider targets are absent, the
 configured Calendar link is not found, attributable DynamoDB rows are absent,
-and the exact active 18-day project-comment tombstone is read back. The owned
-fence, epoch, drained leases and original mapping inventory must also be
-consistent. Missing or conflicting evidence is `partial_or_ambiguous` and
-remains fenced.
+and the exact active 18-day project-comment tombstone is read back. Before
+release, any remaining rows must first be an exact subset of the original
+inventory at the persisted state checkpoint; the watchdog resumes only that
+state phase, including eligible delivery-receipt scrubbing, and preserves
+unrelated records. The owned fence, epoch, drained leases, complete alias
+manifest and original mapping inventory must also be consistent. Missing or
+conflicting evidence is `partial_or_ambiguous` and remains fenced.
 
 The existing scheduled EventBridge erasure watchdog performs the completion;
 there is no new queue or feature flag. It runs only when the existing
@@ -411,17 +414,24 @@ For an eligible exact operation the watchdog:
 
 1. Re-inspects the immutable operation, exact provider readback, tombstone,
    attributable state inventory, fence, epoch, leases and worker mappings.
-2. Restores **only** the UUIDs recorded in the original
+2. If the durable deletion checkpoint is at `state`, resumes at most ten
+   original inventory entries per invocation through the existing fenced
+   deletion adapter. It deletes only exact recorded rows and scrubs eligible
+   delivery-receipt identity references while preserving unrelated references.
+   It persists each checkpoint and continues on the next watchdog pass if
+   needed. A write-ahead attempt, changed row or non-matching inventory remains
+   fenced. It never resumes the Todoist or Calendar provider-delete stages.
+3. Restores **only** the UUIDs recorded in the original
    `lifecycle.enabledMappingIds`; mappings originally disabled remain disabled.
-3. Rechecks the live mapping inventory and the same operation/fence/epoch
+4. Rechecks the live mapping inventory and the same operation/fence/epoch
    immediately before release.
-4. Uses one conditional DynamoDB transaction to remove the original
+5. Uses one conditional DynamoDB transaction to remove the original
    confirmation, any operation-bound pre-write or legacy post-write review
    tokens, operation-owned fence and journal, while replacing the
    identity-bearing operation with an identity-free terminal receipt. The
    epoch and operation/checkpoint conditions are checked in the same
    transaction.
-5. Leaves the original project-comment tombstone untouched for its normal
+6. Leaves the original project-comment tombstone untouched for its normal
    18-day expiry cleanup. It never repeats a Todoist or Calendar delete.
 
 The terminal receipt retains only operation/profile/status, completion time,
