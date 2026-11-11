@@ -24,7 +24,7 @@ function fixture() {
     providerDeletionReady:true,
     lifecycle:{phase:"verify_deletion",mappingIds:[enabled,disabled],enabledMappingIds:[enabled],
       timeoutSeconds:30,pollMs:5000,nextRunAt:0,
-      evidence:{deletionStarted:receipt},
+      evidence:{deletionStarted:{...receipt}},
       deletionProgress:{stage:"verify",commentIndex:1,stateIndex:0,startedAt:1000}},
   };
   const preview={
