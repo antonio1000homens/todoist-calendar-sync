@@ -727,6 +727,88 @@ test("strong exact postflight is a read-only candidate only with complete deleti
   assert.equal(f.external.writes.length,0);
 });
 
+test("automatic post-write completion restores only recorded mappings and atomically retires identities",async()=>{
+  const f=postWriteCompletionFixture();
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.mappingStates.get(enabledId),"Enabled");
+  assert.equal(f.external.mappingStates.get(disabledId),"Disabled");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.operation.postWriteCompletion.providerDeletesReplayed,false);
+  assert.equal(f.operation.postWriteCompletion.tombstoneRetained,true);
+  assert.equal(f.operation.postWriteCompletion.originalMappingCount,2);
+  assert.equal(f.operation.postWriteCompletion.restoredMappingCount,1);
+  assert.equal(f.operation.target,undefined);
+  assert.equal(f.operation.actionPlan,undefined);
+  assert.equal(f.operation.inventory,undefined);
+  assert.equal(f.operation.previewFingerprint,undefined);
+  assert.equal(JSON.stringify(f.operation).includes("disposable-1"),false);
+  assert.equal(JSON.stringify(f.operation).includes("disposable-event"),false);
+  assert.equal(f.erasureConfirmation,undefined);
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.control.some(row=>row.sk==="JOURNAL"),false);
+  assert.equal(f.external.control.find(row=>row.sk==="EPOCH").epoch,7);
+  assert.equal(f.external.knownTargetCalls,1);
+  assert.equal(f.external.providerCalls,0);
+  assert.equal(f.external.snapshot.projectTombstone.status,"present",
+    "the original project-comment tombstone is not removed by completion");
+  assert.equal(f.external.writes.length,1,"only the atomic completion transaction is written");
+  assert.equal((await f.service.inspectPostWrite("op-recovery")).classification,"completed");
+  assert.equal((await f.service.completePostWriteIfSafe("op-recovery")).status,"completed",
+    "repeated completion is a terminal no-op");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.writes.length,1);
+});
+
+test("post-write completion resolves a lost transaction acknowledgement by terminal readback",async()=>{
+  const f=postWriteCompletionFixture({losePostwriteCompletionAck:true});
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.writes.length,1);
+});
+
+test("post-write completion fails closed for incomplete or ambiguous evidence",async()=>{
+  const cases=[
+    ["write-ahead attempt",f=>{f.operation.lifecycle.deletionProgress.attempt={startedAt:Date.now()};}],
+    ["incomplete checkpoint",f=>{f.operation.lifecycle.deletionProgress.stage="todoist";}],
+    ["missing tombstone",f=>{f.external.knownTargetSnapshot.projectTombstone.status="missing";
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);}],
+    ["provider still present",f=>{f.external.knownTargetSnapshot.knownTargetReadback.calendar="present";
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);}],
+    ["active writer lease",f=>{f.external.control.push({pk:"ERASURE#work",sk:"WRITER#active",operationId:"other"});}],
+    ["wrong fence owner",f=>{f.external.control.find(row=>row.sk==="FENCE").operationId="other";}],
+    ["originally disabled mapping enabled",f=>{f.external.mappingStates.set(disabledId,"Enabled");}],
+    ["missing original mapping",f=>{f.external.mappingInventory=[enabledId];}],
+    ["provider deletion approval missing",f=>{f.operation.providerDeletionReady=false;}],
+    ["recovery already recorded",f=>{f.operation.recovery={status:"queued"};}],
+  ];
+  for(const [name,mutate] of cases) {
+    const f=postWriteCompletionFixture();
+    mutate(f);
+    const result=await f.service.completePostWriteIfSafe("op-recovery");
+    assert.equal(result.status,"blocked",name);
+    assert.ok(result.blockers.length>0,name);
+    assert.ok(f.external.control.some(row=>row.sk==="FENCE"),name);
+    assert.equal(f.operation.status,"review_required",name);
+    assert.equal(f.external.restored.length,0,name);
+    assert.equal(f.external.writes.length,0,name);
+  }
+});
+
+test("post-write completion stays fenced when the atomic release transaction conflicts",async()=>{
+  const f=postWriteCompletionFixture({failPostwriteCompletion:true});
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"blocked");
+  assert.ok(f.external.control.some(row=>row.sk==="FENCE"));
+  assert.equal(f.operation.status,"review_required");
+  assert.deepEqual(f.external.restored,[enabledId],
+    "only the originally enabled mapping may be restored before the conditional release");
+  assert.equal(f.operation.target.eventId,"disposable-event");
+});
+
 test("post-write inspection with an active lease exposes a blocker but never changes controls",async()=>{
   const {service,external}=fixture();
   external.control.push({pk:"ERASURE#work",sk:"ADMISSION#stale",owner:"stale"});
