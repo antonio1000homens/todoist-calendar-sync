@@ -66,7 +66,7 @@ async function verifyTombstonesBeforeReceiptScrub(operation:ErasureOperation, to
     if(comment.id!==id||comment.project_id!==projectId||!marker||marker.profile!==operation.profile
       ||marker.projectId!==projectId||marker.taskId!==operation.target.taskId
       ||Date.parse(marker.expiresAt)<=Date.now()
-      ||requiredEventIds.some(eventId=>!marker.eventIds.includes(eventId)))
+      ||JSON.stringify([...new Set(marker.eventIds)].sort())!==JSON.stringify([...new Set(requiredEventIds)].sort()))
       throw new ErasureGateDriftError();
   }
 }
@@ -265,7 +265,8 @@ export async function executeErasureDeletionStep(operation: ErasureOperation, cu
     if(comment.id!==id||comment.project_id!==profiles[operation.profile].todoistProjectId
       ||!marker||marker.profile!==operation.profile||marker.projectId!==profiles[operation.profile].todoistProjectId
       ||marker.taskId!==operation.target.taskId||Date.parse(marker.expiresAt)<=Date.now()
-      ||aliases.some(alias=>!marker.eventIds.includes(alias)))throw new ErasureGateDriftError();
+      ||JSON.stringify([...new Set(marker.eventIds)].sort())!==JSON.stringify([...new Set(aliases)].sort()))
+      throw new ErasureGateDriftError();
     return {progress:{...progress,finalCommentIndex:index+1},complete:false};
   }
   return {progress,complete:true};
@@ -286,7 +287,7 @@ export function erasureProjectTombstonesPresent(
       &&Boolean(marker&&marker.profile===operation.profile
         &&marker.projectId===profiles[operation.profile].todoistProjectId
         &&marker.taskId===operation.target.taskId&&Date.parse(marker.expiresAt)>now
-        &&[...aliases].every(alias=>marker.eventIds.includes(alias)));
+        &&JSON.stringify([...new Set(marker.eventIds)].sort())===JSON.stringify([...aliases].sort()));
   }))
     && !index.parsed.some(({comment,payload})=>!originalIds.includes(comment.id)
       &&(payload.taskId===operation.target.taskId||aliases.has(payload.eventId)))

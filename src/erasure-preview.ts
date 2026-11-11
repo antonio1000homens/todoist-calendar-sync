@@ -279,6 +279,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       addKnownAlias(target.profile,profiles[target.profile].calendarId,source.recurringEventId);
   }
   const selectedRowKeys=new Set(plan.records.map(record=>JSON.stringify([record.pk,record.sk])));
+  const receiptAliasCandidates:Array<{profile:Profile;calendarId:string;eventId:string}>=[];
   for(const row of rows) {
     if(!selectedRowKeys.has(JSON.stringify([row.pk,row.sk])))continue;
     const eventIds=exactCalendarEventIds(row);
@@ -294,7 +295,53 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
       continue;
     }
     const calendarId=typeof row.calendarId==="string"?row.calendarId:profiles[rowProfile].calendarId;
-    for(const eventId of eventIds)addKnownAlias(rowProfile,calendarId,eventId);
+    for(const eventId of eventIds)receiptAliasCandidates.push({profile:rowProfile,calendarId,eventId});
+  }
+  // Completed receipts can aggregate several Calendar identities. Keep an
+  // alias in this deletion only when no different, exact mapping owns it, or
+  // a direct Calendar read confirms that mapping's shared taskId. A comment
+  // alone can be stale; a mismatch or unreadable event is ambiguous and must
+  // stop confirmation instead of broadening the tombstone.
+  const aliasOwnershipEvidence:Array<{profile:Profile;calendarId:string;eventId:string;ownerTaskDigest:string}>=[];
+  const rawTargetCalendarAliases=new Set([target.eventId,...receiptAliasCandidates
+    .filter(alias=>alias.profile===target.profile&&alias.calendarId===profiles[target.profile].calendarId)
+    .map(alias=>alias.eventId)].filter((id):id is string=>Boolean(id)));
+  for(const candidate of receiptAliasCandidates) {
+    const owners=indexed.parsed.filter(item=>item.payload.profile===candidate.profile
+      &&item.payload.eventId===candidate.eventId);
+    const distinctOwners=[...new Set(owners.map(item=>item.payload.taskId))];
+    if(distinctOwners.length>1) {
+      knownAliasesComplete=false;
+      blockers.push("A recorded Calendar alias has conflicting project mapping owners");
+      continue;
+    }
+    const owner=distinctOwners[0];
+    if(owner&&owner!==target.taskId) {
+      try {
+        if(candidate.calendarId!==profiles[candidate.profile].calendarId) {
+          knownAliasesComplete=false;
+          blockers.push("A recorded Calendar alias has no reader for its exact Calendar scope");
+          continue;
+        }
+        let ownerClients=providerClients;
+        if(candidate.profile!==target.profile)
+          ownerClients=await Promise.resolve((dependencies.providerFactory||defaultProviderClientFactory)(candidate.profile));
+        const ownerEvent=await ownerClients.calendar.getEvent(candidate.eventId);
+        if(ownerEvent?.id!==candidate.eventId
+          ||ownerEvent?.extendedProperties?.shared?.taskId!==owner) {
+          knownAliasesComplete=false;
+          blockers.push("A recorded Calendar alias has unverified or conflicting provider ownership");
+          continue;
+        }
+        aliasOwnershipEvidence.push({...candidate,ownerTaskDigest:fingerprint(owner)});
+        continue;
+      } catch {
+        knownAliasesComplete=false;
+        blockers.push("A recorded Calendar alias owner could not be verified from Calendar");
+        continue;
+      }
+    }
+    addKnownAlias(candidate.profile,candidate.calendarId,candidate.eventId);
   }
   const allKnownAliases=[...knownAliases.values()].sort((a,b)=>
     a.profile.localeCompare(b.profile)||a.calendarId.localeCompare(b.calendarId)||a.eventId.localeCompare(b.eventId));
@@ -314,7 +361,7 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   if(indexed.parsed.some(item=>targetCalendarAliases.has(item.payload.eventId)
     &&!targetProjectCommentIds.has(item.comment.id)))
     blockers.push("A known Calendar alias is still mapped to another Todoist task; manual inspection is required");
-  if(indexed.malformed.some(item=>[...targetCalendarAliases].some(eventId=>item.comment.content?.includes(eventId))))
+  if(indexed.malformed.some(item=>[...rawTargetCalendarAliases].some(eventId=>item.comment.content?.includes(eventId))))
     blockers.push("An unparseable project comment contains a known Calendar alias; manual inspection is required");
   const conflictingTombstone=projectComments.some(comment=>{
     const marker=parseDeletionTombstoneComment(comment);
@@ -335,8 +382,15 @@ export async function buildErasurePreview(input: ErasurePreviewRequest, dependen
   // Cross-profile recovery audits must not silently replace this baseline
   // with a different fingerprint domain, or every intact pre-write operation
   // will be misclassified as ambiguous regardless of provider state.
-  const primaryProviderSnapshotFingerprint=fingerprint(providerData);
-  const providerSnapshotFingerprint=erasureProviderSnapshotFingerprint(providerData,crossProfileEvidence);
+  const sortedAliasOwnershipEvidence=aliasOwnershipEvidence.sort((a,b)=>a.profile.localeCompare(b.profile)
+    ||a.calendarId.localeCompare(b.calendarId)||a.eventId.localeCompare(b.eventId));
+  // Preserve the established target-only digest when there was no additional
+  // alias ownership evidence. Existing pre-write recovery fingerprints must
+  // remain comparable across this code change.
+  const identityBoundProviderData=sortedAliasOwnershipEvidence.length
+    ?{providerData,aliasOwnershipEvidence:sortedAliasOwnershipEvidence}:providerData;
+  const primaryProviderSnapshotFingerprint=fingerprint(identityBoundProviderData);
+  const providerSnapshotFingerprint=erasureProviderSnapshotFingerprint(identityBoundProviderData,crossProfileEvidence);
   const calendarLinkPatch=event?todoistCalendarLinkRemovalPatch(event,target.taskId):undefined;
   if(calendarLinkPatch&&(!target.eventId||typeof event.etag!=="string"||!event.etag))
     blockers.push("Retained Calendar link cannot be safely changed without its exact ETag");

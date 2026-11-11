@@ -164,7 +164,7 @@ test("deletion preview captures profile and Calendar-scoped event aliases before
   assert.deepEqual(preview.blockers,[]);
 });
 
-test("a known Calendar alias mapped to another Todoist task blocks deletion before confirmation",async()=>{
+test("a receipt alias with independently verified different Calendar ownership is excluded",async()=>{
   const taskId="task-alias-owner",eventId="event-alias-primary",otherEventId="event-alias-shared";
   const receipt={pk:"DELIVERY#home#alias-source",sk:"COMPLETED",profile:"home",kind:"calendar",
     identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
@@ -179,11 +179,39 @@ test("a known Calendar alias mapped to another Todoist task blocks deletion befo
   const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
   const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
       listProjectComments:async()=>comments,listTaskComments:async()=>[]},
-    calendar:{getEvent:async()=>event,findByTodoistTaskId:async()=>event}};
+    calendar:{getEvent:async id=>id===otherEventId
+      ?{id:otherEventId,status:"confirmed",extendedProperties:{shared:{taskId:"other-task"}}}:event,
+      findByTodoistTaskId:async()=>event}};
   const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
     {db,clients,inspectFence:async()=>({leases:[]})});
-  assert.ok(preview.actionPlan.knownCalendarAliases.some(alias=>alias.eventId===otherEventId));
-  assert.ok(preview.blockers.some(value=>value.includes("known Calendar alias is still mapped to another Todoist task")));
+  assert.deepEqual(preview.actionPlan.knownCalendarAliases.map(alias=>alias.eventId),[eventId]);
+  assert.deepEqual(preview.blockers,[]);
+  assert.equal(JSON.stringify(preview).includes(otherEventId),false,"proven unrelated event identity is retained only in the fingerprint");
+  assert.equal(JSON.stringify(preview).includes("other-task"),false,"unrelated task identity is retained only in the fingerprint");
+});
+
+test("a receipt alias with conflicting provider ownership remains a fail-closed blocker",async()=>{
+  const taskId="task-alias-owner",eventId="event-alias-primary",otherEventId="event-alias-shared";
+  const receipt={pk:"DELIVERY#home#alias-source",sk:"COMPLETED",profile:"home",kind:"calendar",
+    identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
+    completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
+  const event={id:eventId,etag:"etag-alias-primary",extendedProperties:{shared:{taskId}}};
+  const comments=[
+    {id:"selected-project-comment",content:serializeMappingComment({profile:"home",taskId,eventId,
+      updatedAt:"2026-11-08T12:00:00.000Z"},"test-home-project")},
+    {id:"other-task-alias-comment",content:serializeMappingComment({profile:"home",taskId:"other-task",
+      eventId:otherEventId,updatedAt:"2026-11-08T12:01:00.000Z"},"test-home-project")},
+  ];
+  const db={send:async command=>command.constructor.name==="ScanCommand"?{Items:[receipt]}:{}};
+  const clients={todoist:{getTask:async id=>({id,project_id:"test-home-project"}),
+      listProjectComments:async()=>comments,listTaskComments:async()=>[]},
+    calendar:{getEvent:async id=>id===otherEventId
+      ?{id:otherEventId,status:"confirmed",extendedProperties:{shared:{taskId:"unexpected-task"}}}:event,
+      findByTodoistTaskId:async()=>event}};
+  const preview=await buildErasurePreview({profile:"home",taskId,eventId,deleteCalendar:true},
+    {db,clients,inspectFence:async()=>({leases:[]})});
+  assert.ok(preview.blockers.some(value=>value.includes("unverified or conflicting provider ownership")));
+  assert.equal(preview.actionPlan.knownCalendarAliases.some(alias=>alias.eventId===otherEventId),false);
   assert.equal(preview.confirmation,undefined);
 });
 
