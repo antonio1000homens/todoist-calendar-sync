@@ -638,6 +638,7 @@ export class ErasureRecoveryService {
         const control=await readControl(this.db,current.profile);
         if(control.fence?.operationId!==id||control.fence.state!=="active"
           ||control.epoch!==inspection.preview.epoch||control.leases.length!==0
+          ||Boolean(control.journal)!==inspection.hasJournal
           ||(control.journal&&control.journal.operationId!==id))
           return {status:"blocked",blockers:["The operation-owned fence, epoch, lease drain or journal ownership changed during state cleanup."]};
         const advanced=await this.erasures.advanceFencedLifecycle(id);
