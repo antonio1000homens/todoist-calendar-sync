@@ -2,6 +2,7 @@
  * These results are intentionally NOT used by recoveryMode or any write guard. */
 import {parseDeletionTombstoneComment,type TodoistCommentRecord} from "./mapping-comments.js";
 import type {ErasureOperation} from "./erasure-executor.js";
+import {fingerprint} from "../scripts/item-purge-policy.mjs";
 import type {ErasurePreviewResult} from "./erasure-preview.js";
 
 export type InspectionOutcome =
@@ -29,6 +30,9 @@ export interface RecordedTombstoneExpectation {
   taskId:string;
   commentIds:readonly string[];
   eventIds:readonly string[];
+  /** Only when no provider deletion step or write-ahead attempt was recorded. */
+  preConversionConfirmed?:boolean;
+  originalProjectComments?:readonly {id:string;digest:string}[];
 }
 
 /** Evaluate only the operation's exact recorded comment IDs, never a fuzzy
@@ -66,6 +70,18 @@ export function inspectRecordedProjectTombstone(
       &&Date.parse(marker.expiresAt)>now
       &&JSON.stringify([...marker.eventIds].sort())===JSON.stringify(expectedEvents));
   });
+  // Before any deletion attempt, finding the exact unchanged *mapping*
+  // comment is expected: the bounded tombstone is only written at the first
+  // deletion step. Do not misreport it as an altered/missing safety marker.
+  if(!valid && expected.preConversionConfirmed===true
+    &&matching.every(item=>typeof item.content==="string"
+      &&expected.originalProjectComments?.some(old=>
+        old.id===item.id && old.digest===fingerprint(item.content)))) {
+    return {status:"missing",recordedCommentFound:true,
+      markerMatchesTaskAndCalendar:false,recordedCommentCount:ids.length,
+      foundCommentCount:foundCount,
+      explanation:"The exact original mapping comment is unchanged and deletion has not started. The 18-day tombstone is not yet required; this is not evidence of drift."};
+  }
   return {status:valid?"present":"ambiguous",recordedCommentFound:true,
     markerMatchesTaskAndCalendar:valid,recordedCommentCount:ids.length,foundCommentCount:foundCount,
     explanation:valid
