@@ -100,6 +100,7 @@ function table():string {
 const operationKey=(id:string)=>({pk:"ERASURE_OPERATION#"+id,sk:"STATE"});
 const erasureConfirmationKey=(id:string)=>({pk:"ERASURE_CONFIRMATION#"+id,sk:"STATE"});
 const confirmationKey=(id:string)=>({pk:"ERASURE_RECOVERY_CONFIRMATION#"+id,sk:"STATE"});
+const legacyPostwriteReviewTokenKey=(id:string)=>({pk:"ERASURE_POSTWRITE_CONFIRMATION#"+id,sk:"STATE"});
 /** A timed-out write-ahead claim on the first project-comment tombstone is
  * recoverable only while its original mapping, task, Calendar event, comments,
  * and DynamoDB inventory all still match the confirmed snapshot. Recovery
@@ -651,6 +652,10 @@ export class ErasureRecoveryService {
         ExpressionAttributeNames:{"#status":"status"},
         ExpressionAttributeValues:{":consumed":"consumed",":id":id,":confirmationId":operation.confirmationId,
           ":fingerprint":operation.previewFingerprint}}},
+      // Invalidate any unconsumed pre-write or legacy post-write review tokens
+      // for this operation. Neither token can be reused after the terminal CAS.
+      {Delete:{TableName:table(),Key:confirmationKey(id)}},
+      {Delete:{TableName:table(),Key:legacyPostwriteReviewTokenKey(id)}},
       {Delete:{TableName:table(),Key:profileKey(operation.profile,"FENCE"),
         ConditionExpression:"operationId=:id AND #state=:active",
         ExpressionAttributeNames:{"#state":"state"},
@@ -677,9 +682,11 @@ export class ErasureRecoveryService {
   }
 
   private async verifyPostWriteCompletion(id:string,profile:ErasureOperation["profile"],epoch:number):Promise<boolean> {
-    const [operation,confirmation,control]=await Promise.all([
+    const [operation,confirmation,recoveryToken,legacyPostwriteToken,control]=await Promise.all([
       this.db.send(new GetCommand({TableName:table(),Key:operationKey(id),ConsistentRead:true})),
       this.db.send(new GetCommand({TableName:table(),Key:erasureConfirmationKey(id),ConsistentRead:true})),
+      this.db.send(new GetCommand({TableName:table(),Key:confirmationKey(id),ConsistentRead:true})),
+      this.db.send(new GetCommand({TableName:table(),Key:legacyPostwriteReviewTokenKey(id),ConsistentRead:true})),
       readControl(this.db,profile),
     ]);
     const terminal=operation.Item as ErasureOperation|undefined;
@@ -690,8 +697,9 @@ export class ErasureRecoveryService {
       &&!terminal.previewFingerprint&&!terminal.providerSnapshotFingerprint
       &&!terminal.confirmationFingerprint&&!terminal.confirmationId&&!terminal.lifecycle
       &&!terminal.recovery&&!terminal.postwriteReview&&!terminal.requestId&&!terminal.result&&!terminal.error
-      &&!confirmation.Item&&control.fence?.operationId!==id
-      &&control.journal?.operationId!==id&&typeof control.epoch==="number"&&control.epoch>=epoch);
+      &&!confirmation.Item&&!recoveryToken.Item&&!legacyPostwriteToken.Item
+      &&control.fence?.operationId!==id&&control.journal?.operationId!==id
+      &&typeof control.epoch==="number"&&control.epoch>=epoch);
   }
 
   /**
