@@ -366,9 +366,18 @@ export class ErasureOperationStore {
   }> {
     const operation=await this.get(id);
     const current=operation?.lifecycle;
+    const deletionStarted=current?.evidence.deletionStarted;
+    const fenceInstalled=current?.evidence.fenceInstalled;
     const postWriteStateOnly=operation?.status==="review_required"&&current?.phase==="delete"
       &&["state","verify"].includes(current.deletionProgress?.stage||"")
-      &&!current.deletionProgress?.attempt&&operation.providerDeletionReady===true;
+      &&!current.deletionProgress?.attempt&&operation.providerDeletionReady===true
+      &&operation.confirmationId!==undefined&&operation.confirmationFingerprint===operation.previewFingerprint
+      &&operation.target.deleteCalendar===true&&operation.selectedActions.deleteTodoist===true
+      &&operation.selectedActions.deleteCalendar===true
+      &&deletionStarted?.operationId===operation.operationId&&deletionStarted.phase==="deletionStarted"
+      &&/^[0-9a-f-]{36}$/i.test(deletionStarted.receiptId)&&Number.isFinite(deletionStarted.completedAt)
+      &&fenceInstalled?.operationId===operation.operationId&&fenceInstalled.phase==="fenceInstalled"
+      &&/^[0-9a-f-]{36}$/i.test(fenceInstalled.receiptId)&&Number.isFinite(fenceInstalled.completedAt);
     if(!operation || !current
       ||(!["fencing","deleting","verifying"].includes(operation.status)&&!postWriteStateOnly))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
