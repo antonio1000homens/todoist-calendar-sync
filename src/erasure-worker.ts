@@ -234,6 +234,17 @@ export async function inspectStuckErasureRecovery():Promise<{fenced:number;queue
         queued++;
         continue;
       }
+      if(operation.status==="verifying"
+        &&["restore_mappings","confirm_restored","release_fence"].includes(operation.lifecycle?.phase||"")) {
+        // A previous worker may have advanced the verified deletion into the
+        // mapping-restore lifecycle but lost its next SQS send/ack. Re-drive
+        // only the idempotent restore/release phases; never replay provider deletes.
+        await enqueueErasureOperation(id);
+        queued++;
+        console.info(JSON.stringify({service:"todoist-calendar-sync-erasure-worker",
+          event:"recovery_watchdog_queued",operationId:id,profile,mode:"verified_postwrite_restore"}));
+        continue;
+      }
       if(operation.status!=="review_required"||operation.recovery)continue;
        // Post-write completion is considered before pre-write recovery. It is
        // limited to the immutable known-target manifest and never replays a
