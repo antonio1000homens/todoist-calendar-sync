@@ -32,13 +32,8 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   const erasures={async get(){return {operationId:"op-1",profile:"work",status:"review_required"};}};
   const recovery={
     async inspectPostWrite(id){calls.push(["postwrite",id]);return {operationId:id,profile:"work",
-      classification:"fully_deleted_candidate",releaseAllowed:false,onlyAvailableAction:"keep_fenced",
-      blockers:["not yet authorised"],evidence:{matchingFence:true,leasesDrained:true}};},
-    async issuePostWriteReviewToken(id,operator){calls.push(["postwrite-token",id,operator]);return {
-      operationId:id,profile:"work",confirmationId:"token-123",expiresAt:Date.now()+60000,releaseAllowed:false};},
-    async acknowledgePostWriteReview(id,token,operator,typed){
-      calls.push(["postwrite-ack",id,token,operator,typed]);
-      return {status:"reviewed_fenced",releaseAllowed:false};},
+      classification:"fully_deleted_candidate",releaseAllowed:false,onlyAvailableAction:"automatic_completion_pending",
+      completionEligible:true,completionBlockers:[],blockers:[],evidence:{matchingFence:true,leasesDrained:true}};},
     async inspect(id){calls.push(["inspect",id]);return {preview:{operationId:id,profile:"work",
       phase:"wait_worker_timeout",classification:"pre_write",allowed:true,blockers:[],mappingStates:[],
       fenceOwned:true,leaseCount:0,providerItemsAbsent:false,stateRowsAbsent:false,epoch:3}};},
