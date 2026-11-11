@@ -16,7 +16,6 @@ export interface PostWriteRecoveryAssessment {
   classification:PostWriteClassification;
   /** The inspection itself is read-only and never grants a release. */
   releaseAllowed:false;
-  reviewStatus?:"reviewed_fenced";
   onlyAvailableAction:PostWriteAction;
   potentialDisposition:"automatic_known_identity_completion"|"use_pre_write_recovery"|"keep_fenced_and_escalate"|"completed";
   completionEligible:boolean;
