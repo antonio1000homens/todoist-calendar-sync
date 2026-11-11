@@ -367,6 +367,13 @@ test("postflight requires the exact active tombstone and ignores unrelated notes
   const unrelated={id:"unrelated",project_id:"test-home-project",content:"User's personal shopping note"};
   const now=Date.parse("2026-11-09T12:00:00.000Z");
   assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],now),true);
+  const overbroadMarker=serializeDeletionTombstoneComment({
+    schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
+    eventIds:["event-1","unrelated-event"],createdAt:"2026-11-08T12:00:00.000Z",
+    expiresAt:"2026-11-26T12:00:00.000Z",
+  });
+  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:overbroadMarker}],now),false,
+    "a tombstone containing a receipt alias owned by another task must not pass postflight");
   assert.equal(erasureProjectTombstonesPresent(operation,[unrelated],now),false,"selected tombstone must remain");
   assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:originalContent}],now),false,
     "an unconverted mapping comment cannot pass postflight");
