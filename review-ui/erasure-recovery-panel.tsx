@@ -2,6 +2,7 @@ import React, {useEffect,useRef,useState} from "react";
 import {canAcknowledgeFencedPostWrite,canApplyRecovery,recoveryNeedsDispatch} from "./erasure-recovery-policy.mjs";
 import {
   originalInventoryExplanation,recoveryClassificationExplanation,recoveryDiagnosticRows,
+  recoveryComparisonRows,recoveryTombstoneStatus,recoveryIndependentGuard,recoveryNextSafeAction,
   recoveryExecutionSummary,workerMappingSummary,
 } from "./erasure-recovery-explanations.mjs";
 
@@ -235,7 +236,9 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
     return()=>clearInterval(timer);
   },[operation?.operationId,recoveryStatus,busy]);
   const evidenceRows=recoveryDiagnosticRows(preview);
-  const unresolvedRows=evidenceRows.filter(item=>item.status!=="verified");
+  const comparisonRows=recoveryComparisonRows(preview);
+  const tombstone=recoveryTombstoneStatus(preview);
+  const unresolvedRows=evidenceRows.filter(item=>!["verified","unchanged","expected_lifecycle_change"].includes(item.status));
   const executionAt=recoveryAt||operationAt;
   return <details className="preview erasure-recovery" aria-label="Existing erasure operation status and recovery">
     <summary>Existing erasure operation status / recovery</summary>
@@ -279,20 +282,36 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
             <h5>Last successful guarded inspection · <time dateTime={inspectionAt}>{formatTime(inspectionAt)}</time></h5>
             <p><strong>{preview.allowed?"Eligible for guarded confirmation":"Blocked"}</strong> · phase {preview.phase||"unknown"} · profile {preview.profile}</p>
             <p>{recoveryClassificationExplanation(preview)}</p>
+            <h5>Original expectation vs current read (no identifiers or contents)</h5>
+            {comparisonRows.length>0
+              ?<ul className="recovery-diagnostics">{comparisonRows.map(item=>
+                <li key={item.key}>
+                  <strong>{item.label}</strong> — <strong>{item.result.replaceAll("_"," ")}</strong>
+                  <div>Expected: {item.expected}</div>
+                  <div>Current read: {item.observed}</div>
+                  <div>{item.explanation}</div>
+                </li>)}</ul>
+              :<p>Comparison details were not returned by this API deployment. Do not infer that differences are safe deletion effects.</p>}
+            <h5>Exact recorded Todoist project-comment tombstone</h5>
+            <p><strong>{tombstone.status.replaceAll("_"," ")}</strong> · recorded comment found:
+              {" "}{tombstone.recordedCommentFound===null?"not checked":tombstone.recordedCommentFound?"yes":"no"}
+              {" "}· marker matches operation task and Calendar aliases:
+              {" "}{tombstone.markerMatchesTaskAndCalendar===null?"not checked":tombstone.markerMatchesTaskAndCalendar?"yes":"no"}
+            </p>
+            <p>{tombstone.explanation}</p>
+            <p>Tombstones are bounded to 18 days. A present marker is only one safeguard; it cannot override missing provider, state, fence, invocation or rollback evidence.</p>
+            <h5>Independent recovery guard</h5>
+            <p className="warning">{recoveryIndependentGuard(preview)}</p>
             {preview.calendarDriftReview?.candidateForSeparateApproval&&<p role="status" className="warning">
               Calendar-only provider revision is eligible for a separately confirmed cancellation path. Inspection has made no changes: the Work fence and mapping remain protected. Review all evidence below before requesting the distinct operator-bound cancellation token.
             </p>}
             {!preview.allowed&&<>
               <h5>Why the evidence is insufficient</h5>
-              <p>Each status describes the latest read-only check, not permission to override a guard. Missing means required evidence was unavailable; mismatched means a comparison or condition failed.</p>
+              <p>Each status describes the latest read-only check, not permission to override a guard. Expected lifecycle change is an observed, checkpoint-consistent difference, not proof of safe recovery. Missing evidence and unexpected drift remain blocked.</p>
               <ul className="recovery-diagnostics">{unresolvedRows.length?unresolvedRows.map(item=>
                 <li key={item.key}><strong>{item.label}</strong> — {item.status.replaceAll("_"," ")}</li>)
                 :<li>No individual mismatch was identified in the available checks; inspect the guard blockers below.</li>}</ul>
-              <p className="warning"><strong>Next action:</strong> Remain fenced. Inspect which source changed and re-read the exact provider and original evidence.
-                {preview.calendarDriftReview?.candidateForSeparateApproval
-                  ?" If the Calendar-only revision is the sole verified exception, use the separately reviewed cancellation action below; no recovery has started."
-                  :" Escalate for manual review; do not retry deletion or manually release the fence."}
-              </p>
+              <p className="warning"><strong>Next safe action:</strong> {recoveryNextSafeAction(preview)}</p>
             </>}
             <details className="recovery-technical">
               <summary>Technical details and all read-only checks</summary>
