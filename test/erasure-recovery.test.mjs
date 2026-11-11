@@ -811,6 +811,23 @@ test("automatic post-write completion restores only recorded mappings and atomic
   assert.equal(f.external.writes.length,1);
 });
 
+test("post-write finalizer resumes only the original state checkpoint and scrubs eligible delivery receipts",async()=>{
+  const f=postWriteStateCleanupFixture();
+  const result=await f.service.completePostWriteIfSafe("op-recovery");
+  assert.equal(result.status,"completed");
+  assert.equal(f.advances,3,"one state-row step, one empty-state checkpoint, then the verify checkpoint");
+  assert.deepEqual(f.external.restored,[enabledId]);
+  assert.equal(f.external.mappingStates.get(enabledId),"Enabled");
+  assert.equal(f.external.mappingStates.get(disabledId),"Disabled");
+  assert.equal(f.external.providerCalls,0,"no Todoist or Calendar delete is replayed");
+  assert.equal(f.operation.status,"succeeded");
+  assert.equal(f.operation.postWriteCompletion.providerDeletesReplayed,false);
+  assert.equal(f.operation.postWriteCompletion.tombstoneRetained,true);
+  assert.equal(f.external.snapshot.inventory.length,0);
+  assert.equal(f.external.control.some(row=>row.sk==="FENCE"),false);
+  assert.equal(f.external.writes.length,1,"only the final atomic completion transaction is written by the recovery service");
+});
+
 test("post-write completion resolves a lost transaction acknowledgement by terminal readback",async()=>{
   const f=postWriteCompletionFixture({losePostwriteCompletionAck:true});
   const result=await f.service.completePostWriteIfSafe("op-recovery");
