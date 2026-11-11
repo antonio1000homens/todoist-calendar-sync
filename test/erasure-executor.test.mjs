@@ -236,7 +236,10 @@ test("worker adapters are bound at construction and request arguments cannot rep
     readFreshSnapshot:async()=>snapshotOverride??({profile:db.item.profile,target:db.item.target,selectedActions:db.item.selectedActions,
       providerSnapshotFingerprint:db.item.providerSnapshotFingerprint,inventory:db.item.inventory,actionPlan:db.item.actionPlan}),
     verifyDeletion:async()=>deletionReadback,
-    executeDeletionStep:async(_operation,progress)=>({complete:true,progress:{...progress,stage:"state",stateIndex:0}}),
+    executeDeletionStep:async(_operation,progress)=>{
+      const {attempt,...checkpoint}=progress;
+      return {complete:true,progress:{...checkpoint,stage:"state",stateIndex:0}};
+    },
     beginFence:async(profile,id)=>{events.push(["fence",profile,id]);fence={operationId:id};},
     restoreMappings:async ids=>{events.push(["restore",ids]);if(failRestore){failRestore=false;throw new Error("transient restore failure");}
       for(const id of ids)states.set(id,"Enabled");},
