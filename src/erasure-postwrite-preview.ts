@@ -9,7 +9,7 @@ import type {RecoveryPreview} from "./erasure-recovery.js";
 
 export type PostWriteClassification =
   "not_post_write" | "fully_deleted_candidate" | "partial_or_ambiguous" | "completed";
-export type PostWriteAction = "keep_fenced" | "automatic_completion_pending" | "completed";
+export type PostWriteAction = "keep_fenced" | "automatic_state_cleanup_pending" | "automatic_completion_pending" | "completed";
 export interface PostWriteRecoveryAssessment {
   operationId:string;
   profile:ErasureOperation["profile"];
@@ -19,6 +19,7 @@ export interface PostWriteRecoveryAssessment {
   onlyAvailableAction:PostWriteAction;
   potentialDisposition:"automatic_known_identity_completion"|"use_pre_write_recovery"|"keep_fenced_and_escalate"|"completed";
   completionEligible:boolean;
+  stateCleanupPending?:boolean;
   completionBlockers:string[];
   completion?:{
     status:"pending"|"blocked"|"completed";
