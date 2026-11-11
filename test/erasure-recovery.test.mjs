@@ -152,7 +152,7 @@ function fixture(options={}) {
   };
   const store={async get(id){return id==="op-recovery"?operation:undefined;}};
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
-  return {service,operation,external,db,get confirmation(){return confirmation;},
+  return {service,operation,external,db,
     get postwriteToken(){return postwriteToken;},
     set postwriteToken(value){postwriteToken=value;},
     get confirmation(){return confirmation;},
