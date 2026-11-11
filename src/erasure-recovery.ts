@@ -495,8 +495,7 @@ export class ErasureRecoveryService {
     if(operation.status==="succeeded"&&operation.postWriteCompletion?.status==="completed")
       return this.completedPostWriteAssessment(operation);
     const inspection=await this.inspect(id,{knownIdentityOnly:true});
-    return {...this.postWriteAssessment(inspection),
-      };
+    return this.postWriteAssessment(inspection);
   }
 
   /** Idempotent finalizer for the exact, already-deleted operation. It never
@@ -684,8 +683,13 @@ export class ErasureRecoveryService {
       readControl(this.db,profile),
     ]);
     const terminal=operation.Item as ErasureOperation|undefined;
-    return Boolean(terminal?.status==="succeeded"&&terminal.postWriteCompletion?.mode==="known_identity_post_write"
-      &&!terminal.target&&!terminal.actionPlan&&!terminal.inventory&&!terminal.previewFingerprint
+    return Boolean(terminal?.operationId===id&&terminal.profile===profile&&terminal.status==="succeeded"
+      &&terminal.postWriteCompletion?.mode==="known_identity_post_write"
+      &&terminal.postWriteCompletion.status==="completed"
+      &&!terminal.target&&!terminal.selectedActions&&!terminal.actionPlan&&!terminal.inventory
+      &&!terminal.previewFingerprint&&!terminal.providerSnapshotFingerprint
+      &&!terminal.confirmationFingerprint&&!terminal.confirmationId&&!terminal.lifecycle
+      &&!terminal.recovery&&!terminal.postwriteReview&&!terminal.requestId&&!terminal.result&&!terminal.error
       &&!confirmation.Item&&control.fence?.operationId!==id
       &&control.journal?.operationId!==id&&typeof control.epoch==="number"&&control.epoch>=epoch);
   }
