@@ -70,6 +70,8 @@ export function recoveryIndependentGuard(preview) {
 export function recoveryNextSafeAction(preview) {
   if (!preview) return "Load the operation and run a read-only guarded inspection.";
   const marker=recoveryTombstoneStatus(preview);
+  if (marker.status==="missing"&&preview.classification==="pre_write"&&preview.allowed)
+    return "The tombstone is not needed until deletion begins. Complete independent writer-boundary, deployment and rollback acceptance before any guarded recovery.";
   if (marker.status==="ambiguous"||marker.status==="missing")
     return "Keep the fence. Re-read the exact recorded Todoist project comment and escalate changed or missing marker evidence; do not invent a replacement or force a recovery.";
   if (marker.status==="not_checked" && preview.classification!=="pre_write")
