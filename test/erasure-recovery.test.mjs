@@ -217,6 +217,42 @@ function postWriteCompletionFixture(options={}) {
   return f;
 }
 
+function postWriteStateCleanupFixture() {
+  const f=postWriteCompletionFixture();
+  const row={type:"DELIVERY",key:{pk:"DELIVERY#original",sk:"STATE"},
+    digest:"e".repeat(64),classification:"attributable",
+    receiptCleanup:"scrub_identity_refs",scrubbedDigest:"f".repeat(64)};
+  f.operation.inventory=[row];
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.lifecycle.phase="delete";
+  f.operation.lifecycle.deletionProgress={stage:"state",commentIndex:1,stateIndex:0,startedAt:Date.now()-60_000};
+  f.erasureConfirmation.previewFingerprint=f.operation.previewFingerprint;
+  f.external.knownTargetSnapshot.inventory=[row];
+  f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);
+  f.external.snapshot=f.external.knownTargetSnapshot;
+  let advances=0;
+  f.service.erasures.advanceFencedLifecycle=async()=>{
+    advances++;
+    if(advances===1) {
+      f.operation.lifecycle.deletionProgress={...f.operation.lifecycle.deletionProgress,stateIndex:1};
+      f.operation.updatedAt="2026-11-11T20:01:00.000Z";
+      f.external.knownTargetSnapshot.inventory=[];
+      f.external.knownTargetSnapshot.previewFingerprint=erasurePreviewFingerprint(f.external.knownTargetSnapshot);
+      return {phase:"delete",nextRunAt:0,status:"review_required",waiting:false};
+    }
+    if(advances===2) {
+      f.operation.lifecycle.deletionProgress={...f.operation.lifecycle.deletionProgress,stage:"verify"};
+      f.operation.updatedAt="2026-11-11T20:02:00.000Z";
+      return {phase:"delete",nextRunAt:0,status:"review_required",waiting:false};
+    }
+    f.operation.lifecycle.phase="verify_deletion";
+    f.operation.updatedAt="2026-11-11T20:03:00.000Z";
+    return {phase:"verify_deletion",nextRunAt:0,status:"review_required",waiting:false};
+  };
+  return {...f,get advances(){return advances;}};
+}
+
 function timedOutProjectCommentFixture({ageMs=60_000,stage="comments"}={}) {
   const f=fixture();
   const attemptId="dddddddd-dddd-4ddd-8ddd-dddddddddddd";
