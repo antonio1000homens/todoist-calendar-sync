@@ -7,6 +7,7 @@ const enabledId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const disabledId="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const receiptId="cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 process.env.STATE_TABLE_NAME="test-state";
+process.env.ERASURE_PROTOCOL_VERSION="1";
 
 function fixture(options={}) {
   const base={profile:"work",target:{taskId:"disposable-1",deleteCalendar:false},
@@ -31,13 +32,14 @@ function fixture(options={}) {
   Object.assign(operation,options.operation||{});
   Object.assign(external,options.external||{});
   const opKey="ERASURE_OPERATION#op-recovery";
-  let confirmation,postwriteToken;
+  let confirmation,postwriteToken,erasureConfirmation;
   const db={
     async send(command) {
       const kind=command.constructor.name;
       const input=command.input;
       if(kind==="GetCommand") {
         if(input.Key.pk===opKey)return {Item:operation};
+        if(input.Key.pk==="ERASURE_CONFIRMATION#op-recovery")return {Item:erasureConfirmation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
         if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
         return {Item:undefined};
@@ -66,6 +68,28 @@ function fixture(options={}) {
       }
       if(kind==="TransactWriteCommand") {
         external.writes.push(input);
+        if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.includes("postWriteCompletion=:completion"))) {
+          if(options.failPostwriteCompletion)
+            throw Object.assign(new Error("Completion transaction conflict"),{name:"TransactionCanceledException"});
+          const update=input.TransactItems.find(x=>x.Update?.UpdateExpression?.includes("postWriteCompletion=:completion")).Update;
+          assert.match(update.UpdateExpression,/REMOVE #target/);
+          assert.match(update.ConditionExpression,/attribute_not_exists\(lifecycle\.#progress\.#attempt\)/);
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE_CONFIRMATION#op-recovery"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="FENCE"));
+          assert.ok(input.TransactItems.some(x=>x.ConditionCheck?.Key?.sk==="EPOCH"));
+          assert.ok(input.TransactItems.some(x=>x.Delete?.Key?.sk==="JOURNAL"));
+          const receipt=update.ExpressionAttributeValues[":completion"];
+          operation.status="succeeded";
+          operation.postWriteCompletion=receipt;
+          operation.updatedAt=receipt.completedAt;
+          for(const key of ["target","selectedActions","previewFingerprint","providerSnapshotFingerprint",
+            "confirmationFingerprint","confirmationId","providerDeletionReady","inventory","actionPlan",
+            "lifecycle","recovery","postwriteReview","requestId","result","error"])delete operation[key];
+          erasureConfirmation=undefined;
+          external.control=external.control.filter(x=>!["FENCE","JOURNAL"].includes(x.sk));
+          if(options.losePostwriteCompletionAck)throw new Error("Lost completion acknowledgement");
+          return {};
+        }
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.startsWith("SET postwriteReview=:review"))){
           if(options.failPostwriteTransaction)throw Object.assign(new Error("Transaction conflict"),{name:"TransactionCanceledException"});
           assert.equal(operation.postwriteReview,undefined);
@@ -126,6 +150,57 @@ function fixture(options={}) {
   const service=new ErasureRecoveryService(adapters,db,store,()=>options.token||"fresh-recovery-token");
   return {service,operation,external,db,get confirmation(){return confirmation;},
     get postwriteToken(){return postwriteToken;}};
+}
+
+function postWriteCompletionFixture(options={}) {
+  const f=fixture();
+  const projectCommentId="project-comment-1";
+  f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
+  f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
+  f.operation.actionPlan={
+    todoistTask:{id:"disposable-1",digest:"2".repeat(64)},
+    calendarEvent:{id:"disposable-event",calendarId:"work-calendar",digest:"3".repeat(64),etag:"original-etag"},
+    knownCalendarAliases:[{profile:"work",calendarId:"work-calendar",eventId:"disposable-event"}],
+    knownCalendarAliasesComplete:true,
+    projectCommentIds:[projectCommentId],
+    comments:[{id:projectCommentId,kind:"project",digest:"4".repeat(64)}],
+  };
+  f.operation.inventory=[];
+  f.operation.providerSnapshotFingerprint="1".repeat(64);
+  f.operation.previewFingerprint=erasurePreviewFingerprint(f.operation);
+  f.operation.confirmationFingerprint=f.operation.previewFingerprint;
+  f.operation.confirmationId="erasure-confirm";
+  f.operation.providerDeletionReady=true;
+  f.operation.status="review_required";
+  const startedAt=Date.now()-60_000;
+  f.operation.lifecycle={
+    phase:"verify_deletion",mappingIds:[enabledId,disabledId],enabledMappingIds:[enabledId],
+    timeoutSeconds:30,pollMs:5000,nextRunAt:0,
+    evidence:{
+      fenceInstalled:{operationId:"op-recovery",phase:"fenceInstalled",receiptId,completedAt:startedAt-40_000},
+      deletionStarted:{operationId:"op-recovery",phase:"deletionStarted",
+        receiptId:"dddddddd-dddd-4ddd-8ddd-dddddddddddd",completedAt:startedAt-10_000},
+    },
+    deletionProgress:{stage:"verify",commentIndex:1,stateIndex:0,startedAt},
+  };
+  f.operation.updatedAt="2026-11-11T20:00:00.000Z";
+  f.erasureConfirmation={pk:"ERASURE_CONFIRMATION#op-recovery",sk:"STATE",
+    status:"consumed",operationId:"op-recovery",confirmationId:"erasure-confirm",
+    consumedBy:"op-recovery",previewFingerprint:f.operation.previewFingerprint};
+  const snapshot={
+    operationId:"op-recovery",profile:"work",target:f.operation.target,
+    selectedActions:f.operation.selectedActions,inventory:[],
+    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
+    projectTombstone:{status:"present",recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
+      recordedCommentCount:1,foundCommentCount:1},
+  };
+  snapshot.previewFingerprint=erasurePreviewFingerprint(snapshot);
+  f.external.snapshot=snapshot;
+  f.external.knownTargetSnapshot=snapshot;
+  Object.assign(f.operation,options.operation||{});
+  Object.assign(f.external,options.external||{});
+  return f;
 }
 
 function timedOutProjectCommentFixture({ageMs=60_000,stage="comments"}={}) {
