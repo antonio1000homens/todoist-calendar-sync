@@ -367,14 +367,25 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         executionEnabled:erasureExecutionEnabled(),
         queueReady:erasureExecutionEnabled()&&operation.providerDeletionReady===true,
         backupRetentionNotice:ERASURE_BACKUP_RETENTION_NOTICE,
-        phase:operation.lifecycle?.phase,nextRunAt:operation.lifecycle?.nextRunAt,
+        phase:operation.postWriteCompletion?"complete":operation.lifecycle?.phase,
+        nextRunAt:operation.lifecycle?.nextRunAt,
         deletionProgress:operation.lifecycle?.deletionProgress?{
           stage:operation.lifecycle.deletionProgress.stage,
           commentsCompleted:operation.lifecycle.deletionProgress.commentIndex,
           stateRowsCompleted:operation.lifecycle.deletionProgress.stateIndex,
         }:undefined,
+        ...(operation.postWriteCompletion?{postWriteCompletion:{
+          completedAt:operation.postWriteCompletion.completedAt,epoch:operation.postWriteCompletion.epoch,
+          originalMappingCount:operation.postWriteCompletion.originalMappingCount,
+          restoredMappingCount:operation.postWriteCompletion.restoredMappingCount,
+          tombstoneRetained:operation.postWriteCompletion.tombstoneRetained,
+          providerDeletesReplayed:operation.postWriteCompletion.providerDeletesReplayed,
+        }}:{}),
         ...(operation.lifecycle?.lastError?{lastError:operation.lifecycle.lastError}:{}),
-        ...(operation.status==="review_required"?{
+        ...(operation.postWriteCompletion?{
+          operatorRecoveryRequired:false,
+          message:"Verified post-write cleanup completed. The operation-owned fence was released, only originally enabled worker mappings were restored, and the 18-day project-comment tombstone remains active."
+        }:operation.status==="review_required"?{
           operatorRecoveryRequired:operation.recovery?.status!=="completed",
           message:operation.recovery?.status==="completed"
             ?"This original erasure was stopped. Profile admission has been safely restored; the previous deletion is never resumed."
