@@ -90,9 +90,8 @@ This implementation does not authorize enabling that gate, enabling
 `ERASURE_REPLAY_BARRIER_VERSION`, running a live destructive test, or
 manually editing mappings/fences.
 
-The legacy fenced-review token endpoints may still accept an older client for
-compatibility, but they are not part of this completion path and cannot release
-the fence. The review UI no longer asks for a per-operation review token or
-typed signoff. Read-only inspection exposes a completion candidate and precise
-blockers; the existing watchdog performs the guarded completion automatically
-when the existing release gate and all operation-scoped evidence are satisfied.
+The former fenced-review token and acknowledgement routes have been retired
+(HTTP 404); they are no longer a required step or an alternative completion
+path. The review UI exposes the automatic completion state and precise
+blockers. The existing watchdog performs the guarded completion when the
+existing release gate and all operation-scoped evidence are satisfied.
