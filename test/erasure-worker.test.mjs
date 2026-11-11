@@ -63,7 +63,7 @@ test("watchdog queues only independently eligible pre-write recovery, never dele
   t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
   try {
     const result=await inspectStuckErasureRecovery();
-    assert.deepEqual(result,{fenced:1,queued:1,completed:0,blocked:0});
+    assert.deepEqual(result,{fenced:1,queued:1,completed:0,inProgress:0,blocked:0});
     assert.deepEqual(recoveryCalls,[id]);
     assert.equal(sent.length,1);
     assert.deepEqual(JSON.parse(sent[0].MessageBody),
@@ -93,7 +93,7 @@ test("watchdog automatically completes verified post-write operations without a 
   t.mock.method(SQSClient.prototype,"send",async command=>{sent.push(command.input);return {};});
   try {
     const result=await inspectStuckErasureRecovery();
-    assert.deepEqual(result,{fenced:1,queued:0,completed:1,blocked:0});
+    assert.deepEqual(result,{fenced:1,queued:0,completed:1,inProgress:0,blocked:0});
     assert.deepEqual(preWriteCalls,[]);
     assert.deepEqual(sent,[],"post-write completion does not create or dispatch a new queue message");
   } finally {
