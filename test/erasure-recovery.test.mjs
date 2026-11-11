@@ -203,7 +203,8 @@ function postWriteCompletionFixture(options={}) {
   const snapshot={
     operationId:"op-recovery",profile:"work",target:f.operation.target,
     selectedActions:f.operation.selectedActions,inventory:[],
-    actionPlan:{comments:[]},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
+    actionPlan:{comments:[],projectCommentIds:[],knownCalendarAliases:f.operation.actionPlan.knownCalendarAliases,
+      knownCalendarAliasesComplete:true},providerSnapshotFingerprint:"9".repeat(64),blockers:[],
     knownTargetReadback:{todoist:"absent",calendar:"absent",configuredCalendarLink:"not_found"},
     projectTombstone:{status:"present",recordedCommentFound:true,markerMatchesTaskAndCalendar:true,
       recordedCommentCount:1,foundCommentCount:1},
