@@ -52,7 +52,7 @@ export interface ErasureOperation {
   providerSnapshotFingerprint: string;
   confirmationFingerprint: string;
   confirmationId: string;
-  /** Set only by a future trusted executor release that wires provider deletion and readback. */
+  /** Set only by the trusted, deployment-gated provider deletion workflow. */
   providerDeletionReady?: boolean;
   selectedActions: { deleteTodoist: boolean; deleteCalendar: boolean };
   inventory: Array<{ type: string; key: { pk: string; sk: string }; digest: string; classification: string;
