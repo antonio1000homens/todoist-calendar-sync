@@ -416,11 +416,12 @@ For an eligible exact operation the watchdog:
 3. Rechecks the live mapping inventory and the same operation/fence/epoch
    immediately before release.
 4. Uses one conditional DynamoDB transaction to remove the original
-   confirmation, operation-owned fence and operation-owned journal, while
-   replacing the identity-bearing operation with an identity-free terminal
-   receipt. The epoch and operation/checkpoint conditions are checked in the
-   same transaction.
-5. Leaves the original project-comment tombstone in place for its normal
+   confirmation, any operation-bound pre-write or legacy post-write review
+   tokens, operation-owned fence and journal, while replacing the
+   identity-bearing operation with an identity-free terminal receipt. The
+   epoch and operation/checkpoint conditions are checked in the same
+   transaction.
+5. Leaves the original project-comment tombstone untouched for its normal
    18-day expiry cleanup. It never repeats a Todoist or Calendar delete.
 
 The terminal receipt retains only operation/profile/status, completion time,
