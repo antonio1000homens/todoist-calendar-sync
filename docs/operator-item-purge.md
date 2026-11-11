@@ -436,9 +436,8 @@ has begun but the final transaction conflicts, the fence remains active and
 the next pass retries idempotently after fresh inspection. Never manually
 remove the fence or edit worker mappings.
 
-The legacy fenced-review token endpoints remain only for compatibility with
-older clients. Their acknowledgement records review metadata and cannot
-release a fence; they are not part of the #484 completion path. The pre-write
+The former fenced-review token and acknowledgement endpoints are retired
+(HTTP 404); no per-operation review token is required. The pre-write
 `RESTORE SYNC` confirmation is never reused and cannot act on a post-write
 operation.
 
