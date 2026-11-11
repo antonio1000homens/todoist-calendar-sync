@@ -372,6 +372,8 @@ export class ErasureOperationStore {
     if(!operation || !current
       ||(!["fencing","deleting","verifying"].includes(operation.status)&&!postWriteStateOnly))
       throw new Error("Operation is not in a resumable fenced lifecycle state");
+    if(postWriteStateOnly&&erasurePreviewFingerprint(operation)!==operation.previewFingerprint)
+      throw new ErasureGateDriftError();
     if(operation.providerDeletionReady!==true) throw new Error("Erasure executor is disabled; the active fence must remain for break-glass review");
     const adapters=this.#worker();
     const now=Date.now();
