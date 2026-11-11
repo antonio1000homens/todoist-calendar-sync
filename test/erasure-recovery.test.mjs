@@ -155,7 +155,7 @@ function fixture(options={}) {
 }
 
 function postWriteCompletionFixture(options={}) {
-  const f=fixture();
+  const f=fixture(options);
   const projectCommentId="project-comment-1";
   f.operation.target={taskId:"disposable-1",eventId:"disposable-event",deleteCalendar:true};
   f.operation.selectedActions={deleteTodoist:true,deleteCalendar:true};
