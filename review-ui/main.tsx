@@ -11,6 +11,7 @@ import { RecurrenceRetirementInspector } from "./recurrence-retirement-inspector
 import { RetirementHistory } from "./retirement-history";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
+import { providerRecheckFeedback, reconciliationRequestFeedback } from "./action-feedback.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -48,12 +49,16 @@ function AffectedItem({item,action,taskId,eventId,scope,snapshots,leftovers,upda
       <small>{requiredDispositionRef===key?"Required by repair preview validation.":"Whether a choice is required will be confirmed by the repair preview."}</small>{leftovers[key]&&<small>{dispositionGuidance(leftovers[key])}</small>}{item.object.status==="cancelled"&&<p className="warning">No generic cleanup action is safe for a cancelled recurrence. Leave unchanged preserves it; Exclude guards only this exact ID. Do not treat either choice as deleting the Calendar object or suppressing the whole series.</p>}</div>}
   </div>;
 }
+type InlineActionFeedback={caseKey:string;phase:"checking"|"success"|"warning"|"error";message:string};
 function App() {
   const [cases,setCases] = useState<Case[]>([]), [selected,setSelected] = useState<Case>(), [loadedDetails,setDetails] = useState<any>(), [profile,setProfile] = useState("all"), [history,setHistory] = useState(false);
   const [inboxStatus,setInboxStatus]=useState<"loading"|"ready"|"error">("loading");
   const requestGate=useRef(createScopedRequestGate("all")).current;
   const navigationSequence=useRef(0);
   const [message,setMessage] = useState(""), [busy,setBusy] = useState(false);
+  const [recheckFeedback,setRecheckFeedback]=useState<InlineActionFeedback>();
+  const [cleanupFeedback,setCleanupFeedback]=useState<InlineActionFeedback>();
+  const actionLocks=useRef(new Set<string>());
   const [action,setAction] = useState(""), [winner,setWinner] = useState("none"), [owner,setOwner] = useState(""), [scope,setScope] = useState("occurrence");
   const [repairSelection,setRepairSelection] = useState(emptyRepairSelection()), [targetProfile,setTargetProfile] = useState(""), [decisionAction,setDecisionAction] = useState("");
   const [leftovers,setLeftovers] = useState<Record<string,string>>({}), [requiredDispositionRef,setRequiredDispositionRef] = useState<string>();
@@ -132,6 +137,7 @@ function App() {
     setSelected(item);setDetails(undefined);setRepairSelection(emptyRepairSelection(item));
     setDetailState(item?{key:`${item.profile}:${item.id}`,status:"loading"}:undefined);
     setLeftovers({});setRequiredDispositionRef(undefined);setSearchResults([]);setSearchText("");setOperation(undefined);setBusy(false);
+    setRecheckFeedback(undefined);setCleanupFeedback(undefined);
     setAction("");setWinner("none");setOwner("");setScope("occurrence");setTargetProfile("");setDecisionAction("");
     if(options.syncUrl!==false){const next=caseUrl(location.href,item?.id);if(item)window.history.pushState(null,"",next);else window.history.replaceState(null,"",next);}
   };
@@ -386,10 +392,12 @@ function App() {
   };
   const refreshAffected=async () => {
     if(!selected)return;
+    const caseKey=`${selected.profile}:${selected.id}`, lockKey=`recheck:${selected.profile}:${selected.id}`;
+    if(actionLocks.current.has(lockKey))return;
+    actionLocks.current.add(lockKey);
     setBusy(true);setMessage("");invalidatePreview();
+    setRecheckFeedback({caseKey,phase:"checking",message:"Checking Todoist and Calendar now…"});
     const requestVersion=selectionVersion.current;
-    const intent={action,taskId:taskId||undefined,eventId:eventId||undefined,winner:action==="transfer"?"none":winner,owner:owner||undefined,scope,leftovers,
-      decisionAction:action==="decision"?decisionAction:undefined,targetProfile:action==="move"?targetProfile:undefined};
     try {
       // Rechecking provider objects never needs a chosen mutation. Read-only
       // GET can hydrate searched IDs and links without a fabricated action.
@@ -405,13 +413,20 @@ function App() {
       }
       setDetails((current:any)=>current?.item?.id===selected.id?{...current,item:result.item,snapshots:result.snapshots,deletionCleanup:result.deletionCleanup,unmappedDeletion:result.unmappedDeletion}:current);
       setRepairSelection(current=>reconcileRepairSelection(result.item,result.snapshots,current));setLeftovers({});
+      setRecheckFeedback({caseKey,...providerRecheckFeedback(result,new Date().toLocaleString())});
       if(operationResumeEligibility(operation)==="fresh-preview") {
         const refreshedSelection=reconcileRepairSelection(result.item,result.snapshots,emptyRepairSelection(result.item));
         setRepairSelection(refreshedSelection);
         setMessage(`Current provider items refreshed. The failed operation ${operation?.id} remains unchanged. Review the current Todoist and Calendar IDs, then create a new preview.`);
       }
     }
-    catch(e:any){setMessage(e.message);} finally{setBusy(false);}
+    catch(e:any){
+      if(requestVersion===selectionVersion.current)
+        setRecheckFeedback({caseKey,phase:"error",message:`Provider recheck failed: ${e.message}. No cleanup was performed. Retry this read-only check.`});
+    } finally{
+      actionLocks.current.delete(lockKey);
+      if(requestVersion===selectionVersion.current)setBusy(false);
+    }
   };
   const createPreview=async () => {
     if (!selected || !canPreview) return;
@@ -464,26 +479,45 @@ function App() {
     // The rendered target and the POST body are derived from one value. There
     // is deliberately no "all" target or automatic multi-profile fan-out.
     const target=manualTarget;
+    const caseKey=selected?`${selected.profile}:${selected.id}`:undefined;
     if(!target){setMessage("Choose one sync profile before requesting reconciliation.");return;}
     if(selected?.decision?.type==="operational_reconciliation_stuck"
       && !window.confirm(`Request reconciliation for ${target}? This removes quarantined DLQ messages for this profile and reads current provider state. It does not replay the failed delivery.`))return;
+    const lockKey=`reconcile:${target}`;
+    if(actionLocks.current.has(lockKey))return;
     const ticket=requestGate.begin(`manual:${target}`,profile);
     if(!ticket)return;
+    actionLocks.current.add(lockKey);
+    const requestedVersion=selectionVersion.current;
     setBusy(true);setMessage("");
+    if(caseKey)setCleanupFeedback({caseKey,phase:"checking",message:`Submitting guarded reconciliation for ${target}… No cleanup has been verified.`});
     try{
       const result=await api("reconciliation",{method:"POST",body:JSON.stringify({profile:target})});
       if(!requestGate.current(ticket))return;
       setRunViews(current=>({...current,[target]:{
         status:"ready",data:{reconciliation:result.run,summary:result.summary},diagnostics:[],
       }}));
+      if(caseKey&&requestedVersion===selectionVersion.current)
+        setCleanupFeedback({caseKey,...reconciliationRequestFeedback(target,result,new Date().toLocaleString())});
       const cleared=result.clearedDlq?.deleted||0;
       setMessage(`Cleared ${cleared} quarantined ${cleared===1?"delivery":"deliveries"} for ${target}. Reconciliation requested${result.reconciliation?.created?" with a new generation":"; the active generation was retained"}. ${result.summary?.actionableCaseCount??"Some"} actionable review case(s) remain for this profile; run diagnostics and inbox counts are tracked separately.`);
       refreshReconciliation(target,{quiet:true}).catch(e=>{
-        if(requestGate.current(ticket)&&!isAbortError(e))setMessage(`Reconciliation requested for ${target}, but status refresh failed: ${e.message}`);
+        if(requestGate.current(ticket)&&!isAbortError(e)){
+          setMessage(`Reconciliation requested for ${target}, but status refresh failed: ${e.message}`);
+          if(caseKey&&requestedVersion===selectionVersion.current)
+            setCleanupFeedback({caseKey,phase:"warning",message:`Request accepted but status refresh failed: ${e.message}. Cleanup has not been verified.`});
+        }
       });
     }catch(error:any){
-      if(requestGate.current(ticket))setMessage(error.message);
-    }finally{if(requestGate.current(ticket))setBusy(false);}
+      if(requestGate.current(ticket)){
+        setMessage(error.message);
+        if(caseKey&&requestedVersion===selectionVersion.current)
+          setCleanupFeedback({caseKey,phase:"error",message:`Reconciliation request failed: ${error.message}. No successful queue acceptance is confirmed.`});
+      }
+    }finally{
+      actionLocks.current.delete(lockKey);
+      if(requestGate.current(ticket)&&requestedVersion===selectionVersion.current)setBusy(false);
+    }
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
@@ -516,6 +550,8 @@ function App() {
     ||alertContext.providerTaskId||alertContext.providerEventId);
   const showProviderPanels=Boolean(hasPrimaryProviderIds||hasLiveIdentity);
   const openCaseCount=cases.filter(item=>item.status==="open"||item.status==="repairing").length;
+  const currentRecheckFeedback=recheckFeedback?.caseKey===detailKey?recheckFeedback:undefined;
+  const currentCleanupFeedback=cleanupFeedback?.caseKey===detailKey?cleanupFeedback:undefined;
   return <main>
     <header><div><h1>Calendar sync review</h1><p>Review conflicts using current Todoist and Calendar data.</p></div>
       <div className="header-actions"><details className="review-filter"><summary>Filter alerts</summary><label>Review alerts — profile <select aria-label="Review alerts — profile" value={profile} onChange={e=>changeReviewProfile(e.target.value)}>{profiles.map(p=><option key={p} value={p}>{p==="all"?"All profiles":p}</option>)}</select></label></details>
@@ -678,8 +714,10 @@ function App() {
             <li>Attributable audit, review and manual decisions — retire only after independent state checks</li>
             <li>Terminal conflict receipt — pending successful atomic cleanup</li>
           </ol>
-          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck this alert&apos;s provider items (read-only)</button>
-          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>Retry guarded cleanup for this alert via {selected.profile} reconciliation</button>
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>{currentRecheckFeedback?.phase==="checking"?"Checking provider items…":<>Recheck this alert&apos;s provider items (read-only)</>}</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy||!manualTarget||manualTarget!==selected.profile}>{currentCleanupFeedback?.phase==="checking"?"Submitting reconciliation…":<>Retry guarded cleanup for this alert via {selected.profile} reconciliation</>}</button>
+          {currentRecheckFeedback&&<p className={["error","warning"].includes(currentRecheckFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentRecheckFeedback.message}</p>}
+          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}</p>}
           <p>The worker rechecks this exact case using fresh provider reads and conditional state checks. No provider object is created or deleted by viewing or rechecking this alert; if another item or owner is live, the alert stays actionable.</p>
         </section>}
         {details?.unmappedDeletion?.state==="partial"&&<p className="notice" role="status">
@@ -707,8 +745,10 @@ function App() {
           {details.deletionCleanup.state==="stale_recurrence"&&<p className="warning">Calendar and Todoist are deleted, but an obsolete recurrence link remains; automatic cleanup required.
             {details.deletionCleanup.staleLinks.map((link:any)=><span key={link.seriesId}> <code>{link.seriesId}</code> (active <code>{link.activeInstanceId||link.eventId}</code>)</span>)}</p>}
           {details.deletionCleanup.reason&&<p className="warning">{details.deletionCleanup.reason}</p>}
-          <button className="secondary" onClick={refreshAffected} disabled={busy}>Recheck deletion state (read-only)</button>
-          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>Retry guarded cleanup via reconciliation</button>
+          <button className="secondary" onClick={refreshAffected} disabled={busy}>{currentRecheckFeedback?.phase==="checking"?"Checking provider items…":"Recheck deletion state (read-only)"}</button>
+          <button className="secondary reconcile-button" onClick={runReconciliation} disabled={busy}>{currentCleanupFeedback?.phase==="checking"?"Submitting reconciliation…":"Retry guarded cleanup via reconciliation"}</button>
+          {currentRecheckFeedback&&<p className={["error","warning"].includes(currentRecheckFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentRecheckFeedback.message}</p>}
+          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}</p>}
           <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
         </section>}
         {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&(hasProviderIds||hasLiveIdentity)&&<div className="preview">
