@@ -66,7 +66,9 @@ export interface ErasureOperation {
 }
 export interface ErasureActionPlan {
   todoistTask?: { id: string; digest: string };
-  calendarEvent?: { id: string; calendarId:string; digest: string; etag: string };
+  calendarEvent?: { id: string; calendarId:string; digest: string; etag: string;
+    /** When retained, the exact event is patched to remove its Todoist link under this ETag. */
+    unlinkTodoistTask?: string; unlinkDigest?: string };
   /** Exact event aliases captured before mutation, scoped by profile and Calendar. */
   knownCalendarAliases?:Array<{profile:Profile;calendarId:string;eventId:string}>;
   knownCalendarAliasesComplete?:boolean;
@@ -132,7 +134,9 @@ function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATI
 function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions"|"inventory">):boolean {
   if(!plan||!Array.isArray(plan.comments)) return false;
   if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
-  if(plan.calendarEvent&&(!operation.selectedActions.deleteCalendar||plan.calendarEvent.id!==operation.target.eventId
+  if(plan.calendarEvent&&((!operation.selectedActions.deleteCalendar
+      &&(plan.calendarEvent.unlinkTodoistTask!==operation.target.taskId
+        ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.unlinkDigest||"")))||plan.calendarEvent.id!==operation.target.eventId
     ||typeof plan.calendarEvent.calendarId!=="string"||!/^[^\u0000-\u001f\u007f]{1,1024}$/.test(plan.calendarEvent.calendarId)
     ||!/^[a-f0-9]{64}$/.test(plan.calendarEvent.digest)||typeof plan.calendarEvent.etag!=="string"||!plan.calendarEvent.etag)) return false;
   if(operation.selectedActions.deleteCalendar) {
