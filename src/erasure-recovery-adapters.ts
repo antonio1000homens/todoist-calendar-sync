@@ -74,7 +74,10 @@ async function readErasureSnapshot(operation:ErasureOperation,auditCrossProfileI
         readOnlyTombstoneExpectation:{profile:operation.profile,
           projectId:profiles[operation.profile].todoistProjectId,taskId:operation.target.taskId,
           commentIds:operation.actionPlan.projectCommentIds||[],
-          eventIds:(operation.actionPlan.knownCalendarAliases||[]).map(item=>item.eventId)},
+          eventIds:(operation.actionPlan.knownCalendarAliases||[]).map(item=>item.eventId),
+          preConversionConfirmed:!operation.lifecycle?.deletionProgress
+            && !operation.lifecycle?.evidence.deletionStarted,
+          originalProjectComments:operation.actionPlan.comments.filter(item=>item.kind==="project")},
         inspectFence:async profile=>{
           const value=await inspectErasureFence(profile);
           return {fence:value.fence,leases:value.leases};
