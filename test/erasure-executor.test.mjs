@@ -83,12 +83,20 @@ test("erasure operation contract permits only the resumable forward lifecycle",(
 
 test("review-required recovery can advance only an exact state/verify checkpoint",async()=>{
   const item=postWriteStateOperation("state"),db=memoryDb(item),calls=[];
-  const store=new ErasureOperationStore(db,{executeDeletionStep:async(operation,progress)=>{
-    calls.push({operationId:operation.operationId,stage:progress.stage,attempt:progress.attempt?.id,
-      receiptCleanup:operation.inventory[0].receiptCleanup});
-    const {attempt,...checkpoint}=progress;
-    return {complete:false,progress:{...checkpoint,stateIndex:1}};
-  }});
+  const adapters={
+    listWorkerMappings:async()=>[],disableMappings:async()=>{},mappingStates:async()=>[],
+    inspectFence:async()=>({fence:{operationId:"op"},leases:[]}),beginFence:async()=>{},
+    restoreMappings:async()=>{},finishFence:async()=>{},
+    verifyDeletion:async()=>({providersAbsent:true,stateAbsent:true}),
+    readFreshSnapshot:async()=>({}),readMappingStates:async()=>[],
+    executeDeletionStep:async(operation,progress)=>{
+      calls.push({operationId:operation.operationId,stage:progress.stage,attempt:progress.attempt?.id,
+        receiptCleanup:operation.inventory[0].receiptCleanup});
+      const {attempt,...checkpoint}=progress;
+      return {complete:false,progress:{...checkpoint,stateIndex:1}};
+    },
+  };
+  const store=new ErasureOperationStore(db,()=> "unused",adapters);
   const result=await store.advanceFencedLifecycle("op");
   assert.equal(result.phase,"delete");
   assert.equal(result.status,"review_required");
