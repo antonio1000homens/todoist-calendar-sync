@@ -462,6 +462,18 @@ export class ErasureRecoveryService {
         completionBlockers.push("A separate recovery is already recorded for this operation; do not run post-write completion.");
     }
     const eligible=base.completionEligible&&completionBlockers.length===0;
+    if(!eligible) {
+      const stateCleanupBlockers=this.postWriteStateCleanupBlockers(inspection);
+      const progress=inspection.operation.lifecycle?.deletionProgress;
+      if(stateCleanupBlockers.length===0&&inspection.operation.lifecycle?.phase==="delete"
+        &&progress?.stage==="state"&&progress.stateIndex<inspection.operation.inventory.length) {
+        const message="The exact original DynamoDB state checkpoint is pending automatic cleanup. The watchdog will remove or scrub only the remaining recorded rows; provider deletes will not be replayed.";
+        return {...base,completionEligible:false,stateCleanupPending:true,
+          onlyAvailableAction:"automatic_state_cleanup_pending",
+          potentialDisposition:"automatic_known_identity_completion",
+          completionBlockers:[message],blockers:[message]};
+      }
+    }
     return {...base,completionEligible:eligible,
       completionBlockers:[...new Set(completionBlockers)].sort(),
       blockers:eligible?[]:[...new Set(completionBlockers)].sort(),
