@@ -250,7 +250,8 @@ function postWriteStateCleanupFixture() {
     f.operation.updatedAt="2026-11-11T20:03:00.000Z";
     return {phase:"verify_deletion",nextRunAt:0,status:"review_required",waiting:false};
   };
-  return Object.assign(f,{get advances(){return advances;}});
+  Object.defineProperty(f,"advances",{get:()=>advances});
+  return f;
 }
 
 function timedOutProjectCommentFixture({ageMs=60_000,stage="comments"}={}) {
