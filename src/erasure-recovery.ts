@@ -6,6 +6,8 @@ import {ErasureOperationStore, erasurePreviewFingerprint, type ErasureOperation,
 import type {CrossProfileErasureEvidence} from "./erasure-cross-profile-evidence.js";
 import type {ErasurePreviewResult,KnownTargetReadback} from "./erasure-preview.js";
 import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasure-postwrite-preview.js";
+import {inspectRecoveryComparisons,type InspectionComparisons,
+  type ProjectTombstoneInspection} from "./erasure-recovery-inspection.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
 export type GuardedRecoveryMode = "strict_pre_write" | "calendar_drift_cancel";
@@ -61,6 +63,10 @@ export interface RecoveryPreview {
     stateInventoryMatches:boolean;
     providerSafetyBlockerCount:number;
   };
+  /** Explanatory comparison snapshots and exact recorded-comment check.
+   * Never used to grant recovery, issue tokens, or release a fence. */
+  comparisonDetails?:InspectionComparisons;
+  projectTombstone?:ProjectTombstoneInspection;
   /** Explanation-only statuses from this inspection, never used to grant recovery. */
   diagnostics?:Record<
     "lifecycle"|"originalConfirmation"|"audit"|"freshPreview"|"originalProviderSnapshot"
@@ -414,6 +420,12 @@ export class ErasureRecoveryService {
       blockers.push("Recovery previously blocked due to drift; operator escalation required");
     const mappingStates=expectedMappingStates(op,active);
     const diagnostics=readOnlyRecoveryDiagnostics(op,snapshot,evidenceChecks,control,mappings,active,id);
+    const comparisonDetails=inspectRecoveryComparisons(op,snapshot);
+    const projectTombstone=snapshot.projectTombstone||{
+      status:"not_checked" as const,recordedCommentFound:null,markerMatchesTaskAndCalendar:null,
+      recordedCommentCount:op.actionPlan.projectCommentIds?.length||0,foundCommentCount:0,
+      explanation:"The exact recorded project comment has not been read; do not infer that the tombstone is present.",
+    };
     const preview:RecoveryPreview={operationId:id,profile:op.profile,phase:op.lifecycle?.phase||"unknown",classification,
       blockers:[...new Set(blockers)].sort(),allowed:blockers.length===0,
       mappingStates,epoch:control.epoch,fenceOwned:control.fence?.operationId===id,
@@ -429,7 +441,7 @@ export class ErasureRecoveryService {
         &&(snapshot.crossProfileEvidence?.stateScan.relatedRowCount??0)===0,
       ...(snapshot.knownTargetReadback?{knownTargetReadback:snapshot.knownTargetReadback}:{}),
       snapshotSafetyBlockerCount:snapshot.blockers.length,
-      evidenceChecks,diagnostics,
+      evidenceChecks,diagnostics,comparisonDetails,projectTombstone,
       calendarDriftReview:{candidateForSeparateApproval:calendarDriftCandidate,releaseAllowed:false},
       operationFingerprint:op.previewFingerprint,
       recoveryStatus:op.recovery?.status,
