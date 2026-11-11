@@ -591,7 +591,7 @@ export class ErasureRecoveryService {
    * operation-owned fence remain in place until mappings are restored and one
    * conditional DynamoDB transaction retires the identity-bearing operation. */
   async completePostWriteIfSafe(id:string):Promise<{
-    status:"completed"|"blocked"|"not_applicable";blockers:string[];
+    status:"completed"|"blocked"|"in_progress"|"not_applicable";blockers:string[];
   }> {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const existing=await this.erasures.get(id);
@@ -611,10 +611,48 @@ export class ErasureRecoveryService {
     if(process.env.ERASURE_PROTOCOL_VERSION!=="1")
       return {status:"blocked",blockers:["The existing profile fence/lease protocol is not active; preserve the existing fence."]};
 
-    const inspection=await this.inspect(id,{knownIdentityOnly:true});
-    const assessment=this.postWriteAssessment(inspection);
-    if(!assessment.completionEligible)
-      return {status:"blocked",blockers:assessment.completionBlockers};
+    let inspection=await this.inspect(id,{knownIdentityOnly:true});
+    let assessment=this.postWriteAssessment(inspection);
+    if(!assessment.completionEligible) {
+      const cleanupBlockers=this.postWriteStateCleanupBlockers(inspection);
+      if(cleanupBlockers.length)
+        return {status:"blocked",blockers:[...new Set([...assessment.completionBlockers,...cleanupBlockers])].sort()};
+      // Reuse the existing fenced deletion adapter only after the provider
+      // stages are complete. It processes one exact original state row at a
+      // time, including eligible delivery-receipt scrubbing; it cannot enter
+      // comments/Todoist/Calendar stages while status is review_required.
+      let steps=0;
+      while(steps<10) {
+        const current=await this.erasures.get(id);
+        const progress=current?.lifecycle?.deletionProgress;
+        if(!current||current.status!=="review_required"||current.lifecycle?.phase!=="delete"
+          ||!progress||!["state","verify"].includes(progress.stage)||progress.attempt)
+          return {status:"blocked",blockers:["The state-cleanup checkpoint changed or has an uncertain write-ahead attempt; the fence remains active."]};
+        const control=await readControl(this.db,current.profile);
+        if(control.fence?.operationId!==id||control.fence.state!=="active"
+          ||control.epoch!==inspection.preview.epoch||control.leases.length!==0
+          ||(control.journal&&control.journal.operationId!==id))
+          return {status:"blocked",blockers:["The operation-owned fence, epoch, lease drain or journal ownership changed during state cleanup."]};
+        const advanced=await this.erasures.advanceFencedLifecycle(id);
+        if(advanced.waiting)
+          return {status:"in_progress",blockers:["Exact original state cleanup is waiting for its persisted checkpoint; the existing watchdog will continue without replaying provider deletes."]};
+        steps++;
+        const latest=await this.erasures.get(id);
+        if(!latest||latest.status!=="review_required")
+          return {status:"blocked",blockers:["The original operation changed while state cleanup was in progress; preserve the fence."]};
+        if(latest.lifecycle?.phase==="verify_deletion") {
+          inspection=await this.inspect(id,{knownIdentityOnly:true});
+          assessment=this.postWriteAssessment(inspection);
+          break;
+        }
+        if(latest.lifecycle?.phase!=="delete"||!latest.lifecycle.deletionProgress
+          ||!["state","verify"].includes(latest.lifecycle.deletionProgress.stage)
+          ||latest.lifecycle.deletionProgress.attempt)
+          return {status:"blocked",blockers:["State cleanup did not persist a safe next checkpoint; preserve the fence."]};
+      }
+      if(!assessment.completionEligible)
+        return {status:"in_progress",blockers:["The exact original state inventory is being removed under the active fence. The existing watchdog will continue from the persisted checkpoint."]};
+    }
     const operation=inspection.operation,lifecycle=operation.lifecycle!,progress=lifecycle.deletionProgress!;
     const enabledIds=[...lifecycle.enabledMappingIds];
     // Recheck the owner and immutable operation immediately before the mapping
