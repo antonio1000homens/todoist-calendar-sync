@@ -542,6 +542,20 @@ export class ErasureRecoveryService {
       return {status:"blocked",blockers:assessment.completionBlockers};
     const operation=inspection.operation,lifecycle=operation.lifecycle!,progress=lifecycle.deletionProgress!;
     const enabledIds=[...lifecycle.enabledMappingIds];
+    // Recheck the owner and immutable operation immediately before the mapping
+    // write. The fence prevents new admissions while this bounded step runs.
+    const [preRestoreControl,preRestoreOperation]=await Promise.all([
+      readControl(this.db,operation.profile),this.erasures.get(id),
+    ]);
+    if(preRestoreControl.fence?.operationId!==id||preRestoreControl.fence.state!=="active"
+      ||preRestoreControl.epoch!==inspection.preview.epoch||preRestoreControl.leases.length!==0
+      ||Boolean(preRestoreControl.journal)!==inspection.hasJournal
+      ||(preRestoreControl.journal&&preRestoreControl.journal.operationId!==id)
+      ||!preRestoreOperation||preRestoreOperation.status!=="review_required"
+      ||preRestoreOperation.updatedAt!==operation.updatedAt
+      ||digest(preRestoreOperation.lifecycle)!==digest(operation.lifecycle)
+      ||preRestoreOperation.previewFingerprint!==operation.previewFingerprint)
+      return {status:"blocked",blockers:["The operation changed before mapping restoration; the fence remains active."]};
     // Lambda mapping updates are idempotent. A retry reads the actual state and
     // only re-enables UUIDs that the original operation recorded as enabled.
     await this.adapters.restoreMappings(enabledIds);
@@ -595,7 +609,7 @@ export class ErasureRecoveryService {
       "#inventory":"inventory","#actionPlan":"actionPlan","#lifecycle":"lifecycle","#recovery":"recovery",
       "#postwriteReview":"postwriteReview","#requestId":"requestId","#result":"result",
     };
-    const values:Record<string,unknown>={
+    const values:Record<string,any>={
       ":review":"review_required",":succeeded":"succeeded",":phase":lifecycle.phase,
       ":stage":progress.stage,":commentIndex":progress.commentIndex,":stateIndex":progress.stateIndex,
       ":startedAt":progress.startedAt,":id":id,":deletionStarted":"deletionStarted",
