@@ -34,6 +34,16 @@ export interface FencedLifecycle {
 export type FencedEvidenceKey = "mappingsDisableRequested" | "mappingsDisabled" | "preFenceDrain" | "fenceInstalled"
   | "workerTimeoutElapsed" | "postTimeoutDrain" | "deletionStarted" | "providerDeletionVerified" | "mappingsRestored" | "fenceReleased";
 export interface FencedReceipt { operationId: string; phase: FencedEvidenceKey; receiptId: string; completedAt: number }
+export interface ErasurePostWriteCompletionReceipt {
+  mode:"known_identity_post_write";
+  status:"completed";
+  completedAt:string;
+  epoch:number;
+  originalMappingCount:number;
+  restoredMappingCount:number;
+  tombstoneRetained:true;
+  providerDeletesReplayed:false;
+}
 export interface ErasureOperation {
   operationId: string;
   profile: Profile;
@@ -58,6 +68,8 @@ export interface ErasureOperation {
     confirmationId:string;inspectedFingerprint:string;postflightFingerprint:string;
     reviewedAt:string;
   };
+  /** Identity-free terminal receipt retained after verified post-write completion. */
+  postWriteCompletion?:ErasurePostWriteCompletionReceipt;
   createdAt: string;
   updatedAt: string;
   requestId?: string;
@@ -416,8 +428,13 @@ export class ErasureOperationStore {
           const attempt=await this.#claimDeletionAttempt(operation,current,progress,now);
           operation.lifecycle={...current,deletionProgress:{...progress,attempt}};
           const result=await adapters.executeDeletionStep(operation,operation.lifecycle.deletionProgress!);
-          if(result.complete) next=this.#advance(operation.operationId,current,"verify_deletion",now);
-          else next={...current,deletionProgress:result.progress,nextRunAt:now};
+          if(result.complete) {
+            next=this.#advance(operation.operationId,current,"verify_deletion",now);
+            // Preserve the final checkpoint (including the cleared write-ahead
+            // claim). Recovery can distinguish completed steps from an uncertain
+            // provider acknowledgement without replaying a destructive action.
+            next.deletionProgress=result.progress;
+          } else next={...current,deletionProgress:result.progress,nextRunAt:now};
           break;
         }
         case "verify_deletion": {
