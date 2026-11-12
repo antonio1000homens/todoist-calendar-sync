@@ -17,7 +17,6 @@ import {
   serializeDeletionTombstoneComment,
   serializeMappingComment,
   upsertProjectMappingComment,
-  writeProjectDeletionTombstone,
 } from "../dist/mapping-comments.js";
 import { Todoist } from "../dist/providers.js";
 
@@ -79,33 +78,6 @@ test("project deletion tombstone parser rejects malformed or non-finite scopes",
   ];
   for (const content of malformed) assert.equal(parseDeletionTombstoneComment({ id: "bad", content }), undefined);
   assert.ok(serializeDeletionTombstoneComment({ schemaVersion: 1, profile: "home", projectId: "p", taskId: "t", eventIds: [], createdAt: "2026-11-08T12:00:00.000Z", expiresAt: "2026-11-26T12:00:00.000Z" }));
-});
-
-test("project mapping comment becomes a verified short-lived deletion tombstone idempotently", async () => {
-  const comments = new Map([["map-1", { id: "map-1", project_id:"project-home", content: serializeMappingComment(mapping(), "project-home") }]]);
-  const client = {
-    async getComment(id) { const value = comments.get(id); if (!value) throw Object.assign(new Error("missing"), { status: 404 }); return value; },
-    async updateComment(id, content) { const current=comments.get(id);const value={...current,content};comments.set(id,value);return value; },
-  };
-  const input = { commentId: "map-1", profile: "home", projectId: "project-home", taskId: "task-1",
-    eventIds: ["event-1", "master-1"], createdAt: "2026-11-08T12:00:00.000Z" };
-  const first = await writeProjectDeletionTombstone(client, input);
-  const second = await writeProjectDeletionTombstone(client, input);
-  assert.deepEqual(parseDeletionTombstoneComment(first), parseDeletionTombstoneComment(second));
-  assert.equal(parseMappingComment(first), undefined);
-  assert.equal(parseDeletionTombstoneComment(first).expiresAt, "2026-11-26T12:00:00.000Z");
-  await assert.rejects(writeProjectDeletionTombstone(client, { ...input, taskId: "other-task" }), /does not match/);
-});
-
-test("project deletion marker never creates a replacement comment when the exact mapping note cannot be updated", async () => {
-  const content=serializeMappingComment(mapping(),"project-home");
-  let fallbackCreates=0;
-  const client={getComment:async id=>({id,project_id:"project-home",content}),
-    updateComment:async()=>{throw new Error("Comment is not yours");},
-    upsertProjectComment:async()=>{fallbackCreates++;}};
-  await assert.rejects(writeProjectDeletionTombstone(client,{commentId:"map-1",profile:"home",
-    projectId:"project-home",taskId:"task-1",eventIds:["event-1"]}),/Comment is not yours/);
-  assert.equal(fallbackCreates,0);
 });
 
 test("expired project tombstone cleanup is scoped, dry-run by default, and rechecks before delete", async () => {

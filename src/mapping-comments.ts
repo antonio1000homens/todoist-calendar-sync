@@ -216,53 +216,8 @@ export async function cleanupExpiredProjectDeletionTombstones(
   return { eligible: candidates.length, deleted, skippedChanged };
 }
 
-/** Replace the exact operation-owned mapping comment and require a provider readback. */
-export async function writeProjectDeletionTombstone(
-  client: ProjectCommentClient,
-  input: { commentId: string; profile: Profile; projectId: string; taskId: string;
-    eventIds?: string[]; createdAt?: string },
-): Promise<TodoistCommentRecord> {
-  if (!nonEmptyString(input.commentId) || !nonEmptyString(input.projectId)
-    || !nonEmptyString(input.taskId))
-    throw new Error("Project deletion tombstone identity is incomplete");
-  const current = await client.getComment(input.commentId);
-  if (current.id !== input.commentId || current.project_id !== input.projectId || current.task_id)
-    throw new Error("Project deletion comment ownership does not match the confirmed operation");
-  const oldTombstone = parseDeletionTombstoneComment(current);
-  const eventIds = [...new Set(input.eventIds || [])].sort();
-  if (oldTombstone) {
-    if (oldTombstone.profile !== input.profile || oldTombstone.projectId !== input.projectId
-      || oldTombstone.taskId !== input.taskId || eventIds.some(id => !oldTombstone.eventIds.includes(id)))
-      throw new Error("Existing project deletion tombstone does not match the confirmed identity");
-    return current;
-  }
-  const mapping = parseMappingComment(current);
-  if (!mapping || "error" in mapping || mapping.payload.profile !== input.profile
-    || mapping.payload.projectId !== input.projectId || mapping.payload.taskId !== input.taskId
-    || (eventIds.length > 0 && !eventIds.includes(mapping.payload.eventId)))
-    throw new Error("Project mapping comment does not match the confirmed deletion identity");
-  const tombstoneEventIds = [...new Set([...eventIds, mapping.payload.eventId])].sort();
-  if (tombstoneEventIds.length > 32) throw new Error("Project deletion tombstone exceeds the alias limit");
-  const createdAt = input.createdAt || new Date().toISOString();
-  const payload: ProjectDeletionTombstonePayload = {
-    schemaVersion: 1, profile: input.profile, projectId: input.projectId, taskId: input.taskId,
-    eventIds: tombstoneEventIds, createdAt, expiresAt: projectDeletionTombstoneExpiry(createdAt),
-  };
-  // Updating this exact comment is required. `upsertProjectComment` may create
-  // a second comment when the target cannot be edited, leaving the old mapping
-  // (and its deleted task identity) behind.
-  await client.updateComment(input.commentId, serializeDeletionTombstoneComment(payload));
-  const readback = await client.getComment(input.commentId);
-  const verified = parseDeletionTombstoneComment(readback);
-  if (readback.id !== input.commentId || readback.project_id !== input.projectId || readback.task_id
-    || !verified || verified.profile !== input.profile || verified.projectId !== input.projectId
-    || verified.taskId !== input.taskId || verified.createdAt !== createdAt
-    || verified.expiresAt !== payload.expiresAt
-    || tombstoneEventIds.some(id => !verified.eventIds.includes(id)))
-    throw new Error("Project deletion tombstone was not verified after write");
-  return readback;
-}
-
+/** Historical deletion-tombstone parsing and expiry cleanup remain read-only
+ * compatibility for unfinished erasures. The nuclear path never creates one. */
 export function parseMappingComment(comment: TodoistCommentRecord): ParsedMappingComment | MalformedMappingComment | undefined {
   const content = String(comment.content || "");
   const [marker, ...payloadLines] = content.split(/\r?\n/);
