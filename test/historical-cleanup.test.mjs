@@ -5,6 +5,7 @@ import { ReviewStore, assertManualDecisionReplayAdmission, assertRepairPreviewRe
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { erasurePreviewFingerprint } from "../dist/erasure-executor.js";
 import { projectDeletionTombstoneExpiry, serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { guardReplayProviderClients } from "../dist/erasure-replay-providers.js";
 
 const taskId="historical-task",eventId="historical-event",projectId="test-work-project";
 const item={id:"work-standalone_todoist_task_deleted-fixture",profile:"work",title:"Deleted pair",reason:"deleted",status:"open",taskId,eventId,
@@ -66,6 +67,32 @@ test("offline Work deleted-pair fixture clears exact comment and retires case wi
   assert.equal(f.state.calendarUpdates,0,"cancelled events are never patched");
   assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations,0);
   assert.equal(f.state.closed,1);
+});
+
+test("historical cleanup supplies verified comment ownership to the production mutation guard",async t=>{
+  const previous={ERASURE_REPLAY_BARRIER_VERSION:process.env.ERASURE_REPLAY_BARRIER_VERSION,
+    RETIREMENT_DISPOSITION_VERSION:process.env.RETIREMENT_DISPOSITION_VERSION,STATE_TABLE_NAME:process.env.STATE_TABLE_NAME};
+  process.env.ERASURE_REPLAY_BARRIER_VERSION="0";
+  process.env.RETIREMENT_DISPOSITION_VERSION="1";
+  process.env.STATE_TABLE_NAME="test-state";
+  t.after(()=>{for(const [key,value] of Object.entries(previous)){
+    if(value===undefined)delete process.env[key];else process.env[key]=value;
+  }});
+  const reads=[];
+  t.mock.method(documentClient,"send",async command=>{
+    assert.equal(command.constructor.name,"GetCommand");
+    reads.push(command.input.Key.pk);return {};
+  });
+  const f=harness();
+  const clients=await f.input.engine.clients("work");
+  f.input.engine.clients=async profile=>guardReplayProviderClients(profile,clients);
+  const result=await cleanVerifiedDeletedCase(f.input);
+  assert.equal(result.status,"complete",result.blocker);
+  assert.equal(result.deletedComments,1);
+  assert.deepEqual(reads,["RETIREMENT#work#TASK#historical-task","RETIREMENT#work#EVENT#historical-event"]);
+  assert.equal(f.state.currentComments.length,0);
+  assert.equal(f.state.closed,1);
+  assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations,0);
 });
 
 test("a foreign user comment is preserved while the exact app mapping is removed",async()=>{
