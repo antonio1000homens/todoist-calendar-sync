@@ -29,11 +29,15 @@ test("authenticated recovery is separate from fenced admission, requires exact t
     .setIssuedAt().setExpirationTime("5m").sign(privateKey);
   const headers={origin:"https://calendar-sync.alf-broadcast.co.uk","cf-access-jwt-assertion":jwt};
   const calls=[],messages=[];
+  let postWriteBlocked=false;
   const erasures={async get(){return {operationId:"op-1",profile:"work",status:"review_required"};}};
   const recovery={
     async inspectPostWrite(id){calls.push(["postwrite",id]);return {operationId:id,profile:"work",
-      classification:"fully_deleted_candidate",releaseAllowed:false,onlyAvailableAction:"automatic_completion_pending",
-      completionEligible:true,completionBlockers:[],blockers:[],evidence:{matchingFence:true,leasesDrained:true}};},
+      classification:postWriteBlocked?"partial_or_ambiguous":"fully_deleted_candidate",releaseAllowed:false,
+      onlyAvailableAction:postWriteBlocked?"keep_fenced":"automatic_completion_pending",
+      completionEligible:!postWriteBlocked,
+      completionBlockers:postWriteBlocked?["Exact Todoist readback is unavailable; preserve the profile fence."]:[],
+      blockers:[],evidence:{matchingFence:true,leasesDrained:true}};},
     async inspect(id){calls.push(["inspect",id]);return {preview:{operationId:id,profile:"work",
       phase:"wait_worker_timeout",classification:"pre_write",allowed:true,blockers:[],mappingStates:[],
       fenceOwned:true,leaseCount:0,providerItemsAbsent:false,stateRowsAbsent:false,epoch:3}};},
@@ -56,6 +60,13 @@ test("authenticated recovery is separate from fenced admission, requires exact t
   assert.deepEqual(JSON.parse(postWrite.body).assessment.onlyAvailableAction,"automatic_completion_pending");
   assert.equal(JSON.parse(postWrite.body).assessment.completionEligible,true);
   assert.deepEqual(calls.find(x=>x[0]==="postwrite"),["postwrite","op-1"]);
+  postWriteBlocked=true;
+  const failedPostWrite=await run(request("/review/api/erasure-postwrite-recoveries/op-1","GET",headers));
+  const blockedAssessment=JSON.parse(failedPostWrite.body).assessment;
+  assert.equal(failedPostWrite.statusCode,200);assert.equal(blockedAssessment.completionEligible,false);
+  assert.equal(blockedAssessment.onlyAvailableAction,"keep_fenced");
+  assert.match(blockedAssessment.completionBlockers[0],/readback is unavailable/);
+  assert.deepEqual(messages,[],"failed post-write verification does not queue recovery or release the fence");
   for(const action of ["confirm","apply","dispatch","review-token","acknowledge"]){
     const refused=await run(request("/review/api/erasure-postwrite-recoveries/op-1/"+action,"POST",headers,{}));
     assert.equal(refused.statusCode,404,"Post-write exposes no per-operation approval or mutating route");

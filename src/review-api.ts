@@ -268,7 +268,12 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
             const operationId=typeof fence.operationId==="string"?fence.operationId:"unknown";
             const operation=operationId!=="unknown"?await erasureStore().get(operationId):undefined;
             return response(409,{error:"separate_erasure_fence_active",blocker:"separate_erasure_fence_active",
-              operationId,status:operation?.status||"active",recoveryUrl:"/review/#erasure-recovery"});
+              outcome:"blocked_cleanup_not_started",cleanupStarted:false,cleanupWritesPerformed:false,
+              attemptedAt:new Date().toISOString(),operationId,
+              status:operation?.status||fence.state,phase:operation?.lifecycle?.phase,
+              reason:"The active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This historical case cannot be proven identity-disjoint with the complete inventory and isolated admission protocol available here, so the fence remains in force.",
+              recoveryUrl:operationId==="unknown"?"/review/#erasure-recovery":
+                `/review/?erasureOperation=${encodeURIComponent(operationId)}#erasure-recovery`});
           }
         }
         const acquire=dependencies.acquireWriteLease || acquireProfileAdmissionLease;
@@ -298,8 +303,15 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       const engine=dependencies.createReviewEngine?.(store)||new ReviewEngine(store);
       const cleanup=dependencies.cleanVerifiedDeletedCase||cleanVerifiedDeletedCase;
       const result=await cleanup({item,store,engine,idempotencyKey});
-      return response(result.status==="complete"?200:409,result.status==="complete"?{result}
-        :{error:result.blocker||"historical_cleanup_blocked",blocker:result.blocker,phase:result.phase,result});
+      if(result.status!=="complete") {
+        const checkpoint=await store.getHistoricalCleanupCheckpoint(item.id);
+        const retryable=checkpoint?.status==="retryable";
+        const partiallyCompleted=retryable&&Boolean(result.deletedComments||result.unlinkedEvents);
+        return response(409,{error:result.blocker||"historical_cleanup_blocked",blocker:result.blocker,
+          outcome:partiallyCompleted?"partially_completed_retryable":"blocked",retryable,
+          phase:result.phase,deletedComments:result.deletedComments||0,unlinkedEvents:result.unlinkedEvents||0,result});
+      }
+      return response(200,{result});
     }
 
     // Post-write inspection is read-only. The existing worker watchdog owns
