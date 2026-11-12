@@ -1,9 +1,8 @@
 /**
- * #349 uses a bounded Todoist project-comment tombstone, not permanent
- * DynamoDB/HMAC replay markers. The historical marker writer was retired in
- * #437. The remaining legacy reader is also retired: production does not
- * configure a HMAC keyring or replay flag, and a read-only production inventory
- * on 2026-11-10 found no rows in the historical marker partitions.
+ * #349 now requires zero retained deleted identity, including removal of the
+ * former 18-day project-comment tombstone. The historical HMAC marker writer
+ * and reader are retired. Until #347 proves marker-free replay admission for
+ * every invokable writer, neither retired mechanism is a valid fallback.
  *
  * Keep the old gate as a FAIL-CLOSED tripwire for old deployment settings.
  * Never silently treat an unexpected enabled legacy gate as an allow.
@@ -140,15 +139,15 @@ export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCom
 
 
 /**
- * Legacy HMAC marker admission cannot be re-enabled: #349 superseded it with
- * an 18-day project-comment tombstone checked under the writer/entry lease.
+ * Legacy HMAC marker admission cannot be re-enabled. #349 now requires zero
+ * retained identity and #347 must establish marker-free writer admission.
  * Reject any unexpected nonzero or unknown setting before admitting writes.
  */
 export function replayAdmissionEnabled():boolean {
   const version=process.env.ERASURE_REPLAY_BARRIER_VERSION;
   if(version===undefined||version===""||version==="0")return false;
   throw new ErasureReplayUnavailableError(
-    "Legacy HMAC replay admission was retired; remove ERASURE_REPLAY_BARRIER_VERSION and use bounded project-comment tombstones");
+    "Legacy HMAC replay admission was retired; remove ERASURE_REPLAY_BARRIER_VERSION; marker-free writer admission is not yet proven");
 }
 
 /** Retirement exclusions are independent from the retired HMAC mechanism. */
@@ -169,5 +168,5 @@ export function mappingReplayIdentity(mapping:{
 /** Never authorise an old direct HMAC marker check after reader retirement. */
 export async function assertReplayAdmission(_identity:ReplayIdentity,_db:Db=documentClient):Promise<void> {
   throw new ErasureReplayUnavailableError(
-    "Direct HMAC marker admission was retired; use bounded project-comment tombstones");
+    "Direct HMAC marker admission was retired; marker-free writer admission is not yet proven");
 }
