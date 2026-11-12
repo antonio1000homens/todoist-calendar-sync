@@ -286,6 +286,10 @@ export function erasureProjectCommentsAbsent(operation:ErasureOperation,
       ||aliases.has(payload.eventId))
     &&!index.malformed.some(({comment})=>Boolean(comment.content?.includes(operation.target.taskId)
       ||[...aliases].some(alias=>comment.content?.includes(alias))))
+    // Unstructured project notes must not silently retain exact deleted IDs.
+    // Do not delete such notes implicitly: leave the operation fenced for review.
+    &&!projectComments.some(comment=>Boolean(comment.content?.includes(operation.target.taskId)
+      ||[...aliases].some(alias=>comment.content?.includes(alias))))
     &&!projectComments.some(comment=>{
       const marker=parseDeletionTombstoneComment(comment);
       return Boolean(marker&&(marker.taskId===operation.target.taskId
