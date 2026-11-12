@@ -373,8 +373,11 @@ export async function cleanVerifiedDeletedCase(input: {
       if(ownerBlocker)return block(ownerBlocker);
       if(!await checkpoint({pendingProviderWrite:{type:"todoist_legacy_comment_delete",id:current.id}}))return block("historical_cleanup_checkpoint_conflict");
       await pair.todoist.deleteComment(current.id);
-      try { await pair.todoist.getComment(current.id); return block("legacy_task_comment_delete_unverified"); }
-      catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; deletedComments++; }
+      try {
+        const remaining=await pair.todoist.getComment(current.id);
+        if(remaining.id!==current.id||remaining.is_deleted!==true)return block("legacy_task_comment_delete_unverified");
+        deletedComments++;
+      } catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; deletedComments++; }
       if(!await checkpoint({deletedComments,pendingProviderWrite:null}))return block("historical_cleanup_checkpoint_conflict");
     }
     const remaining = await readProjectComments();

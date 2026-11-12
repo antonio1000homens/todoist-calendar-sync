@@ -12,14 +12,14 @@ const item={id:"work-standalone_todoist_task_deleted-fixture",profile:"work",tit
   decision:{type:"standalone_todoist_task_deleted",taskId,eventId},createdAt:"2026-11-12T00:00:00.000Z",updatedAt:"v1"};
 const ownedComment=()=>({id:"comment-1",project_id:projectId,content:`todoist-calendar-sync:mapping:v1\n${JSON.stringify({schemaVersion:1,profile:"work",projectId,taskId,eventId,mappingRevision:1,updatedAt:"2026-11-11T00:00:00.000Z"})}`});
 function harness({event={id:eventId,status:"cancelled",htmlLink:"https://calendar.test/event"},calendarEvents,instances=[],recurrenceLink,
-  caseItem=item,comments=[ownedComment()],taskExists=false,changedComment=false,reviewStore}={}){
+  caseItem=item,comments=[ownedComment()],taskExists=false,changedComment=false,softDeleteComments=false,reviewStore}={}){
   const calendarState=new Map(calendarEvents||[[eventId,event]]);
   let currentComments=[...comments],calendarUpdates=0,taskDeletes=0,eventDeletes=0,creations=0,closed=0;
   let commentReadChanged=changedComment;
   const todoist={
-    listProjectComments:async()=>currentComments.map(x=>({...x})),
+    listProjectComments:async()=>currentComments.filter(x=>!x.is_deleted).map(x=>({...x})),
     getComment:async id=>{const found=currentComments.find(x=>x.id===id);if(!found)throw Object.assign(new Error("gone"),{status:404});return commentReadChanged?{...found,content:"user changed this"}:{...found};},
-    deleteComment:async id=>{currentComments=currentComments.filter(x=>x.id!==id);},
+    deleteComment:async id=>{if(softDeleteComments)currentComments=currentComments.map(x=>x.id===id?{...x,is_deleted:true}:x);else currentComments=currentComments.filter(x=>x.id!==id);},
     findLegacyTaskComment:async()=>undefined,
     deleteTask:async()=>{taskDeletes++;},createTask:async()=>{creations++;},
   };
@@ -65,6 +65,16 @@ test("offline Work deleted-pair fixture clears exact comment and retires case wi
   assert.equal(result.deletedComments,1);
   assert.equal(f.state.currentComments.length,0);
   assert.equal(f.state.calendarUpdates,0,"cancelled events are never patched");
+  assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations,0);
+  assert.equal(f.state.closed,1);
+});
+
+test("historical cleanup accepts Todoist's verified soft-deleted comment readback",async()=>{
+  const f=harness({softDeleteComments:true});
+  const result=await cleanVerifiedDeletedCase(f.input);
+  assert.equal(result.status,"complete");
+  assert.equal(result.deletedComments,1);
+  assert.equal(f.state.currentComments[0].is_deleted,true);
   assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations,0);
   assert.equal(f.state.closed,1);
 });
