@@ -11,6 +11,19 @@ import { assertReplayAdmissionIfEnabled, ErasureReplayBlockedError, REPLAY_PROFI
 import { activeProjectDeletionTombstone } from "./mapping-comments.js";
 import { profiles, todoistToken } from "./config.js";
 import { Todoist } from "./providers.js";
+type VerifiedDeletionEvidence = {
+  profile: Profile; taskIds: string[]; eventIds: string[];
+  staleMappings?: Mapping[];
+  staleMappingRows?: Array<{ pk: string; sk: string; profile: Profile; taskId: string; eventId: string; updatedAt: string }>;
+  staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
+  masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
+  legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
+};
+type VerifiedDeletionTransaction = NonNullable<ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"]>;
+type HistoricalRetirementAuthorization = {
+  checkpoint: { fingerprint: string; owner: string };
+  scope?: { owner: string; version: number; operationId: string; epoch: number };
+};
 type ProjectCommentClientFactory = (profile: Profile) => Promise<{todoist: Pick<Todoist, "listProjectComments">}>;
 const defaultProjectCommentClientFactory: ProjectCommentClientFactory = async profile =>
   ({todoist:new Todoist(await todoistToken(profile))});
@@ -46,7 +59,9 @@ async function admitReviewIdentities(refs: Iterable<EntityRef>, clientFactory: P
     })) throw new ErasureReplayBlockedError();
   }
 }
-async function nestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<EntityRef[]> {
+function nestedReviewIdentities(value: unknown, defaultProfile: Profile,
+  terminal?: { seriesKeys: string[] },
+): EntityRef[] {
   const refs = new Map<string, EntityRef>();
   const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
   const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId",
@@ -71,7 +86,9 @@ async function nestedReviewIdentities(value: unknown, defaultProfile: Profile): 
       if (field === "candidates") for (const candidate of item) {
         if (!candidate || typeof candidate !== "object") continue;
         const candidateObject = candidate as Record<string,unknown>;
-        if (typeof candidateObject.id === "string" && candidateObject.id) add(profile,"todoist",candidateObject.id);
+        const candidateProfile = terminal && REPLAY_PROFILES.includes(candidateObject.profile as Profile)
+          ? candidateObject.profile as Profile : profile;
+        if (typeof candidateObject.id === "string" && candidateObject.id) add(candidateProfile,"todoist",candidateObject.id);
       }
       for (const child of item) collect(child,profile,field);
       return;
@@ -80,9 +97,14 @@ async function nestedReviewIdentities(value: unknown, defaultProfile: Profile): 
     const object = item as Record<string,unknown>;
     const selectedProfile = typeof object.profile === "string" && REPLAY_PROFILES.includes(object.profile as Profile)
       ? object.profile as Profile : profile;
+    if (terminal && typeof object.id === "string" && object.id && (object.side === "todoist" || object.side === "calendar"))
+      add(selectedProfile, object.side, object.id);
     for (const [name,child] of Object.entries(object)) {
       if (typeof child === "string" && child && taskFields.has(name)) add(selectedProfile,"todoist",child);
-      if (typeof child === "string" && child && eventFields.has(name)) add(selectedProfile,"calendar",child);
+      const verifiedSeriesKey = terminal && selectedProfile === defaultProfile
+        && (name === "seriesId" || name === "masterSeriesId") && terminal.seriesKeys.includes(child as string);
+      if (typeof child === "string" && child && eventFields.has(name) && !verifiedSeriesKey)
+        add(selectedProfile,"calendar",child);
       collect(child,selectedProfile,name);
     }
   };
@@ -99,18 +121,18 @@ async function admitEntityRef(ref: EntityRef): Promise<void> {
   await admitReviewIdentities([ref],defaultProjectCommentClientFactory);
 }
 async function admitNestedReviewIdentities(value: unknown, defaultProfile: Profile): Promise<void> {
-  await admitReviewIdentities(await nestedReviewIdentities(value,defaultProfile),defaultProjectCommentClientFactory);
+  await admitReviewIdentities(nestedReviewIdentities(value,defaultProfile),defaultProjectCommentClientFactory);
 }
 /** Check all provider identities retained by a manual decision before the
  * decision itself is written or changed. */
 export async function assertManualDecisionReplayAdmission(decision: ManualDecision,
   clientFactory: ProjectCommentClientFactory = defaultProjectCommentClientFactory): Promise<void> {
-  await admitReviewIdentities(await nestedReviewIdentities(decision, decision.profile), clientFactory);
+  await admitReviewIdentities(nestedReviewIdentities(decision, decision.profile), clientFactory);
 }
 export async function assertRepairPreviewReplayAdmission(preview: RepairPreview,
   clientFactory: ProjectCommentClientFactory = defaultProjectCommentClientFactory): Promise<void> {
   const refs = new Map<string, EntityRef>();
-  for (const ref of await nestedReviewIdentities(preview,preview.intent.profile)) refs.set(entityKey(ref),ref);
+  for (const ref of nestedReviewIdentities(preview,preview.intent.profile)) refs.set(entityKey(ref),ref);
   for (const snapshot of preview.snapshots || []) refs.set(entityKey(snapshot.ref), snapshot.ref);
   for (const planned of preview.itemPlan || []) refs.set(entityKey(planned.ref), planned.ref);
   for (const snapshot of preview.snapshots || []) if (snapshot.mapping) {
@@ -559,27 +581,96 @@ export class ReviewStore {
    * Remove strictly attributable audit and incident pointers within the same
    * transaction, never records belonging to a live counterpart.
    */
-  async resolveVerifiedDeletedCase(
-    caseId: string,
-    expected: {
-      profile: Profile; taskIds: string[]; eventIds: string[];
-      staleMappings?: Mapping[];
-      staleMappingRows?:Array<{pk:string;sk:string;profile:Profile;taskId:string;eventId:string;updatedAt:string}>;
-      dryRun?:boolean;
-      staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
-      masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
-      scopedAdmission?:{owner:string;version:number};
-      /** Direct provider readbacks for legacy decisions without masterEventId. */
-      legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
-    },
-  ): Promise<boolean> {
+  async resolveVerifiedDeletedCase(caseId: string, expected: VerifiedDeletionEvidence): Promise<boolean> {
+    const items = await this.planVerifiedDeletion(caseId, expected, Date.now());
+    return items ? this.commitVerifiedDeletion(items) : false;
+  }
+
+  /** Plan terminal retirement for the selected persisted case. The caller
+   * must verify provider state and project tombstones before authorizing the
+   * write. Rebuild the plan to detect drift, then CAS the original evidence. */
+  async prepareHistoricalCaseRetirement(selected: ReviewCase, expected: VerifiedDeletionEvidence): Promise<{
+    resourceKeys: string[];
+    commit: (authorize: () => Promise<HistoricalRetirementAuthorization>) => Promise<boolean>;
+  } | undefined> {
+    const preparedAt = Date.now();
+    const planFingerprint = (plan: VerifiedDeletionTransaction) => reviewHash(plan.map(reviewHash).sort());
+    const items = await this.planVerifiedDeletion(selected.id, expected, preparedAt, selected);
+    if (!items) return undefined;
+    return {
+      resourceKeys: items.flatMap(item => [item.Update?.Key, item.Delete?.Key]
+        .filter(Boolean).map(key => `${key!.pk}|${key!.sk}`)),
+      commit: async authorize => {
+        const fresh = await this.planVerifiedDeletion(selected.id, expected, preparedAt, selected);
+        if (!fresh) return false;
+        if (planFingerprint(fresh) !== planFingerprint(items)) {
+          this.lastVerifiedDeletionBlocker = "terminal_retirement_inventory_changed";
+          return false;
+        }
+        const { checkpoint, scope } = await authorize();
+        const guards: VerifiedDeletionTransaction = [{
+          ConditionCheck: {
+            TableName: reviewTable(), Key: { pk: `HISTORICAL_CLEANUP#${selected.id}`, sk: "OP" },
+            ConditionExpression: "fingerprint=:fingerprint AND leaseOwner=:owner AND leaseUntil > :now",
+            ExpressionAttributeValues: { ":fingerprint": checkpoint.fingerprint, ":owner": checkpoint.owner, ":now": Date.now() },
+          },
+        }];
+        if (scope) {
+          guards.push(
+            { ConditionCheck: {
+              TableName: reviewTable(), Key: { pk: `ERASURE#${expected.profile}`, sk: "SCOPED_ADMISSION" },
+              ConditionExpression: "#version=:version AND contains(owners,:owner) AND leaseUntilByOwner.#owner > :now",
+              ExpressionAttributeNames: { "#version": "version", "#owner": scope.owner },
+              ExpressionAttributeValues: { ":version": scope.version, ":owner": scope.owner, ":now": Date.now() },
+            } },
+            { ConditionCheck: {
+              TableName: reviewTable(), Key: { pk: `ERASURE#${expected.profile}`, sk: "FENCE" },
+              ConditionExpression: "operationId=:operationId AND #state=:active",
+              ExpressionAttributeNames: { "#state": "state" },
+              ExpressionAttributeValues: { ":operationId": scope.operationId, ":active": "active" },
+            } },
+            { ConditionCheck: {
+              TableName: reviewTable(), Key: { pk: `ERASURE#${expected.profile}`, sk: "EPOCH" },
+              ConditionExpression: "epoch=:epoch",
+              ExpressionAttributeValues: { ":epoch": scope.epoch },
+            } },
+          );
+        } else if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
+          guards.push({ ConditionCheck: {
+            TableName: reviewTable(), Key: { pk: `ERASURE#${expected.profile}`, sk: "FENCE" },
+            ConditionExpression: "attribute_not_exists(pk)",
+          } });
+        }
+        return this.commitVerifiedDeletion([...items, ...guards]);
+      },
+    };
+  }
+
+  private async planVerifiedDeletion(
+    caseId: string, expected: VerifiedDeletionEvidence, preparedAt: number, selected?: ReviewCase,
+  ): Promise<VerifiedDeletionTransaction | undefined> {
     this.lastVerifiedDeletionBlocker = undefined;
-    const blocked = (reason: string): false => { this.lastVerifiedDeletionBlocker = reason; return false; };
+    const blocked = (reason: string): undefined => { this.lastVerifiedDeletionBlocker = reason; return undefined; };
     const cleanupProfiles: Profile[] = ["home", "antonio", "work"];
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
       || current.operationId || current.result?.startsWith("resolved_deleted")) return blocked("case_status_revision_or_operation_changed");
-    await admitNestedReviewIdentities(current,current.profile);
+    if (selected && (current.updatedAt !== selected.updatedAt || current.status !== selected.status
+      || reviewHash(current.decision ?? null) !== reviewHash(selected.decision ?? null)
+      || current.taskId !== selected.taskId || current.eventId !== selected.eventId))
+      return blocked("case_status_revision_or_operation_changed");
+    if (!selected) await admitNestedReviewIdentities(current,current.profile);
+    const withinVerifiedIdentities = (ref: EntityRef) => ref.profile === expected.profile
+      && (ref.side === "todoist" ? expected.taskIds : expected.eventIds).includes(ref.id);
+    const identityOptions = { seriesKeys: [...expected.taskIds, ...(expected.masterSeriesId ? [expected.masterSeriesId] : [])] };
+    const attributableIdentities = (value: unknown) => nestedReviewIdentities(value, expected.profile, identityOptions)
+      .every(withinVerifiedIdentities);
+    if (selected) {
+      const refs = nestedReviewIdentities(current, current.profile, identityOptions);
+      if (!refs.every(withinVerifiedIdentities)) return blocked("nested_case_identity_unverified");
+      for (const ref of refs) await assertReplayAdmissionIfEnabled({ profile: ref.profile,
+        ...(ref.side === "todoist" ? { taskId: ref.id } : { eventIds: [ref.id] }) });
+    }
     const { taskIds, eventIds } = reviewCaseEvidenceIds(current);
     if (!taskIds.length || !eventIds.length
       || taskIds.some(id => !expected.taskIds.includes(id))
@@ -588,6 +679,7 @@ export class ReviewStore {
     const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
     if (manual && (!["pending", "resolved"].includes(manual.status) || manual.profile !== expected.profile
       || manual.decisionId !== caseId)) return blocked("manual_decision_status_or_identity_changed");
+    if (selected && manual && !attributableIdentities(manual)) return blocked("nested_manual_identity_unverified");
     const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;
     const detail = source?.detail && typeof source.detail === "object"
@@ -595,7 +687,9 @@ export class ReviewStore {
     const attribution = detail ? retainedAuditProviderIds(detail) : { taskIds: [], eventIds: [] };
     const attributable = Boolean(source && detail && attribution.taskIds.length + attribution.eventIds.length > 0
       && attribution.taskIds.every(id => expected.taskIds.includes(id))
-      && attribution.eventIds.every(id => expected.eventIds.includes(id)));
+      && attribution.eventIds.every(id => expected.eventIds.includes(id))
+      && (!selected || attributableIdentities(detail) && typeof source.action === "string"
+        && !/(?:operational|dlq)/.test(source.action)));
     const pointerKey = current.conflictKey && current.id.startsWith("incident-")
       ? { pk: `REVIEW_CONFLICT#${expected.profile}#${current.conflictKey}`, sk: `INCIDENT#${caseId}` }
       : undefined;
@@ -676,7 +770,7 @@ export class ReviewStore {
         ||!expected.eventIds.includes(row.eventId)||!row.updatedAt)return blocked("stale_mapping_identity_or_revision_changed");
       mappingDeleteKeys.add(keyId);
     }
-    const now = new Date().toISOString();
+    const now = new Date(preparedAt).toISOString();
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
       { Update: { TableName: reviewTable(), Key: key(`REVIEW_CASE#${caseId}`),
@@ -685,7 +779,7 @@ export class ReviewStore {
         ExpressionAttributeNames: { "#status": "status", "#result": "result", "#title": "title", "#reason": "reason" },
         ExpressionAttributeValues: { ":resolved": "resolved", ":result": resolution, ":title": "Verified deletion", ":reason": "verified_deletion",
           ":now": now, ":old": current.status, ":version": current.updatedAt,
-          ":expiry": Math.floor(Date.now() / 1000) + 30 * 86400 },
+          ":expiry": Math.floor(preparedAt / 1000) + 30 * 86400 },
       } },
     ];
     if (manual) items.push({ Update: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
@@ -695,6 +789,24 @@ export class ReviewStore {
       ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
         ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
     } });
+    if (selected && manual) {
+      // Manual context can change while the decision remains pending with the
+      // same createdAt. Fence every identity-bearing field that will be removed.
+      const update = items[1].Update!;
+      for (const field of ["context", "taskId", "eventId", "masterEventId", "activeInstanceId", "seriesId", "mappingSnapshot"] as const) {
+        const name = `#manual_${field}`, value = `:manual_${field}`;
+        update.ExpressionAttributeNames![name] = field;
+        const previous = manual[field];
+        if (previous === undefined) update.ConditionExpression += ` AND attribute_not_exists(${name})`;
+        else {
+          update.ConditionExpression += ` AND ${name} = ${value}`;
+          update.ExpressionAttributeValues![value] = previous;
+        }
+      }
+    } else if (selected) {
+      items.push({ ConditionCheck: { TableName: reviewTable(), Key: key(`MANUAL#${caseId}`),
+        ConditionExpression: "attribute_not_exists(pk)" } });
+    }
     // Retire only a mapping whose exact task/event pair is in this case and
     // whose version is unchanged. All three lookup rows are deleted in the
     // same transaction as terminal case closure.
@@ -822,6 +934,7 @@ export class ReviewStore {
           ||!child.sourceAuditKey?.startsWith(`AUDIT#${expected.profile}#`)
           ||await this.get<ManualDecision>(`MANUAL#${id}`))continue;
         const childIds=reviewCaseEvidenceIds(child);
+        if(selected && !attributableIdentities(child))continue;
         if(childIds.taskIds.length+childIds.eventIds.length===0
           ||childIds.taskIds.some(id=>!expected.taskIds.includes(id))
           ||childIds.eventIds.some(id=>!expected.eventIds.includes(id)))continue;
@@ -831,6 +944,7 @@ export class ReviewStore {
         const auditIds=auditDetail?retainedAuditProviderIds(auditDetail):undefined;
         if(!audit||typeof audit.action!=="string"||typeof audit.createdAt!=="string"
           ||/(?:operational|dlq)/.test(audit.action)||!auditIds
+          ||selected && !attributableIdentities(auditDetail)
           ||auditIds.taskIds.length+auditIds.eventIds.length===0
           ||auditIds.taskIds.some(id=>!expected.taskIds.includes(id))
           ||auditIds.eventIds.some(id=>!expected.eventIds.includes(id)))continue;
@@ -844,7 +958,7 @@ export class ReviewStore {
           ExpressionAttributeValues:{":resolved":"resolved",":result":resolution,":title":"Verified deletion",
             ":reason":"verified_deletion",":dismissed":"dismissed",":version":child.updatedAt,
             ":keeper":caseId,":audit":child.sourceAuditKey,":conflict":current.conflictKey,
-            ":now":now,":expiry":Math.floor(Date.now()/1000)+30*86400},
+            ":now":now,":expiry":Math.floor(preparedAt/1000)+30*86400},
         }});
         items.push({Delete:{TableName:reviewTable(),
           Key:{pk:conflictPk,sk:`INCIDENT#${id}`},
@@ -1039,7 +1153,8 @@ export class ReviewStore {
       const identities = retainedAuditProviderIds(auditDetail);
       if (!identities.taskIds.length && !identities.eventIds.length) continue;
       if (identities.taskIds.every(id => expected.taskIds.includes(id))
-        && identities.eventIds.every(id => expected.eventIds.includes(id))) safeAudits.add(auditKey);
+        && identities.eventIds.every(id => expected.eventIds.includes(id))
+        && (!selected || attributableIdentities(auditDetail))) safeAudits.add(auditKey);
     }
     for (const auditKey of safeAudits) {
       if (auditDeletes.has(auditKey)) continue;
@@ -1102,14 +1217,11 @@ export class ReviewStore {
         ExpressionAttributeValues: { ":no": false },
       } });
     }
-    if(expected.scopedAdmission)items.push({ConditionCheck:{TableName:reviewTable(),
-      Key:{pk:`ERASURE#${expected.profile}`,sk:"SCOPED_ADMISSION"},
-      ConditionExpression:"#version=:version AND contains(owners,:owner) AND leaseUntilByOwner.#owner > :now",
-      ExpressionAttributeNames:{"#version":"version","#owner":expected.scopedAdmission.owner},
-      ExpressionAttributeValues:{":version":expected.scopedAdmission.version,":owner":expected.scopedAdmission.owner,":now":Date.now()},
-    }});
-    if (items.length > 95) return blocked("transaction_item_limit_exceeded"); // leave open for safe bounded retry
-    if(expected.dryRun)return true;
+    if (items.length > 95) return blocked("transaction_item_limit_exceeded");
+    return items;
+  }
+
+  private async commitVerifiedDeletion(items: VerifiedDeletionTransaction): Promise<boolean> {
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
       return true;
@@ -1125,9 +1237,12 @@ export class ReviewStore {
           :pk.startsWith("RECURRENCE#")?"recurrence_link_revision_or_owner_changed"
           :pk.startsWith("AUDIT")?"audit_or_pointer_revision_changed"
           :pk.startsWith("SYNC_CONTROL#")?"repair_or_exclusion_guard_changed"
+          :pk.startsWith("ERASURE#")?"fence_or_scoped_admission_changed"
+          :pk.startsWith("HISTORICAL_CLEANUP#")?"historical_cleanup_checkpoint_changed"
           :pk.startsWith("TASK")||pk.startsWith("EVENT")?"live_mapping_or_owner_appeared"
           :"conditional_state_changed";
-        return blocked(`${category}_retry_required`);
+        this.lastVerifiedDeletionBlocker = `${category}_retry_required`;
+        return false;
       }
       throw error;
     }

@@ -157,6 +157,13 @@ test("all review, reconciliation, and erasure writers hold the profile admission
   assert.equal(scopedBlocked.body.cleanupStarted,false);assert.equal(scopedBlocked.body.cleanupWritesPerformed,false);
   assert.equal(scopedBlocked.body.operationId,"erase-op-123");assert.equal(scopedBlocked.body.status,"review_required");
   assert.equal(scopedBlocked.body.recoveryUrl,"/review/?erasureOperation=erase-op-123#erasure-recovery");
+  deps.cleanVerifiedDeletedCase=async()=>({status:"blocked",phase:"checking_providers",
+    blocker:"protected_erasure_tombstone",cleanupStarted:false});
+  const markerBlocked=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-marker-block"},{}),deps));
+  assert.equal(markerBlocked.body.outcome,"blocked_cleanup_not_started");
+  assert.equal(markerBlocked.body.blocker,"protected_erasure_tombstone");
+  assert.match(markerBlocked.body.reason,/normal expiry.*does not resolve the retained case/);
   deps.inspectErasureFence=async()=>({fence:undefined,leases:[]});
   deps.cleanVerifiedDeletedCase=async()=>({status:"blocked",phase:"checking_calendar_links",blocker:"calendar_link_removal_unverified",deletedComments:2,unlinkedEvents:0});
   checkpointStatus={status:"retryable"};
