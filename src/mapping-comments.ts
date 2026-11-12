@@ -515,11 +515,20 @@ export async function deleteExactTaskProjectMappingComments(
     }
     await identity.onBeforeDelete?.(current);
     await client.deleteComment(current.id);
+    let confirmedDeleted = false;
     try {
-      await client.getComment(current.id);
-      throw new Error(`Todoist project mapping comment ${current.id} remains after deletion`);
+      const remaining = await client.getComment(current.id);
+      // Todoist's comments API soft-deletes comments and can continue to serve
+      // the record by ID with is_deleted=true. Treat that provider state as a
+      // verified deletion; an active record still fails closed.
+      if (remaining.id !== current.id || remaining.is_deleted !== true)
+        throw new Error(`Todoist project mapping comment ${current.id} remains after deletion`);
+      confirmedDeleted = true;
     } catch (error) {
-      if (Number((error as { status?: number }).status) !== 404) throw error;
+      if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+      confirmedDeleted = true;
+    }
+    if (confirmedDeleted) {
       await identity.onDeleted?.(current);
       deleted++;
     }
