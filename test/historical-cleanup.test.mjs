@@ -360,6 +360,36 @@ test("marker inventory changes between read-only planning and scoped writes fail
   assert.deepEqual(f.state.currentComments,[ownedComment()]);
 });
 
+test("acquiring the case's scoped admission does not look like a new owner",async t=>{
+  const marker=deletionMarker();
+  const {f,rows,transactions}=fencedFixture(t,{marker});
+  const acquire=f.input.acquireScopedAdmission;
+  const registryKey=`ERASURE#${item.profile}|SCOPED_ADMISSION`;
+  f.input.acquireScopedAdmission=async request=>{
+    const admission=await acquire(request);
+    rows.set(registryKey,{
+      pk:`ERASURE#${item.profile}`,sk:"SCOPED_ADMISSION",version:1,owners:[admission.owner],
+      leaseUntilByOwner:{[admission.owner]:Date.now()+60_000},
+      grants:[{profile:item.profile,owner:admission.owner,caseId:item.id,
+        fenceOperationId:"independent-erasure",fingerprint:request.scope.fingerprint,
+        taskIds:[taskId],eventIds:[eventId],resourceKeys:request.scope.resourceKeys,
+        projectCommentIds:request.scope.projectCommentIds,writeClasses:request.scope.writeClasses,
+        acquiredAt:Date.now(),expiresAt:Date.now()+60_000}],
+    });
+    const release=admission.release;
+    admission.release=async()=>{rows.delete(registryKey);await release();};
+    return admission;
+  };
+
+  const result=await cleanVerifiedDeletedCase(f.input);
+  assert.equal(result.status,"complete",result.blocker);
+  assert.equal(result.cleanupStarted,true);
+  assert.equal(transactions.length,1);
+  assert.equal(rows.has(registryKey),false,"release removes the synthetic admission row");
+  assert.deepEqual(f.state.currentComments,[marker]);
+  assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations+f.state.calendarUpdates,0);
+});
+
 test("case revision and epoch drift at the terminal CAS leave the selected case open",async t=>{
   for(const [failCondition,blocker] of [
     [`REVIEW_CASE#${item.id}`,"case_revision_or_status_changed_retry_required"],

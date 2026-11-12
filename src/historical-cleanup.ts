@@ -204,8 +204,15 @@ export async function cleanVerifiedDeletedCase(input: {
     const scopeEventIds = [...new Set([...eventIds, ...seriesKeys.filter(id => !taskIds.includes(id))])];
     let scopedIdentityFingerprint:string|undefined;
     const checkpointPk = `HISTORICAL_CLEANUP#${item.id}`;
+    const admissionRegistryPk = `ERASURE#${item.profile}`;
     const identityRowsFingerprint=(rows:Array<{pk:string;sk:string;fingerprint:string}>)=>
-      JSON.stringify(rows.filter(row=>row.pk!==checkpointPk||row.sk!=="OP").map(row=>[row.pk,row.sk,row.fingerprint]));
+      // Acquiring this cleanup's scope adds the admitted identity to its own
+      // shared control row. The scope protocol validates that row separately
+      // (including owner/version in the terminal CAS); treating that expected
+      // bookkeeping write as a new provider owner would always fail preflight.
+      JSON.stringify(rows.filter(row=>(row.pk!==checkpointPk||row.sk!=="OP")
+        &&(row.pk!==admissionRegistryPk||row.sk!=="SCOPED_ADMISSION"))
+        .map(row=>[row.pk,row.sk,row.fingerprint]));
     const overlapsOtherErasure = (rows: Array<{pk:string;status?:unknown}>) =>
       rows.some(row=>row.pk.startsWith("ERASURE_OPERATION#")
         && row.pk!==`ERASURE_OPERATION#${input.fencedErasure?.operationId}`
