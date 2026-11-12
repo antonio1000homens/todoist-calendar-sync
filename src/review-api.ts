@@ -318,7 +318,17 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         const checkpoint=await store.getHistoricalCleanupCheckpoint(item.id);
         const retryable=checkpoint?.status==="retryable";
         const partiallyCompleted=retryable&&Boolean(result.deletedComments||result.unlinkedEvents);
+        const reasons: Record<string, string> = {
+          protected_erasure_tombstone: "A Todoist deletion marker is shared with an active erasure or covers identities this case cannot verify. The marker prevents replay until its normal expiry. Expiry alone does not resolve the retained case or prove it is safe to clean up.",
+          shared_erasure_identity: "This case shares a task or Calendar identity with an active erasure. Cleanup requires fresh proof that the case is isolated from the erasure.",
+          shared_project_comment: "This case and the active erasure both reference the same Todoist comment. Cleanup cannot remove evidence the erasure may still need.",
+          shared_audit_record: "This case and the active erasure both reference the same stored evidence. Cleanup cannot retire it while the erasure may still need it.",
+          erasure_tombstone_inventory_unverified: "The Todoist deletion marker inventory could not be verified. The case stays open until cleanup can establish which identities the markers protect.",
+          erasure_tombstone_inventory_changed: "The Todoist deletion marker inventory changed during cleanup. Retry to verify the current markers and case evidence.",
+        };
+        const reason = result.blocker && reasons[result.blocker];
         return response(409,{error:result.blocker||"historical_cleanup_blocked",blocker:result.blocker,
+          ...(reason ? {reason} : {}),
           outcome:partiallyCompleted?"partially_completed_retryable":
             result.cleanupStarted===false?"blocked_cleanup_not_started":"blocked",retryable,
           cleanupStarted:result.cleanupStarted??true,cleanupWritesPerformed:result.cleanupStarted!==false,

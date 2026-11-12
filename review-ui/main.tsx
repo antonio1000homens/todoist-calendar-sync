@@ -555,7 +555,7 @@ function App() {
       }else setCleanupFeedback({caseKey,phase:"warning",message:`Cleanup is blocked at ${result.result?.phase||"unknown phase"}: ${result.result?.blocker||"unknown blocker"}. The case remains open; retry after resolving the blocker.`});
     }catch(error:any){
       if(cleanupSelectionIsCurrent(version,selectionVersion.current)){
-        const reason=error.data?.blocker||error.data?.error||error.message;
+        const reason=error.data?.reason||error.data?.blocker||error.data?.error||error.message;
         const fence=error.data?.error==="separate_erasure_fence_active";
         const noStart=error.data?.cleanupStarted===false||error.data?.outcome==="blocked_cleanup_not_started";
         const partial=error.data?.outcome==="partially_completed_retryable"&&error.data?.retryable===true;
