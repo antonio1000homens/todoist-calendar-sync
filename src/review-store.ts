@@ -677,8 +677,9 @@ export class ReviewStore {
       || eventIds.some(id => !expected.eventIds.includes(id))) return blocked("case_provider_identity_changed_or_incomplete");
 
     const manual = await this.get<ManualDecision>(`MANUAL#${caseId}`);
-    if (manual && (!["pending", "resolved"].includes(manual.status) || manual.profile !== expected.profile
-      || manual.decisionId !== caseId)) return blocked("manual_decision_status_or_identity_changed");
+    if (manual && (!["pending", "resolved", "stale", "cancelled", "expired"].includes(manual.status)
+      || manual.profile !== expected.profile || manual.decisionId !== caseId))
+      return blocked("manual_decision_status_or_identity_changed");
     if (selected && manual && !attributableIdentities(manual)) return blocked("nested_manual_identity_unverified");
     const source = current.sourceAuditKey && current.sourceAuditKey.startsWith(`AUDIT#${expected.profile}#`)
       ? await this.get<Record<string, unknown>>(current.sourceAuditKey) : undefined;

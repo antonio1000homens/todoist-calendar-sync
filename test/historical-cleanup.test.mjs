@@ -280,6 +280,27 @@ test("a disjoint fenced cleanup retires the selected case and preserves the exac
     {name:"ErasureReplayBlockedError"});
 });
 
+test("terminal historical cleanup retires each recognized manual decision status",async t=>{
+  for (const status of ["resolved", "stale", "cancelled", "expired"]) {
+    await t.test(status, async subtest => {
+      const previous = process.env.ERASURE_PROTOCOL_VERSION;
+      process.env.ERASURE_PROTOCOL_VERSION = "1";
+      subtest.after(() => {
+        if (previous === undefined) delete process.env.ERASURE_PROTOCOL_VERSION;
+        else process.env.ERASURE_PROTOCOL_VERSION = previous;
+      });
+      const manual = {pk:`MANUAL#${item.id}`, sk:"STATE", profile:"work", decisionId:item.id,
+        status, taskId, eventId, createdAt:item.createdAt, context:{taskId,eventId}};
+      const {f,rows,transactions}=fencedFixture(subtest,{stateRows:[manual]});
+      const result=await cleanVerifiedDeletedCase(f.input);
+      assert.equal(result.status,"complete",result.blocker);
+      assert.equal(transactions.length,1);
+      assert.equal(rows.get(`MANUAL#${item.id}|STATE`).status,"resolved");
+      assert.equal(rows.get(`MANUAL#${item.id}|STATE`).context,undefined);
+    });
+  }
+});
+
 test("the fence's tombstone, a cross-profile alias, a shared comment and a planned state key each block before writes",async t=>{
   const fixtures=[
     [erasureOperation({projectCommentIds:["retained-marker"]}),"protected_erasure_tombstone"],
