@@ -6,7 +6,8 @@
  * Callers must hold the applicable erasure writer leases; these checks alone
  * do not make external HTTP mutations transactional with marker installation.
  */
-import {parseDeletionTombstoneComment, parseMappingComment} from "./mapping-comments.js";
+import {LEGACY_TASK_COMMENT_MARKERS,parseDeletionTombstoneComment, parseMappingComment,
+  type TodoistCommentRecord} from "./mapping-comments.js";
 import { assertRetirementAdmissionIfEnabled, retirementDispositionEnabled } from "./recurrence-retirement-disposition.js";
 import {
   assertReplayAdmission, ErasureReplayUnavailableError, mappingReplayIdentity, replayAdmissionEnabled,
@@ -63,6 +64,44 @@ function commentIdentity(profile:Profile,content:unknown):ReplayIdentity {
   if(!parsed||"error" in parsed||parsed.payload.profile!==profile)
     throw new ErasureReplayUnavailableError("Unidentifiable or wrong-profile project comment mutation");
   return mappingReplayIdentity(parsed.payload);
+}
+/** Prove a comment's owning identity from a fresh Todoist read before admitting
+ * its deletion. Bare comment IDs carry no task/event identity and remain
+ * fail-closed. Active project tombstones are replay fences, so only expired
+ * markers may be retired by the tombstone cleanup path. */
+async function verifiedCommentDeletionIdentity(profile:Profile,target:object,commentId:unknown):Promise<ReplayIdentity> {
+  if(typeof commentId!=="string"||!commentId)
+    throw new ErasureReplayUnavailableError("Comment deletion requires verified owner identity");
+  const getComment=Reflect.get(target,"getComment");
+  if(typeof getComment!=="function")
+    throw new ErasureReplayUnavailableError("Comment deletion requires a provider read to verify owner identity");
+  let comment:TodoistCommentRecord;
+  try { comment=await Reflect.apply(getComment,target,[commentId]) as TodoistCommentRecord; }
+  catch { throw new ErasureReplayUnavailableError("Comment deletion owner identity could not be verified"); }
+  if(!comment||comment.id!==commentId||typeof comment.content!=="string"||comment.is_deleted===true)
+    throw new ErasureReplayUnavailableError("Comment deletion requires verified owner identity");
+  const tombstone=parseDeletionTombstoneComment(comment);
+  if(tombstone) {
+    if(tombstone.profile!==profile||comment.project_id!==tombstone.projectId||comment.task_id)
+      throw new ErasureReplayUnavailableError("Comment deletion requires verified owner identity");
+    const expiresAt=Date.parse(tombstone.expiresAt);
+    if(!Number.isFinite(expiresAt)||expiresAt>Date.now())
+      throw new ErasureReplayUnavailableError("Active project deletion tombstones are retained as replay fences");
+    return {profile,taskId:tombstone.taskId,eventIds:tombstone.eventIds};
+  }
+  const parsed=parseMappingComment(comment);
+  if(parsed&&!('error' in parsed)) {
+    if(parsed.payload.profile!==profile||comment.project_id!==parsed.payload.projectId||comment.task_id)
+      throw new ErasureReplayUnavailableError("Comment deletion requires verified owner identity");
+    return mappingReplayIdentity(parsed.payload);
+  }
+  const lines=comment.content.split(/\r?\n/);
+  const eventLines=lines.filter(line=>line.startsWith("calendarEventId="));
+  const eventId=eventLines.length===1?eventLines[0].slice("calendarEventId=".length):"";
+  if(LEGACY_TASK_COMMENT_MARKERS.has(lines[0])&&typeof comment.task_id==="string"&&comment.task_id
+    &&eventId&&!/[\u0000-\u001f\u007f]/.test(eventId))
+    return {profile,taskId:comment.task_id,eventIds:[eventId]};
+  throw new ErasureReplayUnavailableError("Comment deletion requires verified owner identity");
 }
 /** Derive complete Calendar provenance from a provider-read event and its known
  * recurrence aliases. Never use task payload.id or a Todoist request ID here. */
@@ -126,7 +165,9 @@ function guardClient<T extends object>(profile:Profile,side:Side,target:T):T {
       if(!methods.has(method))return value.bind(current);
       return async (...args:unknown[])=>{
         if(replayAdmissionEnabled() || retirementDispositionEnabled()) {
-          const identity=replayMutationIdentity(profile,side,method,args);
+          const identity=side==="todoist"&&method==="deleteComment"
+            ?await verifiedCommentDeletionIdentity(profile,current,args[0])
+            :replayMutationIdentity(profile,side,method,args);
           await assertRetirementAdmissionIfEnabled(identity);
           if(replayAdmissionEnabled())await assertReplayAdmission(identity);
         }
