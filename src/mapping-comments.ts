@@ -481,7 +481,9 @@ export async function deleteMappingComments(client: ProjectCommentClient, mappin
 export async function deleteExactTaskProjectMappingComments(
   client: ProjectCommentClient,
   comments: TodoistCommentRecord[],
-  identity: { profile: Profile; projectId: string; taskId: string },
+  identity: { profile: Profile; projectId: string; taskId: string; eventIds?: readonly string[];
+    onBeforeDelete?: (comment:TodoistCommentRecord)=>Promise<void>|void;
+    onDeleted?: (comment:TodoistCommentRecord)=>Promise<void>|void },
 ): Promise<number> {
   const candidates = comments.flatMap(comment => {
     const parsed = parseMappingComment(comment);
@@ -490,6 +492,7 @@ export async function deleteExactTaskProjectMappingComments(
       && parsed.payload.profile === identity.profile
       && parsed.payload.projectId === identity.projectId
       && parsed.payload.taskId === identity.taskId
+      && (!identity.eventIds||identity.eventIds.includes(parsed.payload.eventId))
       ? [{comment, payload: parsed.payload}] : [];
   });
   let deleted = 0;
@@ -506,15 +509,18 @@ export async function deleteExactTaskProjectMappingComments(
       || parsed.payload.profile !== identity.profile
       || parsed.payload.projectId !== identity.projectId
       || parsed.payload.taskId !== identity.taskId
+      || identity.eventIds&&!identity.eventIds.includes(parsed.payload.eventId)
       || parsed.payload.eventId !== payload.eventId) {
       throw new Error(`Todoist project mapping comment ${candidate.id} changed before task deletion cleanup`);
     }
+    await identity.onBeforeDelete?.(current);
     await client.deleteComment(current.id);
     try {
       await client.getComment(current.id);
       throw new Error(`Todoist project mapping comment ${current.id} remains after deletion`);
     } catch (error) {
       if (Number((error as { status?: number }).status) !== 404) throw error;
+      await identity.onDeleted?.(current);
       deleted++;
     }
   }

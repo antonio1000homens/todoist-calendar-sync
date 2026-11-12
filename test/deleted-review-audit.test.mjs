@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { ReviewStore } from "../dist/review-store.js";
 
 function fixture({ race = false } = {}) {
@@ -27,6 +27,7 @@ function fixture({ race = false } = {}) {
       return {Items:pk==="AUDIT_REF#home#todoist#task-a"?[safe,shared]:
         pk==="AUDIT_REF#home#calendar#event-a"?[eventSafe]:[]};
     }
+    if(command instanceof ScanCommand)return {Items:[]};
     if(command instanceof TransactWriteCommand){
       transaction=command.input.TransactItems;
       if(race)throw Object.assign(new Error("owner changed"),{name:"TransactionCanceledException",
@@ -65,7 +66,7 @@ test("deleted fixture audits are retired only when every provider ID is attribut
   assert.ok(checked("TASKOWNER#task-a","MAP"));
   assert.ok(checks.some(x=>x.Key.pk==="SYNC_CONTROL#home:todoist:task-a"
     && x.ConditionExpression.includes("attribute_not_exists(activeRepair)")));
-  assert.equal(f.getQueries(),2);
+  assert.equal(f.getQueries(),15,"all-profile ownership, deletion-review, completion, and audit inventories are read");
 });
 
 test("transaction race preserves actionable conflict and all associated audit evidence",async()=>{
@@ -74,6 +75,58 @@ test("transaction race preserves actionable conflict and all associated audit ev
     {profile:"home",taskIds:["task-a"],eventIds:["event-a"]}),false);
   assert.equal(f.store.lastVerifiedDeletionBlocker,"case_revision_or_status_changed_retry_required");
   assert.ok(f.getTransaction().some(x=>x.Delete?.Key.pk==="AUDIT#home#new-safe"));
+});
+
+test("verified cleanup scrubs only exact provider identities from shared delivery receipts",async()=>{
+  const item={id:"receipt-case",profile:"home",status:"open",title:"Old conflict",reason:"deleted",
+    taskId:"task-a",eventId:"event-a",createdAt:"2026-10-25T00:00:00Z",updatedAt:"2026-10-25T00:00:01Z"};
+  const receipt={pk:"DELIVERY#receipt-1",sk:"COMPLETED",profile:"home",kind:"sync",completedAt:"2026-11-01T00:00:00Z",
+    expiresAt:1795000000,identityRefs:{taskIds:["task-a","other-task"],eventIds:["event-a","other-event"],seriesIds:["other-series"],generation:"g-1"}};
+  let transaction;
+  const store=new ReviewStore({send:async command=>{
+    if(command instanceof GetCommand)return {Item:command.input.Key.pk==="REVIEW_CASE#receipt-case"?item:undefined};
+    if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof ScanCommand)return {Items:[receipt]};
+    if(command instanceof TransactWriteCommand){transaction=command.input.TransactItems;return {};}
+    throw Error("unexpected delivery receipt fixture operation");
+  }});
+  assert.equal(await store.resolveVerifiedDeletedCase("receipt-case",{profile:"home",taskIds:["task-a"],eventIds:["event-a"]}),true);
+  const update=transaction.find(value=>value.Update?.Key.pk===receipt.pk)?.Update;
+  assert.ok(update);
+  assert.deepEqual(update.ExpressionAttributeValues[":newTasks"],["other-task"]);
+  assert.deepEqual(update.ExpressionAttributeValues[":newEvents"],["other-event"]);
+  assert.deepEqual(update.ExpressionAttributeValues[":newSeries"],["other-series"]);
+  assert.equal(update.ExpressionAttributeValues[":profile"],"home");
+  assert.match(update.ConditionExpression,/completedAt = :completedAt/);
+  assert.match(update.ConditionExpression,/contains\(#refs\.#tasks/);
+  assert.match(update.ConditionExpression,/contains\(#refs\.#events/);
+});
+
+test("stale task, event, and owner mapping rows retire atomically with verified case closure",async()=>{
+  const f=fixture();
+  const mapping={profile:"home",taskId:"task-a",eventId:"event-a",updatedAt:"2026-10-25T00:00:00Z",projectId:"test-home-project"};
+  assert.equal(await f.store.resolveVerifiedDeletedCase("review-a",{
+    profile:"home",taskIds:["task-a"],eventIds:["event-a"],staleMappings:[mapping],
+  }),true);
+  const ops=f.getTransaction(),keys=ops.filter(op=>op.Delete).map(op=>op.Delete.Key.pk);
+  for(const pk of ["TASK#home#task-a","EVENT#home#event-a","TASKOWNER#task-a"])assert.ok(keys.includes(pk),pk);
+  assert.ok(!ops.some(op=>op.ConditionCheck?.Key.pk==="TASKOWNER#task-a"));
+  assert.equal(ops.filter(op=>op.Delete?.Key.pk==="TASKOWNER#task-a").length,1);
+  for(const op of ops.filter(op=>op.Delete?.Key.pk?.startsWith("TASK#home#task-a")
+    ||op.Delete?.Key.pk?.startsWith("EVENT#home#event-a")||op.Delete?.Key.pk==="TASKOWNER#task-a"))
+    assert.match(op.Delete.ConditionExpression,/updatedAt = :updated/);
+});
+
+test("preflight inventories partial mapping indexes across every profile and rejects foreign ownership",async()=>{
+  const rows=new Map([
+    ["TASK#home#task-a",{profile:"home",taskId:"task-a",eventId:"event-a",updatedAt:"v1"}],
+    ["EVENT#home#event-a",{profile:"home",taskId:"task-a",eventId:"event-a",updatedAt:"v1"}],
+  ]);
+  const store=new ReviewStore({send:async command=>command instanceof GetCommand?{Item:rows.get(command.input.Key.pk)}:{}});
+  const found=await store.inventoryVerifiedDeletedMappings("home",["task-a"],["event-a"]);
+  assert.deepEqual(found.map(row=>row.pk).sort(),["EVENT#home#event-a","TASK#home#task-a"]);
+  rows.set("EVENT#work#event-a",{profile:"work",taskId:"task-a",eventId:"event-a",updatedAt:"v1"});
+  await assert.rejects(store.inventoryVerifiedDeletedMappings("home",["task-a"],["event-a"]),/cross_profile_or_foreign_task_mapping/);
 });
 
 test("verified deletion exposes a bounded transaction-size blocker without attempting partial cleanup",async()=>{
@@ -179,6 +232,7 @@ test("#292 legacy Work/antonio deleted recurrence closes a dismissed case with a
       return {};
     }
     if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof ScanCommand)return {Items:[]};
     if(command instanceof TransactWriteCommand){transaction=command.input.TransactItems;return {};}
     throw Error("unexpected read-only fixture operation");
   }});
@@ -216,6 +270,7 @@ test("#292 masterless stale link cannot retire without independent cancelled mas
   const store=new ReviewStore({send:async command=>{
     if(command instanceof GetCommand)return {Item:command.input.Key.pk==="REVIEW_CASE#"+caseId?caseItem:undefined};
     if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof ScanCommand)return {Items:[]};
     if(command instanceof TransactWriteCommand){writes++;return {};}
     throw Error("Unexpected operation");
   }});

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {GetCommand,QueryCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
+import {GetCommand,QueryCommand,ScanCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
 import {ReviewStore} from "../dist/review-store.js";
 
 const profile="home",parentId="home-deleted-pair",fingerprint="f".repeat(64);
@@ -42,6 +42,7 @@ function fixture({child=sibling("incident-closed"),other,invalidPointer=false,ra
       const key=command.input.ExpressionAttributeValues[":pk"];
       return {Items:key===prefix?points:[]};
     }
+    if(command instanceof ScanCommand)return{Items:[]};
     if(command instanceof TransactWriteCommand){
       tx=command.input.TransactItems;
       if(race)throw Object.assign(new Error("Concurrent claim"),{name:"TransactionCanceledException"});
@@ -68,7 +69,7 @@ test("#278 terminal deleted parent also retires exact coalesced child receipt, a
   assert.ok(pointerDelete);
   assert.match(pointerDelete.ConditionExpression,/incidentId = :id/);
   assert.equal(ops.filter(o=>o.Delete?.Key.pk==="AUDIT#home#incident-closed").length,1);
-  assert.equal(f.queries(),3,"one exact pointer query and two exact audit reverse index queries");
+  assert.equal(f.queries(),16,"all-profile deletion-review, audit, and completed-history inventories are bounded and exact");
   assert.ok(!ops.some(o=>o.Delete?.Key.pk?.startsWith("COMPLETED_")));
   const keys=ops.map(o=>o.Update?.Key||o.Delete?.Key||o.ConditionCheck?.Key||o.Put?.Item)
     .filter(Boolean).map(k=>k.pk+"|"+k.sk);
