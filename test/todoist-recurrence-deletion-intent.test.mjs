@@ -96,6 +96,51 @@ test("Todoist recurrence deletion queues Calendar deletion without a Slack appro
   }
 });
 
+test("auto cleanup of an already absent Calendar series removes exact state without posting an alert", async () => {
+  const originalSend=SQSClient.prototype.send;
+  const originalQueueUrl=process.env.QUEUE_URL;
+  const originalEnabled=process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
+  const sent=[];
+  SQSClient.prototype.send=async function(command){sent.push(command);return {};};
+  process.env.QUEUE_URL="https://sqs.eu-west-2.amazonaws.com/123456789012/test.fifo";
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED="true";
+  const decisions=new DecisionStore();
+  const notifier=new Notifier();
+  const operations=[];
+  const state={
+    async getMappingByTask(){return mapping;},
+    async syncBlocked(){return false;},
+    async mutationAllowed(){return true;},
+    async recordMutation(){},
+    async deleteMapping(){operations.push("mapping removed");},
+    async deleteRecurrenceLink(){operations.push("recurrence link removed");},
+    async audit(){},
+  };
+  const clients=async()=>({
+    todoist:{async getTask(){const error=new Error("not found");error.status=404;throw error;}},
+    calendar:{async deleteEvent(id){operations.push(`Calendar series ${id} checked`);const error=new Error("not found");error.status=404;throw error;}},
+  });
+  const policy={async resolve(_profile,_type,_seriesId,defaultMode){return {mode:defaultMode,source:"catalog"};}};
+  const service=new ManualInterventionService(decisions,notifier,clients,policy);
+  try{
+    await service.interceptTodoistDeletion({id:"todoist-delete-absent",kind:"todoist",profile:"antonio",mode:"aws",
+      receivedAt:"2026-10-25T00:00:00.000Z",headers:{},
+      body:JSON.stringify({event_name:"item:deleted",event_data:{id:"task-1",content:"Recurring item",is_deleted:true}})},state);
+    const delivery=JSON.parse(sent[0].input.MessageBody);
+    await service.processManualDelivery(delivery,state);
+    assert.deepEqual(operations,["Calendar series master-1 checked","mapping removed","recurrence link removed"]);
+    assert.equal(decisions.decisions.get(delivery.manual.decisionId).status,"resolved");
+    assert.equal(decisions.decisions.get(delivery.manual.decisionId).resolvedBySlackUserId,"AUTO_POLICY");
+    assert.equal(notifier.posted.length,0);
+    assert.equal(notifier.updated.length,0,"already-absent auto cleanup is recorded silently");
+  }finally{
+    SQSClient.prototype.send=originalSend;
+    if(originalQueueUrl===undefined)delete process.env.QUEUE_URL;else process.env.QUEUE_URL=originalQueueUrl;
+    if(originalEnabled===undefined)delete process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED;
+    else process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED=originalEnabled;
+  }
+});
+
 test("a failed Slack completion post does not fail the completed provider action", async () => {
   const originalSend = SSMClient.prototype.send;
   const originalFetch = globalThis.fetch;
