@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {GetCommand,PutCommand,QueryCommand,UpdateCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
+import {GetCommand,PutCommand,QueryCommand,ScanCommand,UpdateCommand,TransactWriteCommand} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "../dist/dynamodb-capacity.js";
 import {StateRepository} from "../dist/repository.js";
 import {SnapshotReconciler} from "../dist/reconciliation.js";
@@ -95,6 +95,7 @@ function fixture({masterStatus="cancelled",raceOwner=false,dismissed=false,
           && key.split("|")[1].startsWith(prefix)).map(([,row])=>row);
       return {Items:clone(items)};
     }
+    if(command instanceof ScanCommand)return {Items:[]};
     if(command instanceof PutCommand){
       const row=command.input.Item,key=k(row.pk,row.sk);
       const prior=rows.get(key);

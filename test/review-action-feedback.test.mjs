@@ -47,5 +47,6 @@ test("#478 inline success, loading and errors are case-scoped and accessible",()
  assert.match(ui,/currentRecheckFeedback&&<p[^>]+role="status" aria-live="polite"/);
  assert.match(ui,/currentCleanupFeedback&&<p[^>]+role="status" aria-live="polite"/);
  assert.match(ui,/Checking provider items…/);
- assert.match(ui,/Submitting reconciliation…/);
+ assert.match(ui,/Cleaning historic records…/);
+ assert.match(ui,/Clean up historic records/);
 });

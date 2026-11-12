@@ -27,6 +27,8 @@ import type { ReconciliationState } from "./repository.js";
 import { REVIEW_PROFILES, operationHasWriteEvidence, entityKey, type EntityRef, type ReviewCase, type ReviewSnapshot, type RepairIntent, type ReviewActor, type Side } from "./review-types.js";
 import { randomUUID } from "node:crypto";
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
+import { cleanVerifiedDeletedCase } from "./historical-cleanup.js";
+import { inspectErasureFence } from "./erasure-protocol.js";
 
 const REVIEW_ORIGIN = "https://calendar-sync.alf-broadcast.co.uk";
 type Claims = { email?: unknown; sub?: unknown; aud?: unknown };
@@ -184,6 +186,8 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   enqueueErasureRecovery?: typeof enqueueErasureRecovery;
   acquireWriteLease?: (selectedProfile:Profile,owner:string)=>Promise<()=>Promise<void>>;
   createReviewStore?:()=>ReviewStore;
+  cleanVerifiedDeletedCase?: typeof cleanVerifiedDeletedCase;
+  inspectErasureFence?:typeof inspectErasureFence;
   createOrphanApprovalService?:(store:ReviewStore)=>OrphanApprovalService;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
   createStateRepository?:()=>StateRepository;
@@ -258,6 +262,15 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
         writeProfiles.push(profile(body.profile));
       }
       for(const selectedProfile of [...new Set(writeProfiles)]) {
+        if(segments[0]==="cases"&&segments[2]==="historical-cleanup") {
+          const {fence}=await (dependencies.inspectErasureFence||inspectErasureFence)(selectedProfile);
+          if(fence?.state==="active") {
+            const operationId=typeof fence.operationId==="string"?fence.operationId:"unknown";
+            const operation=operationId!=="unknown"?await erasureStore().get(operationId):undefined;
+            return response(409,{error:"separate_erasure_fence_active",blocker:"separate_erasure_fence_active",
+              operationId,status:operation?.status||"active",recoveryUrl:"/review/#erasure-recovery"});
+          }
+        }
         const acquire=dependencies.acquireWriteLease || acquireProfileAdmissionLease;
         manualWriteLeases.push(await acquire(selectedProfile,admissionOwner));
       }
@@ -266,6 +279,28 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       if(method==="POST"&&process.env.ERASURE_PROTOCOL_VERSION==="1"&&!writeProfiles.includes(selectedProfile))
         fail(409,"The profile changed while this request was acquiring its admission lease; reload and retry");
     };
+
+    if(method==="GET"&&segments[0]==="cases"&&segments[2]==="historical-cleanup"&&segments.length===3){
+      const item=await store.getCase(segments[1]);
+      if(!item)return response(404,{error:"conflict_not_found"});
+      const checkpoint=await store.getHistoricalCleanupCheckpoint(item.id);
+      return response(200,{caseId:item.id,profile:item.profile,status:checkpoint?.status||"idle",
+        phase:checkpoint?.phase||"checking_providers",updatedAt:checkpoint?.updatedAt});
+    }
+
+    if(method==="POST"&&segments[0]==="cases"&&segments[2]==="historical-cleanup"&&segments.length===3) {
+      if(Object.keys(body||{}).length)fail(400,"Historical cleanup accepts no request fields");
+      const idempotencyKey=requestHeader(event,"idempotency-key")||"";
+      if(!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey))fail(400,"A valid Idempotency-Key header is required");
+      const item=await store.getCase(segments[1]);
+      if(!item)return response(404,{error:"conflict_not_found"});
+      requireAdmissionProfile(item.profile);
+      const engine=dependencies.createReviewEngine?.(store)||new ReviewEngine(store);
+      const cleanup=dependencies.cleanVerifiedDeletedCase||cleanVerifiedDeletedCase;
+      const result=await cleanup({item,store,engine,idempotencyKey});
+      return response(result.status==="complete"?200:409,result.status==="complete"?{result}
+        :{error:result.blocker||"historical_cleanup_blocked",blocker:result.blocker,phase:result.phase,result});
+    }
 
     // Post-write inspection is read-only. The existing worker watchdog owns
     // automatic completion; no per-operation review token or mutating route exists.

@@ -31,7 +31,7 @@ test("#428 opening Home alert in all-profiles inbox does not drop Work or Antoni
 
 test("#428 hides zero-diagnostic panels but preserves pagination and retirement tools",()=>{
   assert.match(main,/view\.diagnostics\.some\(\(item:any\)=>history\|\|item\.caseStatus!=="retired"\)\|\|Boolean\(view\.cursor\)/);
-  assert.match(main,/<details className="preview history-tools">/);
+  assert.match(main,/<details className="preview history-tools" id="erasure-recovery">/);
   assert.match(main,/<RetirementHistory key=\{runProfile\}/);
   assert.match(main,/<ErasureRecoveryPanel api=\{api\}/);
   assert.match(main,/<details className="run-technical">/);

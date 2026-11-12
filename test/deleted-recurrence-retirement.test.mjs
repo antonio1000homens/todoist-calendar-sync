@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 import { StateRepository } from "../dist/repository.js";
 import { ReviewStore, reviewHash } from "../dist/review-store.js";
@@ -77,6 +77,7 @@ test("verified deletion resolves only exact open case, tombstones pending decisi
   let tx;
   const review=new ReviewStore({send:async(command)=>{
     if(command instanceof QueryCommand)return {Items:[]};
+    if(command instanceof ScanCommand)return {Items:[]};
     if(command instanceof GetCommand){
       if(command.input.Key.pk==="REVIEW_CASE#"+id)return {Item:current};
       if(command.input.Key.pk==="MANUAL#"+id)return {Item:manual};

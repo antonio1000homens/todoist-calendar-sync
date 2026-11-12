@@ -103,7 +103,9 @@ test("#278 review API refresh and UI use same non-mutating evidence, with no rep
   assert.match(ui,/<OrphanDeletionPanel/);
   assert.match(ui,/\(hasProviderIds\|\|hasLiveIdentity\)&&<div className="preview">/);
   assert.match(ui,/One-sided deletion — no automatic purge/);
-  assert.match(ui,/Retry guarded cleanup for this alert via/);
+  assert.match(api,/historical-cleanup/);
+  assert.match(ui,/Clean up historic records/);
+  assert.doesNotMatch(ui,/Retry guarded cleanup for this alert via/);
   assert.match(ui,/Recheck this alert&apos;s provider items \(read-only\)/);
   assert.match(ui,/Resolved — verified deletion \/ stale state retired/);
 });

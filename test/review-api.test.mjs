@@ -97,6 +97,22 @@ test("all review, reconciliation, and erasure writers hold the profile admission
   assert.equal(casePreview.status,200);assert.equal(active.size,0);fenceAfterRelease();
   const dismissed=await jsonResponse(await handler(event("/review/api/cases/case-lease/dismiss","POST",headers,{}),deps));
   assert.equal(dismissed.status,200);assert.equal(active.size,0);fenceAfterRelease();
+  let cleanupCalls=0;
+  deps.inspectErasureFence=async selected=>{assert.equal(selected,"home");return {fence:undefined,leases:[]};};
+  deps.cleanVerifiedDeletedCase=async({item,idempotencyKey})=>{
+    assert.ok(active.has(item.profile),"case cleanup runs inside its profile admission lease");
+    assert.equal(idempotencyKey,"historic-cleanup-test");cleanupCalls++;
+    return {status:"complete",phase:"verified_complete",deletedComments:1,unlinkedEvents:0};
+  };
+  const cleaned=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-test"},{}),deps));
+  assert.equal(cleaned.status,200);assert.equal(cleanupCalls,1);assert.equal(active.size,0);fenceAfterRelease();
+  deps.inspectErasureFence=async()=>({fence:{state:"active",operationId:"unknown"},leases:[]});
+  const fenced=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-test-2"},{}),deps));
+  assert.equal(fenced.status,409);assert.equal(fenced.body.blocker,"separate_erasure_fence_active");
+  assert.equal(fenced.body.recoveryUrl,"/review/#erasure-recovery");assert.equal(cleanupCalls,1);assert.equal(active.size,0);fenceAfterRelease();
+  delete deps.inspectErasureFence;delete deps.cleanVerifiedDeletedCase;
   let caseLookups=0,dismissWrites=0;
   store.getCase=async()=>++caseLookups===1?caseItem:{...caseItem,profile:"work"};
   store.dismissCase=async()=>{dismissWrites++;return {...caseItem,status:"dismissed"};};

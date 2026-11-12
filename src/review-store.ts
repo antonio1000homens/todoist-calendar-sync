@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { GetCommand, PutCommand, QueryCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { CalendarEvent, Profile, RecurrenceLink } from "./types.js";
+import type { CalendarEvent, Mapping, Profile, RecurrenceLink } from "./types.js";
 import { verifyCancelledSeries } from "./verified-deletion.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
@@ -134,6 +134,51 @@ export async function assertRepairPreviewReplayAdmission(preview: RepairPreview,
 export class ReviewStore {
   /** Safe, case-scoped reason from the most recent verified-deletion attempt. */
   lastVerifiedDeletionBlocker?: string;
+  async getHistoricalCleanupCheckpoint(caseId:string):Promise<Record<string,unknown>|undefined>{
+    return (await this.db.send(new GetCommand({TableName:reviewTable(),Key:{pk:`HISTORICAL_CLEANUP#${caseId}`,sk:"OP"},ConsistentRead:true}))).Item as Record<string,unknown>|undefined;
+  }
+  async inventoryVerifiedDeletedMappings(profile:Profile,taskIds:string[],eventIds:string[]):Promise<Array<{
+    pk:string;sk:string;profile:Profile;taskId:string;eventId:string;updatedAt:string;
+  }>>{
+    const candidates:Profile[]=["home","antonio","work"],rows:Array<{pk:string;sk:string;profile:Profile;taskId:string;eventId:string;updatedAt:string}>=[];
+    const keys=new Map<string,{pk:string;sk:string}>();
+    for(const taskId of taskIds){
+      for(const candidate of candidates)keys.set(`TASK#${candidate}#${taskId}|MAP`,{pk:`TASK#${candidate}#${taskId}`,sk:"MAP"});
+      keys.set(`TASKOWNER#${taskId}|MAP`,{pk:`TASKOWNER#${taskId}`,sk:"MAP"});
+    }
+    for(const eventId of eventIds)for(const candidate of candidates)
+      keys.set(`EVENT#${candidate}#${eventId}|MAP`,{pk:`EVENT#${candidate}#${eventId}`,sk:"MAP"});
+    for(const keyValue of keys.values()){
+      const result=await this.db.send(new GetCommand({TableName:reviewTable(),Key:keyValue,ConsistentRead:true}));
+      const row=result.Item as Record<string,unknown>|undefined;if(!row)continue;
+      const taskId=typeof row.taskId==="string"?row.taskId:"",eventId=typeof row.eventId==="string"?row.eventId:"";
+      if(![...taskIds].includes(taskId)||!eventIds.includes(eventId)||row.profile!==profile
+        ||typeof row.updatedAt!=="string")throw new Error("cross_profile_or_foreign_task_mapping");
+      rows.push({...keyValue,profile,taskId,eventId,updatedAt:row.updatedAt});
+    }
+    return rows;
+  }
+  /** Durable per-case progress with a short lease; retries resume only the same exact identity set. */
+  async saveHistoricalCleanupCheckpoint(input:{caseId:string;profile:Profile;fingerprint:string;owner:string;
+    patch:Record<string,unknown>;release?:boolean}):Promise<boolean>{
+    const pk=`HISTORICAL_CLEANUP#${input.caseId}`;
+    const now=Date.now();
+    const current=(await this.db.send(new GetCommand({TableName:reviewTable(),Key:{pk,sk:"OP"},ConsistentRead:true}))).Item as Record<string,unknown>|undefined;
+    if(current?.fingerprint!==undefined&&current.fingerprint!==input.fingerprint)return false;
+    if(current?.status==="complete")return true;
+    if(current&&typeof current.leaseUntil==="number"&&current.leaseUntil>now&&current.leaseOwner!==input.owner)return false;
+    const updatedAt=new Date(now).toISOString();
+    const next={...(current||{}),pk,sk:"OP",caseId:input.caseId,profile:input.profile,fingerprint:input.fingerprint,
+      ...input.patch,leaseOwner:input.owner,leaseUntil:input.release?0:now+120_000,updatedAt,
+      expiresAt:Math.floor(now/1000)+90*86400};
+    try{
+      await this.db.send(new PutCommand({TableName:reviewTable(),Item:next,
+        ...(current?{ConditionExpression:"updatedAt = :version AND fingerprint = :fingerprint AND (attribute_not_exists(leaseUntil) OR leaseUntil <= :now OR leaseOwner = :owner)",
+          ExpressionAttributeValues:{":version":current.updatedAt,":fingerprint":input.fingerprint,":now":now,":owner":input.owner}}
+          :{ConditionExpression:"attribute_not_exists(pk)"})}));
+      return true;
+    }catch(error){if(conditional(error)||(error as {name?:string}).name==="TransactionCanceledException")return false;throw error;}
+  }
   constructor(private readonly db: Pick<typeof client, "send"> = client) {}
   async get<T>(pk: string): Promise<T | undefined> {
     return (await this.db.send(new GetCommand({ TableName: reviewTable(), Key: key(pk), ConsistentRead: true }))).Item as T | undefined;
@@ -483,6 +528,9 @@ export class ReviewStore {
     caseId: string,
     expected: {
       profile: Profile; taskIds: string[]; eventIds: string[];
+      staleMappings?: Mapping[];
+      staleMappingRows?:Array<{pk:string;sk:string;profile:Profile;taskId:string;eventId:string;updatedAt:string}>;
+      dryRun?:boolean;
       staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
       masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
       /** Direct provider readbacks for legacy decisions without masterEventId. */
@@ -491,6 +539,7 @@ export class ReviewStore {
   ): Promise<boolean> {
     this.lastVerifiedDeletionBlocker = undefined;
     const blocked = (reason: string): false => { this.lastVerifiedDeletionBlocker = reason; return false; };
+    const cleanupProfiles: Profile[] = ["home", "antonio", "work"];
     const current = await this.getCase(caseId);
     if (!current || current.profile !== expected.profile || !["open", "dismissed"].includes(current.status)
       || current.operationId || current.result?.startsWith("resolved_deleted")) return blocked("case_status_revision_or_operation_changed");
@@ -572,6 +621,25 @@ export class ReviewStore {
         || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return blocked("recurrence_link_ownership_or_revision_changed");
       seenLinks.add(identity);
     }
+    const staleMappings=expected.staleMappings||[];
+    const mappingKeys=new Set<string>(),mappingTasks=new Set<string>();
+    for(const mapping of staleMappings){
+      const identity=`${mapping.profile}/${mapping.taskId}/${mapping.eventId}`;
+      if(mappingKeys.has(identity)||mappingTasks.has(mapping.taskId)||mapping.profile!==expected.profile||!expected.taskIds.includes(mapping.taskId)
+        ||!expected.eventIds.includes(mapping.eventId)||!mapping.updatedAt)
+        return blocked("stale_mapping_identity_or_revision_changed");
+      mappingKeys.add(identity);mappingTasks.add(mapping.taskId);
+    }
+    const staleMappingRows=expected.staleMappingRows||[],mappingDeleteKeys=new Set<string>();
+    for(const row of staleMappingRows){
+      const exactKey=row.pk===`TASK#${expected.profile}#${row.taskId}`&&row.sk==="MAP"
+        ||row.pk===`EVENT#${expected.profile}#${row.eventId}`&&row.sk==="MAP"
+        ||row.pk===`TASKOWNER#${row.taskId}`&&row.sk==="MAP";
+      const keyId=`${row.pk}|${row.sk}`;
+      if(!exactKey||mappingDeleteKeys.has(keyId)||row.profile!==expected.profile||!expected.taskIds.includes(row.taskId)
+        ||!expected.eventIds.includes(row.eventId)||!row.updatedAt)return blocked("stale_mapping_identity_or_revision_changed");
+      mappingDeleteKeys.add(keyId);
+    }
     const now = new Date().toISOString();
     const resolution = "resolved_deleted: both provider objects verified absent; stale conflict retired";
     const items: ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"] = [
@@ -591,6 +659,26 @@ export class ReviewStore {
       ExpressionAttributeValues: { ":old": manual.status, ":resolved": "resolved", ":profile": expected.profile,
         ":id": caseId, ":createdAt": manual.createdAt, ":result": resolution, ":now": now },
     } });
+    // Retire only a mapping whose exact task/event pair is in this case and
+    // whose version is unchanged. All three lookup rows are deleted in the
+    // same transaction as terminal case closure.
+    for(const row of staleMappingRows){
+      const values={":profile":row.profile,":task":row.taskId,":event":row.eventId,":updated":row.updatedAt};
+      items.push({Delete:{TableName:reviewTable(),Key:{pk:row.pk,sk:row.sk},
+        ConditionExpression:"#profile = :profile AND #task = :task AND #event = :event AND updatedAt = :updated",
+        ExpressionAttributeNames:{"#profile":"profile","#task":"taskId","#event":"eventId"},ExpressionAttributeValues:values}});
+    }
+    if(!expected.staleMappingRows)for(const mapping of staleMappings){
+      const values={":profile":mapping.profile,":task":mapping.taskId,":event":mapping.eventId,":updated":mapping.updatedAt};
+      const names={"#profile":"profile","#task":"taskId","#event":"eventId"};
+      const condition="#profile = :profile AND #task = :task AND #event = :event AND updatedAt = :updated";
+      items.push({Delete:{TableName:reviewTable(),Key:{pk:`TASK#${mapping.profile}#${mapping.taskId}`,sk:"MAP"},
+        ConditionExpression:condition,ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
+      items.push({Delete:{TableName:reviewTable(),Key:{pk:`EVENT#${mapping.profile}#${mapping.eventId}`,sk:"MAP"},
+        ConditionExpression:condition,ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
+      items.push({Delete:{TableName:reviewTable(),Key:{pk:`TASKOWNER#${mapping.taskId}`,sk:"MAP"},
+        ConditionExpression:condition,ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
+    }
     // Retire the stale active link inside the same transaction as the case and
     // pending manual decision. All identity/ownership/version fields are CAS
     // fenced; a revived or re-owned series cancels the entire operation.
@@ -620,6 +708,19 @@ export class ReviewStore {
       ...expected.taskIds.map(id => ({ side: "todoist", id })),
       ...expected.eventIds.map(id => ({ side: "calendar", id })),
     ];
+    for(const ref of refs)for(const candidateProfile of cleanupProfiles){
+      const pk=`DELETION_REVIEW#${candidateProfile}#${ref.side}#${ref.id}`;
+      const page=await this.db.send(new QueryCommand({TableName:reviewTable(),ConsistentRead:true,Limit:50,
+        KeyConditionExpression:"pk = :pk AND begins_with(sk, :prefix)",
+        ExpressionAttributeValues:{":pk":pk,":prefix":"CASE#"}}));
+      if(page.LastEvaluatedKey)return blocked("deletion_review_guard_inventory_over_limit");
+      for(const row of page.Items||[]){
+        if(typeof row.sk!=="string"||!row.sk.startsWith("CASE#")||typeof row.caseId!=="string")
+          return blocked("deletion_review_guard_identity_inconsistent");
+        if(candidateProfile!==expected.profile||row.caseId!==caseId)
+          return blocked("another_review_case_owns_verified_identity");
+      }
+    }
     for (const ref of refs) items.push({ Delete: { TableName: reviewTable(),
       Key: { pk: `DELETION_REVIEW#${expected.profile}#${ref.side}#${ref.id}`,
         sk: `CASE#${caseId}` },
@@ -725,6 +826,106 @@ export class ReviewStore {
         }
       }
     }
+    // Delivery receipts are shared replay evidence and have no reverse GSI.
+    // Enumerate them strongly and scrub only exact verified-deleted IDs while
+    // retaining receipt identity, expiry, idempotency data, and unrelated refs.
+    let receiptCursor:Record<string,unknown>|undefined,receiptPages=0,receiptRows=0;
+    const targetTaskIds=new Set(expected.taskIds),targetEventIds=new Set(expected.eventIds),targetSeriesIds=new Set(seriesKeys);
+    do{
+      const page=await this.db.send(new ScanCommand({TableName:reviewTable(),ConsistentRead:true,Limit:1000,
+        ...(receiptCursor?{ExclusiveStartKey:receiptCursor}:{})}));
+      receiptPages++;receiptRows+=(page.Items||[]).length;
+      if(receiptPages>100||receiptRows>100_000)return blocked("delivery_receipt_inventory_over_limit");
+      for(const raw of page.Items||[]){
+        const row=raw as Record<string,unknown>,refs=row.identityRefs as Record<string,unknown>|undefined;
+        if(typeof row.pk!=="string"||!row.pk.startsWith("DELIVERY#")||row.sk!=="COMPLETED"||!refs)continue;
+        const tasks=refs.taskIds,events=refs.eventIds,series=refs.seriesIds;
+        if(!Array.isArray(tasks)&&!Array.isArray(events)&&!Array.isArray(series))continue;
+        const arrays=[tasks,events,series].filter(Array.isArray) as unknown[][];
+        if(arrays.some(list=>list.some(id=>typeof id!=="string")||new Set(list).size!==list.length))
+          return blocked("delivery_receipt_identity_inventory_malformed");
+        const touches=(tasks as unknown[]|undefined)?.some(id=>targetTaskIds.has(id as string))
+          ||(events as unknown[]|undefined)?.some(id=>targetEventIds.has(id as string))
+          ||(series as unknown[]|undefined)?.some(id=>targetSeriesIds.has(id as string));
+        if(!touches)continue;
+        if(row.profile!==expected.profile)return blocked("cross_profile_delivery_receipt_identity_reference");
+        if(typeof row.profile!=="string"||typeof row.kind!=="string"||typeof row.completedAt!=="string"
+          ||typeof row.expiresAt!=="number")return blocked("delivery_receipt_identity_owner_or_version_incomplete");
+        const nextRefs={...refs,
+          ...(Array.isArray(tasks)?{taskIds:tasks.filter(id=>!targetTaskIds.has(id as string))}:{}),
+          ...(Array.isArray(events)?{eventIds:events.filter(id=>!targetEventIds.has(id as string))}:{}),
+          ...(Array.isArray(series)?{seriesIds:series.filter(id=>!targetSeriesIds.has(id as string))}:{})};
+        if(!Array.isArray(tasks)||!Array.isArray(events))return blocked("delivery_receipt_identity_owner_or_version_incomplete");
+        const names:Record<string,string>={"#refs":"identityRefs","#tasks":"taskIds","#events":"eventIds",
+          "#profile":"profile","#kind":"kind"};
+        const values:Record<string,unknown>={":profile":row.profile,":kind":row.kind,":completedAt":row.completedAt,
+          ":expiresAt":row.expiresAt,":taskCount":Array.isArray(tasks)?tasks.length:0,":eventCount":Array.isArray(events)?events.length:0,
+          ":newTasks":nextRefs.taskIds??[],":newEvents":nextRefs.eventIds??[]};
+        const conditions=["#profile = :profile","#kind = :kind","completedAt = :completedAt","expiresAt = :expiresAt",
+          "size(#refs.#tasks) = :taskCount","size(#refs.#events) = :eventCount"];
+        const expressions=["#refs.#tasks = :newTasks","#refs.#events = :newEvents"];
+        for(const[id,index]of (tasks as string[]).map((id,index)=>[id,index] as const))if(targetTaskIds.has(id)){
+          const token=`:receiptTask${index}`;conditions.push(`contains(#refs.#tasks, ${token})`);values[token]=id;
+        }
+        for(const[id,index]of (events as string[]).map((id,index)=>[id,index] as const))if(targetEventIds.has(id)){
+          const token=`:receiptEvent${index}`;conditions.push(`contains(#refs.#events, ${token})`);values[token]=id;
+        }
+        if(Array.isArray(series)){
+          names["#series"]="seriesIds";values[":seriesCount"]=series.length;values[":newSeries"]=nextRefs.seriesIds;
+          conditions.push("size(#refs.#series) = :seriesCount");expressions.push("#refs.#series = :newSeries");
+          for(const[id,index]of (series as string[]).map((id,index)=>[id,index] as const))if(targetSeriesIds.has(id)){
+            const token=`:receiptSeries${index}`;conditions.push(`contains(#refs.#series, ${token})`);values[token]=id;
+          }
+        }
+        items.push({Update:{TableName:reviewTable(),Key:{pk:row.pk,sk:"COMPLETED"},
+          UpdateExpression:`SET ${expressions.join(", ")}`,
+          ConditionExpression:conditions.join(" AND "),ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
+        if(items.length>95)return blocked("transaction_item_limit_exceeded");
+      }
+      receiptCursor=page.LastEvaluatedKey as Record<string,unknown>|undefined;
+    }while(receiptCursor);
+    // Keep the seven-day completion lifecycle. After that window, retire only
+    // exact task/event projection rows in this verified pair; terminal series
+    // certificates remain as immutable replay guards.
+    const completedCutoff=Date.now()-7*86400_000,completedSeen=new Set<string>();
+    for(const eventId of expected.eventIds)for(const candidateProfile of cleanupProfiles){
+      const result=await this.db.send(new GetCommand({TableName:reviewTable(),Key:key(`COMPLETED_EVENT#${candidateProfile}#${eventId}`),ConsistentRead:true}));
+      const row=result.Item as Record<string,unknown>|undefined;
+      if(!row)continue;
+      if(row.profile!==candidateProfile||row.eventId!==eventId||typeof row.taskId!=="string")return blocked("completed_history_identity_inconsistent");
+      if(candidateProfile!==expected.profile||!expected.taskIds.includes(row.taskId))return blocked("completed_history_has_foreign_owner");
+      const completedAt=typeof row.completedAt==="string"?Date.parse(row.completedAt):NaN;
+      if(!Number.isFinite(completedAt)||completedAt>completedCutoff)return blocked("completed_task_seven_day_guard_active");
+      const pk=`COMPLETED_EVENT#${candidateProfile}#${eventId}`;
+      if(!completedSeen.has(pk))items.push({Delete:{TableName:reviewTable(),Key:key(pk),
+        ConditionExpression:"profile = :profile AND taskId = :task AND eventId = :event AND completedAt = :completedAt",
+        ExpressionAttributeValues:{":profile":candidateProfile,":task":row.taskId,":event":eventId,":completedAt":row.completedAt}}});
+      completedSeen.add(pk);
+    }
+    for(const taskId of expected.taskIds)for(const candidateProfile of cleanupProfiles){
+      let cursor:Record<string,unknown>|undefined,pages=0;
+      do{
+        const page=await this.db.send(new QueryCommand({TableName:reviewTable(),ConsistentRead:true,Limit:100,
+          KeyConditionExpression:"pk = :pk AND begins_with(sk, :prefix)",ExpressionAttributeValues:{":pk":`COMPLETED_TASK#${candidateProfile}#${taskId}`,":prefix":"EVENT#"},
+          ...(cursor?{ExclusiveStartKey:cursor}:{})}));
+        pages++;if(pages>20)return blocked("completed_history_inventory_over_limit");
+        for(const raw of page.Items||[]){
+          const row=raw as Record<string,unknown>,eventId=typeof row.eventId==="string"?row.eventId:undefined;
+          if(!eventId||!expected.eventIds.includes(eventId))continue;
+          if(row.profile!==candidateProfile||row.taskId!==taskId)return blocked("completed_history_identity_inconsistent");
+          if(candidateProfile!==expected.profile)return blocked("completed_history_has_foreign_owner");
+          const completedAt=typeof row.completedAt==="string"?Date.parse(row.completedAt):NaN;
+          if(!Number.isFinite(completedAt)||completedAt>completedCutoff)return blocked("completed_task_seven_day_guard_active");
+          const pk=`COMPLETED_TASK#${candidateProfile}#${taskId}`,sk=typeof row.sk==="string"?row.sk:`EVENT#${eventId}`;
+          const unique=`${pk}|${sk}`;
+          if(!completedSeen.has(unique))items.push({Delete:{TableName:reviewTable(),Key:{pk,sk},
+            ConditionExpression:"profile = :profile AND taskId = :task AND eventId = :event AND completedAt = :completedAt",
+            ExpressionAttributeValues:{":profile":candidateProfile,":task":taskId,":event":eventId,":completedAt":row.completedAt}}});
+          completedSeen.add(unique);
+        }
+        cursor=page.LastEvaluatedKey as Record<string,unknown>|undefined;
+      }while(cursor);
+    }
     // Retire only canonical identity and reconciliation baseline snapshots
     // scoped to the fully absent provider IDs. Every delete is version-fenced:
     // a concurrent new provider identity or repair aborts the whole transaction
@@ -733,13 +934,13 @@ export class ReviewStore {
       ...expected.taskIds.map(id => ({ side: "todoist", id })),
       ...expected.eventIds.map(id => ({ side: "calendar", id })),
     ];
-    for (const ref of canonicalRefs) {
-      const pk = `CANONICAL#${expected.profile}#${ref.side}#${ref.id}`;
+    for (const ref of canonicalRefs) for(const candidateProfile of cleanupProfiles) {
+      const pk = `CANONICAL#${candidateProfile}#${ref.side}#${ref.id}`;
       const currentIdentity = await this.get<Record<string, unknown>>(pk);
       if (!currentIdentity) continue;
-      if (currentIdentity.profile !== expected.profile || currentIdentity.side !== ref.side
+      if (candidateProfile!==expected.profile||currentIdentity.profile !== expected.profile || currentIdentity.side !== ref.side
         || currentIdentity.providerId !== ref.id
-        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return blocked("canonical_identity_record_inconsistent");
+        || typeof currentIdentity.updatedAt !== "string" || !currentIdentity.identity) return blocked("canonical_identity_record_inconsistent_or_foreign");
       items.push({ Delete: { TableName: reviewTable(), Key: key(pk),
         ConditionExpression: "#profile = :profile AND #side = :side AND providerId = :id AND updatedAt = :updated AND #identity = :identity",
         ExpressionAttributeNames: { "#profile": "profile", "#side": "side", "#identity": "identity" },
@@ -748,6 +949,10 @@ export class ReviewStore {
       } });
     }
     for (const taskId of expected.taskIds) {
+      for(const candidateProfile of ["home","antonio","work"] as Profile[])if(candidateProfile!==expected.profile){
+        const foreign=(await this.db.send(new GetCommand({TableName:reviewTable(),Key:{pk:`BASELINE#${candidateProfile}#TASK#${taskId}`,sk:"RECONCILE"},ConsistentRead:true}))).Item;
+        if(foreign)return blocked("cross_profile_reconciliation_baseline_reference");
+      }
       const baselineKey = { pk: `BASELINE#${expected.profile}#TASK#${taskId}`, sk: "RECONCILE" };
       const currentBaseline = (await this.db.send(new GetCommand({
         TableName: reviewTable(), Key: baselineKey, ConsistentRead: true,
@@ -765,10 +970,10 @@ export class ReviewStore {
     // recorded provider IDs are within this verified-deleted fixture.
     const auditDeletes = new Set(items.filter(x => x.Delete)
       .map(x => x.Delete?.Key?.pk).filter((value): value is string => typeof value === "string"));
-    const referenceKeys = [
-      ...expected.taskIds.map(id => `AUDIT_REF#${expected.profile}#todoist#${id}`),
-      ...expected.eventIds.map(id => `AUDIT_REF#${expected.profile}#calendar#${id}`),
-    ];
+    const referenceKeys = cleanupProfiles.flatMap(candidate=>[
+      ...expected.taskIds.map(id => `AUDIT_REF#${candidate}#todoist#${id}`),
+      ...expected.eventIds.map(id => `AUDIT_REF#${candidate}#calendar#${id}`),
+    ]);
     const referencedAudits = new Map<string, Record<string, unknown>>();
     const auditPointers = new Map<string, { key: { pk: string; sk: string }; auditKey: string }>();
     for (const pk of referenceKeys) {
@@ -778,8 +983,9 @@ export class ReviewStore {
         ConsistentRead: true, Limit: 50 }));
       if (page.LastEvaluatedKey) return blocked("audit_pointer_inventory_exceeds_safe_bound"); // no partially attributed cleanup
       for (const row of page.Items || []) {
-        if (typeof row.auditKey !== "string" || !row.auditKey.startsWith(`AUDIT#${expected.profile}#`)
-          || typeof row.sk !== "string") continue;
+        if(typeof row.auditKey!=="string"||typeof row.sk!=="string")return blocked("audit_pointer_identity_incomplete");
+        if(!pk.startsWith(`AUDIT_REF#${expected.profile}#`))return blocked("cross_profile_audit_identity_reference");
+        if(!row.auditKey.startsWith(`AUDIT#${expected.profile}#`))return blocked("audit_pointer_owner_mismatch");
         const pointerKey = { pk, sk: row.sk };
         auditPointers.set(`${pk}|${row.sk}`, { key: pointerKey, auditKey: row.auditKey });
         if (!referencedAudits.has(row.auditKey)) {
@@ -819,27 +1025,28 @@ export class ReviewStore {
     // DynamoDB ownership and repair/completion indexes in the SAME atomic
     // transaction as the terminal case update. A concurrent sync or repair
     // that claims any verified identity must cancel the entire retirement.
-    const profiles: Profile[] = ["home", "antonio", "work"];
     const absence = new Map<string, { pk: string; sk: string }>();
     const checkAbsent = (pk: string, sk = "MAP"): void => {
       absence.set(`${pk}|${sk}`, { pk, sk });
     };
     for (const taskId of expected.taskIds) {
-      checkAbsent(`TASKOWNER#${taskId}`);
-      for (const candidateProfile of profiles) {
-        checkAbsent(`TASK#${candidateProfile}#${taskId}`);
+      if(!mappingDeleteKeys.has(`TASKOWNER#${taskId}|MAP`)&&!staleMappings.some(mapping=>mapping.taskId===taskId))checkAbsent(`TASKOWNER#${taskId}`);
+      for (const candidateProfile of cleanupProfiles) {
+        if(!mappingDeleteKeys.has(`TASK#${candidateProfile}#${taskId}|MAP`)
+          &&!staleMappings.some(mapping=>mapping.profile===candidateProfile&&mapping.taskId===taskId))checkAbsent(`TASK#${candidateProfile}#${taskId}`);
         // Every recurrence identity is fenced together below, including
         // the Calendar iCalUID key rather than only task-ID keys.
       }
     }
     for (const eventId of expected.eventIds) {
-      for (const candidateProfile of profiles) {
-        checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
+      for (const candidateProfile of cleanupProfiles) {
+        if(!mappingDeleteKeys.has(`EVENT#${candidateProfile}#${eventId}|MAP`)
+          &&!staleMappings.some(mapping=>mapping.profile===candidateProfile&&mapping.eventId===eventId))checkAbsent(`EVENT#${candidateProfile}#${eventId}`);
         // Completed task/event projections remain untouched and are not
         // considered live ownership of a deleted recurrence.
       }
     }
-    for (const seriesId of seriesKeys) for (const candidateProfile of profiles) {
+    for (const seriesId of seriesKeys) for (const candidateProfile of cleanupProfiles) {
       checkAbsent(`RECURRENCE#${candidateProfile}#${seriesId}`, "STATE");
     }
     // Never ConditionCheck a key that is also deleted in this transaction.
@@ -860,6 +1067,7 @@ export class ReviewStore {
       } });
     }
     if (items.length > 95) return blocked("transaction_item_limit_exceeded"); // leave open for safe bounded retry
+    if(expected.dryRun)return true;
     try {
       await this.db.send(new TransactWriteCommand({ TransactItems: items }));
       return true;
