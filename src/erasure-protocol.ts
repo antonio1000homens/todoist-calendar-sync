@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { DeleteCommand, GetCommand, QueryCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
+import {scopedGrantsAsLeases} from "./scoped-erasure-admission.js";
 
 function table(): string {
   if (!process.env.STATE_TABLE_NAME) throw new Error("STATE_TABLE_NAME is required");
@@ -115,12 +116,12 @@ export async function beginErasureFence(profile: Profile, operationId: string): 
   }
 }
 
-export async function inspectErasureFence(profile: Profile): Promise<{ fence?: Record<string, unknown>; leases: Record<string, unknown>[] }> {
+export async function inspectErasureFence(profile: Profile,db:Pick<typeof documentClient,"send">=documentClient): Promise<{ fence?: Record<string, unknown>; leases: Record<string, unknown>[] }> {
   const key = fenceKey(profile);
   const rows: Record<string, unknown>[] = [];
   let cursor: Record<string, unknown> | undefined;
   do {
-    const result = await documentClient.send(new QueryCommand({
+    const result = await db.send(new QueryCommand({
       TableName: table(), KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": key.pk },
       ConsistentRead: true, ExclusiveStartKey: cursor,
     }));
@@ -129,17 +130,17 @@ export async function inspectErasureFence(profile: Profile): Promise<{ fence?: R
   } while (cursor);
   return {
     fence: rows.find((item) => item.sk === key.sk),
-    leases: rows.filter((item) => typeof item.sk === "string" && ![key.sk, "JOURNAL", "EPOCH"].includes(item.sk)) as Record<string, unknown>[],
+    leases: [
+      ...rows.filter((item) => typeof item.sk === "string"
+        && ![key.sk, "JOURNAL", "EPOCH", "SCOPED_ADMISSION"].includes(item.sk)) as Record<string, unknown>[],
+      ...scopedGrantsAsLeases(rows.find(item=>item.sk==="SCOPED_ADMISSION")),
+    ],
   };
 }
 
 /** Remove only the matching temporary fence after purge postconditions pass. */
 export async function finishErasureFence(profile: Profile, operationId: string): Promise<void> {
-  const key = fenceKey(profile);
-  await documentClient.send(new DeleteCommand({
-    TableName: table(), Key: key, ConditionExpression: "operationId = :operationId",
-    ExpressionAttributeValues: { ":operationId": operationId },
-  }));
+  await releaseFenceAtomically(profile,operationId);
 }
 
 /** Atomically remove the temporary fence and identity-bearing journal on success. */
@@ -151,9 +152,30 @@ export async function finishErasureProtocol(
   const { fence, leases } = await inspectErasureFence(profile);
   if (fence?.operationId !== operationId) throw new Error("The profile fence is not owned by this erasure operation");
   if (leases.length) throw new Error(`Erasure is not drained: ${leases.length} admission or writer lease(s) remain`);
-  await documentClient.send(new TransactWriteCommand({ TransactItems: [
-    { Delete: { TableName: table(), Key: fenceKey(profile), ConditionExpression: "operationId = :operationId", ExpressionAttributeValues: { ":operationId": operationId } } },
-    { Delete: { TableName: table(), Key: journalKey, ConditionExpression: "operationId = :operationId", ExpressionAttributeValues: { ":operationId": operationId } } },
-  ] }));
+  await releaseFenceAtomically(profile,operationId,journalKey);
+}
+
+async function releaseFenceAtomically(profile:Profile,operationId:string,journalKey?:{pk:string;sk:string}):Promise<void>{
+  const scopedKey={pk:`ERASURE#${profile}`,sk:"SCOPED_ADMISSION"};
+  const gate=(await documentClient.send(new GetCommand({TableName:table(),Key:scopedKey,ConsistentRead:true}))).Item as Record<string,unknown>|undefined;
+  const gateItems:any[]=[];
+  if(gate){
+    const grants=scopedGrantsAsLeases(gate);
+    if(grants.length||gate.exclusiveOwner&&gate.exclusiveOwner!==operationId)
+      throw new Error("Scoped admission or another recovery still owns the erasure gate");
+    if(gate.exclusiveOwner===operationId)gateItems.push({Delete:{TableName:table(),Key:scopedKey,
+      ConditionExpression:"exclusiveOwner=:owner AND #version=:version AND (attribute_not_exists(grants) OR size(grants)=:zero)",
+      ExpressionAttributeNames:{"#version":"version"},
+      ExpressionAttributeValues:{":owner":operationId,":version":gate.version,":zero":0}}});
+    else gateItems.push({ConditionCheck:{TableName:table(),Key:scopedKey,
+      ConditionExpression:"#version=:version AND (attribute_not_exists(grants) OR size(grants)=:zero) AND attribute_not_exists(exclusiveOwner)",
+      ExpressionAttributeNames:{"#version":"version"},ExpressionAttributeValues:{":version":gate.version,":zero":0}}});
+  }else gateItems.push({ConditionCheck:{TableName:table(),Key:scopedKey,ConditionExpression:"attribute_not_exists(pk)"}});
+  const items:any[]=[{Delete:{TableName:table(),Key:fenceKey(profile),
+    ConditionExpression:"operationId=:owner AND #state=:active",ExpressionAttributeNames:{"#state":"state"},
+    ExpressionAttributeValues:{":owner":operationId,":active":"active"} }},...gateItems];
+  if(journalKey)items.push({Delete:{TableName:table(),Key:journalKey,
+    ConditionExpression:"operationId=:owner",ExpressionAttributeValues:{":owner":operationId}}});
+  await documentClient.send(new TransactWriteCommand({TransactItems:items}));
 }
 

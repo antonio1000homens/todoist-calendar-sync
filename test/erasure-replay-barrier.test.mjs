@@ -106,7 +106,7 @@ test("confirmed erasure completion readback only succeeds after owned fence and 
     return {Item:rows.get(key(command))};
   }};
   assert.equal(await verifyConfirmedErasureCompletion(proof,db),true);
-  assert.equal(reads.length,5);
+  assert.equal(reads.length,6);
   rows.set("ERASURE#home|FENCE",{operationId:"op-current",state:"active"});
   assert.equal(await verifyConfirmedErasureCompletion(proof,db),false);
   rows.delete("ERASURE#home|FENCE");

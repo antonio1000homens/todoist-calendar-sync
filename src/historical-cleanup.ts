@@ -9,21 +9,30 @@ import { activeProjectDeletionTombstone, parseMappingComment, LEGACY_TASK_COMMEN
 import type { ReviewEngine } from "./review-engine.js";
 import type { ReviewStore } from "./review-store.js";
 import type { ReviewCase } from "./review-types.js";
-import type { CalendarEvent } from "./types.js";
+import type { CalendarEvent,Profile } from "./types.js";
+import type { ErasureOperation } from "./erasure-executor.js";
+import {erasureAdmissionFingerprint,makeHistoricalCleanupScope,scopeConflict,type ScopedAdmission,ScopedAdmissionBlockedError} from "./scoped-erasure-admission.js";
+import {erasurePreviewFingerprint,validErasureActionPlan} from "./erasure-executor.js";
+import {getErasureEpoch} from "./erasure-protocol.js";
 
 export type HistoricalCleanupPhase = "checking_providers" | "clearing_todoist_comments"
   | "checking_calendar_links" | "cleaning_dynamodb" | "verified_complete";
 
 export async function cleanVerifiedDeletedCase(input: {
   item: ReviewCase; store: ReviewStore; engine: ReviewEngine; idempotencyKey?:string;
+  fencedErasure?:ErasureOperation;
+  acquireScopedAdmission?:(input:{profile:Profile;fenceOperationId:string;epoch:number;
+    scope:ReturnType<typeof makeHistoricalCleanupScope>})=>Promise<ScopedAdmission>;
   onPhase?: (phase: HistoricalCleanupPhase) => Promise<void> | void;
-}): Promise<{ status: "complete" | "blocked"; phase: HistoricalCleanupPhase; blocker?: string; deletedComments?: number; unlinkedEvents?: number }> {
+}): Promise<{ status: "complete" | "blocked"; phase: HistoricalCleanupPhase; blocker?: string; deletedComments?: number; unlinkedEvents?: number;cleanupStarted?:boolean }> {
   const { item, store, engine } = input;
   let phase: HistoricalCleanupPhase = "checking_providers";
   let deletedComments=0,unlinkedEvents=0;
   let terminal=false;
+  let cleanupStarted=false;
+  let scopedAdmission:ScopedAdmission|undefined;
   const setPhase = async (value: HistoricalCleanupPhase) => { phase = value; await input.onPhase?.(value); };
-  const block = (blocker: string) => ({ status: "blocked" as const, phase, blocker, deletedComments, unlinkedEvents });
+  const block = (blocker: string) => ({ status: "blocked" as const, phase, blocker, deletedComments, unlinkedEvents,cleanupStarted });
   if(item.status==="resolved"&&item.result?.startsWith("resolved_deleted"))return {status:"complete" as const,phase:"verified_complete" as const,deletedComments:0,unlinkedEvents:0};
   if (item.status !== "open" && item.status !== "dismissed") return block("case_not_actionable");
   const decisionType=item.decision?.type;
@@ -42,12 +51,16 @@ export async function cleanVerifiedDeletedCase(input: {
   unlinkedEvents=Number(existing?.unlinkedEvents)||0;
   if(existing?.fingerprint&&existing.fingerprint!==fingerprint)return block("historical_cleanup_identity_changed");
   if(existing?.status==="complete")return {status:"complete",phase:"verified_complete",deletedComments:Number(existing.deletedComments)||0,unlinkedEvents:Number(existing.unlinkedEvents)||0};
-  const checkpoint=(patch:Record<string,unknown>,release=false)=>store.saveHistoricalCleanupCheckpoint({
-    caseId:item.id,profile:item.profile,fingerprint,owner,patch:{phase,...patch},release,
-  });
-  if(!await checkpoint({status:"running",idempotencyKey:input.idempotencyKey,
-    startedAt:existing?.startedAt||new Date().toISOString()}))
-    return block("historical_cleanup_in_progress");
+  const checkpoint=async(patch:Record<string,unknown>,release=false)=>{
+    if(input.fencedErasure&&scopedAdmission)await scopedAdmission.assertActive();
+    return store.saveHistoricalCleanupCheckpoint({caseId:item.id,profile:item.profile,fingerprint,owner,
+      patch:{phase,...patch},release});
+  };
+  if(!input.fencedErasure){
+    if(!await checkpoint({status:"running",idempotencyKey:input.idempotencyKey,
+      startedAt:existing?.startedAt||new Date().toISOString()}))return block("historical_cleanup_in_progress");
+    cleanupStarted=true;
+  }
   try {
     const pair = await engine.clients(item.profile);
     const recurring=item.decision?.type?.includes("recurrence_task_deleted")===true;
@@ -160,7 +173,18 @@ export async function cleanVerifiedDeletedCase(input: {
     const linkSignature=(values:typeof links)=>JSON.stringify(values.map(link=>[link.profile,link.owner,link.seriesId,
       link.taskId,link.eventId,link.masterEventId||"",link.activeInstanceId||"",link.updatedAt])
       .sort((a,b)=>String(a[2]).localeCompare(String(b[2]))));
+    let scopedIdentityFingerprint:string|undefined;
+    const identityRowsFingerprint=(rows:Array<{pk:string;sk:string;fingerprint:string}>)=>
+      JSON.stringify(rows.map(row=>[row.pk,row.sk,row.fingerprint]));
     const stateBeforeExternalWrite=async():Promise<string|undefined>=>{
+      if(input.fencedErasure&&scopedIdentityFingerprint){
+        const freshInventory=await store.inventoryScopedIdentityRows(taskIds,eventIds);
+        if(!freshInventory.complete)return "incomplete_owner_inventory";
+        if(freshInventory.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.activeRepair))return "active_repair_owns_identity";
+        if(freshInventory.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.excluded===true))return "identity_is_excluded";
+        if(identityRowsFingerprint(freshInventory.rows)!==scopedIdentityFingerprint)
+          return "owner_inventory_changed_before_provider_write";
+      }
       const freshMappings=await store.inventoryVerifiedDeletedMappings(item.profile,taskIds,eventIds);
       if(mappingSignature(freshMappings)!==mappingSignature(staleMappingRows))return "mapping_ownership_changed_before_provider_write";
       const freshLinks=await readExactRecurrenceLinks(seriesKeys,(profile,seriesId)=>engine.state.getRecurrenceLink(profile,seriesId));
@@ -183,6 +207,76 @@ export async function cleanVerifiedDeletedCase(input: {
       return undefined;
     };
 
+    if(input.fencedErasure){
+      const erasure=input.fencedErasure,plan=erasure.actionPlan;
+      if(erasure.profile!==item.profile||erasure.status!=="review_required"
+        ||erasure.previewFingerprint!==erasure.confirmationFingerprint
+        ||erasurePreviewFingerprint(erasure)!==erasure.previewFingerprint
+        ||!validErasureActionPlan(plan,erasure)
+        ||!Array.isArray(plan?.projectCommentIds)||plan.projectCommentIds.length>100
+        ||erasure.selectedActions.deleteTodoist&&plan.projectCommentIds.length===0
+        ||(erasure.selectedActions.deleteCalendar&&plan.knownCalendarAliasesComplete!==true))
+        return block("incomplete_owner_inventory");
+      const identityScan=await store.inventoryScopedIdentityRows(taskIds,eventIds);
+      if(!identityScan.complete)return block("incomplete_owner_inventory");
+      scopedIdentityFingerprint=identityRowsFingerprint(identityScan.rows);
+      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.activeRepair))
+        return block("active_repair_owns_identity");
+      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.excluded===true))
+        return block("identity_is_excluded");
+      const liveStatuses=new Set(["open","repairing","pending","queued","running","needs_review"]);
+      if(identityScan.rows.some(row=>row.pk.startsWith("REPAIR#")&&liveStatuses.has(String(row.status))
+        ||row.pk.startsWith("REPAIR_PREVIEW#")&&row.status==="issued"&&Number(row.expiresAt)>Date.now()
+        ||row.pk.startsWith("MANUAL#")&&liveStatuses.has(String(row.status))))
+        return block("writer_not_protocol_aware");
+      if(identityScan.rows.some(row=>row.pk.startsWith("REVIEW_CASE#")&&row.pk!==`REVIEW_CASE#${item.id}`
+        &&["open","repairing","pending","queued","running","needs_review"].includes(String(row.status))))
+        return block("shared_review_identity");
+      const projectCommentIds=[...new Set([...candidates.map(value=>value.comment.id),
+        ...legacyCandidates.map(value=>value.comment.id)])];
+      const resources=identityScan.rows.map(row=>row.pk+"|"+row.sk);
+      const erasureResources:string[]=[];
+      for(const entry of erasure.inventory){
+        const keyValue=(entry as {key?:{pk?:unknown;sk?:unknown}})?.key;
+        if(typeof keyValue?.pk!=="string"||typeof keyValue.sk!=="string")
+          return block("incomplete_owner_inventory");
+        erasureResources.push(keyValue.pk+"|"+keyValue.sk);
+      }
+      erasureResources.push("ERASURE_OPERATION#"+erasure.operationId+"|STATE",
+        "ERASURE_CONFIRMATION#"+erasure.operationId+"|STATE",
+        "ERASURE_RECOVERY_CONFIRMATION#"+erasure.operationId+"|STATE");
+      const activeErasureComments=[...new Set([...plan.projectCommentIds,
+        ...plan.comments.filter(comment=>comment.kind==="project").map(comment=>comment.id)])];
+      const entities=[...taskIds.map(id=>item.profile+":todoist:"+id),
+        ...eventIds.map(id=>item.profile+":calendar:"+id)];
+      const erasureEntities=[erasure.profile+":todoist:"+erasure.target.taskId,
+        ...(erasure.target.eventId?[erasure.profile+":calendar:"+erasure.target.eventId]:[]),
+        ...(plan.knownCalendarAliases||[]).map(alias=>alias.profile+":calendar:"+alias.eventId)];
+      const scope=makeHistoricalCleanupScope({profile:item.profile,caseId:item.id,
+        fenceFingerprint:erasureAdmissionFingerprint(erasure as unknown as Record<string,unknown>),entities,taskIds,eventIds,
+        resourceKeys:resources,projectCommentIds,writeClasses:["todoist_project_comment_delete",
+          "todoist_task_comment_delete","calendar_shared_link_patch","dynamodb_review_state_cleanup"]});
+      const erasureScope={profile:erasure.profile,entities:erasureEntities,
+        taskIds:[erasure.target.taskId],
+        eventIds:[...(erasure.target.eventId?[erasure.target.eventId]:[]),
+          ...(plan.knownCalendarAliases||[]).map(alias=>alias.eventId)],
+        resourceKeys:erasureResources,projectCommentIds:activeErasureComments};
+      const conflict=scopeConflict(scope,erasureScope as typeof scope);
+      if(conflict)return block(conflict);
+      const acquire=input.acquireScopedAdmission;
+      if(!acquire||!Number.isSafeInteger(erasure.lifecycle?.evidence?.fenceInstalled?.completedAt))
+        return block("writer_not_protocol_aware");
+      const epoch=await getErasureEpoch(item.profile);
+      try{scopedAdmission=await acquire({profile:item.profile,fenceOperationId:erasure.operationId,epoch,scope});}
+      catch(error){return block(error instanceof ScopedAdmissionBlockedError?error.blocker:"scoped_admission_overlap");}
+      if(!await checkpoint({status:"running",idempotencyKey:input.idempotencyKey,
+        startedAt:existing?.startedAt||new Date().toISOString()}))return block("historical_cleanup_in_progress");
+      cleanupStarted=true;
+    }else {
+      if(!await checkpoint({status:"running",idempotencyKey:input.idempotencyKey,
+        startedAt:existing?.startedAt||new Date().toISOString()}))return block("historical_cleanup_in_progress");
+      cleanupStarted=true;
+    }
     await setPhase("clearing_todoist_comments");
     await checkpoint({phase});
     try{
@@ -297,7 +391,18 @@ export async function cleanVerifiedDeletedCase(input: {
         id=>engine.state.getCompletedCalendarProjectionByEvent(item.profile,id));
       if(!checked.valid||checked.fingerprint!==legacyInstanceFingerprint)return block("recurrence_instance_inventory_changed_before_terminal_cleanup");
     }
+    if(input.fencedErasure&&scopedIdentityFingerprint){
+      const finalInventory=await store.inventoryScopedIdentityRows(taskIds,eventIds);
+      if(!finalInventory.complete||identityRowsFingerprint(finalInventory.rows)!==scopedIdentityFingerprint)
+        return block("owner_inventory_changed_before_terminal_cleanup");
+      if(finalInventory.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.activeRepair))
+        return block("active_repair_owns_identity");
+      if(finalInventory.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.excluded===true))
+        return block("identity_is_excluded");
+    }
+    const admissionVersion=scopedAdmission?await scopedAdmission.assertActive():undefined;
     const closed = await store.resolveVerifiedDeletedCase(item.id, { profile: item.profile, taskIds, eventIds, staleMappingRows,
+      ...(scopedAdmission&&admissionVersion!==undefined?{scopedAdmission:{owner:scopedAdmission.owner,version:admissionVersion}}:{}),
       staleLinks:classification.stale,seriesKeys,
       ...(recurringIdentity?{masterId,activeInstanceId,masterSeriesId,...(legacyMaster?{legacyMasterProof}:{})}:{}) });
     if (!closed) return block(store.lastVerifiedDeletionBlocker || "dynamodb_case_cleanup_blocked");
@@ -313,16 +418,20 @@ export async function cleanVerifiedDeletedCase(input: {
     terminal=true;
     await checkpoint({status:"complete",deletedComments,unlinkedEvents,completedAt:new Date().toISOString(),pendingProviderWrite:null},true);
     await setPhase("verified_complete");
-    return { status: "complete", phase, deletedComments, unlinkedEvents };
+    return { status: "complete", phase, deletedComments, unlinkedEvents,cleanupStarted:true };
   } catch (error) {
     const status = Number((error as { status?: number }).status);
-    return block(status === 401 || status === 403 ? "provider_auth_failed"
+    return block(error instanceof ScopedAdmissionBlockedError?error.blocker:status === 401 || status === 403 ? "provider_auth_failed"
       : status === 429 ? "provider_rate_limited" : status >= 500 ? "provider_unavailable"
       : error instanceof Error ? error.message.slice(0, 180) : "provider_check_failed");
   } finally {
-    if(!terminal){
-      const latest=await store.getHistoricalCleanupCheckpoint(item.id);
-      if(latest?.status!=="complete")await checkpoint({status:"retryable"},true);
+    try {
+      if(!terminal&&(!input.fencedErasure||scopedAdmission)){
+        const latest=await store.getHistoricalCleanupCheckpoint(item.id);
+        if(latest?.status!=="complete")await checkpoint({status:"retryable"},true);
+      }
+    } finally {
+      await scopedAdmission?.release();
     }
   }
 }
