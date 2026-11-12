@@ -255,6 +255,21 @@ export async function cleanVerifiedDeletedCase(input: {
     if(identityScan) {
       if (!identityScan.complete) return block("incomplete_owner_inventory");
       if (overlapsOtherErasure(identityScan.rows)) return block("shared_erasure_identity");
+      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.activeRepair))
+        return block("active_repair_owns_identity");
+      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.excluded===true))
+        return block("identity_is_excluded");
+      // The selected case's manual decision is already validated and fenced
+      // by the retirement plan. A pending decision from another case owns
+      // its own review evidence and still blocks admission.
+      const liveStatuses=new Set(["open","repairing","pending","queued","running","needs_review"]);
+      if(identityScan.rows.some(row=>row.pk.startsWith("REPAIR#")&&liveStatuses.has(String(row.status))
+        ||row.pk.startsWith("REPAIR_PREVIEW#")&&row.status==="issued"&&Number(row.expiresAt)>Date.now()))
+        return block("writer_not_protocol_aware");
+      if(identityScan.rows.some(row=>liveStatuses.has(String(row.status))
+        && (row.pk.startsWith("REVIEW_CASE#")&&row.pk!==`REVIEW_CASE#${item.id}`
+          ||row.pk.startsWith("MANUAL#")&&(row.pk!==`MANUAL#${item.id}`||row.sk!=="STATE"))))
+        return block("shared_review_identity");
       scopedIdentityFingerprint = identityRowsFingerprint(identityScan.rows);
     }
     if(input.fencedErasure){
@@ -268,18 +283,6 @@ export async function cleanVerifiedDeletedCase(input: {
         ||(erasure.selectedActions.deleteCalendar&&plan.knownCalendarAliasesComplete!==true))
         return block("incomplete_owner_inventory");
       if(!identityScan)return block("incomplete_owner_inventory");
-      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.activeRepair))
-        return block("active_repair_owns_identity");
-      if(identityScan.rows.some(row=>row.pk.startsWith("SYNC_CONTROL#")&&row.excluded===true))
-        return block("identity_is_excluded");
-      const liveStatuses=new Set(["open","repairing","pending","queued","running","needs_review"]);
-      if(identityScan.rows.some(row=>row.pk.startsWith("REPAIR#")&&liveStatuses.has(String(row.status))
-        ||row.pk.startsWith("REPAIR_PREVIEW#")&&row.status==="issued"&&Number(row.expiresAt)>Date.now()
-        ||row.pk.startsWith("MANUAL#")&&liveStatuses.has(String(row.status))))
-        return block("writer_not_protocol_aware");
-      if(identityScan.rows.some(row=>row.pk.startsWith("REVIEW_CASE#")&&row.pk!==`REVIEW_CASE#${item.id}`
-        &&["open","repairing","pending","queued","running","needs_review"].includes(String(row.status))))
-        return block("shared_review_identity");
       const projectCommentIds=[...new Set([...candidates.map(value=>value.comment.id),
         ...legacyCandidates.map(value=>value.comment.id), ...tombstones.keys()])];
       const resources=[...identityScan.rows.map(row=>row.pk+"|"+row.sk),

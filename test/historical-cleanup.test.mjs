@@ -210,7 +210,13 @@ function fencedFixture(t,{operation=erasureOperation(), marker=deletionMarker(),
         assert.equal(update.ExpressionAttributeValues[":version"],storedCase.updatedAt);
         storedCase={...storedCase,status:"resolved",result:update.ExpressionAttributeValues[":result"],
           taskId:undefined,eventId:undefined,decision:undefined};
-        for (const operation of input.TransactItems) if (operation.Delete) rows.delete(keyOf(operation.Delete.Key));
+        for (const operation of input.TransactItems) {
+          if (operation.Delete) rows.delete(keyOf(operation.Delete.Key));
+          const manual = operation.Update && rows.get(keyOf(operation.Update.Key));
+          if (manual?.pk.startsWith("MANUAL#")) rows.set(keyOf(manual),{
+            ...manual,status:"resolved",taskId:undefined,eventId:undefined,context:undefined,
+          });
+        }
         if(loseAcknowledgment)throw new Error("lost terminal acknowledgement");
         return {};
       }
@@ -240,10 +246,13 @@ test("a disjoint fenced cleanup retires the selected case and preserves the exac
   const sourceAuditKey="AUDIT#work#historical-source";
   const unrelatedAuditKey="AUDIT#work#unrelated-source";
   const mappingKey=`TASK#work#${taskId}|MAP`;
+  const manualKey=`MANUAL#${item.id}|STATE`;
   const {f,rows,scopes,transactions}=fencedFixture(t,{marker,caseItem:{...item,sourceAuditKey},stateRows:[
     {pk:sourceAuditKey,sk:"STATE",action:"deletion_review",createdAt:"fixture-revision",detail:{taskId,eventId}},
     {pk:unrelatedAuditKey,sk:"STATE",action:"deletion_review",createdAt:"fixture-revision",detail:{taskId:"unrelated-task"}},
     {pk:`TASK#work#${taskId}`,sk:"MAP",profile:"work",taskId,eventId,updatedAt:"fixture-revision"},
+    {pk:`MANUAL#${item.id}`,sk:"STATE",profile:"work",decisionId:item.id,status:"pending",
+      taskId,eventId,createdAt:item.createdAt,context:{taskId,eventId}},
   ]});
   const result=await cleanVerifiedDeletedCase(f.input);
   assert.equal(result.status,"complete",result.blocker);
@@ -254,7 +263,10 @@ test("a disjoint fenced cleanup retires the selected case and preserves the exac
   assert.ok(scopes[0].resourceKeys.includes(`REVIEW_CASE#${item.id}|STATE`));
   assert.ok(scopes[0].resourceKeys.includes(mappingKey));
   assert.ok(scopes[0].resourceKeys.includes(sourceAuditKey+"|STATE"));
-  assert.deepEqual([...rows.keys()],[unrelatedAuditKey+"|STATE"]);
+  assert.ok(scopes[0].resourceKeys.includes(manualKey));
+  assert.deepEqual([...rows.keys()],[unrelatedAuditKey+"|STATE",manualKey]);
+  assert.equal(rows.get(manualKey).status,"resolved");
+  assert.equal(rows.get(manualKey).taskId,undefined);
   assert.equal(transactions.length,1);
   const checks=transactions[0].flatMap(operation=>operation.ConditionCheck?[operation.ConditionCheck]:[]);
   assert.equal(checks.find(check=>check.Key.sk==="EPOCH").ExpressionAttributeValues[":epoch"],7);
@@ -296,6 +308,8 @@ test("partial inventories, stale selections and unverified nested aliases fail b
     [{currentCase:{...item,updatedAt:"new-revision"}},"case_status_revision_or_operation_changed"],
     [{caseItem:nestedCase},"nested_case_identity_unverified"],
     [{marker:deletionMarker({eventIds:[eventId,"unverified-marker-alias"]})},"protected_erasure_tombstone"],
+    [{stateRows:[{pk:"MANUAL#other-case",sk:"STATE",status:"pending",profile:"work",taskId,eventId}]},
+      "shared_review_identity"],
   ]){
     await t.test(blocker,async subtest=>{
       const {f,scopes,transactions}=fencedFixture(subtest,options);
