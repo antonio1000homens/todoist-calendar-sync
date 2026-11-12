@@ -10,6 +10,8 @@ import {assessPostWriteRecovery,type PostWriteRecoveryAssessment} from "./erasur
 import {erasureExecutionEnabled} from "./erasure-readiness.js";
 import {inspectRecoveryComparisons,type InspectionComparisons,
   type ProjectTombstoneInspection} from "./erasure-recovery-inspection.js";
+import {scopedGrantsAsLeases} from "./scoped-erasure-admission.js";
+import {acquireErasureExclusiveAdmission} from "./scoped-erasure-admission.js";
 
 export type RecoveryStatus = "queued" | "restoring" | "verifying" | "completed" | "blocked";
 export type GuardedRecoveryMode = "strict_pre_write" | "calendar_drift_cancel";
@@ -184,7 +186,10 @@ async function readControl(db:Db,profile:string):Promise<{
   const get=(sk:string)=>rows.find(item=>item.sk===sk);
   const rawEpoch=get("EPOCH")?.epoch;
   return {fence:get("FENCE"),epoch:typeof rawEpoch==="number"&&Number.isSafeInteger(rawEpoch)&&rawEpoch>0?rawEpoch:undefined,
-    journal:get("JOURNAL"),leases:rows.filter(item=>typeof item.sk==="string"&&!["FENCE","EPOCH","JOURNAL"].includes(item.sk))};
+    journal:get("JOURNAL"),leases:[
+      ...rows.filter(item=>typeof item.sk==="string"&&!["FENCE","EPOCH","JOURNAL","SCOPED_ADMISSION"].includes(item.sk)),
+      ...scopedGrantsAsLeases(get("SCOPED_ADMISSION")),
+    ]};
 }
 function validateLifecycle(op:ErasureOperation):string[] {
   const blockers:string[]=[];
@@ -612,6 +617,18 @@ export class ErasureRecoveryService {
   async completePostWriteIfSafe(id:string):Promise<{
     status:"completed"|"blocked"|"in_progress"|"not_applicable";blockers:string[];
   }> {
+    const initial=await this.erasures.get(id);
+    if(!initial||initial.status!=="review_required")return this.#completePostWriteIfSafeCore(id);
+    const initialControl=await readControl(this.db,initial.profile);
+    if(initialControl.fence?.operationId!==id)return this.#completePostWriteIfSafeCore(id);
+    const release=await acquireErasureExclusiveAdmission(initial.profile,id,this.db);
+    try{return await this.#completePostWriteIfSafeCore(id);}
+    finally{await release();}
+  }
+
+  async #completePostWriteIfSafeCore(id:string):Promise<{
+    status:"completed"|"blocked"|"in_progress"|"not_applicable";blockers:string[];
+  }> {
     if(!idPattern.test(id))throw Object.assign(new Error("Invalid recovery operation ID"),{status:400});
     const existing=await this.erasures.get(id);
     if(!existing)return {status:"blocked",blockers:["The original operation record is missing; absence cannot prove completion."]};
@@ -805,6 +822,9 @@ export class ErasureRecoveryService {
         ConditionExpression:"operationId=:id AND #state=:active",
         ExpressionAttributeNames:{"#state":"state"},
         ExpressionAttributeValues:{":id":id,":active":"active"}}},
+      {Delete:{TableName:table(),Key:profileKey(operation.profile,"SCOPED_ADMISSION"),
+        ConditionExpression:"exclusiveOwner=:id AND (attribute_not_exists(grants) OR size(grants)=:zero)",
+        ExpressionAttributeValues:{":id":id,":zero":0}}},
       {ConditionCheck:{TableName:table(),Key:profileKey(operation.profile,"EPOCH"),
         ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":inspection.preview.epoch}}},
     ];
@@ -928,7 +948,8 @@ export class ErasureRecoveryService {
       lifecycleFingerprint:digest(current.operation.lifecycle),
       epoch:current.preview.epoch,hasJournal:current.hasJournal,startedAt:new Date(now).toISOString()};
     // Lock the durable operation before SQS dispatch. No pre-existing fence/epoch may be changed.
-    await this.db.send(new TransactWriteCommand({TransactItems:[
+    const releaseExclusive=await acquireErasureExclusiveAdmission(current.operation.profile,id,this.db);
+    try{await this.db.send(new TransactWriteCommand({TransactItems:[
       {Update:{TableName:table(),Key:operationKey(id),
         UpdateExpression:"SET recovery=:recovery, updatedAt=:now",
         ConditionExpression:"#status=:review AND attribute_not_exists(recovery) AND previewFingerprint=:fingerprint AND lifecycle.#phase=:phase AND updatedAt=:observedUpdatedAt",
@@ -946,7 +967,10 @@ export class ErasureRecoveryService {
         ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
       {ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"EPOCH"),
         ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":current.preview.epoch}}},
-    ]}));
+      {ConditionCheck:{TableName:table(),Key:profileKey(current.operation.profile,"SCOPED_ADMISSION"),
+        ConditionExpression:"exclusiveOwner=:id AND exclusiveUntil>:now AND (attribute_not_exists(grants) OR size(grants)=:zero)",
+        ExpressionAttributeValues:{":id":id,":now":now,":zero":0}}},
+    ]}));}catch(error){await releaseExclusive();throw error;}
   }
 
   async status(id:string):Promise<RecoveryState|undefined> {
@@ -963,6 +987,15 @@ export class ErasureRecoveryService {
   }
 
   async process(id:string):Promise<{status:RecoveryStatus;retry:boolean}> {
+    const op=await this.erasures.get(id);
+    if(!op?.recovery||op.status!=="review_required")return {status:"blocked",retry:false};
+    if(!activeRestore.has(op.recovery.status))return {status:op.recovery.status,retry:false};
+    const release=await acquireErasureExclusiveAdmission(op.profile,id,this.db);
+    try{return await this.#processUnderExclusiveAdmission(id);}
+    finally{await release();}
+  }
+
+  async #processUnderExclusiveAdmission(id:string):Promise<{status:RecoveryStatus;retry:boolean}> {
     const op=await this.erasures.get(id);
     if(!op?.recovery||op.status!=="review_required")return {status:"blocked",retry:false};
     const recovery=op.recovery;
@@ -1013,6 +1046,9 @@ export class ErasureRecoveryService {
         {Delete:{TableName:table(),Key:profileKey(op.profile,"FENCE"),
           ConditionExpression:"operationId=:id AND #state=:active",
           ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":id":id,":active":"active"}}},
+        {Delete:{TableName:table(),Key:profileKey(op.profile,"SCOPED_ADMISSION"),
+          ConditionExpression:"exclusiveOwner=:id AND (attribute_not_exists(grants) OR size(grants)=:zero)",
+          ExpressionAttributeValues:{":id":id,":zero":0}}},
         {ConditionCheck:{TableName:table(),Key:profileKey(op.profile,"EPOCH"),
           ConditionExpression:"epoch=:epoch",ExpressionAttributeValues:{":epoch":recovery.epoch}}},
       ];

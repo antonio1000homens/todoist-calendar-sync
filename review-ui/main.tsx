@@ -557,13 +557,14 @@ function App() {
       if(cleanupSelectionIsCurrent(version,selectionVersion.current)){
         const reason=error.data?.blocker||error.data?.error||error.message;
         const fence=error.data?.error==="separate_erasure_fence_active";
+        const noStart=error.data?.cleanupStarted===false||error.data?.outcome==="blocked_cleanup_not_started";
         const partial=error.data?.outcome==="partially_completed_retryable"&&error.data?.retryable===true;
-        setCleanupFeedback({caseKey,phase:"warning",message:fence
-          ?`Blocked — cleanup not started at ${new Date(error.data.attemptedAt||Date.now()).toLocaleString()}. No Todoist, Calendar, or DynamoDB cleanup was performed by this attempt. Fence operation ${error.data.operationId} is ${error.data.status||"unknown"}${error.data.phase?` (${error.data.phase})`:""}. ${error.data.reason||"The active profile fence prevents case-scoped admission."} The historical cleanup case remains open.`
+        setCleanupFeedback({caseKey,phase:"warning",message:fence||noStart
+          ?`Blocked — cleanup not started at ${new Date(error.data.attemptedAt||Date.now()).toLocaleString()}. No Todoist, Calendar, or DynamoDB cleanup was performed by this attempt.${error.data.operationId?` Fence operation ${error.data.operationId} is ${error.data.status||"unknown"}${error.data.phase?` (${error.data.phase})`:""}.`:""} ${error.data.reason||error.data.blocker||"The case-scoped admission proof is incomplete."} The historical cleanup case remains open.`
           :partial
             ?`Partially completed — safe to retry. Stopped at ${error.data.phase||"an unrecorded phase"}: ${reason}. Verified progress so far: ${error.data.deletedComments||0} Todoist comment(s) removed and ${error.data.unlinkedEvents||0} Calendar link(s) removed. The durable checkpoint released this attempt for an idempotent retry; the case remains open.`
             :`Blocked at ${error.data?.phase||"admission"}: ${reason}. The case remains open; retry after resolving the blocker.`,
-          ...(fence?{recoveryUrl:error.data.recoveryUrl}:{} )});
+          ...((fence||noStart)&&error.data.recoveryUrl?{recoveryUrl:error.data.recoveryUrl}:{} )});
       }
     }finally{polling=false;window.clearInterval(progressTimer);actionLocks.current.delete(lockKey);if(cleanupSelectionIsCurrent(version,selectionVersion.current))setBusy(false);}
   };
@@ -754,7 +755,7 @@ function App() {
         {details?.unmappedDeletion?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Recorded provider items deleted — guarded cleanup pending</h3>
           <p>The exact Todoist and Calendar identities on this alert have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
-          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This case can proceed during that fence only with a complete identity-disjointness inventory and isolated admission protocol; those proofs are not available here, so cleanup stays blocked and the erasure fence remains intact.</p>
+          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. Historic cleanup can proceed during that fence only when a complete identity inventory proves the case is isolated and the shared admission protocol grants a compatible scope. If either proof fails, the case stays open and cleanup reports the exact blocker without starting its writes.</p>
           <p>Todoist IDs: <code>{details.unmappedDeletion.taskIds.join(", ")}</code></p>
           <p>Calendar event/master IDs: <code>{details.unmappedDeletion.eventIds.join(", ")}</code></p>
           <ol>
@@ -781,7 +782,7 @@ function App() {
         {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Verified recurring deletion</h3>
           <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
-          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This case can proceed during that fence only with a complete identity-disjointness inventory and isolated admission protocol; those proofs are not available here, so cleanup stays blocked and the erasure fence remains intact.</p>
+          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. Historic cleanup can proceed during that fence only when a complete identity inventory proves the case is isolated and the shared admission protocol grants a compatible scope. If either proof fails, the case stays open and cleanup reports the exact blocker without starting its writes.</p>
           <p>Task: <code>{details.deletionCleanup.taskIds.join(", ")}</code> · Calendar master: <code>{details.deletionCleanup.masterId}</code>
             {details.deletionCleanup.activeInstanceId&&<> · Active instance: <code>{details.deletionCleanup.activeInstanceId}</code></>}</p>
           <ol>

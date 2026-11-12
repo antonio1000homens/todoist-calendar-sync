@@ -40,6 +40,7 @@ function fixture(options={}) {
       const input=command.input;
       if(kind==="GetCommand") {
         if(input.Key.pk===opKey)return {Item:operation};
+        if(input.Key.pk==="ERASURE#work")return {Item:external.control.find(row=>row.sk===input.Key.sk)};
         if(input.Key.pk==="ERASURE_CONFIRMATION#op-recovery")return {Item:erasureConfirmation};
         if(input.Key.pk==="ERASURE_RECOVERY_CONFIRMATION#op-recovery")return {Item:confirmation};
         if(input.Key.pk==="ERASURE_POSTWRITE_CONFIRMATION#op-recovery")return {Item:postwriteToken};
@@ -61,6 +62,20 @@ function fixture(options={}) {
         return {};
       }
       if(kind==="UpdateCommand") {
+        if(input.Key.pk==="ERASURE#work"&&input.Key.sk==="SCOPED_ADMISSION"){
+          const values=input.ExpressionAttributeValues;
+          const index=external.control.findIndex(row=>row.sk==="SCOPED_ADMISSION");
+          const previous=index>=0?external.control[index]:{pk:"ERASURE#work",sk:"SCOPED_ADMISSION",version:0,grants:[]};
+          const next={...previous,version:values[":nextVersion"],grants:values[":grants"],owners:values[":owners"],
+            leaseUntilByOwner:values[":leaseMap"]};
+          if(input.UpdateExpression.includes("exclusiveOwner=:owner")){
+            next.exclusiveOwner=values[":owner"];next.exclusiveUntil=values[":until"];
+          } else if(input.UpdateExpression.includes("REMOVE exclusiveOwner")){
+            delete next.exclusiveOwner;delete next.exclusiveUntil;
+          }
+          if(index>=0)external.control[index]=next;else external.control.push(next);
+          return {};
+        }
         external.writes.push(input);
         assert.equal(operation.recovery.status,input.ExpressionAttributeValues[":expected"]);
         operation.recovery.status=input.ExpressionAttributeValues[":next"];
@@ -70,6 +85,8 @@ function fixture(options={}) {
       }
       if(kind==="TransactWriteCommand") {
         external.writes.push(input);
+        if(input.TransactItems.some(x=>x.Delete?.Key?.pk==="ERASURE#work"&&x.Delete?.Key?.sk==="SCOPED_ADMISSION"))
+          external.control=external.control.filter(x=>x.sk!=="SCOPED_ADMISSION");
         if(input.TransactItems.some(x=>x.Update?.UpdateExpression?.includes("postWriteCompletion=:completion"))) {
           if(options.failPostwriteCompletion)
             throw Object.assign(new Error("Completion transaction conflict"),{name:"TransactionCanceledException"});

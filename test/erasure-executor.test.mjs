@@ -13,18 +13,28 @@ const oldTable=process.env.STATE_TABLE_NAME;
 function memoryDb(seed){
   let item=seed;
   const markers=new Set();
+  let gate;
   const calls=[];
   return {calls,get item(){return item;},set item(value){item=value;},markers,async send(command){
     calls.push(command);
     if(command.constructor.name.includes("Get")){
       const key=command.input.Key;
       if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="FENCE"&&item.lifecycle)return {Item:{pk:key.pk,sk:"FENCE",operationId:item.operationId,state:"active"}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
       if(key.pk.startsWith("ERASURE_REPLAY#"))return {Item:markers.has(`${key.pk}\0${key.sk}`)?{markerVersion:1}:undefined};
       if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
       return {Item:undefined};
     }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
+      if(command.input.Key?.sk==="SCOPED_ADMISSION"){
+        const prior=gate||{pk:command.input.Key.pk,sk:"SCOPED_ADMISSION",version:0,grants:[]};
+        const next={...prior,version:values[":nextVersion"],grants:values[":grants"],owners:values[":owners"],leaseUntilByOwner:values[":leaseMap"]};
+        if(command.input.UpdateExpression.includes("exclusiveOwner=:owner")){next.exclusiveOwner=values[":owner"];next.exclusiveUntil=values[":until"];}
+        else if(command.input.UpdateExpression.includes("REMOVE exclusiveOwner")){delete next.exclusiveOwner;delete next.exclusiveUntil;}
+        gate=next;return {};
+      }
       if(values[":attempt"]){
         if(item.lifecycle.deletionProgress.attempt)
           throw Object.assign(new Error("conditional check failed"),{name:"ConditionalCheckFailedException"});
@@ -131,7 +141,14 @@ test("deletion gate drift is persisted as review-required with a CAS and cannot 
       pollMs:5000,nextRunAt:1,evidence:{}}};
   const calls=[];
   const db={async send(command){calls.push(command);
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="FENCE")return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       const input=command.input,values=input.ExpressionAttributeValues;
       assert.equal(input.ConditionExpression,"#status=:deleting AND lifecycle.#phase=:ready AND previewFingerprint=:fingerprint");
@@ -161,7 +178,14 @@ test("queued replay-readiness failure records review without creating a lifecycl
   const prior=process.env.STATE_TABLE_NAME;process.env.STATE_TABLE_NAME="test-state";
   const item={...storedQueuedOperation()},calls=[];
   const db={async send(command){calls.push(command);
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="FENCE")return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       assert.match(command.input.ConditionExpression,/attribute_not_exists\(lifecycle\)/);
       const values=command.input.ExpressionAttributeValues;
@@ -182,7 +206,14 @@ test("revoked readiness stops active lifecycle work and retains its fence for br
     lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
       pollMs:5000,nextRunAt:0,evidence:{fenceInstalled:{operationId:"op",phase:"fenceInstalled",receiptId:"123e4567-e89b-12d3-a456-426614174000",completedAt:1}}}};
   const db={async send(command){
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="FENCE")return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
       assert.equal(values[":observedReady"],false);
@@ -211,7 +242,14 @@ test("deployment revocation freezes a provider-ready lifecycle using the real st
   const commands=[];
   const db={async send(command){
     commands.push(command);
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="FENCE")return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       const input=command.input,values=input.ExpressionAttributeValues;
       assert.match(input.ConditionExpression,/providerDeletionReady=:observedReady/);
@@ -260,7 +298,7 @@ test("gate drift during release-fence verification persists review-required with
   assert.equal(db.item.status,"review_required");
   assert.equal(db.item.lifecycle.phase,"release_fence");
   assert.match(db.item.lifecycle.lastError,/break-glass recovery is required/);
-  assert.deepEqual(events,["inspect","verifyDeletion"],"gate drift must stop before fence release or cleanup");
+  assert.deepEqual(events,["inspect","inspect","verifyDeletion"],"gate drift must stop before fence release or cleanup");
   assert.deepEqual(fence,{operationId:"op"});
   assert.equal(db.calls.some(command=>command.constructor.name.includes("TransactWrite")
     ||command.constructor.name.includes("Delete")),false,"operation and fence cleanup must not run");
@@ -288,7 +326,7 @@ test("worker adapters are bound at construction and request arguments cannot rep
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";process.env.ERASURE_PROTOCOL_VERSION="1";
   process.env.ERASURE_REPLAY_HMAC_CURRENT_KEY="current";
   process.env.ERASURE_REPLAY_HMAC_KEYS=JSON.stringify({current:Buffer.alloc(32,1).toString("base64")});
-  let now=10_000,leases=[{id:"writer"}],fence,failDisable=true,failRestore=true,failSaveAfterRelease=true;
+  let now=10_000,leases=[{id:"writer"}],fence,gate,failDisable=true,failRestore=true,failSaveAfterRelease=true;
   const states=new Map([["uuid-enabled","Enabled"],["uuid-disabled","Enabled"]]),events=[];
   const db=memoryDb(storedQueuedOperation());
   const realNow=Date.now;Date.now=()=>now;
@@ -394,6 +432,8 @@ test("worker adapters are bound at construction and request arguments cannot rep
       if(command.constructor.name.includes("Get")){
         const key=command.input.Key;
         if(key.sk==="EPOCH")return {Item:{epoch:7}};
+        if(key.sk==="FENCE"&&db.item?.lifecycle)return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+        if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
         if(key.pk.startsWith("ERASURE_REPLAY#"))return {Item:db.markers.has(`${key.pk}\0${key.sk}`)?{markerVersion:1}:undefined};
         if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:db.item};
         return {Item:undefined};
@@ -402,11 +442,18 @@ test("worker adapters are bound at construction and request arguments cannot rep
         failSaveAfterRelease=false;
         for(const item of command.input.TransactItems)if(item.Put?.Item?.pk.startsWith("ERASURE_REPLAY#"))
           db.markers.add(`${item.Put.Item.pk}\0${item.Put.Item.sk}`);
-        db.item=undefined;
+        db.item=undefined;fence=undefined;gate=undefined;
         throw new Error("simulated lost acknowledgement after atomic commit");
       }
       if(command.constructor.name.includes("Update")){
         const values=command.input.ExpressionAttributeValues;
+        if(command.input.Key?.sk==="SCOPED_ADMISSION"){
+          const prior=gate||{pk:command.input.Key.pk,sk:"SCOPED_ADMISSION",version:0,grants:[]};
+          gate={...prior,version:values[":nextVersion"],grants:values[":grants"],owners:values[":owners"],leaseUntilByOwner:values[":leaseMap"]};
+          if(command.input.UpdateExpression.includes("exclusiveOwner=:owner")){gate.exclusiveOwner=values[":owner"];gate.exclusiveUntil=values[":until"];}
+          else if(command.input.UpdateExpression.includes("REMOVE exclusiveOwner")){delete gate.exclusiveOwner;delete gate.exclusiveUntil;}
+          return {};
+        }
         Object.assign(db.item,{status:values[":next"]??db.item.status,lifecycle:values[":lifecycle"]??db.item.lifecycle,updatedAt:values[":updatedAt"]??db.item.updatedAt});return {};
       }
       return {};
@@ -635,11 +682,25 @@ test("a lost deletion checkpoint acknowledgement leaves a durable claim and neve
     lifecycle:{phase:"delete",mappingIds:["worker"],enabledMappingIds:["worker"],timeoutSeconds:30,
       pollMs:5000,nextRunAt:0,evidence:{},
       deletionProgress:{stage:"comments",commentIndex:0,stateIndex:0,startedAt:now}}};
-  let item=operation,providerAttempts=0,failedCheckpoint=false;
+  let item=operation,providerAttempts=0,failedCheckpoint=false,gate;
   const db={async send(command){
-    if(command.constructor.name.includes("Get"))return {Item:item};
+    if(command.constructor.name.includes("Get")){
+      const key=command.input.Key;
+      if(key.sk==="FENCE")return {Item:{pk:key.pk,sk:"FENCE",operationId:"op",state:"active"}};
+      if(key.sk==="EPOCH")return {Item:{epoch:7}};
+      if(key.sk==="SCOPED_ADMISSION")return {Item:gate};
+      if(key.pk.startsWith("ERASURE_OPERATION#"))return {Item:item};
+      return {Item:undefined};
+    }
     if(command.constructor.name.includes("Update")){
       const values=command.input.ExpressionAttributeValues;
+      if(command.input.Key?.sk==="SCOPED_ADMISSION"){
+        const prior=gate||{pk:command.input.Key.pk,sk:"SCOPED_ADMISSION",version:0,grants:[]};
+        const next={...prior,version:values[":nextVersion"],grants:values[":grants"],owners:values[":owners"],leaseUntilByOwner:values[":leaseMap"]};
+        if(command.input.UpdateExpression.includes("exclusiveOwner=:owner")){next.exclusiveOwner=values[":owner"];next.exclusiveUntil=values[":until"];}
+        else if(command.input.UpdateExpression.includes("REMOVE exclusiveOwner")){delete next.exclusiveOwner;delete next.exclusiveUntil;}
+        gate=next;return {};
+      }
       if(values[":attempt"]){
         item={...item,lifecycle:{...item.lifecycle,deletionProgress:{...item.lifecycle.deletionProgress,
           attempt:values[":attempt"]}},updatedAt:values[":updatedAt"]};

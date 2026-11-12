@@ -29,6 +29,7 @@ import { randomUUID } from "node:crypto";
 import { erasureExecutionEnabled } from "./erasure-readiness.js";
 import { cleanVerifiedDeletedCase } from "./historical-cleanup.js";
 import { inspectErasureFence } from "./erasure-protocol.js";
+import {acquireHistoricalCleanupScope,type HistoricalCleanupScope,type ScopedAdmission} from "./scoped-erasure-admission.js";
 
 const REVIEW_ORIGIN = "https://calendar-sync.alf-broadcast.co.uk";
 type Claims = { email?: unknown; sub?: unknown; aud?: unknown };
@@ -188,6 +189,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
   createReviewStore?:()=>ReviewStore;
   cleanVerifiedDeletedCase?: typeof cleanVerifiedDeletedCase;
   inspectErasureFence?:typeof inspectErasureFence;
+  acquireScopedAdmission?:(input:{profile:Profile;fenceOperationId:string;epoch:number;scope:HistoricalCleanupScope})=>Promise<ScopedAdmission>;
   createOrphanApprovalService?:(store:ReviewStore)=>OrphanApprovalService;
   createReviewEngine?:(store:ReviewStore)=>ReviewEngine;
   createStateRepository?:()=>StateRepository;
@@ -230,6 +232,7 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
     const enqueueRepairFn=dependencies.enqueueRepair || enqueueRepair;
     const admissionOwner=randomUUID();
     const writeProfiles:Profile[]=[];
+    let fencedErasureOperation:Awaited<ReturnType<ErasureOperationStore["get"]>>|undefined;
     if(method==="POST") {
       if(segments[0]==="erasure-previews"&&typeof body?.profile==="string"&&REVIEW_PROFILES.includes(body.profile as Profile)) {
         writeProfiles.push(body.profile as Profile);
@@ -263,19 +266,25 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       }
       for(const selectedProfile of [...new Set(writeProfiles)]) {
         if(segments[0]==="cases"&&segments[2]==="historical-cleanup") {
-          const {fence}=await (dependencies.inspectErasureFence||inspectErasureFence)(selectedProfile);
+          const {fence,leases}=await (dependencies.inspectErasureFence||inspectErasureFence)(selectedProfile);
           if(fence?.state==="active") {
             const operationId=typeof fence.operationId==="string"?fence.operationId:"unknown";
             const operation=operationId!=="unknown"?await erasureStore().get(operationId):undefined;
-            return response(409,{error:"separate_erasure_fence_active",blocker:"separate_erasure_fence_active",
-              outcome:"blocked_cleanup_not_started",cleanupStarted:false,cleanupWritesPerformed:false,
-              attemptedAt:new Date().toISOString(),operationId,
-              status:operation?.status||fence.state,phase:operation?.lifecycle?.phase,
-              reason:"The active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This historical case cannot be proven identity-disjoint with the complete inventory and isolated admission protocol available here, so the fence remains in force.",
-              recoveryUrl:operationId==="unknown"?"/review/#erasure-recovery":
-                `/review/?erasureOperation=${encodeURIComponent(operationId)}#erasure-recovery`});
+            const incompatibleLeases=leases.filter(lease=>lease.kind!=="scoped_historical_cleanup");
+            if(segments[0]==="cases"&&segments[2]==="historical-cleanup"
+              &&operation?.status==="review_required"&&incompatibleLeases.length===0)
+              fencedErasureOperation=operation;
+            else return response(409,{error:"separate_erasure_fence_active",blocker:"separate_erasure_fence_active",
+                outcome:"blocked_cleanup_not_started",cleanupStarted:false,cleanupWritesPerformed:false,
+                attemptedAt:new Date().toISOString(),operationId,
+                status:operation?.status||fence.state,phase:operation?.lifecycle?.phase,
+                reason:incompatibleLeases.length?"An existing profile writer lease has not drained; scoped cleanup cannot be admitted while it is active."
+                  :"A compatible scoped-admission proof is unavailable for this erasure lifecycle state; the existing profile fence remains in force.",
+                recoveryUrl:operationId==="unknown"?"/review/#erasure-recovery":
+                  `/review/?erasureOperation=${encodeURIComponent(operationId)}#erasure-recovery`});
           }
         }
+        if(segments[0]==="cases"&&segments[2]==="historical-cleanup"&&fencedErasureOperation)continue;
         const acquire=dependencies.acquireWriteLease || acquireProfileAdmissionLease;
         manualWriteLeases.push(await acquire(selectedProfile,admissionOwner));
       }
@@ -302,13 +311,19 @@ export async function handler(event: LambdaFunctionURLEvent, dependencies: {
       requireAdmissionProfile(item.profile);
       const engine=dependencies.createReviewEngine?.(store)||new ReviewEngine(store);
       const cleanup=dependencies.cleanVerifiedDeletedCase||cleanVerifiedDeletedCase;
-      const result=await cleanup({item,store,engine,idempotencyKey});
+      const result=await cleanup({item,store,engine,idempotencyKey,
+        ...(fencedErasureOperation?{fencedErasure:fencedErasureOperation,
+          acquireScopedAdmission:dependencies.acquireScopedAdmission||acquireHistoricalCleanupScope}:{})});
       if(result.status!=="complete") {
         const checkpoint=await store.getHistoricalCleanupCheckpoint(item.id);
         const retryable=checkpoint?.status==="retryable";
         const partiallyCompleted=retryable&&Boolean(result.deletedComments||result.unlinkedEvents);
         return response(409,{error:result.blocker||"historical_cleanup_blocked",blocker:result.blocker,
-          outcome:partiallyCompleted?"partially_completed_retryable":"blocked",retryable,
+          outcome:partiallyCompleted?"partially_completed_retryable":
+            result.cleanupStarted===false?"blocked_cleanup_not_started":"blocked",retryable,
+          cleanupStarted:result.cleanupStarted??true,cleanupWritesPerformed:result.cleanupStarted!==false,
+          ...(fencedErasureOperation?{operationId:fencedErasureOperation.operationId,status:fencedErasureOperation.status,
+            recoveryUrl:`/review/?erasureOperation=${encodeURIComponent(fencedErasureOperation.operationId)}#erasure-recovery`}:{}),
           phase:result.phase,deletedComments:result.deletedComments||0,unlinkedEvents:result.unlinkedEvents||0,result});
       }
       return response(200,{result});

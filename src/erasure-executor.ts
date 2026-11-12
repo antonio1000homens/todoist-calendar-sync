@@ -6,6 +6,7 @@ import { documentClient } from "./dynamodb-capacity.js";
 import type { Profile } from "./types.js";
 import {atomicConfirmedErasureCompletion,ErasureReplayUnavailableError,
   verifyConfirmedErasureCompletion} from "./erasure-replay-barrier.js";
+import {acquireErasureExclusiveAdmission} from "./scoped-erasure-admission.js";
 
 export type ErasureOperationStatus = "previewed" | "queued" | "fencing" | "deleting" | "verifying" | "succeeded" | "partial_failure" | "review_required";
 export type FencedLifecyclePhase = "disable_mappings" | "confirm_disabled" | "drain_before_fence"
@@ -143,8 +144,11 @@ export function advanceErasureOperation(current: ErasureOperation, status: Erasu
 
 function operationKey(id: string) { return { pk: `ERASURE_OPERATION#${id}`, sk: "STATE" }; }
 function confirmationKey(operationId: string) { return { pk: `ERASURE_CONFIRMATION#${operationId}`, sk: "STATE" }; }
-function validActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions"|"inventory">):boolean {
-  if(!plan||!Array.isArray(plan.comments)) return false;
+export function validErasureActionPlan(plan:ErasureActionPlan,operation:Pick<ErasureOperation,"profile"|"target"|"selectedActions"|"inventory">):boolean {
+  if(!plan||!Array.isArray(plan.comments)||!Array.isArray(operation.inventory)
+    ||operation.inventory.some(item=>!item||typeof item.type!=="string"||!item.type
+      ||!item.key||typeof item.key.pk!=="string"||!item.key.pk||typeof item.key.sk!=="string"||!item.key.sk
+      ||typeof item.digest!=="string"||!item.digest||typeof item.classification!=="string"||!item.classification)) return false;
   if(plan.todoistTask&&(plan.todoistTask.id!==operation.target.taskId||!/^[a-f0-9]{64}$/.test(plan.todoistTask.digest))) return false;
   if(plan.calendarEvent&&((!operation.selectedActions.deleteCalendar
       &&(plan.calendarEvent.unlinkTodoistTask!==operation.target.taskId
@@ -251,7 +255,7 @@ export class ErasureOperationStore {
     confirmationId: string; previewFingerprint: string; expiresAt: number;
   }> {
     if (!preview.operationId || !/^[a-f0-9]{64}$/.test(preview.providerSnapshotFingerprint)
-      || !validActionPlan(preview.actionPlan,preview)
+      || !validErasureActionPlan(preview.actionPlan,preview)
       || preview.selectedActions.deleteTodoist !== true
       || preview.selectedActions.deleteCalendar !== preview.target.deleteCalendar
       || (preview.target.deleteCalendar && !preview.target.eventId)) throw new Error("Invalid erasure operation preview");
@@ -284,7 +288,7 @@ export class ErasureOperationStore {
       || typeof item.expiresAt!=="number" || item.expiresAt<=Date.now() || !item.preview) return undefined;
     const preview=item.preview as {profile:Profile;target:ErasureOperation["target"];
       selectedActions:ErasureOperation["selectedActions"];providerSnapshotFingerprint:string;inventory:ErasureOperation["inventory"];actionPlan:ErasureActionPlan};
-    if(!validActionPlan(preview.actionPlan,preview)
+    if(!validErasureActionPlan(preview.actionPlan,preview)
       ||erasurePreviewFingerprint(preview)!==item.previewFingerprint) return undefined;
     return {...preview,previewFingerprint:item.previewFingerprint as string,
       executionReadyAtIssue:item.executionReadyAtIssue===true};
@@ -294,7 +298,7 @@ export class ErasureOperationStore {
     const now=Date.now();
     if (operation.status !== "previewed" || !operation.operationId || !operation.previewFingerprint
       || operation.lifecycle!==undefined
-      || !validActionPlan(operation.actionPlan,operation)
+      || !validErasureActionPlan(operation.actionPlan,operation)
       || !/^[a-f0-9]{64}$/.test(operation.providerSnapshotFingerprint)
       || operation.confirmationFingerprint !== operation.previewFingerprint
       || operation.selectedActions.deleteTodoist !== true
@@ -360,8 +364,23 @@ export class ErasureOperationStore {
         ":ready":true,":lifecycle":lifecycle,":updatedAt":new Date(Date.now()).toISOString(),":fingerprint":current.previewFingerprint}}));
   }
 
+  /** Serialize fenced lifecycle writes against compatible historical-cleanup
+   * grants. Before the fence exists, the original profile lease is sufficient. */
+  async advanceFencedLifecycle(id:string):Promise<{
+    phase:FencedLifecyclePhase;nextRunAt:number;status:ErasureOperationStatus;waiting:boolean;
+  }>{
+    const operation=await this.get(id);
+    if(!operation?.lifecycle)return this.#advanceFencedLifecycleCore(id);
+    if(!this.#workerAdapters)return this.#advanceFencedLifecycleCore(id);
+    const {fence}=await this.#worker().inspectFence(operation.profile);
+    if(fence?.operationId!==id)return this.#advanceFencedLifecycleCore(id);
+    const release=await acquireErasureExclusiveAdmission(operation.profile,id,this.db);
+    try{return await this.#advanceFencedLifecycleCore(id);}
+    finally{await release();}
+  }
+
   /** Execute one trusted adapter action/readback and persist its opaque receipt with a CAS. */
-  async advanceFencedLifecycle(id: string): Promise<{
+  async #advanceFencedLifecycleCore(id: string): Promise<{
     phase: FencedLifecyclePhase; nextRunAt: number; status: ErasureOperationStatus; waiting: boolean;
   }> {
     const operation=await this.get(id);

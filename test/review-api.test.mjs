@@ -123,18 +123,40 @@ test("all review, reconciliation, and erasure writers hold the profile admission
   assert.ok(Number.isFinite(Date.parse(fenced.body.attemptedAt)));
   assert.equal(fenced.body.operationId,"erase-op-123");
   assert.equal(fenced.body.status,"review_required");assert.equal(fenced.body.phase,"delete");
-  assert.match(fenced.body.reason,/complete inventory and isolated admission protocol/);
+  assert.match(fenced.body.reason,/existing profile writer lease has not drained/);
   assert.equal(fenced.body.recoveryUrl,"/review/?erasureOperation=erase-op-123#erasure-recovery");assert.equal(cleanupCalls,1);
   assert.equal(observed.length,beforeFencedAttempt,"pre-admission 409 performs no state/queue/provider cleanup writes");
   assert.equal(active.size,0);fenceAfterRelease();
-  // A complete-looking disjoint pair is still rejected: the server has no
-  // identity-scoped admission proof that can safely bypass the profile fence.
+  // After pre-existing profile writers drain, a provably disjoint case uses
+  // case-scoped admission and does not acquire the ordinary profile lease.
   caseItem.taskId="task-disjoint";caseItem.eventId="event-disjoint";
+  deps.inspectErasureFence=async()=>({fence:{state:"active",operationId:"erase-op-123"},leases:[]});
+  let scopedAcquireCalls=0;
+  deps.acquireScopedAdmission=async admission=>{scopedAcquireCalls++;assert.equal(admission.fenceOperationId,"erase-op-123");
+    return {owner:"scoped-owner",fingerprint:admission.scope.fingerprint,assertActive:async()=>1,release:async()=>{}};};
+  deps.cleanVerifiedDeletedCase=async input=>{assert.equal(input.fencedErasure.operationId,"erase-op-123");
+    assert.equal(typeof input.acquireScopedAdmission,"function");
+    await input.acquireScopedAdmission({profile:"home",fenceOperationId:"erase-op-123",epoch:7,scope:{fingerprint:"synthetic"}});
+    cleanupCalls++;
+    return {status:"complete",phase:"verified_complete",deletedComments:1,unlinkedEvents:0};};
   const disjoint=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-disjoint"},{}),deps));
-  assert.equal(disjoint.status,409);assert.equal(disjoint.body.outcome,"blocked_cleanup_not_started");
-  assert.equal(disjoint.body.cleanupWritesPerformed,false);assert.equal(cleanupCalls,1);
-  assert.equal(observed.length,beforeFencedAttempt,"apparently disjoint identity still performs zero writes behind the fence");
+  assert.equal(disjoint.status,200);assert.equal(scopedAcquireCalls,1);assert.equal(cleanupCalls,2);
+  assert.equal(active.size,0,"scoped cleanup must not acquire the ordinary profile writer lease");
+  assert.equal(observed.length,beforeFencedAttempt,"cleanup starts only through the scoped admission protocol");
+  deps.acquireScopedAdmission=async()=>{const error=new Error("shared_audit_record");error.blocker="shared_audit_record";throw error;};
+  deps.cleanVerifiedDeletedCase=async input=>{
+    try{await input.acquireScopedAdmission({profile:"home",fenceOperationId:"erase-op-123",epoch:7,scope:{fingerprint:"blocked"}});}
+    catch(error){return {status:"blocked",phase:"checking_providers",blocker:error.blocker,cleanupStarted:false};}
+    throw new Error("blocked admission unexpectedly succeeded");
+  };
+  const scopedBlocked=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-scope-block"},{}),deps));
+  assert.equal(scopedBlocked.status,409);assert.equal(scopedBlocked.body.blocker,"shared_audit_record");
+  assert.equal(scopedBlocked.body.outcome,"blocked_cleanup_not_started");
+  assert.equal(scopedBlocked.body.cleanupStarted,false);assert.equal(scopedBlocked.body.cleanupWritesPerformed,false);
+  assert.equal(scopedBlocked.body.operationId,"erase-op-123");assert.equal(scopedBlocked.body.status,"review_required");
+  assert.equal(scopedBlocked.body.recoveryUrl,"/review/?erasureOperation=erase-op-123#erasure-recovery");
   deps.inspectErasureFence=async()=>({fence:undefined,leases:[]});
   deps.cleanVerifiedDeletedCase=async()=>({status:"blocked",phase:"checking_calendar_links",blocker:"calendar_link_removal_unverified",deletedComments:2,unlinkedEvents:0});
   checkpointStatus={status:"retryable"};
@@ -142,7 +164,7 @@ test("all review, reconciliation, and erasure writers hold the profile admission
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-retry"},{}),deps));
   assert.equal(partial.status,409);assert.equal(partial.body.outcome,"partially_completed_retryable");
   assert.equal(partial.body.retryable,true);assert.equal(partial.body.deletedComments,2);
-  assert.equal(cleanupCalls,1,"the blocked cleanup mock must not run during the fenced attempt");
+  assert.equal(cleanupCalls,2,"the blocked cleanup mock must not run during the fenced attempt");
   delete deps.inspectErasureFence;delete deps.cleanVerifiedDeletedCase;
   let caseLookups=0,dismissWrites=0;
   store.getCase=async()=>++caseLookups===1?caseItem:{...caseItem,profile:"work"};

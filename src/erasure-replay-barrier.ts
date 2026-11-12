@@ -107,6 +107,9 @@ export function atomicConfirmedErasureCompletion(proof:ConfirmedErasureCompletio
     {Delete:{TableName:table,Key:{pk:`ERASURE#${proof.profile}`,sk:"FENCE"},
       ConditionExpression:"operationId=:operationId AND #state=:active",
       ExpressionAttributeNames:{"#state":"state"},ExpressionAttributeValues:{":operationId":proof.operationId,":active":"active"}}},
+    {Delete:{TableName:table,Key:{pk:`ERASURE#${proof.profile}`,sk:"SCOPED_ADMISSION"},
+      ConditionExpression:"exclusiveOwner=:operationId AND (attribute_not_exists(grants) OR size(grants)=:zero)",
+      ExpressionAttributeValues:{":operationId":proof.operationId,":zero":0}}},
     {ConditionCheck:{TableName:table,Key:{pk:`ERASURE#${proof.profile}`,sk:"JOURNAL"},
       ConditionExpression:"attribute_not_exists(pk)"}},
   ];
@@ -123,14 +126,15 @@ export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCom
     try{return (await db.send(new GetCommand({TableName:table,Key:key,ConsistentRead:true}))).Item;}
     catch {throw new ErasureReplayUnavailableError("Erasure completion readback is unavailable");}
   };
-  const [operation,confirmation,fence,epoch,journal]=await Promise.all([
+  const [operation,confirmation,fence,epoch,journal,scopedAdmission]=await Promise.all([
     read({pk:`ERASURE_OPERATION#${proof.operationId}`,sk:"STATE"}),
     read({pk:`ERASURE_CONFIRMATION#${proof.operationId}`,sk:"STATE"}),
     read({pk:`ERASURE#${proof.profile}`,sk:"FENCE"}),
     read({pk:`ERASURE#${proof.profile}`,sk:"EPOCH"}),
     read({pk:`ERASURE#${proof.profile}`,sk:"JOURNAL"}),
+    read({pk:`ERASURE#${proof.profile}`,sk:"SCOPED_ADMISSION"}),
   ]);
-  if(operation||confirmation||fence||journal||epoch?.epoch!==proof.epoch)return false;
+  if(operation||confirmation||fence||journal||scopedAdmission||epoch?.epoch!==proof.epoch)return false;
   return true;
 }
 

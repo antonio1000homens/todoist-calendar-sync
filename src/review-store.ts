@@ -158,6 +158,41 @@ export class ReviewStore {
     }
     return rows;
   }
+  /** Strongly consistent base-table identity scan used by fenced scoped
+   * admission. A partial or over-limit scan can never authorize a writer. */
+  async inventoryScopedIdentityRows(taskIds:string[],eventIds:string[]):Promise<{
+    complete:boolean;rows:Array<{pk:string;sk:string;matchedTaskIds:string[];matchedEventIds:string[];
+      profile?:unknown;status?:unknown;activeRepair?:unknown;excluded?:unknown;taskId?:unknown;eventId?:unknown;expiresAt?:unknown;fingerprint:string}>;
+  }>{
+    const identities=[...new Set([...taskIds,...eventIds])];
+    if(!identities.length)return {complete:false,rows:[]};
+    let cursor:Record<string,unknown>|undefined,pages=0,visited=0;
+    const rows:Array<{pk:string;sk:string;matchedTaskIds:string[];matchedEventIds:string[];
+      profile?:unknown;status?:unknown;activeRepair?:unknown;excluded?:unknown;taskId?:unknown;eventId?:unknown;expiresAt?:unknown;fingerprint:string}>= [];
+    do{
+      if(++pages>100)return {complete:false,rows:[]};
+      const page=await this.db.send(new ScanCommand({TableName:reviewTable(),ConsistentRead:true,Limit:1000,
+        ...(cursor?{ExclusiveStartKey:cursor}:{})}));
+      visited+=(page.Items||[]).length;
+      if(visited>100_000)return {complete:false,rows:[]};
+      for(const raw of page.Items||[]){
+        const item=raw as Record<string,unknown>;
+        if(typeof item.pk!=="string"||typeof item.sk!=="string")return {complete:false,rows:[]};
+        const serialized=JSON.stringify(item);
+        const keyText=item.pk+"\u0000"+item.sk;
+        const matches=(id:string)=>serialized.includes(JSON.stringify(id))||keyText.includes(id);
+        const matchedTaskIds=taskIds.filter(matches),matchedEventIds=eventIds.filter(matches);
+        if(matchedTaskIds.length||matchedEventIds.length)rows.push({pk:item.pk,sk:item.sk,matchedTaskIds,matchedEventIds,
+          ...(item.profile!==undefined?{profile:item.profile}:{}),...(item.status!==undefined?{status:item.status}:{}),
+          ...(item.activeRepair!==undefined?{activeRepair:item.activeRepair}:{}),...(item.excluded!==undefined?{excluded:item.excluded}:{}),
+          ...(item.taskId!==undefined?{taskId:item.taskId}:{}),...(item.eventId!==undefined?{eventId:item.eventId}:{}),
+          ...(item.expiresAt!==undefined?{expiresAt:item.expiresAt}:{}),
+          fingerprint:createHash("sha256").update(serialized).digest("hex")});
+      }
+      cursor=page.LastEvaluatedKey as Record<string,unknown>|undefined;
+    }while(cursor);
+    return {complete:true,rows:rows.sort((a,b)=>`${a.pk}\u0000${a.sk}`.localeCompare(`${b.pk}\u0000${b.sk}`))};
+  }
   /** Durable per-case progress with a short lease; retries resume only the same exact identity set. */
   async saveHistoricalCleanupCheckpoint(input:{caseId:string;profile:Profile;fingerprint:string;owner:string;
     patch:Record<string,unknown>;release?:boolean}):Promise<boolean>{
@@ -533,6 +568,7 @@ export class ReviewStore {
       dryRun?:boolean;
       staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
       masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
+      scopedAdmission?:{owner:string;version:number};
       /** Direct provider readbacks for legacy decisions without masterEventId. */
       legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
     },
@@ -1059,13 +1095,19 @@ export class ReviewStore {
       items.push({ ConditionCheck: { TableName: reviewTable(), Key,
         ConditionExpression: "attribute_not_exists(pk)" } });
     }
-    for (const ref of refs) {
+    for (const ref of refs) for(const candidateProfile of cleanupProfiles) {
       items.push({ ConditionCheck: { TableName: reviewTable(),
-        Key: key(`SYNC_CONTROL#${expected.profile}:${ref.side}:${ref.id}`),
+        Key: key(`SYNC_CONTROL#${candidateProfile}:${ref.side}:${ref.id}`),
         ConditionExpression: "attribute_not_exists(activeRepair) AND (attribute_not_exists(excluded) OR excluded = :no)",
         ExpressionAttributeValues: { ":no": false },
       } });
     }
+    if(expected.scopedAdmission)items.push({ConditionCheck:{TableName:reviewTable(),
+      Key:{pk:`ERASURE#${expected.profile}`,sk:"SCOPED_ADMISSION"},
+      ConditionExpression:"#version=:version AND contains(owners,:owner) AND leaseUntilByOwner.#owner > :now",
+      ExpressionAttributeNames:{"#version":"version","#owner":expected.scopedAdmission.owner},
+      ExpressionAttributeValues:{":version":expected.scopedAdmission.version,":owner":expected.scopedAdmission.owner,":now":Date.now()},
+    }});
     if (items.length > 95) return blocked("transaction_item_limit_exceeded"); // leave open for safe bounded retry
     if(expected.dryRun)return true;
     try {
