@@ -276,7 +276,7 @@ test("Calendar 410 without exact deleted-resource evidence remains an error afte
   assert.equal(reads,2,"the uncertain delete outcome is checked with a direct readback");
 });
 
-test("legacy final-comments checkpoint retains only exact operation-owned project tombstones",async()=>{
+test("legacy final-comments checkpoint rejects tombstones that belong to another identity",async()=>{
   const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
   const original={
     schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
@@ -304,7 +304,7 @@ test("legacy final-comments checkpoint retains only exact operation-owned projec
     assert.equal(deletions,0,"unrelated project content must not be deleted");
   }
 });
-test("legacy final-comments checkpoint retains an active verified tombstone",async()=>{
+test("legacy final-comments checkpoint removes an exact active tombstone",async()=>{
   const { serializeDeletionTombstoneComment }=await import("../dist/mapping-comments.js");
   const marker={schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
     eventIds:["event-1"],createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"};
@@ -319,11 +319,11 @@ test("legacy final-comments checkpoint retains an active verified tombstone",asy
       getComment:async()=>comment,deleteComment:async()=>{deletes++;},
     }},inspectFence:async()=>({leases:[]})});
   assert.equal(result.progress.finalCommentIndex,1);
-  assert.equal(deletes,0);
+  assert.equal(deletes,1,"the legacy marker is removed immediately rather than retained for 18 days");
 });
 
 
-test("postflight requires the exact active tombstone and ignores unrelated notes",async()=>{
+test("postflight requires absence of mapping comments and retained tombstones",async()=>{
   const {serializeDeletionTombstoneComment}=await import("../dist/mapping-comments.js");
   const operation={...baseOperation,actionPlan:{...baseOperation.actionPlan,
     projectCommentIds:["original-1"],knownCalendarAliases:[
@@ -338,18 +338,14 @@ test("postflight requires the exact active tombstone and ignores unrelated notes
     expiresAt:"2026-11-26T12:00:00.000Z",
   });
   const unrelated={id:"unrelated",project_id:"test-home-project",content:"User's personal shopping note"};
-  const now=Date.parse("2026-11-09T12:00:00.000Z");
-  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],now),true);
-  const overbroadMarker=serializeDeletionTombstoneComment({
-    schemaVersion:1,profile:"home",projectId:"test-home-project",taskId:"task-1",
-    eventIds:["event-1","unrelated-event"],createdAt:"2026-11-08T12:00:00.000Z",
-    expiresAt:"2026-11-26T12:00:00.000Z",
-  });
-  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:overbroadMarker}],now),false,
-    "a tombstone containing a receipt alias owned by another task must not pass postflight");
-  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated],now),false,"selected tombstone must remain");
-  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:originalContent}],now),false,
-    "an unconverted mapping comment cannot pass postflight");
-  assert.equal(erasureProjectTombstonesPresent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}],
-    Date.parse("2026-11-27T12:00:00.000Z")),false,"expired tombstones cannot pass postflight");
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated]),true,
+    "unrelated project comments must be left untouched");
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated,{...unrelated,id:"original-1",content:markerContent}]),false,
+    "the original comment must not survive as a tombstone");
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated,{...unrelated,id:"original-1",content:originalContent}]),false,
+    "the original mapping comment must not survive either");
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated,{...unrelated,id:"other",content:markerContent}]),false,
+    "a second marker for the deleted identity is unacceptable");
+  assert.equal(erasureProjectCommentsAbsent(operation,[unrelated,{...unrelated,id:"other",content:"task-1"}]),false,
+    "malformed notes that still mention the deleted identity are unacceptable");
 });
