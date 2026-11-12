@@ -12,6 +12,7 @@ import { RetirementHistory } from "./retirement-history";
 import { providerIdentity, providerLink, dispositionOptions, scopeLabel, previewEffect } from "./item-identity.mjs";
 import { caseUrl, recordedPrimaryProviderIds, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots } from "./case-url.mjs";
 import { providerRecheckFeedback, reconciliationRequestFeedback } from "./action-feedback.mjs";
+import { claimHistoricalCleanup, cleanupSelectionIsCurrent } from "./historical-cleanup-flow.mjs";
 
 type Case = { id:string; profile:string; title:string; reason:string; status:string; taskId?:string; eventId?:string; createdAt:string; updatedAt?:string; decision?:any; operationId?:string; result?:string; reconciliationGeneration?:string; progressCheckpoint?:any };
 type ProviderObject = { id:string; content?:string; summary?:string; description?:string; url?:string; htmlLink?:string; due?:{date?:string;datetime?:string;string?:string;is_recurring?:boolean}; start?:{date?:string;dateTime?:string}; end?:{date?:string;dateTime?:string}; recurrence?:string[]; recurringEventId?:string; status?:string };
@@ -529,16 +530,16 @@ function App() {
   const cleanHistoricRecords=async()=>{
     if(!selected||!details)return;
     const caseKey=`${selected.profile}:${selected.id}`,lockKey=`historic-cleanup:${caseKey}`;
-    if(actionLocks.current.has(lockKey))return;
-    const version=selectionVersion.current;actionLocks.current.add(lockKey);setBusy(true);
-    setCleanupFeedback({caseKey,phase:"checking",message:"Checking provider evidence, then cleaning verified historical records…"});
+    if(!claimHistoricalCleanup(actionLocks.current,lockKey))return;
+    const version=selectionVersion.current;setBusy(true);
+    setCleanupFeedback({caseKey,phase:"checking",message:`Cleanup request acknowledged at ${new Date().toLocaleString()}. Checking provider evidence; no cleanup outcome is verified yet…`});
     const route=`/review/api/cases/${encodeURIComponent(selected.id)}/historical-cleanup`;
     let polling=true;
     const refreshProgress=async()=>{
       try{
         const response=await fetch(route,{cache:"no-store"});if(!response.ok)return;
         const progress=await response.json();
-        if(polling&&version===selectionVersion.current&&progress.caseId===selected.id)
+        if(polling&&cleanupSelectionIsCurrent(version,selectionVersion.current)&&progress.caseId===selected.id)
           setCleanupFeedback(current=>current?.caseKey===caseKey&&current.phase==="checking"
             ?{...current,message:historicalCleanupProgress(progress.phase)}:current);
       }catch{/* progress polling is observational; the action response remains authoritative */}
@@ -547,21 +548,24 @@ function App() {
     void refreshProgress();
     try{
       const result=await api(`cases/${encodeURIComponent(selected.id)}/historical-cleanup`,{method:"POST",headers:{"idempotency-key":crypto.randomUUID()},body:"{}"});
-      if(version!==selectionVersion.current)return;
+      if(!cleanupSelectionIsCurrent(version,selectionVersion.current))return;
       if(result.result?.status==="complete"){
         setCleanupFeedback({caseKey,phase:"success",message:`Verified cleanup completed at ${new Date().toLocaleString()}. Removed ${result.result.deletedComments||0} Todoist mapping comment(s); unlinked ${result.result.unlinkedEvents||0} live Calendar event(s).`});
         await refreshAffected();
       }else setCleanupFeedback({caseKey,phase:"warning",message:`Cleanup is blocked at ${result.result?.phase||"unknown phase"}: ${result.result?.blocker||"unknown blocker"}. The case remains open; retry after resolving the blocker.`});
     }catch(error:any){
-      if(version===selectionVersion.current){
+      if(cleanupSelectionIsCurrent(version,selectionVersion.current)){
         const reason=error.data?.blocker||error.data?.error||error.message;
         const fence=error.data?.error==="separate_erasure_fence_active";
+        const partial=error.data?.outcome==="partially_completed_retryable"&&error.data?.retryable===true;
         setCleanupFeedback({caseKey,phase:"warning",message:fence
-          ?`Separate erasure fence ${error.data.operationId} is ${error.data.status}; recovery is independent and the cleanup case remains open.`
-          :`Cleanup did not complete: ${reason}. The case remains open; retry after the blocker clears.`,
+          ?`Blocked — cleanup not started at ${new Date(error.data.attemptedAt||Date.now()).toLocaleString()}. No Todoist, Calendar, or DynamoDB cleanup was performed by this attempt. Fence operation ${error.data.operationId} is ${error.data.status||"unknown"}${error.data.phase?` (${error.data.phase})`:""}. ${error.data.reason||"The active profile fence prevents case-scoped admission."} The historical cleanup case remains open.`
+          :partial
+            ?`Partially completed — safe to retry. Stopped at ${error.data.phase||"an unrecorded phase"}: ${reason}. Verified progress so far: ${error.data.deletedComments||0} Todoist comment(s) removed and ${error.data.unlinkedEvents||0} Calendar link(s) removed. The durable checkpoint released this attempt for an idempotent retry; the case remains open.`
+            :`Blocked at ${error.data?.phase||"admission"}: ${reason}. The case remains open; retry after resolving the blocker.`,
           ...(fence?{recoveryUrl:error.data.recoveryUrl}:{} )});
       }
-    }finally{polling=false;window.clearInterval(progressTimer);actionLocks.current.delete(lockKey);if(version===selectionVersion.current)setBusy(false);}
+    }finally{polling=false;window.clearInterval(progressTimer);actionLocks.current.delete(lockKey);if(cleanupSelectionIsCurrent(version,selectionVersion.current))setBusy(false);}
   };
   const dismissAlert=async () => {
     if(!selected||selected.status!=="open")return;
@@ -750,6 +754,7 @@ function App() {
         {details?.unmappedDeletion?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Recorded provider items deleted — guarded cleanup pending</h3>
           <p>The exact Todoist and Calendar identities on this alert have been checked and are missing or cancelled. This does <strong>not</strong> prove that DynamoDB mappings, other recurring occurrences, repairs or shared audit evidence can be deleted.</p>
+          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This case can proceed during that fence only with a complete identity-disjointness inventory and isolated admission protocol; those proofs are not available here, so cleanup stays blocked and the erasure fence remains intact.</p>
           <p>Todoist IDs: <code>{details.unmappedDeletion.taskIds.join(", ")}</code></p>
           <p>Calendar event/master IDs: <code>{details.unmappedDeletion.eventIds.join(", ")}</code></p>
           <ol>
@@ -759,9 +764,9 @@ function App() {
             <li>Terminal conflict receipt — pending successful atomic cleanup</li>
           </ol>
           <button className="secondary" onClick={refreshAffected} disabled={busy}>{currentRecheckFeedback?.phase==="checking"?"Checking provider items…":<>Recheck this alert&apos;s provider items (read-only)</>}</button>
-          <button className="primary" onClick={cleanHistoricRecords} disabled={busy||!details||selected.status!=="open"}>{currentCleanupFeedback?.phase==="checking"?"Cleaning historic records…":"Clean up historic records"}</button>
+          <button className="primary" onClick={cleanHistoricRecords} disabled={busy||!details||selected.status!=="open"}>{currentCleanupFeedback?.phase==="checking"?"Cleanup request in progress…":"Clean up historic records"}</button>
           {currentRecheckFeedback&&<p className={["error","warning"].includes(currentRecheckFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentRecheckFeedback.message}</p>}
-          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}{currentCleanupFeedback.recoveryUrl&&<> <a href={currentCleanupFeedback.recoveryUrl}>Open independent erasure recovery</a></>}</p>}
+          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}{currentCleanupFeedback.recoveryUrl&&<> <a href={currentCleanupFeedback.recoveryUrl}>Open erasure operation and recovery status</a></>}</p>}
           <p>The worker rechecks this exact case using fresh provider reads and conditional state checks. No provider object is created or deleted by viewing or rechecking this alert; if another item or owner is live, the alert stays actionable.</p>
         </section>}
         {details?.unmappedDeletion?.state==="partial"&&<p className="notice" role="status">
@@ -776,6 +781,7 @@ function App() {
         {details?.deletionCleanup?.bothGone&&<section className="preview" role="status" aria-live="polite">
           <h3>Verified recurring deletion</h3>
           <p><strong>Todoist task deleted; Calendar series deleted — verifying residual sync state.</strong></p>
+          <p>An active erasure fence protects profile-wide owners, repairs, audit records and replay barriers. This case can proceed during that fence only with a complete identity-disjointness inventory and isolated admission protocol; those proofs are not available here, so cleanup stays blocked and the erasure fence remains intact.</p>
           <p>Task: <code>{details.deletionCleanup.taskIds.join(", ")}</code> · Calendar master: <code>{details.deletionCleanup.masterId}</code>
             {details.deletionCleanup.activeInstanceId&&<> · Active instance: <code>{details.deletionCleanup.activeInstanceId}</code></>}</p>
           <ol>
@@ -790,9 +796,9 @@ function App() {
             {details.deletionCleanup.staleLinks.map((link:any)=><span key={link.seriesId}> <code>{link.seriesId}</code> (active <code>{link.activeInstanceId||link.eventId}</code>)</span>)}</p>}
           {details.deletionCleanup.reason&&<p className="warning">{details.deletionCleanup.reason}</p>}
           <button className="secondary" onClick={refreshAffected} disabled={busy}>{currentRecheckFeedback?.phase==="checking"?"Checking provider items…":"Recheck deletion state (read-only)"}</button>
-          <button className="primary" onClick={cleanHistoricRecords} disabled={busy||!details||selected.status!=="open"}>{currentCleanupFeedback?.phase==="checking"?"Cleaning historic records…":"Clean up historic records"}</button>
+          <button className="primary" onClick={cleanHistoricRecords} disabled={busy||!details||selected.status!=="open"}>{currentCleanupFeedback?.phase==="checking"?"Cleanup request in progress…":"Clean up historic records"}</button>
           {currentRecheckFeedback&&<p className={["error","warning"].includes(currentRecheckFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentRecheckFeedback.message}</p>}
-          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}{currentCleanupFeedback.recoveryUrl&&<> <a href={currentCleanupFeedback.recoveryUrl}>Open independent erasure recovery</a></>}</p>}
+          {currentCleanupFeedback&&<p className={["error","warning"].includes(currentCleanupFeedback.phase)?"warning":"notice"} role="status" aria-live="polite">{currentCleanupFeedback.message}{currentCleanupFeedback.recoveryUrl&&<> <a href={currentCleanupFeedback.recoveryUrl}>Open erasure operation and recovery status</a></>}</p>}
           <p>No provider object will be recreated by this review page. The reconciliation worker independently re-verifies identities and conditionally retires obsolete state.</p>
         </section>}
         {details&&!details.deletionCleanup?.bothGone&&!details.unmappedDeletion?.bothGone&&(hasProviderIds||hasLiveIdentity)&&<div className="preview">

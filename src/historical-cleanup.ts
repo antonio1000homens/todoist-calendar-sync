@@ -20,9 +20,10 @@ export async function cleanVerifiedDeletedCase(input: {
 }): Promise<{ status: "complete" | "blocked"; phase: HistoricalCleanupPhase; blocker?: string; deletedComments?: number; unlinkedEvents?: number }> {
   const { item, store, engine } = input;
   let phase: HistoricalCleanupPhase = "checking_providers";
+  let deletedComments=0,unlinkedEvents=0;
   let terminal=false;
   const setPhase = async (value: HistoricalCleanupPhase) => { phase = value; await input.onPhase?.(value); };
-  const block = (blocker: string) => ({ status: "blocked" as const, phase, blocker });
+  const block = (blocker: string) => ({ status: "blocked" as const, phase, blocker, deletedComments, unlinkedEvents });
   if(item.status==="resolved"&&item.result?.startsWith("resolved_deleted"))return {status:"complete" as const,phase:"verified_complete" as const,deletedComments:0,unlinkedEvents:0};
   if (item.status !== "open" && item.status !== "dismissed") return block("case_not_actionable");
   const decisionType=item.decision?.type;
@@ -37,6 +38,8 @@ export async function cleanVerifiedDeletedCase(input: {
   const fingerprint=createHash("sha256").update(JSON.stringify([item.profile,[...taskIds].sort(),[...eventIds].sort()])).digest("hex");
   const owner=randomUUID();
   const existing=await store.getHistoricalCleanupCheckpoint(item.id);
+  deletedComments=Number(existing?.deletedComments)||0;
+  unlinkedEvents=Number(existing?.unlinkedEvents)||0;
   if(existing?.fingerprint&&existing.fingerprint!==fingerprint)return block("historical_cleanup_identity_changed");
   if(existing?.status==="complete")return {status:"complete",phase:"verified_complete",deletedComments:Number(existing.deletedComments)||0,unlinkedEvents:Number(existing.unlinkedEvents)||0};
   const checkpoint=(patch:Record<string,unknown>,release=false)=>store.saveHistoricalCleanupCheckpoint({
@@ -182,7 +185,6 @@ export async function cleanVerifiedDeletedCase(input: {
 
     await setPhase("clearing_todoist_comments");
     await checkpoint({phase});
-    let deletedComments = 0;
     try{
       for(const taskId of taskIds)deletedComments+=await deleteExactTaskProjectMappingComments(pair.todoist,initialComments,{
         profile:item.profile,projectId,taskId,eventIds,
@@ -243,7 +245,6 @@ export async function cleanVerifiedDeletedCase(input: {
 
     await setPhase("checking_calendar_links");
     await checkpoint({phase});
-    let unlinkedEvents = Number(existing?.unlinkedEvents)||0;
     for (const [eventId, original] of events) {
       if (!original || original.status === "cancelled") continue;
       const taskId = original.extendedProperties?.shared?.taskId;

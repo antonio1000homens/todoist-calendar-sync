@@ -10,9 +10,10 @@ function harness({event={id:eventId,status:"cancelled",htmlLink:"https://calenda
   caseItem=item,comments=[ownedComment()],taskExists=false,changedComment=false}={}){
   const calendarState=new Map(calendarEvents||[[eventId,event]]);
   let currentComments=[...comments],calendarUpdates=0,taskDeletes=0,eventDeletes=0,creations=0,closed=0;
+  let commentReadChanged=changedComment;
   const todoist={
     listProjectComments:async()=>currentComments.map(x=>({...x})),
-    getComment:async id=>{const found=currentComments.find(x=>x.id===id);if(!found)throw Object.assign(new Error("gone"),{status:404});return changedComment?{...found,content:"user changed this"}:{...found};},
+    getComment:async id=>{const found=currentComments.find(x=>x.id===id);if(!found)throw Object.assign(new Error("gone"),{status:404});return commentReadChanged?{...found,content:"user changed this"}:{...found};},
     deleteComment:async id=>{currentComments=currentComments.filter(x=>x.id!==id);},
     findLegacyTaskComment:async()=>undefined,
     deleteTask:async()=>{taskDeletes++;},createTask:async()=>{creations++;},
@@ -34,7 +35,7 @@ function harness({event={id:eventId,status:"cancelled",htmlLink:"https://calenda
     getRecurrenceLink:async(profile,seriesId)=>!recurrenceRemoved&&recurrenceLink?.profile===profile&&recurrenceLink.seriesId===seriesId?recurrenceLink:undefined,
     getCompletedCalendarProjectionByEvent:async()=>undefined,
   }};
-  return {input:{item:caseItem,store,engine},get state(){return{currentComments,calendarUpdates,taskDeletes,eventDeletes,creations,closed,calendarState,lastExpected};}};
+  return {input:{item:caseItem,store,engine},setCommentReadChanged:value=>{commentReadChanged=value;},get state(){return{currentComments,calendarUpdates,taskDeletes,eventDeletes,creations,closed,calendarState,lastExpected,checkpoint};}};
 }
 
 test("offline Work deleted-pair fixture clears exact comment and retires case without provider task/event deletion",async()=>{
@@ -62,6 +63,22 @@ test("changed app comment blocks closure and leaves the case open",async()=>{
   assert.equal(result.status,"blocked");
   assert.equal(result.blocker,"todoist_mapping_comment_changed");
   assert.equal(f.state.closed,0);
+});
+
+test("a blocked attempt releases its exact checkpoint for a safe retry",async()=>{
+  const f=harness({changedComment:true});
+  const first=await cleanVerifiedDeletedCase(f.input);
+  assert.equal(first.status,"blocked");
+  assert.equal(first.blocker,"todoist_mapping_comment_changed");
+  assert.equal(f.state.checkpoint.status,"retryable");
+  assert.equal(f.state.currentComments.length,1);
+  f.setCommentReadChanged(false);
+  const retry=await cleanVerifiedDeletedCase(f.input);
+  assert.equal(retry.status,"complete");
+  assert.equal(retry.deletedComments,1);
+  assert.equal(f.state.currentComments.length,0);
+  assert.equal(f.state.closed,1);
+  assert.equal(f.state.taskDeletes+f.state.eventDeletes+f.state.creations,0);
 });
 
 test("unrelated case types cannot use historical cleanup even when provider IDs are present",async()=>{

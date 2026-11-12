@@ -50,7 +50,8 @@ function LocalResult({result}:{result?:ActionResult}) {
 }
 
 export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
-  const [operationId,setOperationId]=useState("");
+  const initialOperationId=useRef(new URLSearchParams(location.search).get("erasureOperation")||"").current;
+  const [operationId,setOperationId]=useState(initialOperationId);
   const [operation,setOperation]=useState<Operation>();
   const [operationAt,setOperationAt]=useState<string>();
   const [preview,setPreview]=useState<any>(),[inspectionAt,setInspectionAt]=useState<string>();
@@ -109,11 +110,38 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
         setPostWriteAssessment(terminalPostWriteAssessment(result.operation));
         setPostWriteAt(result.operation?.postWriteCompletion?now():undefined);
         setRecoveryStatus(result.operation?.recoveryStatus);setRecoveryAt(undefined);
+        if(initialOperationId===id&&!result.operation?.postWriteCompletion){
+          const version=generation.current;
+          void api("erasure-postwrite-recoveries/"+encodeURIComponent(id)).then(postWrite=>{
+            if(version!==generation.current)return;
+            setPostWriteAssessment(postWrite.assessment);setPostWriteAt(now());
+            const assessment=postWrite.assessment;
+            const message=assessment?.classification==="completed"
+              ?"Verified post-write completion is complete; no provider deletion was replayed."
+              :assessment?.stateCleanupPending
+                ?"Automatic post-write state cleanup is pending on the existing watchdog. This read-only inspection does not confirm a worker is currently running."
+                :assessment?.completionEligible
+                  ?"Automatic post-write completion is eligible; the existing watchdog will finish it without another approval."
+                  :`Automatic post-write completion is blocked: ${(assessment?.completionBlockers||assessment?.blockers||[]).join("; ")||"the operation does not meet the verified post-write conditions."}`;
+            setResults(value=>({...value,inspectPostWrite:{action:actionNames.inspectPostWrite,
+              mode:"Read-only",at:now(),message,failed:false}}));
+          }).catch(error=>{
+            if(version!==generation.current)return;
+            setResults(value=>({...value,inspectPostWrite:{action:actionNames.inspectPostWrite,
+              mode:"Read-only",at:now(),message:messageOf(error,"Post-write eligibility could not be verified."),failed:true}}));
+          });
+        }
         return result.operation?.postWriteCompletion
           ?"Verified post-write cleanup is complete. The original tombstone remains active and no provider delete was replayed."
           :"Operation record loaded. No inspection, recovery execution or provider state changed.";
       },error=>messageOf(error,"Operation lookup failed. No state changed."));
   };
+  useEffect(()=>{
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(initialOperationId))return;
+    const section=document.getElementById("erasure-recovery");
+    if(section instanceof HTMLDetailsElement)section.open=true;
+    lookup();
+  },[]);
   const refresh=()=>{
     if(!operation||busy)return;
     const id=operation.operationId;
@@ -376,9 +404,9 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
           {preview&&!preview.allowed&&!preview.calendarDriftReview?.candidateForSeparateApproval&&
             <p>Recovery confirmation is not offered while the independent safety guards are blocked.</p>}
         </section>
-        <details className="recovery-scope recovery-postwrite">
+        <details className="recovery-scope recovery-postwrite" open={Boolean(postWriteAssessment)}>
           <summary>5. Post-write evidence and automatic completion</summary>
-          <p>Inspection is read-only. The existing erasure watchdog automatically completes a fully verified operation: it restores only the originally enabled mappings, then atomically removes the operation-owned fence. It never repeats a Todoist or Calendar delete and does not require a separate per-operation signoff.</p>
+          <p>Inspection is read-only. The existing erasure watchdog automatically completes a fully verified post-write operation: it restores only the originally enabled mappings, then atomically removes the operation-owned fence. It never repeats a Todoist or Calendar delete and does not require a separate per-operation signoff. An active fence by itself does not establish eligibility; inspect the evidence below for eligibility or its concrete blockers.</p>
           <button className="secondary" disabled={busy} onClick={inspectPostWrite}>Inspect post-write evidence</button>
           {pending==="inspectPostWrite"&&<p role="status" aria-live="polite">Reading exact post-write evidence only…</p>}
           <LocalResult result={results.inspectPostWrite}/>
@@ -390,7 +418,7 @@ export function ErasureRecoveryPanel({api}:{api:ErasureApi}){
                 <p>Classification: <strong>{postWriteAssessment.classification?.replaceAll("_"," ")}</strong> · profile {postWriteAssessment.profile} · automatic completion: <strong>{postWriteAssessment.stateCleanupPending?"state cleanup pending":postWriteAssessment.completionEligible?"eligible":"blocked"}</strong></p>
                 <p>Write evidence recorded: {postWriteAssessment.evidence?.originalProviderWriteIndicated?"yes":"no"} · exact targets recorded: {postWriteAssessment.evidence?.exactTodoistAndCalendarTargetsRecorded?"yes":"no"} · active fence owned: {postWriteAssessment.evidence?.matchingFence?"yes":"no"} · leases drained: {postWriteAssessment.evidence?.leasesDrained?"yes":"no"} · tombstone verified: {postWriteAssessment.evidence?.projectTombstonePresent?"yes":"no"} · deletion checkpoints complete: {postWriteAssessment.evidence?.deletionCheckpointComplete?"yes":"no"}</p>
                 {postWriteAssessment.stateCleanupPending?
-                  <p role="status">The exact provider targets are already absent. The existing watchdog is continuing only the original DynamoDB state checkpoint (including eligible delivery-receipt scrubbing), up to ten recorded entries per run. It will not replay a Todoist or Calendar delete. Refresh to see the next checkpoint; uncertain attempts or inventory drift remain fenced.</p>
+                  <p role="status">The exact provider targets are already absent. The original DynamoDB state checkpoint is pending for the existing watchdog; this read-only inspection does not confirm that a worker is currently running. The watchdog processes only recorded state entries (including eligible delivery-receipt scrubbing), up to ten per run, and never replays a Todoist or Calendar delete. Re-inspect after the next scheduled watchdog run; uncertain attempts or inventory drift remain fenced.</p>
                   :postWriteAssessment.completionEligible?
                     <p role="status">All operation-scoped evidence is satisfied. The existing scheduled watchdog will finish cleanup automatically; no new queue or per-operation approval is needed.</p>
                     :<p className="warning">The operation remains fenced. The watchdog will not restore sync or release the fence while any completion condition is uncertain.</p>}

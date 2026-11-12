@@ -67,12 +67,14 @@ test("all review, reconciliation, and erasure writers hold the profile admission
   const recordWrite=label=>{fenceAttempts++;assert.equal(tryFence(),false,`${label}: a competing fence must wait for the lease`);observed.push(label);};
   const fenceAfterRelease=()=>{assert.equal(tryFence(),true,"the fence may proceed after the writer releases its lease");fenceInstalled=false;};
   const caseItem={id:"case-lease",profile:"home",status:"open",createdAt:"2026-10-23T00:00:00.000Z",updatedAt:"2026-10-23T00:00:00.000Z"};
+  let checkpointStatus;
   const preview={id:"preview-lease",actor:{subject:"access-user-123",email:"review-owner@example.test"},
     intent:{caseId:"case-lease",profile:"home",action:"exclude"},expiresAt:Math.floor(Date.now()/1000)+600};
   const operation={id:"operation-lease",preview,actor:preview.actor,status:"queued",attempt:0,steps:{}};
   const store={getCase:async()=>caseItem,dismissCase:async()=>{recordWrite("dismiss");return {...caseItem,status:"dismissed"};},
     getPreview:async()=>preview,submit:async()=>{recordWrite("submit");return operation;},
     getOperation:async()=>operation,saveOperation:async()=>{recordWrite("resume-save");},
+    getHistoricalCleanupCheckpoint:async()=>checkpointStatus,
     countActionableCases:async()=>0};
   const exact={operationId:"erase-lease",profile:"home",target:{taskId:"task-lease",deleteCalendar:false},
     selectedActions:{deleteTodoist:true,deleteCalendar:false},providerSnapshotFingerprint:"a".repeat(64),
@@ -107,11 +109,40 @@ test("all review, reconciliation, and erasure writers hold the profile admission
   const cleaned=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-test"},{}),deps));
   assert.equal(cleaned.status,200);assert.equal(cleanupCalls,1);assert.equal(active.size,0);fenceAfterRelease();
-  deps.inspectErasureFence=async()=>({fence:{state:"active",operationId:"unknown"},leases:[]});
+  erasureStore.get=async id=>({operationId:id,status:"review_required",target:{taskId:"task-overlap",eventId:"event-fence"},
+    lifecycle:{phase:"delete"},inventory:[{type:"provider_identity",taskId:"task-fence"}]});
+  deps.inspectErasureFence=async()=>({fence:{state:"active",operationId:"erase-op-123"},
+    leases:[{pk:"ERASURE_LEASE#home",owner:"active-synthetic-lease"}]});
+  caseItem.taskId="task-overlap";caseItem.eventId="event-fence";
+  const beforeFencedAttempt=observed.length;
   const fenced=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
     ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-test-2"},{}),deps));
   assert.equal(fenced.status,409);assert.equal(fenced.body.blocker,"separate_erasure_fence_active");
-  assert.equal(fenced.body.recoveryUrl,"/review/#erasure-recovery");assert.equal(cleanupCalls,1);assert.equal(active.size,0);fenceAfterRelease();
+  assert.equal(fenced.body.outcome,"blocked_cleanup_not_started");
+  assert.equal(fenced.body.cleanupStarted,false);assert.equal(fenced.body.cleanupWritesPerformed,false);
+  assert.ok(Number.isFinite(Date.parse(fenced.body.attemptedAt)));
+  assert.equal(fenced.body.operationId,"erase-op-123");
+  assert.equal(fenced.body.status,"review_required");assert.equal(fenced.body.phase,"delete");
+  assert.match(fenced.body.reason,/complete inventory and isolated admission protocol/);
+  assert.equal(fenced.body.recoveryUrl,"/review/?erasureOperation=erase-op-123#erasure-recovery");assert.equal(cleanupCalls,1);
+  assert.equal(observed.length,beforeFencedAttempt,"pre-admission 409 performs no state/queue/provider cleanup writes");
+  assert.equal(active.size,0);fenceAfterRelease();
+  // A complete-looking disjoint pair is still rejected: the server has no
+  // identity-scoped admission proof that can safely bypass the profile fence.
+  caseItem.taskId="task-disjoint";caseItem.eventId="event-disjoint";
+  const disjoint=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-disjoint"},{}),deps));
+  assert.equal(disjoint.status,409);assert.equal(disjoint.body.outcome,"blocked_cleanup_not_started");
+  assert.equal(disjoint.body.cleanupWritesPerformed,false);assert.equal(cleanupCalls,1);
+  assert.equal(observed.length,beforeFencedAttempt,"apparently disjoint identity still performs zero writes behind the fence");
+  deps.inspectErasureFence=async()=>({fence:undefined,leases:[]});
+  deps.cleanVerifiedDeletedCase=async()=>({status:"blocked",phase:"checking_calendar_links",blocker:"calendar_link_removal_unverified",deletedComments:2,unlinkedEvents:0});
+  checkpointStatus={status:"retryable"};
+  const partial=await jsonResponse(await handler(event("/review/api/cases/case-lease/historical-cleanup","POST",{
+    ...headers,origin:"https://calendar-sync.alf-broadcast.co.uk","idempotency-key":"historic-cleanup-retry"},{}),deps));
+  assert.equal(partial.status,409);assert.equal(partial.body.outcome,"partially_completed_retryable");
+  assert.equal(partial.body.retryable,true);assert.equal(partial.body.deletedComments,2);
+  assert.equal(cleanupCalls,1,"the blocked cleanup mock must not run during the fenced attempt");
   delete deps.inspectErasureFence;delete deps.cleanVerifiedDeletedCase;
   let caseLookups=0,dismissWrites=0;
   store.getCase=async()=>++caseLookups===1?caseItem:{...caseItem,profile:"work"};

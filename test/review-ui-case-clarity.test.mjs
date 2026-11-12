@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { providerLink } from "../review-ui/item-identity.mjs";
+import { claimHistoricalCleanup, cleanupSelectionIsCurrent } from "../review-ui/historical-cleanup-flow.mjs";
 import { calendarReviewSnapshot } from "./helpers/review-provider-snapshot.mjs";
 import { caseUrl, caseIdentityState, recordedProviderState, dispositionGuidance, snapshotRelationship, groupAffectedSnapshots, providerSnapshotLink } from "../review-ui/case-url.mjs";
 
@@ -18,6 +19,29 @@ test("review case selection writes deep links and browser back/forward reloads t
   assert.match(source,/window\.addEventListener\("popstate",onPopState\)/);
   assert.match(source,/new URLSearchParams\(location\.search\)\.get\("case"\)/);
   assert.match(source,/api\(`cases\/\$\{encodeURIComponent\(caseId\)\}`\)\.then\(data=>/);
+});
+
+test("historical cleanup fence result says no cleanup started and deep-links to the exact erasure operation",async()=>{
+  const source=await readFile(new URL("../review-ui/main.tsx",import.meta.url),"utf8");
+  const recovery=await readFile(new URL("../review-ui/erasure-recovery-panel.tsx",import.meta.url),"utf8");
+  assert.match(source,/No Todoist, Calendar, or DynamoDB cleanup was performed by this attempt/);
+  assert.match(source,/Blocked — cleanup not started/);
+  assert.match(source,/Open erasure operation and recovery status/);
+  assert.match(recovery,/get\("erasureOperation"\)/);
+  assert.match(recovery,/lookup\(\)/);
+  assert.match(recovery,/initialOperationId===id&&!result\.operation\?\.postWriteCompletion/);
+  assert.match(recovery,/Automatic post-write completion is eligible/);
+  assert.match(recovery,/does not confirm a worker is currently running/);
+  assert.match(recovery,/active fence by itself does not establish eligibility/);
+  assert.match(recovery,/Automatic post-write completion is blocked/);
+});
+
+test("historical cleanup suppresses duplicate clicks and stale selection responses",()=>{
+  const locks=new Set();
+  assert.equal(claimHistoricalCleanup(locks,"historic-cleanup:work:case-1"),true);
+  assert.equal(claimHistoricalCleanup(locks,"historic-cleanup:work:case-1"),false);
+  assert.equal(cleanupSelectionIsCurrent(7,7),true);
+  assert.equal(cleanupSelectionIsCurrent(7,8),false);
 });
 
 test("required affected-item disposition is shown only after preview validation requests it",async()=>{
