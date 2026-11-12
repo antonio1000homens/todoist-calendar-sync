@@ -1902,8 +1902,10 @@ export class ManualInterventionService {
     state: StateRepository,
     resolution: string,
     slackUserId?: string,
+    silent = false,
   ): Promise<void> {
     await this.store.finish(decision.decisionId, "resolved", resolution, slackUserId);
+    if (silent) return;
     const resolvedBy = slackUserId === "AUTO_POLICY" ? "saved intervention policy" : slackUserId ? `<@${slackUserId}>` : "operator";
     const text = decision.type === "todoist_owned_recurrence_task_deleted" && resolution === "delete_calendar_series"
       ? `✅ Todoist recurrence deletion completed. The Todoist task is absent, the mapped Calendar series was deleted (or was already absent), and the sync mapping was removed.\n*Todoist task:* \`${decision.taskId || "unknown"}\`\n*Calendar series:* \`${decision.masterEventId || decision.eventId || "unknown"}\`\n*Series ID:* \`${decision.seriesId || "unknown"}\`\nIf this deletion was unintended, recreate the task and Calendar series manually.`
@@ -2509,10 +2511,20 @@ export class ManualInterventionService {
 
     if (decision.type === "todoist_owned_recurrence_task_deleted") {
       if (action === "delete_calendar_series") {
-        await pair.calendar.deleteEvent(mapping.masterEventId || mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
+        let seriesAlreadyAbsent = false;
+        try { await pair.calendar.deleteEvent(mapping.masterEventId || mapping.eventId); }
+        catch (error) {
+          if (!providerNotFound(error)) throw error;
+          seriesAlreadyAbsent = true;
+        }
         await state.deleteMapping(mapping);
         if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
-        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
+        // Auto-policy decisions that find the exact mapped Calendar series
+        // already absent need no Slack alert. Keep the durable decision
+        // receipt and exact mapping/link cleanup, but don't post the alert
+        // title as though an operator action were pending.
+        return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId,
+          seriesAlreadyAbsent && slackUserId === "AUTO_POLICY");
       }
       if (action === "keep_calendar_unlinked") {
         await state.deleteMapping(mapping);
