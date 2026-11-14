@@ -2328,11 +2328,52 @@ export class Synchronizer {
       // do not send a second item_update (which could skip an occurrence).
       const alreadyAdvanced = Boolean(currentCalendarRecurrence && currentRecurringTask
         && startsMatch(next, currentRecurringTask));
-      const nextTask = alreadyAdvanced && currentRecurringTask
-        ? currentRecurringTask
-        : currentCalendarRecurrence && currentRecurringTask
-          ? await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next))
-          : await todoist.upsertTask(toTodoistTask(next), undefined, calendarReplaySourceIds(next));
+      let nextTask: TodoistTask;
+      if (alreadyAdvanced && currentRecurringTask) {
+        nextTask = currentRecurringTask;
+      } else if (currentCalendarRecurrence && currentRecurringTask) {
+        nextTask = await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next));
+      } else {
+        const desired = toTodoistTask(next);
+        const projectId = profiles[delivery.profile].todoistProjectId;
+        const candidates = (await todoist.listTasks()).filter((candidate) => candidate.id !== task!.id
+          && candidate.project_id === projectId && !candidate.due?.is_recurring
+          && hasCanonicalState(next, candidate));
+        if (candidates.length > 1) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_successor_ambiguous", {
+            seriesId: mapping.seriesId, eventId: next.id, candidateTaskIds: candidates.map(({ id }) => id),
+          });
+        }
+        if (candidates.length === 1) {
+          nextTask = candidates[0];
+        } else {
+          const receivedAt = Date.parse(delivery.receivedAt);
+          if (!Number.isFinite(receivedAt) || Date.now() - receivedAt > 23 * 60 * 60_000) {
+            return this.state.audit(delivery.profile, "calendar_recurrence_successor_creation_uncertain", {
+              seriesId: mapping.seriesId, eventId: next.id, taskId: task.id,
+              reason: "idempotency_window_expired_without_verified_successor",
+            });
+          }
+          const requestKey = JSON.stringify([delivery.profile, mapping.seriesId, mapping.masterEventId, task.id,
+            next.id, eventStart(next)]);
+          nextTask = await todoist.createTaskOnce(desired, requestKey, calendarReplaySourceIds(next, mapping.masterEventId));
+        }
+        const owner = await this.state.getMappingByTaskAnyProfile(nextTask.id);
+        if (owner) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_successor_ownership_conflict", {
+            seriesId: mapping.seriesId, eventId: next.id, taskId: nextTask.id,
+            ownerProfile: owner.profile, mappedEventId: owner.eventId,
+          });
+        }
+        const readbackTask = await todoist.getTask(nextTask.id);
+        if (readbackTask.project_id !== projectId || readbackTask.due?.is_recurring
+          || !hasCanonicalState(next, readbackTask)) {
+          return this.state.audit(delivery.profile, "calendar_recurrence_successor_readback_mismatch", {
+            seriesId: mapping.seriesId, eventId: next.id, taskId: nextTask.id,
+          });
+        }
+        nextTask = readbackTask;
+      }
       if (alreadyAdvanced) {
         await this.state.audit(delivery.profile, "calendar_owned_completion_provider_already_advanced", {
           seriesId: mapping.seriesId, taskId: task.id, nextEventId: next.id,
@@ -2383,10 +2424,11 @@ export class Synchronizer {
         link: recurrenceLink(nextMapping, "calendar"),
       });
       if (!advanced) {
-        return this.state.audit(delivery.profile, "calendar_recurrence_mapping_advance_deferred", {
+        await this.state.audit(delivery.profile, "calendar_recurrence_mapping_advance_deferred", {
           seriesId: mapping.seriesId, taskId: task.id, eventId: mapping.eventId,
           reason: "mapping_or_recurrence_link_changed",
         });
+        throw new Error("Calendar recurrence mapping advance conflicted; retain completion for retry");
       }
       await this.state.recordMutation(delivery.profile);
       return this.state.audit(delivery.profile, "calendar_recurrence_completed_rolled", {
