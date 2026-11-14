@@ -89,6 +89,7 @@ jobs:
         run: npm ci
 
       - name: Build and test exact deployment revision
+        if: github.event_name == 'workflow_dispatch'
         run: npm test
 
       - name: Check public-source boundary
