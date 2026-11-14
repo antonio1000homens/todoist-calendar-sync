@@ -64,3 +64,31 @@ test("Calendar recurrence advance transaction conflict is retryable and reported
 
   assert.equal(await new StateRepository().advanceCalendarSeriesMapping(fixture), false);
 });
+
+test("Calendar recurrence advance atomically transfers task indexes to a new successor ID", async (t) => {
+  const fixture = advanceFixture();
+  fixture.mapping.taskId = "task-successor";
+  fixture.link.taskId = "task-successor";
+  let transaction;
+  t.mock.method(documentClient, "send", async (command) => {
+    transaction = command.input.TransactItems;
+    return {};
+  });
+
+  assert.equal(await new StateRepository().advanceCalendarSeriesMapping(fixture), true);
+  const operations = transaction.flatMap((item) => Object.values(item));
+  const keys = operations.map((operation) => `${operation.Key?.pk || operation.Item?.pk}|${operation.Key?.sk || operation.Item?.sk || ""}`);
+  assert.equal(new Set(keys).size, keys.length, "each transaction item is addressed once");
+  assert.ok(transaction.some((item) => item.Delete?.Key.pk === "TASK#home#task-1"
+    && /updatedAt = :updated/.test(item.Delete.ConditionExpression)));
+  assert.ok(transaction.some((item) => item.Delete?.Key.pk === "TASKOWNER#task-1"
+    && /updatedAt = :updated/.test(item.Delete.ConditionExpression)));
+  assert.ok(transaction.some((item) => item.Put?.Item.pk === "TASK#home#task-successor"
+    && item.Put.ConditionExpression === "attribute_not_exists(pk)"));
+  assert.ok(transaction.some((item) => item.Put?.Item.pk === "TASKOWNER#task-successor"
+    && item.Put.ConditionExpression === "attribute_not_exists(pk)"));
+  assert.ok(transaction.some((item) => item.Put?.Item.pk === "RECURRENCE#home#series-1"
+    && item.Put.Item.taskId === "task-successor"
+    && item.Put.ExpressionAttributeValues[":task"] === "task-1"));
+  assert.ok(transaction.some((item) => item.ConditionCheck?.Key.pk === "PROJECTION#home#TASK#task-successor"));
+});

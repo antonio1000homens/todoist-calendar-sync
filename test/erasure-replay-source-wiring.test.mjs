@@ -79,6 +79,6 @@ test("production Todoist creation paths must supply checked Calendar provenance"
       repairs++;
     }
   }
-  assert.ok(creators>=12,"Expected normal and manual Calendar-origin task creation paths");
-  assert.ok(repairs>=3,"Expected direct and delegated idempotent task creation paths");
+  assert.ok(creators>=11,"Expected normal and manual Calendar-origin task creation paths");
+  assert.ok(repairs>=4,"Expected direct and delegated idempotent task creation paths");
 });

@@ -106,6 +106,7 @@ class FakeState {
     if (this.mappingsByEvent.get(previous.eventId)?.taskId !== previous.taskId
       || this.links.find((item) => item.profile === previous.profile && item.seriesId === previous.seriesId)?.eventId !== previous.eventId) return false;
     this.mappingsByEvent.delete(previous.eventId);
+    if (previous.taskId !== mapping.taskId) this.mappingsByTask.delete(previous.taskId);
     this.storeMapping(mapping);
     this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
     this.links.push(structuredClone(link));
@@ -148,6 +149,7 @@ class FakeState {
 function fakeClients(state, instances, link, masterDelta, recurrenceString, projectComments = []) {
   const failures = {};
   const tasks = new Map();
+  const createdByRequest = new Map();
   if (link) {
     const active = instances.find((item) => item.id === link.activeInstanceId);
     if (active) {
@@ -210,6 +212,16 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString, proj
         tasks.set(id, task);
         todoistUpserts.push({ id, existingId, payload: structuredClone(payload) });
         state.operations.push({ action: "upsert-task", id, existingId });
+        return structuredClone(task);
+      },
+      async createTaskOnce(payload, requestKey) {
+        if (createdByRequest.has(requestKey)) return structuredClone(tasks.get(createdByRequest.get(requestKey)));
+        const id = `created-${++created}`;
+        const task = { id, project_id: profiles[PROFILE].todoistProjectId, ...structuredClone(payload) };
+        tasks.set(id, task);
+        createdByRequest.set(requestKey, id);
+        todoistUpserts.push({ id, requestKey, payload: structuredClone(payload) });
+        state.operations.push({ action: "create-task-once", id, requestKey });
         return structuredClone(task);
       },
       async deleteTask(id) { todoistDeletes.push(id); tasks.delete(id); state.operations.push({ action: "delete-task", id }); },
@@ -595,6 +607,32 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
   assert.equal(state.links[0].activeInstanceId, "day-18");
   assert.equal(state.links[0].completedThroughOriginalStart, "2099-09-17");
   assert.equal(state.links[0].calendarProgressVersion, 1);
+});
+
+test("Calendar-owned one-off completion transfers to one idempotently created successor across mapping retry", async () => {
+  const completed = instance("oneoff-day-17", "2099-09-17T14:00:00Z", "2099-09-17T14:15:00Z");
+  const successor = instance("oneoff-day-24", "2099-09-24T14:00:00Z", "2099-09-24T14:15:00Z");
+  const link = linkFor(completed, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [completed, successor], link);
+  const delivery = completedDelivery("complete-oneoff", link.taskId, completed, "2099-09-17T15:00:00Z");
+  state.failAdvance = true;
+  const first = new Synchronizer(state, undefined, async () => clients);
+  await assert.rejects(first.process(delivery), /injected recurrence mapping transaction failure/);
+  assert.equal(state.links[0].taskId, link.taskId, "the old mapping remains until its transaction succeeds");
+  assert.equal(clients.todoistUpserts.length, 1, "the provider successor was created once before the injected failure");
+  assert.equal(state.completedProjections.some((projection) => projection.eventId === completed.id), true);
+
+  state.failAdvance = false;
+  const retry = new Synchronizer(state, undefined, async () => clients);
+  await retry.process(delivery);
+  assert.equal(clients.todoistUpserts.length, 1, "retry reuses the idempotent successor");
+  assert.equal(state.links[0].taskId, clients.todoistUpserts[0].id);
+  assert.equal(state.links[0].activeInstanceId, successor.id);
+  assert.equal(state.links[0].completedThroughOriginalStart, completed.originalStartTime.dateTime);
+  assert.equal(state.mappingsByTask.has(link.taskId), false);
+  assert.equal(state.mappingsByTask.get(clients.todoistUpserts[0].id).eventId, successor.id);
+  assert.equal(state.completedProjections.some((projection) => projection.eventId === completed.id), true);
 });
 
 test("multiple Calendar-owned completions advance the watermark monotonically and stale completion replays cannot roll it back", async () => {
