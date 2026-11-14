@@ -1074,7 +1074,8 @@ export class StateRepository {
 
   /**
    * Atomically bind a Calendar-owned recurring task to its next occurrence,
-   * commit completion progress, and remove the previous occurrence index.
+   * commit completion progress, and atomically replace the prior occurrence
+   * and task indexes. A one-off Todoist completion may produce a new task ID.
    * Provider advancement must already have been read back and verified.
    */
   async advanceCalendarSeriesMapping(input: {
@@ -1086,7 +1087,8 @@ export class StateRepository {
     const { previous, mapping, expectedLink, link } = input;
     await assertReplayAdmissionIfEnabled(mappingReplayIdentity(previous));
     await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
-    if (previous.profile !== mapping.profile || previous.taskId !== mapping.taskId
+    const taskChanged = previous.taskId !== mapping.taskId;
+    if (previous.profile !== mapping.profile
       || previous.eventId === mapping.eventId || previous.recurrenceOwner !== "calendar"
       || mapping.recurrenceOwner !== "calendar" || !previous.seriesId
       || !previous.masterEventId || previous.seriesId !== mapping.seriesId || previous.masterEventId !== mapping.masterEventId
@@ -1121,18 +1123,41 @@ export class StateRepository {
         Item: { ...mapping, ...key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"), ...mappingEventLookupAttributes(mapping) },
         ConditionExpression: "attribute_not_exists(pk)",
       } },
-      { Put: {
-        TableName: table,
-        Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
-        ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: oldValues,
-      } },
-      { Put: {
-        TableName: table,
-        Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
-        ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: oldValues,
-      } },
+      ...(taskChanged ? [
+        { Delete: {
+          TableName: table, Key: key(`TASK#${previous.profile}#${previous.taskId}`, "MAP"),
+          ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldValues,
+        } },
+        { Delete: {
+          TableName: table, Key: key(`TASKOWNER#${previous.taskId}`, "MAP"),
+          ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldValues,
+        } },
+        { Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+          ConditionExpression: "attribute_not_exists(pk)",
+        } },
+        { Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+          ConditionExpression: "attribute_not_exists(pk)",
+        } },
+      ] : [
+        { Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"), ...mappingLookupAttributes(mapping) },
+          ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldValues,
+        } },
+        { Put: {
+          TableName: table,
+          Item: { ...mapping, ...key(`TASKOWNER#${mapping.taskId}`, "MAP"), ...mappingOwnerLookupAttributes(mapping) },
+          ConditionExpression: sameOld, ExpressionAttributeNames: { "#profile": "profile" },
+          ExpressionAttributeValues: oldValues,
+        } },
+      ]),
       { Put: {
         TableName: table,
         Item: { ...link, ...key(`RECURRENCE#${link.profile}#${link.seriesId}`), ...recurrenceLookupAttributes(link) },
@@ -1152,13 +1177,10 @@ export class StateRepository {
         ConditionExpression: "attribute_not_exists(pk)",
       } },
     ];
-    for (const profile of allProfiles) {
-      if (profile === mapping.profile) continue;
-      tx.push({ ConditionCheck: {
-        TableName: table, Key: key(`TASK#${profile}#${mapping.taskId}`, "MAP"),
-        ConditionExpression: "attribute_not_exists(pk)",
-      } });
-    }
+    for (const profile of allProfiles) if (profile !== mapping.profile) tx.push({ ConditionCheck: {
+      TableName: table, Key: key(`TASK#${profile}#${mapping.taskId}`, "MAP"),
+      ConditionExpression: "attribute_not_exists(pk)",
+    } });
     try {
       await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
       return true;

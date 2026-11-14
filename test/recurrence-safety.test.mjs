@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { profiles } from "../dist/config.js";
 import { Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 
@@ -135,6 +136,7 @@ class FakeState {
     if (active?.eventId !== previous.eventId || recurrence?.eventId !== previous.eventId) return false;
     this.operations.push(`advance-mapping:${mapping.taskId}:${mapping.eventId}`);
     this.mappingsByEvent.delete(previous.eventId);
+    if (previous.taskId !== mapping.taskId) this.mappingsByTask.delete(previous.taskId);
     this.storeMapping(mapping);
     this.links = this.links.filter((item) => !(item.profile === link.profile && item.seriesId === link.seriesId));
     this.links.push(structuredClone(link));
@@ -192,6 +194,7 @@ class FakeState {
 
 function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvents = []) {
   let created = 0;
+  const createdByRequest = new Map();
   const calendarDeletes = [];
   const calendarUpserts = [];
   const todoistDeletes = [];
@@ -261,11 +264,21 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     },
     async upsertTask(payload, existingId) {
       const id = existingId || `created-${++created}`;
-      const stored = { id, ...structuredClone(payload), project_id: "home-project" };
+      const stored = { id, ...structuredClone(payload), project_id: profiles[PROFILE].todoistProjectId };
       state.operations.push(`upsert-task:${id}`);
       todoistUpserts.push({ id, payload: structuredClone(payload), existingId });
       tasks.set(id, stored);
       return stored;
+    },
+    async createTaskOnce(payload, requestKey) {
+      if (createdByRequest.has(requestKey)) return structuredClone(tasks.get(createdByRequest.get(requestKey)));
+      const id = `created-${++created}`;
+      const stored = { id, ...structuredClone(payload), project_id: profiles[PROFILE].todoistProjectId };
+      createdByRequest.set(requestKey, id);
+      tasks.set(id, stored);
+      todoistUpserts.push({ id, requestKey, payload: structuredClone(payload) });
+      state.operations.push(`create-task-once:${id}`);
+      return structuredClone(stored);
     },
     async updateTaskMetadata(id, metadata) {
       const current = tasks.get(id);
