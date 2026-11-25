@@ -341,8 +341,8 @@ function masterEvent() {
     summary: "Recurring reminder",
     description: "",
     iCalUID: SERIES,
-    start: { date: "2026-09-17" },
-    end: { date: "2026-09-18" },
+    start: { date: "2099-09-17" },
+    end: { date: "2099-09-18" },
     recurrence: ["RRULE:FREQ=DAILY;COUNT=2"],
   };
 }
@@ -462,7 +462,7 @@ for (const failure of ["calendarTimezone", "todoistTimeZone"]) {
   });
 }
 
-test("Calendar master re-anchor updates the same Todoist mirror once under repeated notifications", async () => {
+test("unsupported finite daily re-anchor preserves its existing mirror", async () => {
   const earlier = instance("day-17", "2099-09-17", "2099-09-18");
   const current = instance("day-18", "2099-09-18", "2099-09-19");
   const link = linkFor(current, { calendarProgressVersion: 1 });
@@ -483,11 +483,10 @@ test("Calendar master re-anchor updates the same Todoist mirror once under repea
   await sync.process({ ...delivery, id: "calendar-reanchor-duplicate" });
 
   assert.deepEqual(clients.todoistDeletes, []);
-  assert.equal(clients.todoistUpserts.length, 1);
-  assert.equal(clients.todoistUpserts[0].existingId, link.taskId);
-  assert.equal(clients.todoistUpserts[0].id, link.taskId);
-  assert.equal(state.links[0].activeInstanceId, "day-17");
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.links[0].activeInstanceId, current.id);
   assert.equal(state.links[0].calendarProgressVersion, 1);
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_rule_unsupported"));
 });
 
 test("a Home-owned recurrence mirrored to Antonio creates exactly one Todoist task", async () => {
@@ -503,8 +502,12 @@ test("a Home-owned recurrence mirrored to Antonio creates exactly one Todoist ta
     recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
   };
   const active = instance("home-active", "2099-09-02", "2099-09-03");
+  const finiteInstances = [active,
+    instance("home-next-1", "2099-09-09", "2099-09-10"),
+    instance("home-next-2", "2099-09-16", "2099-09-17"),
+    instance("home-next-3", "2099-09-23", "2099-09-24")];
   const homeState = new FakeState();
-  const homeClients = fakeClients(homeState, [active], undefined, master);
+  const homeClients = fakeClients(homeState, finiteInstances, undefined, master);
   const homeSync = new Synchronizer(homeState, undefined, async () => homeClients);
 
   await homeSync.process({
@@ -518,7 +521,7 @@ test("a Home-owned recurrence mirrored to Antonio creates exactly one Todoist ta
   });
 
   const antonioState = new FakeState();
-  const antonioClients = fakeClients(antonioState, [active], undefined, master);
+  const antonioClients = fakeClients(antonioState, finiteInstances, undefined, master);
   const antonioSync = new Synchronizer(antonioState, undefined, async () => antonioClients);
   await antonioSync.process({
     id: "antonio-accepted-home-event",

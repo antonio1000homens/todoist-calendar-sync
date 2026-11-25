@@ -737,7 +737,7 @@ export class Synchronizer {
     return latest;
   }
 
-  private mappingFromCalendarCorrelation(profile: Profile, event: CalendarEvent): Mapping | undefined {
+  mappingFromCalendarCorrelation(profile: Profile, event: CalendarEvent): Mapping | undefined {
     const shared = event.extendedProperties?.shared;
     if (!shared) return undefined;
     const taskId = shared.syncTaskId || shared.taskId;
@@ -2189,6 +2189,11 @@ export class Synchronizer {
         seriesId, masterEventId: master.id, taskId: task.id, reason: "existing_native_recurrence_cannot_be_safely_flattened",
       });
     }
+    // Keep any existing mirror intact while the rule is unsupported. Never
+    // project an unsupported series as a one-off, even when its old mapped
+    // task is missing: that would silently flatten recurrence and create a
+    // false mirror that cannot be advanced correctly.
+    if (!calendarRecurrence) return;
     if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id }, !existing)) {
       return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
     }
@@ -2231,17 +2236,19 @@ export class Synchronizer {
       }
     }
     const nextTask = await todoist.upsertTask(
-      calendarRecurrence ? calendarOwnedRecurringTaskPayload(active, calendarRecurrence, calendarTimeZone) : toTodoistTask(active), task?.id,
+      calendarOwnedRecurringTaskPayload(active, calendarRecurrence, calendarTimeZone), task?.id,
       calendarReplaySourceIds(active, master.id),
     );
-    const readback = calendarRecurrence ? calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence, calendarTimeZone) : undefined;
-    if (readback && !readback.matches) {
+    const readback = calendarOwnedRecurringTaskReadback(nextTask, active, calendarRecurrence, calendarTimeZone);
+    if (!readback.matches) {
       if (!task) {
         await todoist.deleteTask(nextTask.id).catch((error: unknown) => {
           if (Number((error as { status?: number }).status) !== 404) throw error;
         });
       } else {
-        await todoist.upsertTask(toTodoistTask(active), task.id);
+        // Restore the prior Todoist payload, including its original native
+        // due string, instead of flattening a failed recurring update.
+        await todoist.upsertTask(task, task.id);
       }
       return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,

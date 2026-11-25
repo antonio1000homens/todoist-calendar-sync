@@ -1084,7 +1084,9 @@ export class SnapshotReconciler {
     }
 
     if (existing && existing.status !== "cancelled") {
-      const eventMapping = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
+      const eventMapping = await this.providerMappingByEvent(profile, existing.id, clients.todoist)
+        || new Synchronizer(this.state, undefined, async () => clients)
+          .mappingFromCalendarCorrelation(profile, existing);
       if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
           taskId: task.id, eventId: existing.id, ownerTaskId: eventMapping.taskId,
@@ -1094,35 +1096,12 @@ export class SnapshotReconciler {
       // Tombstones take precedence over orphaned indexes. Delegate to the
       // established timestamp/reset policy instead of reviving an old link.
       if (eventMapping?.taskId === task.id && !tombstone) {
-        // Never invent a recurrence link or progression state. A missing or
-        // inconsistent link needs an explicit ownership decision.
-        const link = eventMapping.recurrenceOwner && eventMapping.seriesId
-          ? await this.providerRecurrenceLink(profile, eventMapping.seriesId, clients)
-          : undefined;
-        if (eventMapping.recurrenceOwner && (!link
-          || link.owner !== eventMapping.recurrenceOwner
-          || link.taskId !== task.id || link.eventId !== existing.id
-          || link.profile !== eventMapping.profile || link.seriesId !== eventMapping.seriesId
-          || link.masterEventId !== eventMapping.masterEventId
-          || link.activeInstanceId !== eventMapping.activeInstanceId
-          || link.originalStart !== eventMapping.originalStart
-          || link.activeEffectiveStart !== eventMapping.activeEffectiveStart
-          || link.calendarProgressVersion !== eventMapping.calendarProgressVersion
-          || link.completedThroughOriginalStart !== eventMapping.completedThroughOriginalStart)) {
-          await this.state.audit(profile, "todoist_snapshot_reconcile_recurrence_link_conflict", {
-            taskId: task.id, eventId: existing.id, seriesId: eventMapping.seriesId,
-          });
-          return "conflict";
-        }
-        const restored = await this.state.restoreMappingIndexesIfOwned(eventMapping, link);
-        if (!restored) {
-          await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_ownership_conflict", {
-            taskId: task.id, eventId: existing.id,
-          });
-          return "conflict";
-        }
+        // Calendar shared properties contain the exact task/event identity.
+        // The provider pair itself is authoritative; legacy DynamoDB indexes
+        // and recurrence-link rows must not gate repair of its project comment.
+        await this.persistProviderMapping(eventMapping, clients);
         await this.store.putBaseline(profile, task.id, task, existing);
-        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_indices_restored", {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_provider_correlation_recovered", {
           taskId: task.id, eventId: existing.id,
         });
         return "baseline";
@@ -1150,23 +1129,6 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
-    if (!continuation && tableName && this.state instanceof StateRepository) {
-      // A missed deletion webhook must not let recurring recovery re-create
-      // a surviving side before the terminal review pass. Prime exact-ID
-      // guards from already-open cases before any recurrence/provider writes.
-      const reviews = new ReviewStore();
-      let reviewCursor: Record<string, unknown> | undefined;
-      let indexed = 0;
-      do {
-        const page = await reviews.listCases(profile, reviewCursor, false);
-        for (const item of page.items) {
-          if (item.status !== "open") continue;
-          if (++indexed > 100) throw new Error("Too many active conflict identities to fence safely; reconciliation deferred");
-          await reviews.indexDeletedConflictCase(item);
-        }
-        reviewCursor = page.cursor as Record<string, unknown> | undefined;
-      } while (reviewCursor);
-    }
     const clients = await this.clients(profile);
     // Snapshot reconciliation is a separate admitted writer path from the
     // SQS webhook preflight. Read the bounded erasure tombstones while the

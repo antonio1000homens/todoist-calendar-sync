@@ -483,13 +483,33 @@ test("unsupported legacy Calendar recurrence preserves its existing Todoist mirr
     && entry.detail.existingMirrorPreserved), true);
 });
 
-test("repeated Calendar master notifications keep the same live mirror", async () => {
+test("new unsupported Calendar recurrence does not create a flattened one-off mirror", async () => {
+  const current = instance("hourly-current", "2099-01-01", "2099-01-02");
+  const next = instance("hourly-next", "2099-01-02", "2099-01-03");
+  const state = new FakeState();
+  const clients = fakeClients(state, [current, next]);
+  const master = { id: MASTER, iCalUID: SERIES, status: "confirmed", summary: current.summary,
+    start: { date: "2099-01-01" }, recurrence: ["RRULE:FREQ=HOURLY"] };
+  clients.events.set(MASTER, master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+
+  await sync.applyCalendarSeries({ id: "unsupported-series", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2026-10-26T12:00:00Z", headers: {}, body: "" }, master, clients.todoist);
+
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.equal(state.links.length, 0);
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_rule_unsupported"), true);
+});
+
+test("repeated Calendar master notifications upgrade an exact one-off mirror to native recurrence once", async () => {
   const current = instance("current", "2099-01-01", "2099-01-02");
   const next = instance("next", "2100-01-01", "2100-01-02");
   const link = linkFor(current);
   const state = new FakeState(link);
   const tasks = new Map([[link.taskId, { id: link.taskId, content: current.summary, description: "", due: { date: current.start.date } }]]);
-  const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
+  const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, start: structuredClone(current.start),
+    recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
   const clients = fakeClients(state, [current, next], tasks, master);
   const sync = new Synchronizer(state, undefined, async () => clients);
   const delivery = { id: "calendar-master", kind: "calendar", profile: PROFILE, mode: "aws", receivedAt: "2026-09-06T00:00:00Z", headers: {}, body: "" };
@@ -498,9 +518,11 @@ test("repeated Calendar master notifications keep the same live mirror", async (
   await sync.process({ ...delivery, id: "calendar-master-2" });
 
   assert.deepEqual(clients.todoistDeletes, []);
-  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(clients.todoistUpserts.length, 1);
+  assert.equal(clients.todoistUpserts[0].existingId, link.taskId);
+  assert.equal(clients.todoistUpserts[0].payload.due.is_recurring, true);
   assert.equal(state.links[0].activeInstanceId, "current");
-  assert.equal(state.audits.filter((entry) => entry.action === "calendar_recurrence_noop_active_instance").length, 2);
+  assert.ok(state.links[0].calendarNativeRecurring);
 });
 
 test("stale Calendar cancellation after Calendar-owned rollover cannot advance the series twice", async () => {
@@ -1179,7 +1201,8 @@ test("deleting the Todoist recurring task deletes its Calendar RRULE master", as
 for (const shape of ["title-date", "shared-master", "shared-instance", "one-off-other-profile", "recurring-existing-mirror"]) {
   test(`Calendar worker blocks duplicate recurrence recovery: ${shape}`, async () => {
     const current = instance("current", "2099-01-01", "2099-01-02");
-    const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
+    const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, start: structuredClone(current.start),
+      recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
     const task = { id:"original-task", content:current.summary, project_id:"home-project", due:{ date:current.start.date, is_recurring:true } };
     if (shape === "shared-master" || shape === "one-off-other-profile") master.extendedProperties = {shared:{taskId:task.id}};
     if (shape === "shared-instance") current.extendedProperties = {shared:{taskId:task.id}};
@@ -1199,7 +1222,8 @@ for (const shape of ["title-date", "shared-master", "shared-instance", "one-off-
 
 test("new genuinely Calendar-owned series creates one mirror across retries", async () => {
   const current = instance("current", "2099-01-01", "2099-01-02");
-  const master = {id:MASTER,iCalUID:SERIES,summary:current.summary,recurrence:["RRULE:FREQ=YEARLY"],status:"confirmed"};
+  const master = {id:MASTER,iCalUID:SERIES,summary:current.summary,start:structuredClone(current.start),
+    recurrence:["RRULE:FREQ=YEARLY"],status:"confirmed"};
   const state = new FakeState();
   const clients = fakeClients(state,[current],new Map(),master);
   const sync = new Synchronizer(state,undefined,async () => clients);
