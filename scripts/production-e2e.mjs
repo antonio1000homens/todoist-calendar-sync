@@ -543,6 +543,82 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       profile, calendarToTodoist: true, todoistToCalendar: true, exceptionPreserved: true,
     });
 
+    const currentTaskBeforeReschedule = await todoist.getTask(recurringTaskId);
+    const recurrenceMappingBeforeReschedule = await providerMapping(
+      todoist, config.todoistProjectId, recurringEventId, recurringTaskId,
+    );
+    if (!recurrenceMappingBeforeReschedule?.activeInstanceId || !currentTaskBeforeReschedule.due?.is_recurring
+      || !currentTaskBeforeReschedule.due.string) {
+      throw new Error("Todoist recurrence did not expose its exact active occurrence before reschedule acceptance");
+    }
+    const currentOccurrence = await calendar.getEvent(recurrenceMappingBeforeReschedule.activeInstanceId);
+    const immutableOriginalStart = currentOccurrence.originalStartTime?.dateTime
+      || currentOccurrence.originalStartTime?.date;
+    const masterRuleBeforeReschedule = (await calendar.getEvent(recurringEventId)).recurrence;
+    const currentDueBeforeReschedule = currentTaskBeforeReschedule.due.datetime || currentTaskBeforeReschedule.due.date;
+    if (!immutableOriginalStart || !currentDueBeforeReschedule?.includes("T")) {
+      throw new Error("Todoist current-occurrence reschedule acceptance requires a timed mapped instance");
+    }
+    const movedCurrentDue = new Date(Date.parse(currentDueBeforeReschedule) + 30 * 60 * 1000).toISOString();
+    await todoist.updateRecurringOccurrence(currentTaskBeforeReschedule, {
+      content: currentTaskBeforeReschedule.content,
+      description: currentTaskBeforeReschedule.description || "",
+      due: {
+        datetime: movedCurrentDue,
+        string: currentTaskBeforeReschedule.due.string,
+        ...(currentTaskBeforeReschedule.due.timezone ? { timezone: currentTaskBeforeReschedule.due.timezone } : {}),
+      },
+    });
+    await poll(
+      `${profile} Todoist current occurrence reschedule patches only the mapped Calendar instance`, timeoutMs,
+      async () => {
+        const [task, instance, master, mapping] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          calendar.getEvent(recurrenceMappingBeforeReschedule.activeInstanceId),
+          calendar.getEvent(recurringEventId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { task, instance, master, mapping };
+      },
+      ({ task, instance, master, mapping }) => task.due?.is_recurring
+        && timestampsMatch(task.due.datetime || task.due.date, movedCurrentDue)
+        && timestampsMatch(instance.start?.dateTime, movedCurrentDue)
+        && (instance.originalStartTime?.dateTime || instance.originalStartTime?.date) === immutableOriginalStart
+        && JSON.stringify(master.recurrence) === JSON.stringify(masterRuleBeforeReschedule)
+        && mapping?.activeInstanceId === recurrenceMappingBeforeReschedule.activeInstanceId
+        && mapping.originalStart === immutableOriginalStart
+        && timestampsMatch(mapping.activeEffectiveStart, movedCurrentDue),
+    );
+    const movedCurrentTask = await todoist.getTask(recurringTaskId);
+    await todoist.updateRecurringOccurrence(movedCurrentTask, {
+      content: movedCurrentTask.content,
+      description: movedCurrentTask.description || "",
+      due: {
+        datetime: currentDueBeforeReschedule,
+        string: movedCurrentTask.due.string,
+        ...(movedCurrentTask.due.timezone ? { timezone: movedCurrentTask.due.timezone } : {}),
+      },
+    });
+    await poll(
+      `${profile} Todoist current occurrence due restoration`, timeoutMs,
+      async () => {
+        const [task, instance, master] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          calendar.getEvent(recurrenceMappingBeforeReschedule.activeInstanceId),
+          calendar.getEvent(recurringEventId),
+        ]);
+        return { task, instance, master };
+      },
+      ({ task, instance, master }) => task.due?.is_recurring
+        && timestampsMatch(task.due.datetime || task.due.date, currentDueBeforeReschedule)
+        && timestampsMatch(instance.start?.dateTime, currentDueBeforeReschedule)
+        && (instance.originalStartTime?.dateTime || instance.originalStartTime?.date) === immutableOriginalStart
+        && JSON.stringify(master.recurrence) === JSON.stringify(masterRuleBeforeReschedule),
+    );
+    log("todoist_current_occurrence_reschedule_verified", {
+      profile, instanceOnly: true, originalStartPreserved: true, recurrenceRulePreserved: true,
+    });
+
     let nextDue = completedDue;
     const completionResults = [];
     for (let occurrence = 1; occurrence <= 2; occurrence += 1) {

@@ -684,6 +684,123 @@ export class Synchronizer {
     return next;
   }
 
+  private async rescheduleMappedRecurringOccurrence(
+    delivery: Delivery,
+    task: TodoistTask,
+    oldTask: TodoistTask | undefined,
+    mapping: Mapping,
+    calendar: GoogleCalendar,
+    todoist: Todoist,
+  ): Promise<void> {
+    const unsupported = async (reason: string) => this.state.audit(delivery.profile,
+      "todoist_recurring_occurrence_reschedule_unsupported", {
+        taskId: task.id, masterEventId: mapping.masterEventId, eventId: mapping.activeInstanceId,
+        reason, sourceLeftUnchanged: true,
+      });
+    const oldDue = oldTask?.due?.datetime || oldTask?.due?.date || mapping.activeEffectiveStart;
+    const nextDue = task.due?.datetime || task.due?.date;
+    const nextRule = todoistRecurrenceToRrule(task);
+    if (!mapping.masterEventId || !mapping.activeInstanceId || !mapping.originalStart
+      || (oldTask && !oldTask.due?.is_recurring) || !task.due?.is_recurring || !oldDue || !nextDue
+      || !nextRule
+      || (oldTask && (todoistRecurrenceToRrule(oldTask) !== nextRule
+        || todoistRecurrenceKey(oldTask) !== todoistRecurrenceKey(task)
+        || oldTask.due?.timezone !== task.due?.timezone))) return unsupported("recurrence_or_identity_changed");
+    if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
+      return this.state.audit(delivery.profile, "todoist_recurring_occurrence_reschedule_suppressed", {
+        taskId: task.id, masterEventId: mapping.masterEventId, eventId: mapping.activeInstanceId,
+        mode: delivery.mode,
+      });
+    }
+
+    const master = await calendar.getEvent(mapping.masterEventId);
+    const current = await calendar.getEvent(mapping.activeInstanceId);
+    const masterTaskId = master.extendedProperties?.shared?.taskId;
+    const masterShared = master.extendedProperties?.shared;
+    const original = current.originalStartTime?.dateTime || current.originalStartTime?.date;
+    const currentStart = current.start?.dateTime || current.start?.date;
+    const currentEnd = current.end?.dateTime || current.end?.date;
+    const currentIsAllDay = Boolean(current.start?.date && !current.start.dateTime);
+    const sameInstant = (left: string | undefined, right: string | undefined) => {
+      const a = Date.parse(left || ""), b = Date.parse(right || "");
+      return Number.isFinite(a) && Number.isFinite(b) && a === b;
+    };
+    const sameStart = (left: string | undefined, right: string | undefined) => currentIsAllDay
+      ? left === right : sameInstant(left, right);
+    const alreadyApplied = sameStart(currentStart, nextDue);
+    const stillAtOldStart = sameStart(currentStart, oldDue);
+    const mappedStartStillValid = !mapping.activeEffectiveStart
+      || sameStart(currentStart, mapping.activeEffectiveStart)
+      || sameStart(mapping.activeEffectiveStart, oldDue);
+    if (mapping.profile !== delivery.profile || mapping.taskId !== task.id
+      || task.project_id !== profiles[delivery.profile].todoistProjectId
+      || master.id !== mapping.masterEventId || master.status !== "confirmed" || !master.recurrence?.includes(nextRule)
+      || masterTaskId !== task.id
+      || (masterShared?.todoistRecurrence && masterShared.todoistRecurrence !== todoistRecurrenceKey(task))
+      || (masterShared?.syncProfile && masterShared.syncProfile !== delivery.profile)
+      || (masterShared?.syncCalendarId && masterShared.syncCalendarId !== profiles[delivery.profile].calendarId)
+      || current.id !== mapping.activeInstanceId || current.status !== "confirmed"
+      || current.recurringEventId !== mapping.masterEventId || original !== mapping.originalStart
+      || !currentStart || !currentEnd || !mappedStartStillValid
+      || (!stillAtOldStart && !alreadyApplied)
+      || !current.etag) return unsupported("provider_occurrence_identity_or_version_changed");
+
+    let start: CalendarEvent["start"];
+    let end: CalendarEvent["end"];
+    const nextIsAllDay = /^\d{4}-\d{2}-\d{2}$/.test(nextDue);
+    if (currentIsAllDay && nextIsAllDay && current.start?.date && current.end?.date && !current.end.dateTime) {
+      const dayDelta = Math.round((Date.parse(`${current.end.date}T00:00:00Z`)
+        - Date.parse(`${current.start.date}T00:00:00Z`)) / 86_400_000);
+      if (dayDelta < 1) return unsupported("invalid_all_day_occurrence_boundaries");
+      const nextEnd = new Date(Date.parse(`${nextDue}T00:00:00Z`) + dayDelta * 86_400_000)
+        .toISOString().slice(0, 10);
+      start = { date: nextDue };
+      end = { date: nextEnd };
+    } else if (!currentIsAllDay && !nextIsAllDay && current.start?.dateTime && current.end?.dateTime
+      && hasOffset(nextDue)) {
+      const duration = Date.parse(current.end.dateTime) - Date.parse(current.start.dateTime);
+      if (!Number.isFinite(duration) || duration <= 0) return unsupported("invalid_timed_occurrence_boundaries");
+      start = { dateTime: nextDue, ...(task.due?.timezone || current.start.timeZone
+        ? { timeZone: task.due?.timezone || current.start.timeZone } : {}) };
+      const nextDueMs = Date.parse(nextDue);
+      if (!Number.isFinite(nextDueMs)) return unsupported("invalid_timed_due_boundary");
+      end = { dateTime: new Date(nextDueMs + duration).toISOString(),
+        ...(task.due?.timezone || current.end.timeZone ? { timeZone: task.due?.timezone || current.end.timeZone } : {}) };
+    } else {
+      return unsupported("date_shape_conversion_not_supported");
+    }
+
+    const unchangedMasterRule = JSON.stringify(master.recurrence);
+    const updated = alreadyApplied ? current
+      : await calendar.upsertEventIfUnchanged({ ...current, start, end }, current.id, current.etag);
+    const [readback, masterReadback] = await Promise.all([
+      calendar.getEvent(current.id), calendar.getEvent(master.id),
+    ]);
+    const actualStart = readback.start?.dateTime || readback.start?.date;
+    const actualEnd = readback.end?.dateTime || readback.end?.date;
+    const expectedEnd = end?.dateTime || end?.date;
+    const startMatches = start?.date ? actualStart === start.date : sameInstant(actualStart, start?.dateTime);
+    const endMatches = end?.date ? actualEnd === end.date : sameInstant(actualEnd, end?.dateTime);
+    const readbackOriginal = readback.originalStartTime?.dateTime || readback.originalStartTime?.date;
+    const currentOriginal = current.originalStartTime?.dateTime || current.originalStartTime?.date;
+    if (updated.id !== current.id || readback.id !== current.id || readback.status !== "confirmed"
+      || readback.recurringEventId !== master.id || readbackOriginal !== currentOriginal
+      || !startMatches || !endMatches || !expectedEnd
+      || masterReadback.id !== master.id || JSON.stringify(masterReadback.recurrence) !== unchangedMasterRule) {
+      throw new Error("Calendar recurring instance reschedule readback mismatch");
+    }
+    await this.persistProviderMapping({
+      ...mapping,
+      activeEffectiveStart: actualStart,
+      updatedAt: new Date().toISOString(),
+    }, todoist);
+    await this.state.recordMutation(delivery.profile);
+    return this.state.audit(delivery.profile, "todoist_recurring_occurrence_rescheduled", {
+      taskId: task.id, masterEventId: master.id, eventId: current.id,
+      originalStart: mapping.originalStart, effectiveStart: actualStart, recoveredAppliedWrite: alreadyApplied,
+    });
+  }
+
   /** @deprecated Kept for callers migrating from the repository-backed writer. */
   async saveMapping(mapping: Mapping, todoist?: Todoist): Promise<Mapping> {
     return this.persistProviderMapping(mapping, todoist);
@@ -2482,7 +2599,7 @@ export class Synchronizer {
       lifecycle.action === "upsert" && !existingMapping)) {
       return this.state.audit(controlProfile, "todoist_task_sync_control_blocked", { taskId: task.id });
     }
-    const recurringDateEdit = todoistRecurringDateEdited(payload);
+    let recurringDateEdit = todoistRecurringDateEdited(payload);
     const orderedLifecycle = lifecycle.action === "upsert" || lifecycle.reason === "completed"
       || lifecycle.reason === "uncompleted" || lifecycle.reason === "due_removed" || lifecycle.reason === "undated";
     if (orderedLifecycle && !await this.state.acceptTaskVersion(delivery.profile, task.id, task.updated_at)) {
@@ -2534,6 +2651,17 @@ export class Synchronizer {
     const { calendar, todoist } = await this.clients(delivery.profile);
     let mapping = existingMapping?.profile === delivery.profile
       ? existingMapping : await this.providerMappingByTask(delivery.profile, task.id, todoist);
+    if (!recurringDateEdit && lifecycle.action === "upsert"
+      && payload.event_name === "item:updated"
+      && payload.event_data_extra?.update_intent === "item_updated"
+      && task.due?.is_recurring && mapping?.masterEventId && mapping.activeEffectiveStart) {
+      const due = taskDateTime(task) || task.due.date;
+      const previous = mapping.activeEffectiveStart;
+      const allDay = /^\d{4}-\d{2}-\d{2}$/.test(previous);
+      const changed = allDay ? due !== previous : !Number.isFinite(Date.parse(due || ""))
+        || Date.parse(due || "") !== Date.parse(previous);
+      recurringDateEdit = Boolean(due && changed);
+    }
     const pendingAnnualRecovery = lifecycle.action==="upsert"
       ? await this.state.getCancelledAnnualRecoveryReceipt?.(delivery.profile,task.id)
       : undefined;
@@ -2546,6 +2674,16 @@ export class Synchronizer {
       return this.state.audit(delivery.profile,"todoist_cancelled_annual_projection_source_changed",{
         taskId:task.id,
       });
+    }
+    const oldTaskForDateEdit = payload.event_data_extra?.old_item;
+    const recurrenceRuleUnchanged = !oldTaskForDateEdit || Boolean(oldTaskForDateEdit.due?.is_recurring
+      && task.due?.is_recurring
+      && todoistRecurrenceToRrule(oldTaskForDateEdit) === todoistRecurrenceToRrule(task)
+      && todoistRecurrenceKey(oldTaskForDateEdit) === todoistRecurrenceKey(task)
+      && oldTaskForDateEdit.due?.timezone === task.due?.timezone);
+    if (lifecycle.action === "upsert" && recurringDateEdit && recurrenceRuleUnchanged && mapping?.masterEventId) {
+      return this.rescheduleMappedRecurringOccurrence(delivery, task,
+        oldTaskForDateEdit, mapping, calendar, todoist);
     }
     if (mapping && lifecycle.action === "upsert" && !mapping.recurrenceOwner) {
       const completed = await this.getCompletedProjection(delivery.profile, mapping.eventId);
