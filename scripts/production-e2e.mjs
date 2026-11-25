@@ -273,7 +273,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
             throw error;
           }
         },
-        ({ event, mapping }) => !event && !mapping,
+        ({ event, mapping }) => (!event || event.status === "cancelled") && !mapping,
       );
       log("cleanup_verified", { profile });
     }
