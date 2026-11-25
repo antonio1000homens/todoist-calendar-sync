@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { GoogleCalendar } from "../dist/providers.js";
 
+function isGoogleOAuthUrl(value) {
+  return new URL(String(value)).hostname === "oauth2.googleapis.com";
+}
+
 test("Google Calendar watch creates and stops a webhook channel", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url, init });
-    if (url.includes("oauth2.googleapis.com")) {
+    if (isGoogleOAuthUrl(url)) {
       return new Response(JSON.stringify({ access_token: "test-access-token" }), { status: 200 });
     }
     if (url.endsWith("/events/watch")) {
@@ -39,7 +43,7 @@ test("manual Calendar deletion sends If-Match for the exact approved event versi
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({url,init});
-    if (url.includes("oauth2.googleapis.com")) return Response.json({access_token:"test-access-token"});
+    if (isGoogleOAuthUrl(url)) return Response.json({access_token:"test-access-token"});
     return new Response(null,{status:204});
   };
   try {
@@ -57,7 +61,7 @@ test("ordinary Calendar deletion rereads exact event identity and uses its ETag"
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     if(!init.method||init.method==="GET")return Response.json({id:"exact-event",etag:"fresh-etag"});
     return new Response(null,{status:204});
   };
@@ -75,7 +79,7 @@ test("Calendar event upsert is a conditional patch and refuses a stale approved 
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     return Response.json({id:"event-1",etag:"new-etag",extendedProperties:{shared:{humanKey:"keep"}}});
   };
   try{
@@ -89,7 +93,7 @@ test("recurring occurrence identity cleanup sends an If-Match metadata-only PATC
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     if(!init.method||init.method==="GET")return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-approved",extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncRecurrenceOwner:"calendar"}}});
     return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-after",extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncHistoryOnly:"true"}}});
   };
@@ -107,7 +111,7 @@ test("Todoist event writes stamp exact provider correlation and retain unrelated
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     if(!init.method||init.method==="GET")return Response.json({id:"event-1",etag:"etag-1",extendedProperties:{shared:{providerField:"preserve",syncSource:"todoist-calendar-sync",syncRecurrenceOwner:"todoist"}}});
     return Response.json({...JSON.parse(init.body),id:"event-1",etag:"etag-2"});
   };
@@ -135,7 +139,7 @@ test("Calendar-originated links acquire task correlation with a conditional meta
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     if(!init.method||init.method==="GET")return Response.json({id:"event-1",etag:"etag-1",extendedProperties:{shared:{humanKey:"keep-me",syncRecurrenceOwner:"calendar"}}});
     return Response.json({id:"event-1",etag:"etag-2",extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncTaskId:"task-1",syncProfile:"home",syncCalendarId:"home@example.test",syncEventId:"event-1",syncSchemaVersion:"2",syncSeriesId:"series-1",syncMasterEventId:"event-1",syncActiveInstanceId:"event-1",syncOriginalStart:"2026-11-25",syncProgressVersion:"1",syncCompletedThrough:"2026-11-24"}}});
   };
@@ -155,7 +159,7 @@ test("Calendar correlation refuses to overwrite a different exact task identity"
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     return Response.json({id:"event-1",etag:"etag-1",extendedProperties:{shared:{taskId:"other-task"}}});
   };
   try{
@@ -169,7 +173,7 @@ test("Calendar series correlation advances a task ID only from the exact previou
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
-    if(url.includes("oauth2.googleapis.com"))return Response.json({access_token:"test-access-token"});
+    if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
     if(!init.method||init.method==="GET")return Response.json({id:"master-1",etag:"etag-7",extendedProperties:{shared:{
       taskId:"task-old",syncTaskId:"task-old",syncProfile:"home",syncCalendarId:"home@example.test",
       syncEventId:"master-1",syncSchemaVersion:"2",humanKey:"preserve",
