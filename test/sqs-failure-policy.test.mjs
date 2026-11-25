@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   MAX_SYNC_RECEIVES, DLQ_RETENTION_SECONDS, failedDeliveryDisposition,
-  isTransientDynamoDbFailure, quarantineFailedRecord,
+  isTransientDynamoDbFailure, isTransientProviderFailure, quarantineFailedRecord,
   shortenTransientRetryVisibility, syncFailureQueueClient,
   transientRetryVisibilitySeconds,
 } from "../dist/sqs-failure-policy.js";
@@ -50,6 +50,26 @@ test("transient DynamoDB classification is strict across wrapped errors and tran
     namedError("ProviderError",{status:429,$retryable:{throttling:true}}),
     namedError("ProviderError",{status:400}),
   ]) assert.equal(isTransientDynamoDbFailure(error), false, error.name);
+});
+
+test("provider throttling and temporary outages retry only before a provider write", () => {
+  const response = (status, body = '{"error_tag":"LIMITS_REACHED"}') =>
+    namedError("ReconciliationItemError", { status, body, cause:namedError("Error", {status, body}) });
+  for (const status of [408, 429, 500, 503, 599]) {
+    assert.equal(isTransientProviderFailure(response(status)), true, `HTTP ${status}`);
+    assert.deepEqual(failedDeliveryDisposition(response(status), {kind:"reconcile"}, false, 1), {
+      kind:"retry_fifo", reason:"transient_provider", receiveCount:1,
+    });
+  }
+  assert.equal(failedDeliveryDisposition(response(429), {kind:"todoist"}, false, 4).kind, "retry_fifo");
+  assert.equal(failedDeliveryDisposition(response(429), {kind:"calendar"}, false, 5).reason, "retries_exhausted");
+  assert.equal(failedDeliveryDisposition(response(429), {kind:"reconcile"}, true, 1).reason, "partial_provider_mutation");
+  for (const kind of ["repair", "manual", "orphan"]) {
+    assert.equal(failedDeliveryDisposition(response(429), {kind}, false, 1).reason, "unverified_delivery_type");
+  }
+  assert.equal(isTransientProviderFailure(response(400)), false);
+  assert.equal(isTransientProviderFailure(namedError("ProviderError", {status:429,$retryable:{throttling:true}})), false);
+  assert.equal(isTransientProviderFailure(namedError("Error", {status:503,body:"not a provider response"})), false);
 });
 
 test("the earliest provider write boundary prevents retry of a later DynamoDB mapping throttle", async () => {
@@ -152,7 +172,7 @@ test("SQS retry only changes original receipt visibility, while quarantine prese
 });
 
 function setupHandler(t,{receive="1",failure=throttle(),kind="calendar",profile="home",priorMutation=false,
- completed=false,failHandoff=false,failVisibility=false}={}){
+ completed=false,failHandoff=false,failVisibility=false,failureAt="receipt"}={}){
   const older={protocol:process.env.ERASURE_PROTOCOL_VERSION,source:process.env.SYNC_QUEUE_URL,dlq:process.env.DLQ_URL};
   // State fixtures exercise the worker without AWS or provider calls.
   delete process.env.ERASURE_PROTOCOL_VERSION;
@@ -170,13 +190,14 @@ function setupHandler(t,{receive="1",failure=throttle(),kind="calendar",profile=
     if(cmd.constructor.name==="ChangeMessageVisibilityCommand"&&failVisibility)throw new Error("SQS visibility unavailable");
     return {};
   });
-  t.mock.method(StateRepository.prototype,"isDeliveryCompleted",async()=>{if(!completed && !priorMutation)throw failure;return completed;});
+  t.mock.method(StateRepository.prototype,"isDeliveryCompleted",async()=>{if(failureAt==="receipt"&&!completed&&!priorMutation)throw failure;return completed;});
   const mark=t.mock.method(StateRepository.prototype,"markDeliveryCompleted",async()=>{});
   t.mock.method(StateRepository.prototype,"getSyncToken",async()=> "token");
   t.mock.method(StateRepository.prototype,"mutationAllowed",async()=>true);
   t.mock.method(StateRepository.prototype,"audit",async()=>{});
   const write=t.mock.method(StateRepository.prototype,"recordMutation",async()=>{throw failure;});
   const provider=t.mock.method(OrphanRecoveringSynchronizer.prototype,"process",async function(delivery){
+    if(failureAt==="provider")throw failure;
     if(priorMutation)await this.state.recordMutation(delivery.profile);
   });
   t.mock.method(ManualInterventionService.prototype,"interceptTodoistDeletion",async()=>false);
@@ -190,6 +211,16 @@ test("short DynamoDB throttling retries IN PLACE without ack, DLQ or provider wr
   assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:f.record.messageId}]});
   assert.deepEqual(f.sent.map(c=>c.constructor.name),["ChangeMessageVisibilityCommand"]);
   assert.equal(f.provider.mock.callCount(),0);
+  assert.equal(f.mark.mock.callCount(),0);
+  assert.equal(f.alerts.mock.callCount(),0);
+});
+
+test("provider 429 retries the original Calendar delivery without quarantining it",async t=>{
+  const failure=namedError("ReconciliationItemError",{status:429,body:'{"error_tag":"LIMITS_REACHED"}'});
+  const f=setupHandler(t,{failure,kind:"calendar",profile:"antonio",failureAt:"provider"});
+  const result=await handler({Records:[f.record]},{awsRequestId:"req-provider-429"});
+  assert.deepEqual(result,{batchItemFailures:[{itemIdentifier:f.record.messageId}]});
+  assert.deepEqual(f.sent.map(command=>command.constructor.name),["ChangeMessageVisibilityCommand"]);
   assert.equal(f.mark.mock.callCount(),0);
   assert.equal(f.alerts.mock.callCount(),0);
 });

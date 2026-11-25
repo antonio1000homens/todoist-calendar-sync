@@ -41,10 +41,20 @@ function fields(error: unknown): ErrorFields {
   return error && typeof error === "object" ? error as ErrorFields : {};
 }
 
+function hasProviderErrorBody(body: unknown): boolean {
+  if (typeof body !== "string") return false;
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown; error_tag?: unknown };
+    return Boolean(parsed && typeof parsed === "object" && ("error" in parsed || "error_tag" in parsed));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Match explicit AWS DynamoDB exceptions, including known transaction-wide
- * throttling cancellation reasons. Never match on text/status alone; Google
- * or Todoist 429s and conditional/erasure conflicts must not be replayed.
+ * throttling cancellation reasons. Provider HTTP failures are classified
+ * separately and require a recognizable provider response body.
  */
 export function isTransientDynamoDbFailure(error: unknown): boolean {
   const visited = new Set<object>();
@@ -69,8 +79,26 @@ export function isTransientDynamoDbFailure(error: unknown): boolean {
 
 export interface FailedDeliveryDisposition {
   kind: "retry_fifo" | "quarantine";
-  reason: "transient_dynamodb" | "partial_provider_mutation" | "unverified_delivery_type" | "non_transient" | "retries_exhausted";
+  reason: "transient_dynamodb" | "transient_provider" | "partial_provider_mutation" | "unverified_delivery_type" | "non_transient" | "retries_exhausted";
   receiveCount: number;
+}
+
+/** Provider throttling and temporary outages can retry only before any write was attempted. */
+export function isTransientProviderFailure(error: unknown): boolean {
+  const visited = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth++) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    const e = fields(current) as ErrorFields & { body?: unknown; providerReason?: unknown };
+    const status = Number(e.status);
+    const transientStatus = status === 408 || status === 429 || (status >= 500 && status < 600);
+    const providerResponse = hasProviderErrorBody(e.body)
+      || (e.name === "ReconciliationItemError" && typeof e.providerReason === "string");
+    if (transientStatus && providerResponse) return true;
+    current = e.cause;
+  }
+  return false;
 }
 
 export function failedDeliveryDisposition(
@@ -80,17 +108,21 @@ export function failedDeliveryDisposition(
   receiveCount: number,
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
-  if (!isTransientDynamoDbFailure(error)) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
+  const transientDynamoDb = isTransientDynamoDbFailure(error);
+  const transientProvider = !transientDynamoDb && isTransientProviderFailure(error);
+  if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
   // A provider write may already have happened. The DynamoDB state write may
   // have failed after it, so automated replay could duplicate provider writes.
   if (providerMutationObserved) return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
-  // Do not replay manual approvals, repairs, erasure-sensitive orphan work or
-  // partially persisted reconciliation generations without operator review.
-  if (!delivery || !["calendar", "todoist"].includes(delivery.kind)) {
+  // Retry only deliveries whose state is safe to re-read. Reconciliation chunks
+  // are idempotent when no provider write has been attempted; repair and
+  // erasure-sensitive operations remain quarantined.
+  const retryableKinds = transientProvider ? ["calendar", "todoist", "reconcile"] : ["calendar", "todoist"];
+  if (!delivery || !retryableKinds.includes(delivery.kind)) {
     return { kind:"quarantine", reason:"unverified_delivery_type", receiveCount:attempts };
   }
   if (attempts >= MAX_SYNC_RECEIVES) return { kind:"quarantine", reason:"retries_exhausted", receiveCount:attempts };
-  return { kind:"retry_fifo", reason:"transient_dynamodb", receiveCount:attempts };
+  return { kind:"retry_fifo", reason:transientProvider ? "transient_provider" : "transient_dynamodb", receiveCount:attempts };
 }
 
 export function transientRetryVisibilitySeconds(receiveCount: number): number {

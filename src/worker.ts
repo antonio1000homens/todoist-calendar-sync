@@ -785,14 +785,15 @@ export const handler: SQSHandler = async (event, context: Context) => {
         try {
           await shortenTransientRetryVisibility(record, receiveCount);
         } catch (visibilityError) {
-          log("transient_dynamodb_retry_visibility_fallback", {
+          log("transient_retry_visibility_fallback", {
             delivery: deliverySummary(delivery),
             error: serializeError(visibilityError),
           });
         }
-        log("delivery_transient_dynamodb_retry_scheduled", {
+        log("delivery_transient_retry_scheduled", {
           delivery: deliverySummary(delivery),
           sqs: sqsSummary(record),
+          reason: disposition.reason,
           receiveCount,
           maxReceiveCount: MAX_SYNC_RECEIVES,
           targetVisibilitySeconds: transientRetryVisibilitySeconds(receiveCount),
