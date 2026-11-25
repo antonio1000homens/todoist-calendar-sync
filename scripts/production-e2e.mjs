@@ -454,6 +454,25 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
     if (!currentInstance || currentInstance.status === "cancelled") {
       throw new Error("Calendar recurrence did not expose its exactly mapped current instance");
     }
+    const currentOccurrenceTitle = `[E2E ${token}] Current occurrence rename`;
+    await calendar.upsertEvent({ ...currentInstance, summary: currentOccurrenceTitle }, currentInstance.id);
+    await poll(
+      `${profile} current Calendar occurrence metadata propagation`, timeoutMs,
+      () => todoist.getTask(recurringTaskId),
+      (candidate) => candidate.id === recurringTaskId && candidate.content === currentOccurrenceTitle
+        && candidate.due?.is_recurring
+        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+    );
+    const restoredCurrent = await calendar.getEvent(currentInstance.id);
+    await calendar.upsertEvent({ ...restoredCurrent, summary: recurringTitle }, currentInstance.id);
+    await poll(
+      `${profile} current Calendar occurrence metadata restoration`, timeoutMs,
+      () => todoist.getTask(recurringTaskId),
+      (candidate) => candidate.id === recurringTaskId && candidate.content === recurringTitle
+        && candidate.due?.is_recurring
+        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+    );
+    log("current_occurrence_edit_verified", { profile, taskIdPreserved: true, recurrencePreserved: true });
     const [movedInstance, cancelledInstance, followingInstance] = orderedInstances
       .filter((item) => item.id !== currentInstance.id && item.status !== "cancelled");
     if (!movedInstance || !cancelledInstance || !followingInstance) {
@@ -565,6 +584,50 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       nextDue = advancedDue;
     }
     log("recurrence_completions_verified", { profile, count: completionResults.length });
+
+    const activeMapping = await providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId);
+    if (activeMapping?.taskId !== recurringTaskId || !activeMapping.activeInstanceId) {
+      throw new Error("Calendar recurrence did not expose the exact active occurrence after completion");
+    }
+    const postCompletionInstances = await calendar.listInstancesInWindow(recurringEventId,
+      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      new Date(Date.now() + 10 * 24 * 60 * 60 * 1000).toISOString());
+    const activeAfterCompletion = postCompletionInstances.find((item) => item.id === activeMapping.activeInstanceId);
+    const activeOriginalStart = activeAfterCompletion?.originalStartTime?.dateTime
+      || activeAfterCompletion?.originalStartTime?.date;
+    const nextAfterDeletion = postCompletionInstances
+      .filter((item) => item.recurringEventId === recurringEventId && item.status !== "cancelled"
+        && item.id !== activeMapping.activeInstanceId && item.originalStartTime)
+      .filter((item) => {
+        const original = item.originalStartTime.dateTime || item.originalStartTime.date;
+        return Boolean(activeOriginalStart && original && Date.parse(original) > Date.parse(activeOriginalStart));
+      })
+      .sort((left, right) => Date.parse(left.originalStartTime.dateTime || left.originalStartTime.date || "")
+        - Date.parse(right.originalStartTime.dateTime || right.originalStartTime.date || ""))[0];
+    if (!activeAfterCompletion || activeAfterCompletion.status === "cancelled" || !nextAfterDeletion) {
+      throw new Error("Calendar recurrence did not expose the active and successor occurrences for deletion acceptance");
+    }
+    await calendar.deleteEvent(activeAfterCompletion.id);
+    const successorStart = nextAfterDeletion.start?.dateTime || nextAfterDeletion.start?.date;
+    const afterActiveDeletion = await poll(
+      `${profile} current Calendar occurrence deletion advances the mapped task`, timeoutMs,
+      async () => {
+        const [task, mapping] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { task, mapping };
+      },
+      ({ task, mapping }) => task.id === recurringTaskId && task.due?.is_recurring
+        && (task.due?.datetime || task.due?.date) !== nextDue
+        && mapping?.activeInstanceId === nextAfterDeletion.id,
+    );
+    if (!successorStart || !(successorStart.includes("T")
+      ? timestampsMatch(afterActiveDeletion.task.due?.datetime || afterActiveDeletion.task.due?.date || "", successorStart)
+      : (afterActiveDeletion.task.due?.datetime || afterActiveDeletion.task.due?.date) === successorStart)) {
+      throw new Error("Deleting the active Calendar occurrence did not advance Todoist to the verified successor");
+    }
+    log("current_occurrence_deletion_verified", { profile, taskIdPreserved: true, successorMapped: true });
 
     if (cleanup) {
       await safeDeleteCalendar(calendar, recurringEventId);
