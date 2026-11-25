@@ -22,7 +22,6 @@ import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
 import { ReviewEngine } from "./review-engine.js";
 import { ReviewStore } from "./review-store.js";
-import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
 import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
 import {assertReplayAdmission, ErasureReplayBlockedError, ErasureReplayUnavailableError, replayAdmissionEnabled} from "./erasure-replay-barrier.js";
 import { logEvent } from "./observability.js";
@@ -658,23 +657,6 @@ export const handler: SQSHandler = async (event, context: Context) => {
           await markCompleted();
         }
         log("repair_delivery_completed", { awsRequestId:context.awsRequestId, status:result.status, operationId:result.id });
-        continue;
-      }
-
-      if (delivery.kind === "todoist" && await manual.interceptTodoistDeletion(delivery, state)) {
-        const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
-          // This intercepted delivery never reaches Synchronizer.process.
-          // Index and schedule the same exact-ID deletion recheck before
-          // recording the original webhook as completed.
-          await requestDeletedConflictReview(state, delivery.profile, { taskIds: [payload.event_data.id] });
-        }
-        await markCompleted();
-        log("todoist_delete_deferred_for_manual_decision", {
-          awsRequestId: context.awsRequestId,
-          durationMs: Date.now() - startedAt,
-          delivery: deliverySummary(delivery),
-        });
         continue;
       }
 

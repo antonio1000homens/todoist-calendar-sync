@@ -8,7 +8,6 @@ import { activeProjectDeletionTombstone, attachProjectCommentReference, buildPro
   upsertProjectMappingComment } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
-import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
 import {
@@ -1172,20 +1171,7 @@ export class Synchronizer {
 
   async process(delivery: Delivery): Promise<void> {
     if (delivery.kind === "calendar") return this.processCalendar(delivery);
-    if (delivery.kind === "todoist") {
-      await this.processTodoist(delivery);
-      // Run only after the original provider delivery completed successfully.
-      // A stale payload alone is never sufficient for retirement; the queued
-      // reconciliation performs fresh reads and version-fenced cleanup.
-      if (this.state instanceof StateRepository) {
-        const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-        if (payload.event_name === "item:deleted" && payload.event_data?.id
-          && !await this.state.isRetired?.({profile:delivery.profile,taskId:payload.event_data.id})) {
-          await requestDeletedConflictReview(this.state, delivery.profile, { taskIds: [payload.event_data.id] });
-        }
-      }
-      return;
-    }
+    if (delivery.kind === "todoist") return this.processTodoist(delivery);
     if (delivery.kind === "reconcile") return this.reconcile(delivery.profile);
     return this.processOrphan(delivery);
   }
@@ -1414,29 +1400,7 @@ export class Synchronizer {
         });
       }
     }
-    if (this.state instanceof StateRepository) {
-      const deleted = delta.items.filter(event => event.status === "cancelled");
-      const eligibleDeleted: CalendarEvent[] = [];
-      for(const event of deleted){
-        // applyCalendarEvent observes this marker before event-specific work,
-        // but cancellation review scheduling runs afterward on a separate
-        // path. Do not let the sync worker's own deleted-event delta create
-        // review/DynamoDB identity from the same tombstoned Calendar ID.
-        if(activeProjectDeletionTombstone(projectComments,{profile:delivery.profile,
-          projectId:profiles[delivery.profile].todoistProjectId,
-          eventIds:[event.id,event.recurringEventId].filter((id):id is string=>Boolean(id))})) continue;
-        if(await this.state.isRetired?.({profile:delivery.profile,
-          eventIds:[...new Set([event.id,event.recurringEventId]
-            .filter((id):id is string=>Boolean(id)))],
-          ...(event.iCalUID?{seriesIds:[event.iCalUID]}:{})})) continue;
-        eligibleDeleted.push(event);
-      }
-      if (eligibleDeleted.length) await requestDeletedConflictReview(this.state, delivery.profile, {
-        eventIds: [...new Set(eligibleDeleted.flatMap(event => [event.id, event.recurringEventId].filter((id): id is string => Boolean(id))))],
-      });
-    }
-    // Only advance after all deletion-review guards and follow-up scheduling
-    // succeed, otherwise a failed notification loses these Calendar deltas.
+    // Advance only after every event delta has been processed successfully.
     if (delta.nextSyncToken) await this.state.putSyncToken(delivery.profile, delta.nextSyncToken);
     await this.state.audit(delivery.profile, "calendar_delta_processed", { deliveryId: delivery.id, count: delta.items.length, mode: delivery.mode });
   }
