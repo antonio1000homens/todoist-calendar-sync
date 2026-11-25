@@ -1,6 +1,6 @@
-import { createSign, randomUUID } from "node:crypto";
+import { createHash, createSign, randomUUID } from "node:crypto";
 import {guardReplayCalendarClient} from "./erasure-replay-providers.js";
-import { profileForTodoistProject, todoistProjectForToken } from "./config.js";
+import { profileForTodoistProject, profiles, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
 
@@ -108,6 +108,74 @@ export class GoogleCalendar {
 
   constructor(private readonly credentials: GoogleCredentials, private readonly calendarId: string,
     private readonly requestOptions:ProviderRequestOptions={}) {}
+
+  private correlate(event: CalendarEvent, mapping?: Partial<Mapping>): CalendarEvent {
+    const profile = (Object.entries(profiles) as Array<[Profile, (typeof profiles)[Profile]]>)
+      .find(([, config]) => config.calendarId === this.calendarId)?.[0];
+    if (!profile) return event;
+    const originalShared = event.extendedProperties?.shared || {};
+    const { syncSource: _legacySource, syncRecurrenceOwner: _legacyOwner, ...shared } = originalShared;
+    if (!event.extendedProperties?.shared?.taskId && !originalShared.syncSource && !originalShared.syncRecurrenceOwner) return event;
+    const taskId = event.extendedProperties?.shared?.taskId;
+    return { ...event, extendedProperties: { ...event.extendedProperties, shared: {
+      ...shared,
+      ...(taskId ? {
+      syncSchemaVersion: "2",
+      syncProfile: profile,
+      syncCalendarId: this.calendarId,
+      syncTaskId: taskId,
+      ...(event.id ? { syncEventId: event.id } : {}),
+      ...(mapping?.seriesId ? { syncSeriesId: mapping.seriesId } : {}),
+      ...(mapping?.masterEventId ? { syncMasterEventId: mapping.masterEventId } : {}),
+      ...(mapping?.activeInstanceId ? { syncActiveInstanceId: mapping.activeInstanceId } : {}),
+      ...(mapping?.originalStart ? { syncOriginalStart: mapping.originalStart } : {}),
+      ...(mapping?.activeEffectiveStart ? { syncActiveEffectiveStart: mapping.activeEffectiveStart } : {}),
+      ...(mapping?.calendarProgressVersion === 1 ? { syncProgressVersion: "1" } : {}),
+      ...(mapping?.completedThroughOriginalStart ? { syncCompletedThrough: mapping.completedThroughOriginalStart } : {}),
+      ...(mapping?.calendarNativeRecurring ? { syncCalendarNative: "true" } : {}),
+      ...(mapping?.todoistPhaseBVersion === 1 ? { syncTodoistPhaseBVersion: "1" } : {}),
+      } : {}),
+    } } };
+  }
+
+  private async ensureCorrelation(event: CalendarEvent): Promise<CalendarEvent> {
+    const correlated = this.correlate(event);
+    const desired = correlated.extendedProperties?.shared;
+    if (!desired || (Object.entries(desired).every(([key, value]) =>
+      event.extendedProperties?.shared?.[key] === value)
+      && event.extendedProperties?.shared?.syncSource === undefined)) return correlated;
+    if (!event.id || !event.etag) throw new Error("Calendar write returned no exact event identity or ETag for correlation readback");
+    return this.updateSharedEventPropertiesIfUnchanged(event.id, event.etag,
+      { ...Object.fromEntries(Object.entries(desired).filter(([key, value]) => event.extendedProperties?.shared?.[key] !== value)),
+        ...(event.extendedProperties?.shared?.syncSource !== undefined ? { syncSource: null } : {}),
+        ...(event.extendedProperties?.shared?.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}) });
+  }
+
+  /** Ensure both provider directions can rediscover the exact task/master pair. */
+  async ensureTaskCorrelation(eventId: string, taskId: string, expectedTaskId?: string,
+    mapping?: Partial<Mapping>): Promise<CalendarEvent> {
+    if (!eventId || !taskId) throw new Error("Calendar correlation requires exact event and task IDs");
+    const current = await this.getEvent(eventId);
+    const shared = current.extendedProperties?.shared || {};
+    if (shared.taskId && shared.taskId !== taskId && shared.taskId !== expectedTaskId) {
+      throw new Error("Calendar event is already correlated to a different Todoist task");
+    }
+    const candidate: CalendarEvent = {
+      ...current,
+      extendedProperties: {
+        ...current.extendedProperties,
+        shared: { ...shared, taskId },
+      },
+    };
+    const correlated = this.correlate(candidate, mapping);
+    const desired = correlated.extendedProperties?.shared || {};
+    const changes = { ...Object.fromEntries(Object.entries(desired).filter(([key, value]) => shared[key] !== value)),
+      ...(shared.syncSource !== undefined ? { syncSource: null } : {}),
+      ...(shared.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}) };
+    if (!Object.keys(changes).length) return current;
+    if (!current.etag) throw new Error("Calendar correlation readback has no ETag");
+    return this.updateSharedEventPropertiesIfUnchanged(eventId, current.etag, changes);
+  }
 
   private async token(): Promise<string> {
     if (this.accessToken) return this.accessToken;
@@ -444,10 +512,10 @@ export class GoogleCalendar {
     try {
       const created = await this.request<CalendarEvent>(
         `/calendars/${encodeURIComponent(this.calendarId)}/events`,
-        { method: "POST", body: JSON.stringify(event) },
+        { method: "POST", body: JSON.stringify(this.correlate(event)) },
       );
       if (!valid(created)) throw new Error("Created Calendar master does not match the approved future schedule");
-      return created;
+      return this.ensureCorrelation(created);
     } catch (error) {
       if (Number((error as { status?: number }).status) !== 409) throw error;
       const existing = await this.getEvent(event.id);
@@ -465,25 +533,65 @@ export class GoogleCalendar {
     const shared = event.extendedProperties?.shared;
     if (!/^[a-f0-9]{32}$/.test(event.id) || !event.start?.date
       || event.start.dateTime || event.recurrence?.length !== 1
-      || shared?.syncRecurrenceOwner !== "todoist" || !shared.taskId
+      || (!shared?.todoistRecurrence && shared?.syncRecurrenceOwner !== "todoist") || !shared.taskId
       || shared.todoistAnchorStart !== event.start.date
       || shared.todoistPhaseBVersion !== "1") {
       throw new Error("Phase B master create requires an anchored deterministic identity");
     }
     try {
-      return { event: await this.request<CalendarEvent>(
+      const created = await this.request<CalendarEvent>(
         `/calendars/${encodeURIComponent(this.calendarId)}/events`,
-        { method: "POST", body: JSON.stringify(event) },
-      ), created: true };
+        { method: "POST", body: JSON.stringify(this.correlate(event)) },
+      );
+      return { event: await this.ensureCorrelation(created), created: true };
     } catch (error) {
       if (Number((error as { status?: number }).status) !== 409) throw error;
-      return { event: await this.getEvent(event.id), created: false };
+      return { event: await this.ensureCorrelation(await this.getEvent(event.id)), created: false };
     }
   }
 
   async upsertEvent(event: CalendarEvent, existingId?: string): Promise<CalendarEvent> {
-    const path = `/calendars/${encodeURIComponent(this.calendarId)}/events${existingId ? `/${encodeURIComponent(existingId)}` : ""}`;
-    return this.request(path, { method: existingId ? "PUT" : "POST", body: JSON.stringify(event) });
+    if (existingId) return this.patchEventIfUnchanged(event, existingId);
+    const path = `/calendars/${encodeURIComponent(this.calendarId)}/events`;
+    const correlated = this.correlate(event);
+    const result = await this.request<CalendarEvent>(path, { method: "POST", body: JSON.stringify(correlated) });
+    return this.ensureCorrelation(result);
+  }
+
+  private async patchEventIfUnchanged(event: CalendarEvent, eventId: string, expectedEtag?: string): Promise<CalendarEvent> {
+    if (!eventId) throw new Error("Calendar update requires an exact event ID");
+    const current = await this.getEvent(eventId);
+    if (expectedEtag && current.etag !== expectedEtag) {
+      throw Object.assign(new Error("Calendar event changed since it was read"), { status: 412 });
+    }
+    if (!current.etag) throw new Error("Calendar update readback has no ETag");
+    if (current.status === "cancelled") throw Object.assign(new Error("Cannot update a cancelled Calendar event"), { status: 410 });
+
+    const currentExtended = current.extendedProperties || {};
+    const incomingExtended = event.extendedProperties || {};
+    const currentShared = currentExtended.shared || {};
+    const desired = this.correlate({ ...event, id: eventId });
+    const incomingShared = desired.extendedProperties?.shared || {};
+    const shared = { ...currentShared, ...incomingShared };
+    // The provider IDs are sufficient correlation. Remove the old static
+    // source marker when touching a known managed event.
+    if (incomingShared.taskId) {
+      delete shared.syncSource;
+      delete shared.syncRecurrenceOwner;
+    }
+    const extendedProperties = {
+      ...currentExtended,
+      ...incomingExtended,
+      shared,
+    };
+    const body: Record<string, unknown> = { extendedProperties };
+    for (const field of ["summary", "description", "start", "end", "recurrence"] as const) {
+      if (event[field] !== undefined) body[field] = event[field];
+    }
+    return this.request<CalendarEvent>(
+      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`,
+      { method: "PATCH", headers: { "If-Match": current.etag }, body: JSON.stringify(body) },
+    );
   }
 
   /** Retry creation only for a deterministic event ID owned by this repair. */
@@ -518,10 +626,7 @@ export class GoogleCalendar {
    */
   async upsertEventIfUnchanged(event: CalendarEvent, existingId: string, etag: string): Promise<CalendarEvent> {
     if (!existingId || !etag) throw new Error("Manual Calendar update requires existing event ID and ETag");
-    return this.request(
-      `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(existingId)}`,
-      { method: "PUT", headers: { "If-Match": etag }, body: JSON.stringify(event) },
-    );
+    return this.patchEventIfUnchanged(event, existingId, etag);
   }
 
   /** Patch only shared identity keys on one exact event or recurring instance. */
@@ -531,16 +636,24 @@ export class GoogleCalendar {
     shared: Record<string, string | null>,
   ): Promise<CalendarEvent> {
     if (!eventId || !etag || !Object.keys(shared).length) throw new Error("Manual Calendar metadata update requires an exact event ID, ETag, and properties");
+    const current = await this.getEvent(eventId);
+    if (current.etag !== etag) throw Object.assign(new Error("Calendar event changed before correlation metadata update"), { status: 412 });
+    const merged = { ...(current.extendedProperties?.shared || {}) } as Record<string, string | null>;
+    for (const [key, value] of Object.entries(shared)) {
+      if (value === null) delete merged[key];
+      else merged[key] = value;
+    }
     return this.request(
       `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`,
-      { method: "PATCH", headers: { "If-Match": etag }, body: JSON.stringify({ extendedProperties: { shared } }) },
+      { method: "PATCH", headers: { "If-Match": etag }, body: JSON.stringify({ extendedProperties: { shared: merged } }) },
     );
   }
 
   async deleteEvent(eventId: string, etag?: string): Promise<void> {
-    await this.request<void>(`/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`, {
-      method: "DELETE", ...(etag ? { headers: { "If-Match": etag } } : {}),
-    });
+    if (etag) return this.deleteEventIfUnchanged(eventId, etag);
+    const current = await this.getEvent(eventId);
+    if (current.id !== eventId || !current.etag) throw new Error("Calendar deletion readback did not confirm the exact event and ETag");
+    await this.deleteEventIfUnchanged(eventId, current.etag);
   }
 
   /** Delete only the exact Calendar version approved by a repair preview. */
@@ -591,17 +704,16 @@ export class Todoist {
     }
   }
 
-  private async syncCommand(type: string, args: Record<string, unknown>): Promise<void> {
-    const uuid = randomUUID();
+  private async syncCommand(type: string, args: Record<string, unknown>, commandUuid: string = randomUUID()): Promise<void> {
     const headers = new Headers({ authorization: `Bearer ${this.token}` });
     headers.set("content-type", "application/x-www-form-urlencoded");
     const body = new URLSearchParams({
-      commands: JSON.stringify([{ type, uuid, args }]),
+      commands: JSON.stringify([{ type, uuid: commandUuid, args }]),
     });
     const result = await responseJson<{ sync_status?: Record<string, unknown> }>(
       await fetchProvider(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body },this.requestOptions),
     );
-    const status = result.sync_status?.[uuid];
+    const status = result.sync_status?.[commandUuid];
     if (status !== "ok") {
       throw new Error(`Todoist sync command ${type} failed: ${JSON.stringify(status)}`);
     }
@@ -624,6 +736,15 @@ export class Todoist {
 
   async listTasks(projectId = todoistProjectForToken(this.token)): Promise<TodoistTask[]> {
     return this.readTasks(projectId);
+  }
+
+  async getProject(projectId: string): Promise<{ id: string; name: string }> {
+    if (typeof projectId !== "string" || !projectId) throw new Error("Todoist project read requires an exact project ID");
+    const project = await this.request<{ id?: unknown; name?: unknown }>(`/projects/${encodeURIComponent(projectId)}`);
+    if (project.id !== projectId || typeof project.name !== "string" || !project.name.trim()) {
+      throw new Error("Todoist project readback did not match the exact configured project");
+    }
+    return { id: project.id, name: project.name };
   }
 
   /** Paginate the complete active-task collection for a read-only identity audit. */
@@ -853,6 +974,24 @@ export class Todoist {
     return this.getTask(task.id);
   }
 
+  /**
+   * Complete the exact live task through Todoist's completion command. The
+   * expected due and deterministic command UUID make a lost acknowledgement
+   * safe to retry without completing the next recurring occurrence.
+   */
+  async completeTask(taskId: string, expectedDue: string): Promise<"completed" | "already_completed" | "stale"> {
+    if (typeof taskId !== "string" || !taskId) throw new Error("Todoist completion requires an exact task ID");
+    if (typeof expectedDue !== "string" || !expectedDue) throw new Error("Todoist completion requires the exact expected due");
+    const current = await this.getTask(taskId);
+    if (current.id !== taskId) throw new Error("Todoist completion readback returned a different task ID");
+    if (current.is_deleted || current.is_completed || current.completed_at) return "already_completed";
+    if (current.due?.date !== expectedDue && current.due?.datetime !== expectedDue) return "stale";
+    const commandUuid = createHash("sha256").update(`todoist-complete:${taskId}:${expectedDue}`).digest("hex");
+    const uuid = `${commandUuid.slice(0,8)}-${commandUuid.slice(8,12)}-${commandUuid.slice(12,16)}-${commandUuid.slice(16,20)}-${commandUuid.slice(20,32)}`;
+    await this.syncCommand("item_close", { id: taskId }, uuid);
+    return "completed";
+  }
+
   async deleteTask(taskId: string): Promise<void> {
     const projectId = todoistProjectForToken(this.token);
     if (projectId) {
@@ -1079,6 +1218,7 @@ export class Todoist {
     const baseMapping: Mapping = {
       ...(mappingDetails || {}),
       profile,
+      calendarId: profiles[profile].calendarId,
       projectId,
       taskId,
       eventId,

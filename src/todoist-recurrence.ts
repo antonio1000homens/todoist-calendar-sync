@@ -168,7 +168,7 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
 export function isTodoistOwnedCalendarRecurrence(event: { recurrence?: string[]; extendedProperties?: { shared?: Record<string, string> } }): boolean {
   return Boolean(
     event.recurrence?.length
-    && event.extendedProperties?.shared?.syncRecurrenceOwner === "todoist",
+    && Boolean(event.extendedProperties?.shared?.todoistRecurrence || event.extendedProperties?.shared?.syncRecurrenceOwner === "todoist"),
   );
 }
 
@@ -177,8 +177,8 @@ export function calendarRecurrenceMatchesTodoist(event: { recurrence?: string[];
   if (!rrule) return !event.recurrence?.length;
   return Boolean(
     event.recurrence?.includes(rrule)
-    && event.extendedProperties?.shared?.syncRecurrenceOwner === "todoist"
-    && event.extendedProperties?.shared?.todoistRecurrence === todoistRecurrenceKey(task),
+    && Boolean(event.extendedProperties?.shared?.todoistRecurrence || event.extendedProperties?.shared?.syncRecurrenceOwner === "todoist")
+    && (!event.extendedProperties?.shared?.todoistRecurrence || event.extendedProperties?.shared?.todoistRecurrence === todoistRecurrenceKey(task)),
   );
 }
 

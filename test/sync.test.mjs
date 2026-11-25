@@ -26,6 +26,38 @@ test("converts Calendar all-day and timed representations into Todoist", () => {
   assert.deepEqual(timed.due, { datetime: "2026-09-01T09:30:00+01:00", timezone: "Europe/London" });
 });
 
+test("mapping persistence writes provider correlation and a minimal shared-field baseline", async () => {
+  const state={};
+  const comments=[];
+  const todoist={
+    async listProjectComments(){return comments;},
+    async upsertProjectComment(projectId,content,existingId){
+      const comment={id:existingId||"project-correlation",project_id:projectId,content};
+      comments.splice(0,comments.length,comment);
+      return comment;
+    },
+    async updateComment(){throw new Error("no existing comment expected");},
+  };
+  const correlations=[];
+  const calendar={async ensureTaskCorrelation(eventId,taskId,_expectedTaskId,mapping){
+    correlations.push({eventId,taskId,mapping});
+    return {id:eventId,summary:"Exact title",description:"Exact details",start:{dateTime:"2099-05-01T09:00:00Z"}};
+  }};
+  const sync=new Synchronizer(state,undefined,async()=>({todoist,calendar}));
+  await sync.saveMapping({profile:"home",calendarId:"old-calendar",eventId:"event-master",masterEventId:"event-master",
+    taskId:"task-42",activeEffectiveStart:"2099-05-08T09:00:00Z",updatedAt:"2099-05-01T09:00:00Z"});
+  assert.equal(correlations[0].eventId,"event-master");
+  assert.equal(correlations[0].taskId,"task-42");
+  assert.equal(correlations[0].mapping.calendarId,profiles.home.calendarId);
+  const serialized=comments[0].content;
+  assert.match(serialized,/"schemaVersion":2/);
+  assert.match(serialized,/"baselineVersion":1/);
+  assert.match(serialized,/"syncedTitle":"Exact title"/);
+  assert.match(serialized,/"syncedDescription":"Exact details"/);
+  assert.match(serialized,/"syncedDue":"2099-05-08T09:00:00Z"/);
+  assert.equal(JSON.parse(serialized.split("\n")[1]).calendarId,profiles.home.calendarId);
+});
+
 test("multi-day Calendar events use only their first day as the Todoist due date", () => {
   const original = {
     id: "leave-event", status: "confirmed", summary: "Leave Approved",
@@ -436,7 +468,7 @@ test("projects supported Todoist recurrence as a Calendar RRULE master", () => {
   assert.deepEqual(event.recurrence, ["RRULE:FREQ=DAILY"]);
   assert.deepEqual(event.start, { date: "2026-09-01" });
   assert.deepEqual(event.end, { date: "2026-09-02" });
-  assert.equal(event.extendedProperties.shared.syncRecurrenceOwner, "todoist");
+  assert.equal(event.extendedProperties.shared.syncRecurrenceOwner, undefined);
   assert.equal(event.extendedProperties.shared.todoistRecurrence, "every day");
   assert.equal(todoistRecurrenceToRrule(task), "RRULE:FREQ=DAILY");
 });
@@ -498,7 +530,7 @@ test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE ma
   const event = toCalendarEvent(task);
   assert.deepEqual(event.recurrence, ["RRULE:FREQ=WEEKLY"]);
   assert.deepEqual(event.start, { dateTime: "2026-09-19T09:30:00+01:00", timeZone: "Europe/London" });
-  assert.equal(event.extendedProperties.shared.syncRecurrenceOwner, "todoist");
+  assert.equal(event.extendedProperties.shared.syncRecurrenceOwner, undefined);
   assert.equal(event.extendedProperties.shared.todoistRecurrence, "every week 09:30");
 });
 
@@ -514,7 +546,7 @@ test("validates Todoist HMAC over the exact raw body", () => {
 test("Todoist canonical no-op preserves canonical project-comment mapping references", async () => {
   const task = {
     id: "task-canonical",
-    project_id: "project-home",
+    project_id: profiles.home.todoistProjectId,
     content: "Canonical task",
     description: "",
     due: { date: "2026-10-05" },
@@ -531,7 +563,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   };
   const original = {
     profile: "home",
-    projectId: "project-home",
+    projectId: profiles.home.todoistProjectId,
     eventId: event.id,
     taskId: task.id,
     projectCommentId: "project-comment-7",
@@ -539,7 +571,9 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     mappingRevision: 7,
     updatedAt: "2026-10-05T17:00:00Z",
   };
-  let saved;
+  const initialComment={id:original.projectCommentId,project_id:profiles.home.todoistProjectId,
+    content:serializeMappingComment({...original,calendarId:profiles.home.calendarId},profiles.home.todoistProjectId)};
+  const comments=[initialComment];
   let fenceHeld = false;
   const state = {
     async beginTodoistCalendarWrite(id) {
@@ -560,10 +594,6 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     async getCalendarProjectionTombstone() { return undefined; },
     async getMappingByTask() { return structuredClone(original); },
     async mutationAllowed() { return true; },
-    async putMapping(value) {
-      assert.equal(fenceHeld, true, "the fence remains held through the mapping write");
-      saved = structuredClone(value);
-    },
     async getCompletedCalendarProjectionByEvent() { return undefined; },
     async audit() {},
   };
@@ -574,7 +604,10 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist: {
-    async listProjectComments() { return []; }, async getTask() { return structuredClone(task); } } }));
+    async listProjectComments() { return comments.map(value=>structuredClone(value)); },
+    async updateComment(id,content) { const index=comments.findIndex(value=>value.id===id);comments[index]={...comments[index],content};return structuredClone(comments[index]); },
+    async upsertProjectComment(projectId,content,existingId) { const value={id:existingId||"new-comment",project_id:projectId,content};const index=comments.findIndex(entry=>entry.id===value.id);if(index<0)comments.push(value);else comments[index]=value;return structuredClone(value); },
+    async getTask() { return structuredClone(task); } } }));
 
   await sync.process({
     id: "canonical-noop",
@@ -586,12 +619,13 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
     body: JSON.stringify({ event_name: "item:updated", event_data: task }),
   });
 
-  assert.ok(saved);
+  assert.equal(comments.length,1);
   assert.equal(fenceHeld, false, "the fence is released after the complete no-op workflow");
-  assert.equal(saved.projectId, "project-home");
-  assert.equal(saved.projectCommentId, "project-comment-7");
-  assert.equal(saved.taskCommentId, "legacy-task-comment-2");
-  assert.equal(saved.mappingRevision, 7);
+  const persisted=JSON.parse(comments[0].content.split("\n")[1]);
+  assert.equal(persisted.projectId,profiles.home.todoistProjectId);
+  assert.equal(persisted.taskId,task.id);
+  assert.equal(persisted.eventId,event.id);
+  assert.ok(persisted.mappingRevision>=7);
 });
 
 test("erased Todoist upsert and delete replays emit identity-free suppression audits", async () => {
@@ -650,7 +684,12 @@ test("deleted Todoist task removes its exact project mapping comment even withou
     },
     async deleteComment(id) { deletedComments.push(id); commentExists.delete(id); },
   };
-  const calendar = { async findByTodoistTaskId() { return undefined; } };
+  const calendar = {
+    async findByTodoistTaskId() { return undefined; },
+    async getEvent(id) { return {id,status:"confirmed",extendedProperties:{shared:{taskId}}}; },
+    async deleteEvent(id) { deletedCalendarEvents.push(id); },
+  };
+  const deletedCalendarEvents=[];
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
 
   await sync.process({ id: "deleted-task-orphan-comment", kind: "todoist", profile: "home", mode: "aws",
@@ -661,6 +700,7 @@ test("deleted Todoist task removes its exact project mapping comment even withou
   });
 
   assert.deepEqual(deletedComments, [comment.id]);
+  assert.deepEqual(deletedCalendarEvents,[eventId]);
   assert.equal(commentExists.has(comment.id), false);
   assert.equal(commentExists.has(userNote.id), true);
 });
@@ -830,7 +870,7 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
     async mutationAllowed(){return true;},
     async putMapping(v){assert.equal(lease,true);mapping=structuredClone(v);},
     async putRecurrenceLink(v){assert.equal(lease,true);link=structuredClone(v);},
-    async completeCancelledAnnualRecovery(){assert.ok(mapping&&link);receipt=undefined;completion++;return true;},
+    async completeCancelledAnnualRecovery(){assert.ok(mapping);receipt=undefined;completion++;return true;},
     async recordRecurrence(){},async recordMutation(){},
     async audit(_profile,action,details){logs.push({action,details});},
   };
@@ -869,7 +909,6 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
   assert.equal(mapping.eventId,"new-yearly-master");
   assert.equal(mapping.recurrenceOwner,"todoist");
   assert.equal(mapping.taskId,task.id);
-  assert.equal(link.masterEventId,"new-yearly-master");
   assert.equal(lease,false);
   assert.ok(logs.some(x=>x.action==="todoist_created_calendar"));
 });

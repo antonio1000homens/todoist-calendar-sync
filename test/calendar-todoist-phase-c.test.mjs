@@ -95,7 +95,7 @@ test("missing anchor phase, wrong ordinal and finite/cancelled/other-owned rules
     assert.equal(calendarPhaseCCandidate(calendar).reason, reason, calendar.recurrence[0]);
   assert.equal(calendarPhaseCCandidate({
     ...master("2027-01-01", "RRULE:FREQ=WEEKLY;BYDAY=MO,FR"),
-    extendedProperties: { shared: { syncRecurrenceOwner: "todoist" } },
+    extendedProperties: { shared: { todoistRecurrence: "every weekday" } },
   }).disposition, "unsupported");
   assert.equal(calendarPhaseCCandidate({
     ...master("2027-01-01", "RRULE:FREQ=WEEKLY;BYDAY=MO,FR"), recurrence: [

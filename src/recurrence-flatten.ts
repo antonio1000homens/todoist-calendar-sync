@@ -43,7 +43,7 @@ export function planRecurrenceFlatten(profile: Profile, task: TodoistTask, maste
 }
 export function flattenStandalone(plan: RecurrenceFlattenPlan, occurrence: CalendarEvent): CalendarEvent {
   return {id:plan.standaloneId,summary:occurrence.summary,description:occurrence.description || "",start:{date:plan.start},end:{date:plan.end},
-    extendedProperties:{shared:{taskId:plan.taskId,syncSource:"todoist-calendar-sync",syncFlattenMasterId:plan.masterId,syncFlattenOccurrenceId:plan.occurrenceId}}};
+    extendedProperties:{shared:{taskId:plan.taskId,syncFlattenMasterId:plan.masterId,syncFlattenOccurrenceId:plan.occurrenceId}}};
 }
 export function assertFlattenedMaster(plan: RecurrenceFlattenPlan, master: CalendarEvent): void {
   if (master.status !== "confirmed" || master.id !== plan.masterId) throw new Error("Flattened Calendar master disappeared or was cancelled");

@@ -11,6 +11,7 @@ import {
   cleanupExpiredProjectDeletionTombstones,
   deleteMappingComments,
   findProjectMappingComment,
+  mappingFromProjectMappingComment,
   parseMappingComment,
   parseDeletionTombstoneComment,
   projectDeletionTombstoneExpired,
@@ -45,6 +46,7 @@ test("v1 project mapping comment round-trips recurrence metadata", () => {
   const parsed = parseMappingComment({ id: "comment-1", content });
   assert.ok(parsed && !("error" in parsed));
   assert.equal(parsed.payload.profile, "home");
+  assert.equal(Object.hasOwn(JSON.parse(content.split("\n")[1]), "recurrenceOwner"), false, "new project correlations do not persist a permanent recurrence owner");
   assert.equal(parsed.payload.projectId, "project-home");
   assert.equal(parsed.payload.taskId, "task-1");
   assert.equal(parsed.payload.eventId, "event-1");
@@ -52,6 +54,60 @@ test("v1 project mapping comment round-trips recurrence metadata", () => {
   assert.equal(parsed.payload.masterEventId, "master-1");
   assert.equal(parsed.payload.activeInstanceId, "event-1");
   assert.equal(parsed.payload.mappingRevision, 3);
+});
+
+test("provider-native v2 mapping preserves calendar identity and the last-synced field baseline", () => {
+  const comment={id:"v2",content:serializeMappingComment(mapping({calendarId:"calendar-home",
+    calendarNativeRecurring:true,todoistPhaseBVersion:1,calendarProgressVersion:1,
+    completedThroughOriginalStart:"2026-11-25T09:00:00Z",
+    syncedTitle:"Title",syncedDescription:"Description",syncedDue:"2026-12-01T10:00:00Z"}),"project-home")};
+  const parsed=parseMappingComment(comment);
+  assert.ok(parsed&&!('error' in parsed));
+  assert.equal(parsed.payload.schemaVersion,2);
+  assert.equal(parsed.payload.calendarId,"calendar-home");
+  assert.equal(parsed.payload.baselineVersion,1);
+  assert.equal(parsed.payload.syncedTitle,"Title");
+  assert.equal(parsed.payload.syncedDescription,"Description");
+  assert.equal(parsed.payload.syncedDue,"2026-12-01T10:00:00Z");
+  assert.equal(parsed.payload.calendarNativeRecurring,true);
+  assert.equal(parsed.payload.todoistPhaseBVersion,1);
+  assert.equal(parsed.payload.calendarProgressVersion,1);
+  assert.equal(Object.hasOwn(JSON.parse(comment.content.split("\n")[1]), "recurrenceOwner"), false);
+  assert.equal(parsed.payload.completedThroughOriginalStart,"2026-11-25T09:00:00Z");
+  assert.deepEqual(mappingFromProjectMappingComment(parsed),mapping({calendarId:"calendar-home",
+    calendarNativeRecurring:true,todoistPhaseBVersion:1,calendarProgressVersion:1,
+    completedThroughOriginalStart:"2026-11-25T09:00:00Z",
+    projectCommentId:"v2",syncedTitle:"Title",syncedDescription:"Description",syncedDue:"2026-12-01T10:00:00Z"}));
+  const emptyBaseline=parseMappingComment({id:"empty-baseline",content:serializeMappingComment(mapping({
+    syncedTitle:"",syncedDescription:"",syncedDue:"2099-05-01"}),"project-home")});
+  assert.ok(emptyBaseline&&!('error' in emptyBaseline),"empty titles/descriptions are valid synced values");
+});
+
+test("a rolling recurring series keeps one project correlation when its successor task ID changes", async () => {
+  const current = { id: "series-comment", project_id: "project-home",
+    content: serializeMappingComment(mapping(), "project-home") };
+  const comments = [current];
+  const writes = [];
+  const client = {
+    async listProjectComments() { return comments.map(comment => structuredClone(comment)); },
+    async upsertProjectComment(projectId, content, existingId) {
+      writes.push(existingId);
+      const next = { id: existingId || "new-comment", project_id: projectId, content };
+      const index = comments.findIndex(comment => comment.id === next.id);
+      if (index < 0) comments.push(next); else comments[index] = next;
+      return structuredClone(next);
+    },
+  };
+  const next = await upsertProjectMappingComment(client, mapping({ taskId: "task-successor",
+    eventId: "event-successor", activeInstanceId: "event-successor", mappingRevision: 4 }), "project-home");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0], "series-comment");
+  assert.equal(comments.length, 1, "the rolling occurrence updates the stable series comment in place");
+  assert.equal(next.taskId, "task-successor");
+  const parsed = parseMappingComment(comments[0]);
+  assert.ok(parsed && !("error" in parsed));
+  assert.equal(parsed.payload.seriesId, "series-1");
+  assert.equal(parsed.payload.taskId, "task-successor");
 });
 
 test("project deletion tombstone round-trips exact identities and expires without DynamoDB state", () => {

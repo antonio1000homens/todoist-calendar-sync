@@ -4,15 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: Sync profile to exercise
+        description: Production acceptance is scoped to the antonio profile
         required: true
         default: antonio
         type: choice
         options:
           - antonio
-          - home
-          - work
-          - all
       timeout_seconds:
         description: Maximum wait for each asynchronous hop
         required: true
@@ -22,12 +19,6 @@ on:
           - '120'
           - '180'
           - '300'
-      cleanup:
-        description: Delete the disposable Calendar item and verify Todoist cleanup
-        required: true
-        default: true
-        type: boolean
-
 permissions:
   contents: read
   id-token: write
@@ -63,7 +54,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: master
+          ref: ${{ github.sha }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -83,17 +74,10 @@ jobs:
           role-session-name: github-actions-todoist-calendar-e2e
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Resolve production state resources
+      - name: Resolve production queue resources
         shell: bash
         run: |
           set -euo pipefail
-
-          state_table="$(aws cloudformation describe-stack-resource \
-            --region "$AWS_REGION" \
-            --stack-name "$STACK_NAME" \
-            --logical-resource-id SyncState \
-            --query 'StackResourceDetail.PhysicalResourceId' \
-            --output text)"
 
           dlq_physical="$(aws cloudformation describe-stack-resource \
             --region "$AWS_REGION" \
@@ -113,7 +97,6 @@ jobs:
           fi
 
           {
-            echo "STATE_TABLE_NAME=$state_table"
             echo "SYNC_DLQ_URL=$dlq_url"
             echo "GOOGLE_CREDENTIALS_PARAMETER_PREFIX=${SSM_PREFIX%/}/google"
             echo "TODOIST_TOKEN_PARAMETER_PREFIX=${SSM_PREFIX%/}/todoist"
@@ -123,7 +106,7 @@ jobs:
         env:
           E2E_PROFILE: ${{ inputs.profile }}
           E2E_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
-          E2E_CLEANUP: ${{ inputs.cleanup }}
+          E2E_CLEANUP: 'true'
         run: node scripts/production-e2e.mjs
 
       - name: Publish E2E summary
@@ -145,10 +128,10 @@ jobs:
           console.log(`Status: **${result.status}**`);
           console.log(`DLQ depth: **${result.initialDlqDepth} → ${result.finalDlqDepth ?? 'unknown'}**`);
           console.log('');
-          console.log('| Profile | Result | Calendar event | Todoist task | Cleanup |');
-          console.log('| --- | --- | --- | --- | --- |');
+          console.log('| Profile | Result | Cleanup |');
+          console.log('| --- | --- | --- |');
           for (const entry of result.results || []) {
-            console.log(`| ${entry.profile} | ${entry.status} | ${entry.eventId || '-'} | ${entry.taskId || '-'} | ${entry.cleanup ? 'yes' : 'no'} |`);
+            console.log(`| ${entry.profile} | ${entry.status} | ${entry.cleanup ? 'yes' : 'no'} |`);
           }
           if (result.error) {
             console.log('');

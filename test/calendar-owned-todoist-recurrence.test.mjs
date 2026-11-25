@@ -104,6 +104,27 @@ test("indefinite weekly, monthly and annual Calendar patterns produce real Todoi
   }
 });
 
+test("daily Calendar rules, including intervals, map to equivalent Todoist recurrences", () => {
+  for (const [rule, text, interval] of [
+    ["RRULE:FREQ=DAILY", "every day starting 4 Nov 2026", undefined],
+    ["RRULE:FREQ=DAILY;INTERVAL=2", "every 2 days starting 4 Nov 2026", 2],
+  ]) {
+    const master = { id: "master", start: { date: "2026-11-04" }, recurrence: [rule] };
+    assert.equal(nativeCalendarRecurrenceCandidate(master), true);
+    const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+    assert.equal(recurrence.frequency, "daily");
+    assert.equal(recurrence.interval, interval);
+    assert.equal(recurrence.dueString, text);
+    const event = { id: "active", start: { date: "2026-11-08" }, summary: "Daily task" };
+    const task = { id: "task", content: "Daily task", due: {
+      date: "2026-11-08", is_recurring: true, string: text,
+    } };
+    assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
+    assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, string: "every day" } }, recurrence, "Europe/London"), interval === undefined);
+  }
+});
+
 test("all-day native rules and Todoist's normalized no-start recurrence remain valid", () => {
   const shapes = [
     { date: "2099-09-02", rule: "RRULE:FREQ=WEEKLY", normalized: "every Wednesday" },
@@ -173,13 +194,14 @@ test("native recurrence requires a complete explicit exception inventory", async
   let queried;
   const farFuture = { ...instances(["2028-11-01T14:00:00Z"])[0],
     id: "far-future", status: "cancelled" };
-  const rejected = await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async (id) => {
+  const cancelled = await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async (id) => {
     queried = id; return [farFuture];
   });
   assert.equal(queried, master.id);
-  assert.equal(rejected, undefined, "a cancellation outside the bounded instance window blocks native conversion");
-  const moved = { ...farFuture, status: "confirmed", start: { dateTime: "2028-11-02T14:00:00Z" } };
-  assert.equal(await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [moved]), undefined);
+  assert.equal(cancelled?.frequency, "weekly", "a proven cancellation is retained as an occurrence exception");
+  const moved = { ...farFuture, status: "confirmed", start: { dateTime: "2028-11-02T14:00:00Z" },
+    end: { dateTime: "2028-11-02T14:30:00Z" } };
+  assert.equal((await verifiedCalendarOwnedRecurrence(master, scoped, "Europe/London", async () => [moved]))?.frequency, "weekly");
 });
 
 test("native task payload uses verified timezone without a London default", () => {
@@ -193,13 +215,14 @@ test("native task payload uses verified timezone without a London default", () =
   assert.equal(calendarOwnedRecurringTaskPayload(event, recurrence).due.timezone, undefined);
 });
 
-test("native recurrence rejects moved Calendar exceptions but accepts cancellations", () => {
+test("native recurrence preserves moved Calendar exceptions and cancellations", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=WEEKLY");
   const series = instances(["2026-11-04T14:00:00Z", "2026-11-11T14:00:00Z"]);
   const moved = structuredClone(series);
   moved[1].start.dateTime = "2026-11-12T14:00:00Z";
-  assert.equal(calendarOwnedTodoistRecurrence(master, moved, "Europe/London"), undefined,
-    "a moved single Calendar event cannot be represented by one native Todoist rule");
+  moved[1].end = { dateTime: "2026-11-12T14:30:00Z" };
+  assert.equal(calendarOwnedTodoistRecurrence(master, moved, "Europe/London")?.frequency, "weekly",
+    "the immutable original start keeps the base recurrence identity while Calendar retains the move");
   const cancelled = structuredClone(series);
   cancelled[1].status = "cancelled";
   assert.equal(calendarOwnedTodoistRecurrence(master, cancelled, "Europe/London").frequency, "weekly");

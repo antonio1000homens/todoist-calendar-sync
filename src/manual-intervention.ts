@@ -33,7 +33,7 @@ import {
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { assertManualDecisionReplayAdmission, ReviewStore, reviewHash } from "./review-store.js";
 import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
-import { hasCanonicalState, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 function futureSplitDescription(plan: FutureSeriesSplitPlan, anchor?: string): string {
@@ -379,7 +379,7 @@ function consolidationMasterFingerprint(event: CalendarEvent, plan: ReturnType<t
   delete shared.todoistRecurrence;
   delete shared.syncHistoryCutoff;
   Object.assign(shared, {
-    syncSource:"todoist-calendar-sync", syncHistoryOnly:"true", syncHistoryTaskId:taskId,
+    syncHistoryOnly:"true", syncHistoryTaskId:taskId,
     syncHistoryOriginalRule:plan.originalRule, syncHistorySuccessorId:plan.newMasterId,
     ...(plan.previousOccurrence ? { syncHistoryCutoff: plan.previousOccurrence } : {}),
   });
@@ -1275,6 +1275,40 @@ export class ManualInterventionService {
     return (this.executionClientFactory || this.clients)(profile);
   }
 
+  private async persistProviderMapping(state: StateRepository, mapping: Mapping, pair: Awaited<ReturnType<ManualInterventionService["providerClients"]>>): Promise<Mapping> {
+    return new Synchronizer(state, undefined, async () => pair).persistProviderMapping(mapping, pair.todoist);
+  }
+
+  private async providerMappingByTask(state: StateRepository, profile: Profile, taskId: string): Promise<Mapping | undefined> {
+    const pair = await this.providerClients(profile);
+    if (typeof pair.todoist.listProjectComments !== "function"
+      || typeof pair.todoist.upsertProjectComment !== "function"
+      || typeof pair.todoist.updateComment !== "function") return state.getMappingByTask?.(profile, taskId);
+    return new Synchronizer(state, undefined, async () => pair).providerMappingByTask(profile, taskId, pair.todoist);
+  }
+
+  private async providerMappingByEvent(state: StateRepository, profile: Profile, eventId: string): Promise<Mapping | undefined> {
+    const pair = await this.providerClients(profile);
+    if (typeof pair.todoist.listProjectComments !== "function"
+      || typeof pair.todoist.upsertProjectComment !== "function"
+      || typeof pair.todoist.updateComment !== "function") return state.getMappingByEvent?.(profile, eventId);
+    return new Synchronizer(state, undefined, async () => pair).providerMappingByEvent(profile, eventId, pair.todoist);
+  }
+
+  private async providerMappingByTaskAnyProfile(state: StateRepository, taskId: string): Promise<Mapping | undefined> {
+    const found: Mapping[] = [];
+    for (const profile of Object.keys(profiles) as Profile[]) {
+      const mapping = await this.providerMappingByTask(state, profile, taskId);
+      if (mapping) found.push(mapping);
+    }
+    return found.length === 1 ? found[0] : undefined;
+  }
+
+  private async providerRecurrenceLink(state: StateRepository, profile: Profile, seriesId: string) {
+    const pair = await this.providerClients(profile);
+    return new Synchronizer(state, undefined, async () => pair).providerRecurrenceLink(profile, seriesId, pair.todoist);
+  }
+
   private createManualExecutionClientFactory(
     state: StateRepository,
     budget: ReconciliationMutationBudget,
@@ -1289,10 +1323,9 @@ export class ManualInterventionService {
       const sourceTaskId = protectedItems.decision.taskId;
       const sourceEventId = protectedItems.decision.eventId;
       if (sourceTaskId && sourceEventId) {
-        const lookupByEvent = typeof state.getMappingByEvent === "function"
-          ? state.getMappingByEvent.bind(state) : async () => undefined;
+        const lookupByEvent = (owner: Profile, eventId: string) => this.providerMappingByEvent(state, owner, eventId);
         const [byTask, byEvent] = await Promise.all([
-          state.getMappingByTask(profile, sourceTaskId), lookupByEvent(profile, sourceEventId),
+          this.providerMappingByTask(state, profile, sourceTaskId), lookupByEvent(profile, sourceEventId),
         ]);
         let approvedCutover = false;
         const cutover = protectedItems.consolidation;
@@ -1305,7 +1338,7 @@ export class ManualInterventionService {
             state.getFutureSeriesSplitAnyProfile(sourceTaskId),
             state.getConsolidatedTask(profile, cutover.duplicateTaskId),
             lookupByEvent(profile, cutover.newMasterId),
-            state.getRecurrenceLink(profile, sourceTaskId),
+            this.providerRecurrenceLink(state, profile, sourceTaskId),
           ]);
           approvedCutover = split?.profile === profile && split.taskId === sourceTaskId
             && split.oldMasterId === cutover.oldMasterId && split.newMasterId === cutover.newMasterId
@@ -1479,7 +1512,7 @@ export class ManualInterventionService {
     }
     const explicitDelete = Boolean(task?.id && (/deleted/i.test(payload.event_name || "") || task.is_deleted));
     if (!task?.id || !explicitDelete) return false;
-    const mapping = await state.getMappingByTask(delivery.profile, task.id);
+    const mapping = await state.getMappingByTask?.(delivery.profile, task.id);
     if (!mapping) return false;
 
     const type: ManualDecisionType = mapping.recurrenceOwner === "calendar" && mapping.masterEventId
@@ -1605,16 +1638,16 @@ export class ManualInterventionService {
       throw new Error("There is not exactly one matching active one-off Todoist duplicate");
     }
     const duplicate = matchingTasks[0];
-    const mapping = await state.getMappingByTask(profile, duplicate.id);
+    const mapping = await this.providerMappingByTask(state, profile, duplicate.id);
     if (!mapping?.masterEventId || mapping.recurrenceOwner !== "calendar"
       || !mapping.activeInstanceId || mapping.eventId !== mapping.activeInstanceId) {
       throw new Error("The one-off task is not the active mirror of a Calendar-owned recurrence");
     }
     const [link, master, duplicateHistory, taskOwner] = await Promise.all([
-      state.getRecurrenceLink(profile, mapping.seriesId || ""),
+      this.providerRecurrenceLink(state, profile, mapping.seriesId || ""),
       pair.calendar.getEvent(mapping.masterEventId),
       state.listCompletedCalendarProjectionsByTaskAnyProfile(duplicate.id),
-      state.getMappingByTaskAnyProfile(task.id),
+      this.providerMappingByTaskAnyProfile(state, task.id),
     ]);
     const archived = master.extendedProperties?.shared?.syncHistoryOnly === "true";
     const active = archived ? undefined : await pair.calendar.getEvent(mapping.activeInstanceId);
@@ -1848,7 +1881,7 @@ export class ManualInterventionService {
 
   private async validateMappedDecision(decision: ManualDecision, state: StateRepository): Promise<Mapping | undefined> {
     if (!decision.taskId || !decision.mappingSnapshot) return undefined;
-    const current = await state.getMappingByTask(decision.profile, decision.taskId);
+    const current = await this.providerMappingByTask(state, decision.profile, decision.taskId);
     if (!current
       || current.eventId !== decision.mappingSnapshot.eventId
       || current.masterEventId !== decision.mappingSnapshot.masterEventId
@@ -2013,8 +2046,8 @@ export class ManualInterventionService {
     }
 
     const [taskMapping, eventMapping, tombstone, completion, history, baseline, linked] = await Promise.all([
-      state.getMappingByTaskAnyProfile(task.id),
-      state.getMappingByEvent(decision.profile, event.id),
+      this.providerMappingByTaskAnyProfile(state, task.id),
+      this.providerMappingByEvent(state, decision.profile, event.id),
       state.getCalendarProjectionTombstone(decision.profile, task.id),
       state.getCompletedCalendarProjectionByEvent(decision.profile, event.id),
       state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
@@ -2061,9 +2094,8 @@ export class ManualInterventionService {
       }
       // Only update this specific approved event. An event cancelled or
       // changed after preflight must not turn into a replacement POST.
-      await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients)
+      const mapped = await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients)
         .resolveApprovedUnmappedProjection(decision.profile, currentTask, event.id, event.etag);
-      const mapped = await state.getMappingByTask(decision.profile, task.id);
       if (!mapped || mapped.eventId !== event.id
         || (action === "use_todoist_recurrence" && mapped.recurrenceOwner !== "todoist")
         || (action === "use_calendar_version" && mapped.recurrenceOwner)) {
@@ -2194,8 +2226,8 @@ export class ManualInterventionService {
     }
     if (alias) {
       const [mapping, link, split] = await Promise.all([
-        state.getMappingByTask(decision.profile, decision.taskId),
-        state.getRecurrenceLink(decision.profile, decision.taskId),
+        this.providerMappingByTask(state, decision.profile, decision.taskId),
+        this.providerRecurrenceLink(state, decision.profile, decision.taskId),
         state.getFutureSeriesSplitAnyProfile(decision.taskId),
       ]);
       const mappingInstalled = mapping?.recurrenceOwner === "todoist"
@@ -2291,12 +2323,12 @@ export class ManualInterventionService {
       pair.todoist.getTask(decision.taskId),
       pair.todoist.getTask(duplicateId),
       pair.calendar.getEvent(masterId),
-      state.getMappingByTask(decision.profile, duplicateId),
+      this.providerMappingByTask(state, decision.profile, duplicateId),
     ]);
     if (!previousMapping || previousMapping.masterEventId !== masterId) {
       return refuse("The one-off task no longer owns the Calendar series mirror. No changes made.");
     }
-    const previousLink = await state.getRecurrenceLink(decision.profile, previousMapping.seriesId || "");
+    const previousLink = await this.providerRecurrenceLink(state, decision.profile, previousMapping.seriesId || "");
     if (!previousLink) return refuse("The Calendar recurrence link is missing. No changes made.");
     const cancelled = await pair.calendar.getEvent(cancelledId);
     if (cancelled.status !== "cancelled") return refuse("The old Calendar projection is no longer cancelled. No changes made.");
@@ -2451,8 +2483,7 @@ export class ManualInterventionService {
     const task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     await state.deleteMapping(mapping);
     const next: Mapping = { ...mapping, taskId: task.id, updatedAt: isoNow() };
-    await state.putMapping(next);
-    if (next.seriesId) await state.putRecurrenceLink(recurrenceLink(next));
+    await this.persistProviderMapping(state, next, pair);
   }
 
   private async resolveMappedDeletion(
@@ -2485,7 +2516,7 @@ export class ManualInterventionService {
           || mapping.activeInstanceId || mapping.updatedAt !== decision.mappingSnapshot?.updatedAt) {
           return this.markStale(decision, "The standalone mapping changed or belongs to a recurrence; no automatic Calendar deletion was applied.", slackUserId);
         }
-        const eventOwner = await state.getMappingByEvent(decision.profile, mapping.eventId);
+        const eventOwner = await this.providerMappingByEvent(state, decision.profile, mapping.eventId);
         if (!eventOwner || eventOwner.taskId !== mapping.taskId) {
           return this.markStale(decision, "The Calendar event no longer has the same mapped Todoist owner.", slackUserId);
         }
@@ -2506,6 +2537,7 @@ export class ManualInterventionService {
       if (!mappingRemoved) {
         return this.markStale(decision, "Calendar deletion finished but mapping ownership changed; the newer mapping was preserved for review.", slackUserId);
       }
+      await deleteMappingComments(pair.todoist, mapping);
       return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
     }
 
@@ -2518,7 +2550,7 @@ export class ManualInterventionService {
           seriesAlreadyAbsent = true;
         }
         await state.deleteMapping(mapping);
-        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
+        await deleteMappingComments(pair.todoist, mapping);
         // Auto-policy decisions that find the exact mapped Calendar series
         // already absent need no Slack alert. Keep the durable decision
         // receipt and exact mapping/link cleanup, but don't post the alert
@@ -2528,7 +2560,7 @@ export class ManualInterventionService {
       }
       if (action === "keep_calendar_unlinked") {
         await state.deleteMapping(mapping);
-        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
+        await deleteMappingComments(pair.todoist, mapping);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
     }
@@ -2543,7 +2575,7 @@ export class ManualInterventionService {
           || mapping.recurrenceOwner !== "calendar") {
           return this.markStale(decision, "The Calendar recurrence mapping changed; automatic deletion was refused.", slackUserId);
         }
-        const link = await state.getRecurrenceLink(decision.profile, mapping.seriesId);
+        const link = await this.providerRecurrenceLink(state, decision.profile, mapping.seriesId);
         if (!link || link.owner !== "calendar" || link.taskId !== mapping.taskId
           || link.masterEventId !== mapping.masterEventId || link.eventId !== mapping.eventId) {
           return this.markStale(decision, "The recurrence link no longer identifies the same series and task.", slackUserId);
@@ -2560,14 +2592,12 @@ export class ManualInterventionService {
         // quarantined manual delivery, never by creating a new series.
         const removed = await state.deleteMappingIfUnchanged(mapping);
         if (!removed) return this.markStale(decision, "Calendar deletion completed but the mapping advanced concurrently; investigate the remaining mapping.", slackUserId);
-        await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "delete_whole_series" && decision.type === "calendar_owned_recurrence_task_deleted") {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         await state.deleteMapping(mapping);
-        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
@@ -2591,7 +2621,6 @@ export class ManualInterventionService {
           await pair.calendar.deleteEvent(event.id).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         }
         await state.deleteMapping(mapping);
-        if (mapping.seriesId) await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
@@ -2618,10 +2647,7 @@ export class ManualInterventionService {
             activeEffectiveStart: next.start?.dateTime || next.start?.date,
             updatedAt: isoNow(),
           };
-          await state.putMapping(nextMapping);
-          if (nextMapping.seriesId) await state.putRecurrenceLink(recurrenceLink(nextMapping));
-        } else if (mapping.seriesId) {
-          await state.deleteRecurrenceLink(decision.profile, mapping.seriesId);
+          await this.persistProviderMapping(state, nextMapping, pair);
         }
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
@@ -2641,7 +2667,7 @@ export class ManualInterventionService {
     let event: CalendarEvent;
     try { event = await pair.calendar.getEvent(decision.eventId); }
     catch (error) { if (providerNotFound(error)) return this.markStale(decision, "The Calendar event no longer exists.", slackUserId); throw error; }
-    if (await state.getMappingByEvent(decision.profile, decision.eventId)) {
+    if (await this.providerMappingByEvent(state, decision.profile, decision.eventId)) {
       return this.markStale(decision, "The Calendar event has already been mapped.", slackUserId);
     }
 
@@ -2650,7 +2676,7 @@ export class ManualInterventionService {
       const taskId = action.slice("bind_task:".length);
       task = await pair.todoist.getTask(taskId);
       if (!hasCanonicalState(event, task)) return this.markStale(decision, "The selected Todoist task no longer matches the Calendar event.", slackUserId);
-      if (await state.getMappingByTaskAnyProfile(taskId)) return this.markStale(decision, "The selected Todoist task is now owned by another mapping.", slackUserId);
+      if (await this.providerMappingByTaskAnyProfile(state, taskId)) return this.markStale(decision, "The selected Todoist task is now owned by another mapping.", slackUserId);
     } else if (action === "create_new_task") {
       task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
     } else {
@@ -2670,8 +2696,7 @@ export class ManualInterventionService {
       activeEffectiveStart: recurring ? event.start?.dateTime || event.start?.date : undefined,
       updatedAt: isoNow(),
     };
-    await state.putMapping(mapping);
-    if (recurring && mapping.seriesId) await state.putRecurrenceLink(recurrenceLink(mapping));
+    await this.persistProviderMapping(state, mapping, pair);
     return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
   }
 
@@ -2682,7 +2707,7 @@ export class ManualInterventionService {
     slackUserId?: string,
   ): Promise<void> {
     if (!decision.taskId || !decision.eventId) return this.markStale(decision, "Mapped provider IDs are missing.", slackUserId);
-    const mapping = await state.getMappingByTask(decision.profile, decision.taskId);
+    const mapping = await this.providerMappingByTask(state, decision.profile, decision.taskId);
     if (!mapping || mapping.eventId !== decision.eventId) return this.markStale(decision, "The mapping changed after the conflict was raised.", slackUserId);
     const pair = await this.providerClients(decision.profile);
     let event: CalendarEvent | undefined;
@@ -2700,7 +2725,7 @@ export class ManualInterventionService {
       } else {
         const recreated = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
         await state.deleteMapping(mapping);
-        await state.putMapping({ ...mapping, taskId: recreated.id, updatedAt: isoNow() });
+        await this.persistProviderMapping(state, { ...mapping, taskId: recreated.id, updatedAt: isoNow() }, pair);
       }
     } else if (action === "todoist_wins") {
       if (!task) return this.markStale(decision, "Todoist no longer exists, so Todoist cannot win this conflict.", slackUserId);
@@ -2709,7 +2734,7 @@ export class ManualInterventionService {
       } else {
         const recreated = await pair.calendar.upsertEvent(toCalendarEvent(task));
         await state.deleteMapping(mapping);
-        await state.putMapping({ ...mapping, eventId: recreated.id, updatedAt: isoNow() });
+        await this.persistProviderMapping(state, { ...mapping, eventId: recreated.id, updatedAt: isoNow() }, pair);
       }
     } else throw new Error(`Unsupported conflict action ${action}`);
     return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
@@ -2782,8 +2807,8 @@ export class ManualInterventionService {
       }
       if (manual.command === "inspect_mapping") {
         let value: unknown;
-        if (manual.targetType === "task" && manual.targetId) value = await state.getMappingByTask(delivery.profile, manual.targetId);
-        else if (manual.targetType === "event" && manual.targetId) value = await state.getMappingByEvent(delivery.profile, manual.targetId);
+        if (manual.targetType === "task" && manual.targetId) value = await this.providerMappingByTask(state, delivery.profile, manual.targetId);
+        else if (manual.targetType === "event" && manual.targetId) value = await this.providerMappingByEvent(state, delivery.profile, manual.targetId);
         else if (manual.targetType === "decision" && manual.targetId) value = await this.store.get(manual.targetId);
         else value = await state.getReconciliationState(delivery.profile);
         await this.notifier.postText(`*Inspect ${manual.targetType || "profile"} — ${delivery.profile}*\n\`\`\`${JSON.stringify(value || null, null, 2).slice(0, 2800)}\`\`\``, channel);

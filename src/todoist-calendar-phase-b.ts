@@ -193,7 +193,7 @@ export function verifyTodoistPhaseBReadback(
 
   const shared = master.extendedProperties?.shared;
   if (!master.id || !master.etag || master.status !== "confirmed" || master.recurringEventId
-    || shared?.taskId !== task.id || shared.syncRecurrenceOwner !== "todoist"
+    || shared?.taskId !== task.id || (!shared.todoistRecurrence && shared.syncRecurrenceOwner !== "todoist")
     || shared.todoistRecurrence !== todoistRecurrenceKey(before)
     || shared.todoistAnchorStart !== anchor.start
     || master.recurrence?.length !== 1 || !readback.exceptionInventoryComplete)

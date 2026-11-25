@@ -23,6 +23,6 @@ A failed conditional commit or any incomplete/ambiguous provider state leaves th
 ## Operational limitations
 
 - This is a safe **final-handoff-only** recovery, not a generic staged provider replay. A stage interrupted during destination creation, source cap, instance verification or comment transfer still needs a separate explicitly reviewed provider-write recovery plan; absence of response is not evidence of failure.
-- Do not enable the ordinary `PhaseBNativeEnabled` production switch or the recovery approval variable globally; retain the existing source SQS erasure fence under #349/#433.
+- The staged cross-profile native-master move is admitted only from the signed project transition and fresh exact provider/state evidence; there is no separate feature flag. Retain the existing source SQS erasure fence under #349/#433.
 - Do not run on live data without a reviewed exact identity and independent provider captures. This PR only delivers the guarded implementation and isolated fault-injection tests; no disposable 2027 managed-provider E2E is claimed.
 - Production activation requires resolving #349's pre-write recovery, live fixture evidence and an independently reviewed rollout/rollback plan.

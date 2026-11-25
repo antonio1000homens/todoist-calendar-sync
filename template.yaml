@@ -76,16 +76,6 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Explicit two-Lambda opt-in for confirmed item erasure; keep false until guarded acceptance and recovery are approved.
-  PhaseCNativeEnabled:
-    Type: String
-    Default: "true"
-    AllowedValues: ["true", "false"]
-    Description: Explicit #290 native Calendar-to-Todoist Phase C opt-in; false restores original rolling projections.
-  PhaseBNativeEnabled:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: Explicit #389 Todoist-to-Calendar native recurrence writer opt-in; keep false until guarded acceptance.
   CompletedHistoryCleanupApply:
     Type: String
     Default: "false"
@@ -154,8 +144,6 @@ Globals:
         RETIREMENT_DISPOSITION_VERSION: "1"
         QUEUE_URL: !Ref SyncQueue
         SYNC_PROFILE_CONFIG_JSON: !Ref ProfileConfigJson
-        TODOIST_CALENDAR_SYNC_PHASE_C_NATIVE_ENABLED: !Ref PhaseCNativeEnabled
-        TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED: !Ref PhaseBNativeEnabled
         ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64: !Ref ErasureCalendarProvenancePublicKeySpki
         CALENDAR_WATCH_TOKEN_PARAMETER: !Ref CalendarWatchTokenParameter
         TODOIST_WEBHOOK_SECRET_PARAMETER: !Ref TodoistWebhookSecretParameter

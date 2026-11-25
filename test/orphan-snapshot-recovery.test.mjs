@@ -1,20 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { reconcileUnmappedCalendar } from "../dist/calendar-reconciliation.js";
-import { todoistCanonicalIdentity } from "../dist/canonical-identity.js";
 import { ReconciliationMutationBudget } from "../dist/mutation-budget.js";
-
-class FakeIdentityStore {
-  constructor() { this.values = new Map(); }
-  key(profile, side, providerId) { return `${profile}:${side}:${providerId}`; }
-  async get(profile, side, providerId) {
-    const identity = this.values.get(this.key(profile, side, providerId));
-    return identity ? { profile, side, providerId, identity, updatedAt: "2026-09-17T10:00:00Z" } : undefined;
-  }
-  async put(profile, side, providerId, identity) {
-    this.values.set(this.key(profile, side, providerId), structuredClone(identity));
-  }
-}
 
 function fakeState() {
   const mappings = [];
@@ -59,12 +46,10 @@ function task(id, title, hour) {
   };
 }
 
-test("Calendar snapshot recovery re-links and updates the unique Todoist orphan matching the previous identity", async () => {
+test("Calendar snapshot recovery does not re-link a Todoist orphan by old title and date", async () => {
   const changedEvent = event("event-1", "School pickup", 15);
   const oldTask = task("task-1", "School run", 8);
   const tasks = [structuredClone(oldTask)];
-  const identityStore = new FakeIdentityStore();
-  await identityStore.put("home", "calendar", changedEvent.id, todoistCanonicalIdentity(oldTask));
   const state = fakeState();
   const writes = [];
   const clients = {
@@ -93,16 +78,14 @@ test("Calendar snapshot recovery re-links and updates the unique Todoist orphan 
     state,
     async () => clients,
     new ReconciliationMutationBudget(10),
-    undefined,
-    20,
-    identityStore,
   );
 
-  assert.equal(summary.imported, 0);
-  assert.equal(summary.rebound, 1);
+  assert.equal(summary.imported, 1);
+  assert.equal(summary.rebound, 0);
   assert.equal(writes.length, 1);
-  assert.equal(writes[0].existingId, oldTask.id);
+  assert.equal(writes[0].existingId, undefined);
   assert.equal(writes[0].stored.content, "School pickup");
-  assert.equal(state.mappings[0].taskId, oldTask.id);
-  assert.ok(state.audits.some((entry) => entry.action === "calendar_orphan_todoist_rebound_previous_identity"));
+  assert.equal(tasks.find((candidate) => candidate.id === oldTask.id).content, oldTask.content);
+  assert.equal(state.mappings[0].taskId, "created");
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_snapshot_imported_task"));
 });

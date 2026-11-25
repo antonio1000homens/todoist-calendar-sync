@@ -25,19 +25,19 @@ async function sourceFiles(dir=sourceRoot) {
 const inventory={
   calendar:{
     writes:["createFutureMasterOnce","createTodoistPhaseBNativeMasterOnce","createRepairEventOnce","deleteEvent","deleteEventIfUnchanged",
-      "patchEventMetadataIfUnchanged","updateSharedEventPropertiesIfUnchanged","upsertEvent","upsertEventIfUnchanged"],
+      "patchEventMetadataIfUnchanged","updateSharedEventPropertiesIfUnchanged","ensureTaskCorrelation","upsertEvent","upsertEventIfUnchanged"],
     controls:["stopWatch","watch"],
     reads:["findByTodoistTaskId","getEvent","getTimeZone","listAllEventsForErasureAudit",
       "listCalendarListForErasureAudit","listDelta","listEventInstances","listExplicitSeriesExceptions",
       "listInstances","listInstancesInWindow","listLinkedEventsByTodoistTaskId","listOccurrencesInWindow"],
-    internal:["request","serviceAccountAssertion","token"],
+    internal:["correlate","ensureCorrelation","patchEventIfUnchanged","request","serviceAccountAssertion","token"],
   },
   todoist:{
-    writes:["createProjectComment","createTaskOnce","deleteComment","deleteTask","moveTask",
+    writes:["completeTask","createProjectComment","createTaskOnce","deleteComment","deleteTask","moveTask",
       "updateComment","updateRecurringOccurrence","updateTaskMetadata","upsertComment",
       "upsertProjectComment","upsertTask"],
     controls:[],
-    reads:["findComment","findCompletedTaskById","findLegacyTaskComment","getComment","getTask","getTimeZone",
+    reads:["findComment","findCompletedTaskById","findLegacyTaskComment","getComment","getProject","getTask","getTimeZone",
       "listAllProjectCommentsForErasureAudit","listAllTaskCommentsForErasureAudit","listProjectComments",
       "listAllTasksForErasureAudit","listTaskComments","listTasks","readTasks"],
     internal:["request","syncCommand","legacyCommentFields"],

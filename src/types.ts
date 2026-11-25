@@ -186,6 +186,8 @@ export interface CalendarEvent {
 
 export interface Mapping {
   profile: Profile;
+  /** Configured Google Calendar ID; repeated in provider-native correlation metadata. */
+  calendarId?: string;
   eventId: string;
   taskId: string;
   projectId?: string;
@@ -217,6 +219,7 @@ export interface Mapping {
   /** Last successfully mirrored metadata. Used to distinguish user edits from sync echoes. */
   syncedTitle?: string;
   syncedDescription?: string;
+  syncedDue?: string;
   /** True when the Calendar-owned mirror is one native recurring Todoist task. */
   calendarNativeRecurring?: boolean;
   /** Versioned marker for a verified Todoist-owned native Phase B Calendar master. */

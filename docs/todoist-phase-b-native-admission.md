@@ -1,6 +1,6 @@
 # Phase B follow-up: Todoist-owned native recurrence admission
 
-Issue #290 was closed on 7 November 2026 but still contains a broader Phase B Todoist→Calendar native-write requirement. This follow-up does **not** reopen the issue. It adds a guarded writer for newly created tasks; the production switch is default OFF.
+Issue #290 was closed on 7 November 2026 but still contains a broader Phase B Todoist→Calendar native-write requirement. Issue #510 now tracks the bidirectional sync redesign. Verified native recurrence admission and cross-profile native-master moves use provider readback and staged state validation; neither path uses a deployment feature flag.
 
 ## Provider observations (8 November 2026)
 
@@ -28,8 +28,8 @@ Previous 7 November tests also demonstrated that Todoist `every 29,30,31` change
 
 Both return explicit negative reasons and **perform no provider writes or mapping changes**. The `item:added` writer calls them under the existing task write fence and mutation budget, creates a deterministic Calendar master ID, independently GETs the saved master, expands provider instances and inventories explicit exceptions, then commits the Todoist-owned mapping only after verification. An invalid newly created master is deleted and audited; if rollback fails, the exact identity is quarantined and later deliveries stop before replacement. Existing tagged Phase B masters remain native when Todoist advances due; the sync updates the active occurrence mapping and only patches master summary/description with an ETag. Disabling new creation does not flatten an already committed native master.
 
-The deployment control is `PhaseBNativeEnabled` / `PHASE_B_NATIVE_ENABLED`, default `false`. In tests the equivalent runtime variable is `TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED`. Keep it off until the managed-profile disposable E2E has verified all three recurrence families, completion progression, repeat delivery, rollback and recurrence preservation. Cross-profile moves currently fail closed with a review audit while retaining the source master; deterministic destination-master copy/readback is still required before the feature is production-ready. Do not migrate an existing rolling mapping or modify historical Calendar series.
+Cross-profile moves with missing or conflicting exact identity fail closed while retaining the source master. Valid moves use deterministic destination-master copy/readback and an atomic state handoff. Do not migrate an existing rolling mapping or modify historical Calendar series without that verified move path.
 
 ## Rollout state
 
-Code-level validation: the focused policy/writer/provider-surface tests and full suite pass. This PR does **not** turn on Todoist→Calendar native Phase B in production. Managed-profile disposable provider acceptance has not been run, and cross-profile native-master copying remains unimplemented; the switch stays OFF. Existing Phase C Calendar→Todoist native support and flag are unchanged.
+Code-level validation: unit tests cover the guarded admission policy, provider readback, repeat delivery, progression, and rollback. Native admission is unflagged in this worktree. This change has not been deployed; automated live-provider acceptance remains outstanding. Existing Phase C Calendar→Todoist support remains on its separate path.

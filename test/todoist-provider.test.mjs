@@ -1,0 +1,55 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { Todoist } from "../dist/providers.js";
+
+test("Todoist completion rereads the exact task and issues one idempotent close command",async()=>{
+  const originalFetch=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init={})=>{
+    calls.push({url,init});
+    if(url.endsWith("/tasks/task-1"))return Response.json({id:"task-1",content:"Disposable recurrence",is_completed:false,
+      due:{date:"2099-01-01",string:"every day",is_recurring:true}});
+    if(url.endsWith("/sync")){
+      const form=new URLSearchParams(init.body);
+      const commands=JSON.parse(form.get("commands"));
+      assert.equal(commands.length,1);
+      assert.equal(commands[0].type,"item_close");
+      assert.deepEqual(commands[0].args,{id:"task-1"});
+      return Response.json({sync_status:{[commands[0].uuid]:"ok"}});
+    }
+    throw new Error(`Unexpected Todoist request: ${init.method||"GET"} ${url}`);
+  };
+  try{
+    const todoist=new Todoist("test-token");
+    assert.equal(await todoist.completeTask("task-1", "2099-01-01"), "completed");
+    assert.equal(calls.length,2);
+    assert.equal(calls[0].init.method||"GET","GET");
+    assert.equal(calls[1].init.method,"POST");
+  }finally{globalThis.fetch=originalFetch;}
+});
+
+test("Todoist completion does not advance an already completed task again",async()=>{
+  const originalFetch=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init={})=>{
+    calls.push({url,init});
+    return Response.json({id:"task-2",content:"Already done",is_completed:true,completed_at:"2099-01-01T10:00:00Z"});
+  };
+  try{
+    const todoist=new Todoist("test-token");
+    assert.equal(await todoist.completeTask("task-2", "2099-01-01"), "already_completed");
+    assert.equal(calls.length,1,"the provider reread is enough to suppress a repeated completion");
+  }finally{globalThis.fetch=originalFetch;}
+});
+
+test("Todoist project preflight requires the exact configured project identity",async()=>{
+  const originalFetch=globalThis.fetch,calls=[];
+  globalThis.fetch=async(url,init={})=>{
+    calls.push({url,init});
+    return Response.json({id:"project-1",name:"antonio1000homens"});
+  };
+  try{
+    const todoist=new Todoist("test-token");
+    assert.deepEqual(await todoist.getProject("project-1"),{id:"project-1",name:"antonio1000homens"});
+    assert.match(calls[0].url,/\/projects\/project-1$/);
+    await assert.rejects(todoist.getProject("project-2"),/exact configured project/);
+  }finally{globalThis.fetch=originalFetch;}
+});

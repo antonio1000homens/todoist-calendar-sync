@@ -101,7 +101,7 @@ for (const [series,control] of [[false,"event"],[false,"task"],[false,"pair"],[t
 }
 
 test("Calendar import rechecks a resolved pair after comment lookup before writing",async()=>{
-  const state=fakeState(),source=futureEvent("event",10,"Calendar item");
+  const state=fakeState(),source={...futureEvent("event",10,"Calendar item"),extendedProperties:{shared:{taskId:"candidate"}}};
   const clients=fakeClients([source],[{id:"candidate",content:source.summary,description:"",due:{date:source.start.date}}]);
   let blocked=false;
   state.syncBlocked=async(_profile,ids)=>blocked&&ids.taskId==="candidate";
@@ -214,16 +214,16 @@ test("snapshot recovery still imports a recurrence organized outside configured 
 test("snapshot recovery creates one finite weekly Todoist recurrence when account and Calendar zones match", async () => {
   const master = {
     id: "finite-master", iCalUID: "finite-series", status: "confirmed", summary: "Task", description: "",
-    start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
-    end: { dateTime: "2026-11-04T14:15:00Z", timeZone: "Europe/London" },
+    start: { dateTime: "2099-11-04T14:00:00Z", timeZone: "Europe/London" },
+    end: { dateTime: "2099-11-04T14:15:00Z", timeZone: "Europe/London" },
     recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
   };
   const occurrences = [4, 11, 18, 25].map((day) => ({
     id: `finite-${day}`, status: "confirmed", summary: "Task", description: "",
     recurringEventId: master.id, iCalUID: master.iCalUID,
-    originalStartTime: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
-    start: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
-    end: { dateTime: `2026-11-${String(day).padStart(2, "0")}T14:15:00Z`, timeZone: "Europe/London" },
+    originalStartTime: { dateTime: `2099-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+    start: { dateTime: `2099-11-${String(day).padStart(2, "0")}T14:00:00Z`, timeZone: "Europe/London" },
+    end: { dateTime: `2099-11-${String(day).padStart(2, "0")}T14:15:00Z`, timeZone: "Europe/London" },
   }));
   const state = fakeState();
   const tasks = [];
@@ -252,7 +252,7 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(summary.conflicts, 0);
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].due.is_recurring, true);
-  assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2026 and ending 25 Nov 2026");
+  assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2099 and ending 25 Nov 2099");
   assert.equal(state.mappings.length, 1);
   assert.equal(state.mappings[0].taskId, "one-task");
   assert.equal(state.mappings[0].recurrenceOwner, "calendar");
@@ -684,7 +684,7 @@ test("snapshot recovery stops provider writes at the ten-mutation budget", async
 });
 
 test("rejected worst-case reservation still keeps reconciliation pending", async () => {
-  const event = futureEvent("calendar-reservation", 14, "Reservation appointment");
+  const event = { ...futureEvent("calendar-reservation", 14, "Reservation appointment"), extendedProperties: { shared: { taskId: "task-reservation" } } };
   const task = { id: "task-reservation", content: "Reservation appointment", description: "", project_id: "home-project", due: { date: "2099-01-14" } };
   const state = fakeState();
   const clients = fakeClients([event], [task]);

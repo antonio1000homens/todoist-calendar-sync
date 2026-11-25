@@ -201,7 +201,7 @@ test("Use Todoist recurrence converts only the unique existing event to an RRULE
     assert.equal(state.currentMapping?.recurrenceOwner, "todoist");
     assert.deepEqual(events.get("event-1").recurrence, ["RRULE:FREQ=YEARLY"]);
     assert.equal(changes.includes("calendar:upsert"), true);
-    assert.equal(changes.includes("putRecurrenceLink"), true);
+    assert.equal(changes.includes("putRecurrenceLink"), false);
     assert.equal(changes.includes("todoist:upsert"), false);
   });
 });

@@ -553,11 +553,10 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
     },
   }, state);
 
-  assert.deepEqual(operations.slice(0, 4), [
+  assert.deepEqual(operations.slice(0, 3), [
     'calendar:delete:master-1',
     'state:recordMutation',
     'state:deleteMapping',
-    'state:deleteRecurrenceLink',
   ]);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'resolved');
   assert.match(notifier.updated.at(-1).text, /Delete whole Calendar series/);

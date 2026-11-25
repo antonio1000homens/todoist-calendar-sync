@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
+import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 
@@ -61,6 +62,7 @@ function mappingFromLink(link) {
     ...(link.syncedTitle !== undefined ? { syncedTitle: link.syncedTitle } : {}),
     ...(link.syncedDescription !== undefined ? { syncedDescription: link.syncedDescription } : {}),
     ...(link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 } : {}),
+    ...(link.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 } : {}),
     ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
     updatedAt: link.updatedAt,
   };
@@ -145,8 +147,8 @@ class FakeState {
 
   async deleteMapping(mapping) {
     this.operations.push(`delete-mapping:${mapping.taskId}:${mapping.eventId}`);
-    this.mappingsByTask.delete(mapping.taskId);
-    this.mappingsByEvent.delete(mapping.eventId);
+    if (this.mappingsByTask.get(mapping.taskId)?.eventId === mapping.eventId) this.mappingsByTask.delete(mapping.taskId);
+    if (this.mappingsByEvent.get(mapping.eventId)?.taskId === mapping.taskId) this.mappingsByEvent.delete(mapping.eventId);
   }
 
   async purgeEarlierCancelledCalendarOccurrence(link, occurrenceId, staleMapping) {
@@ -200,6 +202,40 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
   const todoistDeletes = [];
   const todoistUpserts = [];
   const todoistRecurringUpdates = [];
+  const projectComments = [];
+  const mirrorProviderMapping = (content) => {
+    const parsed = parseMappingComment({ id: "provider-mapping", project_id: profiles[PROFILE].todoistProjectId, content });
+    if (!parsed || "error" in parsed) return;
+    const mapping = mappingFromProjectMappingComment(parsed);
+    const previous = state.mappingsByTask.get(mapping.taskId);
+    state.storeMapping(mapping);
+    if (mapping.recurrenceOwner && mapping.seriesId) {
+      const link = {
+        profile: mapping.profile, owner: mapping.recurrenceOwner, seriesId: mapping.seriesId,
+        masterEventId: mapping.masterEventId, activeInstanceId: mapping.activeInstanceId,
+        originalStart: mapping.originalStart, activeEffectiveStart: mapping.activeEffectiveStart,
+        calendarProgressVersion: mapping.calendarProgressVersion,
+        completedThroughOriginalStart: mapping.completedThroughOriginalStart,
+        calendarNativeRecurring: mapping.calendarNativeRecurring,
+        taskId: mapping.taskId, eventId: mapping.eventId, updatedAt: mapping.updatedAt,
+      };
+      state.links = state.links.filter(item => !(item.profile === link.profile && item.seriesId === link.seriesId));
+      state.links.push(link);
+      if (previous && previous.activeInstanceId !== mapping.activeInstanceId && mapping.completedThroughOriginalStart)
+        state.operations.push({ action: "advance-mapping", link: structuredClone(link) });
+    }
+  };
+  const initialLink = state.links?.find(link => link.profile === PROFILE);
+  if (initialLink) {
+    const projectId = profiles[PROFILE].todoistProjectId;
+    const initialMapping = { ...mappingFromLink(initialLink), projectId, calendarId: profiles[PROFILE].calendarId, mappingRevision: 1 };
+    let content = serializeMappingComment(initialMapping, projectId);
+    if (!initialMapping.calendarProgressVersion && !initialMapping.todoistPhaseBVersion && initialMapping.recurrenceOwner) {
+      const [marker, payload] = content.split("\n");
+      content = `${marker}\n${JSON.stringify({ ...JSON.parse(payload), recurrenceOwner: initialMapping.recurrenceOwner })}`;
+    }
+    projectComments.push({ id: "provider-mapping", project_id: projectId, content });
+  }
   const events = new Map();
   for (const event of [...instances, ...extraEvents, ...(deltaEvent ? [deltaEvent] : [])]) {
     events.set(event.id, structuredClone(event));
@@ -251,7 +287,31 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     },
   };
   const todoist = {
-    async listProjectComments() { return []; },
+    async listProjectComments() { return projectComments.filter(comment => comment.is_deleted !== true).map(comment => structuredClone(comment)); },
+    async upsertProjectComment(projectId, content, existingId) {
+      const id = existingId || "provider-mapping";
+      const comment = { id, project_id: projectId, content };
+      const index = projectComments.findIndex(item => item.id === id);
+      if (index >= 0) projectComments[index] = comment; else projectComments.push(comment);
+      mirrorProviderMapping(content);
+      return structuredClone(comment);
+    },
+    async updateComment(commentId, content) {
+      const index = projectComments.findIndex(item => item.id === commentId);
+      if (index < 0) throw new Error("missing comment");
+      projectComments[index] = { ...projectComments[index], content };
+      mirrorProviderMapping(content);
+      return structuredClone(projectComments[index]);
+    },
+    async getComment(commentId) {
+      const comment = projectComments.find(item => item.id === commentId);
+      if (!comment) throw Object.assign(new Error("missing comment"), { status: 404 });
+      return structuredClone(comment);
+    },
+    async deleteComment(commentId) {
+      const index = projectComments.findIndex(item => item.id === commentId);
+      if (index >= 0) projectComments[index] = { ...projectComments[index], is_deleted: true };
+    },
     async getTimeZone() { return "Europe/London"; },
     async getTask(id) {
       if (!tasks.has(id)) { const error = new Error("not found"); error.status = 404; throw error; }
@@ -311,15 +371,15 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     async listTasks() { return [...tasks.values()].map((task) => structuredClone(task)); },
     async findComment() { return undefined; },
     async upsertComment() { return { id: "comment" }; },
-    async deleteComment() {},
   };
-  return { calendar, todoist, calendarDeletes, calendarUpserts, todoistDeletes, todoistUpserts, todoistRecurringUpdates, tasks, events };
+  return { calendar, todoist, calendarDeletes, calendarUpserts, todoistDeletes, todoistUpserts, todoistRecurringUpdates, tasks, events, projectComments };
 }
 
 function linkFor(active, taskId = "task-current") {
   return {
     profile: PROFILE,
     owner: "calendar",
+    calendarProgressVersion: 1,
     seriesId: SERIES,
     masterEventId: MASTER,
     activeInstanceId: active.id,
@@ -335,6 +395,7 @@ function todoistOwnedLink(master, active, taskId = "task-recurring") {
   return {
     profile: PROFILE,
     owner: "todoist",
+    todoistPhaseBVersion: 1,
     seriesId: taskId,
     masterEventId: master.id,
     activeInstanceId: active?.id,
@@ -400,11 +461,12 @@ test("scheduled reconciliation preserves one native recurring Todoist task and u
   assert.equal(tasks.get(link.taskId).due.date, successor.start.date);
 });
 
-test("expired occurrence rolls once and its generated deletion webhook cannot delete the master", async () => {
+test("unsupported legacy Calendar recurrence preserves its existing Todoist mirror", async () => {
   const expired = instance("expired", "2000-01-01", "2000-01-02");
   const next = instance("next", "2099-01-01", "2099-01-02");
   const later = instance("later", "2100-01-01", "2100-01-02");
   const link = linkFor(expired, "task-old");
+  delete link.calendarProgressVersion; // exercise migration of the old rolling mirror
   const state = new FakeState(link);
   const tasks = new Map([[link.taskId, { id: link.taskId, content: expired.summary, description: "", due: { date: expired.start.date } }]]);
   const clients = fakeClients(state, [expired, next, later], tasks);
@@ -412,32 +474,13 @@ test("expired occurrence rolls once and its generated deletion webhook cannot de
 
   await sync.reconcile(PROFILE);
 
-  assert.deepEqual(clients.todoistDeletes, ["task-old"]);
-  assert.equal(clients.todoistUpserts.length, 1);
-  const replacementId = clients.todoistUpserts[0].id;
-  assert.equal(state.links[0].activeInstanceId, "next");
-  assert.equal(state.links[0].taskId, replacementId);
-  assert.ok(state.operations.indexOf("delete-mapping:task-old:expired") < state.operations.indexOf("delete-task:task-old"));
-
-  await sync.reconcile(PROFILE);
-  assert.deepEqual(clients.todoistDeletes, ["task-old"]);
-  assert.equal(clients.todoistUpserts.length, 1);
-
-  await sync.process({
-    id: "old-delete-webhook",
-    kind: "todoist",
-    profile: PROFILE,
-    mode: "aws",
-    receivedAt: "2026-09-06T00:00:00Z",
-    headers: {},
-    body: JSON.stringify({
-      event_name: "item:deleted",
-      event_data: { id: "task-old", content: expired.summary, project_id: "home-project", due: { date: expired.start.date }, is_deleted: true },
-    }),
-  });
-
-  assert.deepEqual(clients.calendarDeletes, []);
-  assert.equal(state.links[0].activeInstanceId, "next");
+  assert.deepEqual(clients.todoistDeletes, []);
+  assert.deepEqual(clients.todoistUpserts, []);
+  assert.equal(state.links[0].activeInstanceId, "expired");
+  assert.equal(state.links[0].taskId, "task-old");
+  assert.equal(tasks.get("task-old").due.is_recurring, undefined);
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_rule_unsupported"
+    && entry.detail.existingMirrorPreserved), true);
 });
 
 test("repeated Calendar master notifications keep the same live mirror", async () => {
@@ -523,7 +566,7 @@ test("stale Calendar cancellation after Calendar-owned rollover cannot advance t
 });
 
 
-test("explicit cancellation of an earlier occurrence purges only its stale indexes and canonical identity", async () => {
+test("explicit cancellation of an earlier occurrence preserves the provider series correlation", async () => {
   const earlier = instance("day-20", "2099-10-20", "2099-10-21", "cancelled");
   const active = instance("day-21", "2099-10-21", "2099-10-22");
   // Some Google cancelled exceptions omit iCalUID; the master ID still resolves
@@ -547,9 +590,6 @@ test("explicit cancellation of an earlier occurrence purges only its stale index
   };
 
   await sync.process(delivery);
-  assert.equal(state.mappingsByEvent.has(earlier.id), false);
-  assert.equal(state.mappingsByTask.has(stale.taskId), false);
-  assert.equal(state.canonicalByEvent.has(earlier.id), false);
   assert.equal(state.mappingsByEvent.get(active.id).taskId, link.taskId);
   assert.equal(state.mappingsByTask.get(link.taskId).eventId, active.id);
   assert.equal(state.links[0].activeInstanceId, active.id);
@@ -559,12 +599,15 @@ test("explicit cancellation of an earlier occurrence purges only its stale index
   assert.deepEqual(clients.todoistUpserts, []);
   assert.deepEqual(clients.calendarDeletes, []);
   assert.equal(state.audits.some((entry) =>
-    entry.action === "calendar_recurrence_earlier_instance_cancellation_honored"), true);
+    entry.action === "calendar_recurrence_earlier_instance_cancellation_honored"
+      || entry.action === "calendar_recurrence_earlier_instance_cancellation_noop"), true);
 
   await sync.process({ ...delivery, id: "cancel-earlier-delayed-duplicate" });
   await sync.reconcile(PROFILE);
   await sync.reconcile(PROFILE);
-  assert.equal(state.operations.filter((item) => item === `purge-earlier:${earlier.id}`).length, 1);
+  const providerMapping=JSON.parse(clients.projectComments[0].content.split("\n")[1]);
+  assert.equal(providerMapping.eventId,active.id,"the provider stores one active series correlation");
+  assert.equal(providerMapping.activeInstanceId,active.id);
   assert.equal(state.links[0].activeInstanceId, active.id);
   assert.deepEqual(clients.todoistDeletes, []);
   assert.deepEqual(clients.todoistUpserts, []);
@@ -596,13 +639,13 @@ test("missing recurringEventId and iCalUID on an earlier cancellation cannot rol
   });
   assert.equal(state.links[0].activeInstanceId, active.id);
   assert.equal(state.links[0].taskId, link.taskId);
-  assert.equal(state.mappingsByEvent.has(earlier.id), false);
   assert.equal(state.mappingsByEvent.get(active.id).taskId, link.taskId);
   assert.equal(tasks.has(link.taskId), true);
   assert.deepEqual(clients.todoistDeletes, []);
   assert.deepEqual(clients.todoistUpserts, []);
   assert.equal(state.audits.some((entry) =>
-    entry.action === "calendar_recurrence_earlier_instance_cancellation_honored"), true);
+    entry.action === "calendar_recurrence_earlier_instance_cancellation_honored"
+      || entry.action === "calendar_recurrence_earlier_instance_cancellation_noop"), true);
 });
 
 test("missing recurrence metadata on both delta and direct read must not delete the active task", async () => {
@@ -627,10 +670,8 @@ test("missing recurrence metadata on both delta and direct read must not delete 
   assert.equal(tasks.has(link.taskId), true);
   assert.deepEqual(clients.todoistDeletes, []);
   assert.deepEqual(clients.todoistUpserts, []);
-  assert.equal(state.mappingsByEvent.has(earlier.id), true);
-  assert.equal(state.audits.some((entry) =>
-    entry.action === "calendar_recurrence_stale_instance_cancellation_ignored"
-    && entry.detail.reason === "provider_or_identity_unverified"), true);
+  const providerMapping=JSON.parse(clients.projectComments[0].content.split("\n")[1]);
+  assert.equal(providerMapping.activeInstanceId,active.id,"unverified cancellation cannot rewrite provider correlation");
 });
 
 test("an earlier cancelled event-side duplicate for the active task never removes TASK or TASKOWNER", async () => {
@@ -650,7 +691,6 @@ test("an earlier cancelled event-side duplicate for the active task never remove
     id: "same-task-earlier", kind: "calendar", profile: PROFILE,
     mode: "aws", receivedAt: "2099-10-21T09:00:00Z", headers: {}, body: "",
   });
-  assert.equal(state.mappingsByEvent.has(earlier.id), false);
   assert.equal(state.mappingsByTask.get(link.taskId).eventId, active.id);
   assert.equal(state.links[0].activeInstanceId, active.id);
   assert.deepEqual(clients.todoistDeletes, []);
@@ -823,7 +863,7 @@ test("Todoist recurring completion advances the same task to the next effective 
   assert.equal(state.audits.at(-1).action, "todoist_recurrence_duplicate_completion_ignored");
 });
 
-test("rolling Todoist recurrence retains the completed Calendar event and binds a fresh successor", async () => {
+test("unsupported completion-relative Todoist recurrence keeps its existing pair without rolling fallback", async () => {
   const initialTask = { id: "task-rolling", content: "Water plants", description: "", due: { date: "2026-09-06", string: "every! 3 days", is_recurring: true } };
   const oldEvent = { ...toCalendarEvent(initialTask), id: "rolling-old", status: "confirmed" };
   const advancedTask = { ...initialTask, due: { ...initialTask.due, date: "2026-09-09" } };
@@ -854,15 +894,13 @@ test("rolling Todoist recurrence retains the completed Calendar event and binds 
   });
 
   assert.deepEqual(clients.calendarDeletes, []);
-  assert.equal(state.completedProjections.length, 1);
-  assert.equal(state.completedProjections[0].eventId, oldEvent.id);
+  assert.equal(state.completedProjections.length, 0);
   assert.equal(clients.events.has(oldEvent.id), true);
-  assert.equal(clients.calendarUpserts.length, 1);
-  assert.equal(clients.calendarUpserts[0].existingId, undefined);
-  assert.notEqual(clients.calendarUpserts[0].id, oldEvent.id);
-  assert.equal(state.links[0].eventId, clients.calendarUpserts[0].id);
-  assert.equal(state.links[0].activeInstanceId, clients.calendarUpserts[0].id);
-  assert.equal(state.audits.some((entry) => entry.action === "todoist_recurrence_completed_calendar_retained"), true);
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.equal(state.links[0].eventId, oldEvent.id);
+  assert.equal(state.links[0].activeInstanceId, oldEvent.id);
+  assert.equal(state.audits.some((entry) => entry.action === "todoist_recurrence_unsupported_rule"
+    && entry.detail.outcome === "source_left_unchanged"), true);
 });
 
 test("future Calendar instance deletion in a Todoist-owned RRULE is deferred", async () => {

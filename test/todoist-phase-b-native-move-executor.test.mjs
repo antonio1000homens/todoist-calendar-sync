@@ -138,10 +138,9 @@ function fixture(options={}){
     },
     calls,audits,read:()=>({sourceVersion,destinationVersion,sourceComments,destinationComments})};
 }
-async function withGate(enabled,fn){
+async function withGate(_enabled,fn){
   const before=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
-  if(enabled)process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED="true";
-  else delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+  delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
   try{return await fn();}finally{
     if(before===undefined)delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
     else process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED=before;
@@ -183,11 +182,13 @@ test("out-of-order Calendar instance inventory still selects the exact active oc
     "recurrence link must use sorted active instance, not provider response order");
   assert.equal(f.state.committed,true);
 }));
-test("default-off Phase B cannot claim a stage or touch providers",()=>withGate(false,async()=>{
+test("verified Phase B native move claims its stage without a feature flag",()=>withGate(false,async()=>{
   const f=fixture();
-  await assert.rejects(()=>executePhaseBNativeMove(f),/disabled/);
+  const result=await executePhaseBNativeMove(f);
+  assert.equal(result.mapping.profile,"work");
+  assert.equal(f.state.committed,true);
   assert.equal(f.state.stage,false);
-  assert.equal(f.calls.includes("create-destination"),false);
+  assert.equal(f.calls.includes("create-destination"),true);
 }));
 test("active erasure fence blocks the native cutover before staging or provider writes",()=>withGate(true,async()=>{
   const f=fixture({leaseDenied:true});

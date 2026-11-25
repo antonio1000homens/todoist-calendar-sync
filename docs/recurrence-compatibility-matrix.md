@@ -67,9 +67,11 @@ must verify identical local wall time and timezone across BST/DST.
 4. PR E: opt-in migration *preview only* until identity, rollback and recovery
    have independent acceptance. No automatic migration of existing mappings.
 
-Existing `recurrenceOwner`, `RecurrenceLink.owner`,
-`calendarProgressVersion`, `completedThroughOriginalStart`, original
-recurrence masters, cancellation semantics, and profile boundaries stay intact.
+New Calendar shared properties and Todoist project comments do not persist a
+recurrence owner. They use the exact task/series IDs, a Todoist recurrence key
+or Calendar progress version, and the logical occurrence watermark. The
+runtime still reads legacy `recurrenceOwner` / `RecurrenceLink.owner` values
+while existing provider correlations are migrated; writers omit them.
 
 Provider documentation:
 - [Todoist recurring dates](https://www.todoist.com/help/todoist/features/introduction-to-recurring-dates-YUYVJJAV)
