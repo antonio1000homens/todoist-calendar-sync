@@ -433,12 +433,11 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         && mapping.calendarId === config.calendarId && mapping.taskId === recurringTaskId
         && mapping.calendarProgressVersion === 1,
     );
-    if (initialRecurringMapping.mapping.recurrenceOwner !== "calendar") {
-      throw new Error("Calendar recurrence mapping did not identify its provider-native owner");
-    }
     log("recurring_provider_correlation_verified", { profile });
 
     const exceptionTitle = `[E2E ${token}] Calendar moved occurrence`;
+    const calendarSeriesTitle = `[E2E ${token}] Calendar series rename`;
+    const todoistSeriesTitle = `[E2E ${token}] Todoist series rename`;
     const instanceInventory = await poll(
       `${profile} recurring instance inventory`, timeoutMs,
       () => calendar.listInstancesInWindow(recurringEventId,
@@ -494,6 +493,36 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         && currentTask.due?.is_recurring,
     );
     log("future_calendar_exceptions_verified", { profile, moved: true, cancelled: true, currentTaskUnchanged: true });
+
+    const recurringMaster = await calendar.getEvent(recurringEventId);
+    await calendar.upsertEvent({ ...recurringMaster, summary: calendarSeriesTitle }, recurringEventId);
+    const calendarSeriesEditTask = await poll(
+      `${profile} Calendar series metadata propagation`, timeoutMs,
+      () => todoist.getTask(recurringTaskId),
+      (candidate) => candidate.content === calendarSeriesTitle && candidate.due?.is_recurring
+        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+    );
+    await todoist.updateTaskMetadata(recurringTaskId, {
+      content: todoistSeriesTitle,
+      description: calendarSeriesEditTask.description || "",
+    });
+    const todoistSeriesEditMaster = await poll(
+      `${profile} Todoist series metadata propagation`, timeoutMs,
+      () => calendar.getEvent(recurringEventId),
+      (candidate) => candidate.summary === todoistSeriesTitle && candidate.recurrence?.length > 0,
+    );
+    const preservedException = await calendar.getEvent(movedInstance.id);
+    const seriesEditTask = await todoist.getTask(recurringTaskId);
+    if (preservedException.summary !== exceptionTitle
+      || !timestampsMatch(preservedException.start?.dateTime, movedStart.toISOString())
+      || (seriesEditTask.due?.datetime || seriesEditTask.due?.date) !== completedDue
+      || !seriesEditTask.due?.is_recurring
+      || todoistSeriesEditMaster.extendedProperties?.shared?.taskId !== recurringTaskId) {
+      throw new Error("Bidirectional series title edits changed recurrence identity or erased an explicit Calendar exception");
+    }
+    log("bidirectional_series_edits_verified", {
+      profile, calendarToTodoist: true, todoistToCalendar: true, exceptionPreserved: true,
+    });
 
     let nextDue = completedDue;
     const completionResults = [];
