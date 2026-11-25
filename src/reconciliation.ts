@@ -312,6 +312,17 @@ export class SnapshotReconciler {
     return defaultProviderClientFactory(profile);
   }
 
+  private async reconciliationBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
+    const state = this.state as StateRepository & {
+      reconciliationBlocked?: StateRepository["reconciliationBlocked"];
+    };
+    // Older injected state adapters used by callers may not implement the
+    // reconciliation-specific gate yet. Production StateRepository does.
+    return state.reconciliationBlocked
+      ? state.reconciliationBlocked(profile, ids)
+      : state.syncBlocked(profile, ids);
+  }
+
   private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function"
@@ -618,7 +629,7 @@ export class SnapshotReconciler {
       const current = await this.currentEvent(clients.calendar, eventId);
       if (current && current.status !== "cancelled") return undefined;
       if (await this.completedProjection(profile, eventId)) return undefined;
-      if (await this.state.syncBlocked(profile, { eventId })) return undefined;
+      if (await this.reconciliationBlocked(profile, { eventId })) return undefined;
     }
     const link = await this.providerRecurrenceLink(profile, mapping.seriesId, clients);
     if (!link || link.owner !== "todoist" || link.taskId !== mapping.taskId
@@ -689,7 +700,7 @@ export class SnapshotReconciler {
           for (const taskId of taskIds) {
             if (await this.currentTask(clients.todoist, taskId)
               || await this.providerMappingByTaskAnyProfile(taskId)
-              || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
+              || await this.reconciliationBlocked(profile, { taskId })) return { absent: false };
           }
           const events = new Map<string, CalendarEvent | undefined>();
           for (const eventId of verifiedEventIds) {
@@ -698,7 +709,7 @@ export class SnapshotReconciler {
             if (event && event.status !== "cancelled") return { absent: false };
             if ((await Promise.all((["home", "antonio", "work"] as const)
               .map(candidate => this.providerMappingByEvent(candidate, eventId)))).some(Boolean)
-              || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
+              || await this.reconciliationBlocked(profile, { eventId })) return { absent: false };
           }
           if (!recurringIdentity) return { absent: true };
           // An unmapped conflict is not a recurrence-deletion decision, but a
@@ -816,7 +827,7 @@ export class SnapshotReconciler {
       eventIds:[...new Set([mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
         .filter((id):id is string=>Boolean(id)))],
       ...(mapping.seriesId?{seriesIds:[mapping.seriesId]}:{})})) return "noop";
-    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) {
+    if (await this.reconciliationBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: mapping.taskId, eventId: mapping.eventId, reason: "active_review_control",
         recurrenceOwner: mapping.recurrenceOwner, seriesId: mapping.seriesId,
@@ -942,7 +953,7 @@ export class SnapshotReconciler {
       return "deleted_retired";
     }
     if (await this.state.isRetired?.({profile,taskId:task.id})) return "noop";
-    if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
+    if (await this.reconciliationBlocked(profile, { taskId: task.id })) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: task.id, reason: "active_review_control",
       });
@@ -1012,7 +1023,7 @@ export class SnapshotReconciler {
       });
       return "conflict";
     }
-    if (existing && await this.state.syncBlocked(profile, { taskId: task.id, eventId: existing.id })) {
+    if (existing && await this.reconciliationBlocked(profile, { taskId: task.id, eventId: existing.id })) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
         taskId: task.id, eventId: existing.id, reason: "active_review_control",
       });

@@ -21,6 +21,15 @@ test("only the repair that holds the barrier may work on an excluded entity", as
   assert.equal(await controls.blocked("home", { taskId: "task" }, "repair"), false);
 });
 
+test("automatic reconciliation ignores rejected-pair decisions but honors explicit exclusions", async () => {
+  const controls = new SyncControls();
+  controls.control = async () => undefined;
+  controls.rejected = async () => { throw new Error("Reconciliation must not consult rejected-pair history"); };
+  assert.equal(await controls.blockedForReconciliation("home", { taskId: "task", eventId: "event" }), false);
+  controls.control = async ref => ref.side === "calendar" ? { excluded: true } : undefined;
+  assert.equal(await controls.blockedForReconciliation("home", { taskId: "task", eventId: "event" }), true);
+});
+
 test("a blocked webhook records a pending refresh without taking over the repair", async (t) => {
   const commands = [];
   t.mock.method(documentClient, "send", async (command) => { commands.push(command.input); return {}; });

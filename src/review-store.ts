@@ -1458,6 +1458,28 @@ export class SyncControls {
     }
     return false;
   }
+  /** Automatic reconciliation honors explicit exclusions and in-flight
+   * repair locks, but does not let an old rejected-pair decision or review
+   * case permanently fence provider-native repair. */
+  async blockedForReconciliation(profile: Profile, ids: { taskId?: string; eventId?: string }, operationId?: string): Promise<boolean> {
+    await admitReviewIdentity(profile, ids.taskId, ids.eventId);
+    for (const side of ["todoist", "calendar"] as const) {
+      const id = side === "todoist" ? ids.taskId : ids.eventId;
+      if (!id) continue;
+      const ref = { profile, side, id };
+      const control = await this.control(ref);
+      if (control?.activeRepair && control.activeRepair !== operationId) {
+        await client.send(new UpdateCommand({ TableName: reviewTable(),
+          Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+          UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at",
+          ExpressionAttributeValues: { ":true": true, ":at": randomUUID() },
+        }));
+        return true;
+      }
+      if (control?.excluded) return true;
+    }
+    return false;
+  }
   async claim(refs: EntityRef[], operationId: string): Promise<void> {
     if (!refs.length) return;
     for (const ref of [...new Map(refs.map(item => [entityKey(item), item])).values()]) await admitEntityRef(ref);

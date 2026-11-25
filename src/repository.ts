@@ -178,13 +178,15 @@ export class StateRepository {
   /** Explicit operator retirement silently skips sync; do not report it as a repair conflict. */
   async isRetired(identity: RetiredIdentity): Promise<boolean> { return isRetiredIdentity(identity); }
 
-  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, beforeProjection = false): Promise<boolean> {
+  async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, _beforeProjection = false): Promise<boolean> {
     if (await new SyncControls().blocked(profile, ids, this.repairOperationId)) return true;
-    if (!beforeProjection) return false;
-    const review = new SyncReviewStore();
-    if (ids.taskId && await review.hasActiveDeletionGuard(profile, "todoist", ids.taskId)) return true;
-    if (ids.eventId && await review.hasActiveDeletionGuard(profile, "calendar", ids.eventId)) return true;
     return false;
+  }
+
+  /** Reconciliation ignores historical review decisions and review cases.
+   * Explicit exclusions and short-lived repair locks still protect identities. */
+  async reconciliationBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
+    return new SyncControls().blockedForReconciliation(profile, ids, this.repairOperationId);
   }
 
   /** Failed/ambiguous Phase B creation uses the existing durable pair controls.
