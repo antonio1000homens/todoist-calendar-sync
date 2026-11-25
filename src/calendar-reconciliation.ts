@@ -9,14 +9,6 @@ import {
   ReconciliationMutationBudget,
   type ProviderClientFactory,
 } from "./mutation-budget.js";
-import {
-  calendarCanonicalIdentity,
-  CanonicalIdentityStore,
-  sameCanonicalIdentity,
-  todoistCanonicalIdentity,
-  type CanonicalIdentity,
-  type CanonicalIdentityRepository,
-} from "./canonical-identity.js";
 import { StateRepository } from "./repository.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -33,7 +25,7 @@ import {
 import { normalizedDescription, normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, toTodoistTask } from "./sync.js";
+import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, RecurrenceLink, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -58,15 +50,6 @@ function candidateLimit(): number {
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
-}
-
-function isTodoistOwnedProjection(event: CalendarEvent): boolean {
-  const shared = event.extendedProperties?.shared;
-  return Boolean(
-    shared?.syncSource === "todoist-calendar-sync"
-    || shared?.syncRecurrenceOwner === "todoist"
-    || shared?.taskId,
-  );
 }
 
 function recurrenceLink(mapping: Mapping): RecurrenceLink {
@@ -124,7 +107,6 @@ export async function reconcileUnmappedCalendar(
   mutationBudget = new ReconciliationMutationBudget(MAX_PROVIDER_MUTATIONS),
   continuation?: ReconciliationContinuation,
   maxCandidates = candidateLimit(),
-  identities: CanonicalIdentityRepository | undefined = state instanceof StateRepository ? new CanonicalIdentityStore() : undefined,
 ): Promise<CalendarRecoverySummary> {
   if (continuation && continuation.phase !== "calendar") {
     throw new Error(`Calendar recovery cannot resume continuation phase ${continuation.phase}`);
@@ -169,8 +151,10 @@ export async function reconcileUnmappedCalendar(
   }
 
   const pair = await createBudgetedClientFactory(mutationBudget, clientFactory)(profile);
+  const mappingSync = new Synchronizer(state, undefined, async () => pair);
   const tasks = await pair.todoist.listTasks();
   const snapshot = await pair.calendar.listDelta();
+  const eventsById = new Map(snapshot.items.map((event) => [event.id, event]));
   // Snapshot recovery can import an unmapped Calendar event after confirmed
   // erasure deliberately removed its DynamoDB mapping. Read the bounded
   // project-comment tombstones while the worker's profile writer lease is
@@ -222,7 +206,7 @@ export async function reconcileUnmappedCalendar(
     } catch (error) {
       // Keep a durable association when cleanup itself is unavailable so a
       // later sync or operator review can find the object instead of losing it.
-      await state.putMapping(fallback);
+      await mappingSync.persistProviderMapping(fallback, pair.todoist);
       await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,stage,error:error instanceof Error?error.message:String(error)});
     }
   };
@@ -263,7 +247,7 @@ export async function reconcileUnmappedCalendar(
         reservedCandidateTaskIds: [],
       };
       const isReserved = reservedTaskIds.has(candidate.id);
-      const existing = await state.getMappingByTaskAnyProfile(candidate.id);
+      const existing = await mappingSync.providerMappingByTaskAnyProfile(candidate.id);
       if (isReserved) reserved.push(candidate.id);
       if (existing) mapped.push(candidate.id);
       if (isReserved || existing) {
@@ -282,26 +266,37 @@ export async function reconcileUnmappedCalendar(
     };
   };
 
-  const findCanonicalTask = async (event: CalendarEvent, eventIds = [event.id]) => {
-    return eligibleUniqueTask(tasks.filter((task) => hasCanonicalState(event, task)),eventIds);
+  const findSharedTask = async (eventIds: string[]) => {
+    const sharedTaskIds = [...new Set(eventIds.flatMap((id) => {
+      const event = eventsById.get(id);
+      const taskId = event?.extendedProperties?.shared?.taskId;
+      return taskId ? [taskId] : [];
+    }))];
+    if (sharedTaskIds.length !== 1) return {
+      task: undefined, ambiguous: sharedTaskIds.length > 1,
+      candidateTaskIds: sharedTaskIds.sort(), eligibleCandidateTaskIds: [],
+      mappedCandidateTaskIds: [], reservedCandidateTaskIds: [],
+    };
+    const matches = tasks.filter((task) => task.id === sharedTaskIds[0]);
+    return eligibleUniqueTask(matches, eventIds);
   };
 
-  const findIdentityTask = async (identity: CanonicalIdentity, eventIds: string[]) => {
-    return eligibleUniqueTask(tasks.filter((task) => sameCanonicalIdentity(todoistCanonicalIdentity(task), identity)),eventIds);
-  };
-
-  const rememberStandaloneIdentity = async (event: CalendarEvent, task: TodoistTask): Promise<void> => {
-    if (!identities) return;
-    const eventIdentity = calendarCanonicalIdentity(event);
-    const taskIdentity = todoistCanonicalIdentity(task);
-    if (eventIdentity) await identities.put(profile, "calendar", event.id, eventIdentity);
-    if (taskIdentity) await identities.put(profile, "todoist", task.id, taskIdentity);
+  const findPotentialCollision = async (event: CalendarEvent, eventIds = [event.id]) => {
+    // Title/date similarity is only a conservative duplicate guard. It never
+    // selects a task for binding; correlation requires a provider ID above.
+    const candidates = tasks.filter((task) => hasCanonicalState(event, task));
+    if (!candidates.length) return {
+      task: undefined, ambiguous: false, candidateTaskIds: [],
+      eligibleCandidateTaskIds: [], mappedCandidateTaskIds: [], reservedCandidateTaskIds: [],
+    };
+    const potential = await eligibleUniqueTask(candidates, eventIds);
+    return { ...potential, task: undefined, ambiguous: true };
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
     if (await controlsBlockRecovery([event.id])) return;
     if (await completionBlocksRecovery(event.id)) return;
-    if (await state.getMappingByEvent(profile, event.id)) {
+    if (await mappingSync.providerMappingByEvent(profile, event.id, pair.todoist)) {
       summary.skipped += 1;
       return;
     }
@@ -313,7 +308,9 @@ export async function reconcileUnmappedCalendar(
       });
       return;
     }
-    const match = await findCanonicalTask(event);
+    const match = await findSharedTask([event.id]);
+    const collision = match.candidateTaskIds.length ? match : await findPotentialCollision(event);
+    if (!match.candidateTaskIds.length && (collision.ambiguous || collision.blocked)) Object.assign(match, collision);
     if (match.blocked) return;
     if (match.ambiguous) {
       summary.conflicts += 1;
@@ -329,40 +326,6 @@ export async function reconcileUnmappedCalendar(
 
     let task = match.task;
     let created = false;
-    let recoveredPreviousIdentity = false;
-    const currentIdentity = calendarCanonicalIdentity(event);
-
-    if (!task && currentIdentity && identities) {
-      const previousIdentity = (await identities.get(profile, "calendar", event.id))?.identity;
-      if (previousIdentity && !sameCanonicalIdentity(previousIdentity, currentIdentity)) {
-        const historical = await findIdentityTask(previousIdentity,[event.id]);
-        if (historical.blocked) return;
-        if (historical.ambiguous) {
-          summary.conflicts += 1;
-          await state.audit(profile, "calendar_snapshot_unmapped_ambiguous", {
-            eventId: event.id,
-            source: "snapshot_previous_identity",
-            candidateTaskIds: historical.candidateTaskIds,
-            eligibleCandidateTaskIds: historical.eligibleCandidateTaskIds,
-            mappedCandidateTaskIds: historical.mappedCandidateTaskIds,
-            reservedCandidateTaskIds: historical.reservedCandidateTaskIds,
-            previousIdentity,
-            currentIdentity,
-          });
-          return;
-        }
-        if (historical.task) {
-          if (await controlsBlockRecovery([event.id],historical.task.id)) return;
-          if (!await canMutate(event.id,historical.task.id)) return;
-          if (await completionBlocksRecovery(event.id, true)) return;
-          if (await controlsBlockRecovery([event.id],historical.task.id)) return;
-          task = await pair.todoist.upsertTask(toTodoistTask(event), historical.task.id);
-          await state.recordMutation(profile);
-          recoveredPreviousIdentity = true;
-        }
-      }
-    }
-
     if (!task) {
       if (await controlsBlockRecovery([event.id])) return;
       if (!await canMutate(event.id)) return;
@@ -403,8 +366,8 @@ export async function reconcileUnmappedCalendar(
         if (created) await rollbackCreatedTask(event,task,mapping,"after_comment_write");
         else if (!existingComment) {
           try { if (!await canMutate(event.id,task.id)) throw new Error("Mutation circuit is open; comment rollback is deferred"); await pair.todoist.deleteComment(comment.id); await state.recordMutation(profile); }
-          catch (error) { await state.putMapping(mapping); await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,commentId:comment.id,stage:"after_comment_write",error:error instanceof Error?error.message:String(error)}); }
-        } else await state.putMapping(mapping);
+          catch (error) { await mappingSync.persistProviderMapping(mapping, pair.todoist); await state.audit(profile,"calendar_snapshot_import_cleanup_deferred",{eventId:event.id,taskId:task.id,commentId:comment.id,stage:"after_comment_write",error:error instanceof Error?error.message:String(error)}); }
+        } else await mappingSync.persistProviderMapping(mapping, pair.todoist);
         return;
       }
     }
@@ -413,15 +376,10 @@ export async function reconcileUnmappedCalendar(
       if (created) await rollbackCreatedTask(event,task,mapping,"before_mapping_write");
       return;
     }
-    await state.putMapping(mapping);
-    await rememberStandaloneIdentity(event, task);
+    await mappingSync.persistProviderMapping(mapping, pair.todoist);
     if (created) summary.imported += 1;
     else summary.rebound += 1;
-    const action = created
-      ? "calendar_snapshot_imported_task"
-      : recoveredPreviousIdentity
-        ? "calendar_orphan_todoist_rebound_previous_identity"
-        : "calendar_snapshot_rebound_mapping";
+    const action = created ? "calendar_snapshot_imported_task" : "calendar_snapshot_rebound_mapping";
     await state.audit(profile, action, {
       eventId: event.id,
       taskId: task.id,
@@ -438,7 +396,7 @@ export async function reconcileUnmappedCalendar(
       return;
     }
     if (await controlsBlockRecovery([master.id])) return;
-    const existingLink = await state.getRecurrenceLink(profile, seriesId);
+    const existingLink = await mappingSync.providerRecurrenceLink(profile, seriesId, pair.todoist);
     const originProfile = otherProfileCalendarOrganizer(profile, master);
     if (originProfile) {
       summary.skipped += 1;
@@ -497,7 +455,7 @@ export async function reconcileUnmappedCalendar(
       return;
     }
     if (await controlsBlockRecovery([master.id,active.id])) return;
-    const existingMapping = await state.getMappingByEvent(profile, active.id);
+    const existingMapping = await mappingSync.providerMappingByEvent(profile, active.id, pair.todoist);
     if (existingMapping && !existingLink) {
       summary.skipped += 1;
       return;
@@ -653,8 +611,7 @@ export async function reconcileUnmappedCalendar(
         syncedDescription: normalizedDescription(active.description),
         updatedAt: new Date().toISOString(),
       };
-      await state.putMapping(migratedMapping);
-      await state.putRecurrenceLink(recurrenceLink(migratedMapping));
+      await mappingSync.persistProviderMapping(migratedMapping, pair.todoist);
       summary.rebound += 1;
       await state.audit(profile, "calendar_snapshot_migrated_native_recurring_task", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: currentTask.id,
@@ -662,8 +619,30 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
-    const match = await findCanonicalTask(active,[master.id,active.id]);
+    const match = await findSharedTask([master.id,active.id]);
+    const collision = match.candidateTaskIds.length ? match : await findPotentialCollision(active,[master.id,active.id]);
+    if (!match.candidateTaskIds.length && (collision.ambiguous || collision.blocked)) Object.assign(match, collision);
     if (match.blocked) return;
+    const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
+    if (match.ambiguous && !sharedTaskIds.length) {
+      const recurringCandidates = tasks.filter((task) => task.due?.is_recurring && hasCanonicalState(active, task));
+      if (recurringCandidates.length) {
+        summary.conflicts += 1;
+        await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id,
+          candidateTaskIds: recurringCandidates.map((task) => task.id).sort(),
+        });
+        return;
+      }
+    }
+    if (match.ambiguous && sharedTaskIds.length) {
+      summary.conflicts += 1;
+      await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+        seriesId, masterEventId: master.id, eventId: active.id,
+        candidateTaskIds: [...new Set([...sharedTaskIds, ...match.candidateTaskIds])].sort(),
+      });
+      return;
+    }
     if (match.ambiguous) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_recurring_ambiguous", {
@@ -678,7 +657,6 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
-    const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
     if (match.task?.due?.is_recurring || sharedTaskIds.some((id) => id !== match.task?.id)) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
@@ -761,8 +739,7 @@ export async function reconcileUnmappedCalendar(
       if (created) await rollbackCreatedTask(active,task,mapping,"after_series_task_create");
       return;
     }
-    await state.putMapping(mapping);
-    await state.putRecurrenceLink(recurrenceLink(mapping));
+    await mappingSync.persistProviderMapping(mapping, pair.todoist);
     if (created) summary.imported += 1;
     else summary.rebound += 1;
     await state.audit(profile, created ? "calendar_snapshot_imported_recurring_task" : "calendar_snapshot_rebound_recurring_mapping", {
@@ -798,7 +775,7 @@ export async function reconcileUnmappedCalendar(
       }
       if (event.status === "cancelled" || (event.status && event.status !== "confirmed")) {
         summary.skipped += 1;
-      } else if (isTodoistOwnedProjection(event) || event.recurringEventId) {
+      } else if (event.recurringEventId) {
         summary.skipped += 1;
       } else if (event.recurrence?.length) {
         await createOrBindSeries(event);

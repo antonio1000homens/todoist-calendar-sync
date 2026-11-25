@@ -6,7 +6,7 @@ import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
 import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries, verifyCancelledSeriesInstances } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
-import { activeProjectDeletionTombstone, attachProjectCommentReference, deleteMappingComments } from "./mapping-comments.js";
+import { activeProjectDeletionTombstone, buildProjectMappingIndex, deleteMappingComments, mappingFromProjectMappingComment } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
@@ -188,10 +188,6 @@ function isStrictlyNewer(candidate: string | undefined, baseline: string): boole
   return Number.isFinite(candidateTime) && Number.isFinite(baselineTime) && candidateTime > baselineTime;
 }
 
-function taskComment(event: CalendarEvent): string {
-  return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
-}
-
 
 function unmappedMismatchCategories(event: CalendarEvent, task: TodoistTask): string[] {
   const categories: string[] = [];
@@ -314,6 +310,60 @@ export class SnapshotReconciler {
   private async clients(profile: Profile): Promise<ClientPair> {
     if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
     return defaultProviderClientFactory(profile);
+  }
+
+  private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
+    const client = todoist || (await this.clients(profile)).todoist;
+    if (typeof client.listProjectComments !== "function"
+      || typeof client.upsertProjectComment !== "function"
+      || typeof client.updateComment !== "function") return this.store.listMappings(profile);
+    return buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
+      .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
+  }
+
+  private async providerMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
+    const client = (await this.clients("home")).todoist;
+    if (typeof client.listProjectComments !== "function"
+      || typeof client.upsertProjectComment !== "function"
+      || typeof client.updateComment !== "function") {
+      for (const profile of Object.keys(profiles) as Profile[]) {
+        const mapping = await this.state.getMappingByTask(profile, taskId);
+        if (mapping) return mapping;
+      }
+      return undefined;
+    }
+    const values = (await Promise.all((Object.keys(profiles) as Profile[]).map(async profile =>
+      (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId)))).filter((value): value is Mapping => Boolean(value));
+    if (values.length > 1) return undefined;
+    return values[0];
+  }
+
+  private async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
+    const client = todoist || (await this.clients(profile)).todoist;
+    if (typeof client.listProjectComments !== "function"
+      || typeof client.upsertProjectComment !== "function"
+      || typeof client.updateComment !== "function") return this.state.getMappingByEvent(profile, eventId);
+    return (await this.providerMappings(profile)).find(mapping => mapping.eventId === eventId
+      || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+  }
+
+  private async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
+    const client = todoist || (await this.clients(profile)).todoist;
+    if (typeof client.listProjectComments !== "function"
+      || typeof client.upsertProjectComment !== "function"
+      || typeof client.updateComment !== "function") return this.state.getMappingByTask(profile, taskId);
+    return (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId);
+  }
+
+  private async persistProviderMapping(mapping: Mapping, clients: ClientPair): Promise<Mapping> {
+    return new Synchronizer(this.state, undefined, async () => clients)
+      .persistProviderMapping(mapping, clients.todoist);
+  }
+
+  private async providerRecurrenceLink(profile: Profile, seriesId: string, clients?: ClientPair) {
+    const pair = clients || await this.clients(profile);
+    return new Synchronizer(this.state, undefined, async () => pair).providerRecurrenceLink(profile, seriesId, pair.todoist);
   }
 
   private async completedProjection(profile: Profile, eventId: string) {
@@ -443,8 +493,6 @@ export class SnapshotReconciler {
     }
 
     const stored = await clients.calendar.upsertEvent(toCalendarEvent(task, event), event.id);
-    const knownCommentId = mapping.projectCommentId || mapping.commentId;
-    const existingComment = knownCommentId ? { id: knownCommentId } : await clients.todoist.findComment(task.id, stored.id);
     const projectId = task.project_id || mapping.projectId || profiles[profile].todoistProjectId;
     const draftMapping: Mapping = {
       ...mapping,
@@ -452,12 +500,7 @@ export class SnapshotReconciler {
       eventId: stored.id,
       updatedAt: new Date().toISOString(),
     };
-    const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id, draftMapping);
-    const referenceMapping = existingComment?.id && !draftMapping.projectCommentId && !draftMapping.commentId
-      ? { ...draftMapping, commentId: existingComment.id }
-      : draftMapping;
-    const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
-    await this.state.putMapping(nextMapping);
+    const nextMapping = await this.persistProviderMapping(draftMapping, clients);
     await this.store.putBaseline(profile, task.id, task, stored);
     await this.state.recordMutation(profile);
     await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_updated", {
@@ -547,7 +590,7 @@ export class SnapshotReconciler {
       projectId: nextTask.project_id || mapping.projectId,
       updatedAt: new Date().toISOString(),
     };
-    await this.state.putMapping(nextMapping);
+    await this.persistProviderMapping(nextMapping, clients);
     await this.store.putBaseline(profile, task.id, nextTask, event);
     await this.state.recordMutation(profile);
     await this.state.audit(profile, "todoist_snapshot_reconcile_todoist_updated", {
@@ -577,18 +620,11 @@ export class SnapshotReconciler {
       if (await this.completedProjection(profile, eventId)) return undefined;
       if (await this.state.syncBlocked(profile, { eventId })) return undefined;
     }
-    const link = await this.state.getRecurrenceLink(profile, mapping.seriesId);
+    const link = await this.providerRecurrenceLink(profile, mapping.seriesId, clients);
     if (!link || link.owner !== "todoist" || link.taskId !== mapping.taskId
       || link.eventId !== mapping.eventId || link.masterEventId !== mapping.masterEventId
       || link.activeInstanceId !== mapping.activeInstanceId) return undefined;
-    const retired = await this.state.retireDeletedTodoistRecurrenceIfUnchanged(mapping, link);
-    if (!retired) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_deleted_recurrence_retirement_blocked", {
-        taskId: mapping.taskId, eventId: mapping.eventId,
-        reason: "mapping_repair_or_recurrence_changed_during_verified_deletion",
-      });
-      return "blocked";
-    }
+    await deleteMappingComments(clients.todoist, mapping);
     await this.store.deleteBaseline(profile, mapping.taskId);
     await this.state.audit(profile, "todoist_snapshot_reconcile_verified_deletion_retired", {
       taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
@@ -652,7 +688,7 @@ export class SnapshotReconciler {
         }> => {
           for (const taskId of taskIds) {
             if (await this.currentTask(clients.todoist, taskId)
-              || await this.state.getMappingByTaskAnyProfile(taskId)
+              || await this.providerMappingByTaskAnyProfile(taskId)
               || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
           }
           const events = new Map<string, CalendarEvent | undefined>();
@@ -661,7 +697,7 @@ export class SnapshotReconciler {
             events.set(eventId, event);
             if (event && event.status !== "cancelled") return { absent: false };
             if ((await Promise.all((["home", "antonio", "work"] as const)
-              .map(candidate => this.state.getMappingByEvent(candidate, eventId)))).some(Boolean)
+              .map(candidate => this.providerMappingByEvent(candidate, eventId)))).some(Boolean)
               || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
           }
           if (!recurringIdentity) return { absent: true };
@@ -713,7 +749,7 @@ export class SnapshotReconciler {
         // recurrence records are read strongly across all profiles instead.
         // Their absences are fenced again INSIDE the terminal transaction.
         const links = await readExactRecurrenceLinks(seriesKeys,
-          (owner, seriesId) => this.state.getRecurrenceLink(owner, seriesId));
+          (owner, seriesId) => this.providerRecurrenceLink(owner, seriesId));
         const classification = classifyDeletedRecurrenceLinks(profile, taskIds, verifiedEventIds, links, seriesKeys,
           recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId!,
             ...(legacyMaster ? {legacyMasterVerified: Boolean(first.legacyMasterProof)} : {}),
@@ -943,7 +979,7 @@ export class SnapshotReconciler {
         return "blocked";
       }
       await this.repair(this.reconcileDelivery(profile,task,"reconcile-unmapped","projection-create"));
-      const next=await this.state.getMappingByTask(profile,task.id);
+      const next=await this.providerMappingByTask(profile, task.id, clients.todoist);
       const standalone=pendingAnnual.sourcePolicy==="standalone";
       if (!next || (standalone
         ? Boolean(next.recurrenceOwner || next.masterEventId || next.seriesId || next.activeInstanceId)
@@ -1048,7 +1084,7 @@ export class SnapshotReconciler {
     }
 
     if (existing && existing.status !== "cancelled") {
-      const eventMapping = await this.state.getMappingByEvent(profile, existing.id);
+      const eventMapping = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
       if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
           taskId: task.id, eventId: existing.id, ownerTaskId: eventMapping.taskId,
@@ -1061,7 +1097,7 @@ export class SnapshotReconciler {
         // Never invent a recurrence link or progression state. A missing or
         // inconsistent link needs an explicit ownership decision.
         const link = eventMapping.recurrenceOwner && eventMapping.seriesId
-          ? await this.state.getRecurrenceLink(profile, eventMapping.seriesId)
+          ? await this.providerRecurrenceLink(profile, eventMapping.seriesId, clients)
           : undefined;
         if (eventMapping.recurrenceOwner && (!link
           || link.owner !== eventMapping.recurrenceOwner
@@ -1094,7 +1130,7 @@ export class SnapshotReconciler {
     }
 
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
-    const mapping = await this.state.getMappingByTask(profile, task.id);
+    const mapping = await this.providerMappingByTask(profile, task.id, clients.todoist);
     if (!mapping) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_missing_after_repair", {
         taskId: task.id, reason: "projection_repair_did_not_persist_mapping",
@@ -1143,7 +1179,7 @@ export class SnapshotReconciler {
 
     const tasks = (await clients.todoist.listTasks()).slice().sort((a, b) => a.id.localeCompare(b.id));
     const taskById = new Map(tasks.map((task) => [task.id, task]));
-    const mappings = (await this.store.listMappings(profile)).slice().sort((a, b) => a.taskId.localeCompare(b.taskId));
+    const mappings = (await this.providerMappings(profile, clients.todoist)).slice().sort((a, b) => a.taskId.localeCompare(b.taskId));
     const mappedTaskIds = new Set(mappings.map((mapping) => mapping.taskId));
     const unmappedTasks = tasks.filter((task) => !mappedTaskIds.has(task.id));
     const counts = emptyCounts();

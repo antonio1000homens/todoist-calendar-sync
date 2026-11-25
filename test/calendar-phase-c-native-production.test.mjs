@@ -5,12 +5,6 @@ import {
   calendarOwnedRecurringTaskReadback, matchesCalendarOwnedRecurringRule,
 } from "../dist/calendar-owned-todoist-recurrence.js";
 
-const flag = "TODOIST_CALENDAR_SYNC_PHASE_C_NATIVE_ENABLED";
-function withPhaseC(on, callback) {
-  const old = process.env[flag];
-  try { process.env[flag] = on ? "true" : "false"; return callback(); }
-  finally { if (old === undefined) delete process.env[flag]; else process.env[flag] = old; }
-}
 function m(start, rule, timed = false) {
   return { id: "phase-c-master", etag: "etag", status: "confirmed",
     start: timed ? { dateTime: start, timeZone: "Europe/London" } : { date: start },
@@ -21,15 +15,11 @@ function i(value, n, timed = false) {
   return { id: "instance-" + n, recurringEventId: "phase-c-master", status: "confirmed",
     originalStartTime: start, start };
 }
-test("Phase C is OFF without explicit production opt-in and never widens finite or exception rules", () =>
-  withPhaseC(false, () => {
-    assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-08",
-      "RRULE:FREQ=WEEKLY;BYDAY=MO,FR")), false);
-    assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-15",
-      "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27")), false);
-  }));
-test("enabled Phase C does not admit finite rules, mixed fields, invalid phase or moved instances", async () => {
-  process.env[flag] = "true";
+test("native Phase C admits proven rules by default and rejects unsupported rules or moved instances", async () => {
+  assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-08",
+    "RRULE:FREQ=WEEKLY;BYDAY=MO,FR")), true);
+  assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-15",
+    "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27")), true);
   try {
     const start = "2027-01-08";
     for (const rule of ["RRULE:FREQ=WEEKLY;BYDAY=MO,FR;COUNT=4",
@@ -51,10 +41,9 @@ test("enabled Phase C does not admit finite rules, mixed fields, invalid phase o
     assert.equal(await verifiedCalendarOwnedRecurrence(calendar,
       [i("2027-01-08",0),i("2027-01-12",1),i("2027-01-15",2)],
       "Europe/London", async () => []), undefined);
-  } finally { delete process.env[flag]; }
+  } finally {}
 });
 test("multi-weekday readback accepts one recurring Todoist identity, rejects unrelated cadence", async () => {
-  process.env[flag] = "true";
   try {
     const calendar = m("2027-01-08", "RRULE:FREQ=WEEKLY;BYDAY=MO,FR");
     const items = ["2027-01-08","2027-01-11","2027-01-15","2027-01-18"]
@@ -71,10 +60,9 @@ test("multi-weekday readback accepts one recurring Todoist identity, rejects unr
       recurrence,"Europe/London"),false);
     assert.equal(matchesCalendarOwnedRecurringRule({...task,due:{...task.due,date:"2027-01-12"}},
       recurrence,"Europe/London"),false);
-  } finally { delete process.env[flag]; }
+  } finally {}
 });
 test("multi-month-day, alternating phase and bimonthly readbacks require exact anchored dates", async () => {
-  process.env[flag] = "true";
   try {
     for (const [calendar,dates,normalized,family] of [
       [m("2027-01-02","RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27"),
@@ -93,10 +81,9 @@ test("multi-month-day, alternating phase and bimonthly readbacks require exact a
       assert.equal(matchesCalendarOwnedRecurringRule({...todoist,due:{...todoist.due,date:dates[1]}},
         recurrence,"Europe/London"),true);
     }
-  } finally { delete process.env[flag]; }
+  } finally {}
 });
 test("timezones and DST: an advanced floating Todoist local time matches the Calendar wall clock", async () => {
-  process.env[flag] = "true";
   try {
     const calendar = m("2027-03-26T09:00:00Z","RRULE:FREQ=WEEKLY;BYDAY=MO,FR",true);
     const instances = ["2027-03-26T09:00:00Z","2027-03-29T08:00:00Z","2027-04-02T08:00:00Z"]
@@ -111,11 +98,10 @@ test("timezones and DST: an advanced floating Todoist local time matches the Cal
       datetime:"2027-03-29T09:00:00"}},recurrence,"Europe/London"),true);
     assert.equal(matchesCalendarOwnedRecurringRule({...task,due:{...task.due,
       datetime:"2027-03-29T08:00:00"}},recurrence,"Europe/London"),false);
-  } finally { delete process.env[flag]; }
+  } finally {}
 });
 
 test("live Todoist month-end semantics are excluded from Phase C native writes", () => {
-  process.env[flag] = "true";
   try {
     assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-29",
       "RRULE:FREQ=MONTHLY;BYMONTHDAY=29,30,31")), false,
@@ -125,11 +111,10 @@ test("live Todoist month-end semantics are excluded from Phase C native writes",
       "bimonthly end-of-month drift must stay on a rolling mirror");
     assert.equal(nativeCalendarRecurrenceCandidate(m("2027-01-02",
       "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27")), true);
-  } finally { delete process.env[flag]; }
+  } finally {}
 });
 
 test("live Todoist timed due.date format is treated as a datetime and preserved across BST", async () => {
-  process.env[flag] = "true";
   try {
     const calendar = m("2027-03-26T09:00:00Z","RRULE:FREQ=WEEKLY;BYDAY=MO,FR",true);
     const instances = ["2027-03-26T09:00:00Z","2027-03-29T08:00:00Z",
@@ -152,5 +137,5 @@ test("live Todoist timed due.date format is treated as a datetime and preserved 
       "UTC 08:00 is London-local 09:00 after the DST transition");
     assert.equal(matchesCalendarOwnedRecurringRule({...todoist,due:{...todoist.due,
       date:"2027-03-29T08:00:00"}},rule,"Europe/London"),false);
-  } finally { delete process.env[flag]; }
+  } finally {}
 });

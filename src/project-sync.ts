@@ -130,7 +130,6 @@ function calendarSeriesProjection(master: CalendarEvent, task: TodoistTask): Cal
         taskId: task.id,
         taskUrl: task.url || `https://app.todoist.com/app/task/${task.id}`,
         originalSummary: task.content,
-        syncSource: "todoist-calendar-sync",
       },
     },
   };
@@ -212,7 +211,7 @@ export class ProjectAwareSynchronizer {
       const task = await todoist.getTask(orphan.taskId);
       const currentProfile = profileForTodoistProject(task.project_id);
       if (currentProfile === delivery.profile) return false;
-      const mapping = await this.state.getMappingByEvent(delivery.profile, orphan.eventId);
+      const mapping = await this.delegate.providerMappingByEvent(delivery.profile, orphan.eventId, todoist);
       const tagged = await this.phaseBNativeSource(orphan.taskId, [delivery.profile]);
       if (mapping?.todoistPhaseBVersion === 1 || tagged) {
         await this.state.audit(delivery.profile, "todoist_phase_b_cross_profile_move_requires_review", {
@@ -286,7 +285,7 @@ export class ProjectAwareSynchronizer {
       // the active exception, otherwise the echo would become a false edit.
       || !todoistTaskChangedAgainstOldItem(task, oldTask)) return false;
 
-    const { calendar } = await this.clients(profile);
+    const { calendar, todoist } = await this.clients(profile);
     let master: CalendarEvent;
     try {
       master = await calendar.getEvent(mapping.masterEventId);
@@ -330,12 +329,11 @@ export class ProjectAwareSynchronizer {
       ...mapping,
       eventId: master.id,
       activeInstanceId: stored.id,
-      originalStart: eventStart(stored) || mapping.originalStart,
+      originalStart: recurrenceOriginalStart(stored) || mapping.originalStart,
       activeEffectiveStart: eventEffectiveStart(stored) || mapping.activeEffectiveStart,
       updatedAt: new Date().toISOString(),
     };
-    await this.state.putMapping(nextMapping);
-    await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
+    await this.delegate.persistProviderMapping(nextMapping, todoist);
     await this.state.recordMutation(profile);
     await this.state.audit(profile, "todoist_recurrence_active_exception_written_back", {
       taskId: task.id,
@@ -363,7 +361,7 @@ export class ProjectAwareSynchronizer {
       if (master.extendedProperties?.shared?.todoistPhaseBVersion === "1") {
         // Do not act on mismatched/ambiguous provider identity.
         if (master.extendedProperties.shared.taskId !== taskId
-          || master.extendedProperties.shared.syncRecurrenceOwner !== "todoist")
+          || (!master.extendedProperties.shared.todoistRecurrence && master.extendedProperties.shared.syncRecurrenceOwner !== "todoist"))
           throw new Error("Tagged Phase B source master identity is inconsistent");
         return { profile, master };
       }
@@ -385,7 +383,7 @@ export class ProjectAwareSynchronizer {
       return;
     }
 
-    const mapping = await this.state.getMappingByTaskAnyProfile(rawPayload.event_data.id);
+    const mapping = await this.delegate.providerMappingByTaskAnyProfile(rawPayload.event_data.id);
     const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {
       const recoverable=await hasGuardedRecoveryDispatchCandidate({
@@ -507,8 +505,7 @@ export class ProjectAwareSynchronizer {
         // must not infer a cross-calendar move merely from project mismatch.
         // Missing provider identity, durable mapping or recurrence link stays
         // review-required; never fall through to the rolling project writer.
-        if (process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true"
-          && delivery.mode === "aws" && rawPayload.event_name === "item:updated"
+        if (delivery.mode === "aws" && rawPayload.event_name === "item:updated"
           && transition.action === "move_projection" && transition.toProfile
           && fromProfile !== transition.toProfile
           && explicitProjectChange
@@ -518,7 +515,7 @@ export class ProjectAwareSynchronizer {
           && mapping.profile === fromProfile
           && mapping.masterEventId === nativeSource?.master.id
           && nativeSource?.profile === fromProfile) {
-          const sourceLink = await this.state.getRecurrenceLink(fromProfile, task.id);
+          const sourceLink = await this.delegate.providerRecurrenceLink(fromProfile, task.id);
           if (sourceLink?.owner === "todoist"
             && sourceLink.taskId === task.id
             && sourceLink.profile === fromProfile
@@ -571,8 +568,7 @@ export class ProjectAwareSynchronizer {
       if (transition.action === "create_projection"
         && transition.toProfile && lifecycle.action === "upsert"
         && payload.event_name === "item:added" && !oldProjectId
-        && !mapping && !explicitProjectReentry
-        && process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED === "true") {
+        && !mapping && !explicitProjectReentry) {
         const originalTask = rawPayload.event_data;
         const due = originalTask?.due?.date;
         const candidate = due && /^\d{4}-\d{2}-\d{2}$/.test(due)
@@ -766,15 +762,14 @@ export class ProjectAwareSynchronizer {
       seriesId: todoistRecurring ? task.id : undefined,
       masterEventId: todoistRrule ? stored.id : undefined,
       activeInstanceId: todoistRrule ? active?.id : todoistRecurring ? stored.id : undefined,
-      originalStart: todoistRrule ? (active ? eventStart(active) : eventStart(stored)) : todoistRecurring ? eventStart(stored) : undefined,
+      originalStart: todoistRrule ? (active ? recurrenceOriginalStart(active) : recurrenceOriginalStart(stored)) : todoistRecurring ? recurrenceOriginalStart(stored) : undefined,
       activeEffectiveStart: todoistRrule ? (active ? eventEffectiveStart(active) : undefined) : todoistRecurring ? eventEffectiveStart(stored) : undefined,
       updatedAt: new Date().toISOString(),
     };
     const comment = await clients.todoist.upsertComment(task.id, taskComment(stored), existingComment?.id, draftMapping);
     const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
     const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
-    await this.state.putMapping(nextMapping);
-    if (todoistRecurring) await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "todoist"));
+    await this.delegate.persistProviderMapping(nextMapping, clients.todoist);
     if (destinationTombstone) await this.state.deleteCalendarProjectionTombstone(destinationProfile, task.id);
     await this.state.recordMutation(destinationProfile);
     await this.state.audit(destinationProfile, projectResetAllowed ? "todoist_project_projection_reset" : "todoist_project_projection_created", {
@@ -826,7 +821,6 @@ export class ProjectAwareSynchronizer {
       });
     }
     if (sourceMapping) await deleteMappingComments(sourceClients.todoist, sourceMapping);
-    if (sourceMapping?.seriesId) await this.state.deleteRecurrenceLink(sourceProfile, sourceMapping.seriesId);
     if (sourceMapping) await this.state.deleteMapping(sourceMapping);
     if (eventId || sourceMapping) await this.state.recordMutation(sourceProfile);
   }
@@ -867,7 +861,7 @@ export class ProjectAwareSynchronizer {
       seriesId: destinationMaster.iCalUID || destinationMaster.id,
       masterEventId: destinationMaster.id,
       activeInstanceId: active.id,
-      originalStart: eventStart(active),
+      originalStart: recurrenceOriginalStart(active),
       activeEffectiveStart: eventEffectiveStart(active),
       ...(sourceMapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
       ...(sourceMapping.completedThroughOriginalStart ? { completedThroughOriginalStart: sourceMapping.completedThroughOriginalStart } : {}),
@@ -961,8 +955,7 @@ export class ProjectAwareSynchronizer {
     const comment = await destinationClients.todoist.upsertComment(task.id, taskComment(commentEvent), existingComment?.id, draftMapping);
     const referenceMapping = existingComment?.id ? { ...draftMapping, commentId: existingComment.id } : draftMapping;
     const nextMapping = attachProjectCommentReference(referenceMapping, projectId, comment.id);
-    await this.state.putMapping(nextMapping);
-    await this.state.putRecurrenceLink(recurrenceLink(nextMapping, "calendar"));
+    await this.delegate.persistProviderMapping(nextMapping, destinationClients.todoist);
     if (destinationTombstone) await this.state.deleteCalendarProjectionTombstone(destinationProfile, task.id);
     await this.state.recordMutation(destinationProfile);
     await this.state.audit(destinationProfile, "todoist_calendar_owned_project_projection_moved", {

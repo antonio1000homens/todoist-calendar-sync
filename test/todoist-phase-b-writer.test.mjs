@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { MAPPING_COMMENT_MARKER } from "../dist/mapping-comments.js";
 import { Synchronizer } from "../dist/sync.js";
 
 const projectId="test-home-project";
@@ -42,6 +43,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
   changedBeforeRollback=false, rollbackFailure=false, createdConflict=false,
   unconfirmedCreation=false}={}){
   const state=new State(), instances=["2027-01-10","2027-04-10","2027-07-10"].map((d,i)=>eventInstance(`phase-b-instance-${i}`,d));
+  const projectComments=[];
   const master={id:"phase-b-master",etag:"etag-1",status:"confirmed",summary:task.content,description:task.description,
     start:{date:"2027-01-10"},end:{date:"2027-01-11"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],
     extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistRecurrence:"every quarter",
@@ -76,14 +78,37 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
     },
     async patchEventMetadataIfUnchanged(id,etag,metadata){const saved=events.get(id);assert.equal(etag,saved.etag);Object.assign(saved,metadata);saved.etag="etag-2";return structuredClone(saved);},
   };
-  const todoist={async listProjectComments(){return [];},async getTask(){return structuredClone(task);},async getTimeZone(){return "Europe/London";}};
+  const todoist={
+    async listProjectComments(){return projectComments.map(comment=>structuredClone(comment));},
+    async upsertProjectComment(projectId,content,existingId){
+      const id=existingId||`mapping-${projectComments.length+1}`;
+      const comment={id,project_id:projectId,content};
+      const index=projectComments.findIndex(value=>value.id===id);
+      if(index<0)projectComments.push(comment);else projectComments[index]=comment;
+      const [marker,payload]=content.split("\n");
+      if(marker===MAPPING_COMMENT_MARKER)state.mapping=JSON.parse(payload);
+      return structuredClone(comment);
+    },
+    async updateComment(commentId,content){
+      const index=projectComments.findIndex(value=>value.id===commentId);
+      if(index<0)throw new Error("missing mapping comment");
+      projectComments[index]={...projectComments[index],content};
+      state.mapping=JSON.parse(content.split("\n")[1]);
+      return structuredClone(projectComments[index]);
+    },
+    async getComment(id){const found=projectComments.find(value=>value.id===id);if(!found)throw Object.assign(new Error("missing"),{status:404});return structuredClone(found);},
+    async deleteComment(id){const index=projectComments.findIndex(value=>value.id===id);if(index>=0)projectComments.splice(index,1);},
+    async findLegacyTaskComment(){return undefined;},
+    async getTask(){return structuredClone(task);},
+    async getTimeZone(){return "Europe/London";},
+  };
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
   const delivery={id:"phase-b-item-added",kind:"todoist",profile:"home",mode:"aws",receivedAt:"2026-11-09T12:00:00Z",
     headers:{},body:JSON.stringify({event_name:"item:added",event_data:task})};
   return {state,calendar,sync,delivery,creates,upserts,deletes,events};
 }
-function withGate(enabled,fn){const old=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
-  if(enabled)process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED="true";else delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+function withGate(_enabled,fn){const old=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+  delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
   return Promise.resolve().then(fn).finally(()=>{if(old===undefined)delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;else process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED=old;});}
 
 test("verified new all-day quarterly item creates one native master and repeat webhook preserves it",()=>withGate(true,async()=>{
@@ -91,7 +116,8 @@ test("verified new all-day quarterly item creates one native master and repeat w
   await f.sync.process(f.delivery);
   assert.equal(f.creates.length,1);
   assert.equal(f.upserts.length,0);
-  assert.equal(f.state.mapping.recurrenceOwner,"todoist");
+  assert.equal(f.state.mapping.recurrenceOwner,undefined);
+  assert.equal(f.state.mapping.todoistPhaseBVersion,1);
   assert.equal(f.state.mapping.masterEventId,f.creates[0].id);
   assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
   await f.sync.process({...f.delivery,id:"replay-item-added"});
@@ -110,12 +136,14 @@ test("verified new all-day quarterly item creates one native master and repeat w
   task.updated_at="2026-11-09T11:59:00Z";
 }));
 
-test("Phase B creation stays OFF without explicit opt-in",()=>withGate(false,async()=>{
+test("supported recurrence uses native Calendar creation without a feature flag",()=>withGate(false,async()=>{
   const f=setup();
   await f.sync.process(f.delivery);
-  assert.equal(f.creates.length,0);
-  assert.equal(f.upserts.length,1);
-  assert.equal(f.state.audits.at(-1).action,"todoist_created_calendar");
+  assert.equal(f.creates.length,1);
+  assert.equal(f.upserts.length,0);
+  assert.equal(f.state.mapping.recurrenceOwner,undefined);
+  assert.equal(f.state.mapping.todoistPhaseBVersion,1);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
 }));
 
 test("provider exception after create deletes only the uncommitted deterministic master",()=>withGate(true,async()=>{

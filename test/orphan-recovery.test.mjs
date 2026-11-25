@@ -11,22 +11,6 @@ import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
 
 const HOME = profiles.home.todoistProjectId;
 
-class FakeIdentityStore {
-  constructor() {
-    this.values = new Map();
-  }
-  key(profile, side, providerId) {
-    return `${profile}:${side}:${providerId}`;
-  }
-  async get(profile, side, providerId) {
-    const identity = this.values.get(this.key(profile, side, providerId));
-    return identity ? { profile, side, providerId, identity, updatedAt: new Date().toISOString() } : undefined;
-  }
-  async put(profile, side, providerId, identity) {
-    this.values.set(this.key(profile, side, providerId), structuredClone(identity));
-  }
-}
-
 class FakeState {
   async syncBlocked() { return false; }
   constructor() {
@@ -121,7 +105,6 @@ function delivery(kind, body = "") {
 
 function fixture({ events = [], tasks = [] } = {}) {
   const state = new FakeState();
-  const identities = new FakeIdentityStore();
   const eventMap = new Map(events.map((event) => [event.id, structuredClone(event)]));
   const taskMap = new Map(tasks.map((task) => [task.id, structuredClone(task)]));
   const calendarUpserts = [];
@@ -176,8 +159,8 @@ function fixture({ events = [], tasks = [] } = {}) {
   };
 
   const clients = async () => ({ calendar, todoist });
-  const sync = new OrphanRecoveringSynchronizer(state, undefined, clients, identities);
-  return { state, identities, eventMap, taskMap, calendar, todoist, calendarUpserts, todoistUpserts, sync };
+  const sync = new OrphanRecoveringSynchronizer(state, undefined, clients);
+  return { state, eventMap, taskMap, calendar, todoist, calendarUpserts, todoistUpserts, sync };
 }
 
 function tombstoneComment({profile="home",taskId,eventIds=[]}) {
@@ -282,40 +265,33 @@ test("canonical identity treats Calendar offset time and Todoist floating wall-c
   assert.equal(sameCanonicalIdentity(calendarCanonicalIdentity(event), todoistCanonicalIdentity(task)), true);
 });
 
-test("Calendar edit re-links the unique Todoist task matching the previous canonical identity and updates it", async () => {
+test("Calendar edit does not re-link a Todoist task from a previous canonical identity", async () => {
   const oldTask = timedTask("task-1", "School run", 8);
   const changedEvent = timedEvent("event-1", "School pickup", 15);
   const f = fixture({ events: [changedEvent], tasks: [oldTask] });
-  await f.identities.put("home", "calendar", changedEvent.id, todoistCanonicalIdentity(oldTask));
-
   await f.sync.process(delivery("calendar"));
 
   const mapping = await f.state.getMappingByEvent("home", changedEvent.id);
-  assert.equal(mapping?.taskId, oldTask.id);
+  assert.notEqual(mapping?.taskId, oldTask.id);
   assert.equal(f.todoistUpserts.length, 1);
-  assert.equal(f.todoistUpserts[0].existingId, oldTask.id);
+  assert.equal(f.todoistUpserts[0].existingId, undefined);
   assert.equal(f.todoistUpserts[0].task.content, "School pickup");
-  assert.equal(f.taskMap.size, 1, "must update the orphan rather than create a duplicate task");
-  assert.ok(f.state.audits.some((entry) => entry.action === "calendar_orphan_todoist_rebound_previous_identity"));
+  assert.equal(f.taskMap.size, 2, "similar title/date fields do not prove that an existing task is the counterpart");
 });
 
-test("Calendar previous-identity ambiguity is blocked instead of creating a Todoist duplicate", async () => {
+test("Calendar previous-identity ambiguity preserves both tasks and syncs the event as a new pair", async () => {
   const old = timedTask("task-1", "School run", 8);
   const duplicate = timedTask("task-2", "School run", 8);
   const changedEvent = timedEvent("event-1", "School pickup", 15);
   const f = fixture({ events: [changedEvent], tasks: [old, duplicate] });
-  await f.identities.put("home", "calendar", changedEvent.id, todoistCanonicalIdentity(old));
-
   await f.sync.process(delivery("calendar"));
 
-  assert.equal(f.todoistUpserts.length, 0);
-  assert.equal(f.taskMap.size, 2);
-  const audit = f.state.audits.find((entry) => entry.action === "calendar_snapshot_unmapped_ambiguous");
-  assert.deepEqual(audit?.detail.candidateTaskIds, ["task-1", "task-2"]);
-  assert.equal(audit?.detail.source, "webhook_previous_identity");
+  assert.equal(f.todoistUpserts.length, 1);
+  assert.equal(f.todoistUpserts[0].existingId, undefined);
+  assert.equal(f.taskMap.size, 3);
 });
 
-test("Todoist edit re-links the unique Calendar event matching old_item and updates that event", async () => {
+test("Todoist edit does not re-link a Calendar event from old_item title/date", async () => {
   const oldTask = timedTask("task-1", "Dentist", 10);
   const changedTask = timedTask("task-1", "Dental check-up", 11, { updated_at: "2026-09-17T10:05:00Z" });
   const orphanEvent = timedEvent("event-1", "Dentist", 10);
@@ -329,12 +305,11 @@ test("Todoist edit re-links the unique Calendar event matching old_item and upda
   await f.sync.process(delivery("todoist", body));
 
   const mapping = await f.state.getMappingByTask("home", changedTask.id);
-  assert.equal(mapping?.eventId, orphanEvent.id);
+  assert.notEqual(mapping?.eventId, orphanEvent.id);
   assert.equal(f.calendarUpserts.length, 1);
-  assert.equal(f.calendarUpserts[0].existingId, orphanEvent.id);
+  assert.equal(f.calendarUpserts[0].existingId, undefined);
   assert.equal(f.calendarUpserts[0].event.summary, "Dental check-up");
-  assert.equal(f.eventMap.size, 1, "must update the orphan rather than create a duplicate Calendar event");
-  assert.ok(f.state.audits.some((entry) => entry.action === "todoist_orphan_calendar_rebound_previous_identity"));
+  assert.equal(f.eventMap.size, 2, "similar title/date fields do not prove that an existing event is the counterpart");
 });
 
 test("worker-facing unmapped Todoist upsert ignores a stale payload when the source task is gone", async () => {
@@ -380,7 +355,7 @@ test("worker-facing unmapped Todoist upsert propagates non-404 provider lookup f
   assert.equal(f.state.audits.length, 0);
 });
 
-test("Todoist previous-identity ambiguity performs no Calendar mutation", async () => {
+test("Todoist previous-identity ambiguity preserves events and syncs a new exact pair", async () => {
   const oldTask = timedTask("task-1", "Dentist", 10);
   const changedTask = timedTask("task-1", "Dental check-up", 11, { updated_at: "2026-09-17T10:05:00Z" });
   const events = [timedEvent("event-1", "Dentist", 10), timedEvent("event-2", "Dentist", 10)];
@@ -393,11 +368,9 @@ test("Todoist previous-identity ambiguity performs no Calendar mutation", async 
 
   await f.sync.process(delivery("todoist", body));
 
-  assert.equal(f.calendarUpserts.length, 0);
-  assert.equal(f.eventMap.size, 2);
-  const audit = f.state.audits.find((entry) => entry.action === "todoist_orphan_recovery_ambiguous");
-  assert.deepEqual(audit?.detail.candidateEventIds, ["event-1", "event-2"]);
-  assert.equal(audit?.detail.source, "webhook_old_item");
+  assert.equal(f.calendarUpserts.length, 1);
+  assert.equal(f.calendarUpserts[0].existingId, undefined);
+  assert.equal(f.eventMap.size, 3);
 });
 
 test("new task with the same title/due creates its own Calendar event, not the completed event", async () => {

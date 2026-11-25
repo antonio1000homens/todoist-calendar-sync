@@ -21,12 +21,12 @@ export const REPLAY_GUARDED_PROVIDER_WRITES={
   calendar:[
   "createFutureMasterOnce","createTodoistPhaseBNativeMasterOnce","upsertEvent","patchEventMetadataIfUnchanged",
   "createRepairEventOnce","upsertEventIfUnchanged",
-  "updateSharedEventPropertiesIfUnchanged","deleteEvent","deleteEventIfUnchanged",
+  "updateSharedEventPropertiesIfUnchanged","ensureTaskCorrelation","deleteEvent","deleteEventIfUnchanged",
   ],
   todoist:[
   "upsertTask","updateTaskMetadata","createTaskOnce","moveTask",
   "updateRecurringOccurrence","deleteTask","createProjectComment",
-  "updateComment","upsertProjectComment","upsertComment","deleteComment",
+  "completeTask","updateComment","upsertProjectComment","upsertComment","deleteComment",
   ],
 } as const;
 const calendarWrites=new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.calendar);
@@ -48,8 +48,11 @@ function eventIdentity(profile:Profile,method:string,args:unknown[]):ReplayIdent
     method==="upsertEvent"||method==="upsertEventIfUnchanged" ? args[1] : undefined,
     ["patchEventMetadataIfUnchanged","updateSharedEventPropertiesIfUnchanged","deleteEvent","deleteEventIfUnchanged"].includes(method)
       ? args[0] : undefined,
+    method==="ensureTaskCorrelation" ? args[0] : undefined,
   ]);
-  return {profile,...(taskId?{taskId}:{}),...(eventIds.length?{eventIds}:{})};
+  const exactTaskId=method==="ensureTaskCorrelation"&&typeof args[1]==="string"&&args[1]
+    ? args[1] : taskId;
+  return {profile,...(exactTaskId?{taskId:exactTaskId}:{}),...(eventIds.length?{eventIds}:{})};
 }
 function commentIdentity(profile:Profile,content:unknown):ReplayIdentity {
   if(typeof content!=="string")throw new ErasureReplayUnavailableError("Unidentifiable Todoist comment mutation");

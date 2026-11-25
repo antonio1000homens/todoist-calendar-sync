@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
-import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { mappingFromProjectMappingComment, parseMappingComment, serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import {
   Synchronizer,
   selectCalendarRecurrenceInstance,
@@ -147,6 +147,38 @@ class FakeState {
 }
 
 function fakeClients(state, instances, link, masterDelta, recurrenceString, projectComments = []) {
+  const comments = projectComments.slice();
+  const mirrorProviderMapping = (comment) => {
+    const parsed = parseMappingComment(comment);
+    if (!parsed || "error" in parsed) return;
+    const mapping = mappingFromProjectMappingComment(parsed);
+    const previous = state.mappingsByTask.get(mapping.taskId);
+    state.storeMapping(mapping);
+    if (!mapping.recurrenceOwner || !mapping.seriesId) return;
+    const link = {
+      profile: mapping.profile, owner: mapping.recurrenceOwner, seriesId: mapping.seriesId,
+      masterEventId: mapping.masterEventId, activeInstanceId: mapping.activeInstanceId,
+      originalStart: mapping.originalStart, activeEffectiveStart: mapping.activeEffectiveStart,
+      calendarProgressVersion: mapping.calendarProgressVersion,
+      completedThroughOriginalStart: mapping.completedThroughOriginalStart,
+      calendarNativeRecurring: mapping.calendarNativeRecurring,
+      syncedTitle: mapping.syncedTitle, syncedDescription: mapping.syncedDescription,
+      taskId: mapping.taskId, eventId: mapping.eventId, updatedAt: mapping.updatedAt,
+    };
+    state.putRecurrenceLink(link);
+    if (previous && previous.activeInstanceId !== mapping.activeInstanceId && mapping.completedThroughOriginalStart)
+      state.operations.push({ action: "advance-mapping", link: structuredClone(link) });
+  };
+  if (link && !comments.some(comment => comment.content?.startsWith("todoist-calendar-sync:mapping:"))) {
+    const projectId = profiles[link.profile || PROFILE].todoistProjectId;
+    const mapped = { ...mappingFromLink(link), projectId, calendarId: profiles[link.profile || PROFILE].calendarId, mappingRevision: 1 };
+    let content = serializeMappingComment(mapped, projectId);
+    if (!mapped.calendarProgressVersion && !mapped.todoistPhaseBVersion && mapped.recurrenceOwner) {
+      const [marker, payload] = content.split("\n");
+      content = `${marker}\n${JSON.stringify({ ...JSON.parse(payload), recurrenceOwner: mapped.recurrenceOwner })}`;
+    }
+    comments.push({ id: "provider-mapping", project_id: projectId, content });
+  }
   const failures = {};
   const tasks = new Map();
   const createdByRequest = new Map();
@@ -185,7 +217,12 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString, proj
         return instances.map((item) => structuredClone(item));
       },
       async listInstancesInWindow() { return this.listInstances(); },
-      async listExplicitSeriesExceptions() { return []; },
+      async listExplicitSeriesExceptions() {
+        return instances.filter((item) => item.status === "cancelled"
+          || item.originalStartTime?.date !== item.start?.date
+          || item.originalStartTime?.dateTime !== item.start?.dateTime)
+          .map((item) => structuredClone(item));
+      },
       async getTimeZone() {
         if (failures.calendarTimezone) throw new Error("injected Calendar timezone read failure");
         return failures.calendarTimeZone || "Europe/London";
@@ -200,7 +237,24 @@ function fakeClients(state, instances, link, masterDelta, recurrenceString, proj
       async upsertEvent(event) { calendarUpserts.push(structuredClone(event)); return { ...structuredClone(event), id: event.id || "stored" }; },
     },
     todoist: {
-      async listProjectComments() { return projectComments; },
+      async listProjectComments() { return comments.map(comment => structuredClone(comment)); },
+      async upsertProjectComment(projectId, content, existingId) {
+        if (failures.mappingUpdate) throw new Error("injected provider mapping update failure");
+        const id = existingId || "provider-mapping";
+        const comment = { id, project_id: projectId, content };
+        const index = comments.findIndex(item => item.id === id);
+        if (index >= 0) comments[index] = comment; else comments.push(comment);
+        mirrorProviderMapping(comment);
+        return structuredClone(comment);
+      },
+      async updateComment(commentId, content) {
+        if (failures.mappingUpdate) throw new Error("injected provider mapping update failure");
+        const index = comments.findIndex(item => item.id === commentId);
+        if (index < 0) throw new Error("missing comment");
+        comments[index] = { ...comments[index], content };
+        mirrorProviderMapping(comments[index]);
+        return structuredClone(comments[index]);
+      },
       async getTask(id) {
         const task = tasks.get(id);
         if (!task) throw Object.assign(new Error("missing"), { status: 404 });
@@ -594,7 +648,7 @@ test("completing a Calendar-owned occurrence persists the monotonic boundary bef
 
   await sync.process(completedDelivery("complete-day-17", link.taskId, completed, "2099-09-17T12:00:00Z"));
 
-  const boundaryWrite = state.operations.findIndex((operation) => operation.action === "advance-mapping" && operation.link.completedThroughOriginalStart === "2099-09-17");
+  const boundaryWrite = state.operations.findIndex((operation) => operation.action === "put-link" && operation.link.completedThroughOriginalStart === "2099-09-17");
   const retainedWrite = state.operations.findIndex((operation) => operation.action === "put-completed" && operation.projection.eventId === completed.id);
   const taskAdvance = state.operations.findIndex((operation) => operation.action === "update-recurring" || operation.action === "upsert-task");
   const deleteCalendar = state.operations.findIndex((operation) => operation.action === "delete-calendar");
@@ -616,14 +670,15 @@ test("Calendar-owned one-off completion transfers to one idempotently created su
   const state = new FakeState(link);
   const clients = fakeClients(state, [completed, successor], link);
   const delivery = completedDelivery("complete-oneoff", link.taskId, completed, "2099-09-17T15:00:00Z");
-  state.failAdvance = true;
+  clients.failures.mappingUpdate = true;
   const first = new Synchronizer(state, undefined, async () => clients);
-  await assert.rejects(first.process(delivery), /injected recurrence mapping transaction failure/);
+  await assert.rejects(first.process(delivery), /injected provider mapping update failure/);
   assert.equal(state.links[0].taskId, link.taskId, "the old mapping remains until its transaction succeeds");
   assert.equal(clients.todoistUpserts.length, 1, "the provider successor was created once before the injected failure");
-  assert.equal(state.completedProjections.some((projection) => projection.eventId === completed.id), true);
+  assert.equal(state.completedProjections.some((projection) => projection.eventId === completed.id), false,
+    "failed provider correlation must not leave a terminal marker that suppresses retry");
 
-  state.failAdvance = false;
+  clients.failures.mappingUpdate = false;
   const retry = new Synchronizer(state, undefined, async () => clients);
   await retry.process(delivery);
   assert.equal(clients.todoistUpserts.length, 1, "retry reuses the idempotent successor");
@@ -662,21 +717,21 @@ test("multiple Calendar-owned completions advance the watermark monotonically an
 
 test("Calendar-owned finite weekly completion skips a canceled occurrence and advances the same Todoist task", async () => {
   const scheduled = [4, 11, 18, 25].map((day, index) => instance(
-    `nov-${day}`, `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`,
-    `2026-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
+    `nov-${day}`, `2099-11-${String(day).padStart(2, "0")}T14:00:00Z`,
+    `2099-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
   ));
   const master = {
     id: MASTER, status: "confirmed", summary: "Task", description: "", iCalUID: SERIES,
-    start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
+    start: { dateTime: "2099-11-04T14:00:00Z", timeZone: "Europe/London" },
     recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
   };
   const current = scheduled[0];
-  const recurringString = "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026";
+  const recurringString = "every Wednesday at 2:00pm starting 4 Nov 2099 ending 25 Nov 2099";
   const link = linkFor(current, { calendarProgressVersion: 1 });
   const state = new FakeState(link);
   const clients = fakeClients(state, scheduled, link, master, recurringString);
   const sync = new Synchronizer(state, undefined, async () => clients);
-  const delivery = completedDelivery("complete-nov-4", link.taskId, current, "2026-11-04T15:00:00Z");
+  const delivery = completedDelivery("complete-nov-4", link.taskId, current, "2099-11-04T15:00:00Z");
   const parsed = JSON.parse(delivery.body);
   parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
   delivery.body = JSON.stringify(parsed);
@@ -687,7 +742,7 @@ test("Calendar-owned finite weekly completion skips a canceled occurrence and ad
   assert.equal(task.id, link.taskId);
   assert.equal(task.due.is_recurring, true);
   assert.equal(task.due.string, recurringString);
-  assert.equal(task.due.datetime, "2026-11-18T14:00:00Z");
+  assert.equal(task.due.datetime, "2099-11-18T14:00:00Z");
   assert.deepEqual(clients.recurringUpdates.map((entry) => entry.taskId), [link.taskId]);
   assert.equal(clients.todoistUpserts.length, 0);
   assert.equal(clients.todoistDeletes.length, 0);
@@ -695,10 +750,10 @@ test("Calendar-owned finite weekly completion skips a canceled occurrence and ad
   assert.equal(clients.calendarUpserts.length, 0);
   assert.equal(state.links[0].taskId, link.taskId);
   assert.equal(state.links[0].activeInstanceId, "nov-18");
-  assert.equal(state.links[0].completedThroughOriginalStart, "2026-11-04T14:00:00Z");
+  assert.equal(state.links[0].completedThroughOriginalStart, "2099-11-04T14:00:00Z");
 
   await sync.process(delivery);
-  assert.equal(clients.tasks.get(link.taskId).due.datetime, "2026-11-18T14:00:00Z");
+  assert.equal(clients.tasks.get(link.taskId).due.datetime, "2099-11-18T14:00:00Z");
   assert.equal(clients.recurringUpdates.length, 1, "replay must not advance the same task twice");
   assert.equal(clients.calendarUpserts.length, 0, "Calendar series remains untouched on replay");
 });
@@ -867,26 +922,26 @@ test("incremental all-day recurrence import fails closed on Todoist timezone mis
 for (const failurePoint of ["listInstances", "timezone", "update", "advance"]) {
   test(`Calendar-owned completion retries after ${failurePoint} failure without losing its advance`, async () => {
     const scheduled = [4, 11, 18, 25].map((day, index) => instance(
-      `retry-nov-${day}`, `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`,
-      `2026-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
+      `retry-nov-${day}`, `2099-11-${String(day).padStart(2, "0")}T14:00:00Z`,
+      `2099-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
     ));
     const master = {
       id: MASTER, status: "confirmed", summary: "Task", description: "", iCalUID: SERIES,
-      start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
+      start: { dateTime: "2099-11-04T14:00:00Z", timeZone: "Europe/London" },
       recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
     };
     const current = scheduled[0];
-    const recurrenceString = "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026";
+    const recurrenceString = "every Wednesday at 2:00pm starting 4 Nov 2099 ending 25 Nov 2099";
     const link = linkFor(current, { calendarProgressVersion: 1 });
     const state = new FakeState(link);
     const clients = fakeClients(state, scheduled, link, master, recurrenceString);
     const sync = new Synchronizer(state, undefined, async () => clients);
-    const delivery = completedDelivery(`retry-${failurePoint}`, link.taskId, current, "2026-11-04T15:00:00Z");
+    const delivery = completedDelivery(`retry-${failurePoint}`, link.taskId, current, "2099-11-04T15:00:00Z");
     const parsed = JSON.parse(delivery.body);
     parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
     delivery.body = JSON.stringify(parsed);
     clients.failures[failurePoint] = true;
-    if (failurePoint === "advance") state.failAdvance = true;
+    if (failurePoint === "advance") clients.failures.mappingUpdate = true;
 
     if (failurePoint === "timezone") await sync.process(delivery);
     else await assert.rejects(sync.process(delivery), /injected/);
@@ -895,32 +950,32 @@ for (const failurePoint of ["listInstances", "timezone", "update", "advance"]) {
     assert.equal(state.mappingsByTask.get(link.taskId).activeInstanceId, current.id);
 
     clients.failures[failurePoint] = false;
-    state.failAdvance = false;
+    if (failurePoint === "advance") clients.failures.mappingUpdate = false;
     await sync.process(delivery);
     assert.equal(state.links[0].activeInstanceId, "retry-nov-18");
-    assert.equal(state.links[0].completedThroughOriginalStart, "2026-11-04T14:00:00Z");
+    assert.equal(state.links[0].completedThroughOriginalStart, "2099-11-04T14:00:00Z");
     assert.equal(state.mappingsByTask.get(link.taskId).taskId, link.taskId);
-    assert.equal(clients.tasks.get(link.taskId).due.datetime, "2026-11-18T14:00:00Z");
+    assert.equal(clients.tasks.get(link.taskId).due.datetime, "2099-11-18T14:00:00Z");
   });
 }
 
 test("Calendar-owned completion does not bind a successor until Todoist readback confirms recurrence and due occurrence", async () => {
   const scheduled = [4, 11, 18, 25].map((day, index) => instance(
-    `readback-nov-${day}`, `2026-11-${String(day).padStart(2, "0")}T14:00:00Z`,
-    `2026-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
+    `readback-nov-${day}`, `2099-11-${String(day).padStart(2, "0")}T14:00:00Z`,
+    `2099-11-${String(day).padStart(2, "0")}T14:15:00Z`, index === 1 ? "cancelled" : "confirmed",
   ));
   const master = {
     id: MASTER, status: "confirmed", summary: "Task", description: "", iCalUID: SERIES,
-    start: { dateTime: "2026-11-04T14:00:00Z", timeZone: "Europe/London" },
+    start: { dateTime: "2099-11-04T14:00:00Z", timeZone: "Europe/London" },
     recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
   };
   const current = scheduled[0];
-  const recurrenceString = "every Wednesday at 2:00pm starting 4 Nov 2026 ending 25 Nov 2026";
+  const recurrenceString = "every Wednesday at 2:00pm starting 4 Nov 2099 ending 25 Nov 2099";
   const link = linkFor(current, { calendarProgressVersion: 1 });
   const state = new FakeState(link);
   const clients = fakeClients(state, scheduled, link, master, recurrenceString);
   const sync = new Synchronizer(state, undefined, async () => clients);
-  const delivery = completedDelivery("readback-mismatch", link.taskId, current, "2026-11-04T15:00:00Z");
+  const delivery = completedDelivery("readback-mismatch", link.taskId, current, "2099-11-04T15:00:00Z");
   const parsed = JSON.parse(delivery.body);
   parsed.event_data_extra = { old_item: structuredClone(clients.tasks.get(link.taskId)) };
   delivery.body = JSON.stringify(parsed);
@@ -934,5 +989,5 @@ test("Calendar-owned completion does not bind a successor until Todoist readback
 
   await sync.process(delivery);
   assert.equal(state.links[0].activeInstanceId, "readback-nov-18");
-  assert.equal(clients.tasks.get(link.taskId).due.datetime, "2026-11-18T14:00:00Z");
+  assert.equal(clients.tasks.get(link.taskId).due.datetime, "2099-11-18T14:00:00Z");
 });

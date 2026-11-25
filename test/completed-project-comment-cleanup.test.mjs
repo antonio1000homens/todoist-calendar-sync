@@ -97,8 +97,8 @@ test("cross-profile task owner, partial event mapping and task still available a
 });
 
 test("recurring history requires matched terminal certificate and no live recurrence in ANY profile",async()=>{
-  const history={...marker,recurrenceOwner:"calendar",seriesId:"finite",masterEventId:"master"};
-  const content=commentContent({recurrenceOwner:"calendar",seriesId:"finite",masterEventId:"master"});
+  const history={...marker,recurrenceOwner:"calendar",calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"};
+  const content=commentContent({recurrenceOwner:"calendar",calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"});
   const s=scenario({history,content});
   const certificate={profile:"home",seriesId:"finite",recurrenceOwner:"calendar",
     masterEventId:"master",terminalCompletedAt:completedAt};

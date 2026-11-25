@@ -292,7 +292,6 @@ export async function applyApprovedFutureSeriesSplit(
     delete shared.todoistRecurrence;
     delete shared.syncHistoryCutoff;
     Object.assign(shared, {
-      syncSource: "todoist-calendar-sync",
       syncHistoryOnly: "true", syncHistoryTaskId: task.id,
       syncHistoryOriginalRule: plan.originalRule,
       syncHistorySuccessorId: plan.newMasterId,

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
+import { MAPPING_COMMENT_MARKER } from "../dist/mapping-comments.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 
 const projectId = profiles.home.todoistProjectId;
@@ -41,6 +42,7 @@ function setup(family, {currentDue, oldProjectId, flag=true}={}) {
   const current=structuredClone(task);
   if(currentDue)current.due.date=currentDue;
   const events=new Map(),writes=[],normal=[],reads=[],state=new State();
+  const projectComments=[];
   const instances=family.dates.map((date,index)=>{
     const end=new Date(date+"T00:00:00Z");end.setUTCDate(end.getUTCDate()+1);
     return {id:`instance-${index}`,status:"confirmed",recurringEventId:"",
@@ -67,7 +69,23 @@ function setup(family, {currentDue, oldProjectId, flag=true}={}) {
   const todoist={
     async getTask(id){reads.push(id);return structuredClone(current);},
     async getTimeZone(){return "Europe/London";},
-    async listProjectComments(){return [];},
+    async listProjectComments(){return projectComments.map(comment=>structuredClone(comment));},
+    async upsertProjectComment(projectId,content,existingId){
+      const id=existingId||`mapping-${projectComments.length+1}`;
+      const comment={id,project_id:projectId,content};
+      const index=projectComments.findIndex(value=>value.id===id);
+      if(index<0)projectComments.push(comment);else projectComments[index]=comment;
+      const [marker,payload]=content.split("\n");
+      if(marker===MAPPING_COMMENT_MARKER)state.mapping=JSON.parse(payload);
+      return structuredClone(comment);
+    },
+    async updateComment(commentId,content){
+      const index=projectComments.findIndex(value=>value.id===commentId);
+      if(index<0)throw new Error("missing mapping comment");
+      projectComments[index]={...projectComments[index],content};
+      const payload=content.split("\n")[1];state.mapping=JSON.parse(payload);
+      return structuredClone(projectComments[index]);
+    },
     async findComment(){return undefined;},
     async upsertComment(){return {id:"project-comment"};},
   };
@@ -81,10 +99,9 @@ function setup(family, {currentDue, oldProjectId, flag=true}={}) {
     })};
   return {sync,task,current,events,writes,normal,reads,state,delivery};
 }
-async function withGate(enabled,fn){
+async function withGate(_enabled,fn){
   const before=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
-  if(enabled)process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED="true";
-  else delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
+  delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
   try{return await fn();}finally{
     if(before===undefined)delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
     else process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED=before;
@@ -98,7 +115,8 @@ for(const family of fixtures){
     assert.equal(f.normal.length,0,"ordinary project writer must not consume native candidate");
     assert.deepEqual(f.writes[0].recurrence,[family.rrule]);
     assert.equal(f.state.mapping.todoistPhaseBVersion,1);
-    assert.equal(f.state.mapping.recurrenceOwner,"todoist");
+    assert.equal(f.state.mapping.recurrenceOwner,undefined);
+    assert.equal(f.state.mapping.todoistPhaseBVersion,1);
     assert.equal(f.state.mapping.originalStart,family.due);
     assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
     assert.equal(f.state.versions.length,1,"the project layer must not consume the task version before native admission");
@@ -108,20 +126,21 @@ for(const family of fixtures){
     assert.equal(f.normal.length,0);
   }));
 }
-test("disabled production flag retains ordinary project creation",()=>withGate(false,async()=>{
+test("supported new recurrence is admitted without a deployment feature flag",()=>withGate(false,async()=>{
   const f=setup(fixtures[2]);
   await f.sync.process(f.delivery);
-  assert.equal(f.writes.length,0);
-  assert.equal(f.normal.length,1);
+  assert.equal(f.writes.length,1);
+  assert.equal(f.normal.length,0);
+  assert.equal(f.state.mapping.todoistPhaseBVersion,1);
 }));
-test("initial item:added signature and fresh GET remain independent: a changed due must roll",()=>withGate(true,async()=>{
+test("initial item:added signature and fresh GET remain independent: changed due stays unmirrored",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{currentDue:"2027-04-10"});
   await f.sync.process(f.delivery);
   assert.equal(f.writes.length,0,"stale original due cannot be silently reanchored as a native master");
-  assert.equal(f.normal.length,1);
+  assert.equal(f.normal.length,0,"changed due cannot fall back to a rolling mirror");
   assert.equal(f.state.mapping?.todoistPhaseBVersion,undefined);
-  assert.ok(f.state.audits.some(x=>x.action==="todoist_phase_b_native_admission_rejected"
-    && x.detail.reason==="todoist_source_rule_or_due_changed"));
+  assert.ok(f.state.audits.some(x=>x.action==="todoist_recurrence_unsupported_rule"
+    && x.detail.outcome==="source_left_unchanged"));
 }));
 test("actual project re-entry never promotes a historic rolling mapping",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{oldProjectId:"unmapped-inbox-project"});

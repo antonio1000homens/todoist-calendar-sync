@@ -97,7 +97,7 @@ test("strict Phase B Calendar provider admission requires exact master and insta
     summary:source.content, start:{date:"2027-01-02"},end:{date:"2027-01-03"},
     recurrence:[plan.rule],
     extendedProperties:{shared:{
-      taskId:source.id,syncRecurrenceOwner:"todoist",
+      taskId:source.id,
       todoistRecurrence:source.due.string,
       todoistAnchorStart:"2027-01-02",todoistAnchorEnd:"2027-01-03",todoistPhaseBVersion:"1",
     }},
@@ -114,7 +114,7 @@ test("strict Phase B Calendar provider admission requires exact master and insta
     {master:{...master,etag:undefined}},
     {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,todoistPhaseBVersion:undefined}}}},
     {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,todoistPhaseBVersion:"2"}}}},
-    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,syncRecurrenceOwner:"calendar"}}}},
+    {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,todoistRecurrence:"wrong-rule"}}}},
     {master:{...master,extendedProperties:{shared:{...master.extendedProperties.shared,taskId:"other"}}}},
     {master:{...master,recurrence:["RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15"]}},
     {master:{...master,start:{date:"2027-01-15"}}},
@@ -135,7 +135,7 @@ test("Phase B master create uses its deterministic Calendar identity and never c
   const taskId="task-290", eventId="ab".repeat(16);
   const event={id:eventId,status:"confirmed",start:{date:"2027-01-02"},end:{date:"2027-01-03"},
     recurrence:["RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27"],extendedProperties:{shared:{
-      taskId,syncRecurrenceOwner:"todoist",todoistAnchorStart:"2027-01-02",todoistPhaseBVersion:"1",
+      taskId,todoistRecurrence:"every month on the 2nd, 15th, and 27th",todoistAnchorStart:"2027-01-02",todoistPhaseBVersion:"1",
     }}};
   const calls=[];
   const previous=globalThis.fetch;

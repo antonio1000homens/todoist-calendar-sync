@@ -86,7 +86,7 @@ test("last weekday 1–5 is distinct from fourth weekday for five-weekday months
   }
 });
 
-test("rejects ambiguous, unsupported and contradictory positional rules and moved exceptions", async () => {
+test("rejects ambiguous positional rules and preserves valid moved and cancelled exceptions", async () => {
   const date = "2027-01-29";
   for (const rule of [
     "RRULE:FREQ=MONTHLY;BYDAY=FR", "RRULE:FREQ=MONTHLY;BYDAY=-2FR",
@@ -96,10 +96,10 @@ test("rejects ambiguous, unsupported and contradictory positional rules and move
     "RRULE:FREQ=MONTHLY;BYDAY=5FR;BYSETPOS=-1",
   ]) assert.equal(calendarOwnedTodoistRecurrence(master(date, rule), [], "Europe/London"), undefined, rule);
   const cal = master(date, "RRULE:FREQ=MONTHLY;BYDAY=5FR");
-  const moved = { ...occurrence(date), start: { date: "2027-01-28" } };
-  assert.equal(calendarOwnedTodoistRecurrence(cal, [moved], "Europe/London"), undefined);
-  assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [moved]), undefined);
-  assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [{ ...occurrence(date), status: "cancelled" }]), undefined);
+  const moved = { ...occurrence(date), start: { date: "2027-01-28" }, end: { date: "2027-01-29" } };
+  assert.equal(calendarOwnedTodoistRecurrence(cal, [moved], "Europe/London")?.monthlyOrdinal, 5);
+  assert.equal((await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [moved]))?.monthlyOrdinal, 5);
+  assert.equal((await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London", async () => [{ ...occurrence(date), status: "cancelled" }]))?.monthlyOrdinal, 5);
   assert.equal(await verifiedCalendarOwnedRecurrence(cal, [{ ...occurrence(date), status: "cancelled" }], "Europe/London", async () => []), undefined,
     "a cancellation visible in bounded expansion cannot be ignored when explicit exception inventory is inconsistent");
   assert.equal(await verifiedCalendarOwnedRecurrence(cal, [], "Europe/London"), undefined);

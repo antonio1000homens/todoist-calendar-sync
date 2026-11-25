@@ -4,12 +4,7 @@ import {
   matchesCalendarPhaseCTask, type CalendarPhaseCCandidate,
 } from "./calendar-todoist-phase-c.js";
 
-export function phaseCNativeEnabled(): boolean {
-  return process.env.TODOIST_CALENDAR_SYNC_PHASE_C_NATIVE_ENABLED === "true";
-}
-
 export function isPhaseCNativeCandidate(master: CalendarEvent, timeZone = master.start?.timeZone): boolean {
-  if (!phaseCNativeEnabled()) return false;
   const candidate = calendarPhaseCCandidate(master, timeZone);
   if (candidate.reason !== "provider_readback_required" || !candidate.semantic) return false;
   // Actual Todoist completion readback: "every 29, 30, 31" advanced from
@@ -29,7 +24,8 @@ export interface CalendarOwnedTodoistRecurrence {
   weekday?: string;
   rule: string;
   /** Native Todoist cadence; omitted for legacy finite-weekly rules. */
-  frequency?: "weekly" | "monthly" | "yearly";
+  frequency?: "daily" | "weekly" | "monthly" | "yearly";
+  interval?: number;
   dayOfMonth?: number;
   monthlyOrdinal?: number;
   month?: number;
@@ -42,7 +38,8 @@ export interface CalendarOwnedTodoistRecurrence {
 export interface CalendarOwnedRecurringTaskReadback {
   matches: boolean;
   expected: {
-    frequency: "weekly" | "monthly" | "yearly";
+    frequency: "daily" | "weekly" | "monthly" | "yearly";
+    interval?: number;
     weekday?: string;
     dayOfMonth?: number;
     monthlyOrdinal?: number;
@@ -55,7 +52,8 @@ export interface CalendarOwnedRecurringTaskReadback {
     recurring: boolean;
     dueDate?: string;
     recurrenceParsed: boolean;
-    frequency?: "weekly" | "monthly" | "yearly";
+    frequency?: "daily" | "weekly" | "monthly" | "yearly";
+    interval?: number;
     weekday?: string;
     dayOfMonth?: number;
     monthlyOrdinal?: number;
@@ -332,11 +330,14 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolea
   // retain their original rolling representation and scanning policy.
   if (phaseC.family) return isPhaseCNativeCandidate(master);
   const fields = ruleFields(master.recurrence[0]);
-  return Boolean(fields && ["WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
-    && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || fields.INTERVAL === "1")
+  return Boolean(fields && ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
+    && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || (fields.FREQ === "DAILY"
+      ? Number.isInteger(Number(fields.INTERVAL)) && Number(fields.INTERVAL) >= 1 && Number(fields.INTERVAL) <= 999
+      : fields.INTERVAL === "1"))
     && !fields.BYDAY?.includes(",") && !fields.BYMONTHDAY?.includes(",")
     && !(fields.BYDAY && fields.BYMONTHDAY)
     && (fields.FREQ !== "WEEKLY" || (!fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
+    && (fields.FREQ !== "DAILY" || (!fields.BYDAY && !fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
     && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY"].includes(key)));
 }
 
@@ -346,10 +347,12 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const fields = ruleFields(rule)!;
   const start = master.start?.dateTime || master.start?.date;
   if (!start) return undefined;
+  const interval = fields.INTERVAL === undefined ? 1 : Number(fields.INTERVAL);
+  if (!Number.isInteger(interval) || interval < 1 || interval > 999) return undefined;
   // Newly whitelisted Phase C families use exact two-provider-verified phrases.
   // They never bypass the complete exception inventory performed by
   // verifiedCalendarOwnedRecurrence().
-  const phaseC = phaseCNativeEnabled() ? calendarPhaseCCandidate(master, timeZone) : undefined;
+  const phaseC = calendarPhaseCCandidate(master, timeZone);
   if (phaseC?.reason === "provider_readback_required" && phaseC.semantic && phaseC.todoistPhrase) {
     if (!calendarPhaseCInstancesConform(master, instances, phaseC, timeZone)) return undefined;
     return {
@@ -382,20 +385,25 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
     || (fields.BYSETPOS && monthlyDay[1]) || (fields.BYSETPOS && !/^(?:[1-5]|-1)$/.test(fields.BYSETPOS)))) return undefined;
   if (fields.BYSETPOS && position === undefined) return undefined;
   // A provider instance's immutable originalStartTime must satisfy the master
-  // cadence; its mutable effective start can be a legitimate exception.
-  // Reject contradictory inventories rather than blessing the wrong pattern.
+  // cadence. Its effective start and metadata may be an explicit occurrence
+  // exception; the task keeps the base recurrence and applies that exception
+  // only while the occurrence is current.
+  const seenInstanceIds = new Set<string>();
   for (const instance of instances.filter((item) => item.recurringEventId === master.id)) {
+    if (!instance.id || seenInstanceIds.has(instance.id)
+      || (instance.status !== undefined && instance.status !== "confirmed" && instance.status !== "cancelled")) return undefined;
+    seenInstanceIds.add(instance.id);
     const original = instance.originalStartTime?.dateTime || instance.originalStartTime?.date;
     if (!original) return undefined;
     if (instance.status !== "cancelled") {
       const effective = instance.start?.dateTime || instance.start?.date;
-      if (!effective || (original.length === 10 || effective.length === 10
-        ? original !== effective
-        : Date.parse(original) !== Date.parse(effective))) {
-        // Native recurring Todoist cannot model per-occurrence Calendar moves.
-        // Keep the authoritative Calendar exception on the rolling mirror path.
-        return undefined;
-      }
+      const end = instance.end?.dateTime || instance.end?.date;
+      const originalIsDate = original.length === 10;
+      if (!effective || (effective.length === 10) !== originalIsDate) return undefined;
+      const isMoved = originalIsDate ? effective !== original : Date.parse(effective) !== Date.parse(original);
+      if (isMoved && (!end || (end.length === 10) !== originalIsDate
+        || (originalIsDate ? end <= effective : !Number.isFinite(Date.parse(effective))
+          || !Number.isFinite(Date.parse(end)) || Date.parse(end) <= Date.parse(effective)))) return undefined;
     }
     let originalParts: Record<string, string>;
     try { originalParts = localParts(original, timeZone); }
@@ -404,6 +412,12 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
     const originalDay = Number(originalParts.day);
     const originalWeekday = weekdayNames.find((name) => name.toLowerCase().startsWith(originalParts.weekday.toLowerCase()));
     if (!originalMonth || !originalWeekday || !Number.isInteger(originalDay)) return undefined;
+    if (fields.FREQ === "DAILY") {
+      const anchorDate = localDate(start, timeZone);
+      const originalDate = localDate(original, timeZone);
+      const dayDelta = (Date.parse(`${originalDate}T00:00:00Z`) - Date.parse(`${anchorDate}T00:00:00Z`)) / 86_400_000;
+      if (!Number.isInteger(dayDelta) || dayDelta < 0 || dayDelta % interval !== 0) return undefined;
+    }
     if (fields.FREQ === "WEEKLY" && originalWeekday !== weekday) return undefined;
     if (fields.FREQ === "MONTHLY" && (position !== undefined
       ? !matchingMonthlyWeekday(
@@ -416,6 +430,10 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
   const localIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
   const base = { rule, startDate: localIsoDate, ...(time ? { time } : {}) };
+  if (fields.FREQ === "DAILY") {
+    return { ...base, frequency: "daily", ...(interval > 1 ? { interval } : {}),
+      dueString: `every ${interval > 1 ? `${interval} days` : "day"}${timePhrase} starting ${startPhrase}` };
+  }
   if (fields.FREQ === "WEEKLY") {
     if (fields.BYMONTH || fields.BYMONTHDAY
       || (fields.BYDAY && fields.BYDAY !== Object.keys(weekdayCodes).find((code) => weekdayCodes[code] === weekday))) return undefined;
@@ -444,7 +462,7 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
 /** Parse Todoist's normalized, possibly start-date-free representation.
  * Only a single cadence is accepted; unrecognized modifiers fail closed. */
 function parseOpenTodoistRule(value: string | undefined): {
-  frequency: "weekly" | "monthly" | "yearly"; weekday?: string;
+  frequency: "daily" | "weekly" | "monthly" | "yearly"; interval?: number; weekday?: string;
   dayOfMonth?: number; monthlyOrdinal?: number; month?: number; time?: string; start?: ParsedDate;
 } | undefined {
   if (!value) return undefined;
@@ -458,6 +476,12 @@ function parseOpenTodoistRule(value: string | undefined): {
   const start = match[2] ? parseNaturalDate(match[2]) : undefined;
   if (match[2] && !start) return undefined;
   const extra = { ...(time ? { time } : {}), ...(start ? { start } : {}) };
+  const daily = name.match(/^(?:(\d+)\s+)?days?$/);
+  if (daily) {
+    const interval = Number(daily[1] || 1);
+    if (!Number.isInteger(interval) || interval < 1 || interval > 999) return undefined;
+    return { frequency: "daily", ...(interval > 1 ? { interval } : {}), ...extra };
+  }
   const weekday = weekdayLookup.get(name);
   if (weekday) return { frequency: "weekly", weekday, ...extra };
   const ordinal = name.match(/^(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last)\s+([a-z]+)(?:\s+of\s+(?:the\s+)?month)?$/);
@@ -483,15 +507,20 @@ function parseOpenTodoistRule(value: string | undefined): {
   return undefined;
 }
 
-function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecurrence, verifiedTimeZone?: string): {
-  matches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule>;
-} {
+function openRuleMatches(
+  task: TodoistTask,
+  recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
+  occurrence?: CalendarEvent,
+): { matches: boolean; ruleMatches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule> } {
   const parsed = parseOpenTodoistRule(task.due?.string);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
   const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
     && anchor.month === expectedStart.month && (!anchor.year || anchor.year === expectedStart.year));
-  const due = task.due?.date || task.due?.datetime;
+  const due = occurrence?.originalStartTime?.dateTime || occurrence?.originalStartTime?.date
+    || occurrence?.start?.dateTime || occurrence?.start?.date
+    || task.due?.date || task.due?.datetime;
   // Todoist can return UTC/offset datetimes that fall on the previous local
   // day. Use an independently verified Calendar/Todoist zone to check cadence.
   let currentDay: string | undefined;
@@ -514,6 +543,11 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
   const expectedCadenceDate = Boolean(currentDay && (() => {
     const parsedDate = parseNaturalDate(currentDay);
     if (!parsedDate || (recurrence.startDate && currentDay < recurrence.startDate)) return false;
+    if (recurrence.frequency === "daily") {
+      const anchor = recurrence.startDate || currentDay;
+      const elapsed = (Date.parse(`${currentDay}T00:00:00Z`) - Date.parse(`${anchor}T00:00:00Z`)) / 86_400_000;
+      return Number.isInteger(elapsed) && elapsed >= 0 && elapsed % (recurrence.interval || 1) === 0;
+    }
     if (recurrence.frequency === "monthly" && recurrence.monthlyOrdinal !== undefined)
       return Boolean(recurrence.weekday && matchingMonthlyWeekday(currentDay, recurrence.weekday, recurrence.monthlyOrdinal));
     if (recurrence.frequency === "monthly") return parsedDate.day === recurrence.dayOfMonth;
@@ -524,10 +558,12 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
   // Provider due time and zone are semantic readback, not just phrase text.
   const zoneMatches = !task.due?.timezone || task.due.timezone === verifiedTimeZone;
   const dueValue = task.due?.datetime || task.due?.date;
+  const timeValue = occurrence?.originalStartTime?.dateTime || occurrence?.originalStartTime?.date
+    || occurrence?.start?.dateTime || occurrence?.start?.date || dueValue;
   let observedTime: string | undefined;
-  if (dueValue?.includes("T") && verifiedTimeZone) {
-    if (/Z|[+-]\d{2}:?\d{2}$/i.test(dueValue)) {
-      const instant = new Date(dueValue);
+  if (timeValue?.includes("T") && verifiedTimeZone) {
+    if (/Z|[+-]\d{2}:?\d{2}$/i.test(timeValue)) {
+      const instant = new Date(timeValue);
       if (Number.isFinite(instant.getTime())) {
         try {
           const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
@@ -536,24 +572,26 @@ function openRuleMatches(task: TodoistTask, recurrence: CalendarOwnedTodoistRecu
           observedTime = `${parts.hour}:${parts.minute}`;
         } catch { /* Invalid zone fails closed. */ }
       }
-    } else observedTime = dueValue.slice(11, 16);
+    } else observedTime = timeValue.slice(11, 16);
   }
-  const timeMatches = recurrence.time ? observedTime === recurrence.time : Boolean(dueValue && !dueValue.includes("T"));
-  return { parsed, matches: Boolean(task.due?.is_recurring && parsed && correctStart && expectedCadenceDate && zoneMatches && timeMatches
+  const timeMatches = recurrence.time ? observedTime === recurrence.time : Boolean(timeValue && !timeValue.includes("T"));
+  const ruleMatches = Boolean(task.due?.is_recurring && parsed && correctStart && expectedCadenceDate && zoneMatches && timeMatches
     && parsed.frequency === recurrence.frequency
+    && parsed.interval === recurrence.interval
     && parsed.weekday === recurrence.weekday
     && parsed.monthlyOrdinal === recurrence.monthlyOrdinal
     && parsed.dayOfMonth === recurrence.dayOfMonth
     && parsed.month === recurrence.month
-    && parsed.time === recurrence.time) };
+    && parsed.time === recurrence.time);
+  return { parsed, ruleMatches, matches: ruleMatches && (occurrence ? true : expectedCadenceDate) };
 }
 
 /**
  * A bounded instances expansion cannot prove that an open-ended series has no
  * exceptions elsewhere. Require Google's complete explicit exception inventory
- * before creating or maintaining a native indefinite Todoist recurrence.
- * Any explicit cancellation or modified instance would produce a Todoist
- * occurrence absent from Calendar, so fail closed to the guarded mirror path.
+ * before creating or maintaining a native Todoist recurrence. Preserve valid
+ * cancellations and overrides by their immutable originalStartTime; the sync
+ * worker applies them when each occurrence becomes current.
  */
 export async function verifiedCalendarOwnedRecurrence(
   master: CalendarEvent,
@@ -561,20 +599,69 @@ export async function verifiedCalendarOwnedRecurrence(
   timeZone: string,
   listExplicitSeriesExceptions?: (masterId: string) => Promise<CalendarEvent[]>,
 ): Promise<CalendarOwnedTodoistRecurrence | undefined> {
-  if (!nativeCalendarRecurrenceCandidate(master)) {
+  if (!nativeCalendarRecurrenceCandidate(master) && !finiteWeeklyCalendarRuleCandidate(master)) {
     return calendarOwnedTodoistRecurrence(master, instances, timeZone);
   }
+  // A finite COUNT rule plus a fully paginated instances endpoint is itself a
+  // complete inventory, including canceled exceptions. Open-ended series need
+  // the dedicated exception list because a bounded range cannot prove there
+  // are no exceptions outside it.
+  if (finiteWeeklyCalendarRuleCandidate(master)) return calendarOwnedTodoistRecurrence(master, instances, timeZone);
   if (!listExplicitSeriesExceptions) return undefined;
-  // Even if the explicit provider inventory is inconsistent, a cancellation
-  // already visible in the bounded expansion must never be silently erased.
-  if (instances.some((item) => item.recurringEventId === master.id && item.status === "cancelled")) return undefined;
   const exceptions = await listExplicitSeriesExceptions(master.id);
-  if (exceptions.some((item) => item.recurringEventId !== master.id
-    || item.status === "cancelled" || item.status !== "confirmed")) return undefined;
-  // Even an unmodified explicit override may hide distinct recurrence
-  // semantics (e.g. changed description/location). Never silently adopt it.
-  if (exceptions.length) return undefined;
-  return calendarOwnedTodoistRecurrence(master, instances, timeZone);
+  const exceptionById = new Map<string, CalendarEvent>();
+  for (const item of exceptions) {
+    if (item.recurringEventId !== master.id || !item.id || !item.originalStartTime
+      || (item.status !== "confirmed" && item.status !== "cancelled") || exceptionById.has(item.id)) return undefined;
+    if (item.status === "confirmed") {
+      const start = item.start?.dateTime || item.start?.date;
+      const end = item.end?.dateTime || item.end?.date;
+      if (!start || !end || (start.length === 10) !== (end.length === 10)
+        || (start.length === 10 ? end <= start : !Number.isFinite(Date.parse(start))
+          || !Number.isFinite(Date.parse(end)) || Date.parse(end) <= Date.parse(start))) return undefined;
+    }
+    exceptionById.set(item.id, item);
+  }
+  const sameStart = (left?: { date?: string; dateTime?: string }, right?: { date?: string; dateTime?: string }): boolean => {
+    if (!left || !right) return left === right;
+    if (left.date !== undefined || right.date !== undefined) return left.date === right.date;
+    const a = Date.parse(left.dateTime || ""), b = Date.parse(right.dateTime || "");
+    return Number.isFinite(a) && Number.isFinite(b) && a === b;
+  };
+  const sameDuration = (
+    leftStart?: { date?: string; dateTime?: string }, leftEnd?: { date?: string; dateTime?: string },
+    rightStart?: { date?: string; dateTime?: string }, rightEnd?: { date?: string; dateTime?: string },
+  ): boolean => {
+    if (!leftEnd) return true;
+    if (!leftStart || !rightStart || !rightEnd) return false;
+    const values = [leftStart.dateTime || leftStart.date, leftEnd.dateTime || leftEnd.date,
+      rightStart.dateTime || rightStart.date, rightEnd.dateTime || rightEnd.date];
+    if (values.some((value) => !value) || values.some((value) => value!.length === 10) !== values.every((value) => value!.length === 10)) return false;
+    const parsed = values.map((value) => Date.parse(value!));
+    return parsed.every(Number.isFinite) && parsed[1] - parsed[0] === parsed[3] - parsed[2];
+  };
+  const sameOverride = (item: CalendarEvent): boolean => item.status === "cancelled"
+    || !sameStart(item.originalStartTime, item.start)
+    || !sameDuration(master.start, master.end, item.start, item.end)
+    || (item.summary !== undefined && item.summary !== (master.summary || ""))
+    || (item.description !== undefined && item.description !== (master.description || ""));
+  const boundedById = new Map(instances.filter((item) => item.recurringEventId === master.id && item.id)
+    .map((item) => [item.id!, item]));
+  for (const item of boundedById.values()) {
+    if (sameOverride(item) && !exceptionById.has(item.id!)) return undefined;
+    const explicit = exceptionById.get(item.id!);
+    if (explicit && (explicit.status !== item.status
+      || !sameStart(explicit.originalStartTime, item.originalStartTime)
+      || (explicit.start && !sameStart(explicit.start, item.start))
+      || (explicit.end && !sameStart(explicit.end, item.end))
+      || (explicit.summary !== undefined && explicit.summary !== item.summary)
+      || (explicit.description !== undefined && explicit.description !== item.description))) return undefined;
+  }
+  const combined = new Map<string, CalendarEvent>();
+  for (const item of [...exceptions, ...instances]) {
+    if (item.recurringEventId === master.id && item.id) combined.set(item.id, item);
+  }
+  return calendarOwnedTodoistRecurrence(master, [...combined.values()], timeZone);
 }
 
 export function finiteWeeklyCalendarRuleCandidate(master: CalendarEvent): boolean {
@@ -712,10 +799,10 @@ export function calendarOwnedRecurringTaskReadback(
     };
   }
   if (recurrence.frequency) {
-    const { parsed, matches } = openRuleMatches(task, recurrence, verifiedTimeZone);
+    const { parsed, ruleMatches } = openRuleMatches(task, recurrence, verifiedTimeZone, event);
     return {
-      matches: matches && startsMatchCalendarEvent(event, task, verifiedTimeZone),
-      expected: { frequency: recurrence.frequency, ...(recurrence.weekday ? { weekday: recurrence.weekday } : {}),
+      matches: ruleMatches && startsMatchCalendarEvent(event, task, verifiedTimeZone),
+      expected: { frequency: recurrence.frequency, ...(recurrence.interval ? { interval: recurrence.interval } : {}), ...(recurrence.weekday ? { weekday: recurrence.weekday } : {}),
         ...(recurrence.dayOfMonth ? { dayOfMonth: recurrence.dayOfMonth } : {}),
         ...(recurrence.monthlyOrdinal !== undefined ? { monthlyOrdinal: recurrence.monthlyOrdinal } : {}),
         ...(recurrence.month ? { month: recurrence.month } : {}),
@@ -724,7 +811,7 @@ export function calendarOwnedRecurringTaskReadback(
       observed: { recurring: Boolean(task.due?.is_recurring),
         ...(task.due?.date || task.due?.datetime ? { dueDate: task.due.date || task.due.datetime } : {}),
         recurrenceParsed: Boolean(parsed),
-        ...(parsed ? { frequency: parsed.frequency,
+        ...(parsed ? { frequency: parsed.frequency, ...(parsed.interval ? { interval: parsed.interval } : {}),
           ...(parsed.weekday ? { weekday: parsed.weekday } : {}),
           ...(parsed.dayOfMonth ? { dayOfMonth: parsed.dayOfMonth } : {}),
           ...(parsed.monthlyOrdinal !== undefined ? { monthlyOrdinal: parsed.monthlyOrdinal } : {}),

@@ -2464,7 +2464,7 @@ test("same-date annualizing can resume after the Calendar update but before read
   assert.equal(result.status,"succeeded",result.error);
   assert.equal(h.mappingMap.get("task").masterEventId,"event");
   const shared=h.eventMap.get("event").extendedProperties.shared;
-  assert.equal(shared.syncRecurrenceOwner,"todoist");
+  assert.equal(shared.syncRecurrenceOwner,undefined);
   assert.equal(shared.todoistRecurrence,todoistRecurrenceKey(task("task",{due:{date:"2099-12-18",is_recurring:true,string:"every year"}})));
   assert.ok(!shared.syncHistoryOnly && !shared.syncHistoryMasterId);
   assert.equal(h.writes.filter(w=>w[0]==="event" && w[1]==="event").length,2); // annualization + metadata link

@@ -366,7 +366,7 @@ test("Calendar-owned recurrence moves its master series and active-instance mapp
   assert.equal(state.mapping?.masterEventId, "work-event-1");
   assert.equal(state.mapping?.eventId, "work-event-1-instance");
   assert.equal(state.mapping?.activeEffectiveStart, "2026-09-10");
-  assert.ok(state.recurrenceLinks.some((link) => link.profile === "work" && link.owner === "calendar"));
+  assert.equal(state.mapping?.seriesId, "work-ical-work-event-1");
   assert.ok(state.operations.indexOf(`tombstone:home:${task.id}`) < state.operations.indexOf("delete-mapping:home:home-instance"));
 });
 
@@ -417,7 +417,7 @@ test("Todoist-owned RRULE move binds the destination master and current instance
   assert.equal(state.mapping?.activeInstanceId, "work-event-1-instance");
   assert.equal(state.mapping?.originalStart, "2026-09-12");
   assert.equal(state.mapping?.activeEffectiveStart, "2026-09-12");
-  assert.ok(state.recurrenceLinks.some((link) => link.profile === "work" && link.owner === "todoist" && link.activeInstanceId === "work-event-1-instance"));
+  assert.equal(state.mapping?.activeInstanceId, "work-event-1-instance");
 });
 
 test("Phase B native master stays intact when cross-profile copy protocol is unavailable", async () => {
@@ -479,7 +479,7 @@ test("Phase B native project move routes only verified signed transition through
     return { sync, source, state, called, calendars, mapping, link };
   };
   try {
-    process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED = "true";
+    delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
     const good = makeCase();
     await good.sync.process(good.source);
     assert.equal(good.called.length, 1);
@@ -516,14 +516,6 @@ test("Phase B native project move routes only verified signed transition through
     await wrongEvent.sync.process(wrongEvent.source);
     assert.equal(wrongEvent.called.length, 0);
     assert.equal(wrongEvent.state.audits.at(-1).action,
-      "todoist_phase_b_cross_profile_move_requires_review");
-    process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED = "false";
-    const disabled = makeCase();
-    await disabled.sync.process(disabled.source);
-    assert.equal(disabled.called.length, 0);
-    assert.deepEqual(disabled.calendars.home.deleted, []);
-    assert.deepEqual(disabled.calendars.work.created, []);
-    assert.equal(disabled.state.audits.at(-1).action,
       "todoist_phase_b_cross_profile_move_requires_review");
   } finally {
     if (saved === undefined) delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;

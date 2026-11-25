@@ -1,6 +1,7 @@
 import type { Mapping, Profile } from "./types.js";
 
-export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v1";
+export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v2";
+export const LEGACY_MAPPING_COMMENT_MARKER_V1 = "todoist-calendar-sync:mapping:v1";
 /** Short-lived post-erasure marker kept beside the deleted task's project mapping. */
 export const DELETION_TOMBSTONE_COMMENT_MARKER = "todoist-calendar-sync:deleted:v1";
 /** Cover the four-day FIFO source queue plus its 14-day FIFO DLQ retention. */
@@ -8,7 +9,7 @@ export const PROJECT_DELETION_TOMBSTONE_RETENTION_MS = 18 * 24 * 60 * 60 * 1000;
 export const LEGACY_MAPPING_COMMENT_MARKER = "gcp-app2-sync:mapping:v1";
 /** Historical task-comment identities are accepted only for migration/cleanup. */
 export const LEGACY_TASK_COMMENT_MARKERS = new Set<string>(["gcp-app2-sync", "todoist-calendar-sync"]);
-const ACCEPTED_MAPPING_COMMENT_MARKERS = new Set([MAPPING_COMMENT_MARKER, LEGACY_MAPPING_COMMENT_MARKER]);
+const ACCEPTED_MAPPING_COMMENT_MARKERS = new Set([MAPPING_COMMENT_MARKER, LEGACY_MAPPING_COMMENT_MARKER_V1, LEGACY_MAPPING_COMMENT_MARKER]);
 const VALID_PROFILES = new Set<Profile>(["home", "antonio", "work"]);
 
 export interface TodoistCommentRecord {
@@ -21,8 +22,9 @@ export interface TodoistCommentRecord {
 }
 
 export interface ProjectMappingCommentPayload {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   profile: Profile;
+  calendarId?: string;
   projectId: string;
   taskId: string;
   eventId: string;
@@ -35,6 +37,12 @@ export interface ProjectMappingCommentPayload {
   activeEffectiveStart?: string;
   calendarProgressVersion?: 1;
   completedThroughOriginalStart?: string;
+  calendarNativeRecurring?: true;
+  todoistPhaseBVersion?: 1;
+  syncedTitle?: string;
+  syncedDescription?: string;
+  syncedDue?: string;
+  baselineVersion?: 1;
   mappingRevision: number;
   updatedAt: string;
 }
@@ -59,6 +67,34 @@ export function projectDeletionTombstoneExpiry(createdAt: string): string {
 export interface ParsedMappingComment {
   comment: TodoistCommentRecord;
   payload: ProjectMappingCommentPayload;
+}
+
+/** Rehydrate the exact sync pair from a provider-owned project comment. */
+export function mappingFromProjectMappingComment(parsed: ParsedMappingComment): Mapping {
+  const { payload, comment } = parsed;
+  return {
+    profile: payload.profile, projectId: payload.projectId, taskId: payload.taskId,
+    eventId: payload.eventId, projectCommentId: comment.id,
+    ...(payload.calendarId ? { calendarId: payload.calendarId } : {}),
+    ...(payload.mappingRevision ? { mappingRevision: payload.mappingRevision } : {}),
+    ...(payload.calendarProgressVersion === 1 || payload.calendarNativeRecurring
+      ? { recurrenceOwner: "calendar" as const }
+      : payload.todoistPhaseBVersion === 1 ? { recurrenceOwner: "todoist" as const }
+        : payload.recurrenceOwner ? { recurrenceOwner: payload.recurrenceOwner } : {}),
+    ...(payload.seriesId ? { seriesId: payload.seriesId } : {}),
+    ...(payload.masterEventId ? { masterEventId: payload.masterEventId } : {}),
+    ...(payload.activeInstanceId ? { activeInstanceId: payload.activeInstanceId } : {}),
+    ...(payload.originalStart ? { originalStart: payload.originalStart } : {}),
+    ...(payload.activeEffectiveStart ? { activeEffectiveStart: payload.activeEffectiveStart } : {}),
+    ...(payload.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
+    ...(payload.completedThroughOriginalStart ? { completedThroughOriginalStart: payload.completedThroughOriginalStart } : {}),
+    ...(payload.calendarNativeRecurring === true ? { calendarNativeRecurring: true } : {}),
+    ...(payload.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 as const } : {}),
+    ...(payload.syncedTitle !== undefined ? { syncedTitle: payload.syncedTitle } : {}),
+    ...(payload.syncedDescription !== undefined ? { syncedDescription: payload.syncedDescription } : {}),
+    ...(payload.syncedDue !== undefined ? { syncedDue: payload.syncedDue } : {}),
+    updatedAt: payload.updatedAt,
+  };
 }
 
 export interface MalformedMappingComment {
@@ -91,6 +127,16 @@ function optionalString(value: unknown): value is string | undefined {
   return value === undefined || nonEmptyString(value);
 }
 
+function validDueBaseline(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (dateOnly) {
+    const date = new Date(`${value}T00:00:00.000Z`);
+    return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  }
+  return /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
+}
+
 function laterLogicalStart(left: string | undefined, right: string | undefined): string | undefined {
   if (!left) return right;
   if (!right) return left;
@@ -111,13 +157,13 @@ export function serializeMappingComment(
   revision = Math.max(1, mapping.mappingRevision || 1),
 ): string {
   const payload: ProjectMappingCommentPayload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     profile: mapping.profile,
+    ...(mapping.calendarId ? { calendarId: mapping.calendarId } : {}),
     projectId,
     taskId: mapping.taskId,
     eventId: mapping.eventId,
     ...(calendarUrl ? { calendarUrl } : {}),
-    ...(mapping.recurrenceOwner ? { recurrenceOwner: mapping.recurrenceOwner } : {}),
     ...(mapping.seriesId ? { seriesId: mapping.seriesId } : {}),
     ...(mapping.masterEventId ? { masterEventId: mapping.masterEventId } : {}),
     ...(mapping.activeInstanceId ? { activeInstanceId: mapping.activeInstanceId } : {}),
@@ -125,6 +171,12 @@ export function serializeMappingComment(
     ...(mapping.activeEffectiveStart ? { activeEffectiveStart: mapping.activeEffectiveStart } : {}),
     ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
+    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true as const } : {}),
+    ...(mapping.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 as const } : {}),
+    ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
+    ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
+    ...(mapping.syncedDue !== undefined ? { syncedDue: mapping.syncedDue } : {}),
+    ...(mapping.syncedTitle !== undefined || mapping.syncedDescription !== undefined || mapping.syncedDue !== undefined ? { baselineVersion: 1 as const } : {}),
     mappingRevision: revision,
     updatedAt: mapping.updatedAt || new Date().toISOString(),
   };
@@ -224,7 +276,7 @@ export function parseMappingComment(comment: TodoistCommentRecord): ParsedMappin
   if (!ACCEPTED_MAPPING_COMMENT_MARKERS.has(marker)) return undefined;
   try {
     const value = JSON.parse(payloadLines.join("\n")) as Partial<ProjectMappingCommentPayload>;
-    if (value.schemaVersion !== 1) throw new Error("unsupported schema version");
+    if (value.schemaVersion !== 1 && value.schemaVersion !== 2) throw new Error("unsupported schema version");
     if (!nonEmptyString(value.profile) || !VALID_PROFILES.has(value.profile as Profile)) throw new Error("invalid profile");
     if (!nonEmptyString(value.projectId)) throw new Error("missing projectId");
     if (!nonEmptyString(value.taskId)) throw new Error("missing taskId");
@@ -233,8 +285,20 @@ export function parseMappingComment(comment: TodoistCommentRecord): ParsedMappin
     if (!nonEmptyString(value.updatedAt) || !Number.isFinite(Date.parse(value.updatedAt))) throw new Error("invalid updatedAt");
     if (value.recurrenceOwner !== undefined && !["calendar", "todoist"].includes(value.recurrenceOwner)) throw new Error("invalid recurrenceOwner");
     if (value.calendarProgressVersion !== undefined && value.calendarProgressVersion !== 1) throw new Error("invalid calendarProgressVersion");
-    for (const field of ["calendarUrl", "seriesId", "masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart", "completedThroughOriginalStart"] as const) {
+    if (value.calendarNativeRecurring !== undefined && value.calendarNativeRecurring !== true) throw new Error("invalid calendarNativeRecurring");
+    if (value.todoistPhaseBVersion !== undefined && value.todoistPhaseBVersion !== 1) throw new Error("invalid todoistPhaseBVersion");
+    for (const field of ["calendarId", "calendarUrl", "seriesId", "masterEventId", "activeInstanceId", "originalStart", "activeEffectiveStart", "completedThroughOriginalStart"] as const) {
       if (!optionalString(value[field])) throw new Error(`invalid ${field}`);
+    }
+    if (value.syncedTitle !== undefined && typeof value.syncedTitle !== "string") throw new Error("invalid syncedTitle");
+    if (value.syncedDescription !== undefined && typeof value.syncedDescription !== "string") throw new Error("invalid syncedDescription");
+    if (value.syncedDue !== undefined && !validDueBaseline(value.syncedDue)) throw new Error("invalid syncedDue");
+    if (value.baselineVersion !== undefined && value.baselineVersion !== 1) throw new Error("invalid baselineVersion");
+    // Normalize legacy owner metadata from the durable recurrence markers.
+    // The normalized value is in-memory only; serialization never writes it.
+    if (value.recurrenceOwner === undefined) {
+      if (value.calendarProgressVersion === 1 || value.calendarNativeRecurring === true) value.recurrenceOwner = "calendar";
+      else if (value.todoistPhaseBVersion === 1) value.recurrenceOwner = "todoist";
     }
     return { comment, payload: value as ProjectMappingCommentPayload };
   } catch (error) {
@@ -304,7 +368,10 @@ export function recoverMappingFromProjectComment(mapping: Mapping, parsed: Parse
   if (payload.profile !== mapping.profile || payload.taskId !== mapping.taskId || payload.eventId !== mapping.eventId) {
     throw new Error("project mapping comment identity does not match mapping");
   }
-  const recurrenceOwner = mapping.recurrenceOwner || payload.recurrenceOwner;
+  const recurrenceOwner = mapping.recurrenceOwner
+    || (payload.calendarProgressVersion === 1 || payload.calendarNativeRecurring ? "calendar" : undefined)
+    || (payload.todoistPhaseBVersion === 1 ? "todoist" : undefined)
+    || payload.recurrenceOwner;
   const completedThroughOriginalStart = recurrenceOwner === "calendar"
     ? laterLogicalStart(mapping.completedThroughOriginalStart, payload.completedThroughOriginalStart)
     : undefined;
@@ -320,6 +387,13 @@ export function recoverMappingFromProjectComment(mapping: Mapping, parsed: Parse
       ? { calendarProgressVersion: 1 as const }
       : {}),
     ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
+    ...(mapping.calendarId || payload.calendarId ? { calendarId: mapping.calendarId || payload.calendarId } : {}),
+    ...(mapping.syncedTitle !== undefined || payload.syncedTitle !== undefined
+      ? { syncedTitle: mapping.syncedTitle ?? payload.syncedTitle } : {}),
+    ...(mapping.syncedDescription !== undefined || payload.syncedDescription !== undefined
+      ? { syncedDescription: mapping.syncedDescription ?? payload.syncedDescription } : {}),
+    ...(mapping.syncedDue !== undefined || payload.syncedDue !== undefined
+      ? { syncedDue: mapping.syncedDue ?? payload.syncedDue } : {}),
   };
 }
 
@@ -377,7 +451,13 @@ export async function upsertProjectMappingComment(
   index?: ProjectMappingIndex,
 ): Promise<Mapping> {
   const projectIndex = index || await loadProjectMappingIndex(client, projectId);
-  const existing = findProjectMappingComment(projectIndex, mapping);
+  const stableSeries = mapping.seriesId || mapping.masterEventId;
+  const existing = stableSeries
+    ? projectIndex.parsed
+      .filter(entry => entry.payload.profile === mapping.profile && entry.payload.projectId === projectId
+        && (entry.payload.seriesId === stableSeries || entry.payload.masterEventId === stableSeries))
+      .sort(newest)[0]
+    : findProjectMappingComment(projectIndex, mapping);
   const revision = Math.max(mapping.mappingRevision || 0, existing?.payload.mappingRevision || 0) + 1;
   const draft: Mapping = { ...mapping, projectId, mappingRevision: revision, updatedAt: new Date().toISOString() };
   const comment = await client.upsertProjectComment(projectId, serializeMappingComment(draft, projectId, calendarUrl, revision), existing?.comment.id);

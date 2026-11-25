@@ -32,7 +32,7 @@ this command. The Google master must be confirmed, have an ETag, a matching
 RRULE/DTSTART and the following shared extended properties:
 
 - `taskId`: exact test task ID
-- `syncRecurrenceOwner`: `todoist`
+- `todoistPhaseBVersion`: `1` (the versioned recurrence marker; no persistent owner field)
 - `todoistRecurrence`: the Todoist due string before completion, lowercase
 - `todoistAnchorStart`: the original Calendar DTSTART (exact same text used in `--anchor-start`)
 

@@ -210,7 +210,7 @@ test("completion-originated recurring due advance keeps the existing Calendar an
   assert.equal(state.mapping.originalStart, "2026-09-21");
 });
 
-test("Phase B recurrence edits never delete an existing Calendar RRULE master or its mapping", async () => {
+test("unsupported Todoist recurrence edits leave the existing Calendar master and mapping intact", async () => {
   const oldTask = recurringTask("2026-09-14");
   const task = recurringTask("2026-09-14", "Water plants", "2026-09-14T10:09:00Z");
   task.due.string = "every other Monday";
@@ -220,33 +220,26 @@ test("Phase B recurrence edits never delete an existing Calendar RRULE master or
   assert.equal(state.mapping.masterEventId, MASTER_ID, "preserve the existing recurrence mapping");
   assert.equal(state.mapping.activeInstanceId, "instance-14", "preserve active occurrence identity");
   const record = state.audits.at(-1);
-  assert.equal(record.action, "todoist_phase_b_existing_series_requires_review");
-  assert.equal(record.detail.phaseBFamily, "alternate_weekday");
-  assert.equal(record.detail.phaseBDisposition, "rolling_required");
-  assert.equal(record.detail.phaseBReason, "anchor_not_verified");
-  assert.equal(record.detail.phaseBCandidateRrule, "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO");
+  assert.equal(record.action, "todoist_recurrence_unsupported_rule");
+  assert.equal(record.detail.existingMirrorPreserved, true);
+  assert.equal(record.detail.outcome, "source_left_unchanged");
 });
 
-test("new unsupported Phase B schedules remain one-off rolling projections with diagnostic evidence", async () => {
-  for (const [date, phrase, family, rule] of [
-    ["2026-09-14", "every other Monday", "alternate_weekday", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"],
-    ["2026-09-15", "every 2, 15, 27", "multi_month_day", "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27"],
-    ["2026-09-15", "every quarter", "quarterly", "RRULE:FREQ=MONTHLY;INTERVAL=3"],
+test("new unsupported Todoist recurrence remains untouched with a non-blocking diagnostic", async () => {
+  for (const [date, phrase] of [
+    ["2026-09-14", "every other Monday"],
+    ["2026-09-15", "every 2, 15, 27"],
+    ["2026-09-15", "every quarter"],
   ]) {
     const task = recurringTask(date, "Water plants", "2026-09-14T11:00:00Z");
     task.due.string = phrase;
     const { state, sync, upserts } = fixture({ unlinked: true });
     await sync.process(delivery(task));
-    assert.equal(upserts.length, 1, phrase);
-    assert.equal(upserts[0].payload.recurrence, undefined, phrase);
-    assert.equal(state.mapping.recurrenceOwner, "todoist", phrase);
-    assert.equal(state.mapping.masterEventId, undefined, phrase);
+    assert.equal(upserts.length, 0, phrase);
+    assert.equal(state.mapping, undefined, phrase);
     const record = state.audits.at(-1);
-    assert.equal(record.action, "todoist_created_calendar", phrase);
-    assert.equal(record.detail.recurrenceProjection, "rolling", phrase);
-    assert.equal(record.detail.phaseBFamily, family, phrase);
-    assert.equal(record.detail.phaseBCandidateRrule, rule, phrase);
-    assert.equal(record.detail.phaseBReason, "anchor_not_verified", phrase);
+    assert.equal(record.action, "todoist_recurrence_unsupported_rule", phrase);
+    assert.equal(record.detail.outcome, "source_left_unchanged", phrase);
   }
 });
 
@@ -258,6 +251,6 @@ test("Phase B never overwrites a Todoist-owned Calendar master when DynamoDB map
   assert.equal(upserts.length, 0);
   assert.equal(state.mapping, undefined);
   const record = state.audits.at(-1);
-  assert.equal(record.action, "todoist_phase_b_existing_series_requires_review");
+  assert.equal(record.action, "todoist_recurrence_unsupported_rule");
   assert.equal(record.detail.eventId, MASTER_ID);
 });

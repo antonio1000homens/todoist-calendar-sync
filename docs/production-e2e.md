@@ -1,109 +1,28 @@
-# Production E2E journey
+# Production E2E acceptance
 
-The repository includes a manually triggered GitHub Actions workflow named **Production E2E**. It exercises the deployed production synchronization path against real Google Calendar and Todoist provider APIs.
+The manually triggered **Production E2E** workflow exercises the deployed sync worker through real Google Calendar and Todoist APIs. It is scoped to the `antonio` profile, checks that the configured Todoist project is `antonio1000homens`, verifies the configured Calendar is listed with write access, and always cleans up captured fixture IDs. Home and work are never selected for disposable acceptance fixtures.
 
-The workflow is intentionally not part of pull-request CI. It uses the protected `production` environment, GitHub OIDC, production SSM credentials, and disposable provider objects.
+The workflow uses the protected production environment, GitHub OIDC, production SSM credentials, and the production sync DLQ. No database correlation lookup is used as acceptance evidence.
 
-## Journey
+## Current automated journey
 
-For each selected profile (`home`, `antonio`, `work`, or all three sequentially), the workflow performs:
+The runner creates uniquely named fixtures at bounded future times and polls the live providers for each worker result:
 
-```text
-Google Calendar
-  create disposable timed event
-      ↓ Google watch
-Cloudflare Calendar Worker
-      ↓
-AWS ingress Lambda
-      ↓
-SQS FIFO
-      ↓
-Worker Lambda
-      ↓
-Todoist
-  verify exactly one mirrored task
-      ↓
-DynamoDB
-  verify eventId ↔ taskId durable mapping
-      ↓
-Todoist
-  change title and due time on the same task
-      ↓ Todoist webhook
-AWS ingress → SQS → Worker
-      ↓
-Google Calendar
-  verify the same event ID was updated
-      ↓
-DynamoDB
-  verify the mapping still points to the same pair
-      ↓
-Google Calendar
-  delete the disposable event
-      ↓ Google watch
-AWS ingress → SQS → Worker
-      ↓
-Todoist
-  verify the mirrored task is deleted
-      ↓
-DynamoDB
-  verify the mapping is removed
-```
+1. Create a one-off Calendar event; verify the Todoist task and provider-native correlation.
+2. Edit that Todoist task's title and due time; verify the same Calendar event changes.
+3. Delete the Calendar event; verify Todoist and provider correlation cleanup.
+4. Create a one-off Todoist task; verify its Calendar projection and correlation, then delete it and verify cleanup.
+5. Create a recurring Todoist task; verify a native Calendar master and project-comment correlation, then delete the task and verify series cleanup.
+6. Create a daily recurring Calendar series; verify its native Todoist task, provider metadata and project comment. Move and rename a future Calendar occurrence, cancel the next occurrence, and verify the current Todoist task stays unchanged. Complete two occurrences and verify the same task ID applies the moved occurrence, skips the cancellation and returns to cadence while preserving recurrence. Delete the series and verify both projections and correlation are removed.
+7. Compare production DLQ depth before and after the run; fail if it increases.
 
-The runner also captures the DLQ depth before and after the journey. The run fails if the DLQ depth increases.
+Raw Calendar `extendedProperties.shared` and paginated Todoist project comments are read back directly. Result artifacts contain profile, outcome, cleanup status and sanitized error categories; fixture IDs and personal content are omitted.
 
-## One-time IAM bootstrap
+## Run and results
 
-The existing GitHub deployment role already has the SSM, CloudFormation and SQS read permissions needed by the test, but the E2E runner also verifies the actual DynamoDB mapping with `dynamodb:GetItem`.
+The workflow is intentionally separate from pull-request CI because it writes disposable objects to production. Its inputs select only `antonio` and a bounded timeout; cleanup cannot be disabled. The job summary and uploaded `e2e-result.json` provide machine-generated evidence.
 
-After merging the E2E implementation, rerun the normal deployment-role bootstrap once with the same privileged AWS identity and environment used when the role was originally created:
-
-```bash
-AWS_REGION=eu-west-2 \
-CODE_BUCKET=<artifact-bucket> \
-SAM_CLI_MANAGED_SOURCE_BUCKET_NAME=<sam-managed-bucket> \
-bash infrastructure/bootstrap-deployment-role.sh
-```
-
-The bootstrap now deploys a second small IAM policy stack named `todoist-calendar-sync-github-actions-e2e-access`. It adds only read-only `dynamodb:GetItem` access to the active sync state-table resource prefix supplied through `RESOURCE_NAME_PREFIX`. It does not grant mutation access to production state.
-
-## Triggering the test
-
-From GitHub:
-
-1. Open **Actions**.
-2. Select **Production E2E**.
-3. Choose **Run workflow**.
-4. Select a profile. `antonio` is the default; `all` runs `home`, `antonio`, and `work` sequentially.
-5. Leave the timeout at 180 seconds unless provider delivery is unusually slow.
-6. Leave cleanup enabled for normal runs.
-
-The protected `production` environment remains the safety boundary, so any configured environment approval rules still apply.
-
-## Result and evidence
-
-The workflow writes a job summary and uploads `e2e-result.json` for 14 days. The result records only non-secret diagnostics such as profile, Calendar event ID, Todoist task ID, cleanup state and DLQ depth.
-
-Success proves the following deployed behavior in one journey:
-
-- real Calendar watch delivery through Cloudflare and AWS;
-- Calendar → Todoist creation;
-- durable DynamoDB mapping creation;
-- real Todoist webhook delivery;
-- Todoist → Calendar update of the same event rather than duplicate creation;
-- stable event/task identity across the round trip;
-- Calendar → Todoist deletion propagation;
-- durable mapping cleanup;
-- no increase in DLQ depth during the test.
-
-## Failure cleanup
-
-With cleanup enabled, the runner attempts direct provider cleanup if any assertion fails. Cleanup errors are reported separately and do not hide the original E2E failure.
-
-If a run is interrupted outside the runner (for example, a cancelled GitHub Actions job), search both providers for titles beginning with `[E2E gh-` and remove the disposable items. Normal reconciliation should then repair any remaining mapping state.
-
-## Local/operator execution
-
-The same harness can be run from an authenticated operator shell after setting the production routing and resolved resource environment variables:
+The same harness can run from an authenticated environment after building the provider client:
 
 ```bash
 npm ci
@@ -111,10 +30,10 @@ npm run build
 node scripts/production-e2e.mjs --profile antonio --timeout-seconds 180 --cleanup true
 ```
 
-Required runtime environment:
+Required environment includes AWS credentials and region, `SYNC_PROFILE_CONFIG_JSON`, `SYNC_DLQ_URL`, and the configured Google and Todoist SSM parameter prefixes when they differ from the defaults.
 
-- `AWS_REGION` and AWS credentials able to read the required SSM parameters;
-- `SYNC_PROFILE_CONFIG_JSON`;
-- `STATE_TABLE_NAME`;
-- `SYNC_DLQ_URL`;
-- optionally `GOOGLE_CREDENTIALS_PARAMETER_PREFIX` and `TODOIST_TOKEN_PARAMETER_PREFIX` when not using the canonical SSM prefixes.
+## Failure cleanup
+
+The runner attempts targeted cleanup on any failure using only fixture IDs captured during that run. If the workflow is interrupted outside the runner, inspect only the unique `[E2E gh-…]` fixtures in the configured antonio Calendar and Todoist project and remove those exact objects. Do not use the runner against home or work.
+
+This journey is one part of issue #510's acceptance. The live exception matrix, repeated full reconciliation, production conflict cleanup, and final state-store removal still need to pass before the issue is complete.

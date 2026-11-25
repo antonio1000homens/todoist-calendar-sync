@@ -779,7 +779,7 @@ test("pending future-only split prevents hourly reconciliation creating a compet
   assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_future_series_split_pending"));
 });
 
-test("Todoist-owned deleted recurrence retires exact indexes without provider recreation", async () => {
+test("Todoist-owned deleted recurrence is not recreated or retired through the mapping store", async () => {
   for (const calendarStatus of ["cancelled", "missing"]) {
     const m={...mapping(),recurrenceOwner:"todoist",seriesId:"task-1",
       masterEventId:"event-1",activeInstanceId:"instance-1"};
@@ -803,7 +803,7 @@ test("Todoist-owned deleted recurrence retires exact indexes without provider re
     };
     const result=await makeReconciler({state,store,clients}).reconcile("home");
     assert.equal(result.counts.deleted_retired,1,calendarStatus);
-    assert.equal(retired,1,calendarStatus);
+    assert.equal(retired,0,calendarStatus);
     assert.equal(store.baselines.size,0);
     assert.deepEqual(clients.metrics.todoistUpdates,[]);
     assert.deepEqual(clients.metrics.calendarUpdates,[]);

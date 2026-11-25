@@ -100,9 +100,7 @@ export function newNativeMaster(task: TodoistTask, plan: PhaseBNativeMovePlan, z
     end: { date: plusDays(plan.destinationStart, 1) },
     recurrence: [plan.destinationRule],
     extendedProperties: { shared: {
-      syncSource: "todoist-calendar-sync",
       taskId: task.id,
-      syncRecurrenceOwner: "todoist",
       todoistRecurrence: key,
       todoistAnchorStart: plan.destinationStart,
       todoistAnchorEnd: plusDays(plan.destinationStart, 1),
@@ -156,7 +154,7 @@ export function verifyHistoryMaster(master: CalendarEvent, original: CalendarEve
     || s.syncHistoryOriginalRule !== plan.sourceRule
     || s.syncHistorySuccessorId !== plan.successorMasterId
     || s.syncHistoryCutoff !== plan.historicalLastOccurrence
-    || s.taskId || s.syncRecurrenceOwner || s.todoistPhaseBVersion)
+    || s.taskId || s.todoistPhaseBVersion)
     throw new Error("Source Calendar history cap readback is incomplete or changed");
 }
 
@@ -197,8 +195,6 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
 }> {
   const { task, sourceProfile, destinationProfile, sourceMapping, sourceLink,
     source, destination, state } = input;
-  if (process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED !== "true")
-    throw new Error("Phase B native writer remains disabled");
   if (sourceProfile === destinationProfile
     || !sourceMapping.projectCommentId
     || sourceMapping.projectId !== profiles[sourceProfile].todoistProjectId

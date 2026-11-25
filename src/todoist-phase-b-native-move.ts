@@ -118,7 +118,7 @@ export function planPhaseBNativeFutureOnlyMove(
     || !date(master.start?.date) || !date(master.end?.date)
     || master.end!.date!==nextDate(master.start!.date!)
     || master.start?.dateTime || master.end?.dateTime
-    || shared?.taskId!==task.id || shared?.syncRecurrenceOwner!=="todoist"
+    || shared?.taskId!==task.id || (!shared?.todoistRecurrence && shared?.syncRecurrenceOwner !== "todoist")
     || shared?.todoistPhaseBVersion!=="1"
     || shared?.todoistAnchorStart!==master.start?.date
     || shared?.todoistAnchorEnd!==master.end?.date

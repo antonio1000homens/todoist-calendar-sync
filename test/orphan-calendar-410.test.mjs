@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { profiles } from "../dist/config.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 import { Synchronizer } from "../dist/sync.js";
 
 const delivery = {
@@ -20,6 +22,10 @@ function providerError(status, body) {
 function fixture({ deleteError, readError, readEvent, taskExists = false, mappedTaskId = "todoist-task", completed = false } = {}) {
   const calls = { delete: [], read: [], task: [] };
   const mapping = { profile: "home", taskId: mappedTaskId, eventId: "calendar-event", updatedAt: "2026-10-21T12:00:00Z" };
+  const projectId=profiles.home.todoistProjectId;
+  const comments=[{id:"mapping-comment",project_id:projectId,content:serializeMappingComment({
+    ...mapping,projectId,calendarId:profiles.home.calendarId,mappingRevision:1,
+  },projectId)}];
   const state = {
     mapping,
     audits: [],
@@ -30,7 +36,8 @@ function fixture({ deleteError, readError, readEvent, taskExists = false, mapped
       return this.mapping?.profile === profile && this.mapping?.eventId === id ? this.mapping : undefined;
     },
     async deleteMapping(expected) {
-      assert.strictEqual(this.mapping, expected);
+      assert.equal(this.mapping?.eventId, expected.eventId);
+      assert.equal(this.mapping?.taskId, expected.taskId);
       this.mapping = undefined;
     },
     async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); },
@@ -47,6 +54,10 @@ function fixture({ deleteError, readError, readEvent, taskExists = false, mapped
     },
   };
   const todoist = {
+    async listProjectComments() { return comments.map(comment=>structuredClone(comment)); },
+    async getComment(id) { const found=comments.find(comment=>comment.id===id);if(!found)throw providerError(404);return structuredClone(found); },
+    async deleteComment(id) { const index=comments.findIndex(comment=>comment.id===id);if(index>=0)comments.splice(index,1); },
+    async findLegacyTaskComment() { return undefined; },
     async getTask(id) {
       calls.task.push(id);
       if (!taskExists) throw providerError(404);

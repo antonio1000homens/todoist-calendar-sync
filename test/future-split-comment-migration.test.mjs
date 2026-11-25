@@ -8,7 +8,7 @@ const oldMapping = {
   profile: "antonio", projectId: profiles.antonio.todoistProjectId,
   taskId: "smoke-task", eventId: "old-master",
   recurrenceOwner: "todoist", seriesId: "smoke-task", masterEventId: "old-master",
-  updatedAt: "2026-10-19T09:00:00Z", mappingRevision: 2,
+  updatedAt: "2026-10-19T09:00:00Z", mappingRevision: 2, todoistPhaseBVersion: 1,
 };
 const oldComment = {
   id: "old-project-comment", project_id: profiles.antonio.todoistProjectId,
@@ -45,7 +45,7 @@ test("Calendar-owned project comment evidence cannot be migrated to Todoist recu
   const api = new Todoist(token);
   api.listProjectComments = async () => [{
     ...oldComment, content: serializeMappingComment({
-      ...oldMapping, recurrenceOwner: "calendar",
+      ...oldMapping, recurrenceOwner: "calendar", todoistPhaseBVersion: undefined, calendarProgressVersion: 1,
     }, profiles.antonio.todoistProjectId, undefined, 2),
   }];
   api.upsertProjectComment = async () => { throw new Error("must not mutate"); };
