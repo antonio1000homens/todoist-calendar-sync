@@ -2031,16 +2031,13 @@ test("Calendar-wins repair fences delayed Todoist payloads before releasing its 
   assert.ok(h.calls.some(value => value[0] === "audit" && value[1] === "todoist_stale_version_suppressed"));
 });
 
-for (const reason of ["excluded", "activeRepair", "rejectedPair"]) {
+for (const reason of ["excluded", "activeRepair"]) {
   for (const changedDescription of [false, true]) {
     test(`Calendar candidate selection respects ${reason} before ${changedDescription ? "updating the task" : "restoring a canonical mapping"}`, async (t) => {
       const h = harness(t, { tasks: [task("task", { description: changedDescription ? "Old description" : "Plan" })] });
       const controls = new SyncControls();
       controls.control = async ref => ref.side === "todoist" ? { [reason]: reason === "activeRepair" ? "other-repair" : true } : undefined;
-      controls.rejected = async (_profile, taskId, eventId) => reason === "rejectedPair" && taskId === "task" && eventId === "event";
       t.mock.method(documentClient, "send", async () => ({}));
-      t.mock.method(ReviewStore.prototype, "get", async pk => pk.startsWith("REJECTED_PAIR#") && reason === "rejectedPair"
-        ? { operationId:"someone-else" } : undefined);
       t.mock.method(StateRepository.prototype, "syncBlocked", (profile, ids) => controls.blocked(profile, ids));
       await new Synchronizer(new StateRepository(), undefined, async () => h.clients).process({
         id: "calendar-change", kind: "calendar", profile: "home", mode: "aws", headers: {}, body: "",

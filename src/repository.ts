@@ -179,14 +179,13 @@ export class StateRepository {
   async isRetired(identity: RetiredIdentity): Promise<boolean> { return isRetiredIdentity(identity); }
 
   async syncBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}, _beforeProjection = false): Promise<boolean> {
-    if (await new SyncControls().blocked(profile, ids, this.repairOperationId)) return true;
-    return false;
+    return new SyncControls().blockedForReconciliation(profile, ids, this.repairOperationId);
   }
 
   /** Reconciliation ignores historical review decisions and review cases.
    * Explicit exclusions and short-lived repair locks still protect identities. */
   async reconciliationBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
-    return new SyncControls().blockedForReconciliation(profile, ids, this.repairOperationId);
+    return this.syncBlocked(profile, ids);
   }
 
   /** Failed/ambiguous Phase B creation uses the existing durable pair controls.

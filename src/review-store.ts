@@ -1442,21 +1442,7 @@ export class SyncControls {
     await client.send(new DeleteCommand({ TableName: reviewTable(), Key: key(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`) }));
   }
   async blocked(profile: Profile, ids: { taskId?: string; eventId?: string }, operationId?: string): Promise<boolean> {
-    await admitReviewIdentity(profile, ids.taskId, ids.eventId);
-    for (const side of ["todoist", "calendar"] as const) {
-      const id = side === "todoist" ? ids.taskId : ids.eventId; if (!id) continue;
-      const ref = { profile, side, id }, control = await this.control(ref);
-      if (control?.activeRepair && control.activeRepair !== operationId) {
-        await client.send(new UpdateCommand({ TableName: reviewTable(), Key: key(`SYNC_CONTROL#${entityKey(ref)}`), UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at", ExpressionAttributeValues: { ":true": true, ":at": randomUUID() } }));
-        return true;
-      }
-      if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;
-    }
-    if (ids.taskId && ids.eventId) {
-      const rejection = await new ReviewStore().get<{ operationId?: string }>(`REJECTED_PAIR#${profile}#${ids.taskId}#${ids.eventId}`);
-      if (rejection && rejection.operationId !== operationId) return true;
-    }
-    return false;
+    return this.blockedForReconciliation(profile, ids, operationId);
   }
   /** Automatic reconciliation honors explicit exclusions and in-flight
    * repair locks, but does not let an old rejected-pair decision or review
@@ -1476,7 +1462,7 @@ export class SyncControls {
         }));
         return true;
       }
-      if (control?.excluded) return true;
+      if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;
     }
     return false;
   }

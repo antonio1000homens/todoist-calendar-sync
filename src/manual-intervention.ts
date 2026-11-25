@@ -59,7 +59,7 @@ class ManualCircuitOpenError extends Error {
   }
 }
 class ManualSyncBlockedError extends Error {
-  constructor() { super("An affected item or pairing is protected by a repair, exclusion, or rejected link. Use the review page to resolve it."); this.name = "ManualSyncBlockedError"; }
+  constructor() { super("An affected item or pairing is protected by an in-flight repair or explicit exclusion."); this.name = "ManualSyncBlockedError"; }
 }
 
 export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled" | "expired";

@@ -795,7 +795,7 @@ for (const entry of ['decision', 'command']) {
 }
 
 for (const protection of ['activeRepair','excluded','rejectedPair']) {
-  for (const ownRepair of [false,true]) test(`Slack Calendar-wins action respects ${protection} with ownRepair=${ownRepair}`,async t=>{
+  for (const ownRepair of [false,true]) test(`Slack Calendar-wins action handles ${protection} with ownRepair=${ownRepair}`,async t=>{
     process.env.STATE_TABLE_NAME ||= 'test-state';
     const decisions=new FakeDecisionStore(),notifier=new FakeNotifier(),writes=[];
     const decision=decisionFor('both_sides_changed',{decisionId:'protected-pair',taskId:'task-1',eventId:'event-1'});
@@ -820,9 +820,11 @@ for (const protection of ['activeRepair','excluded','rejectedPair']) {
     }),new FakePolicyStore());
     await service.processManualDelivery({id:'manual-protected',kind:'manual',profile:'antonio',mode:'aws',headers:{},body:'',
       manual:{decisionId:decision.decisionId,action:'calendar_wins'}},state);
-    assert.equal(writes.length,ownRepair?1:0);
-    assert.equal(decision.status,ownRepair?'resolved':'pending');
-    if(!ownRepair)assert.match(notifier.updated[0].text,/protected by a repair, exclusion, or rejected link/);
+    const persistentlyRejected = protection === 'rejectedPair';
+    const blocked = !persistentlyRejected && !ownRepair;
+    assert.equal(writes.length,blocked?0:1);
+    assert.equal(decision.status,blocked?'pending':'resolved');
+    if(blocked)assert.match(notifier.updated[0].text,/protected by an in-flight repair or explicit exclusion/);
   });
 }
 

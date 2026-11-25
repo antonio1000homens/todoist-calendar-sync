@@ -4,6 +4,7 @@ import { documentClient } from "../dist/dynamodb-capacity.js";
 import { ReviewEngine, snapshotFingerprint } from "../dist/review-engine.js";
 import { SyncControls } from "../dist/review-store.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
+import { StateRepository } from "../dist/repository.js";
 
 test("an exclusion control still blocks requests after the repair barrier is released", async () => {
   const controls = new SyncControls();
@@ -26,8 +27,18 @@ test("automatic reconciliation ignores rejected-pair decisions but honors explic
   controls.control = async () => undefined;
   controls.rejected = async () => { throw new Error("Reconciliation must not consult rejected-pair history"); };
   assert.equal(await controls.blockedForReconciliation("home", { taskId: "task", eventId: "event" }), false);
+  assert.equal(await controls.blocked("home", { taskId: "task", eventId: "event" }), false);
   controls.control = async ref => ref.side === "calendar" ? { excluded: true } : undefined;
   assert.equal(await controls.blockedForReconciliation("home", { taskId: "task", eventId: "event" }), true);
+});
+
+test("ordinary sync ignores rejected-pair history while retaining exclusion controls", async (t) => {
+  t.mock.method(SyncControls.prototype, "control", async () => undefined);
+  t.mock.method(SyncControls.prototype, "rejected", async () => {
+    throw new Error("Ordinary sync must not read rejected-pair history");
+  });
+  const state = new StateRepository();
+  assert.equal(await state.syncBlocked("home", { taskId: "task", eventId: "event" }), false);
 });
 
 test("a blocked webhook records a pending refresh without taking over the repair", async (t) => {
