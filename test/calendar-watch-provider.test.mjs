@@ -89,12 +89,14 @@ test("Calendar event upsert is a conditional patch and refuses a stale approved 
   }finally{globalThis.fetch=originalFetch;}
 });
 
-test("recurring occurrence identity cleanup sends an If-Match metadata-only PATCH",async()=>{
+test("recurring occurrence identity cleanup preserves live boundaries in its If-Match PATCH",async()=>{
   const originalFetch=globalThis.fetch,calls=[];
   globalThis.fetch=async(url,init={})=>{
     calls.push({url,init});
     if(isGoogleOAuthUrl(url))return Response.json({access_token:"test-access-token"});
-    if(!init.method||init.method==="GET")return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-approved",extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncRecurrenceOwner:"calendar"}}});
+    if(!init.method||init.method==="GET")return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-approved",
+      start:{date:"2026-11-25"},end:{date:"2026-11-26"},
+      extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncRecurrenceOwner:"calendar"}}});
     return Response.json({id:"exact-instance",recurringEventId:"series-master",etag:"etag-after",extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncHistoryOnly:"true"}}});
   };
   try {
@@ -103,7 +105,10 @@ test("recurring occurrence identity cleanup sends an If-Match metadata-only PATC
     const patch=calls.find(({init})=>init.method==="PATCH");
     assert.match(patch.url,/\/events\/exact-instance$/);
     assert.equal(patch.init.headers.get("If-Match"),"etag-approved");
-    assert.deepEqual(JSON.parse(patch.init.body),{extendedProperties:{shared:{humanKey:"keep-me",syncHistoryOnly:"true"}}});
+    assert.deepEqual(JSON.parse(patch.init.body),{
+      start:{date:"2026-11-25"},end:{date:"2026-11-26"},
+      extendedProperties:{shared:{humanKey:"keep-me",syncHistoryOnly:"true"}},
+    });
   } finally { globalThis.fetch=originalFetch; }
 });
 

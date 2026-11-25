@@ -645,7 +645,18 @@ export class GoogleCalendar {
     }
     return this.request(
       `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`,
-      { method: "PATCH", headers: { "If-Match": etag }, body: JSON.stringify({ extendedProperties: { shared: merged } }) },
+      {
+        method: "PATCH",
+        headers: { "If-Match": etag },
+        // Some all-day recurring masters fail Google validation when only
+        // extendedProperties are patched. Include the exact freshly-read
+        // boundaries so the conditional write keeps the resource valid.
+        body: JSON.stringify({
+          ...(current.start ? { start: current.start } : {}),
+          ...(current.end ? { end: current.end } : {}),
+          extendedProperties: { shared: merged },
+        }),
+      },
     );
   }
 
