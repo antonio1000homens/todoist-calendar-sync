@@ -800,7 +800,7 @@ export class ProjectAwareSynchronizer {
       if (linked?.status !== "cancelled") eventId = deleteCalendarMaster && linked?.recurringEventId ? linked.recurringEventId : linked?.id;
     }
     if (eventId && await this.state.syncBlocked(sourceProfile, { taskId: task.id, eventId })) {
-      throw new Error("Source projection is protected by an active repair, exclusion, or rejected-pair decision");
+      throw new Error("Source projection is protected by an in-flight repair or explicit exclusion");
     }
     // A task-side completed lookup can already be gone after seven days.
     // Always check the permanent event-side history marker before deleting a
@@ -834,7 +834,7 @@ export class ProjectAwareSynchronizer {
     const destinationClients = await this.clients(destinationProfile);
     if (await this.state.syncBlocked(destinationProfile, { taskId: task.id })) throw new Error("Destination item is protected by an active repair or exclusion");
     const existing = await destinationClients.calendar.findByTodoistTaskId(task.id);
-    if (existing && await this.state.syncBlocked(destinationProfile, { taskId: task.id, eventId: existing.id })) throw new Error("Destination pair was explicitly rejected or is protected by a repair");
+    if (existing && await this.state.syncBlocked(destinationProfile, { taskId: task.id, eventId: existing.id })) throw new Error("Destination pair is protected by an in-flight repair or explicit exclusion");
     let destinationMaster: CalendarEvent | undefined;
     if (existing?.recurringEventId) {
       try {
