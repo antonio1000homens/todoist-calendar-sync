@@ -1401,7 +1401,19 @@ export class Synchronizer {
     }
     const projectComments=delta.items.length
       ?await todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true):[];
-    for (const event of delta.items) await this.applyCalendarEvent(delivery, event, calendar, todoist,projectComments);
+    for (const event of delta.items) {
+      try {
+        await this.applyCalendarEvent(delivery, event, calendar, todoist,projectComments);
+      } catch (error) {
+        if (error instanceof ReconciliationItemError) throw error;
+        throw new ReconciliationItemError(error, {
+          stage: "calendar",
+          eventId: event.id,
+          taskId: event.extendedProperties?.shared?.taskId,
+          seriesId: event.recurringEventId || event.iCalUID,
+        });
+      }
+    }
     if (this.state instanceof StateRepository) {
       const deleted = delta.items.filter(event => event.status === "cancelled");
       const eligibleDeleted: CalendarEvent[] = [];
