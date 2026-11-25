@@ -1340,13 +1340,13 @@ export class Synchronizer {
         : task?.due?.is_recurring
           ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
           : await todoist.upsertTask(
-            recurrence ? calendarOwnedRecurringTaskPayload(active, recurrence, timeZone) : toTodoistTask(active),
+            calendarOwnedRecurringTaskPayload(active, recurrence, timeZone),
             task?.id, calendarReplaySourceIds(active),
           );
       if (providerAlreadyAdvanced) await this.state.audit(profile, "calendar_owned_completion_provider_already_advanced", {
         seriesId: link.seriesId, taskId: link.taskId, nextEventId: active.id, origin: "scheduled_reconcile",
       });
-      if (recurrence && !calendarOwnedRecurringTaskReadback(nextTask, active, recurrence, timeZone).matches) {
+      if (!calendarOwnedRecurringTaskReadback(nextTask, active, recurrence, timeZone).matches) {
         await this.state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
           seriesId: link.seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,
           reason: "scheduled_reconciliation",
