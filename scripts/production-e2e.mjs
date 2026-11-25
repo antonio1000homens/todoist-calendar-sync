@@ -247,8 +247,10 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         timeoutMs,
         async () => {
           try {
-            await todoist.getTask(taskId);
-            return false;
+            const task = await todoist.getTask(taskId);
+            // Todoist can keep a deleted-item tombstone readable by ID. Treat
+            // that terminal provider state as absence just like a 404.
+            return Boolean(task.is_deleted);
           } catch (error) {
             if (providerNotFound(error)) return true;
             throw error;
