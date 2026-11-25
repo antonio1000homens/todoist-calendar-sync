@@ -21,7 +21,6 @@ const guardedIdentityMutators=[
   "putNewRecurrenceMappingIfUnowned",
   "putConsolidationGuard",
   "commitRecurrenceConsolidation",
-  "restoreMappingIndexesIfOwned",
   "deleteProfileMappingIndexes",
   "completeFutureSeriesSplit",
   "purgeEarlierCancelledCalendarOccurrence",
