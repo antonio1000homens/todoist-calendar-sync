@@ -51,6 +51,7 @@ export class OrphanRecoveringSynchronizer {
     private readonly state = new StateRepository(),
     private readonly scheduleOrphan?: ScheduleOrphan,
     private readonly clientFactory: ProviderClientFactory = defaultProviderClientFactory,
+    private readonly onCalendarItemCompleted?: (replayVerified: boolean) => void,
   ) {}
 
   private async clients(profile: Profile): Promise<ProviderClients> {
@@ -79,7 +80,7 @@ export class OrphanRecoveringSynchronizer {
   private async processCalendar(delivery: Delivery): Promise<void> {
     const token = await this.state.getSyncToken(delivery.profile);
     if (!token) {
-      await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
+      await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory, undefined, this.onCalendarItemCompleted).process(delivery);
       return;
     }
 
@@ -89,7 +90,7 @@ export class OrphanRecoveringSynchronizer {
       delta = await clients.calendar.listDelta(token);
     } catch (error) {
       if (Number((error as { status?: number }).status) !== 410) throw error;
-      await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory).process(delivery);
+      await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, this.clientFactory, undefined, this.onCalendarItemCompleted).process(delivery);
       return;
     }
 
@@ -135,7 +136,7 @@ export class OrphanRecoveringSynchronizer {
         calendar: proxiedCalendarWithDelta(clients, token, delta, blockedEventIds),
       };
     };
-    await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, filteredClients).process(delivery);
+    await new ProjectAwareSynchronizer(this.state, this.scheduleOrphan, filteredClients, undefined, this.onCalendarItemCompleted).process(delivery);
 
     // Do not create canonical title/date identity rows. Future recovery must
     // come from an exact provider ID or surviving provider metadata.

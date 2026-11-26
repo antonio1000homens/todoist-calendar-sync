@@ -24,13 +24,14 @@ test("Calendar delta edits on archived occurrences never recreate Todoist tasks"
   };
   let getMaster = 0;
   let writes = 0;
+  let commentReads = 0;
   const sync = new Synchronizer(state, undefined, async () => ({
     calendar: {
       async listDelta() { return { items: [historicOccurrence, historicalMaster], nextSyncToken: "next-token" }; },
       async getEvent(id) { assert.equal(id, historicalMaster.id); getMaster += 1; return historicalMaster; },
     },
     todoist: {
-      async listProjectComments() { return []; },
+      async listProjectComments() { commentReads += 1; return []; },
       async listTasks() { throw new Error("Archived instances must never enter task matching"); },
       async upsertTask() { writes += 1; throw new Error("Historical task resurrection"); },
     },
@@ -41,6 +42,7 @@ test("Calendar delta edits on archived occurrences never recreate Todoist tasks"
   });
   assert.equal(getMaster, 1);
   assert.equal(writes, 0);
+  assert.equal(commentReads, 1, "only the occurrence without archive metadata needs mapping evidence");
   assert.equal(audits.filter((action) => action === "calendar_archived_series_delta_ignored").length, 2);
 });
 
@@ -62,4 +64,28 @@ test("normal Todoist title edits preserve all three future split history referen
   assert.equal(edited.extendedProperties.shared.syncHistoryMasterId, "old-master");
   assert.equal(edited.extendedProperties.shared.syncHistoryCutoff, "2026-05-03");
   assert.equal(edited.extendedProperties.shared.syncSplitVersion, "1");
+});
+
+
+test("elapsed standalone and explicitly archived Calendar deltas make no Todoist reads", async () => {
+  let cursor;
+  const sync = new Synchronizer({
+    async getSyncToken() { return "valid"; },
+    async putSyncToken(_profile, value) { cursor = value; },
+    async audit() {},
+  }, undefined, async () => ({
+    calendar: {
+      async listDelta() { return { items: [historicalMaster, {
+        id: "elapsed", status: "confirmed", start: { dateTime: "2000-01-01T10:00:00Z" },
+        end: { dateTime: "2000-01-01T11:00:00Z" },
+      }], nextSyncToken: "next" }; },
+    },
+    todoist: {
+      async listProjectComments() { assert.fail("historical-only delta must not load inventory"); },
+      async getTask() { assert.fail("historical-only delta must not read tasks"); },
+    },
+  }));
+  await sync.process({ id:"historical-only",kind:"calendar",profile:"antonio",mode:"aws",
+    receivedAt:new Date().toISOString(),headers:{},body:"" });
+  assert.equal(cursor,"next");
 });

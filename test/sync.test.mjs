@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasConflictingCalendarCandidate, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
-import { todoistTaskPayload } from "../dist/providers.js";
+import { Todoist, todoistTaskPayload } from "../dist/providers.js";
+import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
@@ -1196,4 +1197,140 @@ test("pending standalone reset reuses exact Calendar ID after POST succeeded but
   assert.equal(completion,1);
   assert.equal(receipt,undefined);
   assert.equal(lease,false);
+});
+
+test("20 canonical Calendar delta items and a duplicate replay use one inventory per operation and no provider writes", async t => {
+  const profile = "home", {todoistProjectId:projectId,calendarId} = profiles[profile];
+  const date = "2099-01-01";
+  const tasks = Array.from({length:20},(_,i)=>({id:"task-"+i,project_id:projectId,content:"Task "+i,
+    description:"details",due:{date,is_recurring:false}}));
+  const events = tasks.map((task,i)=>({id:"event-"+i,status:"confirmed",summary:task.content,description:task.description,
+    start:{date},end:{date:"2099-01-02"},extendedProperties:{shared:{
+      taskId:task.id,syncTaskId:task.id,syncProfile:profile,syncCalendarId:calendarId,
+      syncSchemaVersion:"2",syncEventId:"event-"+i,
+    }}}));
+  const comments = tasks.map((task,i)=>({id:"comment-"+i,project_id:projectId,content:serializeMappingComment({
+    profile,projectId,calendarId,taskId:task.id,eventId:events[i].id,
+    syncedTitle:task.content,syncedDescription:task.description,syncedDue:date,
+    syncBaseline:providerSyncBaseline(task,events[i]),mappingRevision:7,updatedAt:new Date().toISOString(),
+  },projectId)}));
+  const calls = [];
+  t.mock.method(globalThis,"fetch",async (url,init={})=>{
+    const path=new URL(url).pathname;
+    calls.push({path,method:init.method||"GET"});
+    if(path.endsWith("/sync"))return Response.json({full_sync:true,sync_token:"snapshot",
+      full_sync_date_utc:new Date().toISOString(),items:tasks,notes:[],project_notes:comments,
+      projects:[{id:projectId}],user:{timezone:"Europe/London"}});
+    const task=tasks.find(task=>path.endsWith("/tasks/"+task.id));
+    if(task&&(init.method||"GET")==="GET")return Response.json(task);
+    assert.fail("unexpected Todoist request "+path);
+  });
+  const audits=[];
+  const state={
+    async getSyncToken(){return "valid";},async putSyncToken(){},
+    async syncBlocked(){return false;},async mutationAllowed(){return true;},
+    async audit(_profile,action){audits.push(action);},
+    async recordMutation(){assert.fail("canonical delta must not mutate");},
+  };
+  const sync=new Synchronizer(state,undefined,async current=>{
+    assert.equal(current,profile,"canonical pair must not expand cross-profile discovery");
+    return {todoist:new Todoist("528-canonical-delta"),calendar:{
+      async listDelta(){return {items:events,nextSyncToken:"next"};},
+      async getTimeZone(){return "Europe/London";},
+      async getEvent(){assert.fail("canonical pair must not reread Calendar correlation");},
+    }};
+  });
+  for(let run=0;run<2;run++){
+    const start=calls.length;
+    await sync.process({id:"528-canonical-"+run,kind:"calendar",profile,mode:"aws",
+      receivedAt:new Date().toISOString(),headers:{},body:""});
+    const batch=calls.slice(start);
+    assert.equal(batch.filter(call=>call.path.endsWith("/sync")).length,1);
+    const exact=batch.filter(call=>call.path.includes("/tasks/"));
+    assert.equal(exact.length,20);
+    assert.equal(new Set(exact.map(call=>call.path)).size,20);
+    assert.equal(batch.length,21,"no separate comments reads or provider writes");
+  }
+  assert.equal(audits.filter(action=>action==="calendar_noop_canonical_state").length,40);
+});
+
+test("Calendar delta fresh evidence ignores unrelated task metadata but defers relevant edits and disappearance", async () => {
+  const {verifyCalendarDeltaTaskUnchanged} = await import("../dist/sync.js");
+  const {failedDeliveryDisposition} = await import("../dist/sqs-failure-policy.js");
+  const before = {id:"task",project_id:"project",content:"Original",description:"details",
+    due:{date:"2099-01-01",is_recurring:false},priority:1,labels:[],updated_at:"old"};
+  let reads=0;
+  await verifyCalendarDeltaTaskUnchanged({async getTask(id,refresh=true) {
+    assert.equal(id,before.id);assert.equal(refresh,true);reads++;
+    return {...before,priority:4,labels:["changed"],updated_at:"new",due:{is_recurring:false,date:"2099-01-01"}};
+  }},before);
+  assert.equal(reads,1);
+  for (const current of [{...before,content:"Concurrent edit"},{...before,project_id:"moved"},
+    {...before,is_completed:true},{...before,due:{date:"2099-02-01"}},{...before,is_deleted:true}]) {
+    await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){return current;}},before), error => {
+      assert.equal(error.code,"calendar_delta_task_changed");
+      assert.equal(failedDeliveryDisposition(error,{kind:"calendar"},false,1).kind,"retry_fifo");
+      return true;
+    });
+  }
+  await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){throw Object.assign(new Error("gone"),{status:404});}},before),
+    {code:"calendar_delta_task_changed"});
+  await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){throw Object.assign(new Error("forbidden"),{status:403});}},before),
+    {status:403});
+});
+
+test("completed Calendar item boundary permits replay after later cooldown without repeating committed fixture creation", async () => {
+  const {failedDeliveryDisposition} = await import("../dist/sqs-failure-policy.js");
+  const {createObservedProviderClientFactory} = await import("../dist/mutation-budget.js");
+  const items=[{id:"first"},{id:"second"}], committed=new Set();
+  let cursor="old", writes=0, totalAttempt=false, itemAttempt=false, rateLimited=true;
+  const factory=createObservedProviderClientFactory(()=>{totalAttempt=true;itemAttempt=true;},async()=>({
+    calendar:{async listDelta(){return {items,nextSyncToken:"new"};}},
+    todoist:{async upsertTask(event){writes++;return {id:event.id};}},
+  }));
+  const state={async getSyncToken(){return cursor;},async putSyncToken(_p,value){cursor=value;},async audit(){}};
+  let earlierUnverified=false, verifyFirst=true;
+  const sync=new Synchronizer(state,undefined,factory,verified=>{
+    if(itemAttempt&&!verified)earlierUnverified=true;
+    itemAttempt=false;
+  });
+  // Exercise real delta orchestration and observed provider boundary with a
+  // minimal idempotent item fixture. Full native mapping replay is covered
+  // separately by provider integration and live acceptance tests.
+  sync.applyCalendarEvent=async (_delivery,event,_calendar,todoist,markReplayVerified)=>{
+    if(committed.has(event.id)) return;
+    if(event.id==="second" && rateLimited) throw Object.assign(new Error("cooldown"),{status:429,code:"todoist_account_cooldown"});
+    await todoist.upsertTask(event);
+    committed.add(event.id);
+    if(event.id!=="first" || verifyFirst) markReplayVerified();
+  };
+  const delivery={id:"boundary",kind:"calendar",profile:"home",mode:"aws",headers:{},body:"",receivedAt:new Date().toISOString()};
+  await assert.rejects(sync.process(delivery),error=>{
+    assert.equal(totalAttempt,true);
+    assert.equal(itemAttempt,false);
+    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,earlierUnverified||itemAttempt).kind,"retry_fifo");
+    return true;
+  });
+  assert.equal(cursor,"old");
+  assert.equal(writes,1);
+  rateLimited=false; totalAttempt=false;itemAttempt=false;
+  await sync.process(delivery);
+  assert.equal(cursor,"new");
+  assert.equal(writes,2);
+  assert.deepEqual([...committed],["first","second"]);
+
+  // A mutation followed by a non-convergence diagnostic (normal return, no
+  // verified boundary) must stay quarantinable even after a later read-only item.
+  items.splice(1,0,{id:"read-only"});
+  committed.clear(); committed.add("read-only");
+  cursor="old";writes=0;rateLimited=true;verifyFirst=false;
+  totalAttempt=false;itemAttempt=false;earlierUnverified=false;
+  await assert.rejects(sync.process(delivery),error=>{
+    assert.equal(earlierUnverified,true);
+    assert.equal(itemAttempt,false);
+    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,earlierUnverified||itemAttempt).reason,"partial_provider_mutation");
+    return true;
+  });
+  assert.equal(cursor,"old");
+  assert.equal(writes,1);
 });

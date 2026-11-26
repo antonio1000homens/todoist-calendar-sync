@@ -94,13 +94,13 @@ test("Todoist project inventories coalesce across client instances for one sync 
     const first = new Todoist("inventory-scope-token");
     const second = new Todoist("inventory-scope-token");
     const results = await Promise.all(Array.from({ length: 100 }, (_, index) =>
-      (index % 2 ? first : second).listProjectComments(index % 5 ? "project-1" : "project-2", true)));
+      (index % 2 ? first : second).listProjectComments(index % 5 ? "project-1" : "project-2")));
     assert.ok(results.flat().some(comment => comment.id === "comment-1"));
     assert.ok(results.flat().some(comment => comment.id === "comment-2"));
     assert.equal(calls, 1);
   });
   await withTodoistInventoryScope(async () => {
-    await new Todoist("inventory-scope-token").listProjectComments("project-1", true);
+    await new Todoist("inventory-scope-token").listProjectComments("project-1");
   });
   assert.equal(calls, 2, "a fresh operation must fetch fresh provider evidence");
 });
@@ -182,7 +182,7 @@ test("an incomplete or stale Sync snapshot falls back to complete paginated REST
     });
   };
   const comments = await withTodoistInventoryScope(() =>
-    new Todoist("snapshot-fallback-token").listProjectComments("project-1", true));
+    new Todoist("snapshot-fallback-token").listProjectComments("project-1"));
   assert.deepEqual(comments.map(comment => comment.id), ["comment-1", "comment-2"]);
   assert.equal(calls, 3, "one rejected snapshot is followed by the complete two-page REST traversal");
 });

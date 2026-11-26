@@ -20,7 +20,7 @@ import { profiles, todoistToken } from "./config.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
-import { todoistAccountIdentity, withTodoistInventoryScope } from "./providers.js";
+import { todoistAccountIdentity, withTodoistInventoryScope, withTodoistCooldownStore } from "./providers.js";
 import { logEvent } from "./observability.js";
 import {
   MAX_SYNC_RECEIVES, failedDeliveryDisposition,
@@ -371,15 +371,17 @@ export async function assertTodoistAccountNotCooling(
   return accountIdentity;
 }
 
-export const handler: SQSHandler = async (event, context: Context) => {
+const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Context) => {
   const failures: { itemIdentifier: string }[] = [];
   for (const record of event.Records) {
     const startedAt = Date.now();
     let delivery: Delivery | undefined;
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
-    let todoistAccountId: string | undefined;
     let meaningfulMutation = false;
+    // Separate delivery-wide diagnostics from an in-flight Calendar item.
+    let calendarItemMutationObserved: boolean | undefined;
+    let earlierCalendarMutationUnverified = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
@@ -424,6 +426,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         // invoked. If this DynamoDB accounting write throttles, the result is
         // ambiguous and must NOT be automatically replayed.
         meaningfulMutation = true;
+        if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = true;
         await recordMutation(profile);
       };
 
@@ -520,11 +523,6 @@ export const handler: SQSHandler = async (event, context: Context) => {
           continue;
         }
       }
-
-      // Worker tests use injected provider clients with no SSM credentials;
-      // production always resolves and checks the shared account identity.
-      if (process.env.NODE_ENV !== "test")
-        todoistAccountId = await assertTodoistAccountNotCooling(delivery.profile, state);
 
       if (delivery.slackInteraction) {
         const interaction = delivery.slackInteraction;
@@ -659,11 +657,18 @@ export const handler: SQSHandler = async (event, context: Context) => {
       // Project/orphan/sync paths may persist mappings or recurrence state
       // before calling recordMutation, so that signal alone is too late to
       // decide that SQS replay is safe after a DynamoDB throttle.
+      if (delivery.kind === "calendar") calendarItemMutationObserved = false;
       const observedClientFactory = createObservedProviderClientFactory(() => {
         meaningfulMutation = true;
+        if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = true;
       });
       await withTodoistInventoryScope(() =>
-        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery!));
+        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory, replayVerified => {
+          if (calendarItemMutationObserved !== undefined) {
+            if (calendarItemMutationObserved && !replayVerified) earlierCalendarMutationUnverified = true;
+            calendarItemMutationObserved = false;
+          }
+        }).process(delivery!));
 
       if (calendarSyncGeneration !== undefined) {
         const followUpNeeded = await state.completeCalendarSync(delivery.profile, calendarSyncGeneration);
@@ -716,16 +721,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
       }
       const receiveCount = Math.max(1, Number(record.attributes?.ApproximateReceiveCount || "1") || 1);
       const retryAfterMs = providerRetryAfterMs(error);
-      if (retryAfterMs !== undefined && retryAfterMs > 0 && todoistAccountId && state) {
-        try {
-          await state.extendTodoistCooldown(todoistAccountId, Date.now() + retryAfterMs);
-        } catch (cooldownError) {
-          log("todoist_shared_cooldown_persist_failed", {
-            profile: delivery?.profile, error: serializeError(cooldownError),
-          });
-        }
-      }
-      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount);
+      // The actual Todoist request boundary persists credential-specific
+      // cooldowns. Calendar Retry-After hints only affect FIFO visibility.
+      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount,
+        earlierCalendarMutationUnverified ? true : calendarItemMutationObserved);
       if (disposition.kind === "retry_fifo") {
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is
@@ -835,3 +834,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
   }
   return { batchItemFailures: failures };
 };
+
+export const handler: SQSHandler = async (event, context) =>
+  process.env.NODE_ENV === "test" ? handleDeliveries(event, context)
+    : withTodoistCooldownStore(new StateRepository(), () => handleDeliveries(event, context));
