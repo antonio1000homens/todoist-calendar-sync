@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
+import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasConflictingCalendarCandidate, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
@@ -54,6 +54,20 @@ test("candidate discovery rejects one-off and recurring type collisions", async 
 
   assert.deepEqual(oneOff, []);
   assert.deepEqual(recurrence, []);
+});
+
+test("a one-off task matching a recurring Calendar occurrence is a conflict, not proof to create a duplicate", async () => {
+  const date = new Date(Date.now() + 40 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  const task = { id: "one-off", content: "Same title", description: "same details", due: { date } };
+  const master = { id: "series", status: "confirmed", summary: "Same title", description: "same details",
+    start: { date: "2020-01-01" }, recurrence: ["RRULE:FREQ=DAILY"] };
+  const instance = { id: "series-instance", status: "confirmed", summary: task.content, description: task.description,
+    recurringEventId: master.id, originalStartTime: { date }, start: { date } };
+  const calendar = { async getEvent(id) { return id === master.id ? master : instance; },
+    async listInstancesInWindow(id) { assert.equal(id, master.id); return [instance]; } };
+
+  assert.deepEqual(await discoverCompatibleCalendarCandidates(task, [master], calendar), []);
+  assert.equal(await hasConflictingCalendarCandidate(task, [master], calendar), true);
 });
 
 test("candidate ownership checks include a comment-only link on any series alias", () => {
@@ -126,7 +140,7 @@ function candidateSyncFixture(task, event, initialComments = []) {
       return structuredClone(value);
     },
   };
-  return { sync: new Synchronizer(state, undefined, async () => ({ calendar, todoist })), audits, comments, events, effects };
+  return { sync: new Synchronizer(state, undefined, async () => ({ calendar, todoist })), audits, comments, events, effects, calendar };
 }
 
 test("Todoist incremental sync recovers an untagged exact Calendar counterpart", async () => {
@@ -169,6 +183,32 @@ test("Todoist incremental recovery refuses a candidate linked only by another ta
   assert.equal(fixture.comments.length, 1);
   assert.equal(fixture.events.get(event.id).extendedProperties, undefined);
   assert.ok(fixture.audits.some(entry => entry.action === "todoist_provider_pair_candidate_owned"));
+});
+
+test("Todoist incremental creation refuses a one-off that collides with a recurring Calendar occurrence", async () => {
+  const task = { id: "one-off-collision", project_id: profiles.home.todoistProjectId,
+    content: "Existing appointment", description: "details", due: { date: "2099-01-11" },
+    updated_at: "2098-12-01T12:00:00Z" };
+  const master = { id: "unrelated-recurring-master", status: "confirmed", summary: task.content,
+    description: task.description, start: { date: "2020-01-11" }, recurrence: ["RRULE:FREQ=YEARLY"] };
+  const instance = { id: "unrelated-current-instance", status: "confirmed", summary: task.content,
+    description: task.description, recurringEventId: master.id, originalStartTime: { date: task.due.date },
+    start: { date: task.due.date } };
+  const fixture = candidateSyncFixture(task, master);
+  fixture.events.set(instance.id, structuredClone(instance));
+  fixture.calendar.listInstancesInWindow = async id => {
+    assert.equal(id, master.id);
+    return [structuredClone(instance)];
+  };
+
+  await fixture.sync.process({ id: "avoid-recurring-duplicate", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2098-12-01T12:00:01Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task }) });
+
+  assert.equal(fixture.effects.correlationWrites, 0);
+  assert.equal(fixture.effects.commentWrites, 0);
+  assert.equal(fixture.events.size, 2, "the existing Calendar series remains the only related object");
+  assert.ok(fixture.audits.some(entry => entry.action === "todoist_provider_pair_conflict"));
 });
 
 test("converts Calendar all-day and timed representations into Todoist", () => {
