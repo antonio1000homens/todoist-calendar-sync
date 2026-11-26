@@ -847,6 +847,12 @@ function todoistOwnedMapping(mapping: Mapping, masterEventId: string, taskId: st
 type ClientPair = { calendar: GoogleCalendar; todoist: Todoist };
 type ClientFactory = (profile: Profile) => Promise<ClientPair>;
 
+function todoistStandaloneCalendarEventId(profile: Profile, taskId: string): string {
+  return createHash("sha256")
+    .update(`todoist-standalone:${profile}:${taskId}`)
+    .digest("hex").slice(0, 32);
+}
+
 export class Synchronizer {
   constructor(
     private readonly state = new StateRepository(),
@@ -4118,6 +4124,54 @@ export class Synchronizer {
         if (linkedEvent) mapping = { profile: delivery.profile, eventId: linkedEvent.id, taskId: task.id, updatedAt: new Date().toISOString() };
       }
     }
+    // A one-off create can commit in Calendar before the Todoist mapping
+    // comment is visible. Read its deterministic provider ID directly before
+    // doing candidate discovery or issuing another POST, so a retry repairs
+    // the same pair instead of creating a second event.
+    const deterministicStandaloneId = !task.due?.is_recurring && !existingEvent && !mapping
+      && !cancelledCalendarLink && !pendingAnnualRecovery
+      ? todoistStandaloneCalendarEventId(delivery.profile, task.id)
+      : undefined;
+    if (deterministicStandaloneId) {
+      try {
+        const exact = await calendar.getEvent(deterministicStandaloneId);
+        const shared = exact.extendedProperties?.shared || {};
+        if (exact.status === "cancelled") {
+          return this.state.audit(delivery.profile, "todoist_update_suppressed_cancelled_calendar", {
+            taskId: task.id, eventId: exact.id,
+          });
+        }
+        if (exact.id !== deterministicStandaloneId || exact.recurrence?.length || exact.recurringEventId
+          || shared.taskId !== task.id
+          || (shared.syncProfile && shared.syncProfile !== delivery.profile)
+          || (shared.syncCalendarId && shared.syncCalendarId !== profiles[delivery.profile].calendarId)) {
+          return this.state.audit(delivery.profile, "todoist_deterministic_calendar_identity_conflict", {
+            taskId: task.id, eventId: deterministicStandaloneId,
+          });
+        }
+        existingEvent = exact;
+        mapping = { profile: delivery.profile, eventId: exact.id, taskId: task.id,
+          projectId: task.project_id || profiles[delivery.profile].todoistProjectId,
+          updatedAt: new Date().toISOString() };
+      } catch (error) {
+        if (Number((error as { status?: number }).status) === 410) {
+          return this.state.audit(delivery.profile, "todoist_update_suppressed_cancelled_calendar", {
+            taskId: task.id, eventId: deterministicStandaloneId,
+          });
+        }
+        if (Number((error as { status?: number }).status) !== 404) throw error;
+      }
+    }
+    const persistDeterministicPairMapping = async (nextMapping: Mapping, client?: Todoist): Promise<Mapping> => {
+      try { return await this.persistProviderMapping(nextMapping, client); }
+      catch (error) {
+        if (!deterministicStandaloneId) throw error;
+        throw new SafeProviderReplayError(
+          `Calendar and Todoist mapping readback needs retry for task ${task!.id}`,
+          { cause: error },
+        );
+      }
+    };
     let candidateInventoryComplete = false;
     if (!existingEvent && !mapping && !cancelledCalendarLink && !pendingAnnualRecovery
       && typeof calendar.listDelta === "function") {
@@ -4163,7 +4217,7 @@ export class Synchronizer {
           : { profile: delivery.profile, eventId: candidate.event.id, taskId: task.id,
             projectId: task.project_id || profiles[delivery.profile].todoistProjectId,
             updatedAt: new Date().toISOString() };
-        await this.persistProviderMapping(discovered, projectCommentClient);
+        await persistDeterministicPairMapping(discovered, projectCommentClient);
         const [verifiedMaster, verifiedMapping] = await Promise.all([
           calendar.getEvent(candidate.master.id),
           this.providerMappingByTask(delivery.profile, task.id, projectCommentClient),
@@ -4186,6 +4240,12 @@ export class Synchronizer {
         });
       }
       candidateInventoryComplete = true;
+    }
+    if (!existingEvent && !mapping && !cancelledCalendarLink && !pendingAnnualRecovery
+      && !task.due?.is_recurring && !candidateInventoryComplete) {
+      return this.state.audit(delivery.profile, "todoist_provider_pair_discovery_incomplete", {
+        taskId: task.id, reason: "complete_calendar_inventory_required_before_creation",
+      });
     }
     if (existingEvent?.status === "cancelled") {
       return this.state.audit(delivery.profile, "todoist_update_suppressed_cancelled_calendar", { taskId: task.id, event: payload.event_name });
@@ -4552,7 +4612,7 @@ export class Synchronizer {
         ...(existingEvent.extendedProperties?.shared?.todoistPhaseBVersion === "1" ? { todoistPhaseBVersion: 1 as const } : {}),
         updatedAt: new Date().toISOString(),
       };
-      await this.persistProviderMapping(nextMapping);
+      await persistDeterministicPairMapping(nextMapping);
       if (pendingAnnualRecovery) await this.state.completeCancelledAnnualRecovery?.(delivery.profile,task.id,existingEvent.id);
       // Only the verified uncompletion path can withdraw completion markers.
       return this.state.audit(delivery.profile, "todoist_noop_canonical_state", {
@@ -4583,26 +4643,71 @@ export class Synchronizer {
       event.extendedProperties.shared ||= {};
       event.extendedProperties.shared.syncRecoveryFingerprint=pendingAnnualRecovery.sourceFingerprint!;
     }
+    const creatingDeterministicStandalone = Boolean(deterministicStandaloneId && !existingEvent && !mapping);
+    if (creatingDeterministicStandalone) event.id = deterministicStandaloneId!;
     let stored:CalendarEvent;
     try {
       stored=await calendar.upsertEvent(event, existingEvent?.id || mapping?.eventId);
     } catch (error) {
-      if (!pendingAnnualRecovery?.candidateEventId || Number((error as {status?:number}).status)!==409)
-        throw error;
-      // A lost response cannot justify a second provider identity. A 409
-      // can only adopt the exact receipt-owned, confirmed canonical object.
-      const found=await calendar.getEvent(pendingAnnualRecovery.candidateEventId);
-      if (found.id!==pendingAnnualRecovery.candidateEventId || found.status!=="confirmed"
-        || found.extendedProperties?.shared?.taskId!==task.id
-        || found.extendedProperties?.shared?.syncRecoveryFingerprint!==pendingAnnualRecovery.sourceFingerprint
-        || !hasCanonicalState(found,task)) {
-        return this.state.audit(delivery.profile,"todoist_cancelled_recovery_duplicate_id_conflict",{taskId:task.id});
+      if (creatingDeterministicStandalone) {
+        if (Number((error as { status?: number }).status) === 409) {
+          try {
+            const exact = await calendar.getEvent(deterministicStandaloneId!);
+            const shared = exact.extendedProperties?.shared || {};
+            if (exact.id === deterministicStandaloneId && exact.status !== "cancelled"
+              && !exact.recurrence?.length && !exact.recurringEventId
+              && shared.taskId === task.id
+              && (!shared.syncProfile || shared.syncProfile === delivery.profile)
+              && (!shared.syncCalendarId || shared.syncCalendarId === profiles[delivery.profile].calendarId)) {
+              stored = exact;
+            } else {
+              throw new Error("Deterministic Calendar event ID is owned by a different object");
+            }
+          } catch (readbackError) {
+            if (readbackError instanceof Error
+              && readbackError.message === "Deterministic Calendar event ID is owned by a different object") throw readbackError;
+            throw new SafeProviderReplayError(
+              `Calendar creation needs retry for Todoist task ${task.id}`,
+              { cause: readbackError },
+            );
+          }
+        } else {
+          throw new SafeProviderReplayError(
+            `Calendar creation needs retry for Todoist task ${task.id}`,
+            { cause: error },
+          );
+        }
+      } else {
+        if (deterministicStandaloneId) {
+          throw new SafeProviderReplayError(
+            `Calendar update needs retry for Todoist task ${task.id}`,
+            { cause: error },
+          );
+        }
+        if (!pendingAnnualRecovery?.candidateEventId || Number((error as {status?:number}).status)!==409)
+          throw error;
+        // A lost response cannot justify a second provider identity. A 409
+        // can only adopt the exact receipt-owned, confirmed canonical object.
+        const found=await calendar.getEvent(pendingAnnualRecovery.candidateEventId);
+        if (found.id!==pendingAnnualRecovery.candidateEventId || found.status!=="confirmed"
+          || found.extendedProperties?.shared?.taskId!==task.id
+          || found.extendedProperties?.shared?.syncRecoveryFingerprint!==pendingAnnualRecovery.sourceFingerprint
+          || !hasCanonicalState(found,task)) {
+          return this.state.audit(delivery.profile,"todoist_cancelled_recovery_duplicate_id_conflict",{taskId:task.id});
+        }
+        stored=found;
       }
-      stored=found;
     }
     // Count the Calendar write before any readback can return or retry. A
     // failed recurrence verification may issue a second conditional rollback.
-    await this.state.recordMutation(delivery.profile);
+    try { await this.state.recordMutation(delivery.profile); }
+    catch (error) {
+      if (!deterministicStandaloneId) throw error;
+      throw new SafeProviderReplayError(
+        `Calendar mutation state recording needs retry for Todoist task ${task.id}`,
+        { cause: error },
+      );
+    }
     const todoistRecurring = Boolean(task.due?.is_recurring);
     let verifiedStored = stored;
     if (todoistRecurring) {
@@ -4732,7 +4837,7 @@ export class Synchronizer {
       ...(stored.extendedProperties?.shared?.todoistPhaseBVersion === "1" ? { todoistPhaseBVersion: 1 as const } : {}),
       updatedAt: new Date().toISOString(),
     };
-    await this.persistProviderMapping(nextMapping);
+    await persistDeterministicPairMapping(nextMapping);
     if (pendingAnnualRecovery) await this.state.completeCancelledAnnualRecovery?.(delivery.profile,task.id,stored.id);
     await this.state.audit(delivery.profile, mapping ? "todoist_updated_calendar" : "todoist_created_calendar", {
       taskId: task.id,
