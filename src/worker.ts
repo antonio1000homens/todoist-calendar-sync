@@ -15,7 +15,7 @@ import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { CalendarSyncAdmissionError, enqueueCalendarSync, enqueueDelivery, queuePendingRefresh, requestReconciliation } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
-import { StateRepository } from "./repository.js";
+import { CalendarSyncStartContentionError, StateRepository } from "./repository.js";
 import { profiles, todoistToken } from "./config.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
@@ -384,6 +384,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
     let earlierCalendarMutationUnverified = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
+    let calendarSyncGeneration: number | undefined;
     try {
       delivery = ensureReconciliationGeneration(JSON.parse(record.body) as Delivery);
       state = new StateRepository();
@@ -511,7 +512,6 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
         continue;
       }
 
-      let calendarSyncGeneration: number | undefined;
       if (delivery.kind === "calendar" && delivery.calendarSync) {
         calendarSyncGeneration = await state.startCalendarSync(delivery.profile, delivery.calendarSync.generation);
         if (calendarSyncGeneration === undefined) {
@@ -708,6 +708,18 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
         failures.push({ itemIdentifier: record.messageId });
         continue;
       }
+      if (delivery?.kind === "calendar" && delivery.calendarSync && error instanceof CalendarSyncStartContentionError) {
+        // No running claim or provider cursor was acquired. Retain this FIFO
+        // delivery for retry; never fail somebody else's running generation.
+        // If SQS eventually redrives it, the existing dispatch lease expires
+        // and scheduled admission can recover the still-dirty generation.
+        log("calendar_sync_start_contention_retry", {
+          profile: delivery.profile, generation: delivery.calendarSync.generation,
+          error: serializeError(error),
+        });
+        failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
       if (delivery?.kind === "calendar" && delivery.calendarSync && error instanceof CalendarSyncAdmissionError) {
         // Provider processing and its cursor commit already succeeded. Keep
         // the original FIFO request retryable so it can re-admit the durable
@@ -805,8 +817,8 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       // durably in the DLQ, or when SQS is applying its configured native
       // redrive. If DLQ handoff fails, keep the source generation resumable.
       if (delivery?.kind === "calendar" && delivery.calendarSync && state
-        && (quarantined || disposition.reason === "retries_exhausted")) {
-        await state.failCalendarSync(delivery.profile).catch((stateError: unknown) => {
+        && calendarSyncGeneration !== undefined && (quarantined || disposition.reason === "retries_exhausted")) {
+        await state.failCalendarSync(delivery.profile, calendarSyncGeneration).catch((stateError: unknown) => {
           log("calendar_sync_failure_state_write_failed", {
             profile: delivery?.profile, generation: delivery?.calendarSync?.generation,
             error: serializeError(stateError),
