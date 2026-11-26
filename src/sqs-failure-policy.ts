@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { SQSRecord } from "aws-lambda";
 import type { Delivery, Profile } from "./types.js";
 import { syncMessageGroupId } from "./types.js";
+import { isSafeProviderReplay } from "./safe-provider-replay.js";
 
 /**
  * The source FIFO queue is the retry buffer. Never enqueue a replacement
@@ -80,7 +81,7 @@ export function isTransientDynamoDbFailure(error: unknown): boolean {
 
 export interface FailedDeliveryDisposition {
   kind: "retry_fifo" | "quarantine";
-  reason: "transient_dynamodb" | "transient_provider" | "partial_provider_mutation" | "unverified_delivery_type" | "non_transient" | "retries_exhausted";
+  reason: "transient_dynamodb" | "transient_provider" | "safe_provider_replay" | "partial_provider_mutation" | "unverified_delivery_type" | "non_transient" | "retries_exhausted";
   receiveCount: number;
 }
 
@@ -109,21 +110,23 @@ export function failedDeliveryDisposition(
   receiveCount: number,
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
+  const safeReplay = isSafeProviderReplay(error);
   const transientDynamoDb = isTransientDynamoDbFailure(error);
-  const transientProvider = !transientDynamoDb && isTransientProviderFailure(error);
+  const transientProvider = !transientDynamoDb && (safeReplay || isTransientProviderFailure(error));
   if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
   // A provider write may already have happened. The DynamoDB state write may
   // have failed after it, so automated replay could duplicate provider writes.
-  if (providerMutationObserved) return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
+  if (providerMutationObserved && !safeReplay) return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
   // Retry only deliveries whose state is safe to re-read. Reconciliation chunks
   // are idempotent when no provider write has been attempted; repair and
   // erasure-sensitive operations remain quarantined.
-  const retryableKinds = transientProvider ? ["calendar", "todoist", "reconcile"] : ["calendar", "todoist"];
+  const retryableKinds = safeReplay ? ["todoist"]
+    : transientProvider ? ["calendar", "todoist", "reconcile"] : ["calendar", "todoist"];
   if (!delivery || !retryableKinds.includes(delivery.kind)) {
     return { kind:"quarantine", reason:"unverified_delivery_type", receiveCount:attempts };
   }
   if (attempts >= MAX_SYNC_RECEIVES) return { kind:"quarantine", reason:"retries_exhausted", receiveCount:attempts };
-  return { kind:"retry_fifo", reason:transientProvider ? "transient_provider" : "transient_dynamodb", receiveCount:attempts };
+  return { kind:"retry_fifo", reason:safeReplay ? "safe_provider_replay" : transientProvider ? "transient_provider" : "transient_dynamodb", receiveCount:attempts };
 }
 
 export function transientRetryVisibilitySeconds(receiveCount: number, retryAfterMs?: number): number {

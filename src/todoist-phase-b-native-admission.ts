@@ -20,7 +20,7 @@ export interface TodoistPhaseBInitialEvidence {
   /** A separately GET-fetched, current version of that exact task. */
   providerReadback: TodoistTask;
   eventName: string;
-  /** Original signed item:added ingress receipt. */
+  /** Ingress receipt for item:added, item:updated or a reconciliation repair. */
   receivedAt: string;
   /** Exact configured Todoist project in the current sync profile. */
   projectId: string;
@@ -44,9 +44,10 @@ function observedDue(task: TodoistTask): string | undefined {
 }
 
 /**
- * The only safe automatic anchor evidence for initial opt-in is a genuinely
- * recent item:added, with no counterpart and a fresh independent Todoist GET.
- * Historical data repair, imports, edits and advanced recurrences stay rolling.
+ * A new item uses its recent item:added receipt to prove the original anchor.
+ * A supported recurrence repaired later uses the exact current due from a
+ * fresh Todoist read as its anchor. In either case we require no existing
+ * correlation, no provider alias, and complete caller-side candidate search.
  */
 export function admitNewTodoistPhaseBNative(
   e: TodoistPhaseBInitialEvidence,
@@ -54,9 +55,11 @@ export function admitNewTodoistPhaseBNative(
   const reject = (reason: string): TodoistPhaseBAdmission => ({ admitted: false, reason });
   const task = e.source;
   const current = e.providerReadback;
-  if (e.eventName !== "item:added" || e.hasMapping || e.hasCalendarAlias
+  const isNew = e.eventName === "item:added";
+  const isRepair = e.eventName === "item:updated";
+  if ((!isNew && !isRepair) || e.hasMapping || e.hasCalendarAlias
     || e.hasPendingRecovery)
-    return reject("only_new_unmapped_item_added");
+    return reject("only_unmapped_add_or_update_without_pending_recovery");
   if (!task.id || task.id !== current.id
     || !e.projectId || task.project_id !== e.projectId
     || current.project_id !== e.projectId
@@ -65,15 +68,21 @@ export function admitNewTodoistPhaseBNative(
     return reject("source_identity_or_profile_not_verified");
   if (!e.calendarTimeZone || e.calendarTimeZone !== e.todoistTimeZone)
     return reject("timezone_not_verified");
-  // The original item-added occurrence is independently supported by its
-  // fresh Todoist updated_at, rather than falsely adopting an old due date.
-  const observedAt = Date.parse(e.receivedAt);
-  const createdAt = Date.parse(task.updated_at || "");
-  const currentAt = Date.parse(current.updated_at || "");
-  if (![observedAt, createdAt, currentAt].every(Number.isFinite)
-    || createdAt > observedAt + 30_000 || observedAt - createdAt > 120_000
-    || currentAt < createdAt || currentAt > observedAt + 30_000)
-    return reject("fresh_creation_provenance_missing");
+  if (isNew) {
+    // A new task must carry a fresh creation receipt so its due is a credible
+    // DTSTART rather than an arbitrary point in an old recurrence.
+    const observedAt = Date.parse(e.receivedAt);
+    const createdAt = Date.parse(task.updated_at || "");
+    const currentAt = Date.parse(current.updated_at || "");
+    if (![observedAt, createdAt, currentAt].every(Number.isFinite)
+      || createdAt > observedAt + 30_000 || observedAt - createdAt > 120_000
+      || currentAt < createdAt || currentAt > observedAt + 30_000)
+      return reject("fresh_creation_provenance_missing");
+  } else if (!task.updated_at || task.updated_at !== current.updated_at) {
+    // Repair is only allowed from a current source readback, never from a
+    // stale update that could rewind a recurrence or resurrect a changed task.
+    return reject("fresh_repair_source_version_missing");
+  }
   const due = observedDue(task);
   const liveDue = observedDue(current);
   if (!due || due !== liveDue || !task.due?.is_recurring || !current.due?.is_recurring
@@ -83,10 +92,11 @@ export function admitNewTodoistPhaseBNative(
   // requires independent timezone and DST provider evidence in the writer.
   if (!/^\d{4}-\d{2}-\d{2}$/.test(due))
     return reject("timed_phase_b_not_enabled");
-  if (due < e.receivedAt.slice(0, 10))
+  if (isNew && due < e.receivedAt.slice(0, 10))
     return reject("overdue_original_anchor_not_verified");
   const anchor: TodoistPhaseBAnchor = {
-    start: due, source: "verified_original_schedule", timeZone: e.calendarTimeZone,
+    start: due, source: isNew ? "verified_original_schedule" : "verified_current_schedule",
+    timeZone: e.calendarTimeZone,
   };
   const candidate = todoistPhaseBCandidate(current, anchor);
   if (!candidate.family || !candidate.semantic || !candidate.candidateRrule

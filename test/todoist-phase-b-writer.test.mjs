@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { profiles } from "../dist/config.js";
 import { MAPPING_COMMENT_MARKER } from "../dist/mapping-comments.js";
 import { Synchronizer } from "../dist/sync.js";
 
@@ -36,7 +37,7 @@ class State {
 }
 function setup({exception=false, lookupExisting=false, missingVersion=false,
   changedBeforeRollback=false, rollbackFailure=false, createdConflict=false,
-  unconfirmedCreation=false, sourceTask=task}={}){
+  unconfirmedCreation=false, sourceTask=task, eventName="item:added"}={}){
   const state=new State(), instances=["2027-01-10","2027-04-10","2027-07-10"].map((d,i)=>eventInstance(`phase-b-instance-${i}`,d));
   const projectComments=[];
   const master={id:"phase-b-master",etag:"etag-1",status:"confirmed",summary:task.content,description:task.description,
@@ -47,10 +48,21 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
   const events=new Map([[master.id,master]]), creates=[], upserts=[], deletes=[];
   let taskExists=true;
   const calendar={
+    async listDelta(){return {items:[]};},
     async findByTodoistTaskId(){return lookupExisting ? [...events.values()].find(
       e=>e.extendedProperties?.shared?.taskId===task.id) : undefined;},
     async getTimeZone(){return "Europe/London";},
     async getEvent(id){const e=events.get(id);if(!e){const err=new Error("missing");err.status=404;throw err;}return structuredClone(e);},
+    async ensureTaskCorrelation(id,taskId,_expectedTaskId,mapping){
+      const current=events.get(id);
+      const shared={...(current.extendedProperties?.shared||{}),taskId,syncSchemaVersion:"2",
+        syncProfile:"home",syncCalendarId:profiles.home.calendarId,syncTaskId:taskId,syncEventId:id,
+        syncSeriesId:mapping.seriesId,syncMasterEventId:mapping.masterEventId,
+        syncActiveInstanceId:mapping.activeInstanceId,syncOriginalStart:mapping.originalStart,
+        syncActiveEffectiveStart:mapping.activeEffectiveStart,syncProgressVersion:"1"};
+      const updated={...current,extendedProperties:{...current.extendedProperties,shared}};
+      events.set(id,updated);return structuredClone(updated);
+    },
     async createTodoistPhaseBNativeMasterOnce(e){
       creates.push(structuredClone(e));
       if(events.has(e.id)) return {event:structuredClone(events.get(e.id)),created:false};
@@ -101,7 +113,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
   };
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
   const delivery={id:"phase-b-item-added",kind:"todoist",profile:"home",mode:"aws",receivedAt:"2026-11-09T12:00:00Z",
-    headers:{},body:JSON.stringify({event_name:"item:added",event_data:task})};
+    headers:{},body:JSON.stringify({event_name:eventName,event_data:task})};
   return {state,calendar,sync,delivery,creates,upserts,deletes,events,projectComments,
     deleteSourceTask(){taskExists=false;}};
 }
@@ -143,6 +155,20 @@ test("supported recurrence uses native Calendar creation without a feature flag"
   assert.equal(f.state.mapping.todoistPhaseBVersion,1);
   assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
 }));
+test("supported recurring item:updated self-heals a missing Calendar counterpart exactly once",()=>withGate(true,async()=>{
+  const repaired={...task,updated_at:"2026-11-09T11:59:30Z"};
+  const f=setup({sourceTask:repaired,eventName:"item:updated"});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:repaired,
+    event_data_extra:{update_intent:"item_updated"}});
+  await f.sync.process(f.delivery);
+  assert.equal(f.creates.length,1);
+  assert.equal(f.creates[0].start.date,"2027-01-10");
+  assert.equal(f.creates[0].recurrence[0],"RRULE:FREQ=MONTHLY;INTERVAL=3");
+  assert.equal(f.state.mapping.taskId,repaired.id);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
+  await f.sync.process({...f.delivery,id:"repair-reconciliation-replay"});
+  assert.equal(f.creates.length,1,"repeated repair must reuse the verified provider pair");
+}));
 
 test("recurrence outside the native admission families is not flattened into a one-off Calendar event",()=>withGate(true,async()=>{
   const source={...task,due:{date:"2027-01-10",is_recurring:true,string:"every 2 years"}};
@@ -160,7 +186,7 @@ test("recurrence outside the native admission families is not flattened into a o
 
 test("provider exception after create deletes only the uncommitted deterministic master",()=>withGate(true,async()=>{
   const f=setup({exception:true});
-  await f.sync.process(f.delivery);
+  await assert.rejects(f.sync.process(f.delivery),/Calendar native write needs retry/);
   assert.equal(f.creates.length,1);
   assert.deepEqual(f.deletes,[f.creates[0].id]);
   assert.equal(f.events.has(f.creates[0].id),false);
@@ -251,7 +277,7 @@ test("exact Calendar series IDs restore the project mapping without a phase owne
 
 test("initial native readback without version marker never commits a mapping",()=>withGate(true,async()=>{
   const f=setup({missingVersion:true});
-  await f.sync.process(f.delivery);
+  await assert.rejects(f.sync.process(f.delivery),/Calendar native write needs retry/);
   assert.equal(f.state.mapping,undefined);
   assert.equal(f.upserts.length,0);
   assert.deepEqual(f.deletes,[f.creates[0].id]);
@@ -260,11 +286,11 @@ test("initial native readback without version marker never commits a mapping",()
 
 test("rollback is ETag conditional and retries a user-edited deterministic master without blocking",()=>withGate(true,async()=>{
   const f=setup({exception:true,changedBeforeRollback:true});
-  await f.sync.process(f.delivery);
+  await assert.rejects(f.sync.process(f.delivery),/Calendar native write needs retry/);
   assert.deepEqual(f.deletes,[]);
   assert.equal(f.events.has(f.creates[0].id),true);
   assert.equal(f.state.mapping,undefined);
-  await f.sync.process({...f.delivery,id:"replayed-after-failed-rollback"});
+  await assert.rejects(f.sync.process({...f.delivery,id:"replayed-after-failed-rollback"}),/Calendar native write needs retry/);
   assert.equal(f.creates.length,2,"retry reads the same deterministic event ID");
   assert.equal(f.upserts.length,0);
   assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_write_retryable");
@@ -275,7 +301,7 @@ test("failed rollback and uncertain POST remain retryable without adopting a mis
   for(const options of [{exception:true,rollbackFailure:true},{exception:true,createdConflict:true},
     {unconfirmedCreation:true}]){
     const f=setup(options);
-    await f.sync.process(f.delivery);
+    await assert.rejects(f.sync.process(f.delivery));
     assert.equal(f.state.mapping,undefined);
     assert.deepEqual(f.deletes,[]);
     assert.ok(f.state.audits.some(x=>x.action==="todoist_phase_b_native_write_retryable"
