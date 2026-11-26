@@ -4,6 +4,7 @@ import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { googleCredentials, profiles, todoistToken } from "../dist/config.js";
 import { buildProjectMappingIndex } from "../dist/mapping-comments.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
+import { StateRepository } from "../dist/repository.js";
 import {
   uniqueProjectEventMapping,
   uniqueProjectTaskMapping,
@@ -1069,6 +1070,18 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           && mapping.seriesId === fixture.taskId,
       );
       if (spec.cadence === "weekly") {
+        const state = new StateRepository();
+        const storedBeforeRecovery = await state.getMappingByTask(profile, fixture.taskId);
+        if (storedBeforeRecovery?.profile !== profile || storedBeforeRecovery.taskId !== fixture.taskId
+          || storedBeforeRecovery.projectId !== config.todoistProjectId
+          || (storedBeforeRecovery.masterEventId || storedBeforeRecovery.eventId) !== fixture.eventId) {
+          throw new Error("Legacy fallback fixture lacks its exact profile/project/task/master mapping");
+        }
+        const fallbackComment = await providerMappingComment(
+          todoist, config.todoistProjectId, fixture.eventId, fixture.taskId,
+        );
+        if (!fallbackComment?.id) throw new Error("Legacy fallback fixture has no exact provider mapping comment to remove");
+        await todoist.deleteComment(fallbackComment.id);
         const eventBeforeRecovery = await calendar.getEvent(fixture.eventId);
         const shared = eventBeforeRecovery.extendedProperties?.shared || {};
         const lostKeys = Object.keys(shared).filter((key) => key === "taskId" || key.startsWith("sync"));
@@ -1077,10 +1090,58 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         const clearCorrelation = Object.fromEntries(lostKeys.map((key) => [key, null]));
         await calendar.updateSharedEventPropertiesIfUnchanged(fixture.eventId, eventBeforeRecovery.etag, clearCorrelation);
         const taskBeforeRecovery = await todoist.getTask(fixture.taskId);
-        const recoveryDescription = `${taskBeforeRecovery.description || ""}\nTodoist correlation recovery ${token}`;
+        if (await providerMappingByTask(todoist, config.todoistProjectId, fixture.taskId)) {
+          throw new Error("Provider-native project mapping remained after deleting the exact fixture comment");
+        }
+        const storedWithoutProviderLinks = await state.getMappingByTask(profile, fixture.taskId);
+        if (storedWithoutProviderLinks?.taskId !== fixture.taskId
+          || (storedWithoutProviderLinks.masterEventId || storedWithoutProviderLinks.eventId) !== fixture.eventId) {
+          throw new Error("Legacy fallback mapping disappeared while removing provider-native links");
+        }
+        const fallbackRecoveryDescription = `${taskBeforeRecovery.description || ""}\nLegacy fallback recovery ${token}`;
+        const fallbackRestoredTask = await todoist.upsertTask({
+          ...taskBeforeRecovery, description: fallbackRecoveryDescription,
+        }, fixture.taskId);
+        await poll(
+          `${profile} exact legacy mapping restores both missing provider-native links`, timeoutMs,
+          async () => {
+            const [event, currentTask, mapping, stored] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+              state.getMappingByTask(profile, fixture.taskId),
+            ]);
+            return { event, currentTask, mapping, stored };
+          },
+          ({ event, currentTask, mapping, stored }) => event.extendedProperties?.shared?.taskId === fixture.taskId
+            && event.extendedProperties?.shared?.syncTaskId === fixture.taskId
+            && event.extendedProperties?.shared?.syncMasterEventId === fixture.eventId
+            && currentTask.id === fixture.taskId
+            && currentTask.description === fallbackRecoveryDescription
+            && fallbackRestoredTask.id === fixture.taskId
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
+            && stored?.taskId === fixture.taskId
+            && (stored.masterEventId || stored.eventId) === fixture.eventId,
+        );
+        log("todoist_legacy_fallback_repairs_missing_provider_correlation", {
+          profile, taskIdPreserved: true, masterIdPreserved: true,
+          providerLinksRestored: true, legacyMappingRetained: true,
+        });
+
+        const eventBeforeTaskOnlyRecovery = await calendar.getEvent(fixture.eventId);
+        const sharedBeforeTaskOnlyRecovery = eventBeforeTaskOnlyRecovery.extendedProperties?.shared || {};
+        const lostTaskOnlyKeys = Object.keys(sharedBeforeTaskOnlyRecovery)
+          .filter((key) => key === "taskId" || key.startsWith("sync"));
+        if (!lostTaskOnlyKeys.includes("taskId") || !lostTaskOnlyKeys.includes("syncTaskId"))
+          throw new Error("Todoist correlation recovery fixture does not contain the expected Calendar task identifiers");
+        const clearTaskOnlyCorrelation = Object.fromEntries(lostTaskOnlyKeys.map((key) => [key, null]));
+        await calendar.updateSharedEventPropertiesIfUnchanged(
+          fixture.eventId, eventBeforeTaskOnlyRecovery.etag, clearTaskOnlyCorrelation,
+        );
+        const taskBeforeTaskOnlyRecovery = await todoist.getTask(fixture.taskId);
+        const recoveryDescription = `${taskBeforeTaskOnlyRecovery.description || ""}\nTodoist correlation recovery ${token}`;
         const retriedDescription = `${recoveryDescription}\nTodoist correlation retry ${token}`;
-        await todoist.upsertTask({ ...taskBeforeRecovery, description: recoveryDescription }, fixture.taskId);
-        await todoist.upsertTask({ ...taskBeforeRecovery, description: retriedDescription }, fixture.taskId);
+        await todoist.upsertTask({ ...taskBeforeTaskOnlyRecovery, description: recoveryDescription }, fixture.taskId);
+        await todoist.upsertTask({ ...taskBeforeTaskOnlyRecovery, description: retriedDescription }, fixture.taskId);
         await poll(
           `${profile} Todoist project mapping repairs missing Calendar correlation`, timeoutMs,
           async () => {
