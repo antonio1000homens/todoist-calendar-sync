@@ -598,7 +598,10 @@ Resources:
     Properties:
       Name: !Sub ${ResourceNamePrefix}-reconcile-${Stage}
       ScheduleExpression: rate(5 minutes)
-      State: ENABLED
+      # Keep scheduled reconciliation off until guarded live acceptance clears
+      # the current recovery and provider-rate-limit blockers. Manual runs stay
+      # available for controlled verification.
+      State: DISABLED
       Targets:
         - Arn: !GetAtt ReconcilerFunction.Arn
           Id: ReconcilerFunctionEveryFifteenMinutesLambdaTarget
