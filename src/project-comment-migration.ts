@@ -18,6 +18,7 @@ import { StateRepository } from "./repository.js";
 import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, TodoistTask } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
+const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, maxRetryDelayMs: 10_000 } as const;
 
 export interface ProjectCommentMigrationState {
   retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;
@@ -464,7 +465,11 @@ export async function runProjectCommentMigration(
   retireLegacyCorrelation = false,
 ): Promise<ProjectCommentMigrationSummary> {
   const mappings = await listMappingsForProjectCommentMigration(profile);
-  const clients = await clientFactory(profile);
+  // Project comments are a rate-limited Todoist endpoint. A multi-profile
+  // cutover can encounter a 429 after substantial successful work; honor the
+  // provider retry_after hint and retry reads in place so the idempotent
+  // migration resumes without discarding earlier progress.
+  const clients = await clientFactory(profile, MIGRATION_PROVIDER_OPTIONS);
   return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy, retireLegacyCorrelation);
 }
 

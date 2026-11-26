@@ -5,7 +5,12 @@ import type { Profile } from "./types.js";
 export const DEFAULT_RECONCILIATION_MUTATION_LIMIT = 10;
 
 export type ProviderClients = { calendar: GoogleCalendar; todoist: Todoist };
-export type ProviderClientOptions = { signal?:AbortSignal; timeoutMs?:number };
+export type ProviderClientOptions = {
+  signal?:AbortSignal;
+  timeoutMs?:number;
+  readRetries?:number;
+  maxRetryDelayMs?:number;
+};
 export type ProviderClientFactory = (profile: Profile, options?:ProviderClientOptions) => Promise<ProviderClients>;
 
 export class MutationBudgetExhaustedError extends Error {
