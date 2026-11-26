@@ -452,3 +452,35 @@ test("Todoist timezone lookup reads only user resource and exposes the IANA time
   assert.deepEqual(JSON.parse(new URLSearchParams(request.init.body).get("resource_types")), ["user"]);
   assert.equal(new URLSearchParams(request.init.body).get("sync_token"), "*");
 });
+
+
+test("Google default WKST=MO preserves a native timed weekly Friday recurrence", async () => {
+  const start = "2026-11-27T16:00:00Z";
+  const master = weeklyMaster(start, "RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=FR");
+  const schedule = instances([start, "2026-12-04T16:00:00Z", "2026-12-11T16:00:00Z"]);
+  assert.equal(nativeCalendarRecurrenceCandidate(master), true);
+  const recurrence = await verifiedCalendarOwnedRecurrence(master, schedule, "Europe/London", async () => []);
+  assert.equal(recurrence?.dueString, "every Friday at 4:00pm starting 27 Nov 2026");
+  const implicit = calendarOwnedTodoistRecurrence(weeklyMaster(start, "RRULE:FREQ=WEEKLY;BYDAY=FR"), schedule, "Europe/London");
+  assert.equal(recurrence.dueString, implicit.dueString);
+  const payload = calendarOwnedRecurringTaskPayload(schedule[0], recurrence, "Europe/London");
+  assert.equal(payload.due.is_recurring, true);
+  assert.equal(payload.due.string, recurrence.dueString);
+  const task = { id: "same-task", due: { datetime: start, is_recurring: true, string: recurrence.dueString } };
+  assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[0], recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask({ ...task, due: { ...task.due, datetime: schedule[1].start.dateTime } },
+    schedule[1], recurrence, "Europe/London"), true);
+  assert.equal(await verifiedCalendarOwnedRecurrence(master, schedule, "Europe/London"), undefined,
+    "explicit exception inventory is still mandatory");
+  for (const rule of [
+    "RRULE:FREQ=WEEKLY;WKST=SU;BYDAY=FR",
+    "RRULE:FREQ=WEEKLY;WKST=XX;BYDAY=FR",
+    "RRULE:FREQ=WEEKLY;WKST=;BYDAY=FR",
+    "RRULE:FREQ=WEEKLY;WKST=MO;WKST=MO;BYDAY=FR",
+    "RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=FR;BYHOUR=16",
+  ]) {
+    const invalid = weeklyMaster(start, rule);
+    assert.equal(nativeCalendarRecurrenceCandidate(invalid), false, rule);
+    assert.equal(calendarOwnedTodoistRecurrence(invalid, schedule, "Europe/London"), undefined, rule);
+  }
+});
