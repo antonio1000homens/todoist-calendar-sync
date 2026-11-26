@@ -352,9 +352,7 @@ export class SnapshotReconciler {
       return this.store?.listMappings ? this.store.listMappings(profile)
         : await this.state.listMappings?.(profile) || [];
     }
-    const providerMappings = buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
-      .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
-      .map(mappingFromProjectMappingComment);
+    const providerMappings = await this.providerCommentMappings(profile, client);
     const legacyMappings = this.store?.listMappings
       ? await this.store.listMappings(profile)
       : await this.state.listMappings?.(profile) || [];
@@ -363,6 +361,12 @@ export class SnapshotReconciler {
       [mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id))));
     return [...providerMappings, ...legacyMappings.filter(mapping =>
       !providerTasks.has(mapping.taskId) && !providerEvents.has(mapping.eventId))];
+  }
+
+  private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
+    return buildProjectMappingIndex(await todoist.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
+      .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
   }
 
   private async reconciliationBaseline(mapping: Mapping): Promise<ReconciliationBaseline | ProviderSyncBaseline | undefined> {
@@ -392,13 +396,13 @@ export class SnapshotReconciler {
     const client = (await this.clients("home")).todoist;
     if (typeof client.listProjectComments !== "function") {
       for (const profile of Object.keys(profiles) as Profile[]) {
-        const mapping = await this.state.getMappingByTask(profile, taskId);
+        const mapping = await this.legacyMappingByTask(profile, taskId);
         if (mapping) return mapping;
       }
       return undefined;
     }
     const values = (await Promise.all((Object.keys(profiles) as Profile[]).map(async profile =>
-      (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId)))).filter((value): value is Mapping => Boolean(value));
+      this.providerMappingByTask(profile, taskId)))).filter((value): value is Mapping => Boolean(value));
     if (values.length > 1) return undefined;
     return values[0];
   }
@@ -406,18 +410,46 @@ export class SnapshotReconciler {
   private async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      return this.state.getMappingByEvent(profile, eventId);
+      return this.legacyMappingByEvent(profile, eventId);
     }
-    return (await this.providerMappings(profile)).find(mapping => mapping.eventId === eventId
+    const provider = (await this.providerCommentMappings(profile, client)).find(mapping => mapping.eventId === eventId
       || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+    if (provider) return provider;
+    return this.legacyMappingByEvent(profile, eventId);
   }
 
   private async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      return this.state.getMappingByTask(profile, taskId);
+      return this.legacyMappingByTask(profile, taskId);
     }
-    return (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId);
+    const provider = (await this.providerCommentMappings(profile, client)).find(mapping => mapping.taskId === taskId);
+    return provider || this.legacyMappingByTask(profile, taskId);
+  }
+
+  private async legacyMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByTask === "function") {
+      const mapping = await this.state.getMappingByTask(profile, taskId);
+      if (mapping?.profile === profile) return mapping;
+    }
+    if (this.store?.listMappings) return (await this.store.listMappings(profile)).find(mapping => mapping.taskId === taskId);
+    return typeof this.state.getMappingByTask === "function" ? undefined
+      : (await this.state.listMappings?.(profile) || []).find(mapping => mapping.taskId === taskId);
+  }
+
+  private async legacyMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByEvent === "function") {
+      const direct = await this.state.getMappingByEvent(profile, eventId);
+      if (direct?.profile === profile) return direct;
+      if (this.store?.listMappings) return (await this.store.listMappings(profile)).find(mapping =>
+        mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+      return typeof this.state.getMappingByEvent === "function" ? undefined
+        : (await this.state.listMappings?.(profile) || []).find(mapping =>
+          mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+    }
+    return (this.store?.listMappings ? await this.store.listMappings(profile)
+      : await this.state.listMappings?.(profile) || []).find(mapping =>
+      mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
   }
 
   private async persistProviderMapping(mapping: Mapping, clients: ClientPair): Promise<Mapping> {

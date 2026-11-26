@@ -268,6 +268,32 @@ test("provider mapping reads prefer Todoist comments and retain legacy DynamoDB-
   assert.deepEqual(mappings.map(mapping => mapping.taskId).sort(), ["task-current", "task-legacy"]);
 });
 
+test("normal provider mapping lookups use exact DynamoDB fallback only after comment lookup misses", async () => {
+  const provider = { profile: "home", eventId: "event-provider", taskId: "task-provider",
+    projectId: profiles.home.todoistProjectId, updatedAt: "2099-01-01T00:00:00Z" };
+  const legacy = { profile: "home", eventId: "event-legacy", taskId: "task-legacy",
+    projectId: profiles.home.todoistProjectId, updatedAt: "2098-01-01T00:00:00Z" };
+  let comments = [{ id: "provider-comment", project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(provider, profiles.home.todoistProjectId) }];
+  let taskReads = 0, eventReads = 0, listReads = 0;
+  const state = {
+    async getMappingByTask(profile, taskId) { taskReads++; return profile === legacy.profile && taskId === legacy.taskId ? legacy : undefined; },
+    async getMappingByEvent(profile, eventId) { eventReads++; return profile === legacy.profile && eventId === legacy.eventId ? legacy : undefined; },
+    async listMappings() { listReads++; return [legacy]; },
+  };
+  const todoist = { async listProjectComments() { return comments; } };
+  const sync = new Synchronizer(state, undefined, async () => ({ todoist, calendar: {} }));
+
+  assert.equal((await sync.providerMappingByTask("home", provider.taskId, todoist)).eventId, provider.eventId);
+  assert.equal(taskReads, 0, "a provider-native task mapping wins without a DynamoDB read");
+  comments = [];
+  assert.equal((await sync.providerMappingByTask("home", legacy.taskId, todoist)).eventId, legacy.eventId);
+  assert.equal(taskReads, 1, "DynamoDB remains a point-read compatibility fallback");
+  assert.equal((await sync.providerMappingByEvent("home", legacy.eventId, todoist)).taskId, legacy.taskId);
+  assert.equal(eventReads, 1, "event fallback also uses the exact DynamoDB key");
+  assert.equal(listReads, 0, "ordinary task/event lookups do not enumerate the legacy mapping table");
+});
+
 test("multi-day Calendar events use only their first day as the Todoist due date", () => {
   const original = {
     id: "leave-event", status: "confirmed", summary: "Leave Approved",

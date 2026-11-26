@@ -602,10 +602,13 @@ test("scheduled reconciliation repairs a missing project mapping from the exact 
   clients.projectComments.splice(0);
   const sync = new Synchronizer(state, undefined, async () => clients);
 
+  assert.equal((await sync.providerMappingByTask(PROFILE, task.id, clients.todoist))?.eventId, current.id,
+    "the exact legacy mapping remains available as a fallback when the provider comment is absent");
+
   await sync.reconcile(PROFILE);
 
-  assert.equal(clients.todoistRecurringUpdates.length, 1, JSON.stringify(state.audits));
-  assert.equal(clients.todoistRecurringUpdates[0].taskId, task.id);
+  assert.equal(clients.todoistRecurringUpdates.length, 0,
+    "the already-correct task is left untouched while its missing provider mapping is repaired");
   assert.equal(clients.tasks.size, 1);
   assert.equal(clients.projectComments.length, 1);
   assert.equal(parseMappingComment(clients.projectComments[0])?.payload.taskId, task.id);
