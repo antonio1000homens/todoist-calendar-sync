@@ -287,12 +287,15 @@ export class GoogleCalendar {
     const desired = correlated.extendedProperties?.shared;
     if (!desired || (Object.entries(desired).every(([key, value]) =>
       event.extendedProperties?.shared?.[key] === value)
-      && event.extendedProperties?.shared?.syncSource === undefined)) return correlated;
+      && event.extendedProperties?.shared?.syncSource === undefined
+      && event.extendedProperties?.shared?.syncRecurrenceOwner === undefined
+      && event.extendedProperties?.shared?.syncCalendarNative === undefined)) return correlated;
     if (!event.id || !event.etag) throw new Error("Calendar write returned no exact event identity or ETag for correlation readback");
     return this.updateSharedEventPropertiesIfUnchanged(event.id, event.etag,
       { ...Object.fromEntries(Object.entries(desired).filter(([key, value]) => event.extendedProperties?.shared?.[key] !== value)),
         ...(event.extendedProperties?.shared?.syncSource !== undefined ? { syncSource: null } : {}),
-        ...(event.extendedProperties?.shared?.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}) });
+        ...(event.extendedProperties?.shared?.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}),
+        ...(event.extendedProperties?.shared?.syncCalendarNative !== undefined ? { syncCalendarNative: null } : {}) });
   }
 
   /** Ensure both provider directions can rediscover the exact task/master pair. */
@@ -315,7 +318,8 @@ export class GoogleCalendar {
     const desired = correlated.extendedProperties?.shared || {};
     const changes = { ...Object.fromEntries(Object.entries(desired).filter(([key, value]) => shared[key] !== value)),
       ...(shared.syncSource !== undefined ? { syncSource: null } : {}),
-      ...(shared.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}) };
+      ...(shared.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}),
+      ...(shared.syncCalendarNative !== undefined ? { syncCalendarNative: null } : {}) };
     if (!Object.keys(changes).length) return current;
     if (!current.etag) throw new Error("Calendar correlation readback has no ETag");
     return this.updateSharedEventPropertiesIfUnchanged(eventId, current.etag, changes);
@@ -734,15 +738,20 @@ export class GoogleCalendar {
     const currentShared = currentExtended.shared || {};
     const desired = this.correlate({ ...event, id: eventId });
     const incomingShared = desired.extendedProperties?.shared || {};
-    const shared = { ...currentShared, ...incomingShared };
+    const shared: Record<string, string | null> = { ...currentShared, ...incomingShared };
     if (Array.isArray(event.recurrence) && event.recurrence.length === 0 && current.recurrence?.length) {
-      for (const property of recurrenceCorrelationKeys) delete shared[property];
+      for (const property of recurrenceCorrelationKeys) {
+        if (currentShared[property] !== undefined) shared[property] = null;
+        else delete shared[property];
+      }
     }
     // The provider IDs are sufficient correlation. Remove the old static
     // source marker when touching a known managed event.
     if (incomingShared.taskId) {
-      delete shared.syncSource;
-      delete shared.syncRecurrenceOwner;
+      for (const key of ["syncSource", "syncRecurrenceOwner", "syncCalendarNative"]) {
+        if (currentShared[key] !== undefined) shared[key] = null;
+        else delete shared[key];
+      }
     }
     const extendedProperties = {
       ...currentExtended,
@@ -805,8 +814,9 @@ export class GoogleCalendar {
     if (current.etag !== etag) throw Object.assign(new Error("Calendar event changed before correlation metadata update"), { status: 412 });
     const merged = { ...(current.extendedProperties?.shared || {}) } as Record<string, string | null>;
     for (const [key, value] of Object.entries(shared)) {
-      if (value === null) delete merged[key];
-      else merged[key] = value;
+      // Calendar PATCH merges extended properties; omission does not delete.
+      // Send explicit null for a requested removal, as required by Google.
+      merged[key] = value;
     }
     return this.request(
       `/calendars/${encodeURIComponent(this.calendarId)}/events/${encodeURIComponent(eventId)}`,
