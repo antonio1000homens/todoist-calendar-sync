@@ -53,7 +53,7 @@ function nestedReviewIdentities(value: unknown, defaultProfile: Profile,
   terminal?: { seriesKeys: string[] },
 ): EntityRef[] {
   const refs = new Map<string, EntityRef>();
-  const taskFields = new Set(["taskId","providerTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
+  const taskFields = new Set(["taskId","providerTaskId","existingTaskId","expectedTaskId","linkedTaskId","ownerTaskId","discardedTaskId","retainedTaskId","masterTaskId"]);
   const eventFields = new Set(["eventId","providerEventId","masterEventId","recurringMasterId","masterId",
     "activeInstanceId","occurrenceId","selectedEventId","seriesId","calendarProjectionId",
     "oldMasterId","newMasterId","lastEventId","previousEventId","cancelledEventId",

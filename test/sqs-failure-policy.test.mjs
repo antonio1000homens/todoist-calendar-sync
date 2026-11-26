@@ -6,6 +6,7 @@ import {
   shortenTransientRetryVisibility, syncFailureQueueClient,
   transientRetryVisibilitySeconds,
 } from "../dist/sqs-failure-policy.js";
+import { CalendarCorrelationConflictError, ReconciliationItemError } from "../dist/reconciliation-diagnostics.js";
 import { handler } from "../dist/worker.js";
 import { StateRepository } from "../dist/repository.js";
 import { ManualInterventionService } from "../dist/manual-intervention.js";
@@ -291,6 +292,31 @@ test("ambiguous provider mutation plus DynamoDB throttle is quarantined directly
   assert.deepEqual(f.sent.map(c=>c.constructor.name),["SendMessageCommand"]);
   assert.equal(f.write.mock.callCount(),1);
   assert.equal(f.mark.mock.callCount(),0);
+});
+
+test("Calendar conflict quarantine logs the failing delta and structured IDs without provider payloads", async t => {
+  const correlationConflict = {
+    stage: "ensureTaskCorrelation", profile: "home", eventId: "series-master",
+    taskId: "requested-task", existingTaskId: "foreign-task", expectedTaskId: "expected-task",
+    calendarEventState: "present", existingTaskState: "unverified",
+  };
+  const failure = new ReconciliationItemError(new CalendarCorrelationConflictError(correlationConflict), {
+    stage: "calendar", eventId: "delta-occurrence", taskId: "stale-delta-task",
+  });
+  const fixture = setupHandler(t, { failure, failureAt: "provider" });
+  const logs = t.mock.method(console, "error", () => {});
+  const result = await handler({ Records: [fixture.record] }, { awsRequestId: "req-conflict" });
+  assert.deepEqual(result, { batchItemFailures: [] });
+  assert.equal(fixture.alerts.mock.calls[0].arguments[1], failure);
+  assert.equal(fixture.sent[0].input.MessageBody, fixture.record.body);
+  const incident = logs.mock.calls.map(call => JSON.parse(call.arguments[0]))
+    .find(entry => entry.event === "delivery_failed_for_dlq");
+  assert.equal(incident.awsRequestId, "req-conflict");
+  assert.equal(incident.error.eventId, "delta-occurrence");
+  assert.equal(incident.error.taskId, "requested-task");
+  assert.equal(incident.error.stage, "calendar");
+  assert.deepEqual(incident.error.correlationConflict, correlationConflict);
+  assert.equal(incident.error.providerBody, undefined);
 });
 
 test("nonretryable conditional failure is not blindly retried",async t=>{

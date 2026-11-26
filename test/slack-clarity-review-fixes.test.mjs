@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { CalendarCorrelationConflictError, ReconciliationItemError } from '../dist/reconciliation-diagnostics.js';
 import {
   decisionBlocks,
   MANUAL_DECISION_CATALOG,
@@ -252,6 +253,45 @@ test('orphan Calendar 410 quarantine keeps the provider identities for review in
   assert.equal(decision.context.providerEventId, 'event-gone');
   assert.equal(decision.context.providerTaskId, 'task-gone');
   assert.equal(decision.context.status, 410);
+});
+
+test('Calendar conflict reviews show the exact requested, stored, and expected identities', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const notifier = new FakeNotifier();
+  const service = new ManualInterventionService(new FakeDecisionStore(), notifier, async () => {
+    assert.fail('operational review must not infer identity by re-reading providers');
+  }, new FakePolicyStore());
+  const masterId = 'master-' + 'a'.repeat(1017);
+  const deltaId = 'delta-' + 'b'.repeat(1018);
+  const requestedId = 'requested-' + 'c'.repeat(1014);
+  const conflict = {
+    stage: 'ensureTaskCorrelation', profile: 'home', eventId: masterId,
+    taskId: requestedId, existingTaskId: 'foreign-task', expectedTaskId: 'prior-task',
+    calendarEventState: 'cancelled', existingTaskState: 'unverified',
+  };
+  const error = new ReconciliationItemError(new CalendarCorrelationConflictError(conflict), {
+    stage: 'calendar', eventId: deltaId, taskId: 'stale-delta-task',
+  });
+  await service.reportDeliveryFailure({
+    id: 'calendar-correlation-conflict', kind: 'calendar', profile: 'home', mode: 'aws',
+    receivedAt: '2026-11-26T00:00:00.000Z', headers: { authorization: 'private-header' },
+    body: JSON.stringify({ description: 'private-description' }),
+  }, error);
+  const [decision] = notifier.posted;
+  assert.equal(decision.type, 'operational_dlq');
+  assert.equal(decision.context.providerTaskId, requestedId);
+  assert.equal(decision.context.providerEventId, deltaId);
+  assert.equal(decision.context.reconcileStage, 'calendar');
+  assert.deepEqual(decision.context.correlationConflict, conflict);
+  assert.doesNotMatch(JSON.stringify(decision.context), /private-header|private-description|stale-delta-task/);
+  const blocks = decisionBlocks(decision);
+  for (const block of blocks.filter(block => block.type === 'section')) assert.ok(block.text.text.length <= 3000);
+  const text = sectionText(blocks);
+  for (const id of [deltaId, masterId, requestedId, 'foreign-task', 'prior-task']) {
+    assert.ok(text.includes(id), id);
+  }
+  assert.match(text, /task state unverified/);
+  assert.match(text, /Calendar readback:.*Cancelled/);
 });
 
 test('repair DLQ failure records only the durable operation reference in safe context', async () => {

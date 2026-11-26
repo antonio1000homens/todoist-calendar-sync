@@ -1,3 +1,5 @@
+import type { Profile } from "./types.js";
+
 /**
  * Provider failures must retain the failing reconciliation candidate, without
  * mistaking an opaque Google HTTP 400 for a deleted Calendar occurrence.
@@ -10,8 +12,33 @@ export interface ReconciliationFailureContext {
   seriesId?: string;
 }
 
+export function exactProviderIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,1024}$/.test(value) ? value : undefined;
+}
+
 function safeIdentifier(value: unknown): string | undefined {
-  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,180}$/.test(value) ? value : undefined;
+  const id = exactProviderIdentifier(value);
+  return id && id.length <= 180 ? id : undefined;
+}
+
+export interface CalendarCorrelationConflict {
+  stage: "ensureTaskCorrelation";
+  profile?: Profile;
+  eventId: string;
+  taskId: string;
+  existingTaskId: string;
+  expectedTaskId?: string;
+  calendarEventState: "present" | "cancelled";
+  existingTaskState: "unverified";
+}
+
+const calendarCorrelationConflictMessage = "Calendar event is already correlated to a different Todoist task";
+
+export class CalendarCorrelationConflictError extends Error {
+  constructor(readonly correlationConflict: CalendarCorrelationConflict) {
+    super(calendarCorrelationConflictMessage);
+    this.name = "CalendarCorrelationConflictError";
+  }
 }
 
 function providerReason(body: unknown): string | undefined {
@@ -38,19 +65,24 @@ export class ReconciliationItemError extends Error {
   readonly status?: number;
   readonly providerReason?: string;
   readonly body?: string;
+  readonly correlationConflict?: CalendarCorrelationConflict;
 
   constructor(error: unknown, context: ReconciliationFailureContext) {
     const original = error as { status?: unknown; body?: unknown } | null;
     const status = Number(original?.status);
     const providerStatus = Number.isInteger(status) && status >= 400 && status < 600 ? status : undefined;
     const reason = providerReason(original?.body);
-    const taskId = safeIdentifier(context.taskId);
-    const eventId = safeIdentifier(context.eventId);
+    const conflict = error instanceof CalendarCorrelationConflictError || error instanceof ReconciliationItemError
+      ? error.correlationConflict : undefined;
+    const taskId = conflict?.taskId || safeIdentifier(context.taskId);
+    const eventId = conflict ? exactProviderIdentifier(context.eventId) : safeIdentifier(context.eventId);
     const seriesId = safeIdentifier(context.seriesId);
     const subject = [taskId ? `task ${taskId}` : undefined, eventId ? `event ${eventId}` : undefined,
       seriesId ? `series ${seriesId}` : undefined].filter(Boolean).join(", ") || "candidate";
     const causeName = error instanceof Error && /^[A-Za-z][A-Za-z0-9]*Error$/.test(error.name) ? error.name : "provider error";
-    super(`Reconciliation ${context.stage} failed for ${subject}: ${providerStatus ? `HTTP ${providerStatus}` : causeName}${reason ? ` (${reason})` : ""}`, { cause: error });
+    super(conflict ? calendarCorrelationConflictMessage
+      : `Reconciliation ${context.stage} failed for ${subject}: ${providerStatus ? `HTTP ${providerStatus}` : causeName}${reason ? ` (${reason})` : ""}`,
+    { cause: error });
     this.name = "ReconciliationItemError";
     this.stage = context.stage;
     this.taskId = taskId;
@@ -58,6 +90,7 @@ export class ReconciliationItemError extends Error {
     this.seriesId = seriesId;
     this.status = providerStatus;
     this.providerReason = reason;
+    this.correlationConflict = conflict;
     // Preserve the original response for the existing CloudWatch-only worker
     // diagnostic. Never add it to the message or to retained audit details.
     this.body = typeof original?.body === "string" ? original.body : undefined;
@@ -65,6 +98,7 @@ export class ReconciliationItemError extends Error {
 }
 
 export function reconciliationFailureDetails(error: unknown): Record<string, unknown> {
+  if (error instanceof CalendarCorrelationConflictError) return { correlationConflict: error.correlationConflict };
   if (!(error instanceof ReconciliationItemError)) return {};
   return {
     stage: error.stage,
@@ -73,5 +107,6 @@ export function reconciliationFailureDetails(error: unknown): Record<string, unk
     seriesId: error.seriesId,
     providerStatus: error.status,
     providerReason: error.providerReason,
+    ...(error.correlationConflict ? { correlationConflict: error.correlationConflict } : {}),
   };
 }

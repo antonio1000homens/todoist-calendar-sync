@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { GoogleCalendar } from "../dist/providers.js";
+import { CalendarCorrelationConflictError, ReconciliationItemError } from "../dist/reconciliation-diagnostics.js";
 import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
@@ -1064,6 +1066,51 @@ test("cancelling the currently active instance advances the same native task wit
   assert.equal(state.links[0].activeInstanceId, successor.id);
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(state.links[0].taskId, link.taskId);
+  assert.deepEqual(clients.calendarDeletes, []);
+});
+
+test("a correlation conflict during Calendar cancellation reports the delta occurrence and the master readback", async t => {
+  const cancelled = instance("cancelled-occurrence", "2099-10-20", "2099-10-21", "cancelled");
+  const successor = instance("successor", "2099-10-21", "2099-10-22");
+  const link = linkFor(cancelled);
+  const state = new FakeState(link);
+  const task = { id: link.taskId, content: cancelled.summary,
+    due: { date: cancelled.start.date, string: "every day", is_recurring: true } };
+  const master = { id: MASTER, iCalUID: SERIES, status: "confirmed", summary: cancelled.summary,
+    start: cancelled.start, recurrence: ["RRULE:FREQ=DAILY"] };
+  const clients = fakeClients(state, [cancelled, successor], new Map([[task.id, task]]), cancelled, [master]);
+  const calendar = new GoogleCalendar({}, profiles[PROFILE].calendarId);
+  t.mock.method(calendar, "getEvent", async id => {
+    assert.equal(id, MASTER);
+    return { ...master, status: "cancelled", extendedProperties: { shared: { taskId: "foreign-task" } } };
+  });
+  t.mock.method(calendar, "updateSharedEventPropertiesIfUnchanged", async () => {
+    assert.fail("the foreign link must survive cleanup");
+  });
+  clients.calendar.ensureTaskCorrelation = calendar.ensureTaskCorrelation.bind(calendar);
+  const update = t.mock.method(clients.todoist, "updateComment");
+  const upsert = t.mock.method(clients.todoist, "upsertProjectComment");
+  const cursor = t.mock.method(state, "putSyncToken");
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await assert.rejects(sync.process({
+    id: "cancelled-occurrence-delta", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2099-10-20T09:00:00Z", headers: {}, body: "",
+  }), error => {
+    assert.ok(error instanceof ReconciliationItemError);
+    assert.ok(error.cause instanceof CalendarCorrelationConflictError);
+    assert.equal(error.eventId, cancelled.id);
+    assert.equal(error.taskId, task.id);
+    assert.deepEqual(error.correlationConflict, {
+      eventId: MASTER, taskId: task.id, existingTaskId: "foreign-task", expectedTaskId: task.id,
+      profile: PROFILE, stage: "ensureTaskCorrelation", calendarEventState: "cancelled", existingTaskState: "unverified",
+    });
+    assert.equal(error.correlationConflict, error.cause.correlationConflict);
+    return true;
+  });
+  assert.equal(cursor.mock.callCount(), 0);
+  assert.equal(update.mock.callCount(), 0);
+  assert.equal(upsert.mock.callCount(), 0);
+  assert.deepEqual(clients.todoistDeletes, []);
   assert.deepEqual(clients.calendarDeletes, []);
 });
 

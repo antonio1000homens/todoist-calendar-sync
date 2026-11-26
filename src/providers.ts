@@ -2,6 +2,7 @@ import { createHash, createSign, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { profileForTodoistProject, profiles, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
+import { CalendarCorrelationConflictError, exactProviderIdentifier } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
 
@@ -249,9 +250,13 @@ export class GoogleCalendar {
   constructor(private readonly credentials: GoogleCredentials, private readonly calendarId: string,
     private readonly requestOptions:ProviderRequestOptions={}) {}
 
-  private correlate(event: CalendarEvent, mapping?: Partial<Mapping>): CalendarEvent {
-    const profile = (Object.entries(profiles) as Array<[Profile, (typeof profiles)[Profile]]>)
+  private configuredProfile(): Profile | undefined {
+    return (Object.entries(profiles) as Array<[Profile, (typeof profiles)[Profile]]>)
       .find(([, config]) => config.calendarId === this.calendarId)?.[0];
+  }
+
+  private correlate(event: CalendarEvent, mapping?: Partial<Mapping>): CalendarEvent {
+    const profile = this.configuredProfile();
     if (!profile) return event;
     const originalShared = event.extendedProperties?.shared || {};
     const {
@@ -301,11 +306,28 @@ export class GoogleCalendar {
   /** Ensure both provider directions can rediscover the exact task/master pair. */
   async ensureTaskCorrelation(eventId: string, taskId: string, expectedTaskId?: string,
     mapping?: Partial<Mapping>): Promise<CalendarEvent> {
-    if (!eventId || !taskId) throw new Error("Calendar correlation requires exact event and task IDs");
+    if (!exactProviderIdentifier(eventId) || !exactProviderIdentifier(taskId)
+      || (expectedTaskId !== undefined && !exactProviderIdentifier(expectedTaskId))) {
+      throw new Error("Calendar correlation requires exact event and task IDs");
+    }
     const current = await this.getEvent(eventId);
+    if (current?.id !== eventId) throw new Error("Calendar correlation readback did not match the exact event ID");
     const shared = current.extendedProperties?.shared || {};
-    if (shared.taskId && shared.taskId !== taskId && shared.taskId !== expectedTaskId) {
-      throw new Error("Calendar event is already correlated to a different Todoist task");
+    const existingTaskId = exactProviderIdentifier(shared.taskId);
+    if (shared.taskId !== undefined && !existingTaskId) {
+      throw new Error("Calendar correlation readback has an invalid shared task ID");
+    }
+    if (existingTaskId && existingTaskId !== taskId && existingTaskId !== expectedTaskId) {
+      throw new CalendarCorrelationConflictError({
+        stage: "ensureTaskCorrelation",
+        profile: mapping?.profile || this.configuredProfile(),
+        eventId,
+        taskId,
+        existingTaskId,
+        ...(expectedTaskId !== undefined ? { expectedTaskId } : {}),
+        calendarEventState: current.status === "cancelled" ? "cancelled" : "present",
+        existingTaskState: "unverified",
+      });
     }
     const candidate: CalendarEvent = {
       ...current,
@@ -321,6 +343,7 @@ export class GoogleCalendar {
       ...(shared.syncRecurrenceOwner !== undefined ? { syncRecurrenceOwner: null } : {}),
       ...(shared.syncCalendarNative !== undefined ? { syncCalendarNative: null } : {}) };
     if (!Object.keys(changes).length) return current;
+    if (current.status === "cancelled") throw new Error("Calendar correlation readback shows a cancelled event");
     if (!current.etag) throw new Error("Calendar correlation readback has no ETag");
     return this.updateSharedEventPropertiesIfUnchanged(eventId, current.etag, changes);
   }

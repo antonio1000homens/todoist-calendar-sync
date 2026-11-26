@@ -34,7 +34,7 @@ type CalendarAuditEvent={calendarId:string;event:CalendarEvent};
 
 const PROFILES:Profile[]=["home","antonio","work"];
 const ID=/^[A-Za-z0-9_.-]{1,1024}$/;
-const TASK_FIELDS=new Set(["taskId","providerTaskId","linkedTaskId","discardedTaskId","retainedTaskId","ownerTaskId"]);
+const TASK_FIELDS=new Set(["taskId","providerTaskId","existingTaskId","expectedTaskId","linkedTaskId","discardedTaskId","retainedTaskId","ownerTaskId"]);
 const EVENT_FIELDS=new Set(["eventId","providerEventId","masterEventId","activeInstanceId","calendarProjectionId","oldMasterId","newMasterId","lastEventId","occurrenceId","selectedEventId","previousEventId","cancelledEventId","syncHistoryMasterId"]);
 const TASK_ARRAYS=new Set(["candidateTaskIds","taskIds"]);
 const EVENT_ARRAYS=new Set(["candidateEventIds","eventIds"]);
