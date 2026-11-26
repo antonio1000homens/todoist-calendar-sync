@@ -1158,6 +1158,63 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         );
         log("todoist_provider_correlation_retry_verified", { profile, taskIdPreserved: true, masterIdPreserved: true, latestStateWon: true });
 
+        const storedBeforeNativeDiscovery = await state.getMappingByTask(profile, fixture.taskId);
+        if (storedBeforeNativeDiscovery?.taskId !== fixture.taskId
+          || (storedBeforeNativeDiscovery.masterEventId || storedBeforeNativeDiscovery.eventId) !== fixture.eventId) {
+          throw new Error("No-legacy discovery fixture lacks its exact temporary mapping row");
+        }
+        const discoveryComment = await providerMappingComment(
+          todoist, config.todoistProjectId, fixture.eventId, fixture.taskId,
+        );
+        if (!discoveryComment?.id) throw new Error("No-legacy discovery fixture has no exact project mapping comment to remove");
+        await state.deleteMapping(storedBeforeNativeDiscovery);
+        await todoist.deleteComment(discoveryComment.id);
+        const eventBeforeNativeDiscovery = await calendar.getEvent(fixture.eventId);
+        const discoveryShared = eventBeforeNativeDiscovery.extendedProperties?.shared || {};
+        const discoveryLinkKeys = Object.keys(discoveryShared)
+          .filter((key) => key === "taskId" || key.startsWith("sync"));
+        if (!discoveryLinkKeys.includes("taskId") || !discoveryLinkKeys.includes("syncTaskId")) {
+          throw new Error("No-legacy discovery fixture lacks the expected Calendar task identifiers");
+        }
+        await calendar.updateSharedEventPropertiesIfUnchanged(
+          fixture.eventId, eventBeforeNativeDiscovery.etag,
+          Object.fromEntries(discoveryLinkKeys.map((key) => [key, null])),
+        );
+        const storedAfterLinkRemoval = await state.getMappingByTask(profile, fixture.taskId);
+        if (storedAfterLinkRemoval?.taskId === fixture.taskId
+          || await providerMappingByTask(todoist, config.todoistProjectId, fixture.taskId)) {
+          throw new Error("No-legacy discovery fixture still has a Todoist mapping after targeted removal");
+        }
+        const unlinkedMaster = await calendar.getEvent(fixture.eventId);
+        if (unlinkedMaster.extendedProperties?.shared?.taskId
+          || unlinkedMaster.extendedProperties?.shared?.syncTaskId) {
+          throw new Error("No-legacy discovery fixture still has Calendar task correlation");
+        }
+        const taskBeforeNativeDiscovery = await todoist.getTask(fixture.taskId);
+        const discoveryPriority = taskBeforeNativeDiscovery.priority === 4 ? 3 : 4;
+        await todoist.upsertTask({ ...taskBeforeNativeDiscovery, priority: discoveryPriority }, fixture.taskId);
+        await poll(
+          `${profile} unique recurring candidate restores links without legacy mapping`, timeoutMs,
+          async () => {
+            const [master, currentTask, mapping, stored] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+              state.getMappingByTask(profile, fixture.taskId),
+            ]);
+            return { master, currentTask, mapping, stored };
+          },
+          ({ master, currentTask, mapping, stored }) => master.recurrence?.length === 1
+            && master.extendedProperties?.shared?.taskId === fixture.taskId
+            && master.extendedProperties?.shared?.syncTaskId === fixture.taskId
+            && currentTask.id === fixture.taskId && currentTask.priority === discoveryPriority
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
+            && mapping.seriesId === fixture.taskId && !stored,
+        );
+        log("todoist_recurring_candidate_recovered_without_legacy_mapping", {
+          profile, taskIdPreserved: true, masterIdPreserved: true,
+          providerLinksRestored: true, legacyMappingAbsent: true,
+        });
+
         const beforeCalendarRuleEdit = await todoist.getTask(fixture.taskId);
         const masterBeforeCalendarRuleEdit = await calendar.getEvent(fixture.eventId);
         const changedCalendarRule = await calendar.upsertEventIfUnchanged({
