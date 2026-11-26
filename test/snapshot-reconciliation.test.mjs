@@ -536,9 +536,43 @@ test("merges simultaneous edits and uses Calendar for same-field ties", async ()
   assert.equal(clients.metrics.todoistUpdates[0].next.content, "Todoist title edit");
   assert.equal(clients.metrics.todoistUpdates[0].next.description, "Calendar edit");
   assert.equal(clients.metrics.todoistUpdates[0].next.due.date, "2026-09-12");
-  assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(clients.metrics.calendarUpdates.length, 1);
+  assert.equal(clients.metrics.calendarUpdates[0].next.summary, "Todoist title edit");
   assert.equal(clients.metrics.calendarDeletes.length, 0);
   assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_simultaneous_edits_merged"), true);
+});
+
+test("simultaneous same-field edits use Todoist when its valid provider timestamp is later", async () => {
+  const m = mapping();
+  const oldTask = task();
+  const oldEvent = event();
+  const editedTask = task({
+    content: "Todoist title",
+    description: "Todoist description",
+    due: { date: "2026-09-12" },
+    updated_at: "2026-09-03T22:00:00Z",
+  });
+  const editedEvent = event({
+    summary: "Calendar title",
+    description: "Calendar description",
+    start: { date: "2026-09-13" },
+    end: { date: "2026-09-14" },
+    updated: "2026-09-03T21:00:00Z",
+  });
+  const state = new FakeState(m);
+  const store = new FakeStore(m, baseline(oldTask, oldEvent));
+  const clients = fakeClients({ listedTasks: [editedTask], taskById: new Map([[editedTask.id, editedTask]]),
+    calendarEvents: new Map([[editedEvent.id, editedEvent]]) });
+
+  await makeReconciler({ state, store, clients }).reconcile("home");
+
+  assert.equal(clients.metrics.todoistUpdates.length, 0, "Todoist already contains the winning values");
+  assert.equal(clients.metrics.calendarUpdates.length, 1);
+  assert.equal(clients.metrics.calendarUpdates[0].next.summary, "Todoist title");
+  assert.equal(clients.metrics.calendarUpdates[0].next.description, "Todoist description");
+  assert.equal(clients.metrics.calendarUpdates[0].next.start.date, "2026-09-12");
+  const mergeAudit = state.audits.find((audit) => audit.action === "todoist_snapshot_reconcile_simultaneous_edits_merged");
+  assert.equal(mergeAudit.detail.sameFieldWinner, "todoist_newer_provider_timestamp");
 });
 
 test("accepts both-sides-changed when the two providers have already converged", async () => {

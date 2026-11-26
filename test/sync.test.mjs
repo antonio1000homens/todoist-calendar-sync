@@ -42,7 +42,7 @@ test("mapping persistence writes provider correlation and a minimal shared-field
     return {id:eventId,summary:"Exact title",description:"Exact details",start:{dateTime:"2099-05-01T09:00:00Z"}};
   }};
   const sync=new Synchronizer(state,undefined,async()=>({todoist,calendar}));
-  await sync.saveMapping({profile:"home",calendarId:"old-calendar",eventId:"event-master",masterEventId:"event-master",
+  await sync.persistProviderMapping({profile:"home",calendarId:"old-calendar",eventId:"event-master",masterEventId:"event-master",
     taskId:"task-42",activeEffectiveStart:"2099-05-08T09:00:00Z",updatedAt:"2099-05-01T09:00:00Z"});
   assert.equal(correlations[0].eventId,"event-master");
   assert.equal(correlations[0].taskId,"task-42");
@@ -837,6 +837,9 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
         summary:task.content,description:"",start:{date:task.due.date},
         end:{date:"2027-08-17"},originalStartTime:{date:task.due.date},
       }];
+    },
+    async listInstancesInWindow(id){
+      return this.listInstances(id);
     },
   };
   const todoist={async listProjectComments(){return [];},async getTask(id){assert.equal(id,task.id);return structuredClone(task);}};

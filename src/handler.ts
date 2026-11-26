@@ -1,6 +1,6 @@
 import type { LambdaFunctionURLEvent, LambdaFunctionURLResult } from "aws-lambda";
 import { calendarWatchToken, profileForChannel, profileForTodoistRoute, proxySharedSecret, todoistWebhookSecret } from "./config.js";
-import { enqueueDelivery } from "./queue.js";
+import { enqueueCalendarSync, enqueueDelivery } from "./queue.js";
 import { StateRepository } from "./repository.js";
 import { equalSecret, sha256, validTodoistSignature } from "./security.js";
 import type { Delivery, Profile } from "./types.js";
@@ -106,10 +106,18 @@ export async function handler(event: LambdaFunctionURLEvent): Promise<LambdaFunc
   });
 
   if (kind === "calendar") {
+    const state = new StateRepository();
     try {
-      await new StateRepository().markCalendarWatchNotification(profile);
+      const generation = await state.markCalendarWatchNotification(profile, new Date().toISOString(),
+        headers["x-goog-channel-id"], headers["x-goog-message-number"]);
+      const queued = await enqueueCalendarSync(state, profile);
+      log(queued ? "calendar_notification_admitted" : "calendar_notification_coalesced", {
+        profile, generation, queued, deliveryId: id,
+      });
+      return response(202, { accepted: true, profile, mode, deliveryId: id, coalesced: !queued });
     } catch (error) {
-      logError("calendar_watch_notification_state_failed", error, { profile });
+      logError("calendar_notification_admission_failed", error, { profile, deliveryId: id });
+      return response(503, { error: "enqueue_failed", accepted: false, deliveryId: id });
     }
   }
 

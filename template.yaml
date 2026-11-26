@@ -401,6 +401,39 @@ Resources:
         Target: es2022
         Minify: true
 
+  CalendarSyncDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ResourceNamePrefix}-calendar-dispatcher-${Stage}
+      Handler: calendar-sync-dispatcher.handler
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      CodeUri: .
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt SyncState.Arn
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SyncQueue.QueueName
+      Events:
+        CalendarSyncDispatchSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Name: !Sub ${ResourceNamePrefix}-calendar-dispatch-${Stage}
+            Description: Recover durable pending Calendar notification generations without provider scans.
+            Enabled: true
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/calendar-sync-dispatcher.ts]
+        Format: cjs
+        Target: es2022
+        Minify: true
+
   ErasureWorkerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:

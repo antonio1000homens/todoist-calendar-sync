@@ -86,6 +86,19 @@ export interface ReconciliationContinuation {
   afterTaskId?: string;
   /** Last Calendar event id processed in Calendar snapshot recovery. Events are sorted before applying this cursor. */
   afterEventId?: string;
+  recurrence?: RecurrenceReconciliationSummary;
+}
+
+export type RecurrenceReconciliationOutcome = "converged" | "repaired" | "unsupported" | "excluded" | "blocked" | "stale" | "unverified";
+export interface RecurrenceReconciliationSummary {
+  total: number;
+  converged: number;
+  repaired: number;
+  unsupported: number;
+  excluded: number;
+  blocked: number;
+  stale: number;
+  unverified: number;
 }
 
 export interface Delivery {
@@ -113,6 +126,8 @@ export interface Delivery {
   manual?: ManualControlDelivery;
   slackInteraction?: SlackInteractionEnvelope;
   repair?: { operationId:string };
+  /** Internal durable incremental Calendar sync request. */
+  calendarSync?: { generation: number };
   /** @deprecated Compatibility for any pre-deployment queued reconcile message. */
   reconcileProfiles?: readonly Profile[];
 }

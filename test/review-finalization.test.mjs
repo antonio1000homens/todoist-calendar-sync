@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ReviewStore } from "../dist/review-store.js";
+import { ReviewStore, SyncControls } from "../dist/review-store.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
 
 process.env.STATE_TABLE_NAME ||= "test-state";
@@ -113,6 +113,64 @@ test("stale retry cannot erase the abandoned marker after an atomic failed-befor
   assert.match(commands[1].ConditionExpression,/abandoned = :yes/);
   assert.match(commands[1].ConditionExpression,/#status = :failed/);
 });
+
+test("expired repair writer with partial write evidence releases its lease for fresh reconciliation",async t=>{
+  let controlReads=0;
+  const commands=[];
+  t.mock.method(ReviewStore.prototype,"get",async pk=>{
+    if(!pk.startsWith("SYNC_CONTROL#")) return undefined;
+    controlReads+=1;
+    return controlReads===1?{activeRepair:"expired-repair"}:undefined;
+  });
+  t.mock.method(ReviewStore.prototype,"getOperation",async()=>({id:"expired-repair",status:"running",
+    updatedAt:new Date(Date.now()-17*60_000).toISOString(),writeStarted:true,outcomes:{provider:{status:"done"}}}));
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+
+  const blocked=await new SyncControls().blockedForReconciliation("home",{taskId:"task-expired"});
+  assert.equal(blocked,false);
+  const transaction=commands[0].input.TransactItems;
+  assert.equal(commands[0].constructor.name,"TransactWriteCommand");
+  assert.equal(transaction[0].Update.ConditionExpression,"activeRepair = :operationId");
+  assert.match(transaction[1].ConditionCheck.ConditionExpression,/#status = :status AND updatedAt = :updatedAt/);
+  assert.doesNotMatch(transaction[1].ConditionCheck.ConditionExpression,/writeStarted|outcomes|verified/);
+  assert.equal(controlReads,2);
+});
+
+test("live repair remains fenced and queues a refresh instead of retiring its lock",async t=>{
+  const commands=[];
+  t.mock.method(ReviewStore.prototype,"get",async pk=>pk.startsWith("SYNC_CONTROL#")
+    ?{activeRepair:"live-repair"}:undefined);
+  t.mock.method(ReviewStore.prototype,"getOperation",async()=>({id:"live-repair",status:"running",
+    updatedAt:new Date().toISOString()}));
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+
+  const blocked=await new SyncControls().blockedForReconciliation("home",{eventId:"event-live"});
+  assert.equal(blocked,true);
+  assert.equal(commands.length,1);
+  assert.equal(commands[0].constructor.name,"UpdateCommand");
+  assert.equal(commands[0].input.ConditionExpression,"activeRepair = :activeRepair");
+});
+
+test("concurrent repair operation update wins the retirement compare-and-swap",async t=>{
+  const commands=[];
+  t.mock.method(ReviewStore.prototype,"get",async pk=>pk.startsWith("SYNC_CONTROL#")
+    ?{activeRepair:"changed-repair"}:undefined);
+  t.mock.method(ReviewStore.prototype,"getOperation",async()=>({id:"changed-repair",status:"running",
+    updatedAt:new Date(Date.now()-17*60_000).toISOString()}));
+  t.mock.method(documentClient,"send",async command=>{
+    commands.push(command);
+    if(command.constructor.name==="TransactWriteCommand")
+      throw Object.assign(new Error("operation changed during retirement"),{name:"TransactionCanceledException"});
+    return {};
+  });
+
+  const blocked=await new SyncControls().blockedForReconciliation("home",{eventId:"event-raced"});
+  assert.equal(blocked,true);
+  assert.deepEqual(commands.map(command=>command.constructor.name),["TransactWriteCommand","UpdateCommand"]);
+  assert.match(commands[0].input.TransactItems[1].ConditionCheck.ConditionExpression,/updatedAt = :updatedAt/);
+  assert.equal(commands[1].input.ConditionExpression,"activeRepair = :activeRepair");
+});
+
 test("a previously dismissed alert can enter an explicit repair without losing its history",async t=>{
   const commands=[];
   const store=new ReviewStore();

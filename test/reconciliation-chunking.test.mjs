@@ -65,6 +65,7 @@ test("snapshot reconciliation resumes after the last processed task id and does 
   const inspectedEvents = [];
   const audits = [];
   let recurrenceRuns = 0;
+  const recurrence = { total: 3, converged: 2, repaired: 0, unsupported: 1, excluded: 0, blocked: 0, stale: 0, unverified: 0 };
 
   const state = {
     async syncBlocked() { return false; },
@@ -94,15 +95,18 @@ test("snapshot reconciliation resumes after the last processed task id and does 
     clients,
     store,
     async () => {},
-    async () => { recurrenceRuns += 1; },
+    async () => { recurrenceRuns += 1; return recurrence; },
   );
 
   const first = await reconciler.reconcile("home", undefined, 2);
-  assert.deepEqual(first.continuation, { sequence: 1, phase: "mapped", afterTaskId: "task-2" });
+  assert.deepEqual(first.continuation, { sequence: 1, phase: "mapped", afterTaskId: "task-2", recurrence });
   assert.equal(first.processedCandidates, 2);
+  assert.equal(first.counts.recurrence_converged, 2);
+  assert.equal(first.counts.recurrence_unsupported, 1);
+  assert.equal(first.counts.recurrence_reported, 1);
 
   const second = await reconciler.reconcile("home", first.continuation, 2);
-  assert.deepEqual(second.continuation, { sequence: 2, phase: "mapped", afterTaskId: "task-4" });
+  assert.deepEqual(second.continuation, { sequence: 2, phase: "mapped", afterTaskId: "task-4", recurrence });
   assert.equal(second.processedCandidates, 2);
 
   const third = await reconciler.reconcile("home", second.continuation, 2);

@@ -2,12 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
-import { Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
+import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
 const SERIES = "calendar-series";
+
+test("Calendar progress metadata takes precedence when recurrence provider IDs coincide", () => {
+  const mapping = { taskId: "same-provider-id", seriesId: "same-provider-id", calendarProgressVersion: 1 };
+  assert.equal(nativeRecurrenceShape(mapping), "calendar");
+  assert.notEqual(nativeRecurrenceShape(mapping), "todoist");
+  assert.equal(nativeRecurrenceShape({ taskId: "todoist-task", seriesId: "todoist-task" }), "todoist");
+  assert.equal(nativeRecurrenceShape({ taskId: "todoist-task", seriesId: "calendar-series" }), "calendar");
+  assert.equal(nativeRecurrenceShape({ taskId: "todoist-task", seriesId: "todoist-task", recurrenceOwner: "calendar" }), "todoist");
+  assert.equal(nativeRecurrenceShape({ taskId: "todoist-task", seriesId: "calendar-series", recurrenceOwner: "todoist" }), "calendar");
+});
 
 function instance(id, start, end, status = "confirmed") {
   return {
@@ -456,27 +466,74 @@ test("repeated reconciliation cannot walk through future occurrences", async () 
   assert.equal(state.links[0].activeInstanceId, "current");
 });
 
-test("scheduled reconciliation preserves one native recurring Todoist task and uses bounded inventory", async (t) => {
+test("scheduled reconciliation bootstraps provider correlation without advancing an overdue incomplete task", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-26T12:00:00Z") });
   const current = instance("oct-21", "2026-10-21", "2026-10-22");
   const successor = instance("oct-28", "2026-10-28", "2026-10-29");
   const link = { ...linkFor(current), calendarProgressVersion: 1 };
   const state = new FakeState(link);
-  const tasks = new Map([[link.taskId, { id: link.taskId, content: current.summary,
+  const tasks = new Map([[link.taskId, { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId, content: current.summary,
     due: { date: "2026-10-21", string: "every Wednesday starting 21 Oct 2026", is_recurring: true },
   }]]);
   const clients = fakeClients(state, [current, successor], tasks);
   clients.events.set(MASTER, { id: MASTER, status: "confirmed", summary: current.summary,
-    start: { date: "2026-10-21" }, recurrence: ["RRULE:FREQ=WEEKLY"] });
+    start: { date: "2026-10-21" }, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=WE"], etag: "master-etag",
+    extendedProperties: { shared: { taskId: link.taskId } } });
+  clients.calendar.ensureTaskCorrelation = async (eventId, taskId, _expectedTaskId, mapping) => {
+    const event = clients.events.get(eventId);
+    const shared = { ...(event.extendedProperties?.shared || {}), taskId,
+      syncSchemaVersion: "2", syncProfile: PROFILE, syncCalendarId: profiles[PROFILE].calendarId,
+      syncTaskId: taskId, syncEventId: eventId, syncSeriesId: mapping.seriesId,
+      syncMasterEventId: mapping.masterEventId, syncActiveInstanceId: mapping.activeInstanceId,
+      syncOriginalStart: mapping.originalStart, syncActiveEffectiveStart: mapping.activeEffectiveStart,
+      ...(mapping.calendarProgressVersion === 1 ? { syncProgressVersion: "1" } : {}) };
+    const updated = { ...event, extendedProperties: { ...event.extendedProperties, shared }, etag: "master-etag-2" };
+    clients.events.set(eventId, updated);
+    return structuredClone(updated);
+  };
   clients.calendar.listInstances = async () => { throw new Error("unbounded expansion forbidden"); };
-  await new Synchronizer(state, undefined, async () => clients).reconcile(PROFILE);
-  assert.equal(clients.todoistRecurringUpdates.length, 1);
+  const recurrenceSummary = await new Synchronizer(state, undefined, async () => clients).reconcile(PROFILE);
+  assert.equal(recurrenceSummary.total, 1);
+  assert.equal(recurrenceSummary.converged + recurrenceSummary.repaired + recurrenceSummary.unsupported
+    + recurrenceSummary.excluded + recurrenceSummary.blocked + recurrenceSummary.stale
+    + recurrenceSummary.unverified, recurrenceSummary.total);
+  assert.equal(clients.todoistRecurringUpdates.length, 0, "elapsed time alone does not complete the represented task");
   assert.deepEqual(clients.todoistDeletes, []);
   assert.deepEqual(clients.todoistUpserts, []);
   assert.equal(state.links[0].taskId, link.taskId);
-  assert.equal(state.links[0].activeInstanceId, successor.id);
+  assert.equal(state.links[0].activeInstanceId, current.id);
   assert.equal(tasks.get(link.taskId).due.is_recurring, true);
-  assert.equal(tasks.get(link.taskId).due.date, successor.start.date);
+  assert.equal(tasks.get(link.taskId).due.date, current.start.date);
+});
+
+test("scheduled reconciliation repairs a stale active pointer and reports unsupported Calendar recurrence as nonblocking",async()=>{
+  const active={...instance("unsupported-current","2099-01-01","2099-01-02"),
+    extendedProperties:{shared:{taskId:"task-current"}}};
+  const successor={...instance("unsupported-next","2099-01-02","2099-01-03"),
+    extendedProperties:{shared:{taskId:"task-current"}}};
+  const link={...linkFor(active),activeInstanceId:"stale-instance"};
+  const state=new FakeState(link);
+  const task={id:link.taskId,project_id:profiles[PROFILE].todoistProjectId,content:active.summary,description:"",
+    due:{date:active.start.date,string:"every day",is_recurring:true}};
+  const tasks=new Map([[task.id,task]]);
+  const master={id:MASTER,status:"confirmed",summary:active.summary,description:"",
+    start:{date:"2099-01-01"},end:{date:"2099-01-02"},
+    recurrence:["RRULE:FREQ=DAILY;BYSETPOS=1"],etag:"unsupported-master-v1",
+    extendedProperties:{shared:{taskId:task.id}}};
+  const clients=fakeClients(state,[active,successor],tasks,undefined,[master]);
+
+  const result=await new Synchronizer(state,undefined,async()=>clients).reconcile(PROFILE);
+
+  assert.equal(result.total,1);
+  assert.equal(result.unsupported,1,JSON.stringify({result,audits:state.audits}));
+  assert.equal(result.blocked,0);
+  assert.equal(result.unverified,0);
+  assert.equal(clients.todoistUpserts.length,0);
+  assert.equal(clients.todoistRecurringUpdates.length,0);
+  assert.equal(state.links[0].activeInstanceId,active.id);
+  assert.equal(state.audits.some(item=>item.action==="calendar_recurrence_active_occurrence_mapping_repaired"),true);
+  assert.equal(state.audits.some(item=>item.action==="calendar_recurrence_todoist_rule_unsupported"
+    && item.detail.outcome==="unsupported" && item.detail.existingMirrorPreserved),true);
 });
 
 test("Calendar series rule edit updates the exact native Todoist task in place", async () => {
@@ -618,7 +675,8 @@ test("repeated Calendar master notifications upgrade an exact one-off mirror to 
   const next = instance("next", "2100-01-01", "2100-01-02");
   const link = linkFor(current);
   const state = new FakeState(link);
-  const tasks = new Map([[link.taskId, { id: link.taskId, content: current.summary, description: "", due: { date: current.start.date } }]]);
+  const tasks = new Map([[link.taskId, { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId,
+    content: current.summary, description: "", due: { date: current.start.date } }]]);
   const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, start: structuredClone(current.start),
     recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
   const clients = fakeClients(state, [current, next], tasks, master);
@@ -894,6 +952,34 @@ test("cancelling the currently active instance advances the same native task wit
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(state.links[0].taskId, link.taskId);
   assert.deepEqual(clients.calendarDeletes, []);
+});
+
+test("Todoist-native active-instance cancellation uses a bounded Calendar occurrence window", async () => {
+  const current = instance("todoist-day-20", "2099-10-20", "2099-10-21", "cancelled");
+  const successor = instance("todoist-day-21", "2099-10-21", "2099-10-22");
+  const task = { id: "task-recurring", project_id: profiles[PROFILE].todoistProjectId,
+    content: current.summary, due: { date: "2099-10-20", string: "every day", is_recurring: true } };
+  const master = { id: MASTER, iCalUID: SERIES, status: "confirmed", summary: current.summary,
+    start: { date: "2099-10-20" }, recurrence: ["RRULE:FREQ=DAILY"],
+    extendedProperties: { shared: { taskId: task.id, todoistRecurrence: "every day" } } };
+  const link = todoistOwnedLink(master, current, task.id);
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [current, successor], new Map([[task.id, task]]), current, [master]);
+  const originalBoundedRead = clients.calendar.listInstancesInWindow.bind(clients.calendar);
+  let boundedRead;
+  clients.calendar.listInstances = async () => { throw new Error("unbounded occurrence expansion forbidden"); };
+  clients.calendar.listInstancesInWindow = async (masterId, start, end) => {
+    boundedRead = { masterId, start, end };
+    return originalBoundedRead(masterId, start, end);
+  };
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "todoist-native-current-cancelled", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2099-10-20T09:00:00Z", headers: {}, body: "",
+  });
+  assert.equal(clients.todoistRecurringUpdates.length, 1);
+  assert.equal(state.links[0].activeInstanceId, successor.id);
+  assert.equal(boundedRead.masterId, MASTER);
+  assert.ok(Date.parse(boundedRead.end) - Date.parse(boundedRead.start) < 4 * 366 * 24 * 60 * 60_000);
 });
 
 test("cancelled Calendar master still terminates a Calendar-owned recurrence", async () => {
@@ -1270,7 +1356,8 @@ test("Todoist completion observing a missing RRULE master writes suppression bef
 });
 
 test("Calendar series rule edit updates the Todoist-owned task without replacing either identity", async () => {
-  const task = { id: "task-recurring", content: "Water plants", description: "", due: { date: "2099-01-01", string: "every day", is_recurring: true } };
+  const task = { id: "task-recurring", project_id: profiles[PROFILE].todoistProjectId,
+    content: "Water plants", description: "", due: { date: "2099-01-01", string: "every day", is_recurring: true } };
   const projected = { ...toCalendarEvent(task), id: "todoist-master", status: "confirmed" };
   const active = todoistInstance(projected.id, task.id, "instance-1", "2099-01-01");
   const successor = todoistInstance(projected.id, task.id, "instance-8", "2099-01-08");
@@ -1348,7 +1435,7 @@ for (const shape of ["title-date", "shared-master", "shared-instance", "one-off-
     const current = instance("current", "2099-01-01", "2099-01-02");
     const master = { id: MASTER, iCalUID: SERIES, summary: current.summary, start: structuredClone(current.start),
       recurrence: ["RRULE:FREQ=YEARLY"], status: "confirmed" };
-    const task = { id:"original-task", content:current.summary, project_id:"home-project", due:{ date:current.start.date, is_recurring:true } };
+    const task = { id:"original-task", content:current.summary, project_id:profiles[PROFILE].todoistProjectId, due:{ date:current.start.date, is_recurring:true } };
     if (shape === "recurring-existing-mirror") task.due.string = "every week";
     if (shape === "shared-master" || shape === "one-off-other-profile") master.extendedProperties = {shared:{taskId:task.id}};
     if (shape === "shared-instance") current.extendedProperties = {shared:{taskId:task.id}};
@@ -1473,7 +1560,7 @@ test("Calendar rename updates a native Todoist task without rewinding its automa
   const link = { ...linkFor(current, "advanced-task"), calendarProgressVersion: 1,
     syncedTitle: "Weekly test", syncedDescription: "" };
   const state = new FakeState(link);
-  const task = { id: link.taskId, project_id: "home-project", content: "Weekly test",
+  const task = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId, content: "Weekly test",
     description: "", due: { date: "2026-11-04", string: "every Wednesday", is_recurring: true } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
   const clients = fakeClients(state, [current, next], tasks, master);
@@ -1505,7 +1592,7 @@ test("native Todoist completion already at next Calendar occurrence updates mapp
   const link = { ...linkFor(current, "advanced-task"), calendarProgressVersion: 1,
     syncedTitle: "Weekly test", syncedDescription: "" };
   const state = new FakeState(link);
-  const oldTask = { id: link.taskId, project_id: "home-project", content: "Weekly test",
+  const oldTask = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId, content: "Weekly test",
     description: "", due: { date: "2026-10-28", string: "every Wednesday", is_recurring: true } };
   const tasks = new Map([[oldTask.id, { ...structuredClone(oldTask),
     due: { ...oldTask.due, date: "2026-11-04" } }]]);

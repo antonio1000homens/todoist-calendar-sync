@@ -447,6 +447,19 @@ export async function resolvePreferredMappingComment(
   return legacy ? { source: "legacy_task", comment: legacy } : undefined;
 }
 
+function stableMappingValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableMappingValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => key !== "mappingRevision" && key !== "updatedAt")
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => [key, stableMappingValue(item)]));
+}
+
+function semanticallyEqualMappingPayload(left: ProjectMappingCommentPayload, right: ProjectMappingCommentPayload): boolean {
+  return JSON.stringify(stableMappingValue(left)) === JSON.stringify(stableMappingValue(right));
+}
+
 export async function upsertProjectMappingComment(
   client: ProjectCommentClient,
   mapping: Mapping,
@@ -462,6 +475,15 @@ export async function upsertProjectMappingComment(
         && (entry.payload.seriesId === stableSeries || entry.payload.masterEventId === stableSeries))
       .sort(newest)[0]
     : findProjectMappingComment(projectIndex, mapping);
+  if (existing?.payload.schemaVersion === 2) {
+    const desired = parseMappingComment({
+      id: existing.comment.id,
+      content: serializeMappingComment(mapping, projectId, calendarUrl, existing.payload.mappingRevision),
+    });
+    if (desired && !("error" in desired)
+      && semanticallyEqualMappingPayload(existing.payload, desired.payload))
+      return mappingFromProjectMappingComment(existing);
+  }
   const revision = Math.max(mapping.mappingRevision || 0, existing?.payload.mappingRevision || 0) + 1;
   const draft: Mapping = { ...mapping, projectId, mappingRevision: revision, updatedAt: new Date().toISOString() };
   const comment = await client.upsertProjectComment(projectId, serializeMappingComment(draft, projectId, calendarUrl, revision), existing?.comment.id);

@@ -1,9 +1,18 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { randomUUID } from "node:crypto";
 import { StateRepository } from "./repository.js";
 import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
 const queue = new SQSClient({});
+
+export class CalendarSyncAdmissionError extends Error {
+  constructor(cause: unknown) {
+    super("Unable to durably admit a follow-up Calendar sync request");
+    this.name = "CalendarSyncAdmissionError";
+    (this as Error & { cause?: unknown }).cause = cause;
+  }
+}
 
 function queueUrl(): string {
   const value = process.env.QUEUE_URL;
@@ -23,6 +32,35 @@ export async function enqueueDelivery(delivery: Delivery): Promise<void> {
     MessageGroupId: syncMessageGroupId(delivery.profile),
     MessageDeduplicationId: messageDeduplicationId(delivery),
   }));
+}
+
+/** Admit at most one incremental Calendar request per profile. DynamoDB owns
+ * the durable claim; FIFO preserves its order alongside independent Todoist
+ * deliveries. An expired claim is recoverable after an ingress crash. */
+export async function enqueueCalendarSync(state: StateRepository, profile: Profile): Promise<boolean> {
+  let generation: number | undefined;
+  try {
+    generation = await state.claimCalendarSyncDispatch(profile);
+    if (generation === undefined) {
+      if (await state.calendarSyncAlreadyHandled(profile)) return false;
+      throw new Error(`Calendar sync request for ${profile} is still awaiting durable queue admission`);
+    }
+    const delivery: Delivery = {
+      id: `calendar-sync:${profile}:${generation}:${randomUUID()}`, kind: "calendar", profile, mode: "aws",
+      receivedAt: new Date().toISOString(), headers: {}, body: "", calendarSync: { generation },
+    };
+    await enqueueDelivery(delivery);
+    await state.markCalendarSyncQueued(profile, generation);
+    return true;
+  }
+  catch (error) {
+    let cause: unknown = error;
+    if (generation !== undefined) {
+      try { await state.releaseCalendarSyncDispatch(profile, generation); }
+      catch (releaseError) { cause = new AggregateError([error, releaseError], "Calendar sync dispatch and claim release both failed"); }
+    }
+    throw new CalendarSyncAdmissionError(cause);
+  }
 }
 
 export interface ReconciliationRequestResult {

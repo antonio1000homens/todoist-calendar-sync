@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
+import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 import { Synchronizer } from "../dist/sync.js";
 
 const PROFILE = "home";
@@ -146,6 +147,7 @@ function fixture({ unlinked = false, unmapped = false, timed = false, initialMap
   const events = new Map(unlinked ? [] : [[MASTER_ID, master]]);
   for (const event of instances) events.set(event.id, event);
   const upserts = [];
+  const deletes = [];
   const projectId = profiles[PROFILE].todoistProjectId;
   const projectComments = !unlinked && !unmapped && initialMapping ? [{
     id: "provider-mapping", project_id: projectId,
@@ -167,10 +169,20 @@ function fixture({ unlinked = false, unmapped = false, timed = false, initialMap
     async listInstances() {
       return instances.map((event) => structuredClone(event));
     },
+    async listInstancesInWindow() {
+      return instances.map((event) => structuredClone(event));
+    },
     async listExplicitSeriesExceptions() { return []; },
     async upsertEvent(payload, existingId) {
       const id = existingId || MASTER_ID;
       const stored = { ...structuredClone(payload), id, status: "confirmed", etag: `updated-${upserts.length + 1}` };
+      if (payload.recurrence?.length === 0 && events.get(id)?.recurrence?.length) {
+        for (const property of ["todoistRecurrence", "todoistAnchorStart", "todoistAnchorEnd",
+          "todoistAnchorAllDay", "todoistAnchorTimeZone", "todoistTemplateSummary", "todoistTemplateDescription",
+          "syncSeriesId", "syncMasterEventId", "syncActiveInstanceId", "syncOriginalStart",
+          "syncActiveEffectiveStart", "syncProgressVersion", "syncCompletedThrough", "syncTodoistPhaseBVersion",
+          "todoistPhaseBVersion"]) delete stored.extendedProperties.shared[property];
+      }
       events.set(id, stored);
       upserts.push({ id, payload: structuredClone(payload), existingId });
       return structuredClone(stored);
@@ -179,7 +191,7 @@ function fixture({ unlinked = false, unmapped = false, timed = false, initialMap
       assert.equal(events.get(existingId)?.etag, etag);
       return this.upsertEvent(payload, existingId);
     },
-    async deleteEvent() {},
+    async deleteEvent(id) { deletes.push(id); },
   };
   const todoist = {
     async listProjectComments() { return projectComments.filter(comment => comment.is_deleted !== true).map(comment => structuredClone(comment)); },
@@ -195,7 +207,7 @@ function fixture({ unlinked = false, unmapped = false, timed = false, initialMap
     async getTask() { return structuredClone(currentTodoistTask); },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
-  return { state, sync, upserts, events, calendar, todoist };
+  return { state, sync, upserts, deletes, events, calendar, todoist };
 }
 
 function delivery(task, oldTask, updateIntent = "item_updated") {
@@ -254,21 +266,63 @@ test("Todoist series rule edit conditionally updates and verifies the exact Cale
   assert.equal(state.audits.at(-1).action, "todoist_updated_calendar");
 });
 
+test("converting a Todoist recurring task to one-off updates the same Calendar event in place", async () => {
+  const oldTask = recurringTask("2026-09-14");
+  const task = { ...recurringTask("2026-09-15", "Water plants", "2026-09-14T11:00:00Z"),
+    due: { date: "2026-09-15", is_recurring: false } };
+  const { state, sync, upserts, deletes, events } = fixture();
+
+  await sync.process(delivery(task, oldTask));
+
+  const converted = events.get(MASTER_ID);
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0].id, MASTER_ID);
+  assert.equal(upserts[0].existingId, MASTER_ID);
+  assert.deepEqual(upserts[0].payload.recurrence, []);
+  assert.deepEqual(converted.recurrence, []);
+  assert.equal(converted.extendedProperties.shared.taskId, TASK_ID);
+  for (const key of ["todoistRecurrence", "todoistAnchorStart", "syncSeriesId", "syncMasterEventId",
+    "syncActiveInstanceId", "syncProgressVersion"]) {
+    assert.equal(converted.extendedProperties.shared[key], undefined, `${key} was retired during conversion`);
+  }
+  assert.deepEqual(deletes, [], "conversion must not delete the linked Calendar identity before relinking");
+  assert.equal(state.mapping.taskId, TASK_ID);
+  assert.equal(state.mapping.eventId, MASTER_ID);
+  assert.equal(state.mapping.seriesId, undefined);
+  assert.equal(state.mapping.masterEventId, undefined);
+  assert.equal(state.mapping.activeInstanceId, undefined);
+});
+
 test("scheduled reconciliation repairs a Todoist-native series from exact provider correlation", async () => {
   const task = recurringTask("2026-09-14", "Water plants", "2026-09-14T10:05:00Z", "every month");
-  const { state, sync, upserts, events, todoist } = fixture();
+  const { state, sync, upserts, events, todoist, calendar } = fixture();
   currentTodoistTask = task;
   const projectId = profiles[PROFILE].todoistProjectId;
-  const commentMapping = { ...state.mapping, projectId, mappingRevision: 1 };
+  const previousTask = recurringTask("2026-09-14", "Water plants", "2026-09-14T09:00:00Z", "every monday");
+  const commentMapping = { ...state.mapping, projectId, mappingRevision: 1,
+    syncBaseline: providerSyncBaseline(previousTask, events.get("instance-14"), events.get(MASTER_ID)) };
   todoist.listProjectComments = async () => [{
     id: "project-mapping", project_id: projectId,
     content: serializeMappingComment(commentMapping, projectId),
   }];
+  calendar.ensureTaskCorrelation = async (eventId, taskId, _expectedTaskId, mapping) => {
+    const current = events.get(eventId);
+    const shared = { ...(current.extendedProperties?.shared || {}), taskId,
+      syncSchemaVersion: "2", syncProfile: PROFILE, syncCalendarId: profiles[PROFILE].calendarId,
+      syncTaskId: taskId, syncEventId: eventId, syncSeriesId: mapping.seriesId,
+      syncMasterEventId: mapping.masterEventId, syncActiveInstanceId: mapping.activeInstanceId,
+      syncOriginalStart: mapping.originalStart, syncActiveEffectiveStart: mapping.activeEffectiveStart,
+      ...(mapping.todoistPhaseBVersion === 1 ? { syncTodoistPhaseBVersion: "1" } : {}) };
+    const updated = { ...current, extendedProperties: { ...current.extendedProperties, shared }, etag: "updated-metadata" };
+    events.set(eventId, updated);
+    upserts.push({ id: eventId, payload: { extendedProperties: { shared } }, existingId: eventId });
+    return structuredClone(updated);
+  };
 
   await sync.reconcile(PROFILE);
   await sync.reconcile(PROFILE);
 
-  assert.equal(upserts.length, 1, "the second full reconciliation is a no-op");
+  assert.equal(upserts.length, 1, `the second full reconciliation is a no-op: ${JSON.stringify({ audits: state.audits, upserts })}`);
   assert.equal(upserts[0].existingId, MASTER_ID);
   assert.deepEqual(events.get(MASTER_ID).recurrence, ["RRULE:FREQ=MONTHLY"]);
   assert.equal(events.get(MASTER_ID).extendedProperties.shared.taskId, TASK_ID);

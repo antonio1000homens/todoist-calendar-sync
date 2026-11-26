@@ -33,6 +33,7 @@ type ErrorFields = {
   name?: string;
   cause?: unknown;
   status?: number;
+  retryAfterMs?: number;
   $retryable?: { throttling?: boolean };
   CancellationReasons?: Array<{ Code?: string }>;
 };
@@ -125,17 +126,34 @@ export function failedDeliveryDisposition(
   return { kind:"retry_fifo", reason:transientProvider ? "transient_provider" : "transient_dynamodb", receiveCount:attempts };
 }
 
-export function transientRetryVisibilitySeconds(receiveCount: number): number {
-  return Math.min(240, 30 * 2 ** Math.max(0, Math.min(3, receiveCount - 1)));
+export function transientRetryVisibilitySeconds(receiveCount: number, retryAfterMs?: number): number {
+  const exponential = 30 * 2 ** Math.max(0, Math.min(3, receiveCount - 1));
+  const hinted = Number.isFinite(retryAfterMs) ? Math.ceil(Math.max(0, retryAfterMs!) / 1000) : 0;
+  return Math.min(43_200, Math.max(exponential, hinted));
 }
 
-export async function shortenTransientRetryVisibility(record: SQSRecord, receiveCount: number): Promise<void> {
+export function providerRetryAfterMs(error: unknown): number | undefined {
+  const visited = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth++) {
+    if (visited.has(current)) break;
+    visited.add(current);
+    const e = fields(current);
+    if (Number(e.status) === 429 && Number.isFinite(e.retryAfterMs) && Number(e.retryAfterMs) >= 0)
+      return Number(e.retryAfterMs);
+    current = e.cause;
+  }
+  return undefined;
+}
+
+export async function shortenTransientRetryVisibility(record: SQSRecord, receiveCount: number,
+  retryAfterMs?: number): Promise<void> {
   const queueUrl = process.env.SYNC_QUEUE_URL;
   if (!queueUrl || !record.receiptHandle) throw new Error("Source SQS queue URL and receipt handle required");
   await syncFailureQueueClient.send(new ChangeMessageVisibilityCommand({
     QueueUrl:queueUrl,
     ReceiptHandle:record.receiptHandle,
-    VisibilityTimeout:transientRetryVisibilitySeconds(receiveCount),
+    VisibilityTimeout:transientRetryVisibilitySeconds(receiveCount, retryAfterMs),
   }));
 }
 

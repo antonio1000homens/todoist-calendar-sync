@@ -13,6 +13,7 @@ const reviewStoreSource = await readText("../src/review-store.ts");
 const syncSource = await readText("../src/sync.ts");
 const mappingCommentsSource = await readText("../src/mapping-comments.ts");
 const queueSource = await readText("../src/queue.ts");
+const calendarDispatcherSource = await readText("../src/calendar-sync-dispatcher.ts");
 const healthSource = await readText("../src/reconcile.ts");
 const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
@@ -40,6 +41,10 @@ test("completed-history EventBridge rule is conditionally managed after SAM tran
   assert.match(productionWorkflow, /Refusing automatic cleanup: #277 seven-day retained-mapping lifecycle is absent/);
   assert.doesNotMatch(productionWorkflow, /^\s*COMPLETED_HISTORY_CLEANUP_APPLY:\s*'true'\s*$/m);
   assert.match(productionWorkflow, /Verify completed-history retirement schedule and Lambda mode/);
+});
+
+test("legacy cutover inventory includes consumed confirmation records", () => {
+  assert.match(legacyCutoverAuditSource, /startsWith\("ERASURE_CONFIRMATION#"\)/);
 });
 
 test("FIFO ordering is isolated by profile", () => {
@@ -153,6 +158,19 @@ test("standalone deployment role scopes SNS and removes the legacy deploy path",
 test("ingress no longer claims DynamoDB delivery state before SQS enqueue", () => {
   assert.doesNotMatch(handlerSource, /claimDelivery\s*\(/);
   assert.match(handlerSource, /await enqueueDelivery\(delivery\)/);
+});
+
+test("pending Calendar notifications have an independent lightweight dispatch recovery schedule", () => {
+  const dispatcher = template.match(/  CalendarSyncDispatcherFunction:[\s\S]*?\n  ErasureWorkerLogGroup:/)?.[0] || "";
+  assert.match(dispatcher, /Handler: calendar-sync-dispatcher\.handler/);
+  assert.match(dispatcher, /Schedule: rate\(1 minute\)/);
+  assert.match(dispatcher, /Enabled: true/);
+  assert.match(dispatcher, /dynamodb:GetItem/);
+  assert.match(dispatcher, /dynamodb:UpdateItem/);
+  assert.match(dispatcher, /SQSSendMessagePolicy/);
+  assert.match(calendarDispatcherSource, /calendarSyncDispatchDue\(profile\)/);
+  assert.match(calendarDispatcherSource, /enqueueCalendarSync\(state, profile\)/);
+  assert.doesNotMatch(calendarDispatcherSource, /GoogleCalendar|Todoist|listDelta|reconcile/);
 });
 
 test("ordinary ingress and processing do not use persistent erasure admission state", () => {

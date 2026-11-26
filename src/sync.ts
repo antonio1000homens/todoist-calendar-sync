@@ -39,7 +39,8 @@ import {
   matchesCalendarOwnedRecurringTask,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
-import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
+import type { CalendarEvent, CompletedCalendarProjection, Delivery, Mapping, Profile, RecurrenceLink,
+  RecurrenceReconciliationOutcome, RecurrenceReconciliationSummary, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
 /**
  * Canonical matching deliberately excludes a recurring Todoist task when
@@ -94,6 +95,27 @@ export function calendarEventGoneOnDirectRead(error: unknown): boolean {
 function taskDateTime(task: TodoistTask): string | undefined {
   const due = task.due;
   return due?.datetime || (due?.date && due.date.includes("T") ? due.date : undefined);
+}
+
+function boundedRecurrenceWindow(anchor: string | undefined, nowMs = Date.now()): { start: string; end: string } | undefined {
+  const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
+  const pivot = Number.isFinite(anchorMs) ? anchorMs : nowMs;
+  return Number.isFinite(pivot) && Number.isFinite(nowMs)
+    ? {
+      start: new Date(pivot - 24 * 60 * 60_000).toISOString(),
+      end: new Date(Math.max(pivot, nowMs) + 3 * 366 * 24 * 60 * 60_000).toISOString(),
+    }
+    : undefined;
+}
+
+async function listBoundedRecurrenceInstances(
+  calendar: GoogleCalendar,
+  masterId: string,
+  anchor: string | undefined,
+): Promise<CalendarEvent[]> {
+  const window = boundedRecurrenceWindow(anchor);
+  if (!window) throw new Error(`Unable to establish bounded recurrence window for ${masterId}`);
+  return calendar.listInstancesInWindow(masterId, window.start, window.end);
 }
 
 function taskHasDue(task: TodoistTask | undefined): boolean {
@@ -304,7 +326,8 @@ export function toCalendarEvent(task: TodoistTask, existing?: CalendarEvent, pre
     description: normalizedDescription(task.description),
     start,
     end,
-    recurrence: rrule ? [rrule] : existing && !existing.recurringEventId ? [] : undefined,
+    recurrence: rrule ? [rrule]
+      : (Boolean(existing?.recurrence?.length) || Boolean(existing && !existing.recurringEventId)) ? [] : undefined,
     extendedProperties: {
       shared: {
         taskId: task.id,
@@ -584,13 +607,22 @@ function recurrenceLink(mapping: Mapping): RecurrenceLink {
 // project comment stores seriesId/taskId correlation and the Calendar master
 // stores its exact Todoist task ID; normal routing does not depend on an owner
 // label or on DynamoDB recurrence rows.
+export function nativeRecurrenceShape(mapping: Mapping | undefined): "calendar" | "todoist" | undefined {
+  if (!mapping?.seriesId) return undefined;
+  // Calendar progress is explicit evidence that occurrence exceptions and
+  // completion advancement are represented through Calendar instances. It
+  // takes precedence over coincidentally equal provider IDs, so one mapping
+  // can never enter both recurrence processing paths.
+  if (mapping.calendarProgressVersion === 1) return "calendar";
+  return mapping.seriesId === mapping.taskId ? "todoist" : "calendar";
+}
+
 function isTodoistNativeSeries(mapping: Mapping | undefined): mapping is Mapping {
-  return Boolean(mapping?.seriesId && mapping.seriesId === mapping.taskId);
+  return nativeRecurrenceShape(mapping) === "todoist";
 }
 
 function isCalendarNativeSeries(mapping: Mapping | undefined): mapping is Mapping {
-  return Boolean(mapping?.seriesId && mapping.seriesId !== mapping.taskId
-    || mapping?.calendarProgressVersion === 1);
+  return nativeRecurrenceShape(mapping) === "calendar";
 }
 
 function completedCalendarProjection(
@@ -675,7 +707,7 @@ export class Synchronizer {
         && (entry.payload.seriesId === stableSeries || entry.payload.masterEventId === stableSeries))
       : [];
     const previousTaskIds = new Set(existingSeriesMappings.map(entry => entry.payload.taskId));
-    if (previousTaskIds.size > 1 && !previousTaskIds.has(next.taskId))
+    if (previousTaskIds.size > 1)
       throw new Error("Provider-native series correlation is ambiguous across Todoist task IDs");
     const expectedTaskId = previousTaskIds.size === 1 ? [...previousTaskIds][0] : undefined;
     const correlationEventId = next.masterEventId || next.eventId;
@@ -811,11 +843,6 @@ export class Synchronizer {
     });
   }
 
-  /** @deprecated Kept for callers migrating from the repository-backed writer. */
-  async saveMapping(mapping: Mapping, todoist?: Todoist): Promise<Mapping> {
-    return this.persistProviderMapping(mapping, todoist);
-  }
-
   async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (!this.providerCommentReaderAvailable(client)) {
@@ -848,6 +875,105 @@ export class Synchronizer {
       throw new Error(`Todoist task ${taskId} has conflicting provider mapping comments`);
     }
     return latest;
+  }
+
+  private async verifyTodoistSeriesPair(
+    profile: Profile, taskId: string, masterEventId: string, calendar: GoogleCalendar, todoist: Todoist,
+    previous: { taskUpdatedAt?: string; masterUpdated?: string; mapping?: Mapping } = {},
+  ): Promise<RecurrenceReconciliationOutcome> {
+    let task: TodoistTask;
+    let master: CalendarEvent;
+    try {
+      [task, master] = await Promise.all([todoist.getTask(taskId), calendar.getEvent(masterEventId)]);
+    } catch (error) {
+      if ([404, 410].includes(Number((error as { status?: number }).status))) {
+        await this.state.audit(profile, "calendar_recurrence_reconciliation_unverified", {
+          taskId, masterEventId, reasons: ["provider_object_missing"],
+        });
+        return "unverified";
+      }
+      throw error;
+    }
+    const mapping = await this.providerMappingByTask(profile, taskId, todoist);
+    const shared = master.extendedProperties?.shared || {};
+    const expectedRule = todoistRecurrenceToRrule(task);
+    let activeInstance: CalendarEvent | undefined;
+    if (mapping?.activeInstanceId) {
+      try { activeInstance = await calendar.getEvent(mapping.activeInstanceId); }
+      catch (error) {
+        if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+      }
+    }
+    const projectId = profiles[profile].todoistProjectId;
+    const calendarId = profiles[profile].calendarId;
+    const exactSeriesId = Boolean(mapping?.seriesId
+      && (mapping.seriesId === taskId || mapping.seriesId === (master.iCalUID || master.id)));
+    const exactMappingEvent = Boolean(mapping?.eventId === master.id
+      || mapping?.eventId === mapping?.activeInstanceId && Boolean(mapping?.activeInstanceId));
+    const exactActiveInstance = Boolean(mapping?.activeInstanceId && mapping.originalStart
+      && mapping.activeEffectiveStart && activeInstance
+      && activeInstance.id === mapping.activeInstanceId && activeInstance.status === "confirmed"
+      && activeInstance.recurringEventId === master.id
+      && compareLogicalStarts(recurrenceOriginalStart(activeInstance) || "", mapping.originalStart) === 0
+      && compareLogicalStarts(eventEffectiveStart(activeInstance) || "", mapping.activeEffectiveStart) === 0);
+    const exactMasterCorrelation = Boolean(mapping && shared.syncSchemaVersion === "2"
+      && shared.syncProfile === profile && shared.syncCalendarId === calendarId
+      && shared.taskId === taskId && shared.syncTaskId === taskId
+      && shared.syncEventId === master.id && shared.syncMasterEventId === master.id
+      && mapping?.seriesId === shared.syncSeriesId
+      && mapping.activeInstanceId && mapping.activeInstanceId === shared.syncActiveInstanceId
+      && (!mapping.originalStart || mapping.originalStart === shared.syncOriginalStart)
+      && (!mapping.activeEffectiveStart || mapping.activeEffectiveStart === shared.syncActiveEffectiveStart)
+      && (mapping.calendarProgressVersion !== 1 || shared.syncProgressVersion === "1")
+      && (mapping.completedThroughOriginalStart === undefined
+        || mapping.completedThroughOriginalStart === shared.syncCompletedThrough));
+    const reasons: string[] = [];
+    if (task.project_id !== projectId || mapping?.profile !== profile || mapping?.projectId !== projectId
+      || mapping?.taskId !== taskId || mapping?.masterEventId !== masterEventId) reasons.push("mapping_identity_mismatch");
+    if (!task.due?.is_recurring || master.status === "cancelled" || !master.recurrence?.length)
+      reasons.push("recurrence_object_not_live");
+    if (!(calendarRecurrenceMatchesTodoist(master, task)
+      || Boolean(expectedRule && master.recurrence?.includes(expectedRule)))) reasons.push("recurrence_rule_mismatch");
+    if (!exactSeriesId || !exactMappingEvent || !exactMasterCorrelation) reasons.push("provider_correlation_mismatch");
+    if (!exactActiveInstance) reasons.push("active_occurrence_mismatch");
+    if (reasons.length) {
+      if (task.due?.is_recurring && !expectedRule
+        && reasons.length === 1 && reasons[0] === "recurrence_rule_mismatch") {
+        await this.state.audit(profile, "todoist_recurrence_unsupported_rule", {
+          taskId, masterEventId, existingMirrorPreserved: true,
+          outcome: "unsupported", nonBlocking: true,
+        });
+        return "unsupported";
+      }
+      await this.state.audit(profile, "calendar_recurrence_reconciliation_unverified", {
+        taskId, masterEventId, reasons,
+      });
+      return "unverified";
+    }
+    const mappingState = (value: Mapping | undefined): string => value ? JSON.stringify({
+      profile: value.profile, projectId: value.projectId, calendarId: value.calendarId,
+      taskId: value.taskId, eventId: value.eventId, seriesId: value.seriesId,
+      masterEventId: value.masterEventId, activeInstanceId: value.activeInstanceId,
+      originalStart: value.originalStart, activeEffectiveStart: value.activeEffectiveStart,
+      calendarProgressVersion: value.calendarProgressVersion,
+      completedThroughOriginalStart: value.completedThroughOriginalStart,
+      todoistPhaseBVersion: value.todoistPhaseBVersion,
+      syncedTitle: value.syncedTitle, syncedDescription: value.syncedDescription, syncedDue: value.syncedDue,
+      syncBaseline: value.syncBaseline ? {
+        version: value.syncBaseline.version, todoist: value.syncBaseline.todoist, calendar: value.syncBaseline.calendar,
+      } : undefined,
+    }) : "missing";
+    const repaired = previous.taskUpdatedAt !== task.updated_at
+      || previous.masterUpdated !== master.updated
+      || mappingState(previous.mapping) !== mappingState(mapping);
+    return repaired ? "repaired" : "converged";
+  }
+
+  private async recurrenceControlOutcome(
+    profile: Profile, ids: { taskId?: string; eventId?: string },
+  ): Promise<RecurrenceReconciliationOutcome> {
+    const state = this.state as StateRepository & { explicitlyExcluded?: StateRepository["explicitlyExcluded"] };
+    return await state.explicitlyExcluded?.(profile, ids) ? "excluded" : "blocked";
   }
 
   async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
@@ -1081,14 +1207,14 @@ export class Synchronizer {
     task: TodoistTask,
     calendar: GoogleCalendar,
     todoist: Todoist,
-  ): Promise<{ blocked: boolean; task: TodoistTask; mapping: Mapping }> {
+  ): Promise<{ blocked: boolean; changed: boolean; task: TodoistTask; mapping: Mapping }> {
     const resolution = calendarOwnedMetadataResolution(mapping, master, task);
     if (resolution.conflicts.length) {
       await this.state.audit(profile, "calendar_owned_metadata_conflict", {
         seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
         fields: resolution.conflicts, reason: "concurrent_edits_or_missing_baseline",
       });
-      return { blocked: true, task, mapping };
+      return { blocked: true, changed: false, task, mapping };
     }
     const expected = { content: resolution.summary, description: resolution.description };
     if (resolution.calendarChanged && !master.etag) {
@@ -1096,12 +1222,12 @@ export class Synchronizer {
         seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
         reason: "calendar_master_etag_missing",
       });
-      return { blocked: true, task, mapping };
+      return { blocked: true, changed: false, task, mapping };
     }
     if (resolution.calendarChanged) {
       if (!await this.state.mutationAllowed(profile)) {
         await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
-        return { blocked: true, task, mapping };
+        return { blocked: true, changed: false, task, mapping };
       }
       const updated = await calendar.patchEventMetadataIfUnchanged(master.id, master.etag!, {
         summary: resolution.summary, description: resolution.description,
@@ -1114,14 +1240,14 @@ export class Synchronizer {
         await this.state.audit(profile, "calendar_owned_metadata_readback_mismatch", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id, provider: "calendar",
         });
-        return { blocked: true, task, mapping };
+        return { blocked: true, changed: false, task, mapping };
       }
     }
     let nextTask = task;
     if (resolution.todoistChanged) {
       if (!await this.state.mutationAllowed(profile)) {
         await this.state.audit(profile, "calendar_owned_metadata_mutation_blocked", { taskId: task.id, masterEventId: master.id });
-        return { blocked: true, task, mapping };
+        return { blocked: true, changed: false, task, mapping };
       }
       nextTask = await todoist.updateTaskMetadata(task.id, expected);
       await this.state.recordMutation(profile);
@@ -1135,7 +1261,7 @@ export class Synchronizer {
         await this.state.audit(profile, "calendar_owned_metadata_readback_mismatch", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id, provider: "todoist",
         });
-        return { blocked: true, task, mapping };
+        return { blocked: true, changed: false, task, mapping };
       }
     }
     const nextMapping: Mapping = {
@@ -1157,7 +1283,7 @@ export class Synchronizer {
         await this.state.audit(profile, "calendar_owned_metadata_mapping_changed", {
           seriesId: mapping.seriesId, taskId: task.id, masterEventId: master.id,
         });
-        return { blocked: true, task: nextTask, mapping };
+        return { blocked: true, changed: false, task: nextTask, mapping };
       }
       await this.persistProviderMapping(nextMapping, todoist);
       if (resolution.calendarChanged || resolution.todoistChanged) {
@@ -1167,7 +1293,9 @@ export class Synchronizer {
         });
       }
     }
-    return { blocked: false, task: nextTask, mapping: nextMapping };
+    return { blocked: false, changed: resolution.calendarChanged || resolution.todoistChanged
+      || mapping.syncedTitle !== resolution.summary || mapping.syncedDescription !== resolution.description,
+      task: nextTask, mapping: nextMapping };
   }
 
   private async bindTodoistOwnedOccurrence(
@@ -1242,25 +1370,9 @@ export class Synchronizer {
       seriesId: mapping.seriesId, masterEventId: master.id, taskId: task.id,
     });
     if (!timeZone) return;
-    let instances: CalendarEvent[];
-    if (finiteWeeklyCalendarRuleCandidate(master)) {
-      instances = await calendar.listInstances(master.id);
-    } else {
-      if (!calendar.listInstancesInWindow) {
-        return this.state.audit(delivery.profile, "calendar_recurrence_bounded_inventory_unavailable", {
-          taskId: task.id, masterEventId: master.id,
-        });
-      }
-      const originalMs = Date.parse(originalStart);
-      if (!Number.isFinite(originalMs)) {
-        return this.state.audit(delivery.profile, "calendar_recurrence_instance_identity_unverified", {
-          taskId: task.id, eventId: current.id, masterEventId: master.id,
-        });
-      }
-      instances = await calendar.listInstancesInWindow(master.id,
-        new Date(originalMs - 24 * 60 * 60_000).toISOString(),
-        new Date(Math.max(Date.now(), originalMs) + 3 * 366 * 24 * 60 * 60_000).toISOString());
-    }
+    const instances = finiteWeeklyCalendarRuleCandidate(master)
+      ? await calendar.listInstances(master.id)
+      : await listBoundedRecurrenceInstances(calendar, master.id, originalStart);
     const listedCurrent = instances.find((instance) => instance.id === current.id);
     if (!listedCurrent || listedCurrent.status !== "confirmed"
       || compareLogicalStarts(recurrenceOriginalStart(listedCurrent) || "", originalStart) !== 0
@@ -1331,11 +1443,18 @@ export class Synchronizer {
   async process(delivery: Delivery): Promise<void> {
     if (delivery.kind === "calendar") return this.processCalendar(delivery);
     if (delivery.kind === "todoist") return this.processTodoist(delivery);
-    if (delivery.kind === "reconcile") return this.reconcile(delivery.profile);
+    if (delivery.kind === "reconcile") { await this.reconcile(delivery.profile); return; }
     return this.processOrphan(delivery);
   }
 
-  async reconcile(profile: Profile): Promise<void> {
+  async reconcile(profile: Profile): Promise<RecurrenceReconciliationSummary> {
+    const outcomes: RecurrenceReconciliationSummary = {
+      total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+    };
+    const recordOutcome = (outcome: RecurrenceReconciliationOutcome): void => {
+      outcomes.total += 1;
+      outcomes[outcome] += 1;
+    };
     const { calendar, todoist } = await this.clients(profile);
     const projectId = profiles[profile].todoistProjectId;
     const projectComments = await todoist.listProjectComments(projectId, true);
@@ -1357,10 +1476,12 @@ export class Synchronizer {
       catch (error) {
         if (!calendarEventGoneOnDirectRead(error)) throw error;
         await this.state.audit(profile, "calendar_recurrence_recovery_stale_master", { masterEventId });
+        recordOutcome("stale");
         continue;
       }
       if (master.status === "cancelled" || !master.recurrence?.length) {
         await this.state.audit(profile, "calendar_recurrence_recovery_stale_master", { masterEventId });
+        recordOutcome("stale");
         continue;
       }
       const shared = master.extendedProperties?.shared || {};
@@ -1373,6 +1494,7 @@ export class Synchronizer {
         await this.state.audit(profile, "calendar_recurrence_provider_correlation_ambiguous", {
           masterEventId, taskId: shared.taskId, candidateTaskIds,
         });
+        recordOutcome("blocked");
         continue;
       }
       const receivedAt = new Date().toISOString();
@@ -1385,8 +1507,55 @@ export class Synchronizer {
           || profileForTodoistProject(exactTask.project_id) !== profile)) exactTask = undefined;
       }
       if (exactTask) {
+        const expectedRule = todoistRecurrenceToRrule(exactTask);
+        const activeId = exactMapping?.activeInstanceId;
+        let mappedActive: CalendarEvent | undefined;
+        if (activeId) {
+          try { mappedActive = await calendar.getEvent(activeId); }
+          catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
+        }
+        const canBootstrapProviderBaseline = Boolean(exactMapping && !exactMapping.syncBaseline
+          && exactMapping.profile === profile && exactMapping.taskId === exactTask.id
+          && exactMapping.masterEventId === master.id && shared.taskId === exactTask.id
+          && expectedRule && master.recurrence?.includes(expectedRule)
+          && mappedActive?.status === "confirmed" && mappedActive.recurringEventId === master.id
+          && startsMatch(mappedActive, exactTask)
+          && normalizedText(master.summary) === normalizedText(exactTask.content)
+          && normalizedDescription(master.description) === normalizedDescription(exactTask.description));
+        if (canBootstrapProviderBaseline) {
+          if (await this.state.syncBlocked(profile, { taskId: exactTask.id, eventId: master.id })) {
+            recordOutcome(await this.recurrenceControlOutcome(profile, { taskId: exactTask.id, eventId: master.id }));
+            continue;
+          }
+          if (!await this.state.mutationAllowed(profile)) {
+            await this.state.audit(profile, "calendar_recurrence_provider_baseline_bootstrap_suppressed", {
+              taskId: exactTask.id, masterEventId: master.id,
+            });
+            recordOutcome("blocked");
+            continue;
+          }
+          const bootstrapped = await this.persistProviderMapping({
+            ...exactMapping!, projectId, calendarId: profiles[profile].calendarId,
+          }, todoist);
+          recordOutcome(await this.verifyTodoistSeriesPair(profile, exactTask.id, master.id, calendar, todoist, {
+            taskUpdatedAt: exactTask.updated_at, masterUpdated: master.updated, mapping: bootstrapped,
+          }));
+          continue;
+        }
         const changes = providerRecurrenceChanges(exactTask, master, exactMapping?.syncBaseline);
-        let routeToTodoist = exactMapping?.seriesId === exactTask.id;
+        if (changes && !changes.todoistChanged && !changes.calendarChanged) {
+          recordOutcome(await this.verifyTodoistSeriesPair(profile, exactTask.id, master.id, calendar, todoist, {
+            taskUpdatedAt: exactTask.updated_at, masterUpdated: master.updated, mapping: exactMapping,
+          }));
+          continue;
+        }
+        if (!changes && calendarRecurrenceMatchesTodoist(master, exactTask)) {
+          recordOutcome(await this.verifyTodoistSeriesPair(profile, exactTask.id, master.id, calendar, todoist, {
+            taskUpdatedAt: exactTask.updated_at, masterUpdated: master.updated, mapping: exactMapping,
+          }));
+          continue;
+        }
+        let routeToTodoist: boolean | undefined;
         if (changes?.todoistChanged && !changes.calendarChanged) routeToTodoist = true;
         else if (changes?.calendarChanged && !changes.todoistChanged) routeToTodoist = false;
         else if (changes?.todoistChanged && changes.calendarChanged) {
@@ -1394,8 +1563,34 @@ export class Synchronizer {
           const calendarChangedAt = Date.parse(master.updated || "");
           // Latest provider timestamp wins; Calendar is the deterministic
           // tie-break for an indistinguishable series-rule edit.
-          routeToTodoist = Number.isFinite(todoistChangedAt) && Number.isFinite(calendarChangedAt)
-            && todoistChangedAt > calendarChangedAt;
+          if (Number.isFinite(todoistChangedAt) && Number.isFinite(calendarChangedAt)) {
+            routeToTodoist = todoistChangedAt > calendarChangedAt;
+          }
+        }
+        if (routeToTodoist === undefined) {
+          if (!nativeCalendarRecurrenceCandidate(master) && !finiteWeeklyCalendarRuleCandidate(master)) {
+            const calendarDelivery: Delivery = {
+              id: `snapshot-reconcile:${profile}:calendar-series:${masterEventId}:${receivedAt}`,
+              kind: "calendar", profile, mode: "aws", receivedAt, headers: {},
+              body: JSON.stringify({ kind: "calendar", event: master }),
+            };
+            try { recordOutcome(await this.applyCalendarSeries(calendarDelivery, master, todoist)); }
+            catch (error) {
+              throw new ReconciliationItemError(error, { stage: "recurrence", eventId: masterEventId });
+            }
+            continue;
+          }
+          if (exactTask.due?.is_recurring && !expectedRule) {
+            recordOutcome(await this.verifyTodoistSeriesPair(profile, exactTask.id, master.id, calendar, todoist, {
+              taskUpdatedAt: exactTask.updated_at, masterUpdated: master.updated, mapping: exactMapping,
+            }));
+            continue;
+          }
+          await this.state.audit(profile, "calendar_recurrence_reconciliation_unverified", {
+            taskId: exactTask.id, masterEventId: master.id, reasons: ["provider_recurrence_baseline_missing_or_ambiguous"],
+          });
+          recordOutcome("unverified");
+          continue;
         }
         if (routeToTodoist) {
           const delivery: Delivery = {
@@ -1406,6 +1601,9 @@ export class Synchronizer {
               event_data_extra: { old_item: exactTask } }),
           };
           await this.processTodoist(delivery, { reconciliation: true });
+          recordOutcome(await this.verifyTodoistSeriesPair(profile, exactTask.id, master.id, calendar, todoist, {
+            taskUpdatedAt: exactTask.updated_at, masterUpdated: master.updated, mapping: exactMapping,
+          }));
           continue;
         }
       }
@@ -1414,7 +1612,7 @@ export class Synchronizer {
         kind: "calendar", profile, mode: "aws", receivedAt, headers: {},
         body: JSON.stringify({ kind: "calendar", event: master }),
       };
-      try { await this.applyCalendarSeries(delivery, master, todoist); }
+      try { recordOutcome(await this.applyCalendarSeries(delivery, master, todoist)); }
       catch (error) {
         throw new ReconciliationItemError(error, { stage: "recurrence", eventId: masterEventId });
       }
@@ -1433,21 +1631,31 @@ export class Synchronizer {
         const masterIds = [...new Set(linked
           .filter(event => event.extendedProperties?.shared?.taskId === task.id && event.status !== "cancelled")
           .map(event => event.recurringEventId || event.id))].sort();
-        if (!masterIds.length) continue;
+        if (!masterIds.length) {
+          const controlOutcome = await this.recurrenceControlOutcome(profile, { taskId: task.id });
+          const outcome = controlOutcome === "excluded" ? "excluded"
+            : !todoistRecurrenceToRrule(task) ? "unsupported" : "unverified";
+          await this.state.audit(profile, "todoist_recurrence_provider_correlation_missing", {
+            taskId: task.id, outcome,
+          });
+          recordOutcome(outcome);
+          continue;
+        }
         if (masterIds.length > 1) {
           await this.state.audit(profile, "calendar_recurrence_provider_correlation_ambiguous", {
             taskId: task.id, candidateCount: masterIds.length,
           });
+          recordOutcome("blocked");
           continue;
         }
         let master: CalendarEvent;
         try { master = await calendar.getEvent(masterIds[0]); }
         catch (error) {
-          if (calendarEventGoneOnDirectRead(error)) continue;
+          if (calendarEventGoneOnDirectRead(error)) { recordOutcome("stale"); continue; }
           throw error;
         }
         if (master.status === "cancelled" || !master.recurrence?.length
-          || master.extendedProperties?.shared?.taskId !== task.id) continue;
+          || master.extendedProperties?.shared?.taskId !== task.id) { recordOutcome("stale"); continue; }
         const receivedAt = new Date().toISOString();
         if (master.extendedProperties.shared.syncSeriesId === task.id) {
           const delivery: Delivery = {
@@ -1458,16 +1666,21 @@ export class Synchronizer {
               event_data_extra: { old_item: task } }),
           };
           await this.processTodoist(delivery, { reconciliation: true });
+          recordOutcome(await this.verifyTodoistSeriesPair(profile, task.id, master.id, calendar, todoist, {
+            taskUpdatedAt: task.updated_at, masterUpdated: master.updated,
+          }));
         } else {
           const delivery: Delivery = {
             id: `snapshot-reconcile:${profile}:calendar-series:${master.id}:${receivedAt}`,
             kind: "calendar", profile, mode: "aws", receivedAt, headers: {},
             body: JSON.stringify({ kind: "calendar", event: master }),
           };
-          await this.applyCalendarSeries(delivery, master, todoist);
+          recordOutcome(await this.applyCalendarSeries(delivery, master, todoist));
         }
       }
     }
+    await this.state.audit(profile, "calendar_recurrence_reconciliation_summary", { ...outcomes });
+    return outcomes;
   }
 
   private async processCalendar(delivery: Delivery): Promise<void> {
@@ -1738,14 +1951,23 @@ export class Synchronizer {
       }
       if (event.status === "cancelled") {
         const { calendar } = await this.clients(delivery.profile);
-        const instances = await calendar.listInstances(parentMapping.masterEventId!);
+        const window = boundedRecurrenceWindow(parentMapping.activeEffectiveStart
+          || eventEffectiveStart(event) || parentMapping.originalStart);
+        if (!calendar.listInstancesInWindow || !window) {
+          return this.state.audit(delivery.profile, "todoist_recurrence_calendar_active_instance_bounded_inventory_unavailable", {
+            eventId: event.id, taskId: task.id, masterEventId: parentMapping.masterEventId,
+          });
+        }
+        const instances = await calendar.listInstancesInWindow(parentMapping.masterEventId!, window.start, window.end);
         const next = selectNextEffectiveTodoistInstance(
           instances,
           parentMapping.activeInstanceId,
           parentMapping.activeEffectiveStart || eventEffectiveStart(event) || parentMapping.originalStart,
         );
         if (!next) {
-          return this.state.audit(delivery.profile, "todoist_recurrence_calendar_active_instance_deleted_no_next", { eventId: event.id, taskId: task.id });
+          return this.state.audit(delivery.profile, "todoist_recurrence_calendar_active_instance_next_outside_bounded_window", {
+            eventId: event.id, taskId: task.id, masterEventId: parentMapping.masterEventId,
+          });
         }
         if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
         const result = await this.bindTodoistOwnedOccurrence(delivery.profile, parentMapping, task, next, todoist);
@@ -1774,7 +1996,8 @@ export class Synchronizer {
       }
     }
     if (event.recurrence?.length && !event.recurringEventId && event.status !== "cancelled") {
-      return this.applyCalendarSeries(delivery, event, todoist);
+      await this.applyCalendarSeries(delivery, event, todoist);
+      return;
     }
     if (event.status === "cancelled") {
       const todoistNativeMaster = Boolean(mapping && mapping.masterEventId === event.id
@@ -1918,18 +2141,14 @@ export class Synchronizer {
           const finiteWeekly = finiteWeeklyCalendarRuleCandidate(master);
           const native = nativeCalendarRecurrenceCandidate(master);
           const anchor = existingRecurrence.activeEffectiveStart || existingRecurrence.originalStart;
-          const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
-          const fromMs = Number.isFinite(anchorMs) ? anchorMs : Date.now();
           if (native && !calendar.listInstancesInWindow) {
             return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
               seriesId: series, masterEventId: master.id,
             });
           }
-          const instances = native
-            ? await calendar.listInstancesInWindow!(master.id,
-              new Date(fromMs - 24 * 60 * 60_000).toISOString(),
-              new Date(Math.max(fromMs, Date.now()) + 3 * 366 * 24 * 60 * 60_000).toISOString())
-            : await calendar.listInstances(master.id);
+          const instances = finiteWeekly
+            ? await calendar.listInstances(master.id)
+            : await listBoundedRecurrenceInstances(calendar, master.id, anchor);
           successorRule = finiteWeekly || native
             ? await verifiedCalendarOwnedRecurrence(master, instances, timeZone,
               calendar.listExplicitSeriesExceptions?.bind(calendar))
@@ -2108,20 +2327,24 @@ export class Synchronizer {
     await this.state.audit(delivery.profile, task ? "calendar_updated_task" : "calendar_created_task", { eventId: event.id, taskId: nextTask.id });
   }
 
-  private async applyCalendarSeries(delivery: Delivery, master: CalendarEvent, todoist: Todoist): Promise<void> {
+  private async applyCalendarSeries(delivery: Delivery, master: CalendarEvent, todoist: Todoist): Promise<RecurrenceReconciliationOutcome> {
     const { calendar } = await this.clients(delivery.profile);
+    let providerChanged = false;
     // A queued delta can outlive a cancellation or a recurrence flattening.
     // Confirm the master still exists as a live series before recovering it.
     try { master = await calendar.getEvent(master.id); }
     catch (error) {
       if (!calendarEventGoneOnDirectRead(error)) throw error;
-      return this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
+      await this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
+      return "stale";
     }
     if (master.status === "cancelled" || !master.recurrence?.length || master.extendedProperties?.shared?.syncHistoryOnly === "true") {
-      return this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
+      await this.state.audit(delivery.profile, "calendar_recurrence_recovery_stale_master", { masterEventId: master.id });
+      return "stale";
     }
     if (await this.state.syncBlocked(delivery.profile, { eventId: master.id }, true)) {
-      return this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id });
+      await this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id });
+      return this.recurrenceControlOutcome(delivery.profile, { eventId: master.id });
     }
     const observedSeriesId = master.iCalUID || master.id;
     const existing = await this.providerSeriesMapping(delivery.profile, observedSeriesId, todoist, master.id);
@@ -2136,25 +2359,22 @@ export class Synchronizer {
     // Native unbounded recurrences must not expand forever. Preserve the
     // current mapped occurrence (which can be overdue) within a bounded lookahead.
     const from = existing?.activeEffectiveStart || existing?.originalStart;
-    const parsedStart = from ? Date.parse(from) : Number.NaN;
-    const startMs = Number.isFinite(parsedStart) ? parsedStart : Date.now();
-    const windowStart = new Date(startMs - 24 * 60 * 60_000).toISOString();
-    const windowEnd = new Date(Math.max(startMs, Date.now()) + 3 * 366 * 24 * 60 * 60_000).toISOString();
     if (nativeRecurrence && !calendar.listInstancesInWindow) {
-      return this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+      await this.state.audit(delivery.profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
         seriesId, masterEventId: master.id,
       });
+      return "blocked";
     }
-    const instances = nativeRecurrence
-      ? await calendar.listInstancesInWindow!(master.id, windowStart, windowEnd)
-      : await calendar.listInstances(master.id);
+    const instances = finiteWeekly
+      ? await calendar.listInstances(master.id)
+      : await listBoundedRecurrenceInstances(calendar, master.id, from);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let calendarTimeZone = master.start?.timeZone;
     if (finiteWeekly || nativeRecurrence || hasAllDayInstances) {
       calendarTimeZone = await this.verifiedCalendarRecurrenceTimeZone(delivery.profile, calendar, todoist, master, {
         seriesId, masterEventId: master.id,
       });
-      if (!calendarTimeZone) return;
+      if (!calendarTimeZone) return "blocked";
     }
     const calendarRecurrence = (finiteWeekly || nativeRecurrence) && calendarTimeZone
       ? await verifiedCalendarOwnedRecurrence(master, instances, calendarTimeZone,
@@ -2178,20 +2398,47 @@ export class Synchronizer {
       });
     }
     const active = selectCalendarRecurrenceInstance(instances, existing, Date.now(), calendarTimeZone);
-    if (!active) return this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
+    if (!active) {
+      await this.state.audit(delivery.profile, "calendar_recurrence_no_active_instance", { seriesId, masterEventId: master.id });
+      return "blocked";
+    }
     if (await this.state.syncBlocked(delivery.profile, { eventId: active.id }, true)) {
-      return this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id, eventId: active.id });
+      await this.state.audit(delivery.profile, "calendar_deleted_conflict_review_blocked", { masterEventId: master.id, eventId: active.id });
+      return this.recurrenceControlOutcome(delivery.profile, { eventId: active.id });
     }
     if (await this.state.syncBlocked(delivery.profile, { taskId:existing?.taskId, eventId:active.id })) {
-      return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:active.id, taskId:existing?.taskId, masterEventId:master.id });
+      await this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:active.id, taskId:existing?.taskId, masterEventId:master.id });
+      return this.recurrenceControlOutcome(delivery.profile, { taskId: existing?.taskId, eventId: active.id });
     }
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
-      return this.state.audit(delivery.profile, "calendar_recurrence_mutation_suppressed", { seriesId, mode: delivery.mode });
+      await this.state.audit(delivery.profile, "calendar_recurrence_mutation_suppressed", { seriesId, mode: delivery.mode });
+      return "blocked";
     }
     const progressAware = existing?.calendarProgressVersion === 1;
     let task: TodoistTask | undefined;
-    if (existing?.taskId && (existing.activeInstanceId === active.id || progressAware)) {
-      try { task = await todoist.getTask(existing.taskId); } catch (error) { if (Number((error as { status?: number }).status) !== 404) throw error; }
+    if (existing?.taskId) {
+      try { task = await todoist.getTask(existing.taskId); }
+      catch (error) {
+        if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
+        await this.state.audit(delivery.profile, "calendar_recurrence_mapped_task_unavailable", {
+          seriesId, masterEventId: master.id, taskId: existing.taskId,
+          reason: "exact_correlated_task_missing; recreation_suppressed",
+        });
+        return "stale";
+      }
+      if (task.project_id !== profiles[delivery.profile].todoistProjectId) {
+        await this.state.audit(delivery.profile, "calendar_recurrence_mapped_task_project_mismatch", {
+          seriesId, masterEventId: master.id, taskId: task.id,
+        });
+        return "blocked";
+      }
+      if (task.is_deleted || task.is_completed || task.completed_at) {
+        await this.state.audit(delivery.profile, "calendar_recurrence_mapped_task_terminal", {
+          seriesId, masterEventId: master.id, taskId: task.id,
+          completed: Boolean(task.is_completed || task.completed_at), deleted: Boolean(task.is_deleted),
+        });
+        return "stale";
+      }
     }
     const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
     // The Calendar master or exact active instance can repair a missing
@@ -2226,32 +2473,72 @@ export class Synchronizer {
         && providerMapping.masterEventId === master.id
         && providerMapping.eventId === existing?.eventId;
       if (!linkVerified) {
-        return this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_identity_unverified", {
+        await this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_identity_unverified", {
           seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
         });
+        return "blocked";
       }
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
-        return this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_suppressed", {
+        await this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_suppressed", {
           seriesId, masterEventId: master.id, taskId: task.id, mode: delivery.mode,
         });
+        return "blocked";
       }
       const priorTask = task;
       const updated = await todoist.upsertTask(
         calendarOwnedRecurringTaskPayload(active, calendarRecurrence!, calendarTimeZone), task.id,
       );
       await this.state.recordMutation(delivery.profile);
+      providerChanged = true;
       if (updated.id !== task.id
         || !calendarOwnedRecurringTaskReadback(updated, active, calendarRecurrence!, calendarTimeZone).matches) {
         await todoist.upsertTask(priorTask, priorTask.id);
         await this.state.recordMutation(delivery.profile);
-        return this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_readback_mismatch", {
+        await this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_readback_mismatch", {
           seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
         });
+        return "blocked";
       }
       task = updated;
       await this.state.audit(delivery.profile, "calendar_recurrence_rule_updated_todoist", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
       });
+    }
+    if (task?.due?.is_recurring && !calendarRecurrence && existing?.taskId === task.id
+      && existing.masterEventId === master.id && !conflictingIds.length) {
+      const providerMapping = await this.providerMappingByTask(delivery.profile, task.id, todoist);
+      const exactMapping = providerMapping?.profile === delivery.profile
+        && providerMapping.projectId === profiles[delivery.profile].todoistProjectId
+        && providerMapping.taskId === task.id
+        && providerMapping.eventId === existing.eventId
+        && providerMapping.masterEventId === master.id
+        && (providerMapping.seriesId === seriesId || providerMapping.seriesId === task.id);
+      const nextOriginalStart = recurrenceOriginalStart(active);
+      const nextEffectiveStart = eventEffectiveStart(active);
+      const activeOccurrenceMatches = active.status === "confirmed" && active.recurringEventId === master.id
+        && Boolean(nextOriginalStart && nextEffectiveStart) && startsMatch(active, task);
+      if (exactMapping && activeOccurrenceMatches) {
+        const activeMappingNeedsRepair = providerMapping.activeInstanceId !== active.id
+          || existing.activeInstanceId !== active.id
+          || !existing.originalStart || compareLogicalStarts(existing.originalStart, nextOriginalStart || "") !== 0
+          || !existing.activeEffectiveStart || compareLogicalStarts(existing.activeEffectiveStart, nextEffectiveStart || "") !== 0;
+        if (activeMappingNeedsRepair) {
+          await this.persistProviderMapping({
+            ...existing, activeInstanceId: active.id, originalStart: nextOriginalStart,
+            activeEffectiveStart: nextEffectiveStart, updatedAt: new Date().toISOString(),
+          }, todoist);
+          await this.state.recordMutation(delivery.profile);
+          await this.state.audit(delivery.profile, "calendar_recurrence_active_occurrence_mapping_repaired", {
+            seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
+          });
+        }
+        await this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
+          seriesId, masterEventId: master.id, eventId: active.id, taskId: task.id,
+          reason: "existing_calendar_rule_outside_supported_subset",
+          existingMirrorPreserved: true, outcome: "unsupported", nonBlocking: true,
+        });
+        return "unsupported";
+      }
     }
     // A native recurring task may already have been advanced by Todoist before
     // we process its completion webhook. Validate the RULE independently of
@@ -2261,23 +2548,26 @@ export class Synchronizer {
       && (task.id === existing?.taskId || sharedTaskIds.includes(task.id))
       && matchesCalendarOwnedRecurringRule(task, calendarRecurrence, calendarTimeZone));
     if ((task?.due?.is_recurring && !mappedRecurringMatches) || conflictingIds.length) {
-      return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+      await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
         seriesId, masterEventId: master.id, eventId: active.id,
         candidateTaskIds: [...new Set([...conflictingIds, ...(task?.due?.is_recurring ? [task.id] : [])])].sort(),
       });
+      return "blocked";
     }
     if (task?.due?.is_recurring && !calendarRecurrence) {
-      return this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
+      await this.state.audit(delivery.profile, "calendar_recurrence_todoist_rule_unsupported", {
         seriesId, masterEventId: master.id, taskId: task.id, reason: "existing_native_recurrence_cannot_be_safely_flattened",
       });
+      return "unsupported";
     }
     // Keep any existing mirror intact while the rule is unsupported. Never
     // project an unsupported series as a one-off, even when its old mapped
     // task is missing: that would silently flatten recurrence and create a
     // false mirror that cannot be advanced correctly.
-    if (!calendarRecurrence) return;
+    if (!calendarRecurrence) return "unsupported";
     if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id }, !existing)) {
-      return this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
+      await this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
+      return this.recurrenceControlOutcome(delivery.profile, { taskId: task?.id, eventId: master.id });
     }
     if (task?.due?.is_recurring && calendarRecurrence) {
       const mapped = await this.providerMappingByTask(delivery.profile, task.id, todoist);
@@ -2286,10 +2576,11 @@ export class Synchronizer {
       if ((!mapped && !sharedTaskIds.includes(task.id))
         || mapped && (mapped.masterEventId !== master.id || !mappingSeriesMatches
           || mapped.eventId !== existing?.eventId)) {
-        return this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
           seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
           reason: "durable_mapping_missing_or_changed",
         });
+        return "blocked";
       }
       if (!mapped) {
         // The shared Calendar task ID is the surviving exact provider
@@ -2297,8 +2588,9 @@ export class Synchronizer {
         // mapping without manufacturing an alternate task.
       } else if (isCalendarNativeSeries(mapped)) {
       const metadata = await this.reconcileCalendarOwnedMetadata(delivery.profile, mapped, master, task, calendar, todoist);
-      if (metadata.blocked) return;
+      if (metadata.blocked) return "blocked";
       task = metadata.task;
+      providerChanged ||= metadata.changed;
       const taskOccurrence = instances.find(instance => startsMatch(instance, task!));
       const taskOccurrenceStart = taskOccurrence ? recurrenceOriginalStart(taskOccurrence) : undefined;
       const activeOccurrenceStart = recurrenceOriginalStart(active);
@@ -2309,11 +2601,12 @@ export class Synchronizer {
         // date to this or a later occurrence while provider mapping metadata
         // still points at its predecessor. Metadata can sync safely; only a
         // verified completion may advance the monotonic progress watermark.
-        return this.state.audit(delivery.profile, "calendar_owned_completion_advance_deferred", {
+        await this.state.audit(delivery.profile, "calendar_owned_completion_advance_deferred", {
           seriesId, masterEventId: master.id, taskId: task.id,
           mappedEventId: existing?.eventId, activeEventId: active.id,
           providerDue: task.due?.date || task.due?.datetime,
         });
+        return "blocked";
       }
       }
     }
@@ -2322,14 +2615,10 @@ export class Synchronizer {
         && normalizedText(active.summary) === normalizedText(task.content)
         && normalizedDescription(active.description) === normalizedDescription(task.description)
         : hasCanonicalState(active, task))) {
-      return this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
+      await this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
+      return providerChanged ? "repaired" : "converged";
     }
-    if (await this.calendarMutationBlockedByCompletion(delivery, active.id)) return;
-    if (existing?.taskId && (!task || existing.activeInstanceId !== active.id)) {
-      if (existing.activeInstanceId !== active.id && !progressAware) {
-        await todoist.deleteTask(existing.taskId).catch((error: unknown) => { if (Number((error as { status?: number }).status) !== 404) throw error; });
-      }
-    }
+    if (await this.calendarMutationBlockedByCompletion(delivery, active.id)) return "blocked";
     const nextTask = task?.due?.is_recurring && calendarRecurrence
       && matchesCalendarOwnedRecurringRule(task, calendarRecurrence, calendarTimeZone)
       ? await todoist.updateRecurringOccurrence(task, toTodoistTask(active))
@@ -2348,11 +2637,12 @@ export class Synchronizer {
         // due string, instead of flattening a failed recurring update.
         await todoist.upsertTask(task, task.id);
       }
-      return this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
+      await this.state.audit(delivery.profile, "calendar_recurrence_todoist_readback_mismatch", {
         seriesId, masterEventId: master.id, eventId: active.id, taskId: nextTask.id,
         expected: readback.expected,
         observed: readback.observed,
       });
+      return "blocked";
     }
     const mapping: Mapping = {
       profile: delivery.profile,
@@ -2377,7 +2667,8 @@ export class Synchronizer {
     };
     await this.persistProviderMapping(mapping);
     await this.state.recordMutation(delivery.profile);
-    return this.state.audit(delivery.profile, task ? "calendar_recurrence_updated_task" : "calendar_recurrence_created_task", { seriesId, eventId: active.id, taskId: nextTask.id });
+    await this.state.audit(delivery.profile, task ? "calendar_recurrence_updated_task" : "calendar_recurrence_created_task", { seriesId, eventId: active.id, taskId: nextTask.id });
+    return "repaired";
   }
 
   private async deleteCompletedCalendarHistory(
@@ -2851,11 +3142,9 @@ export class Synchronizer {
       const mappedStart = mapping.activeEffectiveStart || mapping.originalStart;
       const mappedMs = mappedStart ? Date.parse(mappedStart) : Number.NaN;
       const startMs = Number.isFinite(mappedMs) ? mappedMs : Date.now();
-      const instances = nativeCompletion
-        ? await calendar.listInstancesInWindow!(mapping.masterEventId,
-          new Date(startMs - 24 * 60 * 60_000).toISOString(),
-          new Date(Math.max(startMs, Date.now()) + 3 * 366 * 24 * 60 * 60_000).toISOString())
-        : await calendar.listInstances(mapping.masterEventId);
+      const instances = finiteWeeklyCompletion
+        ? await calendar.listInstances(mapping.masterEventId)
+        : await listBoundedRecurrenceInstances(calendar, mapping.masterEventId, mappedStart);
       let currentRecurringTask: TodoistTask | undefined;
       let currentCalendarRecurrence: ReturnType<typeof calendarOwnedTodoistRecurrence>;
       let verifiedCalendarTimeZone: string | undefined;
@@ -3094,7 +3383,8 @@ export class Synchronizer {
             new Date(completedMs - 24 * 60 * 60_000).toISOString(),
             new Date(completedMs + 3 * 366 * 24 * 60 * 60_000).toISOString());
         } else {
-          instances = await calendar.listInstances(mappedEvent.id);
+          const completedDue = taskDateTime(completedTask) || completedTask.due?.date || mapping.activeEffectiveStart;
+          instances = await listBoundedRecurrenceInstances(calendar, mappedEvent.id, completedDue);
         }
         const completed = selectTodoistCurrentInstance(instances, completedTask);
         if (!completed) {
@@ -3193,7 +3483,8 @@ export class Synchronizer {
         });
         throw new Error(`Calendar did not retain recurring completion projection for task ${task.id}`);
       }
-      const active = selectTodoistCurrentInstance(await calendar.listInstances(readback.id), current);
+      const active = selectTodoistCurrentInstance(
+        await listBoundedRecurrenceInstances(calendar, readback.id, taskDateTime(current) || current.due?.date), current);
       if (!active) {
         const rollback = await rollbackUnverifiedWrite();
         await this.state.audit(delivery.profile, "todoist_recurrence_completion_occurrence_unresolved", {
@@ -3480,7 +3771,7 @@ export class Synchronizer {
     // A provider lookup may recreate a temporary unmarked mapping after a
     // create-before-mapping interruption. Route tagged masters through the
     // native verifier, never through ordinary canonical-state recovery.
-    if (lifecycle.action === "upsert" && existingEvent && verifiedTodoistNativeMaster) {
+    if (lifecycle.action === "upsert" && task.due?.is_recurring && existingEvent && verifiedTodoistNativeMaster) {
       if (existingEvent.extendedProperties?.shared?.taskId !== task.id) {
         return this.state.audit(delivery.profile, "todoist_phase_b_native_identity_conflict", {
           taskId: task.id, eventId: existingEvent.id,
@@ -3492,7 +3783,8 @@ export class Synchronizer {
       return;
     }
 
-    if (lifecycle.action === "upsert" && isTodoistNativeSeries(mapping) && mapping?.masterEventId) {
+    if (lifecycle.action === "upsert" && task.due?.is_recurring
+      && isTodoistNativeSeries(mapping) && mapping?.masterEventId) {
       let phaseBMaster: CalendarEvent | undefined;
       try { phaseBMaster = await calendar.getEvent(mapping.masterEventId); }
       catch (error) { if (![404, 410].includes(Number((error as { status?: number }).status))) throw error; }
@@ -3680,7 +3972,6 @@ export class Synchronizer {
         existingMirrorPreserved: Boolean(existingEvent), outcome: "source_left_unchanged",
       });
     }
-    const previousSeriesId = isTodoistNativeSeries(mapping) ? mapping?.seriesId : undefined;
     // Even when provider mapping correlation is missing, the Calendar master
     // may retain a verified Todoist ownership marker. Never overwrite/delete
     // that master for a still-unverified Phase B cadence.
@@ -3691,16 +3982,9 @@ export class Synchronizer {
         taskId: task.id, eventId: existingEvent.id, ...phaseBPreview,
       });
     }
-    if (isTodoistNativeSeries(mapping) && existingEvent?.recurrence?.length && !desiredRrule) {
-      await calendar.deleteEvent(existingEvent.id).catch((error: unknown) => {
-        if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
-      });
-      mapping = undefined;
-      existingEvent = undefined;
-    }
-
     if (!recurringDateEdit && isTodoistNativeSeries(mapping) && mapping?.masterEventId && existingEvent?.recurrence?.length && desiredRrule) {
-      const instances = await calendar.listInstances(existingEvent.id);
+      const instances = await listBoundedRecurrenceInstances(calendar, existingEvent.id,
+        taskDateTime(task) || task.due?.date || mapping.activeEffectiveStart);
       const mappedActive = mapping.activeInstanceId
         ? instances.find((instance) => instance.id === mapping!.activeInstanceId && instance.status !== "cancelled")
         : undefined;
@@ -3714,7 +3998,9 @@ export class Synchronizer {
       }
     }
 
-    if (!recurringDateEdit && existingEvent && hasCanonicalState(existingEvent, task)) {
+    const convertingRecurringMasterToOneOff = Boolean(existingEvent?.recurrence?.length && !task.due?.is_recurring);
+    if (!recurringDateEdit && !convertingRecurringMasterToOneOff
+      && existingEvent && hasCanonicalState(existingEvent, task)) {
       const todoistRecurring = Boolean(task.due?.is_recurring);
       const todoistRrule = Boolean(desiredRrule && existingEvent.recurrence?.length);
       // A Calendar-owned recurrence may be echoed back by Todoist with an
@@ -3724,7 +4010,8 @@ export class Synchronizer {
       const preservedCalendarMapping = isCalendarNativeSeries(mapping) && mapping?.masterEventId ? mapping : undefined;
       let active: CalendarEvent | undefined;
       if (todoistRrule) {
-        const instances = await calendar.listInstances(existingEvent.id);
+        const instances = await listBoundedRecurrenceInstances(calendar, existingEvent.id,
+          taskDateTime(task) || task.due?.date || mapping?.activeEffectiveStart);
         const mappedActive = mapping?.activeInstanceId
           ? instances.find((instance) => instance.id === mapping!.activeInstanceId && instance.status !== "cancelled")
           : undefined;
@@ -3840,11 +4127,29 @@ export class Synchronizer {
         });
         throw new Error(`Calendar did not retain recurring projection for task ${task.id}`);
       }
+    } else if (existingEvent?.recurrence?.length) {
+      verifiedStored = await calendar.getEvent(stored.id);
+      const shared = verifiedStored.extendedProperties?.shared || {};
+      const staleRecurrenceMetadata = [
+        "syncSeriesId", "syncMasterEventId", "syncActiveInstanceId", "syncOriginalStart",
+        "syncActiveEffectiveStart", "syncProgressVersion", "syncCompletedThrough",
+        "syncTodoistPhaseBVersion", "todoistRecurrence", "todoistAnchorStart", "todoistAnchorEnd",
+        "todoistAnchorAllDay", "todoistAnchorTimeZone", "todoistTemplateSummary",
+        "todoistTemplateDescription", "todoistPhaseBVersion",
+      ].filter((property) => shared[property] !== undefined);
+      if (verifiedStored.id !== existingEvent.id || verifiedStored.recurrence?.length || staleRecurrenceMetadata.length) {
+        await this.state.audit(delivery.profile, "todoist_recurrence_to_one_off_readback_mismatch", {
+          taskId: task.id, eventId: verifiedStored.id,
+          observedRecurrence: verifiedStored.recurrence || [], staleRecurrenceMetadata,
+        });
+        throw new Error(`Calendar did not retain one-off conversion for task ${task.id}`);
+      }
     }
     const todoistRrule = Boolean(verifiedStored.recurrence?.length);
     let active: CalendarEvent | undefined;
     if (todoistRrule) {
-      const instances = await calendar.listInstances(verifiedStored.id);
+      const instances = await listBoundedRecurrenceInstances(calendar, verifiedStored.id,
+        taskDateTime(task) || task.due?.date || mapping?.activeEffectiveStart);
       const mappedActive = mapping?.activeInstanceId
         ? instances.find((instance) => instance.id === mapping!.activeInstanceId && instance.status !== "cancelled")
         : undefined;
