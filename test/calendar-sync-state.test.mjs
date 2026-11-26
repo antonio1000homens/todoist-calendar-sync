@@ -52,7 +52,9 @@ function stateDb(t, beforeComplete = async () => {}, beforeStart = async () => {
       const canStart = (row.calendarSyncState === "queued" || row.calendarSyncState === "dispatching")
           && row.calendarSyncQueuedGeneration === values[":queuedGeneration"]
         || row.calendarSyncState === "idle" || row.calendarSyncState === "pending";
-      if (row.calendarSyncGeneration !== values[":current"] || !canStart)
+      if (row.calendarSyncGeneration !== values[":current"] || !canStart
+        || (row.calendarSyncCompletedGeneration || 0) >= values[":current"]
+        || (row.calendarSyncFailedGeneration || 0) >= values[":current"])
         throw Object.assign(new Error("conditional"), { name: "ConditionalCheckFailedException" });
       row.calendarSyncState = values[":running"];
       row.calendarSyncRunningGeneration = values[":generation"];
