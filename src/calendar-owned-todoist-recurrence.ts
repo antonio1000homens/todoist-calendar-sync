@@ -347,7 +347,10 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolea
     && !(fields.BYDAY && fields.BYMONTHDAY)
     && (fields.FREQ !== "WEEKLY" || (!fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
     && (fields.FREQ !== "DAILY" || (!fields.BYDAY && !fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
-    && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY"].includes(key)));
+    // Google commonly includes the RFC 5545 default week start explicitly.
+    // For a single weekly weekday, WKST=MO is equivalent to omitting WKST.
+    && (fields.WKST === undefined || (fields.FREQ === "WEEKLY" && fields.WKST === "MO"))
+    && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY", "WKST"].includes(key)));
 }
 
 function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[], timeZone: string): CalendarOwnedTodoistRecurrence | undefined {
