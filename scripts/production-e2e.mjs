@@ -124,6 +124,38 @@ async function providerMappingByTask(todoist, projectId, taskId) {
   return uniqueProjectTaskMapping(index, projectId, taskId)?.payload;
 }
 
+async function seedLegacyMappingFixture(state, profile, projectId, calendarId, fixture, mapping) {
+  // New syncs use provider-native links. Seed this exact disposable row only
+  // to exercise the retained legacy fallback, then remove it before the
+  // no-legacy discovery assertions.
+  if (!mapping || mapping.profile !== profile || mapping.projectId !== projectId
+    || mapping.taskId !== fixture.taskId
+    || (mapping.masterEventId || mapping.eventId) !== fixture.eventId) {
+    throw new Error("Legacy mapping fixture does not match its exact profile/project/task/master IDs");
+  }
+  const existing = await state.getMappingByTask(profile, fixture.taskId);
+  if (existing && (existing.profile !== profile || existing.taskId !== fixture.taskId
+    || (existing.masterEventId || existing.eventId) !== fixture.eventId)) {
+    throw new Error("Legacy mapping fixture conflicts with another exact profile/project/task/master mapping");
+  }
+  if (!existing) await state.putMapping({ ...mapping, calendarId });
+  fixture.legacyMappingSeeded = true;
+}
+
+async function removeLegacyMappingFixture(state, profile, fixture) {
+  if (!fixture.legacyMappingSeeded || !fixture.taskId) return;
+  const mapping = await state.getMappingByTask(profile, fixture.taskId);
+  if (mapping && (mapping.profile !== profile || mapping.taskId !== fixture.taskId
+    || (mapping.masterEventId || mapping.eventId) !== fixture.eventId)) {
+    throw new Error("Refusing to remove a legacy mapping outside the exact acceptance fixture");
+  }
+  if (mapping) await state.deleteMapping(mapping);
+  if (await state.getMappingByTask(profile, fixture.taskId)) {
+    throw new Error("Legacy acceptance fixture mapping remained after targeted cleanup");
+  }
+  fixture.legacyMappingSeeded = false;
+}
+
 async function fixtureStillPresent(calendar, todoist, projectId, eventId, taskId) {
   let event;
   let task;
@@ -951,6 +983,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         });
       }
       if (spec.cadence === "weekly") {
+        const state = new StateRepository();
         const mappingComment = await providerMappingComment(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId);
         if (!mappingComment?.id) throw new Error("Calendar correlation recovery fixture has no exact project mapping comment");
         await todoist.deleteComment(mappingComment.id);
@@ -980,6 +1013,56 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
             && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId,
         );
         log("calendar_provider_correlation_retry_verified", { profile, taskIdPreserved: true, masterIdPreserved: true, latestStateWon: true });
+
+        const discoveryComment = await providerMappingComment(
+          todoist, config.todoistProjectId, fixture.eventId, fixture.taskId,
+        );
+        if (!discoveryComment?.id) throw new Error("Calendar no-legacy discovery fixture has no exact project mapping comment to remove");
+        await seedLegacyMappingFixture(state, profile, config.todoistProjectId, config.calendarId,
+          fixture, await providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId));
+        const seededLegacyMapping = await state.getMappingByTask(profile, fixture.taskId);
+        if (seededLegacyMapping?.taskId !== fixture.taskId
+          || (seededLegacyMapping.masterEventId || seededLegacyMapping.eventId) !== fixture.eventId) {
+          throw new Error("Calendar no-legacy discovery fixture lacks its exact temporary mapping row");
+        }
+        await removeLegacyMappingFixture(state, profile, fixture);
+        await todoist.deleteComment(discoveryComment.id);
+        const eventBeforeNativeDiscovery = await calendar.getEvent(fixture.eventId);
+        const discoveryShared = eventBeforeNativeDiscovery.extendedProperties?.shared || {};
+        const discoveryLinkKeys = Object.keys(discoveryShared)
+          .filter((key) => key === "taskId" || key.startsWith("sync"));
+        if (!discoveryLinkKeys.includes("taskId") || !discoveryLinkKeys.includes("syncTaskId")) {
+          throw new Error("Calendar no-legacy discovery fixture lacks the expected shared task identifiers");
+        }
+        const unlinkedMaster = await calendar.updateSharedEventPropertiesIfUnchanged(
+          fixture.eventId, eventBeforeNativeDiscovery.etag,
+          Object.fromEntries(discoveryLinkKeys.map((key) => [key, null])),
+        );
+        if (unlinkedMaster.extendedProperties?.shared?.taskId
+          || unlinkedMaster.extendedProperties?.shared?.syncTaskId) {
+          throw new Error("Calendar no-legacy discovery write did not clear the exact provider links");
+        }
+        await poll(
+          `${profile} Calendar update rediscovers recurring task without legacy mapping`, timeoutMs,
+          async () => {
+            const [master, currentTask, mapping, stored] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+              state.getMappingByTask(profile, fixture.taskId),
+            ]);
+            return { master, currentTask, mapping, stored };
+          },
+          ({ master, currentTask, mapping, stored }) => master.recurrence?.length === 1
+            && master.extendedProperties?.shared?.taskId === fixture.taskId
+            && master.extendedProperties?.shared?.syncTaskId === fixture.taskId
+            && currentTask.id === fixture.taskId && currentTask.due?.is_recurring
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
+            && mapping.seriesId === fixture.taskId && !stored,
+        );
+        log("calendar_recurring_candidate_recovered_without_legacy_mapping", {
+          profile, taskIdPreserved: true, masterIdPreserved: true,
+          providerLinksRestored: true, legacyMappingAbsent: true,
+        });
 
         const before = await todoist.getTask(fixture.taskId);
         const masterBeforeRuleEdit = await calendar.getEvent(fixture.eventId);
@@ -1071,6 +1154,11 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       );
       if (spec.cadence === "weekly") {
         const state = new StateRepository();
+        const mappingBeforeLegacyFallback = await providerMapping(
+          todoist, config.todoistProjectId, fixture.eventId, fixture.taskId,
+        );
+        await seedLegacyMappingFixture(state, profile, config.todoistProjectId, config.calendarId,
+          fixture, mappingBeforeLegacyFallback);
         const storedBeforeRecovery = await state.getMappingByTask(profile, fixture.taskId);
         if (storedBeforeRecovery?.profile !== profile || storedBeforeRecovery.taskId !== fixture.taskId
           || storedBeforeRecovery.projectId !== config.todoistProjectId
@@ -1167,7 +1255,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           todoist, config.todoistProjectId, fixture.eventId, fixture.taskId,
         );
         if (!discoveryComment?.id) throw new Error("No-legacy discovery fixture has no exact project mapping comment to remove");
-        await state.deleteMapping(storedBeforeNativeDiscovery);
+        await removeLegacyMappingFixture(state, profile, fixture);
         await todoist.deleteComment(discoveryComment.id);
         const eventBeforeNativeDiscovery = await calendar.getEvent(fixture.eventId);
         const discoveryShared = eventBeforeNativeDiscovery.extendedProperties?.shared || {};
@@ -1447,9 +1535,11 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           && !tasks.some((task) => task.id === recurringTaskId) && !mapping,
       );
       log("recurring_cleanup_verified", { profile });
+      const cleanupState = new StateRepository();
       for (const fixture of recurrenceMatrixFixtures) {
         await safeDeleteCalendar(calendar, fixture.eventId);
         await safeDeleteTodoist(todoist, fixture.taskId);
+        await removeLegacyMappingFixture(cleanupState, profile, fixture);
         await poll(
           `${profile} ${fixture.cadence} recurrence fixture cleanup`, timeoutMs,
           () => fixtureStillPresent(calendar, todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
@@ -1480,6 +1570,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       try { await safeDeleteCalendar(calendar, todoistRecurringEventId); } catch (cleanupError) { log("fallback_calendar_recurrence_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
       try { await safeDeleteCalendar(calendar, recurringEventId); } catch (cleanupError) { log("fallback_recurring_calendar_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
       try { await safeDeleteTodoist(todoist, recurringTaskId); } catch (cleanupError) { log("fallback_recurring_todoist_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
+      const cleanupState = new StateRepository();
       for (const fixture of recurrenceMatrixFixtures) {
         try { await safeDeleteCalendar(calendar, fixture.eventId); } catch (cleanupError) { log("fallback_matrix_calendar_cleanup_failed", { profile, cadence: fixture.cadence, error: safeFailure(cleanupError) }); }
         try {
@@ -1489,6 +1580,8 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           }
           await safeDeleteTodoist(todoist, fixture.taskId);
         } catch (cleanupError) { log("fallback_matrix_todoist_cleanup_failed", { profile, cadence: fixture.cadence, error: safeFailure(cleanupError) }); }
+        try { await removeLegacyMappingFixture(cleanupState, profile, fixture); }
+        catch (cleanupError) { log("fallback_matrix_mapping_cleanup_failed", { profile, cadence: fixture.cadence, error: safeFailure(cleanupError) }); }
       }
       for (const fixture of seriesDeletionFixtures) {
         try { await safeDeleteCalendar(calendar, fixture.eventId); } catch (cleanupError) { log("fallback_series_calendar_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
