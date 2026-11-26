@@ -674,7 +674,7 @@ test("unsupported Calendar recurrence completion never creates a flattened succe
     && entry.detail.nonBlocking === true && entry.detail.outcome === "source_left_unchanged"));
 });
 
-test("supported Calendar recurrence upgrades its exact legacy task in place across mapping retry", async () => {
+test("Google WKST weekly recurrence upgrades its exact legacy task in place across mapping retry", async () => {
   const completed = instance("oneoff-day-17", "2099-09-17T14:00:00Z", "2099-09-17T14:15:00Z");
   const successor = instance("oneoff-day-24", "2099-09-24T14:00:00Z", "2099-09-24T14:15:00Z");
   const following = instance("oneoff-day-01", "2099-10-01T14:00:00Z", "2099-10-01T14:15:00Z");
@@ -684,7 +684,7 @@ test("supported Calendar recurrence upgrades its exact legacy task in place acro
     ...masterEvent(),
     start: { dateTime: "2099-09-17T14:00:00Z", timeZone: "Europe/London" },
     end: { dateTime: "2099-09-17T14:15:00Z", timeZone: "Europe/London" },
-    recurrence: ["RRULE:FREQ=WEEKLY"],
+    recurrence: ["RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=TH"],
   };
   const clients = fakeClients(state, [completed, successor, following], link, master);
   const delivery = completedDelivery("complete-oneoff", link.taskId, completed, "2099-09-17T15:00:00Z");
@@ -1034,4 +1034,34 @@ test("Calendar-owned completion does not bind a successor until Todoist readback
   await sync.process(delivery);
   assert.equal(state.mappingsByTask.get(link.taskId).activeInstanceId, "readback-nov-18");
   assert.equal(clients.tasks.get(link.taskId).due.datetime, "2099-11-18T14:00:00Z");
+});
+
+
+test("incremental Google weekly WKST series creates exactly one native recurring Todoist task", async () => {
+  const scheduled = [
+    instance("google-friday-18", "2099-09-18T15:00:00Z", "2099-09-18T16:00:00Z"),
+    instance("google-friday-25", "2099-09-25T15:00:00Z", "2099-09-25T16:00:00Z"),
+    instance("google-friday-02", "2099-10-02T15:00:00Z", "2099-10-02T16:00:00Z"),
+  ];
+  const master = {
+    ...masterEvent(), start: scheduled[0].start, end: scheduled[0].end,
+    recurrence: ["RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=FR"],
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, scheduled, undefined, master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = {
+    id: "incremental-google-weekly", kind: "calendar", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-17T10:00:00Z", headers: {}, body: "",
+  };
+  await sync.process(delivery);
+  assert.equal(clients.todoistUpserts.length, 1);
+  const { id, payload } = clients.todoistUpserts[0];
+  assert.equal(payload.due.is_recurring, true);
+  assert.equal(payload.due.string, "every Friday at 4:00pm starting 18 Sep 2099");
+  assert.equal(state.mappingsByTask.get(id).activeInstanceId, scheduled[0].id);
+  await sync.process({ ...delivery, id: "incremental-google-weekly-repeat" });
+  assert.equal(clients.tasks.size, 1);
+  assert.equal(clients.todoistUpserts.length, 1);
+  assert.equal(clients.calendarDeletes.length, 0);
 });
