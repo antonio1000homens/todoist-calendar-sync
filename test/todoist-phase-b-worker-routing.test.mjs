@@ -36,7 +36,7 @@ class State {
   async audit(profile,action,detail){this.audits.push({profile,action,detail});}
 }
 function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:added", incompleteInventory=false,
-  conflictingMaster=false}={}) {
+  conflictingMaster=false,delayFirstInstances=false,failFirstCommentWrite=false}={}) {
   const task={id:`worker-route-${family.name.replaceAll(" ","-")}`,
     content:`Verify ${family.name}`,description:"",project_id:projectId,
     updated_at:updatedAt,due:{date:family.due,string:family.phrase,is_recurring:true}};
@@ -53,6 +53,7 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     start:{date:family.due},end:{date:family.due},
   });
   const projectComments=[];
+  let instanceReadCount=0,commentWriteCount=0;
   const instances=family.dates.map((date,index)=>{
     const end=new Date(date+"T00:00:00Z");end.setUTCDate(end.getUTCDate()+1);
     return {id:`instance-${index}`,status:"confirmed",recurringEventId:"",
@@ -63,13 +64,27 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     async findByTodoistTaskId(id){return [...events.values()].find(e=>e.extendedProperties?.shared?.taskId===id);},
     async getTimeZone(){return "Europe/London";},
     async getEvent(id){const found=events.get(id);if(found)return structuredClone(found);const e=new Error("not found");e.status=404;throw e;},
+    async ensureTaskCorrelation(eventId,taskId,_expectedTaskId,mapping){
+      const found=events.get(eventId);
+      const shared={...(found.extendedProperties?.shared||{}),taskId,syncSchemaVersion:"2",
+        syncProfile:"home",syncCalendarId:profiles.home.calendarId,syncTaskId:taskId,syncEventId:eventId,
+        syncSeriesId:mapping.seriesId,syncMasterEventId:mapping.masterEventId,
+        syncActiveInstanceId:mapping.activeInstanceId,syncOriginalStart:mapping.originalStart,
+        syncActiveEffectiveStart:mapping.activeEffectiveStart,syncProgressVersion:"1"};
+      const stored={...found,extendedProperties:{...found.extendedProperties,shared}};
+      events.set(eventId,stored);return structuredClone(stored);
+    },
     async createTodoistPhaseBNativeMasterOnce(e){
       writes.push(structuredClone(e));
       const created={...structuredClone(e),etag:"phase-b-etag",status:"confirmed"};
       events.set(e.id,created);
       return {event:structuredClone(created),created:true};
     },
-    async listInstancesInWindow(id){return instances.map(x=>({...structuredClone(x),recurringEventId:id}));},
+    async listInstancesInWindow(id){
+      instanceReadCount++;
+      if(delayFirstInstances&&instanceReadCount===1)return [];
+      return instances.map(x=>({...structuredClone(x),recurringEventId:id}));
+    },
     async listExplicitSeriesExceptions(){return [];},
     async upsertEvent(e,existingId){
       normal.push(structuredClone(e));
@@ -82,6 +97,8 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     async getTimeZone(){return "Europe/London";},
     async listProjectComments(){return projectComments.map(comment=>structuredClone(comment));},
     async upsertProjectComment(projectId,content,existingId){
+      commentWriteCount++;
+      if(failFirstCommentWrite&&commentWriteCount===1)throw new Error("Todoist comment write temporarily failed");
       const id=existingId||`mapping-${projectComments.length+1}`;
       const comment={id,project_id:projectId,content};
       const index=projectComments.findIndex(value=>value.id===id);
@@ -108,7 +125,7 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     event_name:eventName,event_data:task,
       ...(oldProjectId?{event_data_extra:{old_item:{...task,project_id:oldProjectId}}}:{}),
     })};
-  return {sync,task,current,events,writes,normal,reads,state,delivery};
+  return {sync,task,current,events,writes,normal,reads,state,delivery,projectComments};
 }
 async function withGate(_enabled,fn){
   const before=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
@@ -177,6 +194,40 @@ test("reconciliation repairs a fixed annual task after unsupported creation synt
   assert.equal(f.state.mapping.originalStart,annual.due);
   await f.sync.process({...f.delivery,id:"annual-reconciliation-replay"});
   assert.equal(f.writes.length,1);
+}));
+test("delayed Calendar instances leave the deterministic master intact and retry until correlation commits",()=>withGate(true,async()=>{
+  const f=setup(fixtures[2],{eventName:"item:updated",delayFirstInstances:true});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  await assert.rejects(f.sync.process(f.delivery),/Calendar native write needs retry/);
+  assert.equal(f.writes.length,1);
+  const master=[...f.events.values()][0];
+  assert.equal(master.status,"confirmed","a delayed instance listing must not roll back a valid master");
+  assert.equal(f.state.mapping,undefined,"the delivery is not acknowledged as linked before mapping persistence");
+  assert.equal(f.state.audits.at(-1).detail.rollback,"preserved_for_retry");
+
+  await f.sync.process({...f.delivery,id:"retry-after-instance-visibility"});
+  assert.equal(f.writes.length,1,"retry discovers the existing deterministic master instead of creating another");
+  assert.equal(f.state.mapping.taskId,f.task.id);
+  assert.equal(f.state.mapping.eventId,master.id);
+  assert.equal(f.projectComments.length,1);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_existing_series_preserved");
+}));
+test("failed project comment persistence retries against the existing Calendar master",()=>withGate(true,async()=>{
+  const f=setup(fixtures[2],{eventName:"item:updated",failFirstCommentWrite:true});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  await assert.rejects(f.sync.process(f.delivery),/mapping readback needs retry/);
+  assert.equal(f.writes.length,1);
+  assert.equal(f.projectComments.length,0);
+  const master=[...f.events.values()][0];
+  assert.equal(master.extendedProperties.shared.taskId,f.task.id);
+
+  await f.sync.process({...f.delivery,id:"retry-after-comment-failure"});
+  assert.equal(f.writes.length,1);
+  assert.equal(f.projectComments.length,1);
+  assert.equal(f.state.mapping.eventId,master.id);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_existing_series_preserved");
 }));
 test("update repair does not create when complete Calendar inventory is unavailable",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{eventName:"item:updated",incompleteInventory:true});
