@@ -35,6 +35,9 @@ export function reviewHash(value: unknown): string {
 const key = (pk: string) => ({ pk, sk: "STATE" });
 const conditional = (e: unknown) => (e as { name?: string }).name === "ConditionalCheckFailedException";
 const dismissalResolutions = new Set(["acknowledge","keep_separate","ignore","dismiss","dismissed"]);
+// Repair workers run in Lambdas with a 15-minute maximum. Keep one minute of
+// margin before retiring a lock left by an invocation that can no longer run.
+const STALE_REPAIR_AGE_MS = 16 * 60_000;
 async function admitReviewIdentities(refs: Iterable<EntityRef>, clientFactory: ProjectCommentClientFactory): Promise<void> {
   const unique = new Map<string, EntityRef>();
   for (const ref of refs) unique.set(entityKey(ref), ref);
@@ -1368,6 +1371,53 @@ export class ReviewStore {
 export interface SyncControl { excluded?: boolean; activeRepair?: string; pendingRefresh?: boolean; pendingRefreshAt?: string; fencedAt?: string; providerUpdatedAt?: string }
 export class SyncControls {
   control(ref: EntityRef): Promise<SyncControl | undefined> { return new ReviewStore().get(`SYNC_CONTROL#${entityKey(ref)}`); }
+  private async retireInactiveRepair(ref: EntityRef, operationId: string): Promise<boolean> {
+    const store = new ReviewStore();
+    const operation = await store.getOperation(operationId);
+    const now = Date.now();
+    const age = operation ? now - Date.parse(operation.updatedAt || operation.createdAt || "") : Number.POSITIVE_INFINITY;
+    const terminal = Boolean(operation && ["succeeded", "failed", "needs_review"].includes(operation.status));
+    const abandoned = operation?.abandoned === true;
+    const expiredRunning = Boolean(operation?.status === "running"
+      && Number.isFinite(age) && age >= STALE_REPAIR_AGE_MS);
+    // Write evidence must remain in the repair history, but it cannot justify
+    // a permanent writer lease. Once the operation is terminal, explicitly
+    // abandoned, or older than the maximum Lambda lifetime, release the
+    // control so fresh provider reconciliation can resume and verify state.
+    if (operation && !terminal && !abandoned && !expiredRunning) return false;
+
+    const controlKey = key(`SYNC_CONTROL#${entityKey(ref)}`);
+    const transactItems: NonNullable<ConstructorParameters<typeof TransactWriteCommand>[0]["TransactItems"]> = [
+      { Update: { TableName: reviewTable(), Key: controlKey, UpdateExpression: "REMOVE activeRepair",
+        ConditionExpression: "activeRepair = :operationId", ExpressionAttributeValues: { ":operationId": operationId } } },
+    ];
+    if (!operation) {
+      transactItems.push({ ConditionCheck: { TableName: reviewTable(), Key: key(`REPAIR#${operationId}`),
+        ConditionExpression: "attribute_not_exists(pk)" } });
+    } else {
+      const conditions = ["#status = :status",
+        operation.updatedAt ? "updatedAt = :updatedAt" : "attribute_not_exists(updatedAt)"];
+      const values: Record<string, unknown> = {
+        ":status": operation.status,
+        ...(operation.updatedAt ? { ":updatedAt": operation.updatedAt } : {}),
+      };
+      const names: Record<string, string> = { "#status": "status" };
+      if (abandoned) {
+        conditions.push("abandoned = :abandoned");
+        values[":abandoned"] = true;
+      }
+      transactItems.push({ ConditionCheck: { TableName: reviewTable(), Key: key(`REPAIR#${operationId}`),
+        ConditionExpression: conditions.join(" AND "), ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values } });
+    }
+    try {
+      await client.send(new TransactWriteCommand({ TransactItems: transactItems }));
+      return true;
+    } catch (error) {
+      if ((error as { name?: string }).name === "TransactionCanceledException" || conditional(error)) return false;
+      throw error;
+    }
+  }
   async rejected(profile: Profile, taskId: string, eventId: string): Promise<boolean> {
     return Boolean(await new ReviewStore().get(`REJECTED_PAIR#${profile}#${taskId}#${eventId}`));
   }
@@ -1394,11 +1444,27 @@ export class SyncControls {
       const ref = { profile, side, id };
       const control = await this.control(ref);
       if (control?.activeRepair && control.activeRepair !== operationId) {
-        await client.send(new UpdateCommand({ TableName: reviewTable(),
-          Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
-          UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at",
-          ExpressionAttributeValues: { ":true": true, ":at": randomUUID() },
-        }));
+        await this.retireInactiveRepair(ref, control.activeRepair);
+        const current = await this.control(ref);
+        if (!current?.activeRepair || current.activeRepair === operationId) {
+          if (current?.excluded) return true;
+          continue;
+        }
+        try {
+          await client.send(new UpdateCommand({ TableName: reviewTable(),
+            Key: key(`SYNC_CONTROL#${entityKey(ref)}`),
+            UpdateExpression: "SET pendingRefresh = :true, pendingRefreshAt = :at",
+            ConditionExpression: "activeRepair = :activeRepair",
+            ExpressionAttributeValues: { ":true": true, ":at": randomUUID(), ":activeRepair": current.activeRepair },
+          }));
+        } catch (error) {
+          if (!conditional(error)) throw error;
+          const latest = await this.control(ref);
+          if (!latest?.activeRepair || latest.activeRepair === operationId) {
+            if (latest?.excluded) return true;
+            continue;
+          }
+        }
         return true;
       }
       if (control?.excluded && (!operationId || control.activeRepair !== operationId)) return true;

@@ -1,4 +1,14 @@
 const terminalOperationStatuses = new Set(["succeeded", "cancelled"]);
+// The migration workflow is capped at 45 minutes; worker Lambda invocations
+// are shorter. Add a one-minute margin so a writer cannot still be executing
+// when an abandoned legacy lease becomes eligible for retirement.
+export const LEGACY_WRITER_STALE_AGE_MS = 46 * 60 * 1000;
+
+export function isStaleLegacyWriter(row, now = Date.now()) {
+  if (!String(row?.pk || "").startsWith("ERASURE#") || !String(row?.sk || "").startsWith("WRITER#")) return false;
+  const acquiredAt = Date.parse(String(row.acquiredAt || ""));
+  return Number.isFinite(acquiredAt) && acquiredAt <= now - LEGACY_WRITER_STALE_AGE_MS;
+}
 
 export function summarizeLegacyCutover(rows, queueState = {}) {
   const pendingByStatus = {};
@@ -8,6 +18,7 @@ export function summarizeLegacyCutover(rows, queueState = {}) {
   const leasesByProfile = {};
   let terminalOperations = 0;
   let orphanConfirmations = 0;
+  let staleWriterCandidates = 0;
   const terminalOperationIds = new Set();
   const confirmationOperationIds = new Set();
   for (const row of rows) {
@@ -44,6 +55,8 @@ export function summarizeLegacyCutover(rows, queueState = {}) {
     } else if (pk.startsWith("ERASURE#") && sk === "EPOCH") {
       const profile = pk.slice("ERASURE#".length);
       replayMarkersByProfile[profile] = (replayMarkersByProfile[profile] || 0) + 1;
+    } else if (pk.startsWith("ERASURE#") && sk.startsWith("WRITER#") && isStaleLegacyWriter(row)) {
+      staleWriterCandidates += 1;
     } else if (pk.startsWith("ERASURE#")) {
       const profile = pk.slice("ERASURE#".length);
       leasesByProfile[profile] = (leasesByProfile[profile] || 0) + 1;
@@ -80,6 +93,7 @@ export function summarizeLegacyCutover(rows, queueState = {}) {
     journalsByProfile,
     activeLeases,
     leasesByProfile,
+    staleWriterCandidates,
     replayMarkers,
     replayMarkersByProfile,
     queues,

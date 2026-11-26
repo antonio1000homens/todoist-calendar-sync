@@ -54,6 +54,15 @@ test("cutover remains pending while a writer lease or terminal audit row remains
   assert.equal(JSON.stringify(result).includes("lease-id"), false);
 });
 
+test("cutover inventory is not clean while a consumed confirmation survives", () => {
+  const result = summarizeLegacyCutover([
+    { pk: "ERASURE_OPERATION#completed-id", sk: "STATE", status: "succeeded" },
+    { pk: "ERASURE_CONFIRMATION#completed-id", sk: "STATE", status: "consumed", operationId: "completed-id" },
+  ], { operations: {}, deadLetter: {} });
+  assert.equal(result.clean, false);
+  assert.equal(result.terminalOperations, 1);
+});
+
 test("cutover treats scoped grants as live leases until they expire", () => {
   const result = summarizeLegacyCutover([
     { pk: "ERASURE#work", sk: "SCOPED_ADMISSION", version: 2,

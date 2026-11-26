@@ -30,6 +30,17 @@ import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, Todoi
 const MAX_PROVIDER_MUTATIONS = 10;
 const DEFAULT_CALENDAR_RECOVERY_CANDIDATE_LIMIT = 20;
 
+function boundedRecurrenceWindow(anchor: string | undefined, nowMs: number): { start: string; end: string } | undefined {
+  const anchorMs = anchor ? Date.parse(anchor) : Number.NaN;
+  const pivot = Number.isFinite(anchorMs) ? anchorMs : nowMs;
+  return Number.isFinite(pivot) && Number.isFinite(nowMs)
+    ? {
+      start: new Date(pivot - 24 * 60 * 60_000).toISOString(),
+      end: new Date(Math.max(pivot, nowMs) + 3 * 366 * 24 * 60 * 60_000).toISOString(),
+    }
+    : undefined;
+}
+
 export interface CalendarRecoverySummary {
   scanned: number;
   skipped: number;
@@ -433,15 +444,15 @@ export async function reconcileUnmappedCalendar(
     // can now be represented natively. Unsupported schedules remain intact.
     const nativeRecurrence = nativeCalendarRecurrenceCandidate(master);
     const finiteWeekly = boundedFiniteWeekly;
-    if (existingLink && !nativeRecurrence && !boundedFiniteWeekly) {
+    if (!nativeRecurrence && !finiteWeekly) {
       summary.skipped += 1;
+      await state.audit(profile, "calendar_recurrence_todoist_rule_unsupported", {
+        seriesId, masterEventId: master.id, existingMirrorPreserved: Boolean(existingLink),
+        outcome: "source_left_unchanged", nonBlocking: true,
+      });
       return;
     }
     const mappedStart = existingLink?.activeEffectiveStart || existingLink?.originalStart;
-    const mappedMs = mappedStart ? Date.parse(mappedStart) : Number.NaN;
-    const fromMs = Number.isFinite(mappedMs) ? Math.min(mappedMs, now) : now;
-    const windowStart = new Date(fromMs - 24 * 60 * 60_000).toISOString();
-    const windowEnd = new Date(now + 3 * 366 * 24 * 60 * 60_000).toISOString();
     if (nativeRecurrence && !pair.calendar.listInstancesInWindow) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
@@ -449,11 +460,17 @@ export async function reconcileUnmappedCalendar(
       });
       return;
     }
-    const instances = boundedFiniteWeekly
+    const window = boundedRecurrenceWindow(mappedStart, now);
+    if (!window) {
+      summary.conflicts += 1;
+      await state.audit(profile, "calendar_recurrence_recovery_bounded_inventory_unavailable", {
+        seriesId, masterEventId: master.id, reason: "invalid_bounded_window",
+      });
+      return;
+    }
+    const instances = finiteWeekly
       ? await pair.calendar.listInstances(master.id)
-      : nativeRecurrence
-        ? await pair.calendar.listInstancesInWindow!(master.id, windowStart, windowEnd)
-        : await pair.calendar.listInstances(master.id, windowStart);
+      : await pair.calendar.listInstancesInWindow!(master.id, window.start, window.end);
     const hasAllDayInstances = instances.some((instance) => instance.end?.date && !instance.end.dateTime);
     let seriesTimeZone = master.start?.timeZone || calendarTimeZone;
     let calendarTimeZoneError: string | undefined;

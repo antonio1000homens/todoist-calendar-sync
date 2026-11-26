@@ -149,6 +149,31 @@ test("a rolling recurring series keeps one project correlation when its successo
   assert.equal(parsed.payload.taskId, "task-successor");
 });
 
+test("provider mapping persistence refuses a series linked to multiple task IDs without mutating either provider", async () => {
+  const seriesId = "ambiguous-series";
+  const comments = [
+    { id: "mapping-current", project_id: "project-home",
+      content: serializeMappingComment(mapping({ seriesId, taskId: "task-current", eventId: "master-current" }), "project-home") },
+    { id: "mapping-other", project_id: "project-home",
+      content: serializeMappingComment(mapping({ seriesId, taskId: "task-other", eventId: "master-other" }), "project-home") },
+  ];
+  let calendarWrites = 0;
+  let commentWrites = 0;
+  const todoist = {
+    async listProjectComments() { return comments; },
+    async upsertProjectComment() { commentWrites += 1; return { id: "unexpected" }; },
+    async updateComment() { commentWrites += 1; },
+  };
+  const calendar = { async ensureTaskCorrelation() { calendarWrites += 1; } };
+  const sync = new Synchronizer({ async putMapping() {} }, undefined, async () => ({ todoist, calendar }));
+
+  await assert.rejects(sync.persistProviderMapping(
+    mapping({ seriesId, taskId: "task-current", eventId: "master-current" }), todoist,
+  ), /ambiguous across Todoist task IDs/);
+  assert.equal(calendarWrites, 0);
+  assert.equal(commentWrites, 0);
+});
+
 test("project deletion tombstone round-trips exact identities and expires without DynamoDB state", () => {
   assert.equal(PROJECT_DELETION_TOMBSTONE_RETENTION_MS, 18 * 24 * 60 * 60 * 1000,
     "four-day FIFO source retention plus fourteen-day FIFO DLQ retention");

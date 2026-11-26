@@ -18,7 +18,8 @@ import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./to
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask } from "./cancelled-mapping-recovery-policy.js";
 import { logEvent } from "./observability.js";
 import { providerSyncBaseline } from "./provider-sync-baseline.js";
-import type { CalendarEvent, Delivery, Mapping, Profile, ProviderSyncBaseline, ReconciliationContinuation, TodoistTask } from "./types.js";
+import type { CalendarEvent, Delivery, Mapping, Profile, ProviderSyncBaseline, ReconciliationContinuation,
+  RecurrenceReconciliationSummary, TodoistTask } from "./types.js";
 
 interface TodoistCanonicalState {
   content: string;
@@ -59,7 +60,7 @@ interface ReconciliationStore {
 type ClientPair = { calendar: GoogleCalendar; todoist: Todoist };
 type ClientFactory = (profile: Profile) => Promise<ClientPair>;
 type RepairCurrentState = (delivery: Delivery) => Promise<void>;
-type ReconcileRecurrence = (profile: Profile) => Promise<void>;
+type ReconcileRecurrence = (profile: Profile) => Promise<RecurrenceReconciliationSummary | void>;
 
 type ReconcileOutcome =
   | "noop"
@@ -73,12 +74,22 @@ type ReconcileOutcome =
   | "blocked"
   | "conflict"
   | "completed_retained"
-  | "deleted_retired";
+  | "deleted_retired"
+  | "recurrence_converged"
+  | "recurrence_repaired"
+  | "recurrence_unsupported"
+  | "recurrence_excluded"
+  | "recurrence_blocked"
+  | "recurrence_stale"
+  | "recurrence_unverified"
+  | "recurrence_reported"
+  | "recurrence_total";
 
 export interface SnapshotReconciliationResult {
   continuation?: ReconciliationContinuation;
   processedCandidates: number;
   counts: Record<ReconcileOutcome, number>;
+  recurrence?: RecurrenceReconciliationSummary;
 }
 
 const DEFAULT_RECONCILIATION_CANDIDATE_LIMIT = 20;
@@ -252,6 +263,15 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
     conflict: 0,
     completed_retained: 0,
     deleted_retired: 0,
+    recurrence_converged: 0,
+    recurrence_repaired: 0,
+    recurrence_unsupported: 0,
+    recurrence_excluded: 0,
+    recurrence_blocked: 0,
+    recurrence_stale: 0,
+    recurrence_unverified: 0,
+    recurrence_reported: 0,
+    recurrence_total: 0,
   };
 }
 
@@ -452,7 +472,7 @@ export class SnapshotReconciler {
     throw failure;
   }
 
-  private async reconcileExistingRecurrence(profile: Profile): Promise<void> {
+  private async reconcileExistingRecurrence(profile: Profile): Promise<RecurrenceReconciliationSummary | void> {
     if (this.reconcileRecurrence) return this.reconcileRecurrence(profile);
     return new Synchronizer(this.state).reconcile(profile);
   }
@@ -655,6 +675,40 @@ export class SnapshotReconciler {
       eventId: event.id,
     });
     return "calendar_to_todoist";
+  }
+
+  /** Apply a simultaneous-edit merge to both providers. Calendar is written
+   * first so a partial failure leaves Todoist's source edits available for the
+   * next fresh reconciliation; a second pass can safely finish the Todoist
+   * update from the now-converged Calendar values. */
+  private async applyMergedChanges(
+    profile: Profile,
+    mapping: Mapping,
+    task: TodoistTask,
+    event: CalendarEvent,
+    mergedTask: TodoistTask,
+    mergedEvent: CalendarEvent,
+    clients: ClientPair,
+  ): Promise<ReconcileOutcome> {
+    const calendarChanged = !hasCanonicalState(event, mergedTask);
+    const todoistChanged = JSON.stringify(canonicalTodoist(task)) !== JSON.stringify(canonicalTodoist(mergedTask));
+    const storedEvent = calendarChanged
+      ? await clients.calendar.upsertEvent(mergedEvent, event.id)
+      : event;
+    const nextTask = todoistChanged
+      ? await clients.todoist.upsertTask(toTodoistTask(mergedEvent), task.id)
+      : task;
+    const nextMapping: Mapping = {
+      ...mapping,
+      projectId: nextTask.project_id || mapping.projectId,
+      eventId: storedEvent.id,
+      updatedAt: new Date().toISOString(),
+    };
+    const persistedMapping = await this.persistProviderMapping(nextMapping, clients);
+    await this.persistReconciliationBaseline(persistedMapping, nextTask, storedEvent, clients);
+    if (calendarChanged || todoistChanged) await this.state.recordMutation(profile);
+    return calendarChanged && !todoistChanged ? "todoist_to_calendar"
+      : todoistChanged && !calendarChanged ? "calendar_to_todoist" : "converged";
   }
 
   /**
@@ -970,31 +1024,45 @@ export class SnapshotReconciler {
         return "converged";
       }
       if (task && event && event.status !== "cancelled") {
-        // Merge independent fields. Calendar wins same-field ties; Todoist
-        // edits survive when Calendar left the corresponding field unchanged.
+        // Merge independent fields. When both providers changed the same
+        // field, use provider timestamps only when both parse and differ;
+        // equal/missing timestamps use the documented Calendar tie-break.
+        const todoistUpdatedAt = Date.parse(task.updated_at || "");
+        const calendarUpdatedAt = Date.parse(event.updated || "");
+        const todoistIsNewer = Number.isFinite(todoistUpdatedAt) && Number.isFinite(calendarUpdatedAt)
+          && todoistUpdatedAt > calendarUpdatedAt;
+        const todoistChangedSummary = todoistChangedFields.includes("content");
+        const calendarChangedSummary = calendarChangedFields.includes("summary");
+        const todoistChangedDescription = todoistChangedFields.includes("description");
+        const calendarChangedDescription = calendarChangedFields.includes("description");
+        const todoistChangedDue = todoistChangedFields.some(field => field === "due" || field.startsWith("due."));
+        const calendarChangedStart = calendarChangedFields.some(field => field === "start" || field.startsWith("start."));
+        const todoistWinsSummary = todoistChangedSummary
+          && (!calendarChangedSummary || todoistIsNewer);
+        const todoistWinsDescription = todoistChangedDescription
+          && (!calendarChangedDescription || todoistIsNewer);
+        const todoistWinsDue = todoistChangedDue && (!calendarChangedStart || todoistIsNewer);
         const taskProjection = hasDue(task) ? toCalendarEvent(task, event) : event;
         const mergedEvent: CalendarEvent = { ...event };
-        if (todoistChangedFields.includes("content") && !calendarChangedFields.includes("summary"))
-          mergedEvent.summary = task.content;
-        if (todoistChangedFields.includes("description") && !calendarChangedFields.includes("description"))
-          mergedEvent.description = task.description || "";
-        if (todoistChangedFields.includes("due") && !calendarChangedFields.includes("start")) {
+        if (todoistWinsSummary) mergedEvent.summary = task.content;
+        if (todoistWinsDescription) mergedEvent.description = task.description || "";
+        if (todoistWinsDue) {
           mergedEvent.start = taskProjection.start;
           mergedEvent.end = taskProjection.end;
         }
         const mergedTaskProjection = toTodoistTask(mergedEvent);
         const mergedTask: TodoistTask = {
           ...task,
-          ...(todoistChangedFields.includes("content") && !calendarChangedFields.includes("summary")
+          ...(todoistWinsSummary
             ? { content: task.content } : { content: mergedTaskProjection.content }),
-          ...(todoistChangedFields.includes("description") && !calendarChangedFields.includes("description")
+          ...(todoistWinsDescription
             ? { description: task.description } : { description: mergedTaskProjection.description }),
           due: mergedTaskProjection.due,
         };
-        const outcome = await this.applyCalendarChange(profile, mapping, mergedTask, mergedEvent, clients);
+        const outcome = await this.applyMergedChanges(profile, mapping, task, event, mergedTask, mergedEvent, clients);
         await this.state.audit(profile, "todoist_snapshot_reconcile_simultaneous_edits_merged", {
           taskId: task.id, eventId: event.id, todoistChangedFields, calendarChangedFields,
-          tieBreak: "calendar_same_field",
+          sameFieldWinner: todoistIsNewer ? "todoist_newer_provider_timestamp" : "calendar_default",
         });
         return outcome;
       }
@@ -1184,7 +1252,9 @@ export class SnapshotReconciler {
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
     const clients = await this.clients(profile);
-    if (!continuation) await this.reconcileExistingRecurrence(profile);
+    const recurrence = continuation?.recurrence
+      ?? (await this.reconcileExistingRecurrence(profile))
+      ?? { total: 1, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 1 };
 
     const tasks = (await clients.todoist.listTasks()).slice().sort((a, b) => a.id.localeCompare(b.id));
     const taskById = new Map(tasks.map((task) => [task.id, task]));
@@ -1192,6 +1262,17 @@ export class SnapshotReconciler {
     const mappedTaskIds = new Set(mappings.map((mapping) => mapping.taskId));
     const unmappedTasks = tasks.filter((task) => !mappedTaskIds.has(task.id));
     const counts = emptyCounts();
+    if (!continuation?.recurrence && recurrence) {
+      counts.recurrence_reported = 1;
+      counts.recurrence_total += recurrence.total;
+      counts.recurrence_converged += recurrence.converged;
+      counts.recurrence_repaired += recurrence.repaired;
+      counts.recurrence_unsupported += recurrence.unsupported;
+      counts.recurrence_excluded += recurrence.excluded;
+      counts.recurrence_blocked += recurrence.blocked;
+      counts.recurrence_stale += recurrence.stale;
+      counts.recurrence_unverified += recurrence.unverified;
+    }
     let processedCandidates = 0;
     const nextSequence = (continuation?.sequence || 0) + 1;
 
@@ -1203,8 +1284,9 @@ export class SnapshotReconciler {
         taskCount: tasks.length,
         mappingCount: mappings.length,
         counts,
+        recurrence,
       });
-      return { continuation: next, processedCandidates, counts };
+      return { continuation: { ...next, ...(recurrence ? { recurrence } : {}) }, processedCandidates, counts, recurrence };
     };
 
     if (!continuation || continuation.phase === "mapped") {
@@ -1257,9 +1339,10 @@ export class SnapshotReconciler {
       processedCandidates,
       continuationSequence: continuation?.sequence || 0,
       counts,
+      recurrence,
     });
     await this.retireVerifiedDeletedCases(profile, clients);
     await this.retireVerifiedDeletedCases(profile, clients, true);
-    return { processedCandidates, counts };
+    return { processedCandidates, counts, recurrence };
   }
 }

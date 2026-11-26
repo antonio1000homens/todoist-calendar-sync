@@ -3,7 +3,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, DeleteCommand, ScanCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { writeFile } from "node:fs/promises";
-import { summarizeLegacyCutover } from "./legacy-cutover-policy.mjs";
+import { isStaleLegacyWriter, summarizeLegacyCutover } from "./legacy-cutover-policy.mjs";
 
 const tableName = process.env.STATE_TABLE_NAME?.trim();
 const region = process.env.AWS_REGION?.trim();
@@ -32,13 +32,14 @@ async function readLegacyRows() {
       TableName: tableName,
       ConsistentRead: true,
       Limit: 25,
-      ProjectionExpression: "pk, sk, #status, epoch, grants, exclusiveOwner, exclusiveUntil, #version, operationId, updatedAt",
+      ProjectionExpression: "pk, sk, #status, epoch, grants, exclusiveOwner, exclusiveUntil, #version, operationId, updatedAt, acquiredAt",
       ExpressionAttributeNames: { "#status": "status", "#version": "version" },
       ReturnConsumedCapacity: "TOTAL",
       ...(cursor ? { ExclusiveStartKey: cursor } : {}),
     }));
     for (const row of result.Items || []) {
       if (String(row.pk || "").startsWith("ERASURE_OPERATION#")
+        || String(row.pk || "").startsWith("ERASURE_CONFIRMATION#")
         || String(row.pk || "").startsWith("ERASURE#")) rows.push(row);
     }
     const capacity = Number(result.ConsumedCapacity?.CapacityUnits || 0);
@@ -111,6 +112,16 @@ async function retireDrainedLegacyRows(rows) {
     const profile = String(row.pk).slice("ERASURE#".length);
     if (!["home", "antonio", "work"].includes(profile)) throw new Error("unknown_legacy_profile_partition");
     if (row.sk === "FENCE" || row.sk === "JOURNAL") throw new Error("legacy_profile_lock_not_retirable");
+    if (String(row.sk).startsWith("WRITER#")) {
+      if (!isStaleLegacyWriter(row)) throw new Error("legacy_writer_lease_not_stale");
+      await dynamo.send(new DeleteCommand({
+        TableName: tableName,
+        Key: { pk: row.pk, sk: row.sk },
+        ConditionExpression: "acquiredAt = :acquiredAt",
+        ExpressionAttributeValues: { ":acquiredAt": row.acquiredAt },
+      }));
+      continue;
+    }
     if (row.sk === "EPOCH") {
       if (!Number.isSafeInteger(row.epoch)) throw new Error("legacy_epoch_invalid");
       await dynamo.send(new TransactWriteCommand({ TransactItems: [

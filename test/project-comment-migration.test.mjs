@@ -264,7 +264,7 @@ test("apply does not misclassify an ambiguous commentId that already points at t
   assert.equal(state.saved.length, 0, "normalization is written to the provider comment only");
   const normalized = parseMappingComment(fake.comments[0]);
   assert.ok(normalized && !("error" in normalized));
-  assert.equal(normalized.payload.mappingRevision, 3);
+  assert.equal(normalized.payload.mappingRevision, 2, "an equivalent provider mapping is left untouched");
 });
 
 test("legacy cleanup is report-only unless apply is explicit", async () => {
@@ -312,7 +312,7 @@ test("legacy cleanup deletes only after a valid project mapping is verified and 
   assert.equal(state.saved.length, 0, "legacy cleanup must not rewrite DynamoDB correlation rows");
   const normalized = parseMappingComment(fake.comments[0]);
   assert.ok(normalized && !("error" in normalized));
-  assert.equal(normalized.payload.mappingRevision, 3);
+  assert.equal(normalized.payload.mappingRevision, 2, "legacy cleanup does not churn an equivalent provider mapping");
 });
 
 test("report mode validates a missing project mapping but never writes provider or DynamoDB state", async () => {
@@ -366,7 +366,7 @@ test("legacy cleanup treats an already-missing task comment as an idempotent del
   assert.equal(state.saved.length, 0);
   const normalized = parseMappingComment(fake.comments[0]);
   assert.ok(normalized && !("error" in normalized));
-  assert.equal(normalized.payload.mappingRevision, 3);
+  assert.equal(normalized.payload.mappingRevision, 2, "idempotent cleanup preserves the equivalent provider mapping");
 });
 
 

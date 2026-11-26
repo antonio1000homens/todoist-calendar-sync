@@ -67,6 +67,8 @@ export interface ReconciliationState {
   slackDecisionId?: string;
   lastProgressAt?: string;
   result?: Record<string, number>;
+  /** Monotonic compare-and-swap token for persisted reconciliation progress. */
+  progressRevision?: number;
   unresolved?: number;
   notificationPending?: boolean;
   notificationText?: string;
@@ -154,6 +156,10 @@ function ttl(days: number): number {
   return Math.floor(Date.now() / 1000) + days * 24 * 60 * 60;
 }
 
+// Reconciliation chunks execute in a Lambda capped at 15 minutes. The margin
+// lets a retried delivery resume after an invocation has certainly stopped.
+const RECONCILIATION_DELIVERY_LEASE_MS = 16 * 60_000;
+
 function conditionalFailure(error: unknown): boolean {
   return (error as { name?: string }).name === "ConditionalCheckFailedException";
 }
@@ -179,6 +185,16 @@ export class StateRepository {
    * Explicit exclusions and short-lived repair locks still protect identities. */
   async reconciliationBlocked(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
     return this.syncBlocked(profile, ids);
+  }
+
+  async explicitlyExcluded(profile: Profile, ids: {taskId?: string; eventId?: string}): Promise<boolean> {
+    const controls = new SyncControls();
+    for (const [side, id] of [["todoist", ids.taskId], ["calendar", ids.eventId]] as const) {
+      if (!id) continue;
+      const control = await controls.control({ profile, side, id });
+      if (control?.excluded === true) return true;
+    }
+    return false;
   }
 
   /** A verified two-calendar native split must fence both profiles before
@@ -314,13 +330,169 @@ export class StateRepository {
     await client.send(new DeleteCommand({ TableName: this.ensureTable(), Key: key(`WATCH_CHANNEL#${channelId}`) }));
   }
 
-  async markCalendarWatchNotification(profile: Profile, receivedAt = now()): Promise<void> {
-    await client.send(new UpdateCommand({
+  async markCalendarWatchNotification(profile: Profile, receivedAt = now(), channelId?: string, messageNumber?: string): Promise<number> {
+    const parsedMessageNumber = Number(messageNumber);
+    if (channelId && /^\d+$/.test(messageNumber || "") && Number.isSafeInteger(parsedMessageNumber)) {
+      try {
+        const result = await client.send(new UpdateCommand({
+          TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+          UpdateExpression: "SET lastNotificationAt = :receivedAt, calendarSyncGeneration = if_not_exists(calendarSyncGeneration, :zero) + :one, calendarSyncChannel = :channel, calendarSyncMessageNumber = :messageNumber",
+          ConditionExpression: "attribute_not_exists(calendarSyncChannel) OR calendarSyncChannel <> :channel OR attribute_not_exists(calendarSyncMessageNumber) OR calendarSyncMessageNumber < :messageNumber",
+          ExpressionAttributeValues: { ":receivedAt": receivedAt, ":zero": 0, ":one": 1, ":channel": channelId, ":messageNumber": parsedMessageNumber },
+          ReturnValues: "UPDATED_NEW",
+        }));
+        const generation = Number(result.Attributes?.calendarSyncGeneration);
+        if (!Number.isSafeInteger(generation) || generation < 1) throw new Error("Calendar notification generation was not persisted");
+        return generation;
+      } catch (error) {
+        if (!conditionalFailure(error)) throw error;
+        // A duplicate or out-of-order push is already covered by a later dirty
+        // generation. The incremental token remains the source of correctness.
+        const current = await this.getCalendarSyncState(profile);
+        if (Number.isSafeInteger(current.generation)) return current.generation!;
+        throw error;
+      }
+    }
+    const result = await client.send(new UpdateCommand({
       TableName: this.ensureTable(),
-      Key: key(`WATCH#${profile}`),
-      UpdateExpression: "SET lastNotificationAt = :receivedAt",
-      ExpressionAttributeValues: { ":receivedAt": receivedAt },
+      Key: key(`CALSYNC#${profile}`),
+      UpdateExpression: "SET lastNotificationAt = :receivedAt, calendarSyncGeneration = if_not_exists(calendarSyncGeneration, :zero) + :one",
+      ExpressionAttributeValues: { ":receivedAt": receivedAt, ":zero": 0, ":one": 1 },
+      ReturnValues: "UPDATED_NEW",
     }));
+    const generation = Number(result.Attributes?.calendarSyncGeneration);
+    if (!Number.isSafeInteger(generation) || generation < 1) throw new Error("Calendar notification generation was not persisted");
+    return generation;
+  }
+
+  /** Claim one durable per-profile Calendar SQS admission. Expired claims recover
+   * a crash between the DynamoDB claim and SQS send; SQS duplicates are safe. */
+  private async getCalendarSyncState(profile: Profile): Promise<{
+    generation?: number; state?: "pending" | "dispatching" | "queued" | "running" | "idle" | "failed";
+    queuedGeneration?: number; leaseUntil?: number; runningGeneration?: number; completedGeneration?: number;
+    failedGeneration?: number;
+  }> {
+    const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`), ConsistentRead: true }));
+    return { generation: result.Item?.calendarSyncGeneration, state: result.Item?.calendarSyncState,
+      queuedGeneration: result.Item?.calendarSyncQueuedGeneration, leaseUntil: result.Item?.calendarSyncLeaseUntil,
+      runningGeneration: result.Item?.calendarSyncRunningGeneration, completedGeneration: result.Item?.calendarSyncCompletedGeneration,
+      failedGeneration: result.Item?.calendarSyncFailedGeneration };
+  }
+
+  async claimCalendarSyncDispatch(profile: Profile, leaseMs = 30_000): Promise<number | undefined> {
+    const watch = await this.getCalendarSyncState(profile);
+    const generation = watch.generation || 0;
+    if (!generation || watch.state === "running"
+      || generation <= (watch.completedGeneration || 0)
+      || generation <= (watch.failedGeneration || 0)) return undefined;
+    const nowMs = Date.now();
+    if (watch.state === "queued" && (watch.leaseUntil || 0) > nowMs) return undefined;
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+        UpdateExpression: "SET calendarSyncState = :dispatching, calendarSyncQueuedGeneration = :generation, calendarSyncLeaseUntil = :lease",
+        ConditionExpression: "calendarSyncGeneration = :generation AND (attribute_not_exists(calendarSyncState) OR calendarSyncState = :pending OR calendarSyncState = :idle OR (calendarSyncState = :failed AND calendarSyncFailedGeneration < :generation) OR (calendarSyncState IN (:queued, :dispatching) AND (attribute_not_exists(calendarSyncLeaseUntil) OR calendarSyncLeaseUntil <= :now)))",
+        ExpressionAttributeValues: { ":dispatching": "dispatching", ":pending": "pending", ":idle": "idle", ":failed": "failed", ":queued": "queued", ":generation": generation, ":lease": nowMs + leaseMs, ":now": nowMs },
+      }));
+      return generation;
+    } catch (error) { if (conditionalFailure(error)) return undefined; throw error; }
+  }
+
+  async markCalendarSyncQueued(profile: Profile, generation: number): Promise<void> {
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+      UpdateExpression: "SET calendarSyncState = :queued, calendarSyncLeaseUntil = :lease",
+      ConditionExpression: "calendarSyncState = :dispatching AND calendarSyncQueuedGeneration = :generation",
+      ExpressionAttributeValues: { ":queued": "queued", ":dispatching": "dispatching", ":generation": generation, ":lease": Date.now() + 15 * 60_000 },
+    }));
+  }
+
+  async calendarSyncAlreadyHandled(profile: Profile): Promise<boolean> {
+    const state = await this.getCalendarSyncState(profile);
+    const generation = state.generation || 0;
+    return state.state === "queued" || state.state === "running"
+      || generation > 0 && generation <= (state.completedGeneration || 0)
+      || generation > 0 && generation <= (state.failedGeneration || 0);
+  }
+
+  /** Lightweight dispatcher recovery. It deliberately checks no provider data
+   * and treats generation as pending when no pass has committed it yet. */
+  async calendarSyncDispatchDue(profile: Profile, nowMs = Date.now()): Promise<boolean> {
+    const state = await this.getCalendarSyncState(profile);
+    const generation = state.generation || 0;
+    if (!generation || generation <= (state.completedGeneration || 0) || state.state === "running") return false;
+    if (state.state === "pending" || state.state === "idle" || !state.state) return true;
+    if (state.state === "failed") return generation > (state.failedGeneration || 0);
+    return (state.state === "dispatching" || state.state === "queued")
+      && (state.leaseUntil || 0) <= nowMs;
+  }
+
+  async releaseCalendarSyncDispatch(profile: Profile, generation: number): Promise<void> {
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+        UpdateExpression: "SET calendarSyncState = :pending REMOVE calendarSyncLeaseUntil",
+        ConditionExpression: "(calendarSyncState = :dispatching OR calendarSyncState = :queued) AND calendarSyncQueuedGeneration = :generation",
+        ExpressionAttributeValues: { ":pending": "pending", ":dispatching": "dispatching", ":queued": "queued", ":generation": generation },
+      }));
+    } catch (error) { if (!conditionalFailure(error)) throw error; }
+  }
+
+  /** Worker snapshots the latest dirty generation. A crash leaves it running;
+   * the original FIFO record retries and may safely take the same lease. */
+  async startCalendarSync(profile: Profile, queuedGeneration: number): Promise<number | undefined> {
+    const watch = await this.getCalendarSyncState(profile);
+    const dirtyGeneration = watch.generation || 0;
+    const completedGeneration = Math.max(watch.completedGeneration || 0, watch.failedGeneration || 0);
+    const pendingNewerWork = watch.state === "pending" && dirtyGeneration > completedGeneration;
+    if ((watch.state === "queued" || watch.state === "dispatching")
+      && (watch.queuedGeneration || 0) > queuedGeneration) return undefined;
+    if (watch.state !== "running" && queuedGeneration <= completedGeneration && !pendingNewerWork) return undefined;
+    if (watch.state === "running" && watch.queuedGeneration === queuedGeneration
+      && Number.isSafeInteger(watch.runningGeneration)) return watch.runningGeneration!;
+    const generation = watch.generation || queuedGeneration;
+    await client.send(new UpdateCommand({
+      TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+      UpdateExpression: "SET calendarSyncState = :running, calendarSyncRunningGeneration = :generation REMOVE calendarSyncLeaseUntil",
+      ConditionExpression: "calendarSyncGeneration = :current AND ((calendarSyncState IN (:queued, :dispatching) AND calendarSyncQueuedGeneration = :queuedGeneration) OR calendarSyncState = :idle OR calendarSyncState = :pending)",
+      ExpressionAttributeValues: { ":running": "running", ":idle": "idle", ":pending": "pending", ":queued": "queued", ":dispatching": "dispatching", ":generation": generation, ":queuedGeneration": queuedGeneration, ":current": generation },
+    }));
+    return generation;
+  }
+
+  /** Complete a pass with a compare-and-swap against the dirty generation. */
+  async completeCalendarSync(profile: Profile, processedGeneration: number): Promise<boolean> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const watch = await this.getCalendarSyncState(profile);
+      const current = watch.generation || 0;
+      const dirty = current !== processedGeneration;
+      try {
+        await client.send(new UpdateCommand({
+          TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+          UpdateExpression: "SET calendarSyncState = :state, calendarSyncCompletedGeneration = :generation REMOVE calendarSyncLeaseUntil, calendarSyncRunningGeneration, calendarSyncQueuedGeneration",
+          ConditionExpression: "calendarSyncState = :running AND calendarSyncRunningGeneration = :generation AND calendarSyncGeneration = :current",
+          ExpressionAttributeValues: { ":state": dirty ? "pending" : "idle", ":running": "running", ":generation": processedGeneration, ":current": current },
+        }));
+        return dirty;
+      } catch (error) { if (!conditionalFailure(error)) throw error; }
+    }
+    throw new Error("Calendar sync completion raced repeated notifications; keep the delivery retryable");
+  }
+
+  /** A quarantined pass remains dirty, so a later provider retry can dispatch
+   * fresh work from the last committed Calendar token. */
+  async failCalendarSync(profile: Profile): Promise<void> {
+    const state = await this.getCalendarSyncState(profile);
+    const runningGeneration = state.runningGeneration;
+    if (!Number.isSafeInteger(runningGeneration)) return;
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+        UpdateExpression: "SET calendarSyncState = :failed, calendarSyncFailedGeneration = :generation REMOVE calendarSyncLeaseUntil, calendarSyncRunningGeneration, calendarSyncQueuedGeneration",
+        ConditionExpression: "calendarSyncState = :running AND calendarSyncRunningGeneration = :generation",
+        ExpressionAttributeValues: { ":failed": "failed", ":running": "running", ":generation": runningGeneration },
+      }));
+    } catch (error) { if (!conditionalFailure(error)) throw error; }
   }
 
   /** @deprecated Ingress no longer claims before enqueue. Kept for compatibility/tests. */
@@ -596,20 +768,39 @@ export class StateRepository {
   }
 
   async beginReconciliation(profile: Profile, generation: string, deliveryId?: string): Promise<boolean> {
+    const current = await this.getReconciliationState(profile);
+    if (!current || current.generation !== generation || !current.pending
+      || deliveryId && current.lastDeliveryId && current.lastDeliveryId !== deliveryId) return false;
+    const startedAt = new Date().toISOString();
+    const previousStartedAt = current.lastStartedAt;
+    if (deliveryId && current.lastStartedDeliveryId === deliveryId) {
+      const previousStartedAtMs = Date.parse(previousStartedAt || "");
+      if (!Number.isFinite(previousStartedAtMs)
+        || Date.parse(startedAt) - previousStartedAtMs < RECONCILIATION_DELIVERY_LEASE_MS) return false;
+    }
+    // Compare the observed start timestamp in the write condition. Concurrent
+    // duplicate deliveries that both read the same old state cannot both
+    // acquire the same chunk lease.
+    const leaseCondition = deliveryId
+      ? previousStartedAt ? " AND lastStartedAt = :previousStartedAt" : " AND attribute_not_exists(lastStartedAt)"
+      : "";
     try {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(),
         Key: key(`RECONCILE#${profile}`),
         UpdateExpression: "SET lastStartedAt = :now, lastProgressAt = :now, #status = :running, queueState = :running, expiresAt = :expiresAt"
           + (deliveryId ? ", lastStartedDeliveryId = :deliveryId" : "") + " REMOVE lastHealthAlertAt",
-        ConditionExpression: "#pending = :true AND generation = :generation AND attribute_not_exists(lastFailedAt)",
+        ConditionExpression: "#pending = :true AND generation = :generation AND attribute_not_exists(lastFailedAt)"
+          + (deliveryId ? current.lastDeliveryId ? " AND lastDeliveryId = :deliveryId" : " AND attribute_not_exists(lastDeliveryId)" : "")
+          + leaseCondition,
         ExpressionAttributeNames: { "#pending": "pending", "#status": "status" },
         ExpressionAttributeValues: {
           ":true": true,
           ":generation": generation,
           ":running": "running",
-          ":now": now(),
+          ":now": startedAt,
           ...(deliveryId ? { ":deliveryId": deliveryId } : {}),
+          ...(deliveryId && previousStartedAt ? { ":previousStartedAt": previousStartedAt } : {}),
           ":expiresAt": ttl(30),
         },
       }));
@@ -624,19 +815,42 @@ export class StateRepository {
     profile: Profile, generation: string, counts: Record<string, number>,
     checkpoint?: ReconciliationState["progressCheckpoint"],
   ): Promise<void> {
-    const current = await this.getReconciliationState(profile);
-    if (!current || current.generation !== generation || !current.pending) return;
-    const aggregate = { ...(current.result || {}) };
-    for (const [name, count] of Object.entries(counts)) aggregate[name] = (aggregate[name] || 0) + count;
-    await client.send(new UpdateCommand({
-      TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
-      UpdateExpression: "SET #result = :result, lastProgressAt = :now, expiresAt = :expiresAt"
-        + (checkpoint ? ", progressCheckpoint = :checkpoint" : "") + " REMOVE lastHealthAlertAt",
-      ConditionExpression: "#pending = :true AND generation = :generation",
-      ExpressionAttributeNames: { "#pending": "pending", "#result": "result" },
-      ExpressionAttributeValues: { ":result": aggregate, ":now": now(), ":expiresAt": ttl(30), ":true": true, ":generation": generation,
-        ...(checkpoint ? { ":checkpoint": { ...checkpoint, observedAt: now() } } : {}) },
-    }));
+    // SQS may redeliver a chunk after its checkpoint was committed. Compare
+    // checkpoints in delivery order and update the aggregate with a revision
+    // token so concurrent redeliveries cannot count the same chunk twice.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await this.getReconciliationState(profile);
+      if (!current || current.generation !== generation || !current.pending) return;
+      if (checkpoint && current.progressCheckpoint) {
+        const phaseOrder = { mapped: 0, unmapped: 1, calendar: 2 };
+        const prior = current.progressCheckpoint;
+        const isBehind = (prior.sequence ?? 0) > (checkpoint.sequence ?? 0)
+          || (prior.sequence ?? 0) === (checkpoint.sequence ?? 0)
+            && phaseOrder[prior.phase || "mapped"] >= phaseOrder[checkpoint.phase || "mapped"];
+        if (isBehind) return;
+      }
+      const aggregate = { ...(current.result || {}) };
+      for (const [name, count] of Object.entries(counts)) aggregate[name] = (aggregate[name] || 0) + count;
+      const revision = current.progressRevision || 0;
+      const writtenAt = now();
+      try {
+        await client.send(new UpdateCommand({
+          TableName: this.ensureTable(), Key: key(`RECONCILE#${profile}`),
+          UpdateExpression: "SET #result = :result, lastProgressAt = :now, progressRevision = :nextRevision, expiresAt = :expiresAt"
+            + (checkpoint ? ", progressCheckpoint = :checkpoint" : "") + " REMOVE lastHealthAlertAt",
+          ConditionExpression: "#pending = :true AND generation = :generation AND "
+            + (current.progressRevision === undefined ? "attribute_not_exists(progressRevision)" : "progressRevision = :revision"),
+          ExpressionAttributeNames: { "#pending": "pending", "#result": "result" },
+          ExpressionAttributeValues: { ":result": aggregate, ":now": writtenAt, ":expiresAt": ttl(30), ":true": true, ":generation": generation,
+            ":revision": revision, ":nextRevision": revision + 1,
+            ...(checkpoint ? { ":checkpoint": { ...checkpoint, observedAt: writtenAt } } : {}) },
+        }));
+        return;
+      } catch (error) {
+        if (!conditionalFailure(error)) throw error;
+      }
+    }
+    throw new Error(`Unable to persist reconciliation progress for ${profile}; state changed repeatedly`);
   }
 
   async preserveReconciliationOutcome(run: ReconciliationState): Promise<void> {

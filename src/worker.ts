@@ -12,7 +12,7 @@ import {
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { enqueueDelivery, queuePendingRefresh, requestReconciliation } from "./queue.js";
+import { CalendarSyncAdmissionError, enqueueCalendarSync, enqueueDelivery, queuePendingRefresh, requestReconciliation } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
@@ -23,7 +23,7 @@ import { Synchronizer } from "./sync.js";
 import { logEvent } from "./observability.js";
 import {
   MAX_SYNC_RECEIVES, failedDeliveryDisposition,
-  quarantineFailedRecord, shortenTransientRetryVisibility, transientRetryVisibilitySeconds,
+  providerRetryAfterMs, quarantineFailedRecord, shortenTransientRetryVisibility, transientRetryVisibilitySeconds,
 } from "./sqs-failure-policy.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 import { decodeSlackInteractionDelivery, isSlackControlUserAllowed } from "./slack-interaction.js";
@@ -478,6 +478,19 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
 
+      let calendarSyncGeneration: number | undefined;
+      if (delivery.kind === "calendar" && delivery.calendarSync) {
+        calendarSyncGeneration = await state.startCalendarSync(delivery.profile, delivery.calendarSync.generation);
+        if (calendarSyncGeneration === undefined) {
+          await markCompleted();
+          log("calendar_sync_duplicate_request_skipped", {
+            awsRequestId: context.awsRequestId, profile: delivery.profile,
+            generation: delivery.calendarSync.generation,
+          });
+          continue;
+        }
+      }
+
       if (delivery.slackInteraction) {
         const interaction = delivery.slackInteraction;
         delivery = decodeSlackInteractionDelivery(delivery);
@@ -596,6 +609,10 @@ export const handler: SQSHandler = async (event, context: Context) => {
           delivery.profile, `circuit:${delivery.id}`, undefined,
           "Calendar changes were deferred because the mutation circuit is open. Request reconciliation manually after the circuit cools down.",
         );
+        if (calendarSyncGeneration !== undefined) {
+          const followUpNeeded = await state.completeCalendarSync(delivery.profile, calendarSyncGeneration);
+          if (followUpNeeded) await enqueueCalendarSync(state, delivery.profile);
+        }
         await markCompleted();
         continue;
       }
@@ -611,6 +628,11 @@ export const handler: SQSHandler = async (event, context: Context) => {
         meaningfulMutation = true;
       });
       await new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery);
+
+      if (calendarSyncGeneration !== undefined) {
+        const followUpNeeded = await state.completeCalendarSync(delivery.profile, calendarSyncGeneration);
+        if (followUpNeeded) await enqueueCalendarSync(state, delivery.profile);
+      }
 
       if (delivery.kind === "calendar" && delivery.headers["x-calendar-sync-cursor-expired"] === "true") {
         await state.audit(delivery.profile, "calendar_sync_cursor_expired_reconciliation_needed", { deliveryId: delivery.id });
@@ -645,15 +667,27 @@ export const handler: SQSHandler = async (event, context: Context) => {
         failures.push({ itemIdentifier: record.messageId });
         continue;
       }
+      if (delivery?.kind === "calendar" && delivery.calendarSync && error instanceof CalendarSyncAdmissionError) {
+        // Provider processing and its cursor commit already succeeded. Keep
+        // the original FIFO request retryable so it can re-admit the durable
+        // follow-up generation after the SQS outage clears.
+        log("calendar_sync_followup_admission_retry", {
+          profile: delivery.profile, generation: delivery.calendarSync.generation,
+          error: serializeError(error),
+        });
+        failures.push({ itemIdentifier: record.messageId });
+        continue;
+      }
       const receiveCount = Math.max(1, Number(record.attributes?.ApproximateReceiveCount || "1") || 1);
       const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount);
       if (disposition.kind === "retry_fifo") {
+        const retryAfterMs = providerRetryAfterMs(error);
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is
         // written. A short visibility backoff is optional: an API outage
         // leaves the original, longer queue visibility timeout in force.
         try {
-          await shortenTransientRetryVisibility(record, receiveCount);
+          await shortenTransientRetryVisibility(record, receiveCount, retryAfterMs);
         } catch (visibilityError) {
           log("transient_retry_visibility_fallback", {
             delivery: deliverySummary(delivery),
@@ -666,7 +700,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
           reason: disposition.reason,
           receiveCount,
           maxReceiveCount: MAX_SYNC_RECEIVES,
-          targetVisibilitySeconds: transientRetryVisibilitySeconds(receiveCount),
+          targetVisibilitySeconds: transientRetryVisibilitySeconds(receiveCount, retryAfterMs),
           error: serializeError(error),
         });
         failures.push({ itemIdentifier: record.messageId });
@@ -722,6 +756,18 @@ export const handler: SQSHandler = async (event, context: Context) => {
             error: serializeError(handoffError),
           });
         }
+      }
+      // Hold a terminal Calendar generation only after its original payload is
+      // durably in the DLQ, or when SQS is applying its configured native
+      // redrive. If DLQ handoff fails, keep the source generation resumable.
+      if (delivery?.kind === "calendar" && delivery.calendarSync && state
+        && (quarantined || disposition.reason === "retries_exhausted")) {
+        await state.failCalendarSync(delivery.profile).catch((stateError: unknown) => {
+          log("calendar_sync_failure_state_write_failed", {
+            profile: delivery?.profile, generation: delivery?.calendarSync?.generation,
+            error: serializeError(stateError),
+          });
+        });
       }
       console.error(JSON.stringify({
         service: "todoist-calendar-sync-worker",

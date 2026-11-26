@@ -43,6 +43,22 @@ test('progress and terminal results persist with reserved attributes aliased', a
   assert.deepEqual(db.get('RECONCILE_OUTCOME#home', 'old').result, { repaired: 3, scanned: 5 });
 });
 
+test('reconciliation progress checkpoint replay and concurrent redelivery count each phase once', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  const mapped = { phase: 'mapped', sequence: 4, deliveryId: 'chunk-4', observedAt: old };
+  await Promise.all([
+    state.addReconciliationProgress('home', 'old', { scanned: 20, repaired: 2 }, mapped),
+    state.addReconciliationProgress('home', 'old', { scanned: 20, repaired: 2 }, mapped),
+  ]);
+  await state.addReconciliationProgress('home', 'old', { calendar_scanned: 7 }, {
+    phase: 'calendar', sequence: 4, deliveryId: 'chunk-4', observedAt: old,
+  });
+  await state.addReconciliationProgress('home', 'old', { scanned: 20, repaired: 2 }, mapped);
+  assert.deepEqual(db.get('RECONCILE#home').result, { scanned: 20, repaired: 2, calendar_scanned: 7 });
+  assert.equal(db.get('RECONCILE#home').progressRevision, 2);
+});
+
 test('scheduled reconciliation records operational completion without creating a Slack notification', async (t) => {
   const db = reconciliationDatabase(t, [run({ reason: 'scheduled', requester: 'scheduler' })]);
   await new StateRepository().completeReconciliation('home', 'old', 0, { scanned: 12 });
@@ -86,6 +102,43 @@ test('reconciliation diagnostics persist accepted delivery, checkpoint, and next
   assert.equal(saved.progressCheckpoint.afterTaskId, 'task-25');
   assert.equal(saved.nextContinuation.deliveryId, 'reconcile:home:old:chunk:2');
   assert.equal(saved.nextContinuation.afterTaskId, 'task-50');
+});
+
+test('superseded reconciliation deliveries cannot restart after a newer chunk is queued', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  await state.markReconciliationEnqueued('home', 'old', 'reconcile:home:old');
+  assert.equal(await state.beginReconciliation('home', 'old', 'reconcile:home:old'), true);
+  await state.markReconciliationEnqueued('home', 'old', 'reconcile:home:old:chunk:1', {
+    phase: 'mapped', sequence: 1, deliveryId: 'reconcile:home:old:chunk:1', afterTaskId: 'task-20',
+  });
+  assert.equal(await state.beginReconciliation('home', 'old', 'reconcile:home:old'), false);
+  assert.equal(await state.beginReconciliation('home', 'old', 'reconcile:home:old:chunk:1'), true);
+  assert.equal(db.get('RECONCILE#home').lastStartedDeliveryId, 'reconcile:home:old:chunk:1');
+});
+
+test('concurrent duplicate reconciliation deliveries acquire only one lease', async (t) => {
+  const db = reconciliationDatabase(t, [run()]);
+  const state = new StateRepository();
+  const results = await Promise.all([
+    state.beginReconciliation('home', 'old', 'reconcile:home:old'),
+    state.beginReconciliation('home', 'old', 'reconcile:home:old'),
+  ]);
+  assert.deepEqual(results.sort(), [false, true]);
+  assert.equal(db.get('RECONCILE#home').lastStartedDeliveryId, 'reconcile:home:old');
+});
+
+test('an expired reconciliation worker lease can retry once after maximum Lambda runtime', async (t) => {
+  const db = reconciliationDatabase(t, [run({
+    lastStartedAt: old,
+    lastStartedDeliveryId: 'reconcile:home:old',
+  })]);
+  const retryState = new StateRepository();
+  assert.equal(await retryState.beginReconciliation('home', 'old', 'reconcile:home:old'), true,
+    'a redelivery can resume after the maximum Lambda execution time plus margin');
+  assert.equal(await retryState.beginReconciliation('home', 'old', 'reconcile:home:old'), false,
+    'the renewed lease rejects another concurrent attempt');
+  assert.notEqual(db.get('RECONCILE#home').lastStartedAt, old);
 });
 
 test('unresolved reconciliation diagnostics are run-scoped, idempotent, bounded, and retain case status', async (t) => {

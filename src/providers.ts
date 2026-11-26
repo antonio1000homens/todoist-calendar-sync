@@ -9,6 +9,13 @@ const TODOIST_COMMENTS_ROOT = "https://api.todoist.com/api/v1/comments";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const MAX_ERASURE_AUDIT_PROJECTS=2048;
 const MAX_ERASURE_AUDIT_COMMENTS=100000;
+const recurrenceCorrelationKeys = [
+  "syncSeriesId", "syncMasterEventId", "syncActiveInstanceId", "syncOriginalStart",
+  "syncActiveEffectiveStart", "syncProgressVersion", "syncCompletedThrough",
+  "syncTodoistPhaseBVersion", "todoistRecurrence", "todoistAnchorStart", "todoistAnchorEnd",
+  "todoistAnchorAllDay", "todoistAnchorTimeZone", "todoistTemplateSummary",
+  "todoistTemplateDescription", "todoistPhaseBVersion",
+] as const;
 export type TodoistProjectCommentAudit={
   projects:Array<{id:string;workspaceId?:number}>;
   comments:TodoistCommentRecord[];
@@ -60,14 +67,16 @@ async function responseJson<T>(response: Response): Promise<T> {
     if (response.status === 429) {
       const header = response.headers.get("retry-after");
       const headerSeconds = header && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) : undefined;
+      const headerDate = header && headerSeconds === undefined ? Date.parse(header) : Number.NaN;
       let bodySeconds: number | undefined;
       try {
         const parsed = JSON.parse(body) as { error_extra?: { retry_after?: unknown } };
         if (typeof parsed.error_extra?.retry_after === "number" && Number.isFinite(parsed.error_extra.retry_after))
           bodySeconds = parsed.error_extra.retry_after;
       } catch { /* A missing provider retry hint uses bounded exponential backoff. */ }
-      const seconds = headerSeconds ?? bodySeconds;
-      if (seconds !== undefined && seconds >= 0) error.retryAfterMs = Math.min(30_000, Math.ceil(seconds * 1000));
+      if (headerSeconds !== undefined && headerSeconds >= 0) error.retryAfterMs = Math.ceil(headerSeconds * 1000);
+      else if (Number.isFinite(headerDate)) error.retryAfterMs = Math.max(0, headerDate - Date.now());
+      else if (bodySeconds !== undefined && bodySeconds >= 0) error.retryAfterMs = Math.ceil(bodySeconds * 1000);
     }
     throw error;
   }
@@ -95,6 +104,23 @@ async function fetchProvider(
     ...(options.timeoutMs===undefined?[]:[AbortSignal.timeout(options.timeoutMs)])]
     .filter((signal):signal is AbortSignal=>signal!==null&&signal!==undefined);
   return fetch(input,signals.length?{...init,signal:AbortSignal.any(signals)}:init);
+}
+
+function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number): number | undefined {
+  const status = Number((error as { status?: number }).status);
+  const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
+  if (status === 429 && Number.isFinite(retryAfterMs)) {
+    // Never retry before an explicit provider hint. Let the FIFO retry path
+    // retain the delivery if the provider asks us to wait longer than this call.
+    return retryAfterMs <= maxRetryDelayMs ? retryAfterMs : undefined;
+  }
+  const ceiling = Math.min(maxRetryDelayMs, 1000 * (2 ** Math.min(attempt, 8)));
+  return Math.floor(Math.random() * Math.max(1, ceiling));
+}
+
+function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number): Promise<void> | undefined {
+  const delay = retryDelayMs(error, attempt, maxRetryDelayMs);
+  return delay === undefined ? undefined : new Promise(resolve => setTimeout(resolve, delay));
 }
 
 /**
@@ -240,10 +266,28 @@ export class GoogleCalendar {
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const headers = new Headers(init.headers);
-    headers.set("authorization", `Bearer ${await this.token()}`);
-    if (init.body) headers.set("content-type", "application/json");
-    return responseJson<T>(await fetchProvider(`${CALENDAR_ROOT}${path}`, { ...init, headers },this.requestOptions));
+    const readOnly = (init.method || "GET").toUpperCase() === "GET";
+    const readRetries = this.requestOptions.readRetries ?? 2;
+    const rateLimitRetries = this.requestOptions.rateLimitRetries ?? 2;
+    const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const headers = new Headers(init.headers);
+        headers.set("authorization", `Bearer ${await this.token()}`);
+        if (init.body) headers.set("content-type", "application/json");
+        return await responseJson<T>(await fetchProvider(`${CALENDAR_ROOT}${path}`, { ...init, headers },this.requestOptions));
+      } catch (error) {
+        const name = (error as { name?: string })?.name;
+        if (name === "AbortError" || name === "TimeoutError") throw error;
+        const status = Number((error as { status?: number }).status);
+        const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
+        const transient = !status || status === 408 || status === 429 || status >= 500;
+        if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
+        const delay = waitForRetry(error, attempt, maxRetryDelayMs);
+        if (!delay) throw error;
+        await delay;
+      }
+    }
   }
 
   async listDelta(syncToken?: string): Promise<{ items: CalendarEvent[]; nextSyncToken?: string }> {
@@ -596,6 +640,9 @@ export class GoogleCalendar {
     const desired = this.correlate({ ...event, id: eventId });
     const incomingShared = desired.extendedProperties?.shared || {};
     const shared = { ...currentShared, ...incomingShared };
+    if (Array.isArray(event.recurrence) && event.recurrence.length === 0 && current.recurrence?.length) {
+      for (const property of recurrenceCorrelationKeys) delete shared[property];
+    }
     // The provider IDs are sufficient correlation. Remove the old static
     // source marker when touching a known managed event.
     if (incomingShared.taskId) {
@@ -725,7 +772,7 @@ export class Todoist {
     const url = `${comments ? TODOIST_COMMENTS_ROOT : TODOIST_ROOT}${path}`;
     const readOnly = (init.method || "GET").toUpperCase() === "GET";
     const readRetries = this.requestOptions.readRetries ?? 2;
-    const rateLimitRetries = this.requestOptions.rateLimitRetries ?? 0;
+    const rateLimitRetries = this.requestOptions.rateLimitRetries ?? 2;
     const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -737,11 +784,9 @@ export class Todoist {
         const transient = !status || status === 408 || status === 429 || status >= 500;
         const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
-        const retryAfterMs = status === 429 ? Number((error as { retryAfterMs?: number }).retryAfterMs) : NaN;
-        const delayMs = Number.isFinite(retryAfterMs)
-          ? Math.min(maxRetryDelayMs, Math.max(0, retryAfterMs))
-          : Math.min(1000, 250 * (2 ** attempt));
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const delay = waitForRetry(error, attempt, maxRetryDelayMs);
+        if (!delay) throw error;
+        await delay;
       }
     }
   }

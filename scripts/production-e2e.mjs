@@ -4,6 +4,7 @@ import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { googleCredentials, profiles, todoistToken } from "../dist/config.js";
 import { buildProjectMappingIndex } from "../dist/mapping-comments.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
+import { unsupportedCalendarRecurrencePreserved } from "./production-e2e-assertions.mjs";
 import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
 
 const PROFILE_NAMES = ["antonio"];
@@ -419,7 +420,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       (tasks) => tasks.filter((task) => task.content === recurringTitle && task.due?.is_recurring).length === 1,
     ).then((tasks) => tasks.find((task) => task.content === recurringTitle && task.due?.is_recurring));
     recurringTaskId = recurringTask?.id;
-    const completedDue = recurringTask?.due?.datetime || recurringTask?.due?.date;
+    let completedDue = recurringTask?.due?.datetime || recurringTask?.due?.date;
     if (!recurringTaskId || !completedDue) throw new Error("Recurring Todoist projection did not expose its ID and due");
 
     const initialRecurringMapping = await poll(
@@ -480,6 +481,74 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         && candidate.due?.is_recurring
         && (candidate.due?.datetime || candidate.due?.date) === completedDue,
     );
+    const currentForMove = await calendar.getEvent(currentInstance.id);
+    const currentOriginalStart = currentForMove.originalStartTime?.dateTime || currentForMove.originalStartTime?.date;
+    const currentOriginalEffectiveStart = currentForMove.start?.dateTime || currentForMove.start?.date;
+    const currentOriginalEnd = currentForMove.end?.dateTime || currentForMove.end?.date;
+    const currentDurationMs = Date.parse(currentOriginalEnd || "") - Date.parse(currentOriginalEffectiveStart || "");
+    if (!currentOriginalStart || !currentOriginalEffectiveStart?.includes("T")
+      || !timestampsMatch(completedDue, currentOriginalEffectiveStart)
+      || !Number.isFinite(currentDurationMs) || currentDurationMs <= 0) {
+      throw new Error("Calendar current-occurrence move acceptance requires valid timed instance boundaries");
+    }
+    const currentMasterRule = (await calendar.getEvent(recurringEventId)).recurrence;
+    const movedCalendarCurrentStart = new Date(Date.parse(currentOriginalEffectiveStart) + 30 * 60 * 1000);
+    const movedCalendarCurrentEnd = new Date(movedCalendarCurrentStart.getTime() + currentDurationMs);
+    await calendar.upsertEvent({
+      ...currentForMove,
+      start: { dateTime: movedCalendarCurrentStart.toISOString(), timeZone: calendarTimeZone },
+      end: { dateTime: movedCalendarCurrentEnd.toISOString(), timeZone: calendarTimeZone },
+    }, currentForMove.id);
+    const movedCalendarCurrent = await poll(
+      `${profile} moving the current Calendar occurrence updates only Todoist due`, timeoutMs,
+      async () => {
+        const [task, instance, master, mapping] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          calendar.getEvent(currentForMove.id),
+          calendar.getEvent(recurringEventId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { task, instance, master, mapping };
+      },
+      ({ task, instance, master, mapping }) => task.id === recurringTaskId && task.due?.is_recurring
+        && timestampsMatch(task.due?.datetime || task.due?.date, movedCalendarCurrentStart.toISOString())
+        && timestampsMatch(instance.start?.dateTime, movedCalendarCurrentStart.toISOString())
+        && (instance.originalStartTime?.dateTime || instance.originalStartTime?.date) === currentOriginalStart
+        && JSON.stringify(master.recurrence) === JSON.stringify(currentMasterRule)
+        && mapping?.activeInstanceId === currentForMove.id
+        && mapping.originalStart === currentOriginalStart
+        && timestampsMatch(mapping.activeEffectiveStart, movedCalendarCurrentStart.toISOString()),
+    );
+    await calendar.upsertEvent({
+      ...movedCalendarCurrent.instance,
+      start: { dateTime: currentOriginalEffectiveStart, timeZone: calendarTimeZone },
+      end: { dateTime: currentOriginalEnd, timeZone: calendarTimeZone },
+    }, currentForMove.id);
+    const restoredCalendarCurrent = await poll(
+      `${profile} restoring the current Calendar occurrence after move acceptance`, timeoutMs,
+      async () => {
+        const [task, instance, master, mapping] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          calendar.getEvent(currentForMove.id),
+          calendar.getEvent(recurringEventId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { task, instance, master, mapping };
+      },
+      ({ task, instance, master, mapping }) => task.id === recurringTaskId && task.due?.is_recurring
+        && timestampsMatch(task.due?.datetime || task.due?.date, currentOriginalEffectiveStart)
+        && timestampsMatch(instance.start?.dateTime, currentOriginalEffectiveStart)
+        && (instance.originalStartTime?.dateTime || instance.originalStartTime?.date) === currentOriginalStart
+        && JSON.stringify(master.recurrence) === JSON.stringify(currentMasterRule)
+        && mapping?.activeInstanceId === currentForMove.id
+        && mapping.originalStart === currentOriginalStart
+        && timestampsMatch(mapping.activeEffectiveStart, currentOriginalEffectiveStart),
+    );
+    completedDue = restoredCalendarCurrent.task.due?.datetime || restoredCalendarCurrent.task.due?.date;
+    if (!completedDue) throw new Error("Restored Calendar current occurrence lost the Todoist due date");
+    log("calendar_current_occurrence_reschedule_verified", {
+      profile, taskIdPreserved: true, originalStartPreserved: true, recurrenceRulePreserved: true,
+    });
     log("current_occurrence_edit_verified", { profile, taskIdPreserved: true, recurrencePreserved: true });
     const [movedInstance, cancelledInstance, followingInstance] = orderedInstances
       .filter((item) => item.id !== currentInstance.id && item.status !== "cancelled");
@@ -804,6 +873,82 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
           && mapping.calendarProgressVersion === 1 && mapping.activeInstanceId,
       );
+      if (spec.cadence === "finite_weekly") {
+        const finiteWindowStart = new Date(matrixStart.getTime() - 24 * 60 * 60 * 1000).toISOString();
+        const finiteWindowEnd = new Date(matrixStart.getTime() + 90 * 24 * 60 * 60 * 1000).toISOString();
+        const finiteOccurrences = (await calendar.listInstancesInWindow(
+          fixture.eventId, finiteWindowStart, finiteWindowEnd,
+        )).filter((item) => item.recurringEventId === fixture.eventId && item.status !== "cancelled"
+          && item.originalStartTime);
+        finiteOccurrences.sort((left, right) => Date.parse(left.originalStartTime.dateTime || left.originalStartTime.date || "")
+          - Date.parse(right.originalStartTime.dateTime || right.originalStartTime.date || ""));
+        if (finiteOccurrences.length !== 4) {
+          throw new Error(`Finite weekly acceptance expected four Calendar occurrences; observed ${finiteOccurrences.length}`);
+        }
+        let finiteDue = projected.due?.datetime || projected.due?.date;
+        const finiteMapping = await providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId);
+        const activeIndex = finiteOccurrences.findIndex((item) => item.id === finiteMapping?.activeInstanceId);
+        if (!finiteDue || activeIndex !== 0) {
+          throw new Error("Finite weekly completion acceptance did not start from its exact first mapped occurrence");
+        }
+        for (let completedIndex = 0; completedIndex < finiteOccurrences.length; completedIndex += 1) {
+          const completion = await todoist.completeTask(fixture.taskId, finiteDue);
+          if (!["completed", "already_completed"].includes(completion)) {
+            throw new Error(`Finite occurrence ${completedIndex + 1} was not completed: ${completion}`);
+          }
+          const nextOccurrence = finiteOccurrences[completedIndex + 1];
+          if (nextOccurrence) {
+            const expectedNextDue = nextOccurrence.start?.dateTime || nextOccurrence.start?.date;
+            const advanced = await poll(
+              `${profile} finite weekly completion advances the same Todoist task ${completedIndex + 1}`,
+              timeoutMs,
+              async () => {
+                const [task, mapping] = await Promise.all([
+                  todoist.getTask(fixture.taskId),
+                  providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+                ]);
+                return { task, mapping };
+              },
+              ({ task, mapping }) => task.id === fixture.taskId && task.due?.is_recurring
+                && (task.due?.datetime || task.due?.date) === expectedNextDue
+                && mapping?.activeInstanceId === nextOccurrence.id,
+            );
+            finiteDue = advanced.task.due?.datetime || advanced.task.due?.date;
+          } else {
+            const terminal = await poll(
+              `${profile} last finite occurrence completes without creating another task or event`, timeoutMs,
+              async () => {
+                const [tasks, master, instances, linkedMaster] = await Promise.all([
+                  todoist.listTasks(config.todoistProjectId),
+                  calendar.getEvent(fixture.eventId),
+                  calendar.listInstancesInWindow(fixture.eventId, finiteWindowStart, finiteWindowEnd),
+                  calendar.findByTodoistTaskId(fixture.taskId),
+                ]);
+                return { tasks, master, instances, linkedMaster };
+              },
+              ({ tasks, master, instances, linkedMaster }) => {
+                const activeTask = tasks.find((item) => item.id === fixture.taskId);
+                const liveOccurrences = instances.filter((item) => item.recurringEventId === fixture.eventId
+                  && item.status !== "cancelled" && item.originalStartTime);
+                return (!activeTask || activeTask.is_completed || Boolean(activeTask.completed_at))
+                  && master.id === fixture.eventId
+                  && linkedMaster?.id === fixture.eventId
+                  && master.recurrence?.includes(spec.rule)
+                  && liveOccurrences.length === finiteOccurrences.length
+                  && liveOccurrences.every((item, index) => item.id === finiteOccurrences[index].id);
+              },
+            );
+            const stillActiveByTitle = terminal.tasks.filter((item) => item.content === fixture.title
+              && !item.is_completed && !item.completed_at);
+            if (stillActiveByTitle.length) {
+              throw new Error("Completing the last finite occurrence left an active duplicate Todoist task");
+            }
+          }
+        }
+        log("finite_recurrence_terminal_completion_verified", {
+          profile, taskIdPreservedUntilTerminal: true, noSuccessorCreated: true,
+        });
+      }
       if (spec.cadence === "weekly") {
         const mappingComment = await providerMappingComment(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId);
         if (!mappingComment?.id) throw new Error("Calendar correlation recovery fixture has no exact project mapping comment");
@@ -1059,6 +1204,24 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
     });
     unsupportedNativeFixture.taskId = unsupportedNativeTask.id;
     if (!unsupportedNativeTask.due?.is_recurring) throw new Error("RRULE recurrence fixture was not natively recurring");
+    const unsupportedCalendarFixture = {
+      cadence: "calendar_unsupported_rule",
+      title: `[E2E ${token}] Calendar unsupported recurrence`,
+      eventId: undefined,
+      taskId: undefined,
+    };
+    recurrenceMatrixFixtures.push(unsupportedCalendarFixture);
+    const unsupportedCalendarStart = new Date(recurringStart.getTime() + 14 * 24 * 60 * 60 * 1000);
+    const unsupportedCalendarEnd = new Date(unsupportedCalendarStart.getTime() + 24 * 60 * 60 * 1000);
+    const unsupportedCalendarMaster = await calendar.upsertEvent({
+      summary: unsupportedCalendarFixture.title,
+      description: "Disposable unsupported Calendar recurrence fixture for production acceptance. Safe to delete.",
+      start: { date: unsupportedCalendarStart.toISOString().slice(0, 10) },
+      end: { date: unsupportedCalendarEnd.toISOString().slice(0, 10) },
+      recurrence: ["RRULE:FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1"],
+    });
+    unsupportedCalendarFixture.eventId = unsupportedCalendarMaster.id;
+    if (!unsupportedCalendarFixture.eventId) throw new Error("Unsupported Calendar recurrence fixture has no master ID");
     const unsupportedNativeDue = JSON.stringify({
       date: unsupportedNativeTask.due.date,
       datetime: unsupportedNativeTask.due.datetime,
@@ -1095,14 +1258,23 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
     unrelatedFixture.eventId = unrelatedEvent.id;
     const unsupportedCheckDeadline = Date.now() + Math.min(timeoutMs, 30_000);
     while (Date.now() < unsupportedCheckDeadline) {
-      const [event, mapping, currentTask, nativeEvent, nativeMapping, nativeCurrentTask] = await Promise.all([
+      const [event, mapping, currentTask, nativeEvent, nativeMapping, nativeCurrentTask,
+        unsupportedCalendarReadback, unsupportedCalendarTasks, unsupportedCalendarComments] = await Promise.all([
         calendar.findByTodoistTaskId(unsupportedFixture.taskId),
         providerMappingByTask(todoist, config.todoistProjectId, unsupportedFixture.taskId),
         todoist.getTask(unsupportedFixture.taskId),
         calendar.findByTodoistTaskId(unsupportedNativeFixture.taskId),
         providerMappingByTask(todoist, config.todoistProjectId, unsupportedNativeFixture.taskId),
         todoist.getTask(unsupportedNativeFixture.taskId),
+        calendar.getEvent(unsupportedCalendarFixture.eventId),
+        todoist.listTasks(config.todoistProjectId),
+        todoist.listProjectComments(config.todoistProjectId, true),
       ]);
+      const unsupportedCalendarIndex = buildProjectMappingIndex(unsupportedCalendarComments);
+      const unsupportedCalendarMapping = unsupportedCalendarIndex.parsed.find((entry) =>
+        entry.payload.projectId === config.todoistProjectId
+          && (entry.payload.eventId === unsupportedCalendarFixture.eventId
+            || entry.payload.masterEventId === unsupportedCalendarFixture.eventId));
       const currentDue = JSON.stringify({
         date: currentTask.due?.date,
         datetime: currentTask.due?.datetime,
@@ -1118,12 +1290,21 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         is_recurring: nativeCurrentTask.due?.is_recurring,
       });
       if (event || mapping || currentDue !== unsupportedDue
-        || nativeEvent || nativeMapping || nativeCurrentDue !== unsupportedNativeDue)
-        throw new Error("Unsupported Todoist recurrence was projected or changed during unrelated sync");
+        || nativeEvent || nativeMapping || nativeCurrentDue !== unsupportedNativeDue
+        || !unsupportedCalendarRecurrencePreserved({
+          readback: unsupportedCalendarReadback,
+          expectedEventId: unsupportedCalendarFixture.eventId,
+          expectedRule: unsupportedCalendarMaster.recurrence,
+          tasks: unsupportedCalendarTasks,
+          fixtureTitle: unsupportedCalendarFixture.title,
+          mapping: unsupportedCalendarMapping,
+        }))
+        throw new Error("Unsupported recurrence was projected or changed during unrelated sync");
       await sleep(POLL_INTERVAL_MS);
     }
     log("unsupported_recurrence_nonblocking_behavior_verified", {
-      profile, sourcePreserved: true, oneOffProjectionCreated: false, unrelatedOneOffSynchronized: true,
+      profile, sourcePreserved: true, oneOffProjectionCreated: false,
+      calendarRulePreserved: true, unrelatedOneOffSynchronized: true,
     });
 
     if (cleanup) {
