@@ -1,4 +1,5 @@
 import { pacedScan } from "./dynamodb-capacity.js";
+import { createHash } from "node:crypto";
 import { profiles } from "./config.js";
 import {
   buildProjectMappingIndex,
@@ -23,13 +24,23 @@ const tableName = process.env.STATE_TABLE_NAME || "";
 // stops at the throttled mapping so a quota rejection never fans out to the
 // remaining mappings in the same run.
 const MIGRATION_PROVIDER_OPTIONS = {
-  readRetries: 7, rateLimitRetries: 1, maxRetryDelayMs: 60_000, minRequestIntervalMs: 2_000,
+  readRetries: 7, rateLimitRetries: 1, maxRetryDelayMs: 60_000,
+  honorFullRetryAfter: true, minRequestIntervalMs: 2_000,
 } as const;
 
 export interface ProjectCommentMigrationState {
   retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;
   putCompletedCalendarProjection?(projection: CompletedCalendarProjection): Promise<void>;
   audit(profile: Profile, action: string, detail: Record<string, unknown>): Promise<void>;
+  getProjectCommentMigrationCheckpoint?(profile: Profile, phase: string): Promise<MigrationCheckpoint | undefined>;
+  putProjectCommentMigrationCheckpoint?(profile: Profile, phase: string, checkpoint: MigrationCheckpoint): Promise<void>;
+  deleteProjectCommentMigrationCheckpoint?(profile: Profile, phase: string): Promise<void>;
+}
+
+export interface MigrationCheckpoint {
+  fingerprint: string;
+  nextIndex: number;
+  summary: ProjectCommentMigrationSummary;
 }
 
 export interface ProjectCommentMigrationClients {
@@ -67,6 +78,7 @@ export interface ProjectCommentMigrationSummary {
   projectMismatches: number;
   duplicateProjectComments: number;
   failures: number;
+  paused?: "rate_limited";
 }
 
 function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommentMigrationSummary {
@@ -232,10 +244,23 @@ export async function migrateProjectComments(
   apply = false,
   cleanupLegacy = false,
   retireLegacyCorrelation = false,
+  checkpointPhase = `${apply ? "apply" : "report"}-${cleanupLegacy ? "cleanup" : "backfill"}-${retireLegacyCorrelation ? "retire" : "keep"}`,
 ): Promise<ProjectCommentMigrationSummary> {
   const projectId = profiles[profile].todoistProjectId;
+  const stableMappings = [...mappings].sort((a,b) => `${a.taskId}\u0000${a.eventId}`.localeCompare(`${b.taskId}\u0000${b.eventId}`));
+  const fingerprint = createHash("sha256").update(JSON.stringify(stableMappings.map(({taskId,eventId,updatedAt})=>[taskId,eventId,updatedAt]))).digest("hex");
   const index = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId));
-  const summary = emptySummary(apply, index);
+  let summary = emptySummary(apply, index);
+  let nextIndex = 0;
+  if (apply && state.getProjectCommentMigrationCheckpoint) {
+    const checkpoint = await state.getProjectCommentMigrationCheckpoint(profile, checkpointPhase);
+    if (checkpoint?.fingerprint === fingerprint && Number.isInteger(checkpoint.nextIndex)
+      && checkpoint.nextIndex >= 0 && checkpoint.nextIndex <= stableMappings.length) {
+      nextIndex = checkpoint.nextIndex;
+      summary = { ...checkpoint.summary, projectCommentsIndexed: index.parsed.length,
+        malformedProjectComments: index.malformed.length };
+    }
+  }
   const retireVerifiedCorrelation = async (mapping: Mapping, task?: TodoistTask): Promise<void> => {
     const indexed = findProjectMappingComment(index, mapping);
     if (!indexed || indexed.comment.project_id !== projectId) {
@@ -290,7 +315,8 @@ export async function migrateProjectComments(
     });
   };
 
-  for (const mapping of mappings) {
+  for (let mappingIndex = nextIndex; mappingIndex < stableMappings.length; mappingIndex++) {
+    const mapping = stableMappings[mappingIndex];
     summary.mappingsScanned += 1;
     let releaseWriterLease: () => Promise<void> = async () => {};
     let migrationStage = "mapping_validation";
@@ -455,6 +481,7 @@ export async function migrateProjectComments(
         code?: unknown;
         status?: unknown;
         providerAction?: unknown;
+        providerSubAction?: unknown;
         retryAfterMs?: unknown;
         $metadata?: { httpStatusCode?: unknown };
       };
@@ -477,21 +504,39 @@ export async function migrateProjectComments(
         providerAction: typeof providerError.providerAction === "string"
           && /^[a-zA-Z0-9-]+:[A-Za-z0-9]+$/.test(providerError.providerAction)
           ? providerError.providerAction : undefined,
+        providerSubAction: typeof providerError.providerSubAction === "string"
+          && /^[a-zA-Z0-9-]+:[A-Za-z0-9]+$/.test(providerError.providerSubAction)
+          ? providerError.providerSubAction : undefined,
         retryAfterMs: status === 429 && Number.isFinite(Number(providerError.retryAfterMs))
           ? Math.max(0, Number(providerError.retryAfterMs)) : undefined,
       });
       if (status === 429) {
-        // The per-mapping audit is a durable checkpoint. All completed writes
-        // are idempotent; resume from the beginning after quota recovery. Never
-        // advance into another mapping while the account is rate limited.
-        throw new Error(`Todoist rate limit paused migration at ${migrationStage}`);
+        // Do not fan a quota rejection out to later mappings in this invocation.
+        if (apply) await state.audit(profile, "project_comment_migration_paused", {
+          taskId: mapping.taskId, eventId: mapping.eventId, phase: checkpointPhase,
+          nextIndex: mappingIndex, reason: "rate_limited",
+        });
+        if (apply && state.putProjectCommentMigrationCheckpoint)
+          await state.putProjectCommentMigrationCheckpoint(profile, checkpointPhase,
+            { fingerprint, nextIndex: mappingIndex,
+              summary: { ...summary, failures: Math.max(0, summary.failures - 1) } });
+        summary.paused = "rate_limited";
+        break;
       }
     } finally {
       await releaseWriterLease();
     }
+    if (apply && state.putProjectCommentMigrationCheckpoint)
+      await state.putProjectCommentMigrationCheckpoint(profile, checkpointPhase,
+        { fingerprint, nextIndex: mappingIndex + 1, summary });
   }
 
-  if (apply) await state.audit(profile, "project_comment_migration_completed", { summary });
+  if (apply && !summary.paused) {
+    await state.audit(profile, "project_comment_migration_completed", { summary });
+    if (state.putProjectCommentMigrationCheckpoint)
+      await state.putProjectCommentMigrationCheckpoint(profile, checkpointPhase,
+        { fingerprint, nextIndex: stableMappings.length, summary });
+  }
   return summary;
 }
 
@@ -519,13 +564,14 @@ export async function runProjectCommentMigration(
   state: ProjectCommentMigrationState = new StateRepository(),
   clientFactory: ProviderClientFactory = defaultProviderClientFactory,
   retireLegacyCorrelation = false,
+  checkpointPhase?: string,
 ): Promise<ProjectCommentMigrationSummary> {
   const mappings = await listMappingsForProjectCommentMigration(profile);
   // Project comments are a rate-limited Todoist endpoint. Explicit
   // Retry-After values are honored by the provider client; if the bounded
   // retry budget is still exhausted, the phase fails and can be rerun safely.
   const clients = await clientFactory(profile, MIGRATION_PROVIDER_OPTIONS);
-  return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy, retireLegacyCorrelation);
+  return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy, retireLegacyCorrelation, checkpointPhase);
 }
 
 export interface AutomaticProjectCommentMigrationResult {
@@ -538,9 +584,9 @@ export interface AutomaticProjectCommentMigrationResult {
  * bounded second cleanup pass handles mappings created during the first one.
  * The runner is injectable so ordering and retry behavior stay testable. */
 export async function runAutomaticProjectCommentMigration(
-  run: (profile: Profile, apply: boolean, cleanupLegacy: boolean, retireLegacyCorrelation?: boolean) => Promise<ProjectCommentMigrationSummary> =
-    (profile, apply, cleanupLegacy, retireLegacyCorrelation = false) =>
-      runProjectCommentMigration(profile, apply, cleanupLegacy, undefined, undefined, retireLegacyCorrelation),
+  run: (profile: Profile, apply: boolean, cleanupLegacy: boolean, retireLegacyCorrelation?: boolean, phase?: string) => Promise<ProjectCommentMigrationSummary> =
+    (profile, apply, cleanupLegacy, retireLegacyCorrelation = false, phase) =>
+      runProjectCommentMigration(profile, apply, cleanupLegacy, undefined, undefined, retireLegacyCorrelation, phase),
   selectedProfiles: Profile[] = ["antonio", "home", "work"],
 ): Promise<AutomaticProjectCommentMigrationResult> {
   const profilesToRun = [...new Set(selectedProfiles)];
@@ -548,15 +594,21 @@ export async function runAutomaticProjectCommentMigration(
     backfill: {}, cleanup: {}, cleanupRetry: {}, correlationRetirement: {},
   };
   for (const profile of profilesToRun)
-    phases.backfill[profile] = await run(profile, true, false);
+    phases.backfill[profile] = await run(profile, true, false, false, "automatic-backfill");
+  if (Object.values(phases.backfill).some(summary => summary?.paused))
+    return { mode: "automatic-post-deployment", status: "failed", phases };
   for (const profile of profilesToRun)
-    phases.cleanup[profile] = await run(profile, true, true);
+    phases.cleanup[profile] = await run(profile, true, true, false, "automatic-cleanup");
+  if (Object.values(phases.cleanup).some(summary => summary?.paused))
+    return { mode: "automatic-post-deployment", status: "failed", phases };
   const retryProfiles = profilesToRun.filter(profile =>
     (phases.cleanup[profile]?.projectCommentsCreated || 0) > 0);
   for (const profile of retryProfiles)
-    phases.cleanupRetry[profile] = await run(profile, true, true);
+    phases.cleanupRetry[profile] = await run(profile, true, true, false, "automatic-cleanup-retry");
+  if (Object.values(phases.cleanupRetry).some(summary => summary?.paused))
+    return { mode: "automatic-post-deployment", status: "failed", phases };
   for (const profile of profilesToRun)
-    phases.correlationRetirement[profile] = await run(profile, true, true, true);
+    phases.correlationRetirement[profile] = await run(profile, true, true, true, "automatic-correlation-retirement");
 
   const allSummaries = Object.values(phases).flatMap(phase => Object.values(phase));
   const unresolvedCleanupCreation = retryProfiles.some(profile =>

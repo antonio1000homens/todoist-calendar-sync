@@ -22,14 +22,18 @@ class FakeState {
     this.saved = [];
     this.audits = [];
     this.completed = [];
+    this.checkpoints = new Map();
   }
   async putMapping(value) { this.saved.push(structuredClone(value)); }
   async getCalendarProjectionTombstone() { return this.tombstone; }
   async putCompletedCalendarProjection(value) { this.completed.push(structuredClone(value)); }
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
+  async getProjectCommentMigrationCheckpoint(profile, phase) { return this.checkpoints.get(`${profile}:${phase}`); }
+  async putProjectCommentMigrationCheckpoint(profile, phase, checkpoint) { this.checkpoints.set(`${profile}:${phase}`, structuredClone(checkpoint)); }
+  async deleteProjectCommentMigrationCheckpoint(profile, phase) { this.checkpoints.delete(`${profile}:${phase}`); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, correlationError, completedTask = false } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, taskError, correlationError, completedTask = false } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -70,6 +74,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           if (deleteError) throw deleteError;
         },
         async getTask(taskId) {
+          if (taskError) throw taskError;
           return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId,
             updated_at: "2026-09-08T10:05:00.000Z", is_completed: completedTask };
         },
@@ -106,6 +111,18 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
   };
 }
 
+test("rate limited migration checkpoints its mapping and resumes on rerun",async()=>{
+  const state=new FakeState();
+  const rateLimit=Object.assign(new Error("rate limited"),{status:429,retryAfterMs:60_000});
+  const first=fakeClients({taskError:rateLimit});
+  const paused=await migrateProjectComments("home",[mapping()],state,first.clients,true);
+  assert.equal(paused.paused,"rate_limited");
+  assert.equal(state.checkpoints.get("home:apply-backfill-keep").nextIndex,0);
+  const resumed=await migrateProjectComments("home",[mapping()],state,fakeClients().clients,true);
+  assert.equal(resumed.projectCommentsCreated,1);
+  assert.equal(state.checkpoints.get("home:apply-backfill-keep").nextIndex,1);
+});
+
 test("migration failure audit records safe provider codes and statuses when Error is generic", async () => {
   const state = new FakeState();
   const error = Object.assign(new Error("provider details must not be logged"), {
@@ -136,10 +153,8 @@ test("a Todoist quota rejection checkpoints and stops before later mappings",asy
       name:"ProviderError",status:429,retryAfterMs:131_000,
     });
   };
-  await assert.rejects(
-    ()=>migrateProjectComments("home",[mapping(),mapping({taskId:"task-2",eventId:"event-2"})],state,clients,true),
-    /rate limit paused migration/,
-  );
+  const summary=await migrateProjectComments("home",[mapping(),mapping({taskId:"task-2",eventId:"event-2"})],state,clients,true);
+  assert.equal(summary.paused,"rate_limited");
   assert.equal(taskReads,1,"a quota rejection must stop the phase instead of advancing mappings");
   const failure=state.audits.find(({action})=>action==="project_comment_migration_mapping_failed");
   assert.equal(failure.detail.providerStatus,429);

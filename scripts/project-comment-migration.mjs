@@ -14,10 +14,12 @@ if (!target || (target !== "all" && !profiles.includes(target))) {
   const results = {};
   for (const profile of selected) {
     results[profile] = await runProjectCommentMigration(profile, apply, cleanupLegacy);
+    if (results[profile].paused) break;
   }
   console.log(JSON.stringify({
     mode: apply ? "apply" : "report",
     cleanupLegacy,
     results,
   }, null, 2));
+  if (Object.values(results).some(summary => summary.paused)) process.exitCode = 1;
 }

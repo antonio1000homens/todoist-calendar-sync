@@ -31,16 +31,19 @@ import {
   readProfileLookup,
 } from "./profile-lookup.js";
 import type { CompletedCalendarProjection, Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
+import type { MigrationCheckpoint } from "./project-comment-migration.js";
 import {phaseBNativeMoveBeginTransaction,phaseBNativeMoveCommitTransaction,
   phaseBNativeMoveControlKeys,phaseBNativeMoveStage,phaseBNativeMoveStageKey,
   type PhaseBNativeMoveHandoff,type PhaseBNativeMoveStage,
 } from "./todoist-phase-b-move-handoff.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
-function annotateProviderAction(error: unknown, providerAction: string): void {
+function annotateProviderAction(error: unknown, providerAction: string, providerSubAction?: string): void {
   if (error && typeof error === "object") {
-    try { Object.defineProperty(error, "providerAction", { value: providerAction, configurable: true }); }
-    catch { /* Preserve the provider failure if a non-extensible SDK error cannot be annotated. */ }
+    try {
+      Object.defineProperty(error, "providerAction", { value: providerAction, configurable: true });
+      if (providerSubAction) Object.defineProperty(error, "providerSubAction", { value: providerSubAction, configurable: true });
+    } catch { /* Preserve the provider failure if a non-extensible SDK error cannot be annotated. */ }
   }
 }
 const allProfiles: Profile[] = ["home", "antonio", "work"];
@@ -1548,7 +1551,6 @@ export class StateRepository {
       await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
       return true;
     } catch (error) {
-      annotateProviderAction(error, "dynamodb:TransactWriteItems");
       const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
       if (cancelled.name === "TransactionCanceledException"
         && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
@@ -1741,7 +1743,6 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
-      annotateProviderAction(error, "dynamodb:TransactWriteItems");
       if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
 
       const currentOwner = await client.send(new GetCommand({
@@ -1816,6 +1817,7 @@ export class StateRepository {
       await client.send(new TransactWriteCommand({ TransactItems: deletes as never }));
       return true;
     } catch (error) {
+      annotateProviderAction(error, "dynamodb:TransactWriteItems", "dynamodb:DeleteItem");
       const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
       if (cancelled.name === "TransactionCanceledException"
         && (!cancelled.CancellationReasons?.length
@@ -2267,6 +2269,7 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
+      annotateProviderAction(error, "dynamodb:TransactWriteItems", "dynamodb:ConditionCheckItem");
       if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
       const saved = await this.getCompletedCalendarProjectionByEvent(projection.profile, projection.eventId);
       if (!saved || saved.taskId !== projection.taskId || saved.completedAt !== projection.completedAt) {
@@ -2566,6 +2569,26 @@ export class StateRepository {
           action, error: error instanceof Error ? error.name : "unknown" }));
       }
     }
+  }
+
+  async getProjectCommentMigrationCheckpoint(profile: Profile, phase: string): Promise<MigrationCheckpoint | undefined> {
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(), Key: key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`),
+      ConsistentRead: true,
+    }));
+    return result.Item?.checkpoint as MigrationCheckpoint | undefined;
+  }
+
+  async putProjectCommentMigrationCheckpoint(profile: Profile, phase: string, checkpoint: MigrationCheckpoint): Promise<void> {
+    await client.send(new PutCommand({ TableName: this.ensureTable(), Item: {
+      ...key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`),
+      checkpoint, updatedAt: now(),
+    } }));
+  }
+
+  async deleteProjectCommentMigrationCheckpoint(profile: Profile, phase: string): Promise<void> {
+    await client.send(new DeleteCommand({ TableName: this.ensureTable(),
+      Key: key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`) }));
   }
 
 }

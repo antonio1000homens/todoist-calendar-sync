@@ -91,9 +91,35 @@ type ProviderRequestOptions = {
   /** Retry bound for explicit 429 responses; callers must use idempotent operations when writing. */
   rateLimitRetries?: number;
   maxRetryDelayMs?: number;
-  /** Minimum spacing between requests on one Todoist client, for controlled migrations. */
+  /** Honor full Retry-After hints for controlled maintenance, rather than an inline retry. */
+  honorFullRetryAfter?: boolean;
+  /** Minimum spacing between requests sharing one Todoist token, for controlled migrations. */
   minRequestIntervalMs?: number;
 };
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const todoistRequestPacing = new Map<string, { nextAt: number; intervalMs: number }>();
+
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(abortError(signal!));
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 async function fetchProvider(
   input: RequestInfo | URL,
@@ -115,16 +141,18 @@ function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number,
   if (status === 429 && Number.isFinite(retryAfterMs)) {
     // Maintenance migrations honor long quota windows. Other inline provider
     // calls retain their existing bounded retry behavior.
-    return honorFullRetryAfter || retryAfterMs <= maxRetryDelayMs ? retryAfterMs : undefined;
+    if ((!honorFullRetryAfter && retryAfterMs > maxRetryDelayMs)
+      || retryAfterMs > MAX_TIMER_DELAY_MS) return undefined;
+    return retryAfterMs;
   }
   const ceiling = Math.min(maxRetryDelayMs, 1000 * (2 ** Math.min(attempt, 8)));
   return Math.floor(Math.random() * Math.max(1, ceiling));
 }
 
 function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number,
-  honorFullRetryAfter = false): Promise<void> | undefined {
+  honorFullRetryAfter = false, signal?: AbortSignal): Promise<void> | undefined {
   const delay = retryDelayMs(error, attempt, maxRetryDelayMs, honorFullRetryAfter);
-  return delay === undefined ? undefined : new Promise(resolve => setTimeout(resolve, delay));
+  return delay === undefined ? undefined : abortableDelay(delay, signal);
 }
 
 /**
@@ -766,19 +794,27 @@ export class GoogleCalendar {
 
 export class Todoist {
   private readonly projectCommentCache = new Map<string, TodoistCommentRecord[]>();
-  private nextRequestAt = 0;
+  private readonly pacingKey: string;
 
-  constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {}
+  constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {
+    this.pacingKey=createHash("sha256").update(token).digest("hex");
+    const interval=this.requestOptions.minRequestIntervalMs||0;
+    if(!Number.isSafeInteger(interval)||interval<0)throw new Error("Invalid Todoist request interval");
+    if(interval>0) {
+      const current=todoistRequestPacing.get(this.pacingKey)||{nextAt:0,intervalMs:0};
+      current.intervalMs=Math.max(current.intervalMs,interval);
+      todoistRequestPacing.set(this.pacingKey,current);
+    }
+  }
 
   private async paceRequest(): Promise<void> {
-    const interval = this.requestOptions.minRequestIntervalMs || 0;
-    if (!interval) return;
-    if (!Number.isSafeInteger(interval) || interval < 0) throw new Error("Invalid Todoist request interval");
+    const pacing=todoistRequestPacing.get(this.pacingKey);
+    if(!pacing||pacing.intervalMs<=0)return;
     const now = Date.now();
-    const startsAt = Math.max(now, this.nextRequestAt);
-    this.nextRequestAt = startsAt + interval;
+    const startsAt = Math.max(now, pacing.nextAt);
+    pacing.nextAt = startsAt + pacing.intervalMs;
     const delay = startsAt - now;
-    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    if (delay > 0) await abortableDelay(delay,this.requestOptions.signal);
   }
 
   private async request<T>(path: string, init: RequestInit = {}, comments = false): Promise<T> {
@@ -801,7 +837,8 @@ export class Todoist {
         const transient = !status || status === 408 || status === 429 || status >= 500;
         const retryLimit = status === 429 ? rateLimitRetries : readOnly ? readRetries : 0;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
-        const delay = waitForRetry(error, attempt, maxRetryDelayMs, true);
+        const delay = waitForRetry(error, attempt, maxRetryDelayMs,
+          this.requestOptions.honorFullRetryAfter===true,this.requestOptions.signal);
         if (!delay) throw error;
         await delay;
       }

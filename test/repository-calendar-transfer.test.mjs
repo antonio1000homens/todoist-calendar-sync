@@ -85,3 +85,13 @@ test("migration preserves changed mapping indexes and conflicting cross-profile 
   assert.equal(await new StateRepository().retireMigratedMappingCorrelation(mapping),false);
   assert.equal(transactions,0);
 });
+
+test("completed projection transaction annotates the actual DynamoDB failure",async t=>{
+  const error=Object.assign(new Error("not authorized"),{name:"AccessDeniedException"});
+  t.mock.method(documentClient,"send",async()=>{throw error;});
+  await assert.rejects(()=>new StateRepository().putCompletedCalendarProjection({
+    profile:"home",taskId:"task-510",eventId:"event-510",completedAt:"2026-10-20T12:00:00.000Z",
+  }),caught=>caught===error);
+  assert.equal(error.providerAction,"dynamodb:TransactWriteItems");
+  assert.equal(error.providerSubAction,"dynamodb:ConditionCheckItem");
+});
