@@ -107,7 +107,7 @@ test("recurring occurrence identity cleanup preserves live boundaries in its If-
     assert.equal(patch.init.headers.get("If-Match"),"etag-approved");
     assert.deepEqual(JSON.parse(patch.init.body),{
       start:{date:"2026-11-25"},end:{date:"2026-11-26"},
-      extendedProperties:{shared:{humanKey:"keep-me",syncHistoryOnly:"true"}},
+      extendedProperties:{shared:{humanKey:"keep-me",taskId:null,syncRecurrenceOwner:null,syncHistoryOnly:"true"}},
     });
   } finally { globalThis.fetch=originalFetch; }
 });
@@ -135,8 +135,8 @@ test("Todoist event writes stamp exact provider correlation and retain unrelated
     assert.equal(shared.syncProfile,"home");
     assert.equal(shared.syncSchemaVersion,"2");
     assert.equal(shared.providerField,"preserve");
-    assert.equal(shared.syncSource,undefined,"new writes retire the legacy source marker");
-    assert.equal(shared.syncRecurrenceOwner,undefined,"new writes do not retain a permanent recurrence owner");
+    assert.equal(shared.syncSource,null,"PATCH explicitly clears the legacy source marker");
+    assert.equal(shared.syncRecurrenceOwner,null,"PATCH explicitly clears the legacy recurrence owner");
   }finally{globalThis.fetch=originalFetch;}
 });
 
@@ -156,7 +156,7 @@ test("Calendar-originated links acquire task correlation with a conditional meta
     const patch=calls.find(({init})=>init.method==="PATCH");
     assert.ok(patch);
     assert.equal(patch.init.headers.get("If-Match"),"etag-1");
-    assert.deepEqual(JSON.parse(patch.init.body),{extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncTaskId:"task-1",syncProfile:"home",syncCalendarId:"home@example.test",syncEventId:"event-1",syncSchemaVersion:"2",syncSeriesId:"series-1",syncMasterEventId:"event-1",syncActiveInstanceId:"event-1",syncOriginalStart:"2026-11-25",syncProgressVersion:"1",syncCompletedThrough:"2026-11-24"}}});
+    assert.deepEqual(JSON.parse(patch.init.body),{extendedProperties:{shared:{humanKey:"keep-me",taskId:"task-1",syncTaskId:"task-1",syncProfile:"home",syncCalendarId:"home@example.test",syncEventId:"event-1",syncSchemaVersion:"2",syncSeriesId:"series-1",syncMasterEventId:"event-1",syncActiveInstanceId:"event-1",syncOriginalStart:"2026-11-25",syncProgressVersion:"1",syncCompletedThrough:"2026-11-24",syncRecurrenceOwner:null}}});
   }finally{globalThis.fetch=originalFetch;}
 });
 
@@ -196,4 +196,49 @@ test("Calendar series correlation advances a task ID only from the exact previou
     assert.equal(shared.syncTaskId,"task-next");
     assert.equal(shared.humanKey,"preserve");
   }finally{globalThis.fetch=originalFetch;}
+});
+
+test("legacy shared-property cleanup converges with Google PATCH merge semantics", async () => {
+  const originalFetch = globalThis.fetch;
+  const patches = [];
+  let stored = {
+    id: "event-1", etag: "etag-1", status: "confirmed",
+    start: { date: "2099-11-27" }, end: { date: "2099-11-28" },
+    extendedProperties: { private: { privateKey: "preserve" }, shared: {
+      taskId: "task-1", syncTaskId: "task-1", syncSchemaVersion: "2", syncProfile: "home",
+      syncCalendarId: "home@example.test", syncEventId: "event-1",
+      syncSource: "todoist-calendar-sync", syncRecurrenceOwner: "todoist",
+      syncCalendarNative: "true", humanKey: "preserve",
+    } },
+  };
+  globalThis.fetch = async (url, init = {}) => {
+    if (isGoogleOAuthUrl(url)) return Response.json({ access_token: "test-access-token" });
+    if (!init.method || init.method === "GET") return Response.json(stored);
+    assert.equal(init.method, "PATCH");
+    assert.equal(init.headers.get("If-Match"), stored.etag);
+    const body = JSON.parse(init.body);
+    patches.push(body);
+    // Google PATCH leaves omitted keys unchanged and clears only explicit nulls.
+    const merged = { ...stored.extendedProperties.shared };
+    for (const [key, value] of Object.entries(body.extendedProperties.shared)) {
+      if (value === null) delete merged[key]; else merged[key] = value;
+    }
+    stored = { ...stored, etag: "etag-2", start: body.start, end: body.end,
+      extendedProperties: { ...stored.extendedProperties, shared: merged } };
+    return Response.json(stored);
+  };
+  try {
+    const calendar = new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"home@example.test");
+    await calendar.ensureTaskCorrelation("event-1", "task-1");
+    assert.equal(patches.length, 1);
+    assert.equal(patches[0].extendedProperties.shared.syncSource, null);
+    assert.equal(patches[0].extendedProperties.shared.syncRecurrenceOwner, null);
+    assert.equal(patches[0].extendedProperties.shared.syncCalendarNative, null);
+    assert.equal(stored.extendedProperties.shared.humanKey, "preserve");
+    assert.equal(stored.extendedProperties.private.privateKey, "preserve");
+    assert.deepEqual(stored.start, { date: "2099-11-27" });
+    assert.deepEqual(stored.end, { date: "2099-11-28" });
+    await calendar.ensureTaskCorrelation("event-1", "task-1");
+    assert.equal(patches.length, 1, "second delivery must not write another Calendar echo");
+  } finally { globalThis.fetch = originalFetch; }
 });
