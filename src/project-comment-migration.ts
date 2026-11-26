@@ -18,7 +18,7 @@ import { StateRepository } from "./repository.js";
 import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, TodoistTask } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
-const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, rateLimitRetries: 7, maxRetryDelayMs: 10_000 } as const;
+const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, rateLimitRetries: 12, maxRetryDelayMs: 10_000 } as const;
 
 export interface ProjectCommentMigrationState {
   retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;
