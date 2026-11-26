@@ -13,7 +13,7 @@ import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { isMutationBudgetExhausted } from "./mutation-budget.js";
 import { ReconciliationItemError, reconciliationFailureDetails, type ReconciliationFailureContext } from "./reconciliation-diagnostics.js";
 import { normalizedText } from "./security.js";
-import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask } from "./cancelled-mapping-recovery-policy.js";
 import { logEvent } from "./observability.js";
@@ -333,6 +333,8 @@ export class DynamoReconciliationStore implements ReconciliationStore {
 }
 
 export class SnapshotReconciler {
+  private readonly clientPairs = new Map<Profile, Promise<ClientPair>>();
+
   constructor(
     private readonly state = new StateRepository(),
     private readonly clientFactory?: ClientFactory,
@@ -342,8 +344,19 @@ export class SnapshotReconciler {
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return defaultProviderClientFactory(profile);
+    let pending = this.clientPairs.get(profile);
+    if (!pending) {
+      pending = this.clientFactory
+        ? this.clientFactory(profile)
+        : defaultProviderClientFactory(profile);
+      this.clientPairs.set(profile, pending);
+    }
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.clientPairs.get(profile) === pending) this.clientPairs.delete(profile);
+      throw error;
+    }
   }
 
   private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
@@ -352,8 +365,11 @@ export class SnapshotReconciler {
       return this.store?.listMappings ? this.store.listMappings(profile)
         : await this.state.listMappings?.(profile) || [];
     }
-    const providerMappings = buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
-      .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
+    const providerMappings = buildProjectMappingIndex(
+      await client.listProjectComments(profiles[profile].todoistProjectId, true),
+    ).parsed
+      .filter(entry => entry.payload.profile === profile
+        && entry.payload.projectId === profiles[profile].todoistProjectId)
       .map(mappingFromProjectMappingComment);
     const legacyMappings = this.store?.listMappings
       ? await this.store.listMappings(profile)
@@ -363,6 +379,12 @@ export class SnapshotReconciler {
       [mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id))));
     return [...providerMappings, ...legacyMappings.filter(mapping =>
       !providerTasks.has(mapping.taskId) && !providerEvents.has(mapping.eventId))];
+  }
+
+  private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
+    return buildProjectMappingIndex(await todoist.listProjectComments(profiles[profile].todoistProjectId)).parsed
+      .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
   }
 
   private async reconciliationBaseline(mapping: Mapping): Promise<ReconciliationBaseline | ProviderSyncBaseline | undefined> {
@@ -392,13 +414,13 @@ export class SnapshotReconciler {
     const client = (await this.clients("home")).todoist;
     if (typeof client.listProjectComments !== "function") {
       for (const profile of Object.keys(profiles) as Profile[]) {
-        const mapping = await this.state.getMappingByTask(profile, taskId);
+        const mapping = await this.legacyMappingByTask(profile, taskId);
         if (mapping) return mapping;
       }
       return undefined;
     }
     const values = (await Promise.all((Object.keys(profiles) as Profile[]).map(async profile =>
-      (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId)))).filter((value): value is Mapping => Boolean(value));
+      this.providerMappingByTask(profile, taskId)))).filter((value): value is Mapping => Boolean(value));
     if (values.length > 1) return undefined;
     return values[0];
   }
@@ -406,18 +428,46 @@ export class SnapshotReconciler {
   private async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      return this.state.getMappingByEvent(profile, eventId);
+      return this.legacyMappingByEvent(profile, eventId);
     }
-    return (await this.providerMappings(profile)).find(mapping => mapping.eventId === eventId
+    const provider = (await this.providerCommentMappings(profile, client)).find(mapping => mapping.eventId === eventId
       || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+    if (provider) return provider;
+    return this.legacyMappingByEvent(profile, eventId);
   }
 
   private async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      return this.state.getMappingByTask(profile, taskId);
+      return this.legacyMappingByTask(profile, taskId);
     }
-    return (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId);
+    const provider = (await this.providerCommentMappings(profile, client)).find(mapping => mapping.taskId === taskId);
+    return provider || this.legacyMappingByTask(profile, taskId);
+  }
+
+  private async legacyMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByTask === "function") {
+      const mapping = await this.state.getMappingByTask(profile, taskId);
+      if (mapping?.profile === profile) return mapping;
+    }
+    if (this.store?.listMappings) return (await this.store.listMappings(profile)).find(mapping => mapping.taskId === taskId);
+    return typeof this.state.getMappingByTask === "function" ? undefined
+      : (await this.state.listMappings?.(profile) || []).find(mapping => mapping.taskId === taskId);
+  }
+
+  private async legacyMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByEvent === "function") {
+      const direct = await this.state.getMappingByEvent(profile, eventId);
+      if (direct?.profile === profile) return direct;
+      if (this.store?.listMappings) return (await this.store.listMappings(profile)).find(mapping =>
+        mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+      return typeof this.state.getMappingByEvent === "function" ? undefined
+        : (await this.state.listMappings?.(profile) || []).find(mapping =>
+          mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+    }
+    return (this.store?.listMappings ? await this.store.listMappings(profile)
+      : await this.state.listMappings?.(profile) || []).find(mapping =>
+      mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
   }
 
   private async persistProviderMapping(mapping: Mapping, clients: ClientPair): Promise<Mapping> {
@@ -1136,6 +1186,7 @@ export class SnapshotReconciler {
       return "created";
     }
     let existing: CalendarEvent | undefined;
+    let discoveredCandidate: Awaited<ReturnType<typeof discoverCompatibleCalendarCandidates>>[number] | undefined;
     try {
       existing = await clients.calendar.findByTodoistTaskId(task.id);
     } catch (error) {
@@ -1148,15 +1199,17 @@ export class SnapshotReconciler {
     }
     if (!existing && typeof clients.calendar.listDelta === "function") {
       const inventory = calendarInventory || (await clients.calendar.listDelta()).items;
-      const compatible = inventory.filter(event =>
-        event.status !== "cancelled" && hasCanonicalState(event, task));
-      if (compatible.length === 1) existing = compatible[0];
-      else if (compatible.length > 1) {
+      const compatible = await discoverCompatibleCalendarCandidates(task, inventory, clients.calendar);
+      if (compatible.length > 1) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_ambiguous", {
-          taskId: task.id, candidateEventIds: compatible.map(event => event.id).sort(),
+          taskId: task.id, candidateEventIds: compatible.map(candidate => candidate.master.id).sort(),
           reason: "multiple_exact_compatible_calendar_events",
         });
         return "conflict";
+      }
+      if (compatible.length === 1) {
+        discoveredCandidate = compatible[0];
+        existing = discoveredCandidate.master;
       }
     }
     // A cancelled provider object is the deletion evidence. A later live
@@ -1206,14 +1259,61 @@ export class SnapshotReconciler {
 
     if (existing && existing.status !== "cancelled") {
       const synchronizer = new Synchronizer(this.state, undefined, async () => clients);
-      const byComment = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
+      if (discoveredCandidate) {
+        const refreshed = await discoverCompatibleCalendarCandidates(task, [discoveredCandidate.master], clients.calendar);
+        if (refreshed.length !== 1 || refreshed[0].master.id !== discoveredCandidate.master.id
+          || refreshed[0].event.id !== discoveredCandidate.event.id) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_candidate_changed", {
+            taskId: task.id, candidateEventIds: [discoveredCandidate.master.id, discoveredCandidate.event.id],
+          });
+          return "conflict";
+        }
+        discoveredCandidate = refreshed[0];
+        existing = discoveredCandidate.master;
+      }
+      const identityIds = discoveredCandidate
+        ? [...new Set([discoveredCandidate.master.id, discoveredCandidate.event.id])]
+        : [existing.id];
+      const identityOwners = await synchronizer.providerMappingsForCalendarIdentity(profile, identityIds, clients.todoist);
+      const conflictingOwners = discoveredCandidate
+        ? compatibleCalendarCandidateOwnerConflicts(discoveredCandidate, identityOwners, task.id, profile)
+        : identityOwners.filter(owner => owner.taskId !== task.id).map(owner => owner.taskId);
       const byCalendar = synchronizer.mappingFromCalendarCorrelation(profile, existing);
+      if (conflictingOwners.length || byCalendar && byCalendar.taskId !== task.id) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
+          taskId: task.id, eventId: existing.id,
+          ownerTaskId: conflictingOwners[0] || byCalendar?.taskId,
+        });
+        return "conflict";
+      }
+      const byComment = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
       const correlation = byComment || byCalendar;
       if ((byComment && byComment.taskId !== task.id) || (byCalendar && byCalendar.taskId !== task.id)) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
           taskId: task.id, eventId: existing.id, ownerTaskId: correlation?.taskId,
         });
         return "conflict";
+      }
+      if (discoveredCandidate) {
+        const discovered: Mapping = discoveredCandidate.master.recurrence?.length
+          ? { profile, eventId: discoveredCandidate.master.id, taskId: task.id,
+            projectId: profiles[profile].todoistProjectId, seriesId: task.id,
+            masterEventId: discoveredCandidate.master.id, activeInstanceId: discoveredCandidate.event.id,
+            originalStart: discoveredCandidate.event.originalStartTime?.dateTime
+              || discoveredCandidate.event.originalStartTime?.date
+              || discoveredCandidate.event.start?.dateTime || discoveredCandidate.event.start?.date,
+            activeEffectiveStart: discoveredCandidate.event.start?.dateTime || discoveredCandidate.event.start?.date,
+            updatedAt: new Date().toISOString() }
+          : { profile, eventId: discoveredCandidate.event.id, taskId: task.id,
+            projectId: profiles[profile].todoistProjectId, updatedAt: new Date().toISOString() };
+        const persisted = await this.persistProviderMapping(discovered, clients);
+        await this.persistReconciliationBaseline(persisted, task, discoveredCandidate.event, clients);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_provider_pair_recovered", {
+          taskId: task.id, eventId: discoveredCandidate.event.id,
+          masterEventId: discoveredCandidate.master.id,
+          tieBreak: "unique_exact_compatible_match",
+        });
+        return "baseline";
       }
       if (correlation?.taskId === task.id) {
         if (hasCanonicalState(existing, task)) {
@@ -1281,6 +1381,10 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
+    // Reuse one provider client per profile within this snapshot so cached
+    // project comment pages are shared across mapping lookups. A new
+    // reconciliation gets a fresh provider inventory.
+    this.clientPairs.clear();
     const clients = await this.clients(profile);
     const recurrence = continuation?.recurrence
       ?? (await this.reconcileExistingRecurrence(profile))

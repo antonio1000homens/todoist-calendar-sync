@@ -12,6 +12,7 @@ import { ManualInterventionService } from "../dist/manual-intervention.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { syncMessageGroupId } from "../dist/types.js";
 import { createObservedProviderClientFactory } from "../dist/mutation-budget.js";
+import { SafeProviderReplayError } from "../dist/safe-provider-replay.js";
 
 function namedError(name, fields = {}) {
   const e = new Error(name);
@@ -70,6 +71,20 @@ test("provider throttling and temporary outages retry only before a provider wri
   assert.equal(isTransientProviderFailure(response(400)), false);
   assert.equal(isTransientProviderFailure(namedError("ProviderError", {status:429,$retryable:{throttling:true}})), false);
   assert.equal(isTransientProviderFailure(namedError("Error", {status:503,body:"not a provider response"})), false);
+});
+
+test("only explicitly deterministic provider replays may retry after a write", () => {
+  const replay = new SafeProviderReplayError("Calendar master already exists; readback still pending");
+  assert.deepEqual(failedDeliveryDisposition(replay, {kind:"todoist"}, true, 1), {
+    kind:"retry_fifo", reason:"safe_provider_replay", receiveCount:1,
+  });
+  assert.equal(failedDeliveryDisposition(replay, {kind:"todoist"}, true, MAX_SYNC_RECEIVES).reason,
+    "retries_exhausted");
+  assert.equal(failedDeliveryDisposition(throttle(), {kind:"todoist"}, true, 1).reason,
+    "partial_provider_mutation");
+  assert.equal(failedDeliveryDisposition(replay, {kind:"reconcile"}, true, 1).reason,
+    "unverified_delivery_type");
+  assert.equal(failedDeliveryDisposition({cause:replay}, {kind:"todoist"}, true, 1).kind, "retry_fifo");
 });
 
 test("the earliest provider write boundary prevents retry of a later DynamoDB mapping throttle", async () => {
