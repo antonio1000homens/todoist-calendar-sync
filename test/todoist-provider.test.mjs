@@ -101,3 +101,17 @@ test("Todoist maintenance retries explicitly rejected 429 comment writes only",a
   await assert.rejects(()=>todoist.createProjectComment("project-1","sync mapping"),{status:503});
   assert.equal(calls,1,"ambiguous write failures are never replayed");
 });
+
+test("Todoist maintenance requests are paced across concurrent callers",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  const starts=[];
+  globalThis.fetch=async url=>{
+    starts.push(Date.now());
+    return Response.json({id:String(url).split("/").at(-1)});
+  };
+  const todoist=new Todoist("test-token",{minRequestIntervalMs:25});
+  await Promise.all([todoist.getTask("task-1"),todoist.getTask("task-2")]);
+  assert.equal(starts.length,2);
+  assert.ok(starts[1]-starts[0]>=20,"concurrent migration reads reserve distinct paced slots");
+});

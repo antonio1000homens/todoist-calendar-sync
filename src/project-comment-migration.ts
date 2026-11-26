@@ -18,7 +18,12 @@ import { StateRepository } from "./repository.js";
 import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, TodoistTask } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
-const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, rateLimitRetries: 12, maxRetryDelayMs: 10_000 } as const;
+// Keep sustained all-profile validation below Todoist's user-level API quota.
+// Honor longer Retry-After hints (within a bounded retry budget) instead of
+// immediately converting a throttled pair into a migration failure.
+const MIGRATION_PROVIDER_OPTIONS = {
+  readRetries: 7, rateLimitRetries: 5, maxRetryDelayMs: 60_000, minRequestIntervalMs: 2_000,
+} as const;
 
 export interface ProjectCommentMigrationState {
   retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;

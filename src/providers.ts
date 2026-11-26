@@ -91,6 +91,8 @@ type ProviderRequestOptions = {
   /** Explicitly rejected 429 writes can be safely retried by idempotent maintenance operations. */
   rateLimitRetries?: number;
   maxRetryDelayMs?: number;
+  /** Minimum spacing between requests on one Todoist client, for controlled migrations. */
+  minRequestIntervalMs?: number;
 };
 
 async function fetchProvider(
@@ -762,8 +764,20 @@ export class GoogleCalendar {
 
 export class Todoist {
   private readonly projectCommentCache = new Map<string, TodoistCommentRecord[]>();
+  private nextRequestAt = 0;
 
   constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {}
+
+  private async paceRequest(): Promise<void> {
+    const interval = this.requestOptions.minRequestIntervalMs || 0;
+    if (!interval) return;
+    if (!Number.isSafeInteger(interval) || interval < 0) throw new Error("Invalid Todoist request interval");
+    const now = Date.now();
+    const startsAt = Math.max(now, this.nextRequestAt);
+    this.nextRequestAt = startsAt + interval;
+    const delay = startsAt - now;
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+  }
 
   private async request<T>(path: string, init: RequestInit = {}, comments = false): Promise<T> {
     const headers = new Headers(init.headers);
@@ -776,6 +790,7 @@ export class Todoist {
     const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
       try {
+        await this.paceRequest();
         return await responseJson<T>(await fetchProvider(url, { ...init, headers },this.requestOptions));
       } catch (error) {
         const name=(error as {name?:string})?.name;
