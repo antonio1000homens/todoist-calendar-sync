@@ -715,6 +715,53 @@ test("Calendar reconciliation adopts the unique unlinked recurring Todoist candi
   assert.equal(state.audits.at(-1).action,"calendar_provider_pair_recovered_by_unique_match");
 });
 
+test("Calendar delta worker recovers a recurring pair with no provider links or legacy mapping", async () => {
+  const current = instance("incremental-unlinked-current", "2099-01-01", "2099-01-02");
+  const history = [
+    instance("incremental-history-2010-1", "2010-01-01", "2010-01-02"),
+    instance("incremental-history-2010-2", "2010-01-02", "2010-01-03"),
+  ];
+  const task = {
+    id: "incremental-existing-unlinked-task",
+    project_id: profiles[PROFILE].todoistProjectId,
+    content: current.summary,
+    description: current.description,
+    due: { date: current.start.date, string: "every day", is_recurring: true },
+  };
+  const master = {
+    id: MASTER, iCalUID: SERIES, status: "confirmed", summary: task.content,
+    description: task.description, start: { date: "2010-01-01" }, end: { date: "2010-01-02" },
+    recurrence: ["RRULE:FREQ=DAILY"], etag: "incremental-unlinked-master",
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, [...history, current], new Map([[task.id, task]]), master);
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = {
+    id: "incremental-calendar-unlinked-series", kind: "calendar", profile: PROFILE,
+    mode: "aws", receivedAt: "2026-11-26T12:00:00Z", headers: {}, body: "",
+  };
+
+  await sync.process(delivery);
+
+  const linkedComment = parseMappingComment(clients.projectComments[0]);
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(clients.todoistDeletes.length, 0);
+  assert.equal(clients.tasks.size, 1, "candidate recovery must preserve the existing Todoist task ID");
+  assert.equal(clients.projectComments.length, 1);
+  assert.equal(linkedComment?.payload.taskId, task.id);
+  assert.equal(linkedComment?.payload.masterEventId, master.id);
+  assert.equal(linkedComment?.payload.activeInstanceId, current.id);
+  assert.equal(clients.events.get(master.id).extendedProperties.shared.taskId, task.id);
+  assert.equal(clients.events.get(master.id).extendedProperties.shared.syncTaskId, task.id);
+  assert.ok(state.audits.some(entry => entry.action === "calendar_provider_pair_recovered_by_unique_match"));
+
+  await sync.process({ ...delivery, id: "incremental-calendar-unlinked-series-replay" });
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(clients.tasks.size, 1, "replayed delta must not create a duplicate task");
+  assert.equal(clients.projectComments.length, 1, "replayed delta must retain one exact provider mapping");
+  assert.equal(clients.events.get(master.id).extendedProperties.shared.taskId, task.id);
+});
+
 test("Calendar reconciliation refuses multiple compatible unlinked recurring tasks", async () => {
   const current=instance("ambiguous-current","2099-01-01","2099-01-02");
   const next=instance("ambiguous-next","2099-01-02","2099-01-03");
