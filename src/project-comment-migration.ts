@@ -435,17 +435,28 @@ export async function migrateProjectComments(
         await retireVerifiedCorrelation(mapping, valid.task);
       }
     } catch (error) {
+      const providerError = error as {
+        name?: unknown;
+        code?: unknown;
+        status?: unknown;
+        $metadata?: { httpStatusCode?: unknown };
+      };
+      const providerCode = typeof providerError.code === "string"
+        && /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(providerError.code)
+        ? providerError.code : undefined;
+      const errorName = typeof providerError.name === "string"
+        && providerError.name !== "Error"
+        && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(providerError.name)
+        ? providerError.name : undefined;
+      const status = Number(providerError.status || providerError.$metadata?.httpStatusCode
+        || (typeof providerError.code === "number" ? providerError.code : undefined));
       summary.failures += 1;
       if (apply) await state.audit(profile, "project_comment_migration_mapping_failed", {
         taskId: mapping.taskId,
         eventId: mapping.eventId,
         stage: migrationStage,
-        providerStatus: Number((error as { status?: unknown; $metadata?: { httpStatusCode?: unknown } }).status
-          || (error as { $metadata?: { httpStatusCode?: unknown } }).$metadata?.httpStatusCode) || undefined,
-        code: (() => {
-          const name = (error as { name?: unknown }).name;
-          return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(name) ? name : "ProviderError";
-        })(),
+        providerStatus: Number.isInteger(status) && status > 0 && status <= 599 ? status : undefined,
+        code: errorName || providerCode || "ProviderError",
       });
     } finally {
       await releaseWriterLease();

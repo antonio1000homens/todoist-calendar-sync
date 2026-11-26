@@ -29,7 +29,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, completedTask = false } = {}) {
+function fakeClients({ projectComments = [], legacyComment, onLegacyRead, deleteError, getError, correlationError, completedTask = false } = {}) {
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
@@ -79,6 +79,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           });
         },
         async ensureTaskCorrelation(eventId, taskId, _expectedTaskId, mapping) {
+          if (correlationError) throw correlationError;
           const current = await this.getEvent(eventId);
           const shared = current.extendedProperties?.shared || {};
           current.extendedProperties = { ...current.extendedProperties, shared: {
@@ -102,6 +103,24 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
     comments,
   };
 }
+
+test("migration failure audit records safe provider codes and statuses when Error is generic", async () => {
+  const state = new FakeState();
+  const error = Object.assign(new Error("provider details must not be logged"), {
+    code: "rate_limit_exceeded",
+    status: 429,
+  });
+  const { clients } = fakeClients({ correlationError: error });
+
+  const summary = await migrateProjectComments("home", [mapping()], state, clients, true);
+
+  assert.equal(summary.failures, 1);
+  const failure = state.audits.find(({ action }) => action === "project_comment_migration_mapping_failed");
+  assert.equal(failure.detail.stage, "calendar_correlation_write");
+  assert.equal(failure.detail.providerStatus, 429);
+  assert.equal(failure.detail.code, "rate_limit_exceeded");
+  assert.equal(JSON.stringify(failure).includes("provider details must not be logged"), false);
+});
 
 test("automatic migration backfills all profiles before cleanup and retries newly created mappings", async () => {
   const calls = [];
