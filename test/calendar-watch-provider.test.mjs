@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GoogleCalendar } from "../dist/providers.js";
+import { CalendarCorrelationConflictError } from "../dist/reconciliation-diagnostics.js";
 
 function isGoogleOAuthUrl(value) {
   return new URL(String(value)).hostname === "oauth2.googleapis.com";
@@ -169,9 +170,68 @@ test("Calendar correlation refuses to overwrite a different exact task identity"
   };
   try{
     const calendar=new GoogleCalendar({client_id:"id",client_secret:"secret",refresh_token:"refresh"},"home@example.test");
-    await assert.rejects(calendar.ensureTaskCorrelation("event-1","task-1"),/different Todoist task/);
+    await assert.rejects(calendar.ensureTaskCorrelation("event-1", "task-1", "expected-task"), error => {
+      assert.ok(error instanceof CalendarCorrelationConflictError);
+      assert.deepEqual(error.correlationConflict, {
+        stage: "ensureTaskCorrelation", profile: "home", eventId: "event-1", taskId: "task-1",
+        existingTaskId: "other-task", expectedTaskId: "expected-task",
+        calendarEventState: "present", existingTaskState: "unverified",
+      });
+      return true;
+    });
     assert.equal(calls.filter(({init})=>init.method==="PATCH").length,0);
   }finally{globalThis.fetch=originalFetch;}
+});
+
+test("Calendar correlation rejects missing or invalid identities before a metadata write", async t => {
+  const calendar = new GoogleCalendar({}, "home@example.test");
+  let current;
+  const read = t.mock.method(calendar, "getEvent", async () => current);
+  const patch = t.mock.method(calendar, "updateSharedEventPropertiesIfUnchanged", async () => {
+    assert.fail("invalid identity must never reach a metadata write");
+  });
+
+  for (const args of [["", "task-1"], ["event-1", undefined], ["event-1", "invalid task"],
+    ["event-1", "task-1", "invalid/previous"]]) {
+    await assert.rejects(calendar.ensureTaskCorrelation(...args), /requires exact event and task IDs/);
+  }
+  assert.equal(read.mock.callCount(), 0);
+  for (current of [{}, { id: "wrong-event" }]) {
+    await assert.rejects(calendar.ensureTaskCorrelation("event-1", "task-1"), /did not match the exact event ID/);
+  }
+  for (const taskId of ["", 42, "bad\nvalue"]) {
+    current = { id: "event-1", etag: "etag", extendedProperties: { shared: { taskId } } };
+    await assert.rejects(calendar.ensureTaskCorrelation("event-1", "task-1"), /invalid shared task ID/);
+  }
+  assert.equal(patch.mock.callCount(), 0);
+});
+
+test("exact cancelled readback and an inaccessible event both fail closed with distinct evidence", async t => {
+  const calendar = new GoogleCalendar({}, "home@example.test");
+  const event = { id: "event-1", status: "cancelled", etag: "etag",
+    extendedProperties: { shared: { taskId: "existing-task" } } };
+  let readError;
+  t.mock.method(calendar, "getEvent", async () => {
+    if (readError) throw readError;
+    return event;
+  });
+  const patch = t.mock.method(calendar, "updateSharedEventPropertiesIfUnchanged", async () => {
+    assert.fail("unavailable or cancelled event must never reach a metadata write");
+  });
+
+  await assert.rejects(calendar.ensureTaskCorrelation(event.id, "requested-task"), error => {
+    assert.ok(error instanceof CalendarCorrelationConflictError);
+    assert.equal(error.correlationConflict.calendarEventState, "cancelled");
+    assert.equal(error.correlationConflict.existingTaskState, "unverified");
+    return true;
+  });
+  await assert.rejects(calendar.ensureTaskCorrelation(event.id, "requested-task", "existing-task"),
+    /readback shows a cancelled event/);
+  for (const status of [403, 404]) {
+    readError = Object.assign(new Error("Calendar read unavailable"), { status });
+    await assert.rejects(calendar.ensureTaskCorrelation(event.id, "requested-task"), error => error === readError);
+  }
+  assert.equal(patch.mock.callCount(), 0);
 });
 
 test("Calendar series correlation advances a task ID only from the exact previous provider comment identity",async()=>{

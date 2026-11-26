@@ -13,7 +13,7 @@ import { enqueueDelivery, requestReconciliation, type ReconciliationRequestResul
 import { clearDeadLetterMessagesForProfile } from "./dead-letter-queue.js";
 import { InterventionPolicyStore, type EffectiveInterventionPolicy, type InterventionPolicyScope, type InterventionResponseMode } from "./intervention-policy.js";
 import { StateRepository } from "./repository.js";
-import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
+import { CalendarCorrelationConflictError, ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { profiles } from "./config.js";
 import { normalizedText } from "./security.js";
@@ -758,6 +758,14 @@ function operationalFailureContext(delivery: Delivery, error: unknown): Record<s
       // The failure record remains useful even when a legacy webhook is malformed.
     }
   }
+  if (error instanceof CalendarCorrelationConflictError || error instanceof ReconciliationItemError) {
+    const conflict = error.correlationConflict;
+    if (conflict) {
+      context.correlationConflict = conflict;
+      context.providerTaskId = conflict.taskId;
+      context.providerEventId = conflict.eventId;
+    }
+  }
   if (error instanceof ReconciliationItemError) {
     context.providerTaskId = error.taskId;
     context.providerEventId = error.eventId;
@@ -863,6 +871,11 @@ function operationalContextLines(decision: ManualDecision): string[] {
   const status = typeof detail.status === "number" ? detail.status : undefined;
   const providerTaskId = contextString(detail, "providerTaskId");
   const providerEventId = contextString(detail, "providerEventId");
+  const conflict = detail.correlationConflict && typeof detail.correlationConflict === "object"
+    ? detail.correlationConflict as Record<string, unknown> : undefined;
+  const correlationEventId = conflict && contextString(conflict, "eventId");
+  const existingTaskId = conflict && contextString(conflict, "existingTaskId");
+  const expectedTaskId = conflict && contextString(conflict, "expectedTaskId");
   const failure = contextString(detail, "failure");
   const reason = contextString(detail, "reconcileReason");
   const generation = contextString(detail, "reconcileGeneration");
@@ -870,8 +883,13 @@ function operationalContextLines(decision: ManualDecision): string[] {
   return [
     kind ? `*Delivery:* ${escapeSlackMrkdwnText(kind)}` : undefined,
     status ? `*Provider response:* HTTP ${status}` : undefined,
-    providerTaskId ? `*Affected Todoist task:* \`${escapeSlackMrkdwnText(providerTaskId)}\`` : undefined,
+    providerTaskId ? `*${conflict ? "Requested" : "Affected"} Todoist task:* \`${escapeSlackMrkdwnText(providerTaskId)}\`` : undefined,
     providerEventId ? `*Affected Calendar event:* \`${escapeSlackMrkdwnText(providerEventId)}\`` : undefined,
+    correlationEventId && correlationEventId !== providerEventId
+      ? `*Calendar event checked for correlation:* \`${escapeSlackMrkdwnText(correlationEventId)}\`` : undefined,
+    existingTaskId ? `*Task ID stored on the Calendar event:* \`${escapeSlackMrkdwnText(existingTaskId)}\` (task state unverified)` : undefined,
+    expectedTaskId ? `*Expected previous Todoist task:* \`${escapeSlackMrkdwnText(expectedTaskId)}\`` : undefined,
+    conflict?.calendarEventState === "cancelled" ? "*Calendar readback:* Cancelled" : undefined,
     failure ? `*Failure:* ${escapeSlackMrkdwnText(failure)}` : undefined,
     reason ? `*Reconciliation:* ${escapeSlackMrkdwnText(reason)}${generation ? ` (${escapeSlackMrkdwnText(generation)})` : ""}${continuation ? `, ${escapeSlackMrkdwnText(continuation)}` : ""}` : undefined,
   ].filter(Boolean) as string[];
@@ -914,6 +932,14 @@ function contextLines(decision: ManualDecision): string[] {
     ...operationalContextLines(decision),
   ].filter(Boolean) as string[];
   return lines;
+}
+
+function contextSectionBlocks(decision: ManualDecision): unknown[] {
+  const lines = contextLines(decision);
+  const text = lines.join("\n");
+  // Keep long provider IDs intact without exceeding Slack's section text limit.
+  const sections = decision.context.correlationConflict && text.length > 3000 ? lines : [text];
+  return sections.map(section => ({ type: "section", text: { type: "mrkdwn", text: section } }));
 }
 
 function technicalContextText(decision: ManualDecision): string {
@@ -962,7 +988,7 @@ export function decisionResolutionBlocks(decision: ManualDecision, text: string,
   const policy = MANUAL_DECISION_CATALOG[decision.type];
   return [
     { type: "header", text: { type: "plain_text", text: policy.title.slice(0, 150) } },
-    { type: "section", text: { type: "mrkdwn", text: contextLines(decision).join("\n") || `*Profile:* \`${decision.profile}\`` } },
+    ...contextSectionBlocks(decision),
     { type: "section", text: { type: "mrkdwn", text } },
     ...extra,
     technicalContextBlock(decision),
@@ -973,7 +999,7 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
   const policy = MANUAL_DECISION_CATALOG[decision.type];
   const blocks: unknown[] = [
     { type: "header", text: { type: "plain_text", text: policy.title.slice(0, 150) } },
-    { type: "section", text: { type: "mrkdwn", text: contextLines(decision).join("\n") || `*Profile:* \`${decision.profile}\`` } },
+    ...contextSectionBlocks(decision),
   ];
   const savedDefault = decision.defaultAction
     ? decision.permittedActions.find((action) => action.id === decision.defaultAction)
@@ -1887,10 +1913,19 @@ export class ManualInterventionService {
       }
     }
     const type: ManualDecisionType = [401, 403].includes(status) ? "operational_provider_auth" : "operational_dlq";
+    const context = operationalFailureContext(delivery, error);
     await this.createDecision(
       delivery.profile,
       type,
-      { deliveryId: delivery.id, status, message: error instanceof Error ? error.message : String(error) },
+      {
+        deliveryId: delivery.id,
+        status,
+        message: context.failure,
+        ...(context.correlationConflict ? {
+          eventId: context.providerEventId,
+          correlationConflict: context.correlationConflict,
+        } : {}),
+      },
       {
         sourceDeliveryId: delivery.id,
         ...(delivery.kind === "orphan" && delivery.orphan ? {
@@ -1898,7 +1933,7 @@ export class ManualInterventionService {
           eventId: delivery.orphan.eventId,
         } : {}),
       },
-      operationalFailureContext(delivery, error),
+      context,
     );
   }
 

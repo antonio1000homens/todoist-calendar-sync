@@ -939,8 +939,7 @@ export class Synchronizer {
     const expectedTaskId = previousTaskIds.size === 1 ? [...previousTaskIds][0] : undefined;
     const correlationEventId = next.masterEventId || next.eventId;
     if (correlationEventId && typeof clients.calendar.ensureTaskCorrelation === "function") {
-      const event = await clients.calendar.ensureTaskCorrelation(correlationEventId, next.taskId,
-        expectedTaskId !== next.taskId ? expectedTaskId : undefined, next);
+      const event = await clients.calendar.ensureTaskCorrelation(correlationEventId, next.taskId, expectedTaskId, next);
       const start = event.start?.dateTime || event.start?.date;
       next = {
         ...next,

@@ -45,7 +45,7 @@ function providerRefs(row) {
     const activeSide = node.side === "todoist" || node.side === "calendar" ? node.side : side;
     for (const [key, value] of Object.entries(node)) {
       if (typeof value === "string" && value) {
-        if (/^(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId)$/.test(key)) tasks.add(value);
+        if (/^(taskId|providerTaskId|existingTaskId|expectedTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId)$/.test(key)) tasks.add(value);
         if (/^(eventId|providerEventId|masterEventId|activeInstanceId|calendarProjectionId|oldMasterId|newMasterId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId)$/.test(key)) events.add(value);
         if (key === "seriesId") series.add(value);
         if (key === "id" && path.endsWith(".ref") && activeSide === "todoist") tasks.add(value);
@@ -107,7 +107,7 @@ export function planPurge(rows, target, options = {}) {
     if (pk.startsWith("CONFLICT_STATE#" + profile + "#") && conflictHashes.has(pk.split("#").at(-1))) reasons.push("conflict identity hash");
     visit(row, (value, path) => {
       if (path === "pk" || path === "sk") return;
-      const taskPath = /(^|\.)(taskId|providerTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId|candidateTaskIds|identityRefs\.taskIds)(\[\d+\])?$/.test(path)
+      const taskPath = /(^|\.)(taskId|providerTaskId|existingTaskId|expectedTaskId|linkedTaskId|discardedTaskId|retainedTaskId|ownerTaskId|candidateTaskIds|identityRefs\.taskIds)(\[\d+\])?$/.test(path)
         || /(^|\.)ref\.id$/.test(path) && path.includes("todoist");
       const eventPath = /(^|\.)(eventId|providerEventId|masterEventId|activeInstanceId|oldMasterId|newMasterId|calendarProjectionId|lastEventId|occurrenceId|selectedEventId|previousEventId|cancelledEventId|candidateEventIds|identityRefs\.eventIds)(\[\d+\])?$/.test(path);
       if (value === taskId && taskPath) reasons.push("task ID at " + path);
