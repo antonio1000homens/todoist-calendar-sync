@@ -14,7 +14,7 @@ function fixture() {
     start: {date:"2026-11-10"}, end:{date:"2026-11-11"},
     recurrence:["RRULE:FREQ=WEEKLY;UNTIL=20261116;BYDAY=TU"],
     extendedProperties:{shared:{taskId,syncTaskId:taskId,syncMasterEventId:oldId,humanKey:"preserve"}} };
-  const master = { ...structuredClone(old), id: masterId, etag:"new-1", iCalUID:masterId+"@google.com",
+  const master = { ...structuredClone(old), id: masterId, etag:"new-1", iCalUID:masterId+"@example.test",
     start:{date:"2026-11-17"},end:{date:"2026-11-18"},
     recurrence:["RRULE:FREQ=WEEKLY;BYDAY=TU"],description:"Weekly school swimming lesson" };
   const active = {id:activeId,etag:"active-1",status:"confirmed",recurringEventId:masterId,
