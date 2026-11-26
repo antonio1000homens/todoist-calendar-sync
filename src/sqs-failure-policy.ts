@@ -109,27 +109,35 @@ export function failedDeliveryDisposition(
   delivery: Pick<Delivery, "kind"> | undefined,
   providerMutationObserved: boolean,
   receiveCount: number,
+  calendarItemMutationObserved?: boolean,
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
   const safeReplay = isSafeProviderReplay(error);
   let accountCooldown = false;
+  let calendarTaskChanged = false;
   const seen = new Set<object>();
   let cause: unknown = error;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && cause && typeof cause === "object"; depth++) {
     if (seen.has(cause)) break;
     seen.add(cause);
-    if (fields(cause).code === "todoist_account_cooldown") {
-      accountCooldown = true;
-      break;
-    }
+    if (fields(cause).code === "todoist_account_cooldown") accountCooldown = true;
+    if (fields(cause).code === "calendar_delta_task_changed") calendarTaskChanged = true;
     cause = fields(cause).cause;
   }
   const transientDynamoDb = isTransientDynamoDbFailure(error);
-  const transientProvider = !transientDynamoDb && (accountCooldown || safeReplay || isTransientProviderFailure(error));
+  const calendarChange = delivery?.kind === "calendar" && calendarTaskChanged;
+  const transientProvider = !transientDynamoDb && (accountCooldown || calendarChange || safeReplay || isTransientProviderFailure(error));
   if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
   // A provider write may already have happened. The DynamoDB state write may
   // have failed after it, so automated replay could duplicate provider writes.
-  if (providerMutationObserved && !safeReplay) return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
+  // Only an explicit completed-item boundary permits a normal Calendar delta
+  // to retry a later cooldown or pre-write edit race after earlier writes.
+  // Unknown boundaries, writes attempted within the failing item, and all
+  // other delivery/error types retain the conservative partial-write guard.
+  const resumableCalendarBoundary = delivery?.kind === "calendar"
+    && calendarItemMutationObserved === false && (accountCooldown || calendarChange);
+  if (providerMutationObserved && !safeReplay && !resumableCalendarBoundary)
+    return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
   // Retry only deliveries whose state is safe to re-read. Reconciliation chunks
   // are idempotent when no provider write has been attempted; repair and
   // erasure-sensitive operations remain quarantined.

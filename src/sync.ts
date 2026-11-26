@@ -687,6 +687,33 @@ export function hasCanonicalState(event: CalendarEvent, task: TodoistTask): bool
   return startsMatch(event, task);
 }
 
+/** Compare only identity, lifecycle and fields the Calendar writer can change.
+ * Provider bookkeeping, labels, priority and timestamps are not sync fields. */
+export function sameCalendarDeltaTaskEvidence(before: TodoistTask, current: TodoistTask): boolean {
+  const evidence = (task: TodoistTask) => [
+    task.id, task.project_id, Boolean(task.is_deleted), Boolean(task.is_completed),
+    task.completed_at || null, normalizedText(task.content), normalizedDescription(task.description),
+    task.due?.date || null, task.due?.datetime || null, task.due?.timezone || null,
+    Boolean(task.due?.is_recurring),
+    task.due?.is_recurring ? task.due.string || null : null,
+    task.due?.is_recurring ? task.due.lang || null : null,
+  ];
+  return JSON.stringify(evidence(before)) === JSON.stringify(evidence(current));
+}
+
+export async function verifyCalendarDeltaTaskUnchanged(todoist: Pick<Todoist, "getTask">, task: TodoistTask): Promise<void> {
+  const changed = () => Object.assign(new Error("Todoist task changed before Calendar delta update"), {
+    code: "calendar_delta_task_changed",
+  });
+  let current: TodoistTask;
+  try { current = await todoist.getTask(task.id); }
+  catch (error) {
+    if (Number((error as {status?: number}).status) === 404) throw changed();
+    throw error;
+  }
+  if (!sameCalendarDeltaTaskEvidence(task, current)) throw changed();
+}
+
 type TodoistCalendarAction = "upsert" | "delete_projection" | "complete_projection" | "skip";
 
 export interface TodoistCalendarLifecycle {
@@ -858,6 +885,7 @@ export class Synchronizer {
     private readonly state = new StateRepository(),
     private readonly scheduleOrphan?: (delivery: Delivery, eventId: string, taskId: string) => Promise<void>,
     private readonly clientFactory?: ClientFactory,
+    private readonly onCalendarItemCompleted?: () => void,
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
@@ -1982,6 +2010,9 @@ export class Synchronizer {
     for (const event of delta.items) {
       try {
         await this.applyCalendarEvent(delivery, event, calendar, todoist);
+        // Only a fully returned item is a safe boundary. Keep the delta cursor
+        // unchanged until the whole batch finishes; replay re-reads provider links.
+        this.onCalendarItemCompleted?.();
       } catch (error) {
         if (error instanceof ReconciliationItemError) throw error;
         throw new ReconciliationItemError(error, {
@@ -2631,10 +2662,7 @@ export class Synchronizer {
     if (task) {
       // Cached evidence is only sufficient to discard an unchanged echo.
       // Recheck an existing candidate before any provider mutation.
-      const current = await todoist.getTask(task.id);
-      if (current.id !== task.id || current.project_id !== task.project_id
-        || JSON.stringify(current) !== JSON.stringify(task))
-        throw new Error("Todoist task changed before Calendar delta update");
+      await verifyCalendarDeltaTaskUnchanged(todoist, task);
     }
     const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id, calendarReplaySourceIds(event));
     const knownCommentId = mapping?.projectCommentId || mapping?.commentId;

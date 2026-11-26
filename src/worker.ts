@@ -379,6 +379,8 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
     let meaningfulMutation = false;
+    // Separate delivery-wide diagnostics from an in-flight Calendar item.
+    let calendarItemMutationObserved: boolean | undefined;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
@@ -423,6 +425,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
         // invoked. If this DynamoDB accounting write throttles, the result is
         // ambiguous and must NOT be automatically replayed.
         meaningfulMutation = true;
+        if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = true;
         await recordMutation(profile);
       };
 
@@ -653,11 +656,15 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       // Project/orphan/sync paths may persist mappings or recurrence state
       // before calling recordMutation, so that signal alone is too late to
       // decide that SQS replay is safe after a DynamoDB throttle.
+      if (delivery.kind === "calendar") calendarItemMutationObserved = false;
       const observedClientFactory = createObservedProviderClientFactory(() => {
         meaningfulMutation = true;
+        if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = true;
       });
       await withTodoistInventoryScope(() =>
-        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery!));
+        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory, () => {
+          if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = false;
+        }).process(delivery!));
 
       if (calendarSyncGeneration !== undefined) {
         const followUpNeeded = await state.completeCalendarSync(delivery.profile, calendarSyncGeneration);
@@ -712,7 +719,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       const retryAfterMs = providerRetryAfterMs(error);
       // The actual Todoist request boundary persists credential-specific
       // cooldowns. Calendar Retry-After hints only affect FIFO visibility.
-      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount);
+      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount, calendarItemMutationObserved);
       if (disposition.kind === "retry_fifo") {
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is

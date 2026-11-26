@@ -1253,3 +1253,64 @@ test("20 canonical Calendar delta items and a duplicate replay use one inventory
   }
   assert.equal(audits.filter(action=>action==="calendar_noop_canonical_state").length,40);
 });
+
+test("Calendar delta fresh evidence ignores unrelated task metadata but defers relevant edits and disappearance", async () => {
+  const {verifyCalendarDeltaTaskUnchanged} = await import("../dist/sync.js");
+  const {failedDeliveryDisposition} = await import("../dist/sqs-failure-policy.js");
+  const before = {id:"task",project_id:"project",content:"Original",description:"details",
+    due:{date:"2099-01-01",is_recurring:false},priority:1,labels:[],updated_at:"old"};
+  let reads=0;
+  await verifyCalendarDeltaTaskUnchanged({async getTask(id,refresh=true) {
+    assert.equal(id,before.id);assert.equal(refresh,true);reads++;
+    return {...before,priority:4,labels:["changed"],updated_at:"new",due:{is_recurring:false,date:"2099-01-01"}};
+  }},before);
+  assert.equal(reads,1);
+  for (const current of [{...before,content:"Concurrent edit"},{...before,project_id:"moved"},
+    {...before,is_completed:true},{...before,due:{date:"2099-02-01"}},{...before,is_deleted:true}]) {
+    await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){return current;}},before), error => {
+      assert.equal(error.code,"calendar_delta_task_changed");
+      assert.equal(failedDeliveryDisposition(error,{kind:"calendar"},false,1).kind,"retry_fifo");
+      return true;
+    });
+  }
+  await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){throw Object.assign(new Error("gone"),{status:404});}},before),
+    {code:"calendar_delta_task_changed"});
+  await assert.rejects(verifyCalendarDeltaTaskUnchanged({async getTask(){throw Object.assign(new Error("forbidden"),{status:403});}},before),
+    {status:403});
+});
+
+test("completed Calendar item boundary permits replay after later cooldown without repeating committed fixture creation", async () => {
+  const {failedDeliveryDisposition} = await import("../dist/sqs-failure-policy.js");
+  const {createObservedProviderClientFactory} = await import("../dist/mutation-budget.js");
+  const items=[{id:"first"},{id:"second"}], committed=new Set();
+  let cursor="old", writes=0, totalAttempt=false, itemAttempt=false, rateLimited=true;
+  const factory=createObservedProviderClientFactory(()=>{totalAttempt=true;itemAttempt=true;},async()=>({
+    calendar:{async listDelta(){return {items,nextSyncToken:"new"};}},
+    todoist:{async upsertTask(event){writes++;return {id:event.id};}},
+  }));
+  const state={async getSyncToken(){return cursor;},async putSyncToken(_p,value){cursor=value;},async audit(){}};
+  const sync=new Synchronizer(state,undefined,factory,()=>{itemAttempt=false;});
+  // Exercise real delta orchestration and observed provider boundary with a
+  // minimal idempotent item fixture. Full native mapping replay is covered
+  // separately by provider integration and live acceptance tests.
+  sync.applyCalendarEvent=async (_delivery,event,_calendar,todoist)=>{
+    if(committed.has(event.id)) return;
+    if(event.id==="second" && rateLimited) throw Object.assign(new Error("cooldown"),{status:429,code:"todoist_account_cooldown"});
+    await todoist.upsertTask(event);
+    committed.add(event.id);
+  };
+  const delivery={id:"boundary",kind:"calendar",profile:"home",mode:"aws",headers:{},body:"",receivedAt:new Date().toISOString()};
+  await assert.rejects(sync.process(delivery),error=>{
+    assert.equal(totalAttempt,true);
+    assert.equal(itemAttempt,false);
+    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,itemAttempt).kind,"retry_fifo");
+    return true;
+  });
+  assert.equal(cursor,"old");
+  assert.equal(writes,1);
+  rateLimited=false; totalAttempt=false;itemAttempt=false;
+  await sync.process(delivery);
+  assert.equal(cursor,"new");
+  assert.equal(writes,2);
+  assert.deepEqual([...committed],["first","second"]);
+});
