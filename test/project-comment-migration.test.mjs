@@ -110,7 +110,9 @@ test("automatic migration backfills all profiles before cleanup and retries newl
     return {
       mode: "apply", projectCommentsCreated: profile === "home" && cleanupLegacy && calls.filter(call => call.profile === profile && call.cleanupLegacy).length === 1 ? 1 : 0,
       failures: 0, malformedProjectComments: 0, duplicateProjectComments: 0,
-      legacyTaskCommentsCleanupRejected: 0,
+      // Unowned or mismatched task comments are preserved deliberately; a
+      // safe refusal to delete them does not invalidate the mapping cutover.
+      legacyTaskCommentsCleanupRejected: profile === "home" && cleanupLegacy ? 5 : 0,
     };
   });
 

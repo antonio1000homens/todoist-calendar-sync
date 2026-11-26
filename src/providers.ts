@@ -79,6 +79,8 @@ type ProviderRequestOptions = {
   timeoutMs?: number;
   /** Extra read retries for controlled maintenance jobs; ordinary sync keeps its short default. */
   readRetries?: number;
+  /** Explicitly rejected 429 writes can be safely retried by idempotent maintenance operations. */
+  rateLimitRetries?: number;
   maxRetryDelayMs?: number;
 };
 
@@ -723,6 +725,7 @@ export class Todoist {
     const url = `${comments ? TODOIST_COMMENTS_ROOT : TODOIST_ROOT}${path}`;
     const readOnly = (init.method || "GET").toUpperCase() === "GET";
     const readRetries = this.requestOptions.readRetries ?? 2;
+    const rateLimitRetries = this.requestOptions.rateLimitRetries ?? 0;
     const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -732,7 +735,8 @@ export class Todoist {
         if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
         const transient = !status || status === 408 || status === 429 || status >= 500;
-        if (!readOnly || !transient || attempt >= readRetries) throw error;
+        const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
+        if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
         const retryAfterMs = status === 429 ? Number((error as { retryAfterMs?: number }).retryAfterMs) : NaN;
         const delayMs = Number.isFinite(retryAfterMs)
           ? Math.min(maxRetryDelayMs, Math.max(0, retryAfterMs))

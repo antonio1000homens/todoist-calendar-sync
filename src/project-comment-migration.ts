@@ -18,7 +18,7 @@ import { StateRepository } from "./repository.js";
 import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, TodoistTask } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
-const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, maxRetryDelayMs: 10_000 } as const;
+const MIGRATION_PROVIDER_OPTIONS = { readRetries: 7, rateLimitRetries: 7, maxRetryDelayMs: 10_000 } as const;
 
 export interface ProjectCommentMigrationState {
   retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;
@@ -278,6 +278,7 @@ export async function migrateProjectComments(
   for (const mapping of mappings) {
     summary.mappingsScanned += 1;
     let releaseWriterLease: () => Promise<void> = async () => {};
+    let migrationStage = "mapping_validation";
     try {
       if (mapping.profile !== profile) throw new Error("project-comment migration mapping belongs to another profile");
       if (apply && process.env.ERASURE_PROTOCOL_VERSION === "1") {
@@ -304,14 +305,17 @@ export async function migrateProjectComments(
 
         let validatedPair: { task: TodoistTask; event: CalendarEvent } | undefined;
         if (apply) {
+          migrationStage = "provider_pair_validation";
           validatedPair = await validateMapping(profile, projectId, recovered, state, clients, summary, true);
           if (!validatedPair) continue;
+          migrationStage = "calendar_correlation_write";
           await ensureCalendarCorrelation(profile, recovered, validatedPair.event, clients.calendar);
         }
 
         let correlationRetirementValidated = false;
         let retirementTask: TodoistTask | undefined;
         if (retireLegacyCorrelation) {
+          migrationStage = "provider_pair_validation";
           const valid = validatedPair
             || await validateMapping(profile, projectId, recovered, state, clients, summary, true);
           if (!valid) {
@@ -330,6 +334,7 @@ export async function migrateProjectComments(
             || await validateMapping(profile, projectId, recovered, state, clients, summary);
           if (valid) {
             try {
+              migrationStage = "legacy_comment_read";
               const legacyComment = await clients.todoist.getComment(explicitLegacyId);
               if (!isOwnedLegacyTaskMappingComment(legacyComment, mapping)) {
                 summary.legacyTaskCommentsCleanupRejected += 1;
@@ -362,6 +367,7 @@ export async function migrateProjectComments(
 
         if (apply && cleanupLegacy && cleanupValidated && explicitLegacyId && legacyCommentPresent) {
           try {
+            migrationStage = "legacy_comment_delete";
             await clients.todoist.deleteComment(explicitLegacyId);
             summary.legacyTaskCommentsDeleted += 1;
           } catch (error) {
@@ -371,6 +377,7 @@ export async function migrateProjectComments(
         }
 
         if (apply && needsNormalization) {
+          migrationStage = "project_comment_write";
           const { commentId: _commentId, taskCommentId: _taskCommentId, ...withoutLegacyAliases } = recovered;
           const normalized = nextProjectCommentMapping(
             cleanupLegacy && cleanupValidated
@@ -388,6 +395,7 @@ export async function migrateProjectComments(
           summary.migratedMappings += 1;
         }
         if (apply && retireLegacyCorrelation && correlationRetirementValidated) {
+          migrationStage = "correlation_retirement";
           await retireVerifiedCorrelation(mapping, retirementTask);
         }
         continue;
@@ -404,8 +412,10 @@ export async function migrateProjectComments(
       }
       if (!apply) continue;
 
+      migrationStage = "calendar_correlation_write";
       await ensureCalendarCorrelation(profile, mapping, valid.event, clients.calendar);
 
+      migrationStage = "project_comment_write";
       const migrated = await upsertProjectMappingComment(
         clients.todoist,
         {
@@ -421,6 +431,7 @@ export async function migrateProjectComments(
       summary.projectCommentsCreated += 1;
       summary.migratedMappings += 1;
       if (retireLegacyCorrelation) {
+        migrationStage = "correlation_retirement";
         await retireVerifiedCorrelation(mapping, valid.task);
       }
     } catch (error) {
@@ -428,7 +439,13 @@ export async function migrateProjectComments(
       if (apply) await state.audit(profile, "project_comment_migration_mapping_failed", {
         taskId: mapping.taskId,
         eventId: mapping.eventId,
-        error: error instanceof Error ? error.message : String(error),
+        stage: migrationStage,
+        providerStatus: Number((error as { status?: unknown; $metadata?: { httpStatusCode?: unknown } }).status
+          || (error as { $metadata?: { httpStatusCode?: unknown } }).$metadata?.httpStatusCode) || undefined,
+        code: (() => {
+          const name = (error as { name?: unknown }).name;
+          return typeof name === "string" && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(name) ? name : "ProviderError";
+        })(),
       });
     } finally {
       await releaseWriterLease();
@@ -508,7 +525,6 @@ export async function runAutomaticProjectCommentMigration(
     (phases.cleanupRetry[profile]?.projectCommentsCreated || 0) > 0);
   const status = allSummaries.some(summary => summary.failures > 0
     || summary.malformedProjectComments > 0 || summary.duplicateProjectComments > 0
-    || summary.legacyTaskCommentsCleanupRejected > 0
     || summary.legacyCorrelationRetirementRejected > 0) || unresolvedCleanupCreation
     ? "failed" : "completed";
   return { mode: "automatic-post-deployment", status, phases };
