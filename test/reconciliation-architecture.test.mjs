@@ -19,11 +19,9 @@ const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
 const deployRoleBootstrap = await readText("../infrastructure/bootstrap-deployment-role.sh");
-const migrationAccessPolicy = await readText("../infrastructure/github-actions-migration-access.yaml");
+const legacyCutoverAuditSource = await readText("../scripts/legacy-erasure-cutover-audit.mjs");
 const deployScript = await readText("../deploy.sh");
 const productionWorkflow = await readText("../.github/workflows/deploy.yml");
-const migrationWorkflow = await readText("../.github/workflows/project-comment-migration.yml");
-const legacyCutoverAuditSource = await readText("../scripts/legacy-erasure-cutover-audit.mjs");
 
 test("completed-history EventBridge rule is conditionally managed after SAM transform", () => {
   assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
@@ -224,8 +222,8 @@ test("profile lookup GSI is additive and validated hot paths are query-only", ()
   assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
   assert.match(reconciliationSource, /listProjectComments\(profiles\[profile\]\.todoistProjectId, true\)/,
     'production snapshot reconciliation must enumerate authoritative Todoist project comments');
-  assert.match(reconciliationSource, /if \(this\.isLegacyTestAdapter\(client\)\)/,
-    'DynamoDB mapping reads may remain only behind the explicit legacy test-adapter seam');
+  assert.match(reconciliationSource, /this\.state\.listMappings\?\.\(profile\)/,
+    'legacy DynamoDB mappings remain available as a transition fallback');
   assert.match(backfillSource, /Limit:\s*25/);
   assert.match(backfillSource, /profileLookupBackfillCondition\(lookup\)/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
@@ -245,23 +243,11 @@ test("production mapping correlation is written only to provider-native records"
   assert.match(serializer, /masterEventId: mapping\.masterEventId/);
 });
 
-test("automatic migration drains legacy erasure work before live acceptance dispatch", () => {
-  const migration = migrationWorkflow.indexOf("scripts/automatic-project-comment-migration.mjs");
-  const drain = migrationWorkflow.indexOf("scripts/legacy-erasure-cutover-audit.mjs");
-  const dispatch = migrationWorkflow.indexOf("event_type=automatic-project-comment-migration");
-  assert.ok(migration >= 0 && drain > migration && dispatch > drain);
-  assert.match(migrationWorkflow, /logical-resource-id ErasureOperationQueue/);
-  assert.match(migrationWorkflow, /logical-resource-id ErasureOperationDlq/);
-  assert.match(migrationWorkflow, /LEGACY_CUTOVER_TIMEOUT_MS: '1500000'/);
-  assert.match(legacyCutoverAuditSource, /idleObservations >= 3/);
-  assert.match(legacyCutoverAuditSource, /await retireDrainedLegacyRows\(current\.rows\)/);
-  assert.match(legacyCutoverAuditSource, /result = await snapshot\(\)/);
-  assert.match(legacyCutoverAuditSource, /const clean = !cleanupFailure && result\?\.clean === true/);
-  assert.doesNotMatch(legacyCutoverAuditSource, /PurgeQueueCommand|PurgeQueue/);
-  const migrationWrites = migrationAccessPolicy.match(/Sid: PersistVerifiedMappingMigration[\s\S]*?(?=\n          - Sid:|$)/)?.[0] || "";
-  assert.match(migrationWrites, /dynamodb:DeleteItem/);
-  assert.match(migrationWrites, /dynamodb:UpdateItem/);
-  assert.match(migrationWrites, /dynamodb:ConditionCheckItem/);
-  assert.match(migrationWrites, /table\/\$\{ResourceNamePrefix\}-state-\*/);
-  assert.doesNotMatch(migrationAccessPolicy, /Resource:\s*"\*"/);
+test("normal sync recovers provider mappings, retains the legacy fallback, and has no migration runner", async () => {
+  assert.match(syncSource, /async providerMappings\([\s\S]*?this\.state\.listMappings\(profile\)/);
+  assert.match(syncSource, /return candidates\.length === 1 \? candidates\[0\] : undefined/);
+  await assert.rejects(readText("../.github/workflows/project-comment-migration.yml"));
+  await assert.rejects(readText("../src/project-comment-migration.ts"));
+  const e2eWorkflow = await readText("../.github/workflows/production-e2e.yml");
+  assert.doesNotMatch(e2eWorkflow, /automatic-project-comment-migration/);
 });

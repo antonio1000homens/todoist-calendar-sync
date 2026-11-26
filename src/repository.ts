@@ -31,7 +31,6 @@ import {
   readProfileLookup,
 } from "./profile-lookup.js";
 import type { CompletedCalendarProjection, Mapping, Profile, ReconciliationReason, RecurrenceLink } from "./types.js";
-import type { MigrationCheckpoint } from "./project-comment-migration.js";
 import {phaseBNativeMoveBeginTransaction,phaseBNativeMoveCommitTransaction,
   phaseBNativeMoveControlKeys,phaseBNativeMoveStage,phaseBNativeMoveStageKey,
   type PhaseBNativeMoveHandoff,type PhaseBNativeMoveStage,
@@ -1758,74 +1757,6 @@ export class StateRepository {
     }
   }
 
-  /** Retire migration-only DynamoDB correlation rows after a provider comment
-   * and both live provider objects have been verified. Every row is strongly
-   * read and conditionally removed in one transaction; newer or cross-profile
-   * ownership is left intact for explicit conflict repair. */
-  async retireMigratedMappingCorrelation(mapping: Mapping): Promise<boolean> {
-    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
-    const table = this.ensureTable();
-    const rowKeys = [
-      key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
-      key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
-      key(`TASKOWNER#${mapping.taskId}`, "MAP"),
-    ];
-    const rows = await Promise.all(rowKeys.map(Key => client.send(new GetCommand({
-      TableName: table, Key, ConsistentRead: true,
-    }))));
-    const entries = rows.map((result, index) => ({ Key: rowKeys[index], Item: result.Item }));
-    const exact = (item: Record<string, unknown> | undefined): boolean => Boolean(item
-      && item.profile === mapping.profile && item.taskId === mapping.taskId
-      && item.eventId === mapping.eventId && item.updatedAt === mapping.updatedAt);
-    if (entries.some(({ Item }) => Item && !exact(Item))) return false;
-
-    let link: RecurrenceLink | undefined;
-    if (mapping.seriesId) {
-      link = await this.getRecurrenceLink(mapping.profile, mapping.seriesId);
-      if (link && (link.profile !== mapping.profile || link.seriesId !== mapping.seriesId
-        || link.taskId !== mapping.taskId || link.eventId !== mapping.eventId
-        || link.masterEventId !== mapping.masterEventId
-        || link.activeInstanceId !== mapping.activeInstanceId
-        || mapping.recurrenceOwner && link.owner !== mapping.recurrenceOwner)) return false;
-    }
-
-    const deletes: Array<Record<string, unknown>> = entries.filter(({ Item }) => Item).map(({ Key }) => ({
-      Delete: {
-        TableName: table, Key,
-        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated",
-        ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: {
-          ":profile": mapping.profile, ":task": mapping.taskId,
-          ":event": mapping.eventId, ":updated": mapping.updatedAt,
-        },
-      },
-    }));
-    if (link) {
-      deletes.push({ Delete: {
-        TableName: table,
-        Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
-        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND seriesId = :series AND updatedAt = :updated",
-        ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: {
-          ":profile": link.profile, ":task": link.taskId, ":event": link.eventId,
-          ":series": link.seriesId, ":updated": link.updatedAt,
-        },
-      } });
-    }
-    if (!deletes.length) return true;
-    try {
-      await client.send(new TransactWriteCommand({ TransactItems: deletes as never }));
-      return true;
-    } catch (error) {
-      annotateProviderAction(error, "dynamodb:TransactWriteItems", "dynamodb:DeleteItem");
-      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
-      if (cancelled.name === "TransactionCanceledException"
-        && (!cancelled.CancellationReasons?.length
-          || cancelled.CancellationReasons.some(reason => reason.Code === "ConditionalCheckFailed"))) return false;
-      throw error;
-    }
-  }
-
   /**
    * Retire a Todoist-owned recurring projection only after its task and every
    * currently referenced Calendar resource have been verified absent by the
@@ -2569,26 +2500,6 @@ export class StateRepository {
           action, error: error instanceof Error ? error.name : "unknown" }));
       }
     }
-  }
-
-  async getProjectCommentMigrationCheckpoint(profile: Profile, phase: string): Promise<MigrationCheckpoint | undefined> {
-    const result = await client.send(new GetCommand({
-      TableName: this.ensureTable(), Key: key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`),
-      ConsistentRead: true,
-    }));
-    return result.Item?.checkpoint as MigrationCheckpoint | undefined;
-  }
-
-  async putProjectCommentMigrationCheckpoint(profile: Profile, phase: string, checkpoint: MigrationCheckpoint): Promise<void> {
-    await client.send(new PutCommand({ TableName: this.ensureTable(), Item: {
-      ...key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`),
-      checkpoint, updatedAt: now(),
-    } }));
-  }
-
-  async deleteProjectCommentMigrationCheckpoint(profile: Profile, phase: string): Promise<void> {
-    await client.send(new DeleteCommand({ TableName: this.ensureTable(),
-      Key: key(`PROJECT_COMMENT_MIGRATION#${profile}`, `CHECKPOINT#${phase}`) }));
   }
 
 }

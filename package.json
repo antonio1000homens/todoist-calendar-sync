@@ -12,7 +12,6 @@
     "e2e:production": "npm run build --silent && node scripts/production-e2e.mjs",
     "e2e:production-erasure": "npm run build --silent && node scripts/production-erasure-e2e.mjs",
     "recur:phase-b:sandbox": "npm run build --silent && node scripts/phase-b-sandbox-capture.mjs",
-    "migrate:project-comments": "npm run build --silent && node scripts/project-comment-migration.mjs",
     "migrate:profile-lookup-index": "npm run build --silent && node scripts/backfill-profile-lookup-index.mjs",
     "seed:review-inbox": "npm run build --silent && node scripts/seed-review-inbox.mjs",
     "cleanup:routine-audit": "npm run build --silent && node scripts/cleanup-routine-audit.mjs",

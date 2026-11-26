@@ -50,4 +50,4 @@ STATE_TABLE_NAME=<table> node scripts/cleanup-routine-audit.mjs --apply
 
 This is intentionally a full-table administrative scan: DynamoDB evaluates every table item and the `AUDIT#` filter only controls which rows are returned as candidates. The script classifies returned audit actions with the current audit policy, deletes only routine actions in batches of 5, retries unprocessed/throttled deletes with exponential backoff, and never selects significant/unknown actions. Capture the preview and before/after table/worker measurements before using `--apply`. No production cleanup is performed automatically by this code change.
 
-Administrative/intervention-policy and project-comment migration scans remain outside the worker hot path and are intentionally retained as labelled admin/migration operations until separately redesigned.
+Administrative and intervention-policy scans remain outside the worker hot path. Normal synchronization reads legacy DynamoDB correlations only as a transition fallback while provider-native metadata is authoritative.

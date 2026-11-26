@@ -349,16 +349,20 @@ export class SnapshotReconciler {
   private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      if (this.isLegacyTestAdapter(client)) {
-        if (this.store?.listMappings) return this.store.listMappings(profile);
-        const listMappings = (this.state as StateRepository & { listMappings?: (profile: Profile) => Promise<Mapping[]> }).listMappings;
-        if (listMappings) return listMappings.call(this.state, profile);
-      }
-      throw new Error("Todoist project comment correlation API unavailable");
+      return this.store?.listMappings ? this.store.listMappings(profile)
+        : await this.state.listMappings?.(profile) || [];
     }
-    return buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
+    const providerMappings = buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
       .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
       .map(mappingFromProjectMappingComment);
+    const legacyMappings = this.store?.listMappings
+      ? await this.store.listMappings(profile)
+      : await this.state.listMappings?.(profile) || [];
+    const providerTasks = new Set(providerMappings.map(mapping => mapping.taskId));
+    const providerEvents = new Set(providerMappings.flatMap(mapping =>
+      [mapping.eventId, mapping.masterEventId, mapping.activeInstanceId].filter((id): id is string => Boolean(id))));
+    return [...providerMappings, ...legacyMappings.filter(mapping =>
+      !providerTasks.has(mapping.taskId) && !providerEvents.has(mapping.eventId))];
   }
 
   private async reconciliationBaseline(mapping: Mapping): Promise<ReconciliationBaseline | ProviderSyncBaseline | undefined> {
@@ -387,14 +391,11 @@ export class SnapshotReconciler {
   private async providerMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
     const client = (await this.clients("home")).todoist;
     if (typeof client.listProjectComments !== "function") {
-      if (this.isLegacyTestAdapter(client)) {
-        for (const profile of Object.keys(profiles) as Profile[]) {
-          const mapping = await this.state.getMappingByTask(profile, taskId);
-          if (mapping) return mapping;
-        }
-        return undefined;
+      for (const profile of Object.keys(profiles) as Profile[]) {
+        const mapping = await this.state.getMappingByTask(profile, taskId);
+        if (mapping) return mapping;
       }
-      throw new Error("Todoist project comment correlation API unavailable");
+      return undefined;
     }
     const values = (await Promise.all((Object.keys(profiles) as Profile[]).map(async profile =>
       (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId)))).filter((value): value is Mapping => Boolean(value));
@@ -405,8 +406,7 @@ export class SnapshotReconciler {
   private async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByEvent(profile, eventId);
-      throw new Error("Todoist project comment correlation API unavailable");
+      return this.state.getMappingByEvent(profile, eventId);
     }
     return (await this.providerMappings(profile)).find(mapping => mapping.eventId === eventId
       || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
@@ -415,8 +415,7 @@ export class SnapshotReconciler {
   private async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (typeof client.listProjectComments !== "function") {
-      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByTask(profile, taskId);
-      throw new Error("Todoist project comment correlation API unavailable");
+      return this.state.getMappingByTask(profile, taskId);
     }
     return (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId);
   }
@@ -1077,6 +1076,7 @@ export class SnapshotReconciler {
     profile: Profile,
     listedTask: TodoistTask,
     clients: ClientPair,
+    calendarInventory?: CalendarEvent[],
   ): Promise<ReconcileOutcome> {
     // listTasks is a paginated snapshot, not proof the source still exists.
     // Re-read the exact Todoist ID before repairing an unmapped projection so
@@ -1145,6 +1145,19 @@ export class SnapshotReconciler {
         candidateEventIds: error.eventIds,
       });
       return "conflict";
+    }
+    if (!existing && typeof clients.calendar.listDelta === "function") {
+      const inventory = calendarInventory || (await clients.calendar.listDelta()).items;
+      const compatible = inventory.filter(event =>
+        event.status !== "cancelled" && hasCanonicalState(event, task));
+      if (compatible.length === 1) existing = compatible[0];
+      else if (compatible.length > 1) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_ambiguous", {
+          taskId: task.id, candidateEventIds: compatible.map(event => event.id).sort(),
+          reason: "multiple_exact_compatible_calendar_events",
+        });
+        return "conflict";
+      }
     }
     // A cancelled provider object is the deletion evidence. A later live
     // Todoist edit can intentionally recreate its projection; no durable
@@ -1228,6 +1241,23 @@ export class SnapshotReconciler {
         calendarEtag: existing.etag,
       });
       return "conflict";
+    }
+
+    if (existing && existing.status !== "cancelled") {
+      const mapping = await this.persistProviderMapping({
+        profile, eventId: existing.recurringEventId || existing.id, taskId: task.id,
+        projectId: profiles[profile].todoistProjectId,
+        ...(existing.recurringEventId || existing.recurrence?.length
+          ? { seriesId: existing.iCalUID || existing.recurringEventId || existing.id,
+            masterEventId: existing.recurringEventId || existing.id }
+          : {}),
+        updatedAt: new Date().toISOString(),
+      }, clients);
+      await this.persistReconciliationBaseline(mapping, task, existing, clients);
+      await this.state.audit(profile, "todoist_snapshot_reconcile_provider_pair_recovered", {
+        taskId: task.id, eventId: existing.id, tieBreak: "unique_exact_compatible_match",
+      });
+      return "baseline";
     }
 
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
@@ -1317,9 +1347,11 @@ export class SnapshotReconciler {
 
     const afterUnmappedTaskId = continuation?.phase === "unmapped" ? continuation.afterTaskId : undefined;
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
+    const calendarInventory = unmappedCandidates.length && typeof clients.calendar.listDelta === "function"
+      ? (await clients.calendar.listDelta()).items : undefined;
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-        const outcome = await this.reconcileUnmappedTask(profile, task, clients)
+        const outcome = await this.reconcileUnmappedTask(profile, task, clients, calendarInventory)
         .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "unmapped", taskId: task.id }));
       counts[outcome] += 1;
       if (isResolvedConflictOutcome(outcome)) {

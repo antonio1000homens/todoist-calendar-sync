@@ -221,13 +221,13 @@ New Todoist mapping comments use:
 todoist-calendar-sync:mapping:v1
 ```
 
-The reader also accepts the legacy marker during migration so existing external mappings are not orphaned.
+The reader also accepts the legacy marker so existing external mappings continue to parse.
 
 ## Operations
 
 For manual intervention behavior see [`MANUAL-INTERVENTION.md`](MANUAL-INTERVENTION.md).
 
-For project-comment migration behavior see [`PROJECT-COMMENT-MIGRATION.md`](PROJECT-COMMENT-MIGRATION.md).
+Project comments and Calendar shared properties are the primary mapping records. Existing DynamoDB correlations remain a read fallback during cutover; normal reconciliation can recover missing links from exact provider IDs or a unique compatible counterpart.
 
 For DynamoDB capacity decisions see [`PROVISIONED-CAPACITY-PLAN.md`](PROVISIONED-CAPACITY-PLAN.md).
 

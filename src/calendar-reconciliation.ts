@@ -24,7 +24,8 @@ import {
 import { normalizedDescription, normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
-import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
+import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, startsMatch, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
+import { todoistRecurrenceKey, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -60,6 +61,25 @@ function candidateLimit(): number {
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
+}
+
+function normalizedRecurrenceRule(rule: string | undefined): string | undefined {
+  if (!rule?.startsWith("RRULE:")) return undefined;
+  const fields = rule.slice("RRULE:".length).split(";").map(field => {
+    const [key, ...parts] = field.split("=");
+    const value = parts.join("=").toUpperCase();
+    if (key.toUpperCase() === "INTERVAL" && value === "1") return undefined;
+    return `${key.toUpperCase()}=${value.split(",").sort().join(",")}`;
+  }).filter((field): field is string => Boolean(field)).sort();
+  return `RRULE:${fields.join(";")}`;
+}
+
+function todoistTaskMatchesCalendarRecurrence(master: CalendarEvent, task: TodoistTask): boolean {
+  const rule = todoistRecurrenceToRrule(task);
+  return Boolean(rule && master.recurrence?.some(candidate =>
+    normalizedRecurrenceRule(candidate) === normalizedRecurrenceRule(rule))
+    && (!master.extendedProperties?.shared?.todoistRecurrence
+      || master.extendedProperties.shared.todoistRecurrence === todoistRecurrenceKey(task)));
 }
 
 
@@ -293,16 +313,19 @@ export async function reconcileUnmappedCalendar(
     return eligibleUniqueTask([current], eventIds);
   };
 
-  const findPotentialCollision = async (event: CalendarEvent, eventIds = [event.id]) => {
-    // Title/date similarity is only a conservative duplicate guard. It never
-    // selects a task for binding; correlation requires a provider ID above.
-    const candidates = tasks.filter((task) => hasCanonicalState(event, task));
+  const findPotentialCollision = async (
+    event: CalendarEvent,
+    eventIds = [event.id],
+    compatible: (task: TodoistTask) => boolean = task => hasCanonicalState(event, task),
+  ) => {
+    // Recover a missing provider link only when all portable fields, including
+    // recurrence, match exactly and ownership checks leave one eligible task.
+    const candidates = tasks.filter(compatible);
     if (!candidates.length) return {
       task: undefined, ambiguous: false, candidateTaskIds: [],
       eligibleCandidateTaskIds: [], mappedCandidateTaskIds: [], reservedCandidateTaskIds: [],
     };
-    const potential = await eligibleUniqueTask(candidates, eventIds);
-    return { ...potential, task: undefined, ambiguous: true };
+    return eligibleUniqueTask(candidates, eventIds);
   };
 
   const createOrBindStandalone = async (event: CalendarEvent): Promise<void> => {
@@ -322,7 +345,7 @@ export async function reconcileUnmappedCalendar(
     }
     const match = await findSharedTask([event.id]);
     const collision = match.candidateTaskIds.length ? match : await findPotentialCollision(event);
-    if (!match.candidateTaskIds.length && (collision.ambiguous || collision.blocked)) Object.assign(match, collision);
+    if (!match.candidateTaskIds.length) Object.assign(match, collision);
     if (match.blocked) return;
     if ("deletedProviderTask" in match && match.deletedProviderTask) {
       if (!await canMutate(event.id, match.candidateTaskIds[0])) return;
@@ -493,6 +516,7 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
+    eventsById.set(active.id, active);
     if (await controlsBlockRecovery([master.id,active.id])) return;
     const existingMapping = await mappingSync.providerMappingByEvent(profile, active.id, pair.todoist)
       || await mappingSync.providerMappingByEvent(profile, master.id, pair.todoist);
@@ -670,13 +694,46 @@ export async function reconcileUnmappedCalendar(
     }
 
     const match = await findSharedTask([master.id,active.id]);
-    const collision = match.candidateTaskIds.length ? match : await findPotentialCollision(active,[master.id,active.id]);
-    if (!match.candidateTaskIds.length && (collision.ambiguous || collision.blocked)) Object.assign(match, collision);
+    const collision = match.candidateTaskIds.length ? match : await findPotentialCollision(active,[master.id,active.id], task =>
+      normalizedText(active.summary).toLocaleLowerCase() === normalizedText(task.content).toLocaleLowerCase()
+      && normalizedDescription(active.description) === normalizedDescription(task.description)
+      && startsMatch(active, task)
+      && (task.due?.is_recurring
+        ? todoistTaskMatchesCalendarRecurrence(master, task)
+        : matchesCalendarOwnedRecurringRule(task, recurrence, seriesTimeZone)));
+    if (!match.candidateTaskIds.length) Object.assign(match, collision);
     if (match.blocked) return;
+    if (!match.candidateTaskIds.length) {
+      // Similar title/description/date with an incompatible recurrence is not
+      // eligible for binding. Keep it as a collision guard so recovery does
+      // not create a second series beside a likely counterpart.
+      const nearMatches = tasks.filter(task =>
+        normalizedText(active.summary).toLocaleLowerCase() === normalizedText(task.content).toLocaleLowerCase()
+        && normalizedDescription(active.description) === normalizedDescription(task.description)
+        && startsMatch(active, task));
+      if (nearMatches.length) {
+        const guarded = await eligibleUniqueTask(nearMatches, [master.id, active.id]);
+        if (guarded.blocked) return;
+        const ownershipConflict = guarded.eligibleCandidateTaskIds.length > 1
+          || (guarded.mappedCandidateTaskIds.length > 0 && guarded.eligibleCandidateTaskIds.length > 0);
+        summary.conflicts += ownershipConflict ? 1 : 0;
+        summary.skipped += ownershipConflict ? 0 : 1;
+        await state.audit(profile, ownershipConflict
+          ? "calendar_snapshot_recurring_ambiguous" : "calendar_recurrence_identity_unverified", {
+          seriesId, masterEventId: master.id, eventId: active.id,
+          candidateTaskIds: guarded.candidateTaskIds,
+          eligibleCandidateTaskIds: guarded.eligibleCandidateTaskIds,
+          mappedCandidateTaskIds: guarded.mappedCandidateTaskIds,
+          reservedCandidateTaskIds: guarded.reservedCandidateTaskIds,
+          outcome: "preserve_independent_objects",
+        });
+        return;
+      }
+    }
     const sharedTaskIds = [...new Set([master.extendedProperties?.shared?.taskId, active.extendedProperties?.shared?.taskId].filter((id): id is string => Boolean(id)))];
     const exactSharedRecurring = tasks.find((task) => sharedTaskIds.includes(task.id) && task.due?.is_recurring);
-    if (exactSharedRecurring && recurrence
-      && !matchesCalendarOwnedRecurringRule(exactSharedRecurring, recurrence, seriesTimeZone)) {
+    if (exactSharedRecurring && (!todoistTaskMatchesCalendarRecurrence(master, exactSharedRecurring)
+      || !matchesCalendarOwnedRecurringRule(exactSharedRecurring, recurrence, seriesTimeZone))) {
       summary.skipped += 1;
       await state.audit(profile, "calendar_recurrence_todoist_rule_unsupported", {
         seriesId, masterEventId: master.id, taskId: exactSharedRecurring.id,
@@ -719,8 +776,7 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
-    if (match.task?.due?.is_recurring && recurrence
-      && !matchesCalendarOwnedRecurringRule(match.task, recurrence, seriesTimeZone)) {
+    if (match.task?.due?.is_recurring && !todoistTaskMatchesCalendarRecurrence(master, match.task)) {
       summary.skipped += 1;
       await state.audit(profile, "calendar_recurrence_todoist_rule_unsupported", {
         seriesId, masterEventId: master.id, taskId: match.task.id,
@@ -730,11 +786,11 @@ export async function reconcileUnmappedCalendar(
       return;
     }
 
-    if (match.task?.due?.is_recurring || sharedTaskIds.some((id) => id !== match.task?.id)) {
+    if (sharedTaskIds.some((id) => id !== match.task?.id)) {
       summary.conflicts += 1;
       await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
         seriesId, masterEventId: master.id, eventId: active.id,
-        candidateTaskIds: [...new Set([...sharedTaskIds, ...(match.task?.due?.is_recurring ? [match.task.id] : [])])].sort(),
+        candidateTaskIds: [...new Set([...sharedTaskIds, ...(match.task ? [match.task.id] : [])])].sort(),
       });
       return;
     }

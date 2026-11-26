@@ -81,7 +81,7 @@ done < <(git grep -IlE '@[A-Za-z0-9.-]+\.(com|co\.uk|net|org|io|dev)\b' -- . \
 # identity and should fail before publication.
 while IFS= read -r path; do
   case "$path" in
-    README.md|docs/production-rename.md|PROJECT-COMMENT-MIGRATION.md|scripts/migrate-ssm-prefix.sh|scripts/preflight-production-rename.sh|infrastructure/bootstrap-deployment-role.sh|infrastructure/github-actions-deploy-role.yaml|src/mapping-comments.ts|scripts/check-public-source.sh)
+    README.md|docs/production-rename.md|scripts/migrate-ssm-prefix.sh|scripts/preflight-production-rename.sh|infrastructure/bootstrap-deployment-role.sh|infrastructure/github-actions-deploy-role.yaml|src/mapping-comments.ts|scripts/check-public-source.sh)
       ;;
     *) report "legacy gcp-app2 reference outside migration compatibility boundary: $path" ;;
   esac
