@@ -2610,7 +2610,34 @@ export class Synchronizer {
     // the existing cross-profile discovery and guarded repair paths.
     const shared = event.extendedProperties?.shared || {};
     const taskEntries = task ? projectMappingIndex.byTaskId.get(task.id) || [] : [];
-    const exactLocalPair = Boolean(task && mapping && !event.recurringEventId && !event.recurrence?.length
+    // A flattened annual series may retain its moved final occurrence as
+    // the exact counterpart of a one-off task. Admit only the all-day,
+    // single-rule, explicitly capped shape with no surviving series mapping.
+    // The ordinary exact local provider and baseline checks still apply.
+    const cappedOriginal = event.originalStartTime?.date;
+    const cappedRule = ownershipEvent.recurrence?.[0];
+    const capMatch = cappedRule?.match(/^RRULE:FREQ=YEARLY;(?:(?:INTERVAL=1;)?UNTIL=(\d{8})(?:;INTERVAL=1)?)$/i);
+    const exactCappedOccurrence = Boolean(event.recurringEventId
+      && ownershipEvent.id === event.recurringEventId && ownershipEvent.status === "confirmed"
+      && ownershipEvent.recurrence?.length === 1 && capMatch
+      && !ownershipEvent.recurringEventId && !originProfile
+      && cappedOriginal && !event.originalStartTime?.dateTime
+      && /^\d{4}-\d{2}-\d{2}$/.test(cappedOriginal)
+      && cappedOriginal.replace(/-/g, "") === capMatch[1]
+      && event.start?.date && !event.start.dateTime
+      && event.start.date >= cappedOriginal
+      && !parentMapping && !existingRecurrenceLink
+      && !shared.todoistRecurrence && !shared.syncSeriesId && !shared.syncMasterEventId
+      && !shared.syncActiveInstanceId && !shared.syncProgressVersion && !shared.syncTodoistPhaseBVersion
+      && (!ownershipEvent.extendedProperties?.shared?.taskId
+        || ownershipEvent.extendedProperties.shared.taskId === task?.id)
+      && (!ownershipEvent.extendedProperties?.shared?.syncTaskId
+        || ownershipEvent.extendedProperties.shared.syncTaskId === task?.id)
+      && (!ownershipEvent.extendedProperties?.shared?.syncProfile
+        || ownershipEvent.extendedProperties.shared.syncProfile === delivery.profile)
+      && (!ownershipEvent.extendedProperties?.shared?.syncCalendarId
+        || ownershipEvent.extendedProperties.shared.syncCalendarId === profiles[delivery.profile].calendarId));
+    const exactLocalPair = Boolean(task && mapping && (!event.recurringEventId || exactCappedOccurrence) && !event.recurrence?.length
       && !task.due?.is_recurring && !task.is_deleted && !task.is_completed && !task.completed_at
       && !mapping.masterEventId && !mapping.seriesId && !mapping.activeInstanceId
       && task.project_id === inventoryProjectId && mapping.projectId === inventoryProjectId
