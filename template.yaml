@@ -214,10 +214,11 @@ Resources:
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SyncDlq.Arn
-        # SDK attempts (5) are inside each Lambda receive; the worker permits
-        # native retries only for eligible transient DynamoDB failures.
-        # Other failures are handed directly to SyncDlq after a confirmed send.
-        maxReceiveCount: 5
+        # The worker explicitly quarantines ordinary transient failures after
+        # five receives. Keep SQS's safety redrive high enough that a durable
+        # account cooldown can defer and recheck without burning DLQ receives.
+        # Four-day message retention still bounds this native fallback.
+        maxReceiveCount: 1000
 
   ErasureOperationDlq:
     Type: AWS::SQS::Queue

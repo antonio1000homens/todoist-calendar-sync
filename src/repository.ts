@@ -316,6 +316,36 @@ export class StateRepository {
     await client.send(new DeleteCommand({ TableName: this.ensureTable(), Key: key(`SYNC#${profile}`) }));
   }
 
+  /** Operational Todoist account cooldown only; this stores no entity mappings. */
+  async getTodoistCooldown(accountIdentity: string): Promise<number | undefined> {
+    if (!/^[a-f0-9]{64}$/.test(accountIdentity)) throw new Error("Invalid Todoist account identity");
+    const result = await client.send(new GetCommand({
+      TableName: this.ensureTable(), Key: key(`TODOIST_COOLDOWN#${accountIdentity}`), ConsistentRead: true,
+    }));
+    const until = result.Item?.cooldownUntilMs;
+    return typeof until === "number" && Number.isSafeInteger(until) && until > Date.now() ? until : undefined;
+  }
+
+  async extendTodoistCooldown(accountIdentity: string, cooldownUntilMs: number): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(accountIdentity) || !Number.isSafeInteger(cooldownUntilMs)
+      || cooldownUntilMs <= Date.now()) throw new Error("Invalid Todoist account cooldown");
+    try {
+      await client.send(new UpdateCommand({
+        TableName: this.ensureTable(), Key: key(`TODOIST_COOLDOWN#${accountIdentity}`),
+        UpdateExpression: "SET cooldownUntilMs = :until, expiresAt = :expires",
+        ConditionExpression: "attribute_not_exists(cooldownUntilMs) OR cooldownUntilMs < :until",
+        ExpressionAttributeValues: {
+          ":until": cooldownUntilMs,
+          ":expires": Math.ceil(cooldownUntilMs / 1000) + 86_400,
+        },
+      }));
+    } catch (error) {
+      // A longer concurrent cooldown already owns the record. Every other
+      // DynamoDB failure must remain visible to the caller.
+      if (!conditionalFailure(error)) throw error;
+    }
+  }
+
   async getCalendarWatch(profile: Profile): Promise<import("./types.js").CalendarWatchState | undefined> {
     const result = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`WATCH#${profile}`), ConsistentRead: true }));
     return result.Item?.status ? result.Item as import("./types.js").CalendarWatchState : undefined;

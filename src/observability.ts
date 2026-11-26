@@ -4,6 +4,7 @@ const SAFE_STRING_KEYS = new Set([
   "targetId", "targetType", "slackUserId", "commentId", "projectId", "oldProjectId",
   "newProjectId", "calendarStatus", "mode", "reason", "type", "action", "event",
   "eventName", "kind", "stage", "operation", "status", "code", "generation",
+  "endpointClass", "accountId",
   "handlingMode", "defaultAction", "source", "auditClass", "updatedAt", "createdAt", "providerReason",
   "sourceUpdatedAt", "taskUpdatedAt", "awsRequestId", "fromProfile", "toProfile",
 ]);
@@ -12,11 +13,12 @@ const SAFE_NUMBER_KEYS = new Set([
   "count", "scannedCount", "evaluatedCount", "returnedCount", "pages", "consumedCapacityUnits", "durationMs",
   "pacedDelayMs", "pacingDelayMs", "receiveCount", "bodyBytes", "mutationCount", "limit",
   "used", "scanned", "skipped", "conflicts", "blocked", "imported", "rebound", "providerMutations", "providerStatus",
+  "retryCount", "httpStatus",
 ]);
 
 const SAFE_BOOLEAN_KEYS = new Set([
   "mutationCapReached", "projectionSuppressed", "visuallyRejoinedSeries", "created", "coalesced",
-  "continued", "pending", "success", "exhausted",
+  "continued", "pending", "success", "exhausted", "rateLimited", "requestSent",
 ]);
 
 const SAFE_ARRAY_KEY_RE = /^(?:candidateEventIds|candidateTaskIds|eligibleCandidateTaskIds|mappedCandidateTaskIds|reservedCandidateTaskIds|mismatchCategories)$|(?:^|_)(?:changedFields|fields)$/;

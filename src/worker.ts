@@ -16,10 +16,11 @@ import { CalendarSyncAdmissionError, enqueueCalendarSync, enqueueDelivery, queue
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
-import { profiles } from "./config.js";
+import { profiles, todoistToken } from "./config.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
+import { todoistAccountIdentity, withTodoistInventoryScope } from "./providers.js";
 import { logEvent } from "./observability.js";
 import {
   MAX_SYNC_RECEIVES, failedDeliveryDisposition,
@@ -163,6 +164,14 @@ export async function processReconciliation(
   delivery: ReconcileDelivery,
   state: StateRepository,
   clientFactory: ProviderClientFactory = defaultProviderClientFactory,
+): Promise<ReconciliationProcessingResult> {
+  return withTodoistInventoryScope(() => processReconciliationInScope(delivery, state, clientFactory));
+}
+
+async function processReconciliationInScope(
+  delivery: ReconcileDelivery,
+  state: StateRepository,
+  clientFactory: ProviderClientFactory,
 ): Promise<ReconciliationProcessingResult> {
   delivery = ensureReconciliationGeneration(delivery);
   const mutationBudget = new ReconciliationMutationBudget();
@@ -342,6 +351,26 @@ async function deliverReconciliationOutcome(state: StateRepository, manual: Manu
   }
 }
 
+export async function assertTodoistAccountNotCooling(
+  profile: Profile,
+  state: Pick<StateRepository, "getTodoistCooldown">,
+  readToken: (profile: Profile) => Promise<string> = todoistToken,
+): Promise<string> {
+  const accountIdentity = todoistAccountIdentity(await readToken(profile));
+  const cooldownUntil = await state.getTodoistCooldown(accountIdentity);
+  if (cooldownUntil && cooldownUntil > Date.now()) {
+    const error = new Error("Todoist account is in a shared rate-limit cooldown") as Error & {
+      status: number; retryAfterMs: number; body: string; code: string;
+    };
+    error.status = 429;
+    error.retryAfterMs = cooldownUntil - Date.now();
+    error.body = '{"error_tag":"LIMITS_REACHED"}';
+    error.code = "todoist_account_cooldown";
+    throw error;
+  }
+  return accountIdentity;
+}
+
 export const handler: SQSHandler = async (event, context: Context) => {
   const failures: { itemIdentifier: string }[] = [];
   for (const record of event.Records) {
@@ -349,6 +378,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let delivery: Delivery | undefined;
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
+    let todoistAccountId: string | undefined;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
@@ -491,6 +521,11 @@ export const handler: SQSHandler = async (event, context: Context) => {
         }
       }
 
+      // Worker tests use injected provider clients with no SSM credentials;
+      // production always resolves and checks the shared account identity.
+      if (process.env.NODE_ENV !== "test")
+        todoistAccountId = await assertTodoistAccountNotCooling(delivery.profile, state);
+
       if (delivery.slackInteraction) {
         const interaction = delivery.slackInteraction;
         delivery = decodeSlackInteractionDelivery(delivery);
@@ -627,7 +662,8 @@ export const handler: SQSHandler = async (event, context: Context) => {
       const observedClientFactory = createObservedProviderClientFactory(() => {
         meaningfulMutation = true;
       });
-      await new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery);
+      await withTodoistInventoryScope(() =>
+        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory).process(delivery!));
 
       if (calendarSyncGeneration !== undefined) {
         const followUpNeeded = await state.completeCalendarSync(delivery.profile, calendarSyncGeneration);
@@ -679,9 +715,18 @@ export const handler: SQSHandler = async (event, context: Context) => {
         continue;
       }
       const receiveCount = Math.max(1, Number(record.attributes?.ApproximateReceiveCount || "1") || 1);
+      const retryAfterMs = providerRetryAfterMs(error);
+      if (retryAfterMs !== undefined && retryAfterMs > 0 && todoistAccountId && state) {
+        try {
+          await state.extendTodoistCooldown(todoistAccountId, Date.now() + retryAfterMs);
+        } catch (cooldownError) {
+          log("todoist_shared_cooldown_persist_failed", {
+            profile: delivery?.profile, error: serializeError(cooldownError),
+          });
+        }
+      }
       const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount);
       if (disposition.kind === "retry_fifo") {
-        const retryAfterMs = providerRetryAfterMs(error);
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is
         // written. A short visibility backoff is optional: an API outage
