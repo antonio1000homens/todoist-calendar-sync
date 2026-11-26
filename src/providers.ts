@@ -362,10 +362,6 @@ export class GoogleCalendar {
       } catch (error) {
         const name = (error as { name?: string })?.name;
         const status = Number((error as { status?: number }).status);
-        if (!readOnly && (!Number.isFinite(status) || status === 0 || status === 408 || status >= 500)) {
-          this.invalidateScopedTaskInventories();
-          this.invalidateScopedCommentInventories();
-        }
         if (name === "AbortError" || name === "TimeoutError") throw error;
         const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
         const transient = !status || status === 408 || status === 429 || status >= 500;
@@ -983,8 +979,12 @@ export class Todoist {
           observedCooldown = todoistCooldownUntil.get(this.pacingKey);
         }
         const name = (error as { name?: string })?.name;
-        if (name === "AbortError" || name === "TimeoutError") throw error;
         const status = Number((error as { status?: number }).status);
+        if (!readOnly && (!Number.isFinite(status) || status === 0 || status === 408 || status >= 500)) {
+          this.invalidateScopedTaskInventories();
+          this.invalidateScopedCommentInventories();
+        }
+        if (name === "AbortError" || name === "TimeoutError") throw error;
         const transient = !status || status === 408 || status === 429 || status >= 500;
         const limit = status === 429 ? retryLimit : readOnly ? (this.requestOptions.readRetries ?? 2) : 0;
         if (!transient || attempt >= limit || (!readOnly && status !== 429)) throw error;

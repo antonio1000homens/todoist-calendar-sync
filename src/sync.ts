@@ -2034,10 +2034,10 @@ export class Synchronizer {
       }
     }
     let ownershipEvent = event;
-    const projectId = profiles[delivery.profile].todoistProjectId;
+    const inventoryProjectId = profiles[delivery.profile].todoistProjectId;
     const projectMappingIndex = typeof todoist.getProjectMappingIndex === "function"
-      ? await todoist.getProjectMappingIndex(projectId)
-      : buildProjectMappingIndex(await todoist.listProjectComments(projectId));
+      ? await todoist.getProjectMappingIndex(inventoryProjectId)
+      : buildProjectMappingIndex(await todoist.listProjectComments(inventoryProjectId));
     const providerCandidates = projectMappingIndex.parsed.filter(entry =>
       entry.payload.profile === delivery.profile
       && entry.payload.projectId === profiles[delivery.profile].todoistProjectId
@@ -2580,13 +2580,13 @@ export class Synchronizer {
     const exactLocalPair = Boolean(task && mapping && !event.recurringEventId && !event.recurrence?.length
       && !task.due?.is_recurring && !task.is_deleted && !task.is_completed && !task.completed_at
       && !mapping.masterEventId && !mapping.seriesId && !mapping.activeInstanceId
-      && task.project_id === projectId && mapping.projectId === projectId
+      && task.project_id === inventoryProjectId && mapping.projectId === inventoryProjectId
       && mapping.calendarId === profiles[delivery.profile].calendarId
       && mapping.taskId === task.id && mapping.eventId === event.id
       && taskEntries.length === 1 && taskEntries[0].payload.schemaVersion === 2
       && taskEntries[0].comment.id === mapping.projectCommentId
       && taskEntries[0].payload.profile === delivery.profile
-      && taskEntries[0].payload.projectId === projectId
+      && taskEntries[0].payload.projectId === inventoryProjectId
       && shared.syncSchemaVersion === "2" && shared.syncProfile === delivery.profile
       && shared.syncCalendarId === profiles[delivery.profile].calendarId
       && shared.syncEventId === event.id && shared.taskId === task.id && shared.syncTaskId === task.id
