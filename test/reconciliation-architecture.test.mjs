@@ -57,11 +57,12 @@ test("worker remains single-concurrency while project moves lack cross-profile c
   assert.match(workerBlock, /ReservedConcurrentExecutions:\s*1/);
 });
 
-test("DLQ retains originals for 14 days and source FIFO retries transient DynamoDB failures at most five times", () => {
+test("DLQ retains originals for 14 days and source FIFO leaves room for durable provider cooldown deferrals", () => {
   const dlqBlock = template.match(/SyncDlq:[\s\S]*?SyncQueue:/)?.[0] || "";
   const queueBlock = template.match(/SyncQueue:[\s\S]*?AlertTopic:/)?.[0] || "";
   assert.match(dlqBlock, /MessageRetentionPeriod:\s*1209600/);
-  assert.match(queueBlock, /maxReceiveCount:\s*5/);
+  assert.match(queueBlock, /maxReceiveCount:\s*1000/);
+  assert.match(queueBlock, /durable[\s\S]*account cooldown/i);
   const workerBlock = template.match(/WorkerFunction:[\s\S]*?ErasureWorkerLogGroup:/)?.[0] || "";
   assert.match(workerBlock, /SYNC_QUEUE_URL: !Ref SyncQueue/);
   assert.match(workerBlock, /QueueName: !GetAtt SyncDlq.QueueName/);
@@ -102,6 +103,7 @@ test("webhooks never start full reconciliation and the scheduled health check qu
   assert.match(healthSource, /SCHEDULED_RECONCILIATION_INTERVAL_MS/);
   assert.doesNotMatch(healthSource, /listDelta|listTasks/);
   assert.match(template, /ScheduleExpression:\s*rate\(5 minutes\)/);
+  assert.match(template, /State:\s*DISABLED/);
   const healthBlock = template.match(/ReconcilerFunction:[\s\S]*?ReconcilerFunctionEveryFifteenMinutes:/)?.[0] || "";
   assert.match(healthBlock, /Action: sqs:SendMessage/);
 });

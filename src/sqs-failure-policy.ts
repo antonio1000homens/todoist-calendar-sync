@@ -1,7 +1,7 @@
 import { ChangeMessageVisibilityCommand, SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { createHash } from "node:crypto";
 import type { SQSRecord } from "aws-lambda";
-import type { Delivery, Profile } from "./types.js";
+import type { Delivery, DeliveryKind, Profile } from "./types.js";
 import { syncMessageGroupId } from "./types.js";
 import { isSafeProviderReplay } from "./safe-provider-replay.js";
 
@@ -34,6 +34,7 @@ type ErrorFields = {
   name?: string;
   cause?: unknown;
   status?: number;
+  code?: string;
   retryAfterMs?: number;
   $retryable?: { throttling?: boolean };
   CancellationReasons?: Array<{ Code?: string }>;
@@ -111,8 +112,9 @@ export function failedDeliveryDisposition(
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
   const safeReplay = isSafeProviderReplay(error);
+  const accountCooldown = fields(error).code === "todoist_account_cooldown";
   const transientDynamoDb = isTransientDynamoDbFailure(error);
-  const transientProvider = !transientDynamoDb && (safeReplay || isTransientProviderFailure(error));
+  const transientProvider = !transientDynamoDb && (accountCooldown || safeReplay || isTransientProviderFailure(error));
   if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
   // A provider write may already have happened. The DynamoDB state write may
   // have failed after it, so automated replay could duplicate provider writes.
@@ -120,19 +122,22 @@ export function failedDeliveryDisposition(
   // Retry only deliveries whose state is safe to re-read. Reconciliation chunks
   // are idempotent when no provider write has been attempted; repair and
   // erasure-sensitive operations remain quarantined.
-  const retryableKinds = safeReplay ? ["todoist"]
+  const retryableKinds: DeliveryKind[] = accountCooldown ? ["calendar", "todoist", "orphan", "reconcile", "manual", "repair"]
+    : safeReplay ? ["todoist"]
     : transientProvider ? ["calendar", "todoist", "reconcile"] : ["calendar", "todoist"];
   if (!delivery || !retryableKinds.includes(delivery.kind)) {
     return { kind:"quarantine", reason:"unverified_delivery_type", receiveCount:attempts };
   }
-  if (attempts >= MAX_SYNC_RECEIVES) return { kind:"quarantine", reason:"retries_exhausted", receiveCount:attempts };
+  if (attempts >= MAX_SYNC_RECEIVES && !accountCooldown) return { kind:"quarantine", reason:"retries_exhausted", receiveCount:attempts };
   return { kind:"retry_fifo", reason:safeReplay ? "safe_provider_replay" : transientProvider ? "transient_provider" : "transient_dynamodb", receiveCount:attempts };
 }
 
 export function transientRetryVisibilitySeconds(receiveCount: number, retryAfterMs?: number): number {
   const exponential = 30 * 2 ** Math.max(0, Math.min(3, receiveCount - 1));
   const hinted = Number.isFinite(retryAfterMs) ? Math.ceil(Math.max(0, retryAfterMs!) / 1000) : 0;
-  return Math.min(43_200, Math.max(exponential, hinted));
+  // Leave room for the worker's full five-minute Lambda execution under SQS's
+  // 12-hour maximum, which is measured from the original receive timestamp.
+  return Math.min(42_900, Math.max(exponential, hinted));
 }
 
 export function providerRetryAfterMs(error: unknown): number | undefined {

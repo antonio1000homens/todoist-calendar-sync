@@ -73,6 +73,18 @@ test("provider throttling and temporary outages retry only before a provider wri
   assert.equal(isTransientProviderFailure(namedError("Error", {status:503,body:"not a provider response"})), false);
 });
 
+test("a durable Todoist account cooldown re-defers every delivery kind beyond the normal retry ceiling", () => {
+  const cooldown = Object.assign(new Error("account cooldown"), {
+    status:429, code:"todoist_account_cooldown", retryAfterMs:1_280_000,
+    body:'{"error_tag":"LIMITS_REACHED"}',
+  });
+  for (const kind of ["calendar", "todoist", "orphan", "reconcile", "manual", "repair"]) {
+    assert.deepEqual(failedDeliveryDisposition(cooldown, {kind}, false, MAX_SYNC_RECEIVES), {
+      kind:"retry_fifo", reason:"transient_provider", receiveCount:MAX_SYNC_RECEIVES,
+    });
+  }
+});
+
 test("only explicitly deterministic provider replays may retry after a write", () => {
   const replay = new SafeProviderReplayError("Calendar master already exists; readback still pending");
   assert.deepEqual(failedDeliveryDisposition(replay, {kind:"todoist"}, true, 1), {

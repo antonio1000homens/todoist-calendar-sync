@@ -6,7 +6,7 @@ import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, buildProjectMappingIndex,
   deleteExactTaskProjectMappingComments, deleteMappingComments, mappingFromProjectMappingComment,
   upsertProjectMappingComment } from "./mapping-comments.js";
-import { GoogleCalendar, Todoist } from "./providers.js";
+import { GoogleCalendar, Todoist, withTodoistInventoryScope } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
@@ -1705,13 +1705,19 @@ export class Synchronizer {
   }
 
   async process(delivery: Delivery): Promise<void> {
-    if (delivery.kind === "calendar") return this.processCalendar(delivery);
-    if (delivery.kind === "todoist") return this.processTodoist(delivery);
-    if (delivery.kind === "reconcile") { await this.reconcile(delivery.profile); return; }
-    return this.processOrphan(delivery);
+    return withTodoistInventoryScope(async () => {
+      if (delivery.kind === "calendar") return this.processCalendar(delivery);
+      if (delivery.kind === "todoist") return this.processTodoist(delivery);
+      if (delivery.kind === "reconcile") { await this.reconcile(delivery.profile); return; }
+      return this.processOrphan(delivery);
+    });
   }
 
   async reconcile(profile: Profile): Promise<RecurrenceReconciliationSummary> {
+    return withTodoistInventoryScope(() => this.reconcileInScope(profile));
+  }
+
+  private async reconcileInScope(profile: Profile): Promise<RecurrenceReconciliationSummary> {
     const outcomes: RecurrenceReconciliationSummary = {
       total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
     };

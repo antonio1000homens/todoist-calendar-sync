@@ -1,6 +1,8 @@
 import { createHash, createSign, randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { profileForTodoistProject, profiles, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
+import { logEvent } from "./observability.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
 
 const CALENDAR_ROOT = "https://www.googleapis.com/calendar/v3";
@@ -9,6 +11,25 @@ const TODOIST_COMMENTS_ROOT = "https://api.todoist.com/api/v1/comments";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const MAX_ERASURE_AUDIT_PROJECTS=2048;
 const MAX_ERASURE_AUDIT_COMMENTS=100000;
+const MAX_TODOIST_INVENTORY_RESPONSE_BYTES=16*1024*1024;
+type TodoistInventoryScope = {
+  comments: Map<string, Promise<TodoistCommentRecord[]>>;
+  tasks: Map<string, Promise<TodoistTask[]>>;
+  timeZones: Map<string, Promise<string>>;
+  snapshots: Map<string, Promise<Awaited<ReturnType<Todoist["listAllTaskCommentsForErasureAudit"]>> | undefined>>;
+};
+const todoistInventoryScope = new AsyncLocalStorage<TodoistInventoryScope>();
+
+/** Share provider inventories across clients for one bounded sync operation. */
+export function withTodoistInventoryScope<T>(operation: () => Promise<T>): Promise<T> {
+  if (todoistInventoryScope.getStore()) return operation();
+  return todoistInventoryScope.run({ comments: new Map(), tasks: new Map(), timeZones: new Map(), snapshots: new Map() }, operation);
+}
+
+/** Stable non-secret key for coordinating cooldowns across profile tokens. */
+export function todoistAccountIdentity(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
 const recurrenceCorrelationKeys = [
   "syncSeriesId", "syncMasterEventId", "syncActiveInstanceId", "syncOriginalStart",
   "syncActiveEffectiveStart", "syncProgressVersion", "syncCompletedThrough",
@@ -83,6 +104,33 @@ async function responseJson<T>(response: Response): Promise<T> {
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
+async function boundedResponseJson<T>(response: Response, maximumBytes: number): Promise<T> {
+  const advertisedLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(advertisedLength) && advertisedLength > maximumBytes)
+    throw Object.assign(new Error("Todoist full inventory exceeded its response size limit"), { status: 413 });
+  if (!response.body) throw Object.assign(new Error("Todoist full inventory returned an empty body"), { status: 400 });
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      totalBytes += next.value.byteLength;
+      if (totalBytes > maximumBytes) {
+        await reader.cancel();
+        throw Object.assign(new Error("Todoist full inventory exceeded its response size limit"), { status: 413 });
+      }
+      chunks.push(next.value);
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { return JSON.parse(new TextDecoder().decode(bytes)) as T; }
+  catch { throw Object.assign(new Error("Todoist full inventory returned invalid JSON"), { status: 400 }); }
+}
+
 type ProviderRequestOptions = {
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -99,6 +147,7 @@ type ProviderRequestOptions = {
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const todoistRequestPacing = new Map<string, { nextAt: number; intervalMs: number }>();
+const todoistCooldownUntil = new Map<string, number>();
 
 function abortError(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
@@ -797,7 +846,7 @@ export class Todoist {
   private readonly pacingKey: string;
 
   constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {
-    this.pacingKey=createHash("sha256").update(token).digest("hex");
+    this.pacingKey=todoistAccountIdentity(token);
     const interval=this.requestOptions.minRequestIntervalMs||0;
     if(!Number.isSafeInteger(interval)||interval<0)throw new Error("Invalid Todoist request interval");
     if(interval>0) {
@@ -808,6 +857,14 @@ export class Todoist {
   }
 
   private async paceRequest(): Promise<void> {
+    const cooldownUntil = todoistCooldownUntil.get(this.pacingKey) || 0;
+    if (cooldownUntil > Date.now()) {
+      const error = new Error("Todoist account is in a shared rate-limit cooldown") as Error & { status: number; retryAfterMs: number; body: string };
+      error.status = 429;
+      error.retryAfterMs = cooldownUntil - Date.now();
+      error.body = '{"error_tag":"LIMITS_REACHED"}';
+      throw error;
+    }
     const pacing=todoistRequestPacing.get(this.pacingKey);
     if(!pacing||pacing.intervalMs<=0)return;
     const now = Date.now();
@@ -815,6 +872,25 @@ export class Todoist {
     pacing.nextAt = startsAt + pacing.intervalMs;
     const delay = startsAt - now;
     if (delay > 0) await abortableDelay(delay,this.requestOptions.signal);
+  }
+
+  private observeRequest(path: string, method: string, retryCount: number, status: number, requestSent: boolean): void {
+    const endpointClass = path === "/sync" ? "sync"
+      : path.startsWith("/tasks") ? "tasks"
+      : path.startsWith("/projects") ? "projects"
+      : path.startsWith("/") && path.includes("comments") || path.startsWith("?") ? "comments"
+      : "other";
+    const profile = profileForTodoistProject(todoistProjectForToken(this.token));
+    logEvent("todoist_provider_request", {
+      profile: profile || "unknown",
+      accountId: this.pacingKey.slice(0, 16),
+      endpointClass,
+      operation: method.toUpperCase() === "GET" ? "read" : "write",
+      retryCount,
+      httpStatus: status,
+      rateLimited: status === 429,
+      requestSent,
+    });
   }
 
   private async request<T>(path: string, init: RequestInit = {}, comments = false): Promise<T> {
@@ -827,13 +903,41 @@ export class Todoist {
     const rateLimitRetries = this.requestOptions.rateLimitRetries ?? 2;
     const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
+      let observedCooldown: number | undefined;
+      let requestSent = false;
+      let httpStatus = 0;
       try {
         await this.paceRequest();
-        return await responseJson<T>(await fetchProvider(url, { ...init, headers },this.requestOptions));
+        const response = await fetchProvider(url, { ...init, headers },this.requestOptions);
+        requestSent = true;
+        httpStatus = response.status;
+        this.observeRequest(path, init.method || "GET", attempt, httpStatus, requestSent);
+        const result = await responseJson<T>(response);
+        if (!readOnly && path.startsWith("/tasks")) this.invalidateScopedTaskInventories();
+        return result;
       } catch (error) {
+        if (!requestSent) this.observeRequest(path, init.method || "GET", attempt,
+          Number((error as { status?: number }).status) || httpStatus, false);
         const name=(error as {name?:string})?.name;
-        if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
+        if (!readOnly && (status === 0 || status >= 500)) {
+          if (comments) {
+            this.projectCommentCache.clear();
+            const scope = todoistInventoryScope.getStore();
+            if (scope) {
+              const prefix = `${this.pacingKey}:`;
+              for (const key of scope.comments.keys()) if (key.startsWith(prefix)) scope.comments.delete(key);
+              scope.snapshots.delete(this.pacingKey);
+            }
+          } else if (path.startsWith("/tasks")) this.invalidateScopedTaskInventories();
+        }
+        if(name==="AbortError"||name==="TimeoutError")throw error;
+        if (status === 429) {
+          const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
+          if (Number.isFinite(retryAfterMs) && retryAfterMs > 0)
+            todoistCooldownUntil.set(this.pacingKey, Math.max(todoistCooldownUntil.get(this.pacingKey) || 0, Date.now() + retryAfterMs));
+          observedCooldown = todoistCooldownUntil.get(this.pacingKey);
+        }
         const transient = !status || status === 408 || status === 429 || status >= 500;
         const retryLimit = status === 429 ? rateLimitRetries : readOnly ? readRetries : 0;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
@@ -841,33 +945,126 @@ export class Todoist {
           this.requestOptions.honorFullRetryAfter===true,this.requestOptions.signal);
         if (!delay) throw error;
         await delay;
+        if (this.requestOptions.honorFullRetryAfter === true && observedCooldown
+          && todoistCooldownUntil.get(this.pacingKey) === observedCooldown)
+          todoistCooldownUntil.delete(this.pacingKey);
+      }
+    }
+  }
+
+  private async syncRequest<T>(body: URLSearchParams, maxResponseBytes?: number): Promise<T> {
+    const headers = new Headers({ authorization: `Bearer ${this.token}` });
+    headers.set("content-type", "application/x-www-form-urlencoded");
+    const requestBody = body.toString();
+    const readOnly = body.has("resource_types") && !body.has("commands");
+    const retryLimit = this.requestOptions.rateLimitRetries ?? 2;
+    for (let attempt = 0; ; attempt++) {
+      let observedCooldown: number | undefined;
+      let requestSent = false;
+      let httpStatus = 0;
+      try {
+        await this.paceRequest();
+        const response = await fetchProvider(`${TODOIST_ROOT}/sync`, {
+          method: "POST", headers, body: requestBody,
+        }, this.requestOptions);
+        requestSent = true;
+        httpStatus = response.status;
+        this.observeRequest("/sync", readOnly ? "GET" : "POST", attempt, httpStatus, requestSent);
+        if (maxResponseBytes === undefined || !response.ok) return await responseJson<T>(response);
+        return await boundedResponseJson<T>(response, maxResponseBytes);
+      } catch (error) {
+        if (!requestSent) this.observeRequest("/sync", readOnly ? "GET" : "POST", attempt,
+          Number((error as { status?: number }).status) || httpStatus, false);
+        if (Number((error as { status?: number }).status) === 429) {
+          const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
+          if (Number.isFinite(retryAfterMs) && retryAfterMs > 0)
+            todoistCooldownUntil.set(this.pacingKey, Math.max(todoistCooldownUntil.get(this.pacingKey) || 0, Date.now() + retryAfterMs));
+          observedCooldown = todoistCooldownUntil.get(this.pacingKey);
+        }
+        const name = (error as { name?: string })?.name;
+        if (name === "AbortError" || name === "TimeoutError") throw error;
+        const status = Number((error as { status?: number }).status);
+        const transient = !status || status === 408 || status === 429 || status >= 500;
+        const limit = status === 429 ? retryLimit : readOnly ? (this.requestOptions.readRetries ?? 2) : 0;
+        if (!transient || attempt >= limit || (!readOnly && status !== 429)) throw error;
+        const delay = waitForRetry(error, attempt, this.requestOptions.maxRetryDelayMs ?? 30_000,
+          this.requestOptions.honorFullRetryAfter === true, this.requestOptions.signal);
+        if (!delay) throw error;
+        await delay;
+        if (this.requestOptions.honorFullRetryAfter === true && observedCooldown
+          && todoistCooldownUntil.get(this.pacingKey) === observedCooldown)
+          todoistCooldownUntil.delete(this.pacingKey);
+      }
+    }
+  }
+
+  private async updateScopedComment(comment: TodoistCommentRecord, deleted = false): Promise<void> {
+    const scope = todoistInventoryScope.getStore();
+    if (!scope) return;
+    const prefix = `${this.pacingKey}:`;
+    for (const [key, pending] of scope.comments) {
+      if (!key.startsWith(prefix)) continue;
+      const comments = await pending;
+      const index = comments.findIndex(entry => entry.id === comment.id);
+      if (deleted) {
+        if (index >= 0) comments.splice(index, 1);
+      } else if (index >= 0) comments[index] = { ...comments[index], ...comment };
+      else if (comment.project_id && key === `${prefix}${comment.project_id}`)
+        comments.push({ ...comment });
+      scope.comments.set(key, Promise.resolve(comments));
+    }
+    const snapshotPending = scope.snapshots.get(this.pacingKey);
+    if (snapshotPending) {
+      const snapshot = await snapshotPending;
+      if (snapshot) {
+        const update = (values: TodoistCommentRecord[]) => {
+          const index = values.findIndex(entry => entry.id === comment.id);
+          if (deleted) { if (index >= 0) values.splice(index, 1); }
+          else if (index >= 0) values[index] = { ...values[index], ...comment };
+          else if (comment.project_id) values.push({ ...comment });
+        };
+        update(snapshot.projectComments);
+        scope.snapshots.set(this.pacingKey, Promise.resolve(snapshot));
       }
     }
   }
 
   private async syncCommand(type: string, args: Record<string, unknown>, commandUuid: string = randomUUID()): Promise<void> {
-    const headers = new Headers({ authorization: `Bearer ${this.token}` });
-    headers.set("content-type", "application/x-www-form-urlencoded");
     const body = new URLSearchParams({
       commands: JSON.stringify([{ type, uuid: commandUuid, args }]),
     });
-    const result = await responseJson<{ sync_status?: Record<string, unknown> }>(
-      await fetchProvider(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body },this.requestOptions),
-    );
+    const result = await this.syncRequest<{ sync_status?: Record<string, unknown> }>(body);
     const status = result.sync_status?.[commandUuid];
     if (status !== "ok") {
       throw new Error(`Todoist sync command ${type} failed: ${JSON.stringify(status)}`);
     }
+    if (type.startsWith("item_")) this.invalidateScopedTaskInventories();
+  }
+
+  private invalidateScopedTaskInventories(): void {
+    const scope = todoistInventoryScope.getStore();
+    if (!scope) return;
+    const prefix = `${this.pacingKey}:`;
+    for (const key of scope.tasks.keys()) if (key.startsWith(prefix)) scope.tasks.delete(key);
+    scope.snapshots.delete(this.pacingKey);
   }
 
   /** Read only the configured account timezone. Never retain or log the user resource. */
   async getTimeZone(): Promise<string> {
-    const headers = new Headers({ authorization: `Bearer ${this.token}` });
-    headers.set("content-type", "application/x-www-form-urlencoded");
+    const scope = todoistInventoryScope.getStore();
+    const cached = scope?.timeZones.get(this.pacingKey);
+    if (cached) return cached;
+    const snapshot = scope?.snapshots.get(this.pacingKey);
+    const loading = snapshot
+      ? snapshot.then(value => value?.timeZone || this.readTimeZone())
+      : this.readTimeZone();
+    scope?.timeZones.set(this.pacingKey, loading);
+    return loading;
+  }
+
+  private async readTimeZone(): Promise<string> {
     const body = new URLSearchParams({ sync_token: "*", resource_types: JSON.stringify(["user"]) });
-    const result = await responseJson<{ user?: { timezone?: string; tz_info?: { timezone?: string } } }>(
-      await fetchProvider(`${TODOIST_ROOT}/sync`, { method: "POST", headers, body },this.requestOptions),
-    );
+    const result = await this.syncRequest<{ user?: { timezone?: string; tz_info?: { timezone?: string } } }>(body);
     const timeZone = result?.user?.tz_info?.timezone || result?.user?.timezone;
     if (!timeZone) throw new Error("Todoist account timezone is missing");
     try { new Intl.DateTimeFormat("en-GB", { timeZone }); }
@@ -876,7 +1073,20 @@ export class Todoist {
   }
 
   async listTasks(projectId = todoistProjectForToken(this.token)): Promise<TodoistTask[]> {
-    return this.readTasks(projectId);
+    const scope = todoistInventoryScope.getStore();
+    if (!scope) return this.readTasks(projectId);
+    const scopeKey = `${this.pacingKey}:${projectId || "*"}`;
+    let pending = scope.tasks.get(scopeKey);
+    if (!pending) {
+      pending = (async () => {
+        const snapshot = await this.operationSnapshot();
+        if (snapshot && (!projectId || snapshot.projectIds.includes(projectId)))
+          return snapshot.tasks.filter(task => !projectId || task.project_id === projectId);
+        return this.readTasks(projectId);
+      })();
+      scope.tasks.set(scopeKey, pending);
+    }
+    return (await pending).map(task => structuredClone(task));
   }
 
   async getProject(projectId: string): Promise<{ id: string; name: string }> {
@@ -896,30 +1106,13 @@ export class Todoist {
   /** Complete active-task and comment inventory from one Todoist full Sync snapshot. */
   async listAllTaskCommentsForErasureAudit(): Promise<{
     comments:TodoistCommentRecord[];projectComments:TodoistCommentRecord[];tasks:TodoistTask[];
-    projectIds:string[];fullSyncDateUtc:string;
+    projectIds:string[];fullSyncDateUtc:string;timeZone?:string;
   }> {
-    const headers=new Headers({authorization:`Bearer ${this.token}`});
-    headers.set("content-type","application/x-www-form-urlencoded");
     // The full snapshot contains items, notes and project_notes. Reusing it
     // avoids a second paginated task inventory and per-project comment reads.
-    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["items","notes","projects"])});
-    let snapshot: {full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
-      sync_token?:unknown;full_sync_date_utc?:unknown};
-    for(let attempt=0;;attempt++) {
-      try {
-        snapshot=await responseJson<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
-          sync_token?:unknown;full_sync_date_utc?:unknown}>(
-          await fetchProvider(`${TODOIST_ROOT}/sync`,{method:"POST",headers,body},this.requestOptions));
-        break;
-      } catch(error) {
-        const name=(error as {name?:string})?.name;
-        if(name==="AbortError"||name==="TimeoutError")throw error;
-        const status=Number((error as {status?:number}).status);
-        const transient=!status||status===408||status===429||status>=500;
-        if(!transient||attempt>=2)throw error;
-        await new Promise(resolve=>setTimeout(resolve,attempt===0?250:750));
-      }
-    }
+    const body=new URLSearchParams({sync_token:"*",resource_types:JSON.stringify(["items","notes","projects","user"])});
+    const snapshot=await this.syncRequest<{full_sync?:unknown;notes?:unknown;project_notes?:unknown;projects?:unknown;items?:unknown;
+      user?:{timezone?:unknown;tz_info?:{timezone?:unknown}};sync_token?:unknown;full_sync_date_utc?:unknown}>(body,MAX_TODOIST_INVENTORY_RESPONSE_BYTES);
     if(snapshot.full_sync!==true||typeof snapshot.sync_token!=="string"||!snapshot.sync_token
       ||!Array.isArray(snapshot.items)||!Array.isArray(snapshot.notes)||!Array.isArray(snapshot.project_notes)||!Array.isArray(snapshot.projects)
       ||typeof snapshot.full_sync_date_utc!=="string"
@@ -980,8 +1173,18 @@ export class Todoist {
       if(projectIds.size>MAX_ERASURE_AUDIT_PROJECTS)
         throw new Error("Todoist project full sync exceeded the audit project limit");
     }
+    if ([...tasks.values()].some(task => typeof task.project_id !== "string" || !projectIds.has(task.project_id)))
+      throw new Error("Todoist task full sync omitted exact project scope");
+    if ([...projectComments.values()].some(comment => !comment.project_id || !projectIds.has(comment.project_id)))
+      throw new Error("Todoist project-comment full sync omitted exact project scope");
+    const rawTimeZone = snapshot.user?.tz_info?.timezone || snapshot.user?.timezone;
+    let timeZone: string | undefined;
+    if (typeof rawTimeZone === "string") {
+      try { new Intl.DateTimeFormat("en-GB", { timeZone: rawTimeZone }); timeZone = rawTimeZone; }
+      catch { /* A missing/invalid metadata field uses the exact user read path. */ }
+    }
     return {comments:[...comments.values()],projectComments:[...projectComments.values()],tasks:[...tasks.values()],
-      projectIds:[...projectIds],fullSyncDateUtc:snapshot.full_sync_date_utc};
+      projectIds:[...projectIds],fullSyncDateUtc:snapshot.full_sync_date_utc,...(timeZone?{timeZone}:{})};
   }
 
   private async readTasks(projectId?:string): Promise<TodoistTask[]> {
@@ -1011,6 +1214,27 @@ export class Todoist {
       seenCursors.add(next);cursor=next;
     }
     throw new Error("Todoist task inventory exceeded the page limit");
+  }
+
+  private async operationSnapshot(): Promise<Awaited<ReturnType<Todoist["listAllTaskCommentsForErasureAudit"]>> | undefined> {
+    const scope = todoistInventoryScope.getStore();
+    if (!scope) return undefined;
+    const pending = scope.snapshots.get(this.pacingKey);
+    if (pending) return pending;
+    const loading = this.listAllTaskCommentsForErasureAudit().then(snapshot => {
+      const ageMs = Date.now() - Date.parse(snapshot.fullSyncDateUtc);
+      if (ageMs < -60_000 || ageMs > 5 * 60_000)
+        return undefined;
+      return snapshot;
+    }).catch(error => {
+      // A known quota cooldown must stop this operation immediately. Other
+      // unsupported, inaccessible, incomplete, stale, or oversized snapshots
+      // fall back to the complete paginated REST inventories.
+      if (Number((error as { status?: number }).status) === 429) throw error;
+      return undefined;
+    });
+    scope.snapshots.set(this.pacingKey, loading);
+    return loading;
   }
 
   async getTask(taskId: string): Promise<TodoistTask> {
@@ -1147,13 +1371,24 @@ export class Todoist {
   }
 
   async listProjectComments(projectId: string, refresh = false): Promise<TodoistCommentRecord[]> {
+    const scope = todoistInventoryScope.getStore();
+    const scopeKey = `${this.pacingKey}:${projectId}`;
+    const scoped = scope?.comments.get(scopeKey);
+    if (scoped) return (await scoped).map(comment => ({ ...comment }));
     const cached = this.projectCommentCache.get(projectId);
     if (cached && !refresh) return cached.slice();
-    const comments=await listTodoistCommentPages(async cursor=>{
-      const query = new URLSearchParams({ project_id: projectId });
-      if (cursor) query.set("cursor", cursor);
-      return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
-    },"project");
+    const loading = (async () => {
+      const snapshot = scope ? await this.operationSnapshot() : undefined;
+      if (snapshot?.projectIds.includes(projectId))
+        return snapshot.projectComments.filter(comment => comment.project_id === projectId);
+      return listTodoistCommentPages(async cursor=>{
+        const query = new URLSearchParams({ project_id: projectId });
+        if (cursor) query.set("cursor", cursor);
+        return this.request<{ results?: TodoistCommentRecord[]; next_cursor?: string }>(`?${query}`, {}, true);
+      },"project");
+    })();
+    if (scope) scope.comments.set(scopeKey, loading);
+    const comments = await loading;
     this.projectCommentCache.set(projectId, comments.slice());
     return comments;
   }
@@ -1282,6 +1517,7 @@ export class Todoist {
     }, true);
     const cached = this.projectCommentCache.get(projectId);
     if (cached) cached.push({ ...comment, project_id: projectId, content });
+    await this.updateScopedComment({ ...comment, project_id: projectId, content });
     return comment;
   }
 
@@ -1294,6 +1530,7 @@ export class Todoist {
       const index = comments.findIndex((entry) => entry.id === commentId);
       if (index >= 0) comments[index] = { ...comments[index], ...comment, content };
     }
+    await this.updateScopedComment({ ...comment, content });
     return comment;
   }
 
@@ -1401,6 +1638,7 @@ export class Todoist {
       const index = comments.findIndex((entry) => entry.id === commentId);
       if (index >= 0) comments.splice(index, 1);
     }
+    await this.updateScopedComment({ id: commentId }, true);
   }
 }
 
