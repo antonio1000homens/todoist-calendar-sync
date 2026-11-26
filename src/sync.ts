@@ -1197,7 +1197,7 @@ export class Synchronizer {
   }
 
   private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
-    const comments = await todoist.listProjectComments(profiles[profile].todoistProjectId, true);
+    const comments = await todoist.listProjectComments(profiles[profile].todoistProjectId);
     return buildProjectMappingIndex(comments).parsed
       .filter(entry => entry.payload.profile === profile
         && entry.payload.projectId === profiles[profile].todoistProjectId)
@@ -1321,7 +1321,7 @@ export class Synchronizer {
       }
       throw new Error("Todoist project comment correlation API unavailable");
     }
-    const comments = await client.listProjectComments(profiles[profile].todoistProjectId, true);
+    const comments = await client.listProjectComments(profiles[profile].todoistProjectId);
     const candidates = buildProjectMappingIndex(comments).parsed
       .filter(entry => entry.payload.profile === profile
         && entry.payload.projectId === profiles[profile].todoistProjectId
