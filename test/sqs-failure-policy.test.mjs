@@ -85,6 +85,21 @@ test("a durable Todoist account cooldown re-defers every delivery kind beyond th
   }
 });
 
+test("Calendar cooldown and edit races retry only at a proven completed-item boundary", () => {
+  const cooldown = namedError("Error", {status:429, code:"todoist_account_cooldown", retryAfterMs:1280000});
+  const changed = namedError("Error", {code:"calendar_delta_task_changed"});
+  for (const cause of [cooldown, changed]) {
+    const wrapped = new Error("Calendar item failed", {cause});
+    assert.equal(failedDeliveryDisposition(wrapped,{kind:"calendar"},true,1,false).kind,"retry_fifo");
+    assert.equal(failedDeliveryDisposition(wrapped,{kind:"calendar"},true,1,true).reason,"partial_provider_mutation");
+    assert.equal(failedDeliveryDisposition(wrapped,{kind:"calendar"},true,1).reason,"partial_provider_mutation");
+  }
+  assert.equal(failedDeliveryDisposition(cooldown,{kind:"calendar"},true,MAX_SYNC_RECEIVES,false).kind,"retry_fifo");
+  assert.equal(failedDeliveryDisposition(changed,{kind:"calendar"},true,MAX_SYNC_RECEIVES,false).reason,"retries_exhausted");
+  assert.equal(failedDeliveryDisposition(cooldown,{kind:"todoist"},true,1,false).reason,"partial_provider_mutation");
+  assert.equal(failedDeliveryDisposition(throttle(),{kind:"calendar"},true,1,false).reason,"partial_provider_mutation");
+});
+
 test("only explicitly deterministic provider replays may retry after a write", () => {
   const replay = new SafeProviderReplayError("Calendar master already exists; readback still pending");
   assert.deepEqual(failedDeliveryDisposition(replay, {kind:"todoist"}, true, 1), {
