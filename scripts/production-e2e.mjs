@@ -4,7 +4,12 @@ import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { googleCredentials, profiles, todoistToken } from "../dist/config.js";
 import { buildProjectMappingIndex } from "../dist/mapping-comments.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
-import { unsupportedCalendarRecurrencePreserved } from "./production-e2e-assertions.mjs";
+import {
+  uniqueProjectEventMapping,
+  uniqueProjectTaskMapping,
+  uniqueProjectTaskMappingForEvent,
+  unsupportedCalendarRecurrencePreserved,
+} from "./production-e2e-assertions.mjs";
 import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
 
 const PROFILE_NAMES = ["antonio"];
@@ -103,24 +108,19 @@ async function queueDepth(client, url) {
 async function providerMapping(todoist, projectId, eventId, taskId) {
   const comments = await todoist.listProjectComments(projectId, true);
   const index = buildProjectMappingIndex(comments);
-  return [...(index.byEventId.get(eventId) || []), ...index.parsed.filter((entry) => entry.payload.masterEventId === eventId)]
-    .find((entry) =>
-    entry.payload.taskId === taskId && entry.payload.projectId === projectId)?.payload;
+  return uniqueProjectTaskMappingForEvent(index, projectId, eventId, taskId)?.payload;
 }
 
 async function providerMappingComment(todoist, projectId, eventId, taskId) {
   const comments = await todoist.listProjectComments(projectId, true);
   const index = buildProjectMappingIndex(comments);
-  return [...(index.byEventId.get(eventId) || []), ...index.parsed.filter((entry) => entry.payload.masterEventId === eventId)]
-    .find((entry) =>
-    entry.payload.taskId === taskId && entry.payload.projectId === projectId)?.comment;
+  return uniqueProjectTaskMappingForEvent(index, projectId, eventId, taskId)?.comment;
 }
 
 async function providerMappingByTask(todoist, projectId, taskId) {
   const comments = await todoist.listProjectComments(projectId, true);
   const index = buildProjectMappingIndex(comments);
-  return (index.byTaskId.get(taskId) || []).find((entry) =>
-    entry.payload.projectId === projectId)?.payload;
+  return uniqueProjectTaskMapping(index, projectId, taskId)?.payload;
 }
 
 async function fixtureStillPresent(calendar, todoist, projectId, eventId, taskId) {
@@ -1271,10 +1271,9 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         todoist.listProjectComments(config.todoistProjectId, true),
       ]);
       const unsupportedCalendarIndex = buildProjectMappingIndex(unsupportedCalendarComments);
-      const unsupportedCalendarMapping = unsupportedCalendarIndex.parsed.find((entry) =>
-        entry.payload.projectId === config.todoistProjectId
-          && (entry.payload.eventId === unsupportedCalendarFixture.eventId
-            || entry.payload.masterEventId === unsupportedCalendarFixture.eventId));
+      const unsupportedCalendarMapping = uniqueProjectEventMapping(
+        unsupportedCalendarIndex, config.todoistProjectId, unsupportedCalendarFixture.eventId,
+      );
       const currentDue = JSON.stringify({
         date: currentTask.due?.date,
         datetime: currentTask.due?.datetime,
