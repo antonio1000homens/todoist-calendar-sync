@@ -334,8 +334,7 @@ export async function hasConflictingCalendarCandidate(
       || (task.due?.is_recurring && !candidateTextMatches(master, task))) continue;
     const instances = await listBoundedRecurrenceInstances(calendar, master.id, due);
     const matchingInstances = instances.filter(instance => instance.status !== "cancelled"
-      && instance.recurringEventId === master.id && startsMatch(instance, task)
-      && candidateTextMatches(instance, task));
+      && instance.recurringEventId === master.id && startsMatch(instance, task));
     for (const instance of matchingInstances) {
       const live = await calendar.getEvent(instance.id);
       if (live.status !== "cancelled" && live.recurringEventId === master.id
