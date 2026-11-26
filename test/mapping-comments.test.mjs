@@ -275,14 +275,17 @@ test("project comment reference replaces the deprecated alias and preserves a ge
 
 test("project mapping upsert never updates an unverified stored comment id", async () => {
   const upserts = [];
+  const comments = [];
   const client = {
-    async listProjectComments() { return []; },
+    async listProjectComments() { return comments.map(comment=>structuredClone(comment)); },
     async upsertProjectComment(projectId, content, existingId) {
       upserts.push({ projectId, content, existingId });
-      return { id: "new-project-comment", project_id: projectId, content };
+      const comment={ id: "new-project-comment", project_id: projectId, content };
+      comments.push(comment);
+      return structuredClone(comment);
     },
     async findLegacyTaskComment() { return undefined; },
-    async deleteComment() {},
+    async deleteComment(id) { const index=comments.findIndex(comment=>comment.id===id);if(index>=0)comments.splice(index,1); },
   };
 
   const migrated = await upsertProjectMappingComment(
@@ -294,6 +297,45 @@ test("project mapping upsert never updates an unverified stored comment id", asy
   assert.equal(upserts.length, 1);
   assert.equal(upserts[0].existingId, undefined);
   assert.equal(migrated.projectCommentId, "new-project-comment");
+});
+
+test("project mapping upsert replaces stale same-task comments, removes duplicates, and verifies one current link",async()=>{
+  const comments=[
+    {id:"stale",project_id:"project-home",content:serializeMappingComment(mapping({eventId:"old-event",seriesId:"old-series",masterEventId:"old-event"}),"project-home")},
+    {id:"duplicate",project_id:"project-home",content:serializeMappingComment(mapping({eventId:"other-old-event",seriesId:"other-series",masterEventId:"other-old-event",mappingRevision:1}),"project-home",undefined,1)},
+    {id:"human",project_id:"project-home",content:"Personal note"},
+  ];
+  const writes=[];
+  const client={
+    async listProjectComments(){return comments.map(comment=>structuredClone(comment));},
+    async upsertProjectComment(projectId,content,existingId){
+      writes.push(existingId);
+      const next={id:existingId||"created",project_id:projectId,content};
+      const index=comments.findIndex(comment=>comment.id===next.id);
+      if(index<0)comments.push(next);else comments[index]=next;
+      return structuredClone(next);
+    },
+    async deleteComment(id){const index=comments.findIndex(comment=>comment.id===id);if(index>=0)comments.splice(index,1);},
+  };
+  const next=await upsertProjectMappingComment(client,mapping({eventId:"new-event",seriesId:"new-series",
+    masterEventId:"new-event",activeInstanceId:"new-event"}),"project-home");
+  assert.deepEqual(writes,["stale"],"recreation updates one verified same-task machine comment in place");
+  assert.equal(comments.length,2);
+  assert.equal(comments.find(comment=>comment.id==="human").content,"Personal note");
+  const owned=buildProjectMappingIndex(comments).parsed;
+  assert.equal(owned.length,1);
+  assert.equal(owned[0].payload.eventId,"new-event");
+  assert.equal(owned[0].payload.masterEventId,"new-event");
+  assert.equal(next.projectCommentId,"stale");
+});
+
+test("project mapping upsert fails retryably when the written comment is missing from provider readback",async()=>{
+  const client={
+    async listProjectComments(){return [];},
+    async upsertProjectComment(projectId,content){return {id:"unreadable-write",project_id:projectId,content};},
+    async deleteComment(){},
+  };
+  await assert.rejects(upsertProjectMappingComment(client,mapping(),"project-home"),/not visible on provider readback/);
 });
 
 test("Todoist project comment listing consumes every next_cursor page", async (t) => {

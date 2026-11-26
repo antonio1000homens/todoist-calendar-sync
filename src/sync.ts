@@ -27,6 +27,7 @@ import { attemptCancelledAnnualRecovery } from "./cancelled-annual-recovery.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFingerprint } from "./cancelled-mapping-recovery-policy.js";
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "./todoist-phase-b-native-admission.js";
+import { SafeProviderReplayError } from "./safe-provider-replay.js";
 import { calendarPhaseCCandidate, matchesCalendarPhaseCTask } from "./calendar-todoist-phase-c.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -3035,7 +3036,9 @@ export class Synchronizer {
       await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
         taskId: task.id, eventId: observedMaster.id, reason: "master_readback_missing",
       });
-      return true;
+      throw new SafeProviderReplayError(`Calendar master readback is temporarily missing for Todoist task ${task.id}`, {
+        cause: error,
+      });
     }
     const shared = master.extendedProperties?.shared;
     if (!master.etag || master.status !== "confirmed" || !master.start?.date
@@ -3072,10 +3075,10 @@ export class Synchronizer {
       `${due}T00:00:00Z`, `${addDays(due, 3)}T00:00:00Z`);
     const active = selectTodoistCurrentInstance(instances, task);
     if (!active || active.status === "cancelled" || !startsMatch(active, task)) {
-      await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_requires_review", {
+      await this.state.audit(delivery.profile, "todoist_phase_b_native_write_retryable", {
         taskId: task.id, eventId: master.id, reason: "active_provider_instance_unresolved",
       });
-      return true;
+      throw new SafeProviderReplayError(`Calendar has not exposed the active instance for Todoist task ${task.id}`);
     }
     if (master.summary !== (normalizedText(task.content) || "Untitled Todoist task")
       || normalizedDescription(master.description) !== normalizedDescription(task.description)) {
@@ -3103,8 +3106,33 @@ export class Synchronizer {
     }
     const base = mapping || { profile: delivery.profile, eventId: master.id, taskId: task.id,
       updatedAt: new Date().toISOString() };
-    const nextMapping = { ...todoistOwnedMapping(base, master.id, task.id, active), todoistPhaseBVersion: 1 as const };
-    await this.persistProviderMapping(nextMapping);
+    const nextMapping = { ...todoistOwnedMapping({ ...base,
+      projectId: task.project_id || base.projectId || profiles[delivery.profile].todoistProjectId,
+    }, master.id, task.id, active), todoistPhaseBVersion: 1 as const };
+    try {
+      const persisted = await this.persistProviderMapping(nextMapping, todoist);
+      const [verifiedMaster, verifiedMapping] = await Promise.all([
+        calendar.getEvent(master.id),
+        this.providerMappingByTask(delivery.profile, task.id, todoist),
+      ]);
+      const verifiedShared = verifiedMaster.extendedProperties?.shared || {};
+      if (verifiedMaster.id !== master.id || verifiedShared.taskId !== task.id
+        || verifiedShared.syncTaskId !== task.id || verifiedShared.syncProfile !== delivery.profile
+        || verifiedShared.syncCalendarId !== profiles[delivery.profile].calendarId
+        || verifiedShared.syncEventId !== master.id || verifiedShared.syncMasterEventId !== master.id
+        || verifiedShared.syncActiveInstanceId !== active.id
+        || persisted.taskId !== task.id || persisted.masterEventId !== master.id
+        || persisted.activeInstanceId !== active.id || !verifiedMapping
+        || verifiedMapping.taskId !== task.id || verifiedMapping.masterEventId !== master.id
+        || verifiedMapping.activeInstanceId !== active.id) {
+        throw new Error("Existing Calendar series and Todoist mapping failed readback verification");
+      }
+    } catch (error) {
+      throw new SafeProviderReplayError(
+        `Calendar and Todoist mapping readback needs retry for task ${task.id}`,
+        { cause: error },
+      );
+    }
     await this.state.audit(delivery.profile, "todoist_phase_b_existing_series_preserved", {
       taskId: task.id, eventId: master.id, activeInstanceId: active.id,
     });
@@ -4251,9 +4279,13 @@ export class Synchronizer {
             taskId: task.id, eventId: nativeEvent.id,
             error: error instanceof Error ? error.message : String(error),
           });
-          return;
+          // The POST may have committed even when its response was lost. Let
+          // SQS retry the same delivery; its deterministic Calendar ID will
+          // read back that object and finish correlation instead of acking a
+          // half-created pair.
+          throw new SafeProviderReplayError(`Calendar master creation needs retry for Todoist task ${task.id}`, { cause: error });
         }
-        const rejectCreatedMaster = async (reason: string): Promise<void> => {
+        const rejectCreatedMaster = async (reason: string, preserveForRetry = false): Promise<never> => {
           let rollback = "not_owned";
           const createdShared = creation.event.extendedProperties?.shared;
           const exactUncommittedIdentity = creation.event.id === nativeEvent.id
@@ -4261,9 +4293,13 @@ export class Synchronizer {
             && createdShared?.todoistPhaseBVersion === "1"
             && createdShared?.todoistAnchorStart === nativePlan.anchor.start
             && JSON.stringify(creation.event.recurrence) === JSON.stringify(nativeEvent.recurrence);
+          // Missing/lagging instances and failed reads are not proof that a
+          // valid master is bad. Preserve it and retry the same deterministic
+          // identity so delayed Calendar visibility cannot orphan the pair.
+          if (preserveForRetry) rollback = "preserved_for_retry";
           // A previous delivery's 409 conflict never authorizes this delivery
           // to delete the pre-existing master, even on verification failure.
-          if (exactUncommittedIdentity && creation.created && creation.event.etag) {
+          else if (exactUncommittedIdentity && creation.created && creation.event.etag) {
             try {
               await calendar.deleteEventIfUnchanged(nativeEvent.id, creation.event.etag);
               rollback = "deleted";
@@ -4284,54 +4320,74 @@ export class Synchronizer {
           await this.state.audit(delivery.profile, "todoist_phase_b_native_write_retryable", {
             taskId: phaseBTask.id, eventId: nativeEvent.id, reason, rollback,
           });
+          throw new SafeProviderReplayError(
+            `Calendar native write needs retry for Todoist task ${phaseBTask.id}: ${reason}`,
+          );
         };
         if (creation.created) {
           try { await this.state.recordMutation(delivery.profile); }
           catch {
-            await rejectCreatedMaster("provider_write_budget_record_failed");
-            return;
+            await rejectCreatedMaster("provider_write_budget_record_failed", true);
           }
         }
         let readback: CalendarEvent;
         let instances: CalendarEvent[];
         let active: CalendarEvent | undefined;
+        let explicitExceptions: CalendarEvent[];
         try {
           readback = await calendar.getEvent(nativeEvent.id);
           const windowEnd = addDays(nativePlan.anchor.start, 400);
-          const [observedInstances, explicitExceptions] = await Promise.all([
+          const [observedInstances, observedExceptions] = await Promise.all([
             calendar.listInstancesInWindow(nativeEvent.id,
               `${nativePlan.anchor.start}T00:00:00Z`, `${windowEnd}T00:00:00Z`),
             calendar.listExplicitSeriesExceptions(nativeEvent.id),
           ]);
           instances = observedInstances;
-          const verification = verifyInitialPhaseBCalendarWrite(nativePlan, task, {
-            master: readback, instances, explicitExceptions, exceptionInventoryComplete: true,
-            calendarTimeZone: verifiedCalendarTimeZone || "",
-          });
-          if (!verification.accepted) {
-            await rejectCreatedMaster(verification.reason);
-            return;
-          }
-          active = selectTodoistCurrentInstance(instances, task);
-          if (!active) {
-            await rejectCreatedMaster("active_instance_unresolved");
-            return;
-          }
+          explicitExceptions = observedExceptions;
         } catch {
-          await rejectCreatedMaster("provider_readback_failed");
-          return;
+          await rejectCreatedMaster("provider_readback_failed", true);
         }
+        const verification = verifyInitialPhaseBCalendarWrite(nativePlan, task, {
+          master: readback!, instances: instances!, explicitExceptions: explicitExceptions!, exceptionInventoryComplete: true,
+          calendarTimeZone: verifiedCalendarTimeZone || "",
+        });
+        if (!verification.accepted) {
+          const transientReadback = verification.reason === "calendar_master_or_instances_missing";
+          await rejectCreatedMaster(verification.reason, transientReadback);
+        }
+        active = selectTodoistCurrentInstance(instances!, task);
+        if (!active) await rejectCreatedMaster("active_instance_unresolved", true);
         const nextMapping: Mapping = {
-          profile: delivery.profile, eventId: readback.id, taskId: task.id,
-          projectId: task.project_id, recurrenceId: active.recurringEventId,
-          seriesId: task.id, masterEventId: readback.id,
-          activeInstanceId: active.id, originalStart: recurrenceOriginalStart(active),
-          activeEffectiveStart: eventEffectiveStart(active), todoistPhaseBVersion: 1,
+          profile: delivery.profile, eventId: readback!.id, taskId: task.id,
+          projectId: task.project_id, recurrenceId: active!.recurringEventId,
+          seriesId: task.id, masterEventId: readback!.id,
+          activeInstanceId: active!.id, originalStart: recurrenceOriginalStart(active!),
+          activeEffectiveStart: eventEffectiveStart(active!), todoistPhaseBVersion: 1,
           updatedAt: new Date().toISOString(),
         };
-        await this.persistProviderMapping(nextMapping);
+        let persistedMapping: Mapping;
+        let verifiedMaster: CalendarEvent;
+        try {
+          persistedMapping = await this.persistProviderMapping(nextMapping, projectCommentClient);
+          verifiedMaster = await calendar.getEvent(readback!.id);
+        } catch (error) {
+          throw new SafeProviderReplayError(
+            `Calendar and Todoist mapping readback needs retry for task ${task.id}`,
+            { cause: error },
+          );
+        }
+        const shared = verifiedMaster.extendedProperties?.shared || {};
+        if (verifiedMaster.id !== readback!.id || shared.taskId !== task.id || shared.syncTaskId !== task.id
+          || shared.syncProfile !== delivery.profile
+          || shared.syncCalendarId !== profiles[delivery.profile].calendarId
+          || shared.syncEventId !== readback!.id || shared.syncMasterEventId !== readback!.id
+          || shared.syncActiveInstanceId !== active!.id
+          || persistedMapping.taskId !== task.id || persistedMapping.eventId !== readback!.id
+          || persistedMapping.masterEventId !== readback!.id || persistedMapping.activeInstanceId !== active!.id) {
+          throw new SafeProviderReplayError(`Calendar and Todoist mapping readback needs retry for task ${task.id}`);
+        }
         return this.state.audit(delivery.profile, "todoist_phase_b_native_calendar_created", {
-          taskId: task.id, eventId: readback.id, activeInstanceId: active.id,
+          taskId: task.id, eventId: readback!.id, activeInstanceId: active!.id,
           family: nativePlan.family, rule: nativePlan.rule,
         });
       }

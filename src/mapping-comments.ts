@@ -469,40 +469,93 @@ export async function upsertProjectMappingComment(
 ): Promise<Mapping> {
   const projectIndex = index || await loadProjectMappingIndex(client, projectId);
   const stableSeries = mapping.seriesId || mapping.masterEventId;
-  const existing = stableSeries
-    ? projectIndex.parsed
-      .filter(entry => entry.payload.profile === mapping.profile && entry.payload.projectId === projectId
-        && (entry.payload.seriesId === stableSeries || entry.payload.masterEventId === stableSeries))
-      .sort(newest)[0]
-    : findProjectMappingComment(projectIndex, mapping);
+  const sameTask = (entries: ParsedMappingComment[]) => entries.filter(entry =>
+    entry.payload.profile === mapping.profile && entry.payload.projectId === projectId
+      && entry.payload.taskId === mapping.taskId).sort(newest);
+  const taskEntries = sameTask(projectIndex.parsed);
+  const seriesEntries = stableSeries
+    ? projectIndex.parsed.filter(entry => entry.payload.profile === mapping.profile
+      && entry.payload.projectId === projectId
+      && (entry.payload.seriesId === stableSeries || entry.payload.masterEventId === stableSeries)).sort(newest)
+    : [];
+  // Prefer the stable series comment, but reuse an exact same-task comment
+  // when a recreated counterpart has a new Calendar ID. This replaces stale
+  // machine metadata in place instead of leaving multiple apparent owners.
+  const existing = seriesEntries[0] || taskEntries[0] || findProjectMappingComment(projectIndex, mapping);
   if (existing?.payload.schemaVersion === 2) {
     const desired = parseMappingComment({
       id: existing.comment.id,
       content: serializeMappingComment(mapping, projectId, calendarUrl, existing.payload.mappingRevision),
     });
     if (desired && !("error" in desired)
-      && semanticallyEqualMappingPayload(existing.payload, desired.payload))
-      return mappingFromProjectMappingComment(existing);
+      && semanticallyEqualMappingPayload(existing.payload, desired.payload)) {
+      return verifyAndRetireDuplicateTaskMappings(client, mapping, projectId,
+        projectIndex, existing, desired.payload);
+    }
   }
   const revision = Math.max(mapping.mappingRevision || 0, existing?.payload.mappingRevision || 0) + 1;
   const draft: Mapping = { ...mapping, projectId, mappingRevision: revision, updatedAt: new Date().toISOString() };
   const comment = await client.upsertProjectComment(projectId, serializeMappingComment(draft, projectId, calendarUrl, revision), existing?.comment.id);
   const migrated = nextProjectCommentMapping(draft, projectId, comment.id, revision);
+  const expected = parseMappingComment({
+    id: comment.id,
+    content: serializeMappingComment(migrated, projectId, calendarUrl, revision),
+  });
+  if (!expected || "error" in expected) throw new Error("Unable to build expected provider mapping readback");
+  return verifyAndRetireDuplicateTaskMappings(client, mapping, projectId,
+    projectIndex, undefined, expected.payload, comment.id);
+}
 
-  const parsed = parseMappingComment({ ...comment, content: serializeMappingComment(migrated, projectId, calendarUrl, revision) });
-  if (parsed && !("error" in parsed)) {
-    projectIndex.parsed = projectIndex.parsed.filter((entry) => entry.comment.id !== comment.id);
-    for (const values of [projectIndex.byTaskId, projectIndex.byEventId, projectIndex.bySeriesId]) {
-      for (const [key, entries] of values.entries()) {
-        values.set(key, entries.filter((entry) => entry.comment.id !== comment.id));
-      }
-    }
-    projectIndex.parsed.push(parsed);
-    addIndex(projectIndex.byTaskId, parsed.payload.taskId, parsed);
-    addIndex(projectIndex.byEventId, parsed.payload.eventId, parsed);
-    addIndex(projectIndex.bySeriesId, parsed.payload.seriesId, parsed);
+async function verifyAndRetireDuplicateTaskMappings(
+  client: ProjectCommentClient,
+  mapping: Mapping,
+  projectId: string,
+  initialIndex: ProjectMappingIndex,
+  unchanged: ParsedMappingComment | undefined,
+  expected: ProjectMappingCommentPayload,
+  preferredCommentId?: string,
+): Promise<Mapping> {
+  let current = buildProjectMappingIndex(await client.listProjectComments(projectId, true));
+  const matching = current.parsed.filter(entry => entry.payload.profile === mapping.profile
+    && entry.payload.projectId === projectId && entry.payload.taskId === mapping.taskId
+    && semanticallyEqualMappingPayload(entry.payload, expected));
+  const canonical = matching.find(entry => entry.comment.id === (preferredCommentId || unchanged?.comment.id))
+    || matching.sort(newest)[0];
+  if (!canonical) throw new Error("Todoist project mapping write was not visible on provider readback");
+
+  const duplicates = sameTaskMappingEntries(current, mapping, projectId)
+    .filter(entry => entry.comment.id !== canonical.comment.id);
+  if (duplicates.length) {
+    for (const duplicate of duplicates) await client.deleteComment(duplicate.comment.id);
+    current = buildProjectMappingIndex(await client.listProjectComments(projectId, true));
   }
-  return migrated;
+  const remaining = sameTaskMappingEntries(current, mapping, projectId);
+  if (remaining.length !== 1 || remaining[0].comment.id !== canonical.comment.id
+    || !semanticallyEqualMappingPayload(remaining[0].payload, expected)) {
+    throw new Error("Todoist project mapping did not verify as the unique current task link");
+  }
+  // Keep the supplied index useful to callers that share it across sequential
+  // writes, while treating the provider readback above as authoritative.
+  if (initialIndex !== current) {
+    initialIndex.parsed = current.parsed;
+    initialIndex.malformed = current.malformed;
+    initialIndex.byTaskId.clear(); initialIndex.byEventId.clear(); initialIndex.bySeriesId.clear();
+    for (const entry of current.parsed) {
+      addIndex(initialIndex.byTaskId, entry.payload.taskId, entry);
+      addIndex(initialIndex.byEventId, entry.payload.eventId, entry);
+      addIndex(initialIndex.bySeriesId, entry.payload.seriesId, entry);
+    }
+  }
+  return mappingFromProjectMappingComment(remaining[0]);
+}
+
+function sameTaskMappingEntries(
+  index: ProjectMappingIndex,
+  mapping: Mapping,
+  projectId: string,
+): ParsedMappingComment[] {
+  return index.parsed.filter(entry => entry.payload.profile === mapping.profile
+    && entry.payload.projectId === projectId && entry.payload.taskId === mapping.taskId);
 }
 
 export function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, mapping: Mapping): boolean {
