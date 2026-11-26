@@ -39,9 +39,14 @@ test("recurring-to-one-off PATCH clears recurrence metadata and preserves unrela
     if (init.method === "PATCH") {
       const body = JSON.parse(init.body);
       assert.deepEqual(body.recurrence, []);
+      const mergedShared = { ...current.extendedProperties.shared };
+      for (const [key, value] of Object.entries(body.extendedProperties.shared)) {
+        if (value === null) delete mergedShared[key];
+        else mergedShared[key] = value;
+      }
       return Response.json({
         ...current, ...body, recurrence: undefined, etag: "etag-2",
-        extendedProperties: { ...current.extendedProperties, ...body.extendedProperties },
+        extendedProperties: { ...current.extendedProperties, ...body.extendedProperties, shared: mergedShared },
       });
     }
     return Response.json(current);
@@ -67,6 +72,7 @@ test("recurring-to-one-off PATCH clears recurrence metadata and preserves unrela
     "syncActiveEffectiveStart", "syncProgressVersion", "syncCompletedThrough", "syncTodoistPhaseBVersion",
     "todoistRecurrence", "todoistAnchorStart", "todoistAnchorEnd", "todoistAnchorAllDay",
     "todoistAnchorTimeZone", "todoistTemplateSummary", "todoistTemplateDescription", "todoistPhaseBVersion"]) {
+    assert.equal(JSON.parse(calls.find(call => call.init.method === "PATCH").init.body).extendedProperties.shared[key], null, `${key} must be explicitly cleared in the PATCH`);
     assert.equal(converted.extendedProperties.shared[key], undefined, `${key} must not survive recurrence removal`);
   }
   assert.equal(calls.filter((call) => call.init.method === "PATCH").length, 1);
