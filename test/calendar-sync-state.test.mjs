@@ -156,7 +156,7 @@ test("notification racing the final completion compare-and-swap cannot be cleare
   assert.equal(row.calendarSyncState, "pending");
 });
 
-test("duplicate notifications are coalesced and watch rotation preserves dirty work", async t => {
+test("duplicate notifications and live dispatch claims are coalesced; watch rotation preserves dirty work", async t => {
   const rows = stateDb(t);
   const repo = new StateRepository();
   const first = await repo.markCalendarWatchNotification("antonio", "t1", "old-channel", "10");
@@ -167,8 +167,13 @@ test("duplicate notifications are coalesced and watch rotation preserves dirty w
   const claim = await repo.claimCalendarSyncDispatch("antonio");
   assert.equal(claim, first + 1);
   assert.equal(await repo.claimCalendarSyncDispatch("antonio"), undefined);
+  assert.equal(await repo.calendarSyncAlreadyHandled("antonio"), true,
+    "a live dispatch lease plus the durable generation prevents retry storms");
+  [...rows.values()][0].calendarSyncLeaseUntil = 0;
   assert.equal(await repo.calendarSyncAlreadyHandled("antonio"), false,
-    "an unconfirmed dispatch claim must not cause ingress to acknowledge a notification");
+    "an expired dispatch claim is no longer sufficient admission evidence");
+  assert.equal(await repo.calendarSyncDispatchDue("antonio"), true,
+    "the dispatcher recovers the dirty generation after an abandoned claim expires");
   assert.equal([...rows.values()][0].calendarSyncGeneration, first + 1);
 });
 

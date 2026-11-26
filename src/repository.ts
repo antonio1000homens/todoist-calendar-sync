@@ -411,6 +411,11 @@ export class StateRepository {
     const state = await this.getCalendarSyncState(profile);
     const generation = state.generation || 0;
     return state.state === "queued" || state.state === "running"
+      // A concurrent ingress may observe the dispatcher's short claim before
+      // its SQS send is confirmed. The durable generation plus this live lease
+      // is enough to acknowledge: the dispatcher recovers an abandoned claim
+      // after expiry, and a send failure releases it back to pending.
+      || state.state === "dispatching" && (state.leaseUntil || 0) > Date.now()
       || generation > 0 && generation <= (state.completedGeneration || 0)
       || generation > 0 && generation <= (state.failedGeneration || 0);
   }
