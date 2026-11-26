@@ -25,7 +25,7 @@ import { normalizedDescription, normalizedText } from "./security.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, startsMatch, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
-import { todoistRecurrenceKey, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { normalizedRecurrenceRule, todoistRecurrenceKey, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -61,17 +61,6 @@ function candidateLimit(): number {
 
 function taskComment(event: CalendarEvent): string {
   return `todoist-calendar-sync\ncalendarEventId=${event.id}\ncalendarUrl=${event.htmlLink || ""}`;
-}
-
-function normalizedRecurrenceRule(rule: string | undefined): string | undefined {
-  if (!rule?.startsWith("RRULE:")) return undefined;
-  const fields = rule.slice("RRULE:".length).split(";").map(field => {
-    const [key, ...parts] = field.split("=");
-    const value = parts.join("=").toUpperCase();
-    if (key.toUpperCase() === "INTERVAL" && value === "1") return undefined;
-    return `${key.toUpperCase()}=${value.split(",").sort().join(",")}`;
-  }).filter((field): field is string => Boolean(field)).sort();
-  return `RRULE:${fields.join(";")}`;
 }
 
 function todoistTaskMatchesCalendarRecurrence(master: CalendarEvent, task: TodoistTask): boolean {
