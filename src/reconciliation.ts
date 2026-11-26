@@ -13,7 +13,7 @@ import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { isMutationBudgetExhausted } from "./mutation-budget.js";
 import { ReconciliationItemError, reconciliationFailureDetails, type ReconciliationFailureContext } from "./reconciliation-diagnostics.js";
 import { normalizedText } from "./security.js";
-import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
+import { compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask } from "./cancelled-mapping-recovery-policy.js";
 import { logEvent } from "./observability.js";
@@ -1136,6 +1136,7 @@ export class SnapshotReconciler {
       return "created";
     }
     let existing: CalendarEvent | undefined;
+    let discoveredCandidate: Awaited<ReturnType<typeof discoverCompatibleCalendarCandidates>>[number] | undefined;
     try {
       existing = await clients.calendar.findByTodoistTaskId(task.id);
     } catch (error) {
@@ -1148,15 +1149,17 @@ export class SnapshotReconciler {
     }
     if (!existing && typeof clients.calendar.listDelta === "function") {
       const inventory = calendarInventory || (await clients.calendar.listDelta()).items;
-      const compatible = inventory.filter(event =>
-        event.status !== "cancelled" && hasCanonicalState(event, task));
-      if (compatible.length === 1) existing = compatible[0];
-      else if (compatible.length > 1) {
+      const compatible = await discoverCompatibleCalendarCandidates(task, inventory, clients.calendar);
+      if (compatible.length > 1) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_unmapped_ambiguous", {
-          taskId: task.id, candidateEventIds: compatible.map(event => event.id).sort(),
+          taskId: task.id, candidateEventIds: compatible.map(candidate => candidate.master.id).sort(),
           reason: "multiple_exact_compatible_calendar_events",
         });
         return "conflict";
+      }
+      if (compatible.length === 1) {
+        discoveredCandidate = compatible[0];
+        existing = discoveredCandidate.master;
       }
     }
     // A cancelled provider object is the deletion evidence. A later live
@@ -1206,14 +1209,61 @@ export class SnapshotReconciler {
 
     if (existing && existing.status !== "cancelled") {
       const synchronizer = new Synchronizer(this.state, undefined, async () => clients);
-      const byComment = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
+      if (discoveredCandidate) {
+        const refreshed = await discoverCompatibleCalendarCandidates(task, [discoveredCandidate.master], clients.calendar);
+        if (refreshed.length !== 1 || refreshed[0].master.id !== discoveredCandidate.master.id
+          || refreshed[0].event.id !== discoveredCandidate.event.id) {
+          await this.state.audit(profile, "todoist_snapshot_reconcile_candidate_changed", {
+            taskId: task.id, candidateEventIds: [discoveredCandidate.master.id, discoveredCandidate.event.id],
+          });
+          return "conflict";
+        }
+        discoveredCandidate = refreshed[0];
+        existing = discoveredCandidate.master;
+      }
+      const identityIds = discoveredCandidate
+        ? [...new Set([discoveredCandidate.master.id, discoveredCandidate.event.id])]
+        : [existing.id];
+      const identityOwners = await synchronizer.providerMappingsForCalendarIdentity(profile, identityIds, clients.todoist);
+      const conflictingOwners = discoveredCandidate
+        ? compatibleCalendarCandidateOwnerConflicts(discoveredCandidate, identityOwners, task.id, profile)
+        : identityOwners.filter(owner => owner.taskId !== task.id).map(owner => owner.taskId);
       const byCalendar = synchronizer.mappingFromCalendarCorrelation(profile, existing);
+      if (conflictingOwners.length || byCalendar && byCalendar.taskId !== task.id) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
+          taskId: task.id, eventId: existing.id,
+          ownerTaskId: conflictingOwners[0] || byCalendar?.taskId,
+        });
+        return "conflict";
+      }
+      const byComment = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
       const correlation = byComment || byCalendar;
       if ((byComment && byComment.taskId !== task.id) || (byCalendar && byCalendar.taskId !== task.id)) {
         await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
           taskId: task.id, eventId: existing.id, ownerTaskId: correlation?.taskId,
         });
         return "conflict";
+      }
+      if (discoveredCandidate) {
+        const discovered: Mapping = discoveredCandidate.master.recurrence?.length
+          ? { profile, eventId: discoveredCandidate.master.id, taskId: task.id,
+            projectId: profiles[profile].todoistProjectId, seriesId: task.id,
+            masterEventId: discoveredCandidate.master.id, activeInstanceId: discoveredCandidate.event.id,
+            originalStart: discoveredCandidate.event.originalStartTime?.dateTime
+              || discoveredCandidate.event.originalStartTime?.date
+              || discoveredCandidate.event.start?.dateTime || discoveredCandidate.event.start?.date,
+            activeEffectiveStart: discoveredCandidate.event.start?.dateTime || discoveredCandidate.event.start?.date,
+            updatedAt: new Date().toISOString() }
+          : { profile, eventId: discoveredCandidate.event.id, taskId: task.id,
+            projectId: profiles[profile].todoistProjectId, updatedAt: new Date().toISOString() };
+        const persisted = await this.persistProviderMapping(discovered, clients);
+        await this.persistReconciliationBaseline(persisted, task, discoveredCandidate.event, clients);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_provider_pair_recovered", {
+          taskId: task.id, eventId: discoveredCandidate.event.id,
+          masterEventId: discoveredCandidate.master.id,
+          tieBreak: "unique_exact_compatible_match",
+        });
+        return "baseline";
       }
       if (correlation?.taskId === task.id) {
         if (hasCanonicalState(existing, task)) {

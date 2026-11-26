@@ -35,13 +35,23 @@ class State {
   async recordRecurrence(){}
   async audit(profile,action,detail){this.audits.push({profile,action,detail});}
 }
-function setup(family, {currentDue, oldProjectId, flag=true}={}) {
+function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:added", incompleteInventory=false,
+  conflictingMaster=false}={}) {
   const task={id:`worker-route-${family.name.replaceAll(" ","-")}`,
     content:`Verify ${family.name}`,description:"",project_id:projectId,
     updated_at:updatedAt,due:{date:family.due,string:family.phrase,is_recurring:true}};
   const current=structuredClone(task);
   if(currentDue)current.due.date=currentDue;
   const events=new Map(),writes=[],normal=[],reads=[],state=new State();
+  if(conflictingMaster)events.set("conflicting-calendar-series",{
+    id:"conflicting-calendar-series",status:"confirmed",summary:task.content,description:task.description,
+    start:{date:family.due},end:{date:family.due},recurrence:["RRULE:FREQ=DAILY"],
+  });
+  if(conflictingMaster)events.set("instance-0",{
+    id:"instance-0",status:"confirmed",summary:task.content,description:task.description,
+    recurringEventId:"conflicting-calendar-series",originalStartTime:{date:family.due},
+    start:{date:family.due},end:{date:family.due},
+  });
   const projectComments=[];
   const instances=family.dates.map((date,index)=>{
     const end=new Date(date+"T00:00:00Z");end.setUTCDate(end.getUTCDate()+1);
@@ -49,6 +59,7 @@ function setup(family, {currentDue, oldProjectId, flag=true}={}) {
       originalStartTime:{date},start:{date},end:{date:end.toISOString().slice(0,10)}};
   });
   const calendar={
+    ...(incompleteInventory?{}:{async listDelta(){return {items:[...events.values()]};}}),
     async findByTodoistTaskId(id){return [...events.values()].find(e=>e.extendedProperties?.shared?.taskId===id);},
     async getTimeZone(){return "Europe/London";},
     async getEvent(id){const found=events.get(id);if(found)return structuredClone(found);const e=new Error("not found");e.status=404;throw e;},
@@ -94,7 +105,7 @@ function setup(family, {currentDue, oldProjectId, flag=true}={}) {
   const sync=new OrphanRecoveringSynchronizer(state,undefined,clients,identities);
   const delivery={kind:"todoist",profile:"home",mode:"aws",id:"worker-item-added",
     receivedAt,headers:{},body:JSON.stringify({
-      event_name:"item:added",event_data:task,
+    event_name:eventName,event_data:task,
       ...(oldProjectId?{event_data_extra:{old_item:{...task,project_id:oldProjectId}}}:{}),
     })};
   return {sync,task,current,events,writes,normal,reads,state,delivery};
@@ -132,6 +143,57 @@ test("supported new recurrence is admitted without a deployment feature flag",()
   assert.equal(f.writes.length,1);
   assert.equal(f.normal.length,0);
   assert.equal(f.state.mapping.todoistPhaseBVersion,1);
+}));
+test("normal reconciliation repairs an existing supported recurring Todoist task",()=>withGate(true,async()=>{
+  const f=setup(fixtures[2],{eventName:"item:updated"});
+  f.delivery.headers={"x-todoist-calendar-sync-reconcile":"true"};
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  await f.sync.process(f.delivery);
+  assert.equal(f.writes.length,1);
+  assert.equal(f.writes[0].recurrence[0],fixtures[2].rrule);
+  assert.equal(f.state.mapping.taskId,f.task.id);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
+  await f.sync.process({...f.delivery,id:"second-reconciliation-pass"});
+  assert.equal(f.writes.length,1,"second reconciliation must converge without another master");
+}));
+test("reconciliation repairs a fixed annual task after unsupported creation syntax is corrected",()=>withGate(true,async()=>{
+  const annual={name:"fixed June 11 annual",phrase:"every June 11",due:"2027-06-11",
+    rrule:"RRULE:FREQ=YEARLY;BYMONTHDAY=11;BYMONTH=6",
+    dates:["2027-06-11","2028-06-11","2029-06-11"]};
+  const unsupported={...annual,phrase:"every June 11 starting 2027-06-11"};
+  const f=setup(unsupported,{eventName:"item:added"});
+  await f.sync.process(f.delivery);
+  assert.equal(f.writes.length,0,"unsupported initial syntax must remain unprojected");
+  f.current.due.string=annual.phrase;
+  f.delivery.id="corrected-item-updated";
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.current,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  f.delivery.headers={"x-todoist-calendar-sync-reconcile":"true"};
+  await f.sync.process(f.delivery);
+  assert.equal(f.writes.length,1);
+  assert.equal(f.writes[0].recurrence[0],annual.rrule);
+  assert.equal(f.state.mapping.taskId,f.task.id);
+  assert.equal(f.state.mapping.originalStart,annual.due);
+  await f.sync.process({...f.delivery,id:"annual-reconciliation-replay"});
+  assert.equal(f.writes.length,1);
+}));
+test("update repair does not create when complete Calendar inventory is unavailable",()=>withGate(true,async()=>{
+  const f=setup(fixtures[2],{eventName:"item:updated",incompleteInventory:true});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  await f.sync.process(f.delivery);
+  assert.equal(f.writes.length,0);
+  assert.equal(f.normal.length,0);
+}));
+test("update repair refuses an incompatible series already occupying the current occurrence",()=>withGate(true,async()=>{
+  const f=setup(fixtures[2],{eventName:"item:updated",conflictingMaster:true});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,
+    event_data_extra:{old_item:structuredClone(f.task)}});
+  await f.sync.process(f.delivery);
+  assert.equal(f.writes.length,0);
+  assert.equal(f.normal.length,0);
+  assert.equal(f.state.audits.at(-1).action,"todoist_provider_pair_conflict");
 }));
 test("initial item:added signature and fresh GET remain independent: changed due stays unmirrored",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{currentDue:"2027-04-10"});

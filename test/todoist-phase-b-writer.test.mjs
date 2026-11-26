@@ -36,7 +36,7 @@ class State {
 }
 function setup({exception=false, lookupExisting=false, missingVersion=false,
   changedBeforeRollback=false, rollbackFailure=false, createdConflict=false,
-  unconfirmedCreation=false, sourceTask=task}={}){
+  unconfirmedCreation=false, sourceTask=task, eventName="item:added"}={}){
   const state=new State(), instances=["2027-01-10","2027-04-10","2027-07-10"].map((d,i)=>eventInstance(`phase-b-instance-${i}`,d));
   const projectComments=[];
   const master={id:"phase-b-master",etag:"etag-1",status:"confirmed",summary:task.content,description:task.description,
@@ -47,6 +47,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
   const events=new Map([[master.id,master]]), creates=[], upserts=[], deletes=[];
   let taskExists=true;
   const calendar={
+    async listDelta(){return {items:[]};},
     async findByTodoistTaskId(){return lookupExisting ? [...events.values()].find(
       e=>e.extendedProperties?.shared?.taskId===task.id) : undefined;},
     async getTimeZone(){return "Europe/London";},
@@ -101,7 +102,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
   };
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
   const delivery={id:"phase-b-item-added",kind:"todoist",profile:"home",mode:"aws",receivedAt:"2026-11-09T12:00:00Z",
-    headers:{},body:JSON.stringify({event_name:"item:added",event_data:task})};
+    headers:{},body:JSON.stringify({event_name:eventName,event_data:task})};
   return {state,calendar,sync,delivery,creates,upserts,deletes,events,projectComments,
     deleteSourceTask(){taskExists=false;}};
 }
@@ -142,6 +143,20 @@ test("supported recurrence uses native Calendar creation without a feature flag"
   assert.equal(f.state.mapping.recurrenceOwner,undefined);
   assert.equal(f.state.mapping.todoistPhaseBVersion,1);
   assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
+}));
+test("supported recurring item:updated self-heals a missing Calendar counterpart exactly once",()=>withGate(true,async()=>{
+  const repaired={...task,updated_at:"2026-11-09T11:59:30Z"};
+  const f=setup({sourceTask:repaired,eventName:"item:updated"});
+  f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:repaired,
+    event_data_extra:{update_intent:"item_updated"}});
+  await f.sync.process(f.delivery);
+  assert.equal(f.creates.length,1);
+  assert.equal(f.creates[0].start.date,"2027-01-10");
+  assert.equal(f.creates[0].recurrence[0],"RRULE:FREQ=MONTHLY;INTERVAL=3");
+  assert.equal(f.state.mapping.taskId,repaired.id);
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
+  await f.sync.process({...f.delivery,id:"repair-reconciliation-replay"});
+  assert.equal(f.creates.length,1,"repeated repair must reuse the verified provider pair");
 }));
 
 test("recurrence outside the native admission families is not flattened into a one-off Calendar event",()=>withGate(true,async()=>{
