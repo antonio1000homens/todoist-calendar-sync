@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Todoist } from "../dist/providers.js";
+import { Todoist, withTodoistInventoryScope } from "../dist/providers.js";
 
 test("Todoist completion rereads the exact task and issues one idempotent close command",async()=>{
   const originalFetch=globalThis.fetch,calls=[];
@@ -147,4 +147,52 @@ test("Todoist maintenance requests are paced across concurrent callers",async t=
   await Promise.all([todoist.getTask("task-1"),secondClient.getTask("task-2")]);
   assert.equal(starts.length,2);
   assert.ok(starts[1]-starts[0]>=20,"concurrent migration reads reserve distinct paced slots");
+});
+
+test("comparison task evidence deduplicates exact reads and 404 across clients, but fresh reads bypass it", async () => {
+  const originalFetch = globalThis.fetch;
+  let reads = 0;
+  globalThis.fetch = async url => {
+    reads++;
+    return url.endsWith("/missing") ? new Response("missing",{status:404}) : Response.json({id:"live",content:"task"});
+  };
+  try {
+    await withTodoistInventoryScope(async () => {
+      const a = new Todoist("528-comparison"), b = new Todoist("528-comparison");
+      await Promise.all([a.getTask("live",false),b.getTask("live",false)]);
+      assert.equal(reads,1);
+      for (const client of [a,b]) await assert.rejects(client.getTask("missing",false),{status:404});
+      assert.equal(reads,2);
+      await a.getTask("live");
+      assert.equal(reads,3);
+    });
+    await withTodoistInventoryScope(() => new Todoist("528-comparison").getTask("live",false));
+    assert.equal(reads,4);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("fresh project comment verification bypasses scoped write-through after lost response", async () => {
+  const originalFetch = globalThis.fetch;
+  let reads = 0, content = "old";
+  globalThis.fetch = async (url,init={}) => {
+    if (url.endsWith("/sync")) return Response.json({});
+    if (init.method === "POST") {
+      content = "external replacement";
+      throw new Error("response lost");
+    }
+    reads++;
+    return Response.json({results:[{id:"comment",project_id:"project",content}],next_cursor:null});
+  };
+  try {
+    await withTodoistInventoryScope(async () => {
+      const a = new Todoist("528-lost-comment"), b = new Todoist("528-lost-comment");
+      assert.equal((await a.listProjectComments("project"))[0].content,"old");
+      await assert.rejects(a.updateComment("comment","new"),/response lost/);
+      assert.equal((await b.listProjectComments("project"))[0].content,"external replacement");
+      assert.equal(reads,2);
+      content = "changed again";
+      assert.equal((await a.listProjectComments("project",true))[0].content,"changed again");
+      assert.equal(reads,3);
+    });
+  } finally { globalThis.fetch = originalFetch; }
 });

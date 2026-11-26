@@ -516,12 +516,17 @@ async function verifyAndRetireDuplicateTaskMappings(
   expected: ProjectMappingCommentPayload,
   preferredCommentId?: string,
 ): Promise<Mapping> {
+  // A single canonical entry in the operation's complete inventory is a
+  // read-only no-op. Actual writes and duplicate retirement require independent
+  // provider evidence, never the write-through inventory.
+  if (unchanged && sameTaskMappingEntries(initialIndex, mapping, projectId).length === 1)
+    return mappingFromProjectMappingComment(unchanged);
   let current = buildProjectMappingIndex(await client.listProjectComments(projectId, true));
   const matching = current.parsed.filter(entry => entry.payload.profile === mapping.profile
     && entry.payload.projectId === projectId && entry.payload.taskId === mapping.taskId
     && semanticallyEqualMappingPayload(entry.payload, expected));
   const canonical = matching.find(entry => entry.comment.id === (preferredCommentId || unchanged?.comment.id))
-    || matching.sort(newest)[0];
+    || (!preferredCommentId ? matching.sort(newest)[0] : undefined);
   if (!canonical) throw new Error("Todoist project mapping write was not visible on provider readback");
 
   const duplicates = sameTaskMappingEntries(current, mapping, projectId)

@@ -366,7 +366,7 @@ export class SnapshotReconciler {
         : await this.state.listMappings?.(profile) || [];
     }
     const providerMappings = buildProjectMappingIndex(
-      await client.listProjectComments(profiles[profile].todoistProjectId, true),
+      await client.listProjectComments(profiles[profile].todoistProjectId),
     ).parsed
       .filter(entry => entry.payload.profile === profile
         && entry.payload.projectId === profiles[profile].todoistProjectId)

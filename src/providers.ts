@@ -15,6 +15,8 @@ const MAX_TODOIST_INVENTORY_RESPONSE_BYTES=16*1024*1024;
 type TodoistInventoryScope = {
   comments: Map<string, Promise<TodoistCommentRecord[]>>;
   tasks: Map<string, Promise<TodoistTask[]>>;
+  exactTasks: Map<string, Promise<TodoistTask>>;
+  mappingIndexes: Map<string, Promise<ReturnType<typeof buildProjectMappingIndex>>>;
   timeZones: Map<string, Promise<string>>;
   snapshots: Map<string, Promise<Awaited<ReturnType<Todoist["listAllTaskCommentsForErasureAudit"]>> | undefined>>;
 };
@@ -23,7 +25,7 @@ const todoistInventoryScope = new AsyncLocalStorage<TodoistInventoryScope>();
 /** Share provider inventories across clients for one bounded sync operation. */
 export function withTodoistInventoryScope<T>(operation: () => Promise<T>): Promise<T> {
   if (todoistInventoryScope.getStore()) return operation();
-  return todoistInventoryScope.run({ comments: new Map(), tasks: new Map(), timeZones: new Map(), snapshots: new Map() }, operation);
+  return todoistInventoryScope.run({ comments: new Map(), tasks: new Map(), exactTasks: new Map(), mappingIndexes: new Map(), timeZones: new Map(), snapshots: new Map() }, operation);
 }
 
 /** Stable non-secret key for coordinating cooldowns across profile tokens. */
@@ -359,8 +361,12 @@ export class GoogleCalendar {
         return await responseJson<T>(await fetchProvider(`${CALENDAR_ROOT}${path}`, { ...init, headers },this.requestOptions));
       } catch (error) {
         const name = (error as { name?: string })?.name;
-        if (name === "AbortError" || name === "TimeoutError") throw error;
         const status = Number((error as { status?: number }).status);
+        if (!readOnly && (!Number.isFinite(status) || status === 0 || status === 408 || status >= 500)) {
+          this.invalidateScopedTaskInventories();
+          this.invalidateScopedCommentInventories();
+        }
+        if (name === "AbortError" || name === "TimeoutError") throw error;
         const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
         const transient = !status || status === 408 || status === 429 || status >= 500;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
@@ -920,16 +926,11 @@ export class Todoist {
           Number((error as { status?: number }).status) || httpStatus, false);
         const name=(error as {name?:string})?.name;
         const status = Number((error as { status?: number }).status);
-        if (!readOnly && (status === 0 || status >= 500)) {
-          if (comments) {
-            this.projectCommentCache.clear();
-            const scope = todoistInventoryScope.getStore();
-            if (scope) {
-              const prefix = `${this.pacingKey}:`;
-              for (const key of scope.comments.keys()) if (key.startsWith(prefix)) scope.comments.delete(key);
-              scope.snapshots.delete(this.pacingKey);
-            }
-          } else if (path.startsWith("/tasks")) this.invalidateScopedTaskInventories();
+        // An absent status (including a lost response or JSON parse failure) is
+        // not a confirmed rejection. Never reuse evidence across uncertain writes.
+        if (!readOnly && (!Number.isFinite(status) || status === 0 || status === 408 || status >= 500)) {
+          if (comments) this.invalidateScopedCommentInventories();
+          else if (path.startsWith("/tasks")) this.invalidateScopedTaskInventories();
         }
         if(name==="AbortError"||name==="TimeoutError")throw error;
         if (status === 429) {
@@ -1002,6 +1003,7 @@ export class Todoist {
     const scope = todoistInventoryScope.getStore();
     if (!scope) return;
     const prefix = `${this.pacingKey}:`;
+    for (const key of scope.mappingIndexes.keys()) if (key.startsWith(prefix)) scope.mappingIndexes.delete(key);
     for (const [key, pending] of scope.comments) {
       if (!key.startsWith(prefix)) continue;
       const comments = await pending;
@@ -1036,6 +1038,9 @@ export class Todoist {
     const result = await this.syncRequest<{ sync_status?: Record<string, unknown> }>(body);
     const status = result.sync_status?.[commandUuid];
     if (status !== "ok") {
+      // Missing/malformed command status cannot establish whether a write applied.
+      this.invalidateScopedTaskInventories();
+      this.invalidateScopedCommentInventories();
       throw new Error(`Todoist sync command ${type} failed: ${JSON.stringify(status)}`);
     }
     if (type.startsWith("item_")) this.invalidateScopedTaskInventories();
@@ -1046,6 +1051,17 @@ export class Todoist {
     if (!scope) return;
     const prefix = `${this.pacingKey}:`;
     for (const key of scope.tasks.keys()) if (key.startsWith(prefix)) scope.tasks.delete(key);
+    for (const key of scope.exactTasks.keys()) if (key.startsWith(prefix)) scope.exactTasks.delete(key);
+    scope.snapshots.delete(this.pacingKey);
+  }
+
+  private invalidateScopedCommentInventories(): void {
+    this.projectCommentCache.clear();
+    const scope = todoistInventoryScope.getStore();
+    if (!scope) return;
+    const prefix = `${this.pacingKey}:`;
+    for (const key of scope.comments.keys()) if (key.startsWith(prefix)) scope.comments.delete(key);
+    for (const key of scope.mappingIndexes.keys()) if (key.startsWith(prefix)) scope.mappingIndexes.delete(key);
     scope.snapshots.delete(this.pacingKey);
   }
 
@@ -1237,8 +1253,29 @@ export class Todoist {
     return loading;
   }
 
-  async getTask(taskId: string): Promise<TodoistTask> {
-    return this.request<TodoistTask>(`/tasks/${encodeURIComponent(taskId)}`);
+  /** Default to an independent exact read for mutation and verification callers.
+   * Opt in to operation-local evidence only for ordinary comparisons. */
+  async getTask(taskId: string, refresh = true): Promise<TodoistTask> {
+    const scope = todoistInventoryScope.getStore();
+    const key = `${this.pacingKey}:${taskId}`;
+    if (!refresh) {
+      const pending = scope?.exactTasks.get(key);
+      if (pending) return structuredClone(await pending);
+    }
+    const loading = this.request<TodoistTask>(`/tasks/${encodeURIComponent(taskId)}`).then(task => {
+      if (!task || task.id !== taskId) throw new Error("Todoist task readback did not match the exact task ID");
+      return task;
+    });
+    if (scope) {
+      scope.exactTasks.set(key, loading);
+      // Only positive evidence and exact HTTP 404 are reusable. Never retain
+      // quota, authorization, timeout or transient failures as absence.
+      void loading.catch(error => {
+        if (Number((error as {status?:number}).status) !== 404
+          && scope.exactTasks.get(key) === loading) scope.exactTasks.delete(key);
+      });
+    }
+    return structuredClone(await loading);
   }
 
   /**
@@ -1374,11 +1411,13 @@ export class Todoist {
     const scope = todoistInventoryScope.getStore();
     const scopeKey = `${this.pacingKey}:${projectId}`;
     const scoped = scope?.comments.get(scopeKey);
-    if (scoped) return (await scoped).map(comment => ({ ...comment }));
+    if (scoped && !refresh) return (await scoped).map(comment => ({ ...comment }));
+    // Never fall back to a previous operation's local cache in a scoped read.
     const cached = this.projectCommentCache.get(projectId);
-    if (cached && !refresh) return cached.slice();
+    if (!scope && cached && !refresh) return cached.slice();
+    if (refresh) scope?.mappingIndexes.delete(scopeKey);
     const loading = (async () => {
-      const snapshot = scope ? await this.operationSnapshot() : undefined;
+      const snapshot = scope && !refresh ? await this.operationSnapshot() : undefined;
       if (snapshot?.projectIds.includes(projectId))
         return snapshot.projectComments.filter(comment => comment.project_id === projectId);
       return listTodoistCommentPages(async cursor=>{
@@ -1388,9 +1427,27 @@ export class Todoist {
       },"project");
     })();
     if (scope) scope.comments.set(scopeKey, loading);
-    const comments = await loading;
-    this.projectCommentCache.set(projectId, comments.slice());
-    return comments;
+    try {
+      const comments = await loading;
+      this.projectCommentCache.set(projectId, comments.slice());
+      return comments.map(comment => ({ ...comment }));
+    } catch (error) {
+      if (scope?.comments.get(scopeKey) === loading) scope.comments.delete(scopeKey);
+      throw error;
+    }
+  }
+
+  async getProjectMappingIndex(projectId: string): Promise<ReturnType<typeof buildProjectMappingIndex>> {
+    const scope = todoistInventoryScope.getStore();
+    const key = `${this.pacingKey}:${projectId}`;
+    const pending = scope?.mappingIndexes.get(key);
+    if (pending) return pending;
+    const loading = this.listProjectComments(projectId).then(buildProjectMappingIndex);
+    scope?.mappingIndexes.set(key, loading);
+    void loading.catch(() => {
+      if (scope?.mappingIndexes.get(key) === loading) scope.mappingIndexes.delete(key);
+    });
+    return loading;
   }
 
   /**

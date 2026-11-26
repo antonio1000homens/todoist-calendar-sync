@@ -898,7 +898,7 @@ export class Synchronizer {
       }
       next = { ...next, syncBaseline: providerSyncBaseline(baselineTask, active || event, master || event) };
     }
-    const projectIndex = buildProjectMappingIndex(await commentClient.listProjectComments(projectId!, true));
+    const projectIndex = buildProjectMappingIndex(await commentClient.listProjectComments(projectId!));
     const stableSeries = next.seriesId || next.masterEventId;
     const existingSeriesMappings = stableSeries && projectIndex
       ? projectIndex.parsed.filter(entry => entry.payload.profile === next.profile
@@ -1203,8 +1203,11 @@ export class Synchronizer {
   }
 
   private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
-    const comments = await todoist.listProjectComments(profiles[profile].todoistProjectId);
-    return buildProjectMappingIndex(comments).parsed
+    const projectId = profiles[profile].todoistProjectId;
+    const index = typeof todoist.getProjectMappingIndex === "function"
+      ? await todoist.getProjectMappingIndex(projectId)
+      : buildProjectMappingIndex(await todoist.listProjectComments(projectId));
+    return index.parsed
       .filter(entry => entry.payload.profile === profile
         && entry.payload.projectId === profiles[profile].todoistProjectId)
       .map(mappingFromProjectMappingComment);
@@ -1727,7 +1730,7 @@ export class Synchronizer {
     };
     const { calendar, todoist } = await this.clients(profile);
     const projectId = profiles[profile].todoistProjectId;
-    const projectComments = await todoist.listProjectComments(projectId, true);
+    const projectComments = await todoist.listProjectComments(projectId);
     const providerMappings = buildProjectMappingIndex(projectComments).parsed
       .filter(entry => entry.payload.profile === profile && entry.payload.projectId === projectId)
       .sort((a, b) => a.payload.taskId.localeCompare(b.payload.taskId)
@@ -1976,11 +1979,9 @@ export class Synchronizer {
       });
       return;
     }
-    const projectComments=delta.items.length
-      ?await todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true):[];
     for (const event of delta.items) {
       try {
-        await this.applyCalendarEvent(delivery, event, calendar, todoist,projectComments);
+        await this.applyCalendarEvent(delivery, event, calendar, todoist);
       } catch (error) {
         if (error instanceof ReconciliationItemError) throw error;
         throw new ReconciliationItemError(error, {
@@ -1997,7 +1998,7 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar,
-    todoist: Todoist,projectComments:Awaited<ReturnType<Todoist["listProjectComments"]>>): Promise<void> {
+    todoist: Todoist): Promise<void> {
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any provider mutation.
@@ -2033,7 +2034,10 @@ export class Synchronizer {
       }
     }
     let ownershipEvent = event;
-    const projectMappingIndex = buildProjectMappingIndex(projectComments);
+    const projectId = profiles[delivery.profile].todoistProjectId;
+    const projectMappingIndex = typeof todoist.getProjectMappingIndex === "function"
+      ? await todoist.getProjectMappingIndex(projectId)
+      : buildProjectMappingIndex(await todoist.listProjectComments(projectId));
     const providerCandidates = projectMappingIndex.parsed.filter(entry =>
       entry.payload.profile === delivery.profile
       && entry.payload.projectId === profiles[delivery.profile].todoistProjectId
@@ -2534,11 +2538,12 @@ export class Synchronizer {
     if (event.status && event.status !== "confirmed") return;
 
     let task: TodoistTask | undefined;
+    const mappedTaskId = mapping?.taskId;
     if (mapping) {
-      try { task = await todoist.getTask(mapping.taskId); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; mapping = undefined; }
+      try { task = await todoist.getTask(mapping.taskId, false); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; mapping = undefined; }
     }
-    if (!task && linkedTaskId) {
-      try { task = await todoist.getTask(linkedTaskId); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; }
+    if (!task && linkedTaskId && linkedTaskId !== mappedTaskId) {
+      try { task = await todoist.getTask(linkedTaskId, false); } catch (error) { if ((error as { status?: number }).status !== 404) throw error; }
     }
     if (!task && !mapping && !linkedTaskId) {
       const candidates = compatibleTodoistOneOffCandidatesForCalendar(event,
@@ -2567,7 +2572,26 @@ export class Synchronizer {
       }
     }
     const policyCandidate = task;
-    if (task) {
+    // A fully bound standalone pair can prove identity in its own project.
+    // Legacy, moved, ambiguous, recurring and partially linked pairs retain
+    // the existing cross-profile discovery and guarded repair paths.
+    const shared = event.extendedProperties?.shared || {};
+    const taskEntries = task ? projectMappingIndex.byTaskId.get(task.id) || [] : [];
+    const exactLocalPair = Boolean(task && mapping && !event.recurringEventId && !event.recurrence?.length
+      && !task.due?.is_recurring && !task.is_deleted && !task.is_completed && !task.completed_at
+      && !mapping.masterEventId && !mapping.seriesId && !mapping.activeInstanceId
+      && task.project_id === projectId && mapping.projectId === projectId
+      && mapping.calendarId === profiles[delivery.profile].calendarId
+      && mapping.taskId === task.id && mapping.eventId === event.id
+      && taskEntries.length === 1 && taskEntries[0].payload.schemaVersion === 2
+      && taskEntries[0].comment.id === mapping.projectCommentId
+      && taskEntries[0].payload.profile === delivery.profile
+      && taskEntries[0].payload.projectId === projectId
+      && shared.syncSchemaVersion === "2" && shared.syncProfile === delivery.profile
+      && shared.syncCalendarId === profiles[delivery.profile].calendarId
+      && shared.syncEventId === event.id && shared.taskId === task.id && shared.syncTaskId === task.id
+      && shared.syncSource === undefined && shared.syncRecurrenceOwner === undefined);
+    if (task && !exactLocalPair) {
       const owner = await this.providerMappingByTaskAnyProfile(task.id);
       if (owner && (owner.profile !== delivery.profile || ![owner.eventId,owner.masterEventId,owner.activeInstanceId].includes(event.id))) {
         return this.state.audit(delivery.profile,"calendar_task_link_ambiguous_conflict",{eventId:event.id,taskId:task.id,ownerProfile:owner.profile,mappedEventId:owner.eventId});
@@ -2584,6 +2608,15 @@ export class Synchronizer {
     }
     if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
     if (task && hasCanonicalState(event, task)) {
+      const baseline = providerSyncBaseline(task, event);
+      if (exactLocalPair && mapping?.syncBaseline
+        && JSON.stringify(mapping.syncBaseline.todoist) === JSON.stringify(baseline.todoist)
+        && JSON.stringify(mapping.syncBaseline.calendar) === JSON.stringify(baseline.calendar)
+        && mapping.syncedTitle === normalizedText(event.summary)
+        && mapping.syncedDescription === normalizedDescription(event.description)
+        && mapping.syncedDue === (event.start?.dateTime || event.start?.date)) {
+        return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
+      }
       const nextMapping: Mapping = {
         ...(mapping || {}),
         profile: delivery.profile,
@@ -2594,6 +2627,14 @@ export class Synchronizer {
       };
       await this.persistProviderMapping(nextMapping);
       return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
+    }
+    if (task) {
+      // Cached evidence is only sufficient to discard an unchanged echo.
+      // Recheck an existing candidate before any provider mutation.
+      const current = await todoist.getTask(task.id);
+      if (current.id !== task.id || current.project_id !== task.project_id
+        || JSON.stringify(current) !== JSON.stringify(task))
+        throw new Error("Todoist task changed before Calendar delta update");
     }
     const nextTask = await todoist.upsertTask(toTodoistTask(event), task?.id, calendarReplaySourceIds(event));
     const knownCommentId = mapping?.projectCommentId || mapping?.commentId;
@@ -3218,7 +3259,7 @@ export class Synchronizer {
     let lifecycle = todoistCalendarLifecycle(payload);
     if (!task?.id || !lifecycle) return;
     const projectCommentClient=(await this.clients(delivery.profile)).todoist;
-    const projectComments=await projectCommentClient.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
+    const projectComments=await projectCommentClient.listProjectComments(profiles[delivery.profile].todoistProjectId);
     // Every Todoist-origin Calendar update/delete holds this task's durable
     // write fence until provider and mapping writes finish. Completion retries
     // rather than committing its immutable marker mid-mutation.
