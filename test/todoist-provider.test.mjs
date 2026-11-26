@@ -53,3 +53,31 @@ test("Todoist project preflight requires the exact configured project identity",
     await assert.rejects(todoist.getProject("project-2"),/exact configured project/);
   }finally{globalThis.fetch=originalFetch;}
 });
+
+test("Todoist read retries honor a 429 retry_after hint within the configured maintenance budget",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0;
+  globalThis.fetch=async()=>{
+    calls++;
+    if(calls===1)return Response.json({error:"Too many requests",error_extra:{retry_after:0}}, {status:429});
+    return Response.json({results:[{id:"comment-1",content:"fixture"}],next_cursor:null});
+  };
+  const todoist=new Todoist("test-token",{readRetries:7,maxRetryDelayMs:10_000});
+  const comments=await todoist.listProjectComments("project-1",true);
+  assert.equal(calls,2);
+  assert.equal(comments[0].id,"comment-1");
+});
+
+test("Todoist read retries stop at their configured bound when the provider remains rate limited",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0;
+  globalThis.fetch=async()=>{
+    calls++;
+    return Response.json({error:"Too many requests",error_extra:{retry_after:0}}, {status:429});
+  };
+  const todoist=new Todoist("test-token",{readRetries:2,maxRetryDelayMs:10_000});
+  await assert.rejects(()=>todoist.listProjectComments("project-1",true),{status:429});
+  assert.equal(calls,3,"the initial request plus two configured retries");
+});

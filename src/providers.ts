@@ -54,15 +54,33 @@ async function responseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = await response.text();
     const detail = body.trim().replace(/\s+/g, " ").slice(0, 500);
-    const error = new Error(`Provider request failed: ${response.status} ${response.url}${detail ? ` — ${detail}` : ""}`) as Error & { status: number; body: string };
+    const error = new Error(`Provider request failed: ${response.status} ${response.url}${detail ? ` — ${detail}` : ""}`) as Error & { status: number; body: string; retryAfterMs?: number };
     error.status = response.status;
     error.body = body;
+    if (response.status === 429) {
+      const header = response.headers.get("retry-after");
+      const headerSeconds = header && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) : undefined;
+      let bodySeconds: number | undefined;
+      try {
+        const parsed = JSON.parse(body) as { error_extra?: { retry_after?: unknown } };
+        if (typeof parsed.error_extra?.retry_after === "number" && Number.isFinite(parsed.error_extra.retry_after))
+          bodySeconds = parsed.error_extra.retry_after;
+      } catch { /* A missing provider retry hint uses bounded exponential backoff. */ }
+      const seconds = headerSeconds ?? bodySeconds;
+      if (seconds !== undefined && seconds >= 0) error.retryAfterMs = Math.min(30_000, Math.ceil(seconds * 1000));
+    }
     throw error;
   }
   return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
-type ProviderRequestOptions = { signal?: AbortSignal; timeoutMs?: number };
+type ProviderRequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Extra read retries for controlled maintenance jobs; ordinary sync keeps its short default. */
+  readRetries?: number;
+  maxRetryDelayMs?: number;
+};
 
 async function fetchProvider(
   input: RequestInfo | URL,
@@ -704,6 +722,8 @@ export class Todoist {
     if (init.body) headers.set("content-type", "application/json");
     const url = `${comments ? TODOIST_COMMENTS_ROOT : TODOIST_ROOT}${path}`;
     const readOnly = (init.method || "GET").toUpperCase() === "GET";
+    const readRetries = this.requestOptions.readRetries ?? 2;
+    const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await responseJson<T>(await fetchProvider(url, { ...init, headers },this.requestOptions));
@@ -712,8 +732,12 @@ export class Todoist {
         if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
         const transient = !status || status === 408 || status === 429 || status >= 500;
-        if (!readOnly || !transient || attempt >= 2) throw error;
-        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 250 : 750));
+        if (!readOnly || !transient || attempt >= readRetries) throw error;
+        const retryAfterMs = status === 429 ? Number((error as { retryAfterMs?: number }).retryAfterMs) : NaN;
+        const delayMs = Number.isFinite(retryAfterMs)
+          ? Math.min(maxRetryDelayMs, Math.max(0, retryAfterMs))
+          : Math.min(1000, 250 * (2 ** attempt));
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
   }
