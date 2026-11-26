@@ -88,7 +88,7 @@ type ProviderRequestOptions = {
   timeoutMs?: number;
   /** Extra read retries for controlled maintenance jobs; ordinary sync keeps its short default. */
   readRetries?: number;
-  /** Explicitly rejected 429 writes can be safely retried by idempotent maintenance operations. */
+  /** Retry bound for explicit 429 responses; callers must use idempotent operations when writing. */
   rateLimitRetries?: number;
   maxRetryDelayMs?: number;
   /** Minimum spacing between requests on one Todoist client, for controlled migrations. */
@@ -108,20 +108,22 @@ async function fetchProvider(
   return fetch(input,signals.length?{...init,signal:AbortSignal.any(signals)}:init);
 }
 
-function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number): number | undefined {
+function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number,
+  honorFullRetryAfter = false): number | undefined {
   const status = Number((error as { status?: number }).status);
   const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
   if (status === 429 && Number.isFinite(retryAfterMs)) {
-    // Never retry before an explicit provider hint. Let the FIFO retry path
-    // retain the delivery if the provider asks us to wait longer than this call.
-    return retryAfterMs <= maxRetryDelayMs ? retryAfterMs : undefined;
+    // Maintenance migrations honor long quota windows. Other inline provider
+    // calls retain their existing bounded retry behavior.
+    return honorFullRetryAfter || retryAfterMs <= maxRetryDelayMs ? retryAfterMs : undefined;
   }
   const ceiling = Math.min(maxRetryDelayMs, 1000 * (2 ** Math.min(attempt, 8)));
   return Math.floor(Math.random() * Math.max(1, ceiling));
 }
 
-function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number): Promise<void> | undefined {
-  const delay = retryDelayMs(error, attempt, maxRetryDelayMs);
+function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number,
+  honorFullRetryAfter = false): Promise<void> | undefined {
+  const delay = retryDelayMs(error, attempt, maxRetryDelayMs, honorFullRetryAfter);
   return delay === undefined ? undefined : new Promise(resolve => setTimeout(resolve, delay));
 }
 
@@ -797,9 +799,9 @@ export class Todoist {
         if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
         const transient = !status || status === 408 || status === 429 || status >= 500;
-        const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
+        const retryLimit = status === 429 ? rateLimitRetries : readOnly ? readRetries : 0;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
-        const delay = waitForRetry(error, attempt, maxRetryDelayMs);
+        const delay = waitForRetry(error, attempt, maxRetryDelayMs, true);
         if (!delay) throw error;
         await delay;
       }

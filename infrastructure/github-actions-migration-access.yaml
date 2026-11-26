@@ -29,6 +29,7 @@ Resources:
             Effect: Allow
             Action:
               - dynamodb:TransactWriteItems
+              - dynamodb:ConditionCheckItem
               - dynamodb:PutItem
               - dynamodb:UpdateItem
               - dynamodb:DeleteItem

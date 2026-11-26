@@ -261,6 +261,7 @@ test("automatic migration drains legacy erasure work before live acceptance disp
   const migrationWrites = migrationAccessPolicy.match(/Sid: PersistVerifiedMappingMigration[\s\S]*?(?=\n          - Sid:|$)/)?.[0] || "";
   assert.match(migrationWrites, /dynamodb:DeleteItem/);
   assert.match(migrationWrites, /dynamodb:UpdateItem/);
+  assert.match(migrationWrites, /dynamodb:ConditionCheckItem/);
   assert.match(migrationWrites, /table\/\$\{ResourceNamePrefix\}-state-\*/);
   assert.doesNotMatch(migrationAccessPolicy, /Resource:\s*"\*"/);
 });

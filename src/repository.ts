@@ -37,6 +37,12 @@ import {phaseBNativeMoveBeginTransaction,phaseBNativeMoveCommitTransaction,
 } from "./todoist-phase-b-move-handoff.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
+function annotateProviderAction(error: unknown, providerAction: string): void {
+  if (error && typeof error === "object") {
+    try { Object.defineProperty(error, "providerAction", { value: providerAction, configurable: true }); }
+    catch { /* Preserve the provider failure if a non-extensible SDK error cannot be annotated. */ }
+  }
+}
 const allProfiles: Profile[] = ["home", "antonio", "work"];
 const CIRCUIT_MUTATION_LIMIT = 20;
 const CIRCUIT_WINDOW_MS = 20_000;
@@ -1542,6 +1548,7 @@ export class StateRepository {
       await client.send(new TransactWriteCommand({ TransactItems: tx as never }));
       return true;
     } catch (error) {
+      annotateProviderAction(error, "dynamodb:TransactWriteItems");
       const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
       if (cancelled.name === "TransactionCanceledException"
         && cancelled.CancellationReasons?.some((reason) => reason.Code === "ConditionalCheckFailed")
@@ -1734,6 +1741,7 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
+      annotateProviderAction(error, "dynamodb:TransactWriteItems");
       if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
 
       const currentOwner = await client.send(new GetCommand({

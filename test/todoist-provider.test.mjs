@@ -69,6 +69,26 @@ test("Todoist read retries honor a 429 retry_after hint within the configured ma
   assert.equal(comments[0].id,"comment-1");
 });
 
+test("Todoist honors Retry-After values beyond the exponential backoff ceiling",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0,scheduledDelay;
+  t.mock.method(globalThis,"setTimeout",(callback,delay)=>{
+    scheduledDelay=delay;
+    queueMicrotask(callback);
+    return 0;
+  });
+  globalThis.fetch=async()=>{
+    calls++;
+    if(calls===1)return Response.json({error:"Too many requests",error_extra:{retry_after:131}}, {status:429});
+    return Response.json({id:"task-1"});
+  };
+  const todoist=new Todoist("test-token",{rateLimitRetries:1,maxRetryDelayMs:10_000});
+  assert.equal((await todoist.getTask("task-1")).id,"task-1");
+  assert.equal(scheduledDelay,131_000);
+  assert.equal(calls,2);
+});
+
 test("Todoist read retries stop at their configured bound when the provider remains rate limited",async t=>{
   const originalFetch=globalThis.fetch;
   t.after(()=>{globalThis.fetch=originalFetch;});

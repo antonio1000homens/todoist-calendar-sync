@@ -19,10 +19,11 @@ import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, Todo
 
 const tableName = process.env.STATE_TABLE_NAME || "";
 // Keep sustained all-profile validation below Todoist's user-level API quota.
-// Honor longer Retry-After hints (within a bounded retry budget) instead of
-// immediately converting a throttled pair into a migration failure.
+// A small retry budget honors explicit Retry-After values, then the migration
+// stops at the throttled mapping so a quota rejection never fans out to the
+// remaining mappings in the same run.
 const MIGRATION_PROVIDER_OPTIONS = {
-  readRetries: 7, rateLimitRetries: 5, maxRetryDelayMs: 60_000, minRequestIntervalMs: 2_000,
+  readRetries: 7, rateLimitRetries: 1, maxRetryDelayMs: 60_000, minRequestIntervalMs: 2_000,
 } as const;
 
 export interface ProjectCommentMigrationState {
@@ -34,6 +35,7 @@ export interface ProjectCommentMigrationState {
 export interface ProjectCommentMigrationClients {
   todoist: ProjectCommentClient & {
     getTask(taskId: string): Promise<TodoistTask>;
+    getComment(commentId: string): Promise<TodoistCommentRecord>;
   };
   calendar: {
     getEvent(eventId: string): Promise<CalendarEvent>;
@@ -235,9 +237,17 @@ export async function migrateProjectComments(
   const index = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId));
   const summary = emptySummary(apply, index);
   const retireVerifiedCorrelation = async (mapping: Mapping, task?: TodoistTask): Promise<void> => {
-    const observed = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId, true));
+    const indexed = findProjectMappingComment(index, mapping);
+    if (!indexed || indexed.comment.project_id !== projectId) {
+      await rejectCorrelationRetirement(mapping, "provider_project_comment_readback_mismatch");
+      return;
+    }
+    // Read back only the exact indexed comment. Refreshing every paginated
+    // project comment for each mapping multiplied quota usage by mapping count.
+    const exactComment = await clients.todoist.getComment(indexed.comment.id);
+    const observed = buildProjectMappingIndex([exactComment]);
     const verified = findProjectMappingComment(observed, mapping);
-    if (!verified || verified.payload.profile !== profile || verified.payload.projectId !== projectId
+    if (!verified || exactComment.project_id !== projectId || verified.payload.profile !== profile || verified.payload.projectId !== projectId
       || verified.payload.taskId !== mapping.taskId || verified.payload.eventId !== mapping.eventId) {
       summary.legacyCorrelationRetirementRejected += 1;
       await state.audit(profile, "project_comment_migration_correlation_retirement_rejected", {
@@ -444,6 +454,8 @@ export async function migrateProjectComments(
         name?: unknown;
         code?: unknown;
         status?: unknown;
+        providerAction?: unknown;
+        retryAfterMs?: unknown;
         $metadata?: { httpStatusCode?: unknown };
       };
       const providerCode = typeof providerError.code === "string"
@@ -462,7 +474,18 @@ export async function migrateProjectComments(
         stage: migrationStage,
         providerStatus: Number.isInteger(status) && status > 0 && status <= 599 ? status : undefined,
         code: errorName || providerCode || "ProviderError",
+        providerAction: typeof providerError.providerAction === "string"
+          && /^[a-zA-Z0-9-]+:[A-Za-z0-9]+$/.test(providerError.providerAction)
+          ? providerError.providerAction : undefined,
+        retryAfterMs: status === 429 && Number.isFinite(Number(providerError.retryAfterMs))
+          ? Math.max(0, Number(providerError.retryAfterMs)) : undefined,
       });
+      if (status === 429) {
+        // The per-mapping audit is a durable checkpoint. All completed writes
+        // are idempotent; resume from the beginning after quota recovery. Never
+        // advance into another mapping while the account is rate limited.
+        throw new Error(`Todoist rate limit paused migration at ${migrationStage}`);
+      }
     } finally {
       await releaseWriterLease();
     }
@@ -498,10 +521,9 @@ export async function runProjectCommentMigration(
   retireLegacyCorrelation = false,
 ): Promise<ProjectCommentMigrationSummary> {
   const mappings = await listMappingsForProjectCommentMigration(profile);
-  // Project comments are a rate-limited Todoist endpoint. A multi-profile
-  // cutover can encounter a 429 after substantial successful work; honor the
-  // provider retry_after hint and retry reads in place so the idempotent
-  // migration resumes without discarding earlier progress.
+  // Project comments are a rate-limited Todoist endpoint. Explicit
+  // Retry-After values are honored by the provider client; if the bounded
+  // retry budget is still exhausted, the phase fails and can be rerun safely.
   const clients = await clientFactory(profile, MIGRATION_PROVIDER_OPTIONS);
   return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy, retireLegacyCorrelation);
 }

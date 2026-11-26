@@ -57,6 +57,8 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
         },
         async getComment(commentId) {
           if (getError) throw getError;
+          const projectComment=comments.find(comment=>comment.id===commentId);
+          if(projectComment)return {...projectComment};
           return legacyComment ? { ...legacyComment } : {
             id: commentId,
             task_id: "task-1",
@@ -107,8 +109,9 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
 test("migration failure audit records safe provider codes and statuses when Error is generic", async () => {
   const state = new FakeState();
   const error = Object.assign(new Error("provider details must not be logged"), {
-    code: "rate_limit_exceeded",
-    status: 429,
+    name: "AccessDeniedException",
+    status: 400,
+    providerAction: "dynamodb:TransactWriteItems",
   });
   const { clients } = fakeClients({ correlationError: error });
 
@@ -117,9 +120,52 @@ test("migration failure audit records safe provider codes and statuses when Erro
   assert.equal(summary.failures, 1);
   const failure = state.audits.find(({ action }) => action === "project_comment_migration_mapping_failed");
   assert.equal(failure.detail.stage, "calendar_correlation_write");
-  assert.equal(failure.detail.providerStatus, 429);
-  assert.equal(failure.detail.code, "rate_limit_exceeded");
+  assert.equal(failure.detail.providerStatus, 400);
+  assert.equal(failure.detail.code, "AccessDeniedException");
+  assert.equal(failure.detail.providerAction, "dynamodb:TransactWriteItems");
   assert.equal(JSON.stringify(failure).includes("provider details must not be logged"), false);
+});
+
+test("a Todoist quota rejection checkpoints and stops before later mappings",async()=>{
+  const state=new FakeState();
+  let taskReads=0;
+  const {clients}=fakeClients();
+  clients.todoist.getTask=async()=>{
+    taskReads++;
+    throw Object.assign(new Error("provider response must not be logged"),{
+      name:"ProviderError",status:429,retryAfterMs:131_000,
+    });
+  };
+  await assert.rejects(
+    ()=>migrateProjectComments("home",[mapping(),mapping({taskId:"task-2",eventId:"event-2"})],state,clients,true),
+    /rate limit paused migration/,
+  );
+  assert.equal(taskReads,1,"a quota rejection must stop the phase instead of advancing mappings");
+  const failure=state.audits.find(({action})=>action==="project_comment_migration_mapping_failed");
+  assert.equal(failure.detail.providerStatus,429);
+  assert.equal(failure.detail.retryAfterMs,131_000);
+  assert.equal(JSON.stringify(failure).includes("provider response must not be logged"),false);
+});
+
+test("retirement verifies the indexed exact project comment instead of refreshing the full project",async()=>{
+  const source=mapping({projectCommentId:"project-comment-existing"});
+  const projectComment={id:source.projectCommentId,project_id:source.projectId,
+    content:serializeMappingComment({...source,mappingRevision:4},source.projectId,undefined,4)};
+  const state=new FakeState();
+  state.retireMigratedMappingCorrelation=async()=>true;
+  const fake=fakeClients({projectComments:[projectComment]});
+  let refreshes=0,exactReads=0;
+  const list=fake.clients.todoist.listProjectComments;
+  fake.clients.todoist.listProjectComments=async(_id,refresh)=>{
+    if(refresh)refreshes++;
+    return list();
+  };
+  const get=fake.clients.todoist.getComment;
+  fake.clients.todoist.getComment=async id=>{exactReads++;return get(id);};
+  const summary=await migrateProjectComments("home",[source],state,fake.clients,true,false,true);
+  assert.equal(summary.legacyCorrelationRowsRetired,1);
+  assert.equal(refreshes,0);
+  assert.equal(exactReads,1);
 });
 
 test("automatic migration backfills all profiles before cleanup and retries newly created mappings", async () => {
