@@ -2853,9 +2853,13 @@ export class Synchronizer {
         || (e.status !== "cancelled" && (effectiveDate === undefined || effectiveDate >= start));
     };
     const sameMapping = (m: Mapping | undefined) => Boolean(m && m.profile === profile
+      && m.calendarId === calendarId && m.projectId === projectId && m.seriesId === stale.seriesId
       && m.taskId === task.id && m.masterEventId === oldId && m.eventId === stale.eventId
       && m.projectCommentId === stale.projectCommentId && m.mappingRevision === stale.mappingRevision
-      && m.updatedAt === stale.updatedAt);
+      && m.updatedAt === stale.updatedAt && m.activeInstanceId === stale.activeInstanceId
+      && m.originalStart === stale.originalStart && m.activeEffectiveStart === stale.activeEffectiveStart
+      && m.syncedTitle === stale.syncedTitle && m.syncedDescription === stale.syncedDescription
+      && m.syncedDue === stale.syncedDue);
     if (!sameMapping(owner) || claims.some(m => !sameMapping(m))
       || aliases.some(e => e.status !== "cancelled" && !ids.includes(e.id)
         && e.recurringEventId !== oldId && e.recurringEventId !== current.id)
@@ -2936,6 +2940,8 @@ export class Synchronizer {
       || finalActive.recurringEventId !== current.id || finalActive.status !== "confirmed"
       || recurrenceOriginalStart(finalActive) !== recurrenceOriginalStart(occurrence)
       || eventEffectiveStart(finalActive) !== eventEffectiveStart(occurrence)
+      || normalizedText(finalActive.summary) !== content || normalizedDescription(finalActive.description) !== description
+      || JSON.stringify(finalActive.end) !== JSON.stringify(occurrence.end)
       || !sameCalendarDeltaTaskEvidence(nextTask, finalTask) || !await allowed())
       return decline("provider_or_mapping_changed_before_commit");
     const next: Mapping = {
