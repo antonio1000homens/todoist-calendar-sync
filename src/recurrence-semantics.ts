@@ -64,6 +64,10 @@ const dayNames: Record<string, string> = {
   thurs:"TH", thursday:"TH", fri:"FR", friday:"FR", sat:"SA",
   saturday:"SA", sun:"SU", sunday:"SU",
 };
+const monthNames: Record<string, number> = {
+  january:1, february:2, march:3, april:4, may:5, june:6,
+  july:7, august:8, september:9, october:10, november:11, december:12,
+};
 const frequencies: RecurrenceFrequency[] = ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
 const knownFields = new Set(["FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "COUNT", "UNTIL", "WKST"]);
 const pad = (value: number): string => String(value).padStart(2, "0");
@@ -222,10 +226,12 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
   let interval = 1;
   let byDay: string[] | undefined;
   let byMonthDay: number[] | undefined;
+  let byMonth: number[] | undefined;
   const every = expression.replace(/^every\s+/, "");
   const monthDays = every.match(/^\d{1,2}(?:\s*,\s*\d{1,2})+$/);
   const alternate = every.match(/^other\s+([a-z]+)$/);
   const quantity = every.match(/^(\d+)\s+(day|week|month|year)s?$/);
+  const fixedAnnual = every.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
   if (["day", "daily"].includes(every)) frequency = "DAILY";
   else if (["week", "weekly"].includes(every)) frequency = "WEEKLY";
   else if (["month", "monthly"].includes(every)) frequency = "MONTHLY";
@@ -237,6 +243,12 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
     byMonthDay = [...new Set(every.split(",").map((day) => Number(day.trim())))].sort((a, b) => a - b);
     if (byMonthDay.some((day) => day < 1 || day > 31)) return decline("invalid_component");
     frequency = "MONTHLY";
+  } else if (fixedAnnual && monthNames[fixedAnnual[1]]) {
+    const month = monthNames[fixedAnnual[1]];
+    const day = Number(fixedAnnual[2]);
+    if (day < 1 || day > 31 || Number(anchor.date.slice(5, 7)) !== month
+      || Number(anchor.date.slice(8, 10)) !== day) return decline("invalid_component");
+    frequency = "YEARLY"; byMonth = [month]; byMonthDay = [day];
   } else if (alternate && dayNames[alternate[1]]) {
     frequency = "WEEKLY"; interval = 2; byDay = [dayNames[alternate[1]]];
   } else if (quantity) {
@@ -257,6 +269,7 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
     frequency, interval, startDate: anchor.date,
     ...(anchor.time ? { localTime: anchor.time, timeZone: context.timeZone } : {}),
     ...(byDay ? { byDay } : {}), ...(byMonthDay ? { byMonthDay } : {}),
+    ...(byMonth ? { byMonth } : {}),
   };
   return finish(semantic, context);
 }

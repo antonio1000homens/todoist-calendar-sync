@@ -15,14 +15,14 @@ import {
 import { todoistRecurrenceKey } from "./todoist-recurrence.js";
 import type { CalendarEvent, TodoistTask } from "./types.js";
 
-export type TodoistPhaseBFamily = "multi_month_day" | "alternate_weekday" | "quarterly";
+export type TodoistPhaseBFamily = "multi_month_day" | "alternate_weekday" | "quarterly" | "fixed_annual_date";
 export type TodoistPhaseBDisposition = "unsupported" | "rolling_required" | "native_exact";
 
 export interface TodoistPhaseBAnchor {
-  /** Original recurrence DTSTART from an independently verified provider/history record. */
+  /** First represented date: original schedule for new items, current due during explicit repair. */
   start: string;
   timeZone?: string;
-  source: "verified_original_schedule";
+  source: "verified_original_schedule" | "verified_current_schedule";
 }
 
 export interface TodoistPhaseBResult {
@@ -57,6 +57,7 @@ function familyFor(key: string): TodoistPhaseBFamily | undefined {
   if (new RegExp("^every\\s+other\\s+" + weekdays + "$").test(phrase)) return "alternate_weekday";
   if (phrase === "every quarter" || phrase === "quarterly" || phrase === "every quarterly"
     || phrase === "every 3 months") return "quarterly";
+  if (/^every\s+[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?$/.test(phrase)) return "fixed_annual_date";
   return undefined;
 }
 
@@ -105,7 +106,7 @@ function candidate(task: TodoistTask, anchor?: TodoistPhaseBAnchor): TodoistPhas
     disposition: "rolling_required", reason: "anchor_not_verified", family,
     candidateRrule: classified.canonicalRrule, semantic: classified.semantic,
   };
-  if (!anchor || anchor.source !== "verified_original_schedule") return provisional;
+  if (!anchor || !["verified_original_schedule", "verified_current_schedule"].includes(anchor.source)) return provisional;
   // Live Todoist provider evidence: "every 29,30,31" fills February with its
   // last day, and quarterly Jan31 -> Apr30 -> Jul30, whereas RFC5545 skips
   // nonexistent BYMONTHDAY. These are deliberately not native equivalents.

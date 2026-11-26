@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
+import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { todoistTaskPayload } from "../dist/providers.js";
 import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
@@ -17,6 +17,158 @@ test("matches a unique Calendar counterpart by exact normalized fields and all-d
   assert.equal(matchingTask(event, tasks)?.id, "match");
   assert.equal(matchingTask(event, [...tasks, { ...tasks[1], id: "second-compatible" }]), undefined);
   assert.equal(matchingTask(event, [{ ...tasks[1], description: "different details" }]), undefined);
+});
+
+test("discovers an untagged recurring master from its current occurrence and equivalent cadence", async () => {
+  const due = new Date(Date.now() + 40 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  const task = { id: "recurring-task", content: "Pay invoice", description: "monthly details",
+    due: { date: due, string: "every day", is_recurring: true } };
+  const master = { id: "untagged-series", status: "confirmed", summary: "Pay invoice", description: "monthly details",
+    start: { date: "2020-01-01" }, recurrence: ["RRULE:INTERVAL=1;FREQ=DAILY"] };
+  const occurrence = { id: "current-occurrence", status: "confirmed", recurringEventId: master.id,
+    summary: task.content, description: task.description, originalStartTime: { date: due }, start: { date: due } };
+  const calendar = {
+    async getEvent(id) { return id === master.id ? master : occurrence; },
+    async listInstancesInWindow(id) { assert.equal(id, master.id); return [occurrence]; },
+  };
+
+  const matches = await discoverCompatibleCalendarCandidates(task, [master], calendar);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].master.id, master.id);
+  assert.equal(matches[0].event.id, occurrence.id);
+});
+
+test("candidate discovery rejects one-off and recurring type collisions", async () => {
+  const date = new Date(Date.now() + 40 * 24 * 60 * 60_000).toISOString().slice(0, 10);
+  const recurringMaster = { id: "series", status: "confirmed", summary: "Same title", description: "",
+    start: { date: "2020-01-01" }, recurrence: ["RRULE:FREQ=DAILY"] };
+  const standalone = { id: "standalone", status: "confirmed", summary: "Same title", description: "", start: { date } };
+  const calendar = { async getEvent(id) { return id === recurringMaster.id ? recurringMaster : standalone; },
+    async listInstancesInWindow() { return []; } };
+
+  const oneOff = await discoverCompatibleCalendarCandidates({ id: "one-off", content: "Same title", due: { date } },
+    [recurringMaster], calendar);
+  const recurrence = await discoverCompatibleCalendarCandidates({ id: "recurring", content: "Same title",
+    due: { date, string: "every day", is_recurring: true } }, [standalone], calendar);
+
+  assert.deepEqual(oneOff, []);
+  assert.deepEqual(recurrence, []);
+});
+
+test("candidate ownership checks include a comment-only link on any series alias", () => {
+  const master = { id: "series-master", status: "confirmed", recurrence: ["RRULE:FREQ=DAILY"] };
+  const active = { id: "active-instance", recurringEventId: master.id, status: "confirmed" };
+  const candidate = { master, event: active };
+  const commentsOnlyOwner = [{ profile: "home", eventId: master.id, taskId: "different-task" }];
+
+  assert.deepEqual(compatibleCalendarCandidateOwnerConflicts(candidate, commentsOnlyOwner, "current-task", "home"),
+    ["different-task"]);
+});
+
+function candidateSyncFixture(task, event, initialComments = []) {
+  const audits = [];
+  const comments = [...initialComments];
+  const events = new Map([[event.id, structuredClone(event)]]);
+  const effects = { correlationWrites: 0, commentWrites: 0 };
+  const state = {
+    async beginTodoistCalendarWrite() { return "fence"; },
+    async endTodoistCalendarWrite() {},
+    async listMappings() { return []; },
+    async getMappingByTaskAnyProfile() { return undefined; },
+    async syncBlocked() { return false; },
+    async acceptTaskVersion() { return true; },
+    async mutationAllowed() { return true; },
+    async getCompletedCalendarProjectionByEvent() { return undefined; },
+    async recordMutation() {},
+    async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
+  };
+  const todoist = {
+    async listProjectComments(projectId) { return projectId === profiles.home.todoistProjectId ? comments : []; },
+    async getTask(id) { assert.equal(id, task.id); return structuredClone(task); },
+    async updateComment(id, content) {
+      const index = comments.findIndex(value => value.id === id);
+      comments[index] = { ...comments[index], content };
+      effects.commentWrites += 1;
+      return comments[index];
+    },
+    async upsertProjectComment(projectId, content, existingId) {
+      const value = { id: existingId || "recovered-comment", project_id: projectId, content };
+      const index = comments.findIndex(entry => entry.id === value.id);
+      if (index < 0) comments.push(value);
+      else comments[index] = value;
+      effects.commentWrites += 1;
+      return value;
+    },
+  };
+  const calendar = {
+    async listDelta() { return { items: [...events.values()] }; },
+    async getEvent(id) {
+      const value = events.get(id);
+      if (value) return structuredClone(value);
+      const error = new Error("not found"); error.status = 404; throw error;
+    },
+    async findByTodoistTaskId(taskId) {
+      return [...events.values()].find(value => value.extendedProperties?.shared?.taskId === taskId);
+    },
+    async ensureTaskCorrelation(id, taskId, _expectedTaskId, mapping) {
+      const value = events.get(id);
+      effects.correlationWrites += 1;
+      value.extendedProperties = { ...value.extendedProperties, shared: {
+        ...value.extendedProperties?.shared, taskId, syncSchemaVersion: "2", syncProfile: "home",
+        syncCalendarId: profiles.home.calendarId, syncTaskId: taskId, syncEventId: id,
+        ...(mapping.seriesId ? { syncSeriesId: mapping.seriesId } : {}),
+        ...(mapping.masterEventId ? { syncMasterEventId: mapping.masterEventId } : {}),
+        ...(mapping.activeInstanceId ? { syncActiveInstanceId: mapping.activeInstanceId } : {}),
+        ...(mapping.originalStart ? { syncOriginalStart: mapping.originalStart } : {}),
+        ...(mapping.activeEffectiveStart ? { syncActiveEffectiveStart: mapping.activeEffectiveStart } : {}),
+      } };
+      return structuredClone(value);
+    },
+  };
+  return { sync: new Synchronizer(state, undefined, async () => ({ calendar, todoist })), audits, comments, events, effects };
+}
+
+test("Todoist incremental sync recovers an untagged exact Calendar counterpart", async () => {
+  const task = { id: "unmapped-task", project_id: profiles.home.todoistProjectId, content: "Existing appointment",
+    description: "details", due: { date: "2099-01-11" }, updated_at: "2098-12-01T12:00:00Z" };
+  const event = { id: "untagged-event", status: "confirmed", summary: task.content, description: task.description,
+    start: { date: task.due.date }, end: { date: "2099-01-12" } };
+  const fixture = candidateSyncFixture(task, event);
+
+  await fixture.sync.process({ id: "recover-unmapped", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2098-12-01T12:00:01Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task }) });
+
+  assert.equal(fixture.effects.correlationWrites, 1);
+  assert.equal(fixture.effects.commentWrites, 1);
+  assert.equal(fixture.comments.length, 1);
+  const mapping = JSON.parse(fixture.comments[0].content.split("\n")[1]);
+  assert.equal(mapping.taskId, task.id);
+  assert.equal(mapping.eventId, event.id);
+  assert.equal(fixture.events.get(event.id).extendedProperties.shared.taskId, task.id);
+  assert.ok(fixture.audits.some(entry => entry.action === "todoist_provider_pair_recovered_by_unique_match"));
+});
+
+test("Todoist incremental recovery refuses a candidate linked only by another task's project comment", async () => {
+  const task = { id: "current-task", project_id: profiles.home.todoistProjectId, content: "Existing appointment",
+    description: "details", due: { date: "2099-01-11" }, updated_at: "2098-12-01T12:00:00Z" };
+  const event = { id: "comment-owned-event", status: "confirmed", summary: task.content, description: task.description,
+    start: { date: task.due.date }, end: { date: "2099-01-12" } };
+  const owner = { id: "other-task-comment", project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment({ profile: "home", projectId: profiles.home.todoistProjectId,
+      eventId: event.id, taskId: "different-task", updatedAt: "2098-12-01T11:00:00Z" }, profiles.home.todoistProjectId) };
+  const fixture = candidateSyncFixture(task, event, [owner]);
+
+  await fixture.sync.process({ id: "refuse-comment-owned-candidate", kind: "todoist", profile: "home", mode: "aws",
+    receivedAt: "2098-12-01T12:00:01Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task }) });
+
+  assert.equal(fixture.effects.correlationWrites, 0);
+  assert.equal(fixture.effects.commentWrites, 0);
+  assert.equal(fixture.comments.length, 1);
+  assert.equal(fixture.events.get(event.id).extendedProperties, undefined);
+  assert.ok(fixture.audits.some(entry => entry.action === "todoist_provider_pair_candidate_owned"));
 });
 
 test("converts Calendar all-day and timed representations into Todoist", () => {
