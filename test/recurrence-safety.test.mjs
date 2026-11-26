@@ -304,6 +304,18 @@ function fakeClients(state, instances, tasks = new Map(), deltaEvent, extraEvent
     async findByTodoistTaskId(taskId) {
       return [...events.values()].find((event) => event.extendedProperties?.shared?.taskId === taskId);
     },
+    async ensureTaskCorrelation(eventId, taskId, _expectedTaskId, mapping) {
+      const event=events.get(eventId);
+      const shared={...(event.extendedProperties?.shared||{}),taskId,
+        syncSchemaVersion:"2",syncProfile:PROFILE,syncCalendarId:profiles[PROFILE].calendarId,
+        syncTaskId:taskId,syncEventId:eventId,syncSeriesId:mapping.seriesId,
+        syncMasterEventId:mapping.masterEventId,syncActiveInstanceId:mapping.activeInstanceId,
+        syncOriginalStart:mapping.originalStart,syncActiveEffectiveStart:mapping.activeEffectiveStart,
+        syncProgressVersion:"1"};
+      const stored={...event,extendedProperties:{...event.extendedProperties,shared}};
+      events.set(eventId,stored);
+      return structuredClone(stored);
+    },
     async listLinkedEventsByTodoistTaskId(taskId) {
       return [...events.values()].filter((event) => event.extendedProperties?.shared?.taskId === taskId)
         .map((event) => structuredClone(event));
@@ -668,6 +680,56 @@ test("new unsupported Calendar recurrence does not create a flattened one-off mi
   assert.deepEqual(clients.todoistDeletes, []);
   assert.equal(state.links.length, 0);
   assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_rule_unsupported"), true);
+});
+
+test("Calendar reconciliation adopts the unique unlinked recurring Todoist candidate", async () => {
+  const current=instance("unlinked-current","2099-01-01","2099-01-02");
+  const history=[instance("history-2010-1","2010-01-01","2010-01-02"),
+    instance("history-2010-2","2010-01-02","2010-01-03"),
+    instance("history-2010-3","2010-01-03","2010-01-04")];
+  const task={id:"existing-unlinked-task",project_id:profiles[PROFILE].todoistProjectId,
+    content:current.summary,description:current.description,
+    due:{date:current.start.date,string:"every day",is_recurring:true}};
+  const state=new FakeState();
+  const master={id:MASTER,iCalUID:SERIES,status:"confirmed",summary:task.content,description:task.description,
+    start:{date:"2010-01-01"},end:{date:"2010-01-02"},recurrence:["RRULE:FREQ=DAILY"],etag:"unlinked-master"};
+  const clients=fakeClients(state,[...history,current],new Map([[task.id,task]]),undefined,[master]);
+  clients.calendar.listInstancesInWindow=async(_id,start,end)=>{
+    const from=start.slice(0,10),to=end.slice(0,10);
+    return [...history,current].filter(item=>item.start.date>=from&&item.start.date<to).map(item=>structuredClone(item));
+  };
+  const sync=new Synchronizer(state,undefined,async()=>clients);
+  const result=await sync.applyCalendarSeries({id:"unlinked-calendar-series",kind:"calendar",profile:PROFILE,
+    mode:"aws",receivedAt:"2026-11-26T12:00:00Z",headers:{},body:""},master,clients.todoist);
+
+  assert.equal(result,"repaired");
+  assert.equal(clients.todoistUpserts.length,0);
+  assert.equal(clients.todoistRecurringUpdates.length,0);
+  assert.equal(clients.tasks.size,1,"candidate adoption must keep the existing Todoist task ID");
+  assert.equal(clients.projectComments.length,1);
+  assert.equal(parseMappingComment(clients.projectComments[0])?.payload.taskId,task.id);
+  assert.equal(clients.events.get(MASTER).extendedProperties.shared.taskId,task.id);
+  assert.equal(state.audits.at(-1).action,"calendar_provider_pair_recovered_by_unique_match");
+});
+
+test("Calendar reconciliation refuses multiple compatible unlinked recurring tasks", async () => {
+  const current=instance("ambiguous-current","2099-01-01","2099-01-02");
+  const next=instance("ambiguous-next","2099-01-02","2099-01-03");
+  const task={project_id:profiles[PROFILE].todoistProjectId,content:current.summary,description:current.description,
+    due:{date:current.start.date,string:"every day",is_recurring:true}};
+  const tasks=new Map([["candidate-a",{...task,id:"candidate-a"}],["candidate-b",{...task,id:"candidate-b"}]]);
+  const state=new FakeState();
+  const master={id:MASTER,iCalUID:SERIES,status:"confirmed",summary:task.content,description:task.description,
+    start:{date:"2099-01-01"},end:{date:"2099-01-02"},recurrence:["RRULE:FREQ=DAILY"],etag:"ambiguous-master"};
+  const clients=fakeClients(state,[current,next],tasks,undefined,[master]);
+  const sync=new Synchronizer(state,undefined,async()=>clients);
+  const result=await sync.applyCalendarSeries({id:"ambiguous-calendar-series",kind:"calendar",profile:PROFILE,
+    mode:"aws",receivedAt:"2026-11-26T12:00:00Z",headers:{},body:""},master,clients.todoist);
+
+  assert.equal(result,"blocked");
+  assert.equal(clients.projectComments.length,0);
+  assert.equal(clients.todoistUpserts.length,0);
+  assert.equal(state.audits.at(-1).action,"calendar_provider_pair_ambiguous");
 });
 
 test("repeated Calendar master notifications upgrade an exact one-off mirror to native recurrence once", async () => {
