@@ -2616,14 +2616,14 @@ export class Synchronizer {
     // The ordinary exact local provider and baseline checks still apply.
     const cappedOriginal = event.originalStartTime?.date;
     const cappedRule = ownershipEvent.recurrence?.[0];
-    const capMatch = cappedRule?.match(/^RRULE:FREQ=YEARLY;(?:(?:INTERVAL=1;)?UNTIL=(\d{8})(?:;INTERVAL=1)?)$/i);
-    const exactCappedOccurrence = Boolean(event.recurringEventId
+    const capMatch = cappedRule?.match(/^RRULE:FREQ=YEARLY;(?:UNTIL=(\d{8})(?:;INTERVAL=1)?|INTERVAL=1;UNTIL=(\d{8}))$/i);
+    const exactCappedOccurrence = Boolean(event.status === "confirmed" && event.recurringEventId
       && ownershipEvent.id === event.recurringEventId && ownershipEvent.status === "confirmed"
       && ownershipEvent.recurrence?.length === 1 && capMatch
       && !ownershipEvent.recurringEventId && !originProfile
       && cappedOriginal && !event.originalStartTime?.dateTime
       && /^\d{4}-\d{2}-\d{2}$/.test(cappedOriginal)
-      && cappedOriginal.replace(/-/g, "") === capMatch[1]
+      && cappedOriginal.replace(/-/g, "") === (capMatch[1] || capMatch[2])
       && event.start?.date && !event.start.dateTime
       && event.start.date >= cappedOriginal
       && !parentMapping && !existingRecurrenceLink
