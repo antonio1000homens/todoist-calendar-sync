@@ -11,6 +11,8 @@ export type ProviderClientOptions = {
   readRetries?:number;
   rateLimitRetries?:number;
   maxRetryDelayMs?:number;
+  honorFullRetryAfter?:boolean;
+  minRequestIntervalMs?:number;
 };
 export type ProviderClientFactory = (profile: Profile, options?:ProviderClientOptions) => Promise<ProviderClients>;
 

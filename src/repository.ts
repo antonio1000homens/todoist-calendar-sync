@@ -37,6 +37,14 @@ import {phaseBNativeMoveBeginTransaction,phaseBNativeMoveCommitTransaction,
 } from "./todoist-phase-b-move-handoff.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
+function annotateProviderAction(error: unknown, providerAction: string, providerSubAction?: string): void {
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "providerAction", { value: providerAction, configurable: true });
+      if (providerSubAction) Object.defineProperty(error, "providerSubAction", { value: providerSubAction, configurable: true });
+    } catch { /* Preserve the provider failure if a non-extensible SDK error cannot be annotated. */ }
+  }
+}
 const allProfiles: Profile[] = ["home", "antonio", "work"];
 const CIRCUIT_MUTATION_LIMIT = 20;
 const CIRCUIT_WINDOW_MS = 20_000;
@@ -411,6 +419,11 @@ export class StateRepository {
     const state = await this.getCalendarSyncState(profile);
     const generation = state.generation || 0;
     return state.state === "queued" || state.state === "running"
+      // A concurrent ingress may observe the dispatcher's short claim before
+      // its SQS send is confirmed. The durable generation plus this live lease
+      // is enough to acknowledge: the dispatcher recovers an abandoned claim
+      // after expiry, and a send failure releases it back to pending.
+      || state.state === "dispatching" && (state.leaseUntil || 0) > Date.now()
       || generation > 0 && generation <= (state.completedGeneration || 0)
       || generation > 0 && generation <= (state.failedGeneration || 0);
   }
@@ -1744,73 +1757,6 @@ export class StateRepository {
     }
   }
 
-  /** Retire migration-only DynamoDB correlation rows after a provider comment
-   * and both live provider objects have been verified. Every row is strongly
-   * read and conditionally removed in one transaction; newer or cross-profile
-   * ownership is left intact for explicit conflict repair. */
-  async retireMigratedMappingCorrelation(mapping: Mapping): Promise<boolean> {
-    await assertReplayAdmissionIfEnabled(mappingReplayIdentity(mapping));
-    const table = this.ensureTable();
-    const rowKeys = [
-      key(`EVENT#${mapping.profile}#${mapping.eventId}`, "MAP"),
-      key(`TASK#${mapping.profile}#${mapping.taskId}`, "MAP"),
-      key(`TASKOWNER#${mapping.taskId}`, "MAP"),
-    ];
-    const rows = await Promise.all(rowKeys.map(Key => client.send(new GetCommand({
-      TableName: table, Key, ConsistentRead: true,
-    }))));
-    const entries = rows.map((result, index) => ({ Key: rowKeys[index], Item: result.Item }));
-    const exact = (item: Record<string, unknown> | undefined): boolean => Boolean(item
-      && item.profile === mapping.profile && item.taskId === mapping.taskId
-      && item.eventId === mapping.eventId && item.updatedAt === mapping.updatedAt);
-    if (entries.some(({ Item }) => Item && !exact(Item))) return false;
-
-    let link: RecurrenceLink | undefined;
-    if (mapping.seriesId) {
-      link = await this.getRecurrenceLink(mapping.profile, mapping.seriesId);
-      if (link && (link.profile !== mapping.profile || link.seriesId !== mapping.seriesId
-        || link.taskId !== mapping.taskId || link.eventId !== mapping.eventId
-        || link.masterEventId !== mapping.masterEventId
-        || link.activeInstanceId !== mapping.activeInstanceId
-        || mapping.recurrenceOwner && link.owner !== mapping.recurrenceOwner)) return false;
-    }
-
-    const deletes: Array<Record<string, unknown>> = entries.filter(({ Item }) => Item).map(({ Key }) => ({
-      Delete: {
-        TableName: table, Key,
-        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated",
-        ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: {
-          ":profile": mapping.profile, ":task": mapping.taskId,
-          ":event": mapping.eventId, ":updated": mapping.updatedAt,
-        },
-      },
-    }));
-    if (link) {
-      deletes.push({ Delete: {
-        TableName: table,
-        Key: key(`RECURRENCE#${mapping.profile}#${mapping.seriesId}`),
-        ConditionExpression: "#profile = :profile AND taskId = :task AND eventId = :event AND seriesId = :series AND updatedAt = :updated",
-        ExpressionAttributeNames: { "#profile": "profile" },
-        ExpressionAttributeValues: {
-          ":profile": link.profile, ":task": link.taskId, ":event": link.eventId,
-          ":series": link.seriesId, ":updated": link.updatedAt,
-        },
-      } });
-    }
-    if (!deletes.length) return true;
-    try {
-      await client.send(new TransactWriteCommand({ TransactItems: deletes as never }));
-      return true;
-    } catch (error) {
-      const cancelled = error as { name?: string; CancellationReasons?: Array<{ Code?: string }> };
-      if (cancelled.name === "TransactionCanceledException"
-        && (!cancelled.CancellationReasons?.length
-          || cancelled.CancellationReasons.some(reason => reason.Code === "ConditionalCheckFailed"))) return false;
-      throw error;
-    }
-  }
-
   /**
    * Retire a Todoist-owned recurring projection only after its task and every
    * currently referenced Calendar resource have been verified absent by the
@@ -2254,6 +2200,7 @@ export class StateRepository {
         ],
       }));
     } catch (error) {
+      annotateProviderAction(error, "dynamodb:TransactWriteItems", "dynamodb:ConditionCheckItem");
       if ((error as { name?: string }).name !== "TransactionCanceledException") throw error;
       const saved = await this.getCompletedCalendarProjectionByEvent(projection.profile, projection.eventId);
       if (!saved || saved.taskId !== projection.taskId || saved.completedAt !== projection.completedAt) {

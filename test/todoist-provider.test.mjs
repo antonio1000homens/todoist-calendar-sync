@@ -69,6 +69,38 @@ test("Todoist read retries honor a 429 retry_after hint within the configured ma
   assert.equal(comments[0].id,"comment-1");
 });
 
+test("Todoist honors Retry-After values beyond the exponential backoff ceiling",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0,scheduledDelay;
+  t.mock.method(globalThis,"setTimeout",(callback,delay)=>{
+    scheduledDelay=delay;
+    queueMicrotask(callback);
+    return 0;
+  });
+  globalThis.fetch=async()=>{
+    calls++;
+    if(calls===1)return Response.json({error:"Too many requests",error_extra:{retry_after:131}}, {status:429});
+    return Response.json({id:"task-1"});
+  };
+  const todoist=new Todoist("test-token",{rateLimitRetries:1,maxRetryDelayMs:10_000,honorFullRetryAfter:true});
+  assert.equal((await todoist.getTask("task-1")).id,"task-1");
+  assert.equal(scheduledDelay,131_000);
+  assert.equal(calls,2);
+});
+
+test("ordinary Todoist workers do not sleep beyond their inline Retry-After budget",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0,scheduled=false;
+  t.mock.method(globalThis,"setTimeout",()=>{scheduled=true;return 0;});
+  globalThis.fetch=async()=>{calls++;return Response.json({error:"Too many requests",error_extra:{retry_after:131}}, {status:429});};
+  const todoist=new Todoist("worker-token-510",{rateLimitRetries:1,maxRetryDelayMs:10_000});
+  await assert.rejects(()=>todoist.getTask("task-1"),{status:429});
+  assert.equal(calls,1);
+  assert.equal(scheduled,false);
+});
+
 test("Todoist read retries stop at their configured bound when the provider remains rate limited",async t=>{
   const originalFetch=globalThis.fetch;
   t.after(()=>{globalThis.fetch=originalFetch;});
@@ -100,4 +132,19 @@ test("Todoist maintenance retries explicitly rejected 429 comment writes only",a
   globalThis.fetch=async()=>{calls++;return Response.json({error:"unavailable"},{status:503});};
   await assert.rejects(()=>todoist.createProjectComment("project-1","sync mapping"),{status:503});
   assert.equal(calls,1,"ambiguous write failures are never replayed");
+});
+
+test("Todoist maintenance requests are paced across concurrent callers",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  const starts=[];
+  globalThis.fetch=async url=>{
+    starts.push(Date.now());
+    return Response.json({id:String(url).split("/").at(-1)});
+  };
+  const todoist=new Todoist("shared-maintenance-token-510",{minRequestIntervalMs:25});
+  const secondClient=new Todoist("shared-maintenance-token-510");
+  await Promise.all([todoist.getTask("task-1"),secondClient.getTask("task-2")]);
+  assert.equal(starts.length,2);
+  assert.ok(starts[1]-starts[0]>=20,"concurrent migration reads reserve distinct paced slots");
 });

@@ -8,13 +8,15 @@ import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
 import { serializeMappingComment } from "../dist/mapping-comments.js";
 
-test("matches Calendar events by normalized title and all-day date", () => {
+test("matches a unique Calendar counterpart by exact normalized fields and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
   const tasks = [
     { id: "wrong-date", content: "pay invoice", due: { date: "2026-09-02" } },
-    { id: "match", content: "Pay invoice for August", due: { date: "2026-09-01" } },
+    { id: "match", content: "Pay invoice", due: { date: "2026-09-01" } },
   ];
   assert.equal(matchingTask(event, tasks)?.id, "match");
+  assert.equal(matchingTask(event, [...tasks, { ...tasks[1], id: "second-compatible" }]), undefined);
+  assert.equal(matchingTask(event, [{ ...tasks[1], description: "different details" }]), undefined);
 });
 
 test("converts Calendar all-day and timed representations into Todoist", () => {
@@ -54,6 +56,24 @@ test("mapping persistence writes provider correlation and a minimal shared-field
   assert.match(serialized,/"syncedDescription":"Exact details"/);
   assert.match(serialized,/"syncedDue":"2099-05-08T09:00:00Z"/);
   assert.equal(JSON.parse(serialized.split("\n")[1]).calendarId,profiles.home.calendarId);
+});
+
+test("provider mapping reads prefer Todoist comments and retain legacy DynamoDB-only links", async () => {
+  const providerMapping = { profile: "home", eventId: "event-current", taskId: "task-current",
+    projectId: profiles.home.todoistProjectId, updatedAt: "2099-01-01T00:00:00Z" };
+  const legacyOnly = { profile: "home", eventId: "event-legacy", taskId: "task-legacy",
+    projectId: profiles.home.todoistProjectId, updatedAt: "2098-01-01T00:00:00Z" };
+  const staleDuplicate = { ...providerMapping, eventId: "event-stale" };
+  const state = { async listMappings() { return [legacyOnly, staleDuplicate]; } };
+  const todoist = { async listProjectComments() { return [{
+    id: "project-link", project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment(providerMapping),
+  }]; } };
+  const sync = new Synchronizer(state, undefined, async () => ({ todoist, calendar: {} }));
+
+  const mappings = await sync.providerMappings("home", todoist);
+
+  assert.deepEqual(mappings.map(mapping => mapping.taskId).sort(), ["task-current", "task-legacy"]);
 });
 
 test("multi-day Calendar events use only their first day as the Todoist due date", () => {

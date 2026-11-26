@@ -58,7 +58,7 @@ leases and therefore remain blocked by an active erasure fence:
   src/reconcile.ts;
 - review, repair, reconciliation, retirement, and undo routes in
   src/review-api.ts;
-- completed-history cleanup and project-comment migration;
+- completed-history cleanup;
 - recurrence, orphan, and native-move writers that acquire the profile writer
   lease or check the erasure epoch before their first mutation.
 

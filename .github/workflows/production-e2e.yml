@@ -1,8 +1,6 @@
 name: Production E2E
 
 on:
-  repository_dispatch:
-    types: [automatic-project-comment-migration]
   workflow_dispatch:
     inputs:
       profile:

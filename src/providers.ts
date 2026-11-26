@@ -88,10 +88,38 @@ type ProviderRequestOptions = {
   timeoutMs?: number;
   /** Extra read retries for controlled maintenance jobs; ordinary sync keeps its short default. */
   readRetries?: number;
-  /** Explicitly rejected 429 writes can be safely retried by idempotent maintenance operations. */
+  /** Retry bound for explicit 429 responses; callers must use idempotent operations when writing. */
   rateLimitRetries?: number;
   maxRetryDelayMs?: number;
+  /** Honor full Retry-After hints for controlled maintenance, rather than an inline retry. */
+  honorFullRetryAfter?: boolean;
+  /** Minimum spacing between requests sharing one Todoist token, for controlled migrations. */
+  minRequestIntervalMs?: number;
 };
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const todoistRequestPacing = new Map<string, { nextAt: number; intervalMs: number }>();
+
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError(signal));
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(abortError(signal!));
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 async function fetchProvider(
   input: RequestInfo | URL,
@@ -106,21 +134,25 @@ async function fetchProvider(
   return fetch(input,signals.length?{...init,signal:AbortSignal.any(signals)}:init);
 }
 
-function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number): number | undefined {
+function retryDelayMs(error: unknown, attempt: number, maxRetryDelayMs: number,
+  honorFullRetryAfter = false): number | undefined {
   const status = Number((error as { status?: number }).status);
   const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
   if (status === 429 && Number.isFinite(retryAfterMs)) {
-    // Never retry before an explicit provider hint. Let the FIFO retry path
-    // retain the delivery if the provider asks us to wait longer than this call.
-    return retryAfterMs <= maxRetryDelayMs ? retryAfterMs : undefined;
+    // Maintenance migrations honor long quota windows. Other inline provider
+    // calls retain their existing bounded retry behavior.
+    if ((!honorFullRetryAfter && retryAfterMs > maxRetryDelayMs)
+      || retryAfterMs > MAX_TIMER_DELAY_MS) return undefined;
+    return retryAfterMs;
   }
   const ceiling = Math.min(maxRetryDelayMs, 1000 * (2 ** Math.min(attempt, 8)));
   return Math.floor(Math.random() * Math.max(1, ceiling));
 }
 
-function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number): Promise<void> | undefined {
-  const delay = retryDelayMs(error, attempt, maxRetryDelayMs);
-  return delay === undefined ? undefined : new Promise(resolve => setTimeout(resolve, delay));
+function waitForRetry(error: unknown, attempt: number, maxRetryDelayMs: number,
+  honorFullRetryAfter = false, signal?: AbortSignal): Promise<void> | undefined {
+  const delay = retryDelayMs(error, attempt, maxRetryDelayMs, honorFullRetryAfter);
+  return delay === undefined ? undefined : abortableDelay(delay, signal);
 }
 
 /**
@@ -762,8 +794,28 @@ export class GoogleCalendar {
 
 export class Todoist {
   private readonly projectCommentCache = new Map<string, TodoistCommentRecord[]>();
+  private readonly pacingKey: string;
 
-  constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {}
+  constructor(private readonly token: string,private readonly requestOptions:ProviderRequestOptions={}) {
+    this.pacingKey=createHash("sha256").update(token).digest("hex");
+    const interval=this.requestOptions.minRequestIntervalMs||0;
+    if(!Number.isSafeInteger(interval)||interval<0)throw new Error("Invalid Todoist request interval");
+    if(interval>0) {
+      const current=todoistRequestPacing.get(this.pacingKey)||{nextAt:0,intervalMs:0};
+      current.intervalMs=Math.max(current.intervalMs,interval);
+      todoistRequestPacing.set(this.pacingKey,current);
+    }
+  }
+
+  private async paceRequest(): Promise<void> {
+    const pacing=todoistRequestPacing.get(this.pacingKey);
+    if(!pacing||pacing.intervalMs<=0)return;
+    const now = Date.now();
+    const startsAt = Math.max(now, pacing.nextAt);
+    pacing.nextAt = startsAt + pacing.intervalMs;
+    const delay = startsAt - now;
+    if (delay > 0) await abortableDelay(delay,this.requestOptions.signal);
+  }
 
   private async request<T>(path: string, init: RequestInit = {}, comments = false): Promise<T> {
     const headers = new Headers(init.headers);
@@ -776,15 +828,17 @@ export class Todoist {
     const maxRetryDelayMs = this.requestOptions.maxRetryDelayMs ?? 30_000;
     for (let attempt = 0; ; attempt += 1) {
       try {
+        await this.paceRequest();
         return await responseJson<T>(await fetchProvider(url, { ...init, headers },this.requestOptions));
       } catch (error) {
         const name=(error as {name?:string})?.name;
         if(name==="AbortError"||name==="TimeoutError")throw error;
         const status = Number((error as { status?: number }).status);
         const transient = !status || status === 408 || status === 429 || status >= 500;
-        const retryLimit = readOnly ? readRetries : status === 429 ? rateLimitRetries : 0;
+        const retryLimit = status === 429 ? rateLimitRetries : readOnly ? readRetries : 0;
         if (!transient || attempt >= retryLimit || (!readOnly && status !== 429)) throw error;
-        const delay = waitForRetry(error, attempt, maxRetryDelayMs);
+        const delay = waitForRetry(error, attempt, maxRetryDelayMs,
+          this.requestOptions.honorFullRetryAfter===true,this.requestOptions.signal);
         if (!delay) throw error;
         await delay;
       }

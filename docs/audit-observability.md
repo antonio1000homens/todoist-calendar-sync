@@ -35,7 +35,7 @@ The implementation is conservative: an action that does not match a reviewed
 routine shape defaults to significant and is retained until explicitly
 classified. This covers all current call sites in `calendar-reconciliation.ts`,
 `reconciliation.ts`, `sync.ts`, `project-sync.ts`, `worker.ts`,
-`manual-intervention.ts`, and `project-comment-migration.ts` without relying
+`manual-intervention.ts` without relying
 on DynamoDB audit history as application state.
 
 ## Payload safety
