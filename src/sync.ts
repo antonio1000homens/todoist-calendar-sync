@@ -314,27 +314,33 @@ export async function hasConflictingCalendarCandidate(
   inventory: CalendarEvent[],
   calendar: GoogleCalendar,
 ): Promise<boolean> {
-  if (!task.due?.is_recurring) return false;
-  const due = taskDateTime(task) || task.due.date;
+  const due = taskDateTime(task) || task.due?.date;
   if (!due) return false;
+  const visitedMasters = new Set<string>();
   for (const listed of inventory) {
-    if (listed.status === "cancelled" || !candidateTextMatches(listed, task)) continue;
+    if (listed.status === "cancelled") continue;
     if (!listed.recurrence?.length && !listed.recurringEventId) {
+      if (!candidateTextMatches(listed, task)) continue;
       const live = await calendar.getEvent(listed.id);
       if (live.status !== "cancelled" && !live.recurrence?.length && !live.recurringEventId
         && candidateTextMatches(live, task) && startsMatch(live, task)) return true;
       continue;
     }
-    if (listed.recurringEventId || !listed.recurrence?.length) continue;
-    const master = await calendar.getEvent(listed.id);
+    const masterId = listed.recurringEventId || listed.id;
+    if (visitedMasters.has(masterId)) continue;
+    visitedMasters.add(masterId);
+    const master = masterId === listed.id ? await calendar.getEvent(listed.id) : await calendar.getEvent(masterId);
     if (master.status === "cancelled" || master.recurringEventId || !master.recurrence?.length
-      || !candidateTextMatches(master, task)) continue;
+      || (task.due?.is_recurring && !candidateTextMatches(master, task))) continue;
     const instances = await listBoundedRecurrenceInstances(calendar, master.id, due);
-    const current = selectTodoistCurrentInstance(instances, task);
-    if (!current || current.status === "cancelled" || current.recurringEventId !== master.id) continue;
-    const live = await calendar.getEvent(current.id);
-    if (live.status !== "cancelled" && live.recurringEventId === master.id
-      && candidateTextMatches(live, task) && startsMatch(live, task)) return true;
+    const matchingInstances = instances.filter(instance => instance.status !== "cancelled"
+      && instance.recurringEventId === master.id && startsMatch(instance, task)
+      && candidateTextMatches(instance, task));
+    for (const instance of matchingInstances) {
+      const live = await calendar.getEvent(instance.id);
+      if (live.status !== "cancelled" && live.recurringEventId === master.id
+        && candidateTextMatches(live, task) && startsMatch(live, task)) return true;
+    }
   }
   return false;
 }
