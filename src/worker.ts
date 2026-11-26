@@ -1,4 +1,5 @@
 import type { Context, SQSHandler, SQSRecord } from "aws-lambda";
+import { createHash } from "node:crypto";
 import { reconcileUnmappedCalendar } from "./calendar-reconciliation.js";
 import { ManualInterventionService } from "./manual-intervention.js";
 import {
@@ -11,31 +12,40 @@ import {
 } from "./mutation-budget.js";
 import { OrphanRecoveringSynchronizer } from "./orphan-recovery.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
-import { enqueueDelivery, queuePendingRefresh } from "./queue.js";
+import { enqueueDelivery, queuePendingRefresh, requestReconciliation } from "./queue.js";
 import { SnapshotReconciler } from "./reconciliation.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { StateRepository } from "./repository.js";
 import { profiles } from "./config.js";
-import { activeProjectDeletionTombstone } from "./mapping-comments.js";
 import { deliverPendingReconciliationOutcome } from "./reconciliation-outcomes.js";
 import { processStatusInbox } from "./status-inbox.js";
 import { Synchronizer } from "./sync.js";
-import { ReviewEngine } from "./review-engine.js";
-import { ReviewStore } from "./review-store.js";
-import { requestDeletedConflictReview } from "./deleted-conflict-recheck.js";
-import { acquireErasureProtocolLease, ErasureEpochChangedError, getErasureEpoch } from "./erasure-protocol.js";
-import {assertReplayAdmission, ErasureReplayBlockedError, ErasureReplayUnavailableError, replayAdmissionEnabled} from "./erasure-replay-barrier.js";
 import { logEvent } from "./observability.js";
 import {
   MAX_SYNC_RECEIVES, failedDeliveryDisposition,
   quarantineFailedRecord, shortenTransientRetryVisibility, transientRetryVisibilitySeconds,
 } from "./sqs-failure-policy.js";
-import { ManualDecisionStore } from "./manual-intervention.js";
 import type { Delivery, Profile, ReconciliationContinuation, TodoistWebhookPayload } from "./types.js";
 import { decodeSlackInteractionDelivery, isSlackControlUserAllowed } from "./slack-interaction.js";
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-worker", event, ...detail }));
+}
+
+type ReconcileDelivery = Delivery & { kind: "reconcile"; reconcile: NonNullable<Delivery["reconcile"]> };
+
+export function ensureReconciliationGeneration(delivery: ReconcileDelivery): ReconcileDelivery;
+export function ensureReconciliationGeneration(delivery: Delivery): Delivery;
+export function ensureReconciliationGeneration(delivery: Delivery): Delivery {
+  if (delivery.kind !== "reconcile" || delivery.reconcile?.generation) return delivery;
+  const digest = createHash("sha256").update(delivery.id).digest("hex").slice(0, 24);
+  return {
+    ...delivery,
+    reconcile: {
+      reason: delivery.reconcile?.reason || "manual",
+      generation: `legacy-${delivery.profile}-${digest}`,
+    },
+  };
 }
 
 function serializeError(error: unknown): Record<string, unknown> {
@@ -150,15 +160,12 @@ async function enqueueReconciliationContinuation(
 }
 
 export async function processReconciliation(
-  delivery: Delivery,
+  delivery: ReconcileDelivery,
   state: StateRepository,
   clientFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): Promise<ReconciliationProcessingResult> {
+  delivery = ensureReconciliationGeneration(delivery);
   const mutationBudget = new ReconciliationMutationBudget();
-  if (!delivery.reconcile?.generation) {
-    log("legacy_reconciliation_delivery_skipped", { deliveryId: delivery.id, profile: delivery.profile, reason: "automatic legacy reconciliation is disabled; request a manual run in Slack" });
-    return { continuationRequired: false };
-  }
   const budgetedClientFactory = createBudgetedClientFactory(mutationBudget, clientFactory);
   const reconciler = new SnapshotReconciler(
     state,
@@ -182,7 +189,7 @@ export async function processReconciliation(
     stage: "mapped_state" | "calendar_snapshot",
     detail: Record<string, unknown> = {},
   ): Promise<ReconciliationProcessingResult> => {
-    const message = `${action}: ${stage}; reconciliation stopped and needs a fresh manual request`;
+    const message = `${action}: ${stage}; reconciliation stopped and will retry on a fresh scheduled or manual run`;
     await state.recordReconciliationFailure(delivery.profile, generation, message);
     await state.audit(delivery.profile, action, {
       deliveryId: delivery.id,
@@ -199,7 +206,7 @@ export async function processReconciliation(
       action,
       mutationBudget: mutationBudget.snapshot(),
       durationMs: Date.now() - startedAt,
-      continuation: "stopped; request a fresh reconciliation manually after addressing the cause",
+      continuation: "stopped; a fresh scheduled or manual run will retry after addressing the cause",
       ...detail,
     });
     return { continuationRequired: true };
@@ -335,26 +342,6 @@ async function deliverReconciliationOutcome(state: StateRepository, manual: Manu
   }
 }
 
-async function deliverRepairOutcome(manual: ManualInterventionService, operationId: string): Promise<void> {
-  const store = new ReviewStore();
-  const operation = await store.getOperation(operationId);
-  if (!operation?.notificationPending) return;
-  const reviewCase = await store.getCase(operation.preview.intent.caseId);
-  const decisionId = reviewCase?.decision?.decisionId;
-  const decision = decisionId ? await new ManualDecisionStore().get(decisionId) : undefined;
-  const status = operation.status === "succeeded" ? "Succeeded"
-    : operation.status === "needs_review" ? "Needs review" : "Failed";
-  const text = operation.notificationText || status + ": " + (operation.verified?.length || 0) + " pairs verified"
-    + (operation.error ? ". " + operation.error : "");
-  const replyTs = await manual.deliverReconciliationOutcome(
-    decision?.slackChannelId,
-    decision?.slackMessageTs,
-    operation.notificationReplyTs,
-    text,
-  );
-  await store.completeNotification(operation.id, replyTs);
-}
-
 export const handler: SQSHandler = async (event, context: Context) => {
   const failures: { itemIdentifier: string }[] = [];
   for (const record of event.Records) {
@@ -362,91 +349,12 @@ export const handler: SQSHandler = async (event, context: Context) => {
     let delivery: Delivery | undefined;
     let state: StateRepository | undefined;
     let manual: ManualInterventionService | undefined;
-    let releaseWriterLease: (() => Promise<void>) | undefined;
-    let replayAdmission = false;
     let meaningfulMutation = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
-      delivery = JSON.parse(record.body) as Delivery;
+      delivery = ensureReconciliationGeneration(JSON.parse(record.body) as Delivery);
       state = new StateRepository();
-      replayAdmission = replayAdmissionEnabled();
-      if (process.env.ERASURE_PROTOCOL_VERSION === "1") {
-        for (let attempt = 0; attempt < 3 && !releaseWriterLease; attempt++) {
-          const currentErasureEpoch = await getErasureEpoch(delivery.profile);
-          if ((delivery.erasureEpoch ?? 0) !== currentErasureEpoch) {
-            logEvent("stale_erasure_epoch_delivery_dropped", { profile: delivery.profile, deliveryEpoch: delivery.erasureEpoch ?? 0, currentEpoch: currentErasureEpoch });
-            break;
-          }
-          try {
-            releaseWriterLease = await acquireErasureProtocolLease(
-              delivery.profile,
-              "writer",
-              `${context.awsRequestId}:${record.messageId}`,
-              currentErasureEpoch,
-            );
-          } catch (error) {
-            if (!(error instanceof ErasureEpochChangedError) || attempt === 2) throw error;
-          }
-        }
-        if (!releaseWriterLease) {
-          continue;
-        }
-      }
-      // Drop keyed erased-task webhooks before any delivery receipt, log with
-      // provider identity, audit, repair, or state write. The profile writer
-      // lease above remains held until the finally block releases it.
-      // An unknown identity is never treated as proof of admission.
-      if(delivery.kind==="todoist"&&replayAdmission) {
-        let taskId:string|undefined;
-        try {
-          const parsed=JSON.parse(delivery.body) as TodoistWebhookPayload;
-          taskId=parsed.event_data?.id;
-        } catch { throw new ErasureReplayUnavailableError("Malformed Todoist webhook under replay admission"); }
-        if(typeof taskId!=="string"||!taskId.length)
-          throw new ErasureReplayUnavailableError("Todoist webhook missing its task identity");
-        try {
-          await assertReplayAdmission({profile:delivery.profile,taskId});
-        } catch(error) {
-          if(!(error instanceof ErasureReplayBlockedError))throw error;
-          logEvent("erased_identity_delivery_suppressed",{profile:delivery.profile,kind:"todoist"});
-          continue;
-        }
-      }
-      // Orphan rechecks can delete a Calendar event and its mapping without
-      // entering either provider webhook path. Consult the durable project
-      // comment under the writer lease before the synchronizer or receipt
-      // handling can write any task identity.
-      if(delivery.kind==="orphan"&&delivery.orphan) {
-        const clients=await defaultProviderClientFactory(delivery.profile);
-        const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
-        if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
-          projectId:profiles[delivery.profile].todoistProjectId,taskId:delivery.orphan.taskId,
-          eventIds:[delivery.orphan.eventId]})) {
-          await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"orphan"});
-          continue;
-        }
-      }
-      // A deletion webhook can be intercepted into a review decision before
-      // Synchronizer.process() runs. Check the provider tombstone first so a
-      // stale deleted identity cannot create review/receipt state in DynamoDB.
-      if(delivery.kind==="todoist") {
-        let payload:TodoistWebhookPayload|undefined;
-        try { payload=JSON.parse(delivery.body) as TodoistWebhookPayload; } catch { /* normal validation owns malformed payloads */ }
-        const task=payload?.event_data;
-        const explicitDelete=Boolean(task?.id&&(/deleted/i.test(payload?.event_name||"")||task.is_deleted));
-        if(explicitDelete&&task?.id) {
-          suppressCompletionReceipt=true;
-          const clients=await defaultProviderClientFactory(delivery.profile);
-          const comments=await clients.todoist.listProjectComments(profiles[delivery.profile].todoistProjectId,true);
-          if(activeProjectDeletionTombstone(comments,{profile:delivery.profile,
-            projectId:profiles[delivery.profile].todoistProjectId,taskId:task.id})) {
-            await state.audit(delivery.profile,"erasure_project_comment_replay_suppressed",{side:"todoist",deliveryId:delivery.id});
-            continue;
-          }
-          suppressCompletionReceipt=false;
-        }
-      }
       manual = new ManualInterventionService();
       const identityRefs = { taskIds: new Set<string>(), eventIds: new Set<string>(), seriesIds: new Set<string>(), generation: delivery.reconcile?.generation };
       const collectIdentityRefs = (value: unknown, field = ""): void => {
@@ -608,7 +516,9 @@ export const handler: SQSHandler = async (event, context: Context) => {
       }
 
       if (delivery.kind === "reconcile") {
-        const reconciliation = await processReconciliation(delivery, state);
+        const reconcileDelivery = ensureReconciliationGeneration(delivery as ReconcileDelivery);
+        delivery = reconcileDelivery;
+        const reconciliation = await processReconciliation(reconcileDelivery, state);
         if (!reconciliation.continuationRequired && !reconciliation.continuationQueued && delivery.reconcile?.generation) {
           const current = await state.getReconciliationState(delivery.profile);
           if (current?.generation === delivery.reconcile.generation) {
@@ -651,29 +561,18 @@ export const handler: SQSHandler = async (event, context: Context) => {
       }
 
       if (delivery.kind === "repair") {
-        if (!delivery.repair?.operationId) throw new Error("Repair delivery is missing its operation ID");
-        const result = await new ReviewEngine().execute(delivery.repair.operationId);
-        if (result.status === "succeeded" || result.status === "needs_review" || result.status === "failed") {
-          await deliverRepairOutcome(manual, result.id);
-          await markCompleted();
-        }
-        log("repair_delivery_completed", { awsRequestId:context.awsRequestId, status:result.status, operationId:result.id });
-        continue;
-      }
-
-      if (delivery.kind === "todoist" && await manual.interceptTodoistDeletion(delivery, state)) {
-        const payload = JSON.parse(delivery.body) as TodoistWebhookPayload;
-        if (payload.event_name === "item:deleted" && payload.event_data?.id) {
-          // This intercepted delivery never reaches Synchronizer.process.
-          // Index and schedule the same exact-ID deletion recheck before
-          // recording the original webhook as completed.
-          await requestDeletedConflictReview(state, delivery.profile, { taskIds: [payload.event_data.id] });
-        }
+        // Legacy repair messages contain a preview/decision operation that
+        // may no longer describe provider state. Replace them with an ordinary
+        // full reconciliation, which re-reads exact live provider IDs and
+        // performs automatic repair without replaying stale reviewed actions.
+        const request = await requestReconciliation(state, delivery.profile, "scheduled", undefined, {
+          requester: "scheduled",
+        });
+        if (request.enqueueError) throw new Error("Unable to enqueue fresh reconciliation for a legacy repair delivery");
         await markCompleted();
-        log("todoist_delete_deferred_for_manual_decision", {
-          awsRequestId: context.awsRequestId,
-          durationMs: Date.now() - startedAt,
-          delivery: deliverySummary(delivery),
+        log("legacy_repair_replaced_by_reconciliation", {
+          awsRequestId: context.awsRequestId, profile: delivery.profile,
+          queued: request.queued, coalesced: request.coalesced,
         });
         continue;
       }
@@ -742,35 +641,6 @@ export const handler: SQSHandler = async (event, context: Context) => {
         delivery: deliverySummary(delivery),
       });
     } catch (error) {
-      // Fence/lease acquisition failures happen before this invocation is an
-      // authorized writer. Do not let generic error reporting mutate state
-      // outside the profile fence.
-      const replayVersion = process.env.ERASURE_REPLAY_BARRIER_VERSION;
-      const replayDisabled = replayVersion === undefined || replayVersion === "" || replayVersion === "0";
-      const mayWriteFailureState = (process.env.ERASURE_PROTOCOL_VERSION !== "1" && replayDisabled)
-        || !!releaseWriterLease;
-      if (!mayWriteFailureState) {
-        failures.push({ itemIdentifier: record.messageId });
-        continue;
-      }
-      if(error instanceof ErasureReplayBlockedError&&state&&delivery
-        &&(delivery.kind==="todoist"||delivery.kind==="calendar")) {
-        // Treat a replay-admission block as suppression, never as a failed
-        // identity-bearing delivery or a reason to retry a provider write.
-        // The audit deliberately omits task/event IDs.
-        suppressCompletionReceipt=true;
-        try {
-          await state.audit(delivery.profile,"erasure_replay_admission_suppressed",
-            {side:delivery.kind});
-        } catch {
-          failures.push({itemIdentifier:record.messageId});
-        }
-        continue;
-      }
-      // The suppression audit is intentionally identity-free. If its write
-      // fails, generic incident reporting would persist the webhook task ID
-      // and recreate the erased identity in DynamoDB. Leave the message for
-      // retry without any secondary state writes or notifications.
       if (suppressCompletionReceipt) {
         failures.push({ itemIdentifier: record.messageId });
         continue;
@@ -870,27 +740,7 @@ export const handler: SQSHandler = async (event, context: Context) => {
         },
       }));
       if (!quarantined) failures.push({ itemIdentifier: record.messageId });
-    } finally {
-      if (releaseWriterLease) {
-        try {
-          await releaseWriterLease();
-        } catch (error) {
-          // A retained lease blocks erasure until an operator can prove this
-          // invocation ended. Never treat a failed release as a drained writer.
-          console.error(JSON.stringify({
-            service: "todoist-calendar-sync-worker",
-            event: "erasure_writer_lease_release_failed",
-            awsRequestId: context.awsRequestId,
-            deliveryId: delivery?.id,
-            profile: delivery?.profile,
-            error: serializeError(error),
-          }));
-          if (!failures.some((failure) => failure.itemIdentifier === record.messageId)) {
-            failures.push({ itemIdentifier: record.messageId });
-          }
-        }
-      }
-    }
+    } finally { /* SQS FIFO serializes normal deliveries by profile. */ }
   }
   return { batchItemFailures: failures };
 };

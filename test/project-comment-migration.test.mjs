@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { documentClient } from "../dist/dynamodb-capacity.js";
-import { serializeMappingComment } from "../dist/mapping-comments.js";
-import { migrateProjectComments } from "../dist/project-comment-migration.js";
+import { parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
+import { migrateProjectComments, runAutomaticProjectCommentMigration } from "../dist/project-comment-migration.js";
 
 function mapping(overrides = {}) {
   return {
@@ -21,9 +21,11 @@ class FakeState {
     this.tombstone = tombstone;
     this.saved = [];
     this.audits = [];
+    this.completed = [];
   }
   async putMapping(value) { this.saved.push(structuredClone(value)); }
   async getCalendarProjectionTombstone() { return this.tombstone; }
+  async putCompletedCalendarProjection(value) { this.completed.push(structuredClone(value)); }
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
@@ -31,6 +33,7 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
   const comments = projectComments.map((comment) => ({ ...comment }));
   const deletes = [];
   let creates = 0;
+  const calendarEvents = new Map();
   return {
     clients: {
       todoist: {
@@ -65,12 +68,32 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
           if (deleteError) throw deleteError;
         },
         async getTask(taskId) {
-          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId, is_completed: completedTask };
+          return { id: taskId, content: "Task", project_id: profiles.home.todoistProjectId,
+            updated_at: "2026-09-08T10:05:00.000Z", is_completed: completedTask };
         },
       },
       calendar: {
         async getEvent(eventId) {
-          return { id: eventId, status: "confirmed", htmlLink: `https://calendar.example/${eventId}` };
+          return structuredClone(calendarEvents.get(eventId) || {
+            id: eventId, etag: "etag-1", status: "confirmed", htmlLink: `https://calendar.example/${eventId}`,
+          });
+        },
+        async ensureTaskCorrelation(eventId, taskId, _expectedTaskId, mapping) {
+          const current = await this.getEvent(eventId);
+          const shared = current.extendedProperties?.shared || {};
+          current.extendedProperties = { ...current.extendedProperties, shared: {
+            ...shared, taskId, syncTaskId: taskId, syncSchemaVersion: "2", syncProfile: "home",
+            syncCalendarId: profiles.home.calendarId, syncEventId: eventId,
+            ...(mapping.seriesId ? { syncSeriesId: mapping.seriesId } : {}),
+            ...(mapping.masterEventId ? { syncMasterEventId: mapping.masterEventId } : {}),
+            ...(mapping.activeInstanceId ? { syncActiveInstanceId: mapping.activeInstanceId } : {}),
+            ...(mapping.originalStart ? { syncOriginalStart: mapping.originalStart } : {}),
+            ...(mapping.activeEffectiveStart ? { syncActiveEffectiveStart: mapping.activeEffectiveStart } : {}),
+            ...(mapping.calendarProgressVersion === 1 ? { syncProgressVersion: "1" } : {}),
+            ...(mapping.completedThroughOriginalStart ? { syncCompletedThrough: mapping.completedThroughOriginalStart } : {}),
+          } };
+          calendarEvents.set(eventId, current);
+          return structuredClone(current);
         },
       },
     },
@@ -79,6 +102,38 @@ function fakeClients({ projectComments = [], legacyComment, onLegacyRead, delete
     comments,
   };
 }
+
+test("automatic migration backfills all profiles before cleanup and retries newly created mappings", async () => {
+  const calls = [];
+  const result = await runAutomaticProjectCommentMigration(async (profile, apply, cleanupLegacy, retireLegacyCorrelation = false) => {
+    calls.push({ profile, apply, cleanupLegacy, retireLegacyCorrelation });
+    return {
+      mode: "apply", projectCommentsCreated: profile === "home" && cleanupLegacy && calls.filter(call => call.profile === profile && call.cleanupLegacy).length === 1 ? 1 : 0,
+      failures: 0, malformedProjectComments: 0, duplicateProjectComments: 0,
+      legacyTaskCommentsCleanupRejected: 0,
+    };
+  });
+
+  assert.deepEqual(calls.map(({ profile, cleanupLegacy }) => [profile, cleanupLegacy]), [
+    ["antonio", false], ["home", false], ["work", false],
+    ["antonio", true], ["home", true], ["work", true], ["home", true],
+    ["antonio", true], ["home", true], ["work", true],
+  ]);
+  assert.deepEqual(calls.slice(-3).map(call => call.retireLegacyCorrelation), [true, true, true]);
+  assert.equal(result.status, "completed");
+  assert.ok(result.phases.cleanupRetry.home);
+  assert.equal(result.phases.cleanupRetry.antonio, undefined);
+});
+
+test("automatic migration fails its report when a profile has ambiguous mappings", async () => {
+  const result = await runAutomaticProjectCommentMigration(async profile => ({
+    mode: "apply", projectCommentsCreated: 0, failures: 0, malformedProjectComments: 0,
+    duplicateProjectComments: profile === "work" ? 1 : 0, legacyTaskCommentsCleanupRejected: 0,
+  }));
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.phases.backfill.work.duplicateProjectComments, 1);
+});
 
 test("migration uses the project index first and does not fan out to task comments", async () => {
   let legacyReads = 0;
@@ -113,20 +168,62 @@ test("apply backfills a missing project comment once, preserves legacy task fall
   assert.equal(first.legacyTaskCommentsFound, 1);
   assert.equal(fake.creates, 1);
   assert.equal(legacyReads, 1);
-  assert.equal(state.saved.length, 1);
-  const migrated = state.saved[0];
-  assert.equal(migrated.projectCommentId, "project-comment-1");
-  assert.equal(migrated.taskCommentId, "legacy-task-comment");
-  assert.equal(migrated.commentId, undefined);
-  assert.equal(migrated.mappingRevision, 1);
+  assert.equal(state.saved.length, 0, "migration must not write a DynamoDB correlation row");
+  const migratedComment = fake.comments[0];
+  assert.equal(migratedComment.id, "project-comment-1");
+  const migrated = parseMappingComment(migratedComment);
+  assert.ok(migrated && !("error" in migrated));
+  assert.equal(migrated.payload.taskId, "task-1");
+  assert.equal(migrated.payload.eventId, "event-1");
+  assert.equal(migrated.payload.mappingRevision, 1);
+  assert.equal(Object.hasOwn(migrated.payload, "recurrenceOwner"), false);
+  const calendarCorrelation = await fake.clients.calendar.getEvent("event-1");
+  assert.equal(calendarCorrelation.extendedProperties.shared.taskId, "task-1");
+  assert.equal(calendarCorrelation.extendedProperties.shared.syncSchemaVersion, "2");
+  assert.equal(calendarCorrelation.extendedProperties.shared.syncProfile, "home");
+  assert.equal(calendarCorrelation.extendedProperties.shared.syncCalendarId, profiles.home.calendarId);
 
   const secondState = new FakeState();
-  const second = await migrateProjectComments("home", [migrated], secondState, fake.clients, true);
+  const second = await migrateProjectComments("home", [mapping({ projectCommentId: migratedComment.id, mappingRevision: 1 })], secondState, fake.clients, true);
   assert.equal(second.existingProjectCommentsReused, 1);
   assert.equal(second.projectCommentsCreated, 0);
   assert.equal(fake.creates, 1, "re-running migration must not create a duplicate project comment");
   assert.equal(legacyReads, 1, "project hit must prevent fallback task-comment lookup on the second run");
   assert.equal(secondState.saved.length, 0, "already-normalized mapping should not be rewritten");
+});
+
+test("correlation retirement follows a verified provider-comment backfill", async () => {
+  const state = new FakeState();
+  const retired = [];
+  state.retireMigratedMappingCorrelation = async value => { retired.push(value); return true; };
+  const fake = fakeClients();
+
+  const summary = await migrateProjectComments("home", [mapping()], state, fake.clients, true, true, true);
+
+  assert.equal(summary.projectCommentsCreated, 1);
+  assert.equal(summary.legacyCorrelationRowsRetired, 1);
+  assert.equal(summary.legacyCorrelationRetirementRejected, 0);
+  assert.equal(retired.length, 1);
+  const saved = parseMappingComment(fake.comments[0]);
+  assert.ok(saved && !("error" in saved));
+  assert.equal(saved.payload.taskId, mapping().taskId);
+  assert.equal(saved.payload.eventId, mapping().eventId);
+});
+
+test("completed mapping retirement first records the seven-day history identity", async () => {
+  const state = new FakeState();
+  const retired = [];
+  state.retireMigratedMappingCorrelation = async value => { retired.push(value); return true; };
+  const fake = fakeClients({ completedTask: true });
+
+  const summary = await migrateProjectComments("home", [mapping()], state, fake.clients, true, true, true);
+
+  assert.equal(summary.legacyCorrelationRowsRetired, 1);
+  assert.equal(state.completed.length, 1);
+  assert.deepEqual(state.completed[0], {
+    profile: "home", taskId: "task-1", eventId: "event-1", completedAt: "2026-09-08T10:05:00.000Z",
+  });
+  assert.equal(retired.length, 1);
 });
 
 test("apply does not misclassify an ambiguous commentId that already points at the project mapping", async () => {
@@ -143,10 +240,10 @@ test("apply does not misclassify an ambiguous commentId that already points at t
 
   assert.equal(summary.legacyTaskCommentsFound, 0);
   assert.equal(fake.deletes.length, 0);
-  assert.equal(state.saved.length, 1);
-  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
-  assert.equal(state.saved[0].taskCommentId, undefined);
-  assert.equal(state.saved[0].commentId, undefined);
+  assert.equal(state.saved.length, 0, "normalization is written to the provider comment only");
+  const normalized = parseMappingComment(fake.comments[0]);
+  assert.ok(normalized && !("error" in normalized));
+  assert.equal(normalized.payload.mappingRevision, 3);
 });
 
 test("legacy cleanup is report-only unless apply is explicit", async () => {
@@ -191,10 +288,10 @@ test("legacy cleanup deletes only after a valid project mapping is verified and 
   assert.equal(summary.legacyTaskCommentsCleanupEligible, 1);
   assert.equal(summary.legacyTaskCommentsDeleted, 1);
   assert.deepEqual(fake.deletes, ["legacy-task-comment"]);
-  assert.equal(state.saved.length, 1);
-  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
-  assert.equal(state.saved[0].taskCommentId, undefined);
-  assert.equal(state.saved[0].commentId, undefined);
+  assert.equal(state.saved.length, 0, "legacy cleanup must not rewrite DynamoDB correlation rows");
+  const normalized = parseMappingComment(fake.comments[0]);
+  assert.ok(normalized && !("error" in normalized));
+  assert.equal(normalized.payload.mappingRevision, 3);
 });
 
 test("report mode validates a missing project mapping but never writes provider or DynamoDB state", async () => {
@@ -211,16 +308,15 @@ test("report mode validates a missing project mapping but never writes provider 
   assert.deepEqual(state.audits, [], "read-only report must not write audit items to DynamoDB");
 });
 
-test("tombstone blocks project-comment backfill so stale breadcrumbs cannot be introduced", async () => {
+test("legacy projection tombstone does not block exact live provider correlation repair", async () => {
   const state = new FakeState({ sourceUpdatedAt: "2026-09-08T09:00:00.000Z" });
   const fake = fakeClients();
 
   const summary = await migrateProjectComments("home", [mapping()], state, fake.clients, true);
 
-  assert.equal(summary.tombstonedMappings, 1);
-  assert.equal(summary.projectCommentsCreated, 0);
-  assert.equal(fake.creates, 0);
-  assert.equal(state.saved.length, 0);
+  assert.equal(summary.projectCommentsCreated, 1);
+  assert.equal(fake.creates, 1);
+  assert.equal(state.saved.length, 0, "provider-native correlation repair must not recreate DDB mapping rows");
 });
 
 
@@ -246,9 +342,10 @@ test("legacy cleanup treats an already-missing task comment as an idempotent del
   assert.equal(summary.legacyTaskCommentsDeleted, 0);
   assert.equal(summary.legacyTaskCommentsAlreadyMissing, 1);
   assert.deepEqual(fake.deletes, []);
-  assert.equal(state.saved.length, 1);
-  assert.equal(state.saved[0].projectCommentId, "project-comment-existing");
-  assert.equal(state.saved[0].taskCommentId, undefined);
+  assert.equal(state.saved.length, 0);
+  const normalized = parseMappingComment(fake.comments[0]);
+  assert.ok(normalized && !("error" in normalized));
+  assert.equal(normalized.payload.mappingRevision, 3);
 });
 
 
@@ -328,7 +425,7 @@ test("cleanup report rejects a mismatched ID without writing any audit record", 
   assert.deepEqual(fake.deletes, []);
 });
 
-test("unexpected legacy HMAC configuration fails migration closed after acquiring the writer lease",async t=>{
+test("stale legacy HMAC configuration does not block provider-comment migration",async t=>{
   const previous=process.env.ERASURE_REPLAY_BARRIER_VERSION;
   const priorProtocol=process.env.ERASURE_PROTOCOL_VERSION;
   process.env.ERASURE_REPLAY_BARRIER_VERSION="1";
@@ -347,14 +444,12 @@ test("unexpected legacy HMAC configuration fails migration closed after acquirin
   });
   const state=new FakeState(),fake=fakeClients();
   const summary=await migrateProjectComments("home",[mapping()],state,fake.clients,true);
-  assert.equal(summary.failures,1);
-  assert.equal(fake.creates,0);
-  assert.deepEqual(fake.deletes,[]);
-  assert.deepEqual(state.saved,[]);
+  assert.equal(summary.failures,0);
+  assert.equal(fake.creates,1);
   assert.ok(sends.includes("TransactWriteCommand"),"writer lease must be acquired");
   assert.ok(sends.includes("DeleteCommand"),"writer lease must be released");
-  assert.equal(sends.includes("PutCommand"),false,"no mapping writes allowed");
-  assert.ok(state.audits.some(entry=>String(entry.detail?.error||"").includes("Legacy HMAC replay admission was retired")));
+  assert.equal(sends.includes("PutCommand"),false,"provider correlation is written through project comments");
+  assert.equal(state.audits.some(entry=>String(entry.detail?.error||"").includes("Legacy HMAC replay admission was retired")),false);
 });
 
 test("project-comment migration refuses mappings from another profile", async () => {

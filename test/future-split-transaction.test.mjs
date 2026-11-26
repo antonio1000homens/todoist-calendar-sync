@@ -31,76 +31,26 @@ test("expired-UNTIL split completion sends only expression values used by its ex
   } finally { documentClient.send = original; }
 });
 
-test("future mapping transaction conditionally claims owner, mapping indexes and recurrence link together", async () => {
+test("an abandoned pending split lease expires and is removed from automatic processing", async () => {
   const original = documentClient.send;
-  let captured;
-  documentClient.send = async (command) => { captured = command; return {}; };
-  try {
-    assert.equal(await new StateRepository().putNewRecurrenceMappingIfUnowned(mapping, link), true);
-    assert.equal(captured.constructor.name, "TransactWriteCommand");
-    const writes = captured.input.TransactItems;
-    const puts = writes.filter((item) => item.Put).map((item) => item.Put);
-    const checks = writes.filter((item) => item.ConditionCheck).map((item) => item.ConditionCheck);
-    assert.deepEqual(puts.map((item) => item.Item.pk).sort(), [
-      "EVENT#antonio#new-series", "RECURRENCE#antonio#smoke-task",
-      "TASK#antonio#smoke-task", "TASKOWNER#smoke-task",
-    ]);
-    assert.ok(puts.every((item) => item.ConditionExpression === "attribute_not_exists(pk)"));
-    assert.ok(checks.some((item) => item.Key.pk === "PROJECTION#antonio#TASK#smoke-task"));
-    assert.ok(checks.some((item) => item.Key.pk === "COMPLETED_EVENT#antonio#new-series"));
-    assert.ok(checks.some((item) => item.Key.pk === "TASK#work#smoke-task"));
-    assert.ok(checks.some((item) => item.Key.pk === "PROJECTION#work#TASK#smoke-task"));
-    const guard = checks.find((item) => item.Key.pk === "FUTURE_SPLIT#TASK#smoke-task");
-    assert.equal(guard.ConditionExpression, "#status = :pending AND profile = :profile AND newMasterId = :master");
-    assert.equal(guard.ExpressionAttributeValues[":pending"], "pending");
-    assert.equal(guard.ExpressionAttributeValues[":master"], mapping.eventId);
-    assert.ok(checks.filter((item) => item !== guard)
-      .every((item) => item.ConditionExpression === "attribute_not_exists(pk)"));
-  } finally { documentClient.send = original; }
-});
-
-test("duplicate consolidation atomically transfers mapping ownership and installs webhook guard", async () => {
-  const original = documentClient.send;
-  let captured;
+  const commands = [];
   documentClient.send = async (command) => {
+    commands.push(command);
     if (command.constructor.name === "GetCommand") return { Item: {
       profile: "antonio", taskId: "smoke-task", oldMasterId: "old-series",
-      newMasterId: "new-series", status: "pending",
+      newMasterId: "new-series", status: "pending", startedAt: "2020-01-01T00:00:00.000Z",
+      expiresAt: 1,
     } };
-    captured = command;
     return {};
   };
-  const previousMapping = {
-    profile: "antonio", projectId: "home-project", taskId: "duplicate-task",
-    eventId: "old-series_20270611", recurrenceOwner: "calendar", seriesId: "old-series",
-    masterEventId: "old-series", activeInstanceId: "old-series_20270611",
-    activeEffectiveStart: "2027-06-11", updatedAt: "2026-10-19T20:00:00Z",
-  };
-  const previousLink = {
-    profile: "antonio", owner: "calendar", seriesId: "old-series",
-    masterEventId: "old-series", activeInstanceId: previousMapping.activeInstanceId,
-    taskId: "duplicate-task", eventId: previousMapping.eventId, updatedAt: previousMapping.updatedAt,
-  };
   try {
-    assert.equal(await new StateRepository().commitRecurrenceConsolidation({
-      mapping, link, previousMapping, previousLink,
-      discardedTaskId: "duplicate-task", decisionId: "decision-1",
-      cancelledEventId: "cancelled-projection",
-    }), true);
-    assert.equal(captured.constructor.name, "TransactWriteCommand");
-    const writes = captured.input.TransactItems;
-    const deletes = writes.filter((item) => item.Delete).map((item) => item.Delete);
-    assert.deepEqual(deletes.map((item) => item.Key.pk), [
-      "EVENT#antonio#old-series_20270611", "TASK#antonio#duplicate-task",
-      "TASKOWNER#duplicate-task", "RECURRENCE#antonio#old-series",
-    ]);
-    const puts = writes.filter((item) => item.Put).map((item) => item.Put);
-    assert.ok(puts.some((item) => item.Item.pk === "CONSOLIDATED_TASK#antonio#duplicate-task"
-      && item.Item.retainedTaskId === "smoke-task" && item.Item.decisionId === "decision-1"
-      && item.Item.cancelledEventId === "cancelled-projection"));
-    assert.ok(puts.every((item) => item.ConditionExpression.startsWith("attribute_not_exists(pk)")));
-    assert.ok(writes.some((item) => item.ConditionCheck?.Key.pk === "FUTURE_SPLIT#TASK#smoke-task"));
-    assert.ok(writes.some((item) => item.ConditionCheck?.Key.pk === "PROJECTION#antonio#TASK#smoke-task"));
+    assert.equal(await new StateRepository().getFutureSeriesSplitAnyProfile("smoke-task"), undefined);
+    const deletion = commands.find((command) => command.constructor.name === "DeleteCommand");
+    assert.ok(deletion);
+    assert.match(deletion.input.ConditionExpression, /#status = :pending/);
+    assert.equal(deletion.input.ExpressionAttributeValues[":pending"], "pending");
+    assert.ok(commands.some((command) => command.constructor.name === "PutCommand"),
+      "expiry should leave an operational audit rather than a permanent fence");
   } finally { documentClient.send = original; }
 });
 

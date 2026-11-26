@@ -41,7 +41,6 @@ export interface PhaseBNativeMoveEvidence {
   /** Source/destination mapping and provider ambiguity checks completed. */
   destinationHasLinkedEvent: boolean;
   destinationHasMapping: boolean;
-  destinationHasTombstone: boolean;
   activeRepairOrErasure: boolean;
 }
 export interface PhaseBNativeMovePlan {
@@ -97,8 +96,7 @@ export function planPhaseBNativeFutureOnlyMove(
   const current=task.due?.date;
   if (e.sourceProfile===e.destinationProfile || !e.sourceProfile || !e.destinationProfile)
     return reject("distinct_profiles_required");
-  if (e.activeRepairOrErasure || e.destinationHasLinkedEvent
-    || e.destinationHasMapping || e.destinationHasTombstone)
+  if (e.activeRepairOrErasure || e.destinationHasLinkedEvent || e.destinationHasMapping)
     return reject("move_identity_or_recovery_conflict");
   if (!e.sourceTimeZone || e.sourceTimeZone!==e.destinationTimeZone
     || e.sourceTimeZone!==e.todoistTimeZone)
@@ -108,7 +106,7 @@ export function planPhaseBNativeFutureOnlyMove(
     || !e.destinationProjectId || task.project_id!==e.destinationProjectId)
     return reject("active_future_todoist_due_not_verified");
   if (mapping.todoistPhaseBVersion!==1 || mapping.profile!==e.sourceProfile
-    || mapping.taskId!==task.id || mapping.recurrenceOwner!=="todoist"
+    || mapping.taskId!==task.id || mapping.seriesId!==task.id
     || mapping.seriesId!==task.id || mapping.masterEventId!==master.id
     || mapping.eventId!==master.id || !mapping.activeInstanceId
     || mapping.originalStart!==current || mapping.activeEffectiveStart!==current)
@@ -118,7 +116,7 @@ export function planPhaseBNativeFutureOnlyMove(
     || !date(master.start?.date) || !date(master.end?.date)
     || master.end!.date!==nextDate(master.start!.date!)
     || master.start?.dateTime || master.end?.dateTime
-    || shared?.taskId!==task.id || (!shared?.todoistRecurrence && shared?.syncRecurrenceOwner !== "todoist")
+    || shared?.taskId!==task.id || !shared?.todoistRecurrence
     || shared?.todoistPhaseBVersion!=="1"
     || shared?.todoistAnchorStart!==master.start?.date
     || shared?.todoistAnchorEnd!==master.end?.date

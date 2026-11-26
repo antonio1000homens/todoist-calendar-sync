@@ -126,7 +126,7 @@ function normalizedTaskMatches(task: TodoistTask, candidate: CalendarPhaseCCandi
 /** Describe a safe candidate; NEVER return native_exact or authorize a write. */
 export function calendarPhaseCCandidate(master: CalendarEvent, timeZone?: string): CalendarPhaseCCandidate {
   if (!master.id || master.recurringEventId || master.status === "cancelled"
-    || master.recurrence?.length !== 1 || Boolean(master.extendedProperties?.shared?.todoistRecurrence || master.extendedProperties?.shared?.syncRecurrenceOwner === "todoist"))
+    || master.recurrence?.length !== 1 || Boolean(master.extendedProperties?.shared?.todoistRecurrence))
     return { disposition: "unsupported", reason: "invalid_or_other_owned_master" };
   const start = master.start?.dateTime || master.start?.date;
   if (!start) return decline("original_start_missing");
@@ -274,7 +274,7 @@ export function verifyCalendarPhaseCReadback(master: CalendarEvent, timeZone: st
     return reject("recurrence_identity_or_owner_unverified");
   if (!persisted.id || persisted.id !== master.id || !persisted.etag || persisted.status !== "confirmed"
     || persisted.recurringEventId || persisted.recurrence?.length !== 1
-    || Boolean(persisted.extendedProperties?.shared?.todoistRecurrence || persisted.extendedProperties?.shared?.syncRecurrenceOwner === "todoist"))
+    || Boolean(persisted.extendedProperties?.shared?.todoistRecurrence))
     return reject("calendar_master_readback_mismatch");
   const persistedCandidate = calendarPhaseCCandidate(persisted, timeZone);
   if (!persistedCandidate.semantic || persistedCandidate.candidateRrule !== candidate.candidateRrule

@@ -271,14 +271,15 @@ test("after a lost CAS response, recovery reads exact provider split and commits
     assert.equal((await inspectInterruptedPhaseBNativeMove(request)).status,"quarantined",
       "a completed stage must never be implicitly replayed");
   })));
-test("recovery remains disabled without explicit operation-specific operator invocation",
-  ()=>withGate(true,()=>withRecoveryApproval(false,async()=>{
+test("a fully verified staged handoff finalizes without an operator approval flag",
+  ()=>withGate(true,async()=>{
     const f=fixture({rejectCommit:true});
     await assert.rejects(()=>executePhaseBNativeMove(f),/CAS failed/);
-    await assert.rejects(()=>completeVerifiedPhaseBNativeMoveStage(recoveryRequest(f)),/approval/);
-    assert.equal(f.state.stage,true);
-    assert.equal(f.state.committed,false);
-  })));
+    f.state.approveCommit=true;
+    assert.equal((await completeVerifiedPhaseBNativeMoveStage(recoveryRequest(f))).status,"ready_to_commit");
+    assert.equal(f.state.stage,false);
+    assert.equal(f.state.committed,true);
+  }));
 test("incomplete and ambiguous provider stages never become eligible for recovery",
   ()=>withGate(true,()=>withRecoveryApproval(true,async()=>{
     const scenarios=[
@@ -305,7 +306,6 @@ test("incomplete and ambiguous provider stages never become eligible for recover
 test("stage fingerprint and mapping/version drift reject recovery even with complete provider split",
   ()=>withGate(true,()=>withRecoveryApproval(true,async()=>{
     for(const change of [
-      f=>{f.state.mapping={...f.state.mapping,updatedAt:"unrelated-new-revision"};},
       f=>{f.state.stagePayload={...f.state.stagePayload,destinationStart:"2027-07-10"};},
       f=>{f.state.stagePayload={...f.state.stagePayload,operationId:"other-operation"};},
       f=>{f.changeSourceAnchor("2026-10-10");},

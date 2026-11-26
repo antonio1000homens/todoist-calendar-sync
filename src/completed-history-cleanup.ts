@@ -5,8 +5,6 @@
  */
 import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as db } from "./dynamodb-capacity.js";
-import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
-import {acquireErasureProtocolLease,getErasureEpoch} from "./erasure-protocol.js";
 import { terminalCompletionDecision, type VerifiedTerminalSeries } from "./completed-history-policy.js";
 import type { CompletedCalendarProjection, Profile } from "./types.js";
 
@@ -54,10 +52,10 @@ async function processTask(
   // the *whole* series ended, allowing older tasks/occurrence batches to retire
   // without mistaking an individual historical occurrence for the final one.
   const seriesId = rows[0]?.seriesId;
-  const seriesRow = seriesId && rows[0].recurrenceOwner
+  const seriesRow = seriesId
     ? await strongGet(table, `COMPLETED_SERIES#${profile}#${seriesId}`)
     : undefined;
-  const certificate = seriesRow as unknown as VerifiedTerminalSeries | undefined;
+  const certificate = seriesRow as VerifiedTerminalSeries | undefined;
   // A partially returned task history is never safe to retire without a
   // terminal series certificate. Repeat bounded batches on later scan passes.
   if (queried.LastEvaluatedKey && !certificate) return "skipped_ambiguous";
@@ -68,7 +66,7 @@ async function processTask(
   // days. Its three indexes may be removed by this same guarded transaction,
   // never by the completion webhook. Old deployments may already have removed
   // them, so the legacy zero-index path also remains supported.
-  const standalone = rows.length === 1 && !rows[0].recurrenceOwner
+  const standalone = rows.length === 1
     && !rows[0].recurrenceId && !rows[0].seriesId && !rows[0].masterEventId
     && !rows[0].activeInstanceId && !rows[0].originalStart && !rows[0].activeEffectiveStart;
   const ownedKeys = [
@@ -92,9 +90,6 @@ async function processTask(
   for (const candidateProfile of profiles) {
     absent.add(`TASK#${candidateProfile}#${taskId}|MAP`);
     for (const row of rows) absent.add(`EVENT#${candidateProfile}#${row.eventId}|MAP`);
-    for (const seriesId of [...new Set(rows.map((r) => r.seriesId).filter((s): s is string => Boolean(s)))]) {
-      absent.add(`RECURRENCE#${candidateProfile}#${seriesId}|STATE`);
-    }
   }
   for (const entry of retainedKeys) absent.delete(entry);
   for (const entry of absent) {
@@ -122,14 +117,14 @@ async function processTask(
   if (!apply) return "eligible";
   const tx: Array<Record<string, unknown>> = [];
   if (certificate && seriesId) {
-    const condition = "#profile = :profile AND seriesId = :series AND recurrenceOwner = :owner AND terminalCompletedAt = :time";
+    const condition = "#profile = :profile AND seriesId = :series AND terminalCompletedAt = :time";
     tx.push({ ConditionCheck: {
       TableName: table, Key: key(`COMPLETED_SERIES#${profile}#${seriesId}`),
       ConditionExpression: certificate.masterEventId ? condition + " AND masterEventId = :master" : condition + " AND attribute_not_exists(masterEventId)",
       ExpressionAttributeNames: { "#profile": "profile" },
       ExpressionAttributeValues: {
         ":profile": profile, ":series": seriesId,
-        ":owner": certificate.recurrenceOwner, ":time": certificate.terminalCompletedAt,
+        ":time": certificate.terminalCompletedAt,
         ...(certificate.masterEventId ? { ":master": certificate.masterEventId } : {}),
       },
     } });
@@ -173,23 +168,12 @@ async function processTask(
     ExpressionAttributeValues: { ":expected": baseline.updatedAt },
   } });
   if (tx.length > 100) return "skipped_ambiguous";
-  const protocolEnabled=process.env.ERASURE_PROTOCOL_VERSION==="1";
-  if(process.env.ERASURE_REPLAY_BARRIER_VERSION==="1"&&!protocolEnabled)
-    throw new Error("Terminal history cleanup requires the erasure writer protocol when replay admission is enabled");
-  const releaseWriterLease=protocolEnabled
-    ?await acquireErasureProtocolLease(profile,"writer",undefined,await getErasureEpoch(profile))
-    :async()=>{};
   try {
-    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:rows.flatMap(row=>[
-      row.eventId,row.masterEventId,row.activeInstanceId,
-    ]).filter((value):value is string=>typeof value==="string"&&value.length>0)});
     await db.send(new TransactWriteCommand({ TransactItems: tx as never }));
     return "retired";
   } catch (error) {
     if (conditionalRace(error)) return "skipped_active";
     throw error;
-  } finally {
-    await releaseWriterLease();
   }
 }
 

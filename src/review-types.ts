@@ -42,7 +42,7 @@ export interface RepairPreview {
   snapshots: ReviewSnapshot[]; fingerprint: string; createdAt: string; expiresAt: number;
   changes: string[]; warnings: string[]; flattenPlan?: RecurrenceFlattenPlan; splitPlan?: FutureSeriesSplitPlan; annualPlan?: StandaloneAnnualPlan;
   elapsedCalendarHistoryPlan?: { eventId:string; taskId:string; timeZone?:string; eventMapping?:Mapping; taskMapping?:Mapping; retainedTaskMapping?:Mapping; retainedEventMappings?:Mapping[]; recurringMasterId?:string; activeInstanceId?:string; recurringMapping?:Mapping; recurrenceLink?:RecurrenceLink };
-  oneOffDeletionPlans?: Array<{ref:EntityRef; mapping?:Mapping; baseline:unknown|null; canonical:unknown|null}>;
+  oneOffDeletionPlans?: Array<{ref:EntityRef; mapping?:Mapping}>;
   /** Exact provider refs and per-object planned effects, matched to frozen snapshots. */
   itemPlan: Array<{ ref:EntityRef; operation:string; result:string }>;
 }

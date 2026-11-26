@@ -21,6 +21,7 @@ process.env.SYNC_PROFILE_CONFIG_JSON = JSON.stringify({
     todoistProjectId: 'test-work-project',
   },
 });
+process.env.NODE_ENV ||= 'test';
 
 // Repository modules capture the state table name during import. Set a test
 // value in the preload step so tests that exercise newly added repository

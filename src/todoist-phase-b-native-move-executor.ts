@@ -23,8 +23,7 @@ import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } fro
  * exact-stage recovery is required before replay.
  */
 export type PhaseBNativeMoveState = Pick<StateRepository,
-  "getMappingByTaskAnyProfile" | "getRecurrenceLink"
-  | "getCalendarProjectionTombstone" | "syncBlocked" | "mutationAllowed"
+  "syncBlocked" | "mutationAllowed"
   | "getPhaseBNativeMoveStage" | "beginPhaseBNativeMove"
   | "commitPhaseBNativeMoveIfUnchanged" | "recordMutation" | "audit">;
 
@@ -66,13 +65,6 @@ export function sameTask(left: TodoistTask, right: TodoistTask): boolean {
     right.due?.date, right.due?.datetime, right.due?.string,
     right.due?.timezone, right.due?.is_recurring,
   ]);
-}
-function equivalentMapping(before: Mapping, after: Mapping | undefined): boolean {
-  return Boolean(after && before.profile === after.profile
-    && before.taskId === after.taskId && before.eventId === after.eventId
-    && before.masterEventId === after.masterEventId
-    && before.updatedAt === after.updatedAt
-    && before.todoistPhaseBVersion === after.todoistPhaseBVersion);
 }
 export function instancesAreExact(
   instances: CalendarEvent[], masterId: string, expected: string[],
@@ -202,27 +194,23 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
     throw new Error("Native move requires exact mapped source and managed destination projects");
   if (await state.getPhaseBNativeMoveStage(task.id))
     throw new Error("A Phase B native move stage exists; manual exact-stage recovery required");
-  const [blockedFrom, blockedTo, fromAllowed, toAllowed, currentMapping, currentLink, tombstone] = await Promise.all([
+  const [blockedFrom, blockedTo, fromAllowed, toAllowed] = await Promise.all([
     state.syncBlocked(sourceProfile, {taskId:task.id, eventId:sourceMapping.masterEventId}),
     state.syncBlocked(destinationProfile, {taskId:task.id}),
     state.mutationAllowed(sourceProfile), state.mutationAllowed(destinationProfile),
-    state.getMappingByTaskAnyProfile(task.id),
-    state.getRecurrenceLink(sourceProfile, task.id),
-    state.getCalendarProjectionTombstone(destinationProfile, task.id),
   ]);
-  if (blockedFrom || blockedTo || !fromAllowed || !toAllowed || tombstone
-    || !equivalentMapping(sourceMapping, currentMapping)
-    || !currentLink || currentLink.updatedAt !== sourceLink.updatedAt
-    || currentLink.masterEventId !== sourceLink.masterEventId)
+  if (blockedFrom || blockedTo || !fromAllowed || !toAllowed
+    || sourceLink.profile!==sourceProfile || sourceLink.taskId!==task.id
+    || sourceLink.masterEventId!==sourceMapping.masterEventId
+    || sourceMapping.profile!==sourceProfile || sourceMapping.taskId!==task.id)
     throw new Error("Phase B move state ownership, suppression, or repair evidence changed");
   const [liveTask, master, sourceZone, destinationZone, todoistZone,
-    destinationAlias, sourceTombstone, sourceComments, destinationComments] = await Promise.all([
+    destinationAlias, sourceComments, destinationComments] = await Promise.all([
       destination.todoist.getTask(task.id),
       source.calendar.getEvent(sourceMapping.masterEventId!),
       source.calendar.getTimeZone(), destination.calendar.getTimeZone(),
       destination.todoist.getTimeZone(),
       destination.calendar.findByTodoistTaskId(task.id),
-      state.getCalendarProjectionTombstone(sourceProfile, task.id),
       source.todoist.listProjectComments(profiles[sourceProfile].todoistProjectId, true),
       destination.todoist.listProjectComments(profiles[destinationProfile].todoistProjectId, true),
     ]);
@@ -239,7 +227,7 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
     || (destinationIndex.byTaskId.get(task.id)||[]).length
     || sourceIndex.malformed.some(x=>String(x.comment.content||"").includes(task.id))
     || destinationIndex.malformed.some(x=>String(x.comment.content||"").includes(task.id))
-    || destinationAlias || sourceTombstone)
+    || destinationAlias)
     throw new Error("Phase B native move source or destination project breadcrumb conflicts");
   const historicalInstances = await source.calendar.listInstancesInWindow(
     master.id, `${master.start?.date}T00:00:00Z`, `${task.due?.date}T00:00:00Z`,
@@ -255,7 +243,7 @@ export async function inspectPhaseBNativeMove(input: PhaseBNativeMoveExecution):
     historicalInstances, historyInventoryComplete:true,
     explicitExceptions:exceptions,exceptionInventoryComplete:true,
     destinationHasLinkedEvent:Boolean(destinationAlias),
-    destinationHasMapping:false,destinationHasTombstone:Boolean(tombstone),
+    destinationHasMapping:false,
     activeRepairOrErasure:Boolean(blockedFrom || blockedTo),
   });
   if (!decision.accepted) throw new Error(`Phase B move denied: ${decision.reason}`);
@@ -369,7 +357,7 @@ export async function executePhaseBNativeMove(input: PhaseBNativeMoveExecution):
     const committed=await state.commitPhaseBNativeMoveIfUnchanged({
       plan,sourceMapping,sourceLink,destinationMapping:updated,destinationLink:link,
     });
-    if (!committed) throw new Error("Phase B mapping owner CAS failed after provider cutover");
+    if (!committed) throw new Error("Phase B control finalization CAS failed after provider cutover");
     await state.audit(destinationProfile,"todoist_phase_b_native_future_only_move_succeeded",{
       taskId:task.id,sourceProfile,destinationProfile,oldMasterId:master.id,
       successorMasterId:plan.successorMasterId,historyCutoff:plan.historicalLastOccurrence,

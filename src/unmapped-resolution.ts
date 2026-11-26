@@ -10,7 +10,7 @@ export function unresolvedStandalonePair(task: TodoistTask, event: CalendarEvent
     && !event.recurrence?.length
     && !event.recurringEventId
     && event.extendedProperties?.shared?.taskId === task.id
-    && event.extendedProperties.shared.syncRecurrenceOwner !== "calendar"
+    && !event.extendedProperties.shared.syncSeriesId
     && title(event.summary) === title(task.content)
     && startsMatch(event, task)
     && Boolean(task.due?.is_recurring);

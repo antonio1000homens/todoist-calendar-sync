@@ -36,16 +36,31 @@ test("independent edits to different metadata fields merge safely", () => {
   assert.deepEqual(result.conflicts, []);
 });
 
-test("divergent concurrent changes to the same title fail closed", () => {
-  const result = calendarOwnedMetadataResolution(original, master("Title A"), task("Title B"));
-  assert.deepEqual(result.conflicts, ["title"]);
+test("Calendar wins same-field ties when provider timestamps match", () => {
+  const result = calendarOwnedMetadataResolution(original,
+    { ...master("Title A"), updated: "2026-11-26T10:00:00.000Z" },
+    { ...task("Title B"), updated_at: "2026-11-26T10:00:00.000Z" });
+  assert.deepEqual(result.conflicts, []);
   assert.equal(result.calendarChanged, false);
-  assert.equal(result.todoistChanged, false);
+  assert.equal(result.todoistChanged, true);
+  assert.equal(result.summary, "Title A");
 });
 
-test("legacy mapping with no safe baseline must not guess which system edited metadata", () => {
+test("legacy mapping with no baseline uses Calendar and updates Todoist", () => {
   const result = calendarOwnedMetadataResolution({}, master("Title A"), task("Title B"));
-  assert.deepEqual(result.conflicts, ["title"]);
+  assert.deepEqual(result.conflicts, []);
+  assert.equal(result.summary, "Title A");
+  assert.equal(result.todoistChanged, true);
+});
+
+test("later Todoist timestamp wins a same-field concurrent edit", () => {
+  const result = calendarOwnedMetadataResolution(original,
+    { ...master("Calendar title"), updated: "2026-11-26T10:00:00.000Z" },
+    { ...task("Todoist title"), updated_at: "2026-11-26T10:01:00.000Z" });
+  assert.deepEqual(result.conflicts, []);
+  assert.equal(result.summary, "Todoist title");
+  assert.equal(result.calendarChanged, true);
+  assert.equal(result.todoistChanged, false);
 });
 
 

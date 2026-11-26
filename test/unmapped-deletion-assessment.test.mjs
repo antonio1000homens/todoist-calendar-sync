@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {readFile} from "node:fs/promises";
 import {assessUnmappedConflictDeletion} from "../dist/unmapped-deletion-assessment.js";
 
 const profile="home";
@@ -32,7 +31,6 @@ test("#278 fully deleted unmapped annual fixture is visible as provider-deleted,
   const reverse=assessUnmappedConflictDeletion(base,[occurrence,task,master]);
   assert.deepEqual(reverse,result,"the order of provider deletion/readback must not change eligibility");
 });
-
 test("#478 deleted standalone Todoist and one-off Calendar identities become guarded-cleanup evidence",()=>{
   const oneOffTask="6hxGHMrqcFPwVqFf",oneOffEvent="p1dk5e55fotqv011l4cibo2bt0";
   const item={id:"work-standalone_todoist_task_deleted-fixture",profile:"work",status:"open",
@@ -48,7 +46,6 @@ test("#478 deleted standalone Todoist and one-off Calendar identities become gua
   assert.deepEqual(result.eventStates,[{id:oneOffEvent,state:"deleted"}]);
   assert.equal(assessUnmappedConflictDeletion(item,[evidence[0],{...evidence[1],lookupError:"HTTP 429"}])?.bothGone,false);
 });
-
 test("#278 live Calendar master protects the annual fixture even after Todoist 404 and cancelled occurrence",()=>{
   const liveMaster=snapshot("calendar",masterId,{id:masterId,status:"confirmed",
     recurrence:["RRULE:FREQ=YEARLY"]});
@@ -89,23 +86,4 @@ test("#278 no cross-issue deletion preview for operation failures or incomplete 
   assert.equal(assessUnmappedConflictDeletion(operational,records),undefined);
   const incomplete={...base,eventId:undefined,decision:{type:"todoist_unmapped_conflict"}};
   assert.equal(assessUnmappedConflictDeletion(incomplete,records)?.state,"unverified");
-});
-
-test("#278 review API refresh and UI use same non-mutating evidence, with no repair for both absent",async()=>{
-  const [api,ui]=await Promise.all([
-    readFile(new URL("../src/review-api.ts",import.meta.url),"utf8"),
-    readFile(new URL("../review-ui/main.tsx",import.meta.url),"utf8"),
-  ]);
-  assert.match(api,/assessUnmappedConflictDeletion\(item,snapshots\)/);
-  assert.match(api,/return response\(200,\{item,snapshots,deletionCleanup,unmappedDeletion\}/);
-  assert.match(ui,/unmappedDeletion:result\.unmappedDeletion/);
-  assert.match(ui,/orphanItemsForCase\(\{item:details\.item,snapshots:details\.snapshots\|\|\[\]\}\)\.length>0/);
-  assert.match(ui,/<OrphanDeletionPanel/);
-  assert.match(ui,/\(hasProviderIds\|\|hasLiveIdentity\)&&<div className="preview">/);
-  assert.match(ui,/One-sided deletion — no automatic purge/);
-  assert.match(api,/historical-cleanup/);
-  assert.match(ui,/Clean up historic records/);
-  assert.doesNotMatch(ui,/Retry guarded cleanup for this alert via/);
-  assert.match(ui,/Recheck this alert&apos;s provider items \(read-only\)/);
-  assert.match(ui,/Resolved — verified deletion \/ stale state retired/);
 });

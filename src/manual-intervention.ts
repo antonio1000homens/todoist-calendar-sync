@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import {calendarReplaySourceIds} from "./erasure-replay-providers.js";
+import {calendarReplaySourceIds} from "./calendar-provenance.js";
 import {
   GetCommand,
   PutCommand,
@@ -32,7 +32,6 @@ import {
 
 import { applyApprovedFutureSeriesSplit, assertApprovedHistoryCap } from "./future-split-execution.js";
 import { assertManualDecisionReplayAdmission, ReviewStore, reviewHash } from "./review-store.js";
-import { competingUnmappedIdentities, manualConflictWindow, unresolvedStandalonePair } from "./unmapped-resolution.js";
 import { hasCanonicalState, Synchronizer, toCalendarEvent, toTodoistTask } from "./sync.js";
 import type { CalendarEvent, Delivery, Mapping, Profile, RecurrenceLink, TodoistTask, TodoistWebhookPayload } from "./types.js";
 
@@ -59,7 +58,7 @@ class ManualCircuitOpenError extends Error {
   }
 }
 class ManualSyncBlockedError extends Error {
-  constructor() { super("An affected item or pairing is protected by a repair, exclusion, or rejected link. Use the review page to resolve it."); this.name = "ManualSyncBlockedError"; }
+  constructor() { super("An affected item or pairing is protected by an in-flight repair or explicit exclusion."); this.name = "ManualSyncBlockedError"; }
 }
 
 export type ManualDecisionStatus = "pending" | "resolved" | "stale" | "cancelled" | "expired";
@@ -183,13 +182,10 @@ export const MANUAL_DECISION_CATALOG: Record<ManualDecisionType, ManualDecisionP
     title: "Todoist task and Calendar projection cannot be safely relinked",
     severity: "warning",
     detection: "audit_conflict",
-    actions: actions(
-      ["use_todoist_recurrence", "Use Todoist recurrence", true],
-      ["split_future_todoist", "Use Todoist for future — keep Calendar history", true],
-      ["use_calendar_version", "Use Calendar version", true],
-      ["keep_separate", "Keep separate / Ignore"],
-      ["reconcile_now", "Retry guarded reconciliation"],
-    ),
+    // This legacy manual decision path has been retired. Reconciliation takes
+    // fresh provider reads on its normal schedule and leaves ambiguous pairs
+    // unchanged with a non-blocking diagnostic.
+    actions: actions(),
   },
   todoist_cancelled_projection_blocked: {
     title: "Calendar projection was cancelled — Todoist task still exists",
@@ -415,11 +411,16 @@ function todoistDue(task: TodoistTask): string | undefined {
   return task.due?.datetime || task.due?.date;
 }
 
+function recurrenceRepresentation(mapping: Pick<Mapping, "taskId" | "seriesId"> | undefined): "calendar" | "todoist" | undefined {
+  if (!mapping?.seriesId) return undefined;
+  return mapping.seriesId === mapping.taskId ? "todoist" : "calendar";
+}
+
 function recurrenceLink(mapping: Mapping): RecurrenceLink {
   if (!mapping.seriesId) throw new Error("Recurring manual mapping is missing seriesId");
   return {
     profile: mapping.profile,
-    owner: mapping.recurrenceOwner || "calendar",
+    owner: recurrenceRepresentation(mapping) || "calendar",
     seriesId: mapping.seriesId,
     masterEventId: mapping.masterEventId,
     activeInstanceId: mapping.activeInstanceId,
@@ -1027,7 +1028,7 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
     }).join("\n");
     blocks.push({ type: "section", text: { type: "mrkdwn", text: `*Candidate matches*\n${candidateText}` } });
   }
-  const dynamicActions: ManualActionDefinition[] = candidates.slice(0, 8).map((candidate, index) => ({
+  const dynamicActions: ManualActionDefinition[] = decision.type === "todoist_unmapped_conflict" ? [] : candidates.slice(0, 8).map((candidate, index) => ({
     id: `bind_task:${String(candidate.id)}`,
     label: `Bind ${String(candidate.content || candidate.summary || `candidate ${index + 1}`).slice(0, 45)}`,
   }));
@@ -1057,11 +1058,13 @@ export function decisionBlocks(decision: ManualDecision): unknown[] {
       })),
     });
   }
-  blocks.push({ type:"actions", elements:[{
-    type:"button", action_id:"gcp_sync_decision_open_review",
-    text:{type:"plain_text",text:"Open review"},
-    url:"https://calendar-sync.alf-broadcast.co.uk/review/?case=" + encodeURIComponent(decision.decisionId),
-  }] });
+  if (decision.type !== "todoist_unmapped_conflict") {
+    blocks.push({ type:"actions", elements:[{
+      type:"button", action_id:"gcp_sync_decision_open_review",
+      text:{type:"plain_text",text:"Open review"},
+      url:"https://calendar-sync.alf-broadcast.co.uk/review/?case=" + encodeURIComponent(decision.decisionId),
+    }] });
+  }
   blocks.push(technicalContextBlock(decision));
   return blocks;
 }
@@ -1279,6 +1282,19 @@ export class ManualInterventionService {
     return new Synchronizer(state, undefined, async () => pair).persistProviderMapping(mapping, pair.todoist);
   }
 
+  private async retireProviderMapping(state: StateRepository, pair: Awaited<ReturnType<ManualInterventionService["providerClients"]>>, mapping: Mapping): Promise<boolean> {
+    // Provider comments are the correlation source. Old DynamoDB rows are
+    // cleaned up opportunistically and never decide whether a repair worked.
+    const current = await this.providerMappingByTask(state, mapping.profile, mapping.taskId);
+    if (current && (current.eventId !== mapping.eventId || current.seriesId !== mapping.seriesId
+      || current.masterEventId !== mapping.masterEventId || current.activeInstanceId !== mapping.activeInstanceId
+      || current.updatedAt !== mapping.updatedAt || current.mappingRevision !== mapping.mappingRevision)) {
+      return false;
+    }
+    await deleteMappingComments(pair.todoist, mapping);
+    return true;
+  }
+
   private async providerMappingByTask(state: StateRepository, profile: Profile, taskId: string): Promise<Mapping | undefined> {
     const pair = await this.providerClients(profile);
     if (typeof pair.todoist.listProjectComments !== "function"
@@ -1347,9 +1363,9 @@ export class ManualInterventionService {
             && alias.previousMapping?.taskId === cutover.duplicateTaskId
             && alias.previousMapping.masterEventId === cutover.oldMasterId
             && byTask?.taskId === sourceTaskId && byTask.eventId === cutover.newMasterId
-            && byTask.masterEventId === cutover.newMasterId && byTask.recurrenceOwner === "todoist"
+            && byTask.masterEventId === cutover.newMasterId && recurrenceRepresentation(byTask) === "todoist"
             && futureByEvent?.taskId === sourceTaskId && futureByEvent.eventId === cutover.newMasterId
-            && futureByEvent.recurrenceOwner === "todoist"
+            && recurrenceRepresentation(futureByEvent) === "todoist"
             && link?.owner === "todoist" && link.taskId === sourceTaskId && link.masterEventId === cutover.newMasterId;
         }
         if (((byTask && byTask.eventId !== sourceEventId) || (byEvent && byEvent.taskId !== sourceTaskId)) && !approvedCutover) {
@@ -1405,17 +1421,28 @@ export class ManualInterventionService {
     const catalog = MANUAL_DECISION_CATALOG[type];
     const seriesId = typeof fields.seriesId === "string" ? fields.seriesId : undefined;
     const resolvedPolicy = await this.policies.resolve(profile, type, seriesId, catalog.defaultMode || "prompt");
-    // An obsolete profile/series prompt preference must not override routine
-    // whole-series deletion. Explicit OFF/OBSERVE safety controls remain.
-    const routineSeriesDelete = type === "calendar_owned_native_recurrence_task_deleted";
+    // A confirmed Todoist deletion is already an explicit user action. Its
+    // exact provider mapping determines the counterpart to remove, so stale
+    // prompt preferences must not turn routine bidirectional deletion into a
+    // human review decision. Explicit OFF/OBSERVE controls remain respected.
+    const routineTodoistDelete = [
+      "calendar_owned_recurrence_task_deleted",
+      "calendar_owned_native_recurrence_task_deleted",
+      "todoist_owned_recurrence_task_deleted",
+      "standalone_todoist_task_deleted",
+    ].includes(type);
+    const routineDeleteAction = type === "standalone_todoist_task_deleted"
+      ? "delete_calendar_event"
+      : type === "todoist_owned_recurrence_task_deleted"
+        ? "delete_calendar_series"
+        : "delete_whole_series";
     const effective = {
       ...resolvedPolicy,
-      ...(routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
-        ? { mode: "auto" as const, defaultAction: type === "calendar_owned_native_recurrence_task_deleted"
-          ? "delete_whole_series" : "delete_calendar_series" }
+      ...(routineTodoistDelete && !["off", "observe"].includes(resolvedPolicy.mode)
+        ? { mode: "auto" as const, defaultAction: routineDeleteAction }
         : {}),
-      defaultAction: routineSeriesDelete && !["off", "observe"].includes(resolvedPolicy.mode)
-        ? type === "calendar_owned_native_recurrence_task_deleted" ? "delete_whole_series" : "delete_calendar_series"
+      defaultAction: routineTodoistDelete && !["off", "observe"].includes(resolvedPolicy.mode)
+        ? routineDeleteAction
         : resolvedPolicy.defaultAction || (resolvedPolicy.source === "catalog" ? catalog.defaultAction : undefined),
     };
     if (effective.mode === "off" || effective.mode === "observe") return { mode: effective.mode };
@@ -1512,12 +1539,12 @@ export class ManualInterventionService {
     }
     const explicitDelete = Boolean(task?.id && (/deleted/i.test(payload.event_name || "") || task.is_deleted));
     if (!task?.id || !explicitDelete) return false;
-    const mapping = await state.getMappingByTask?.(delivery.profile, task.id);
+    const mapping = await this.providerMappingByTask(state, delivery.profile, task.id);
     if (!mapping) return false;
 
-    const type: ManualDecisionType = mapping.recurrenceOwner === "calendar" && mapping.masterEventId
+    const type: ManualDecisionType = recurrenceRepresentation(mapping) === "calendar" && mapping.masterEventId
       ? mapping.calendarNativeRecurring ? "calendar_owned_native_recurrence_task_deleted" : "calendar_owned_recurrence_task_deleted"
-      : mapping.recurrenceOwner === "todoist"
+      : recurrenceRepresentation(mapping) === "todoist"
         ? "todoist_owned_recurrence_task_deleted"
         : "standalone_todoist_task_deleted";
     const identity = {
@@ -1639,7 +1666,7 @@ export class ManualInterventionService {
     }
     const duplicate = matchingTasks[0];
     const mapping = await this.providerMappingByTask(state, profile, duplicate.id);
-    if (!mapping?.masterEventId || mapping.recurrenceOwner !== "calendar"
+    if (!mapping?.masterEventId || recurrenceRepresentation(mapping) !== "calendar"
       || !mapping.activeInstanceId || mapping.eventId !== mapping.activeInstanceId) {
       throw new Error("The one-off task is not the active mirror of a Calendar-owned recurrence");
     }
@@ -1665,7 +1692,6 @@ export class ManualInterventionService {
       archived && priorPlan?.approvedAt ? new Date(priorPlan.approvedAt) : new Date(),
       calendarTimeZone, duplicate.id,
     );
-    const tombstone = await state.getCalendarProjectionTombstone(profile, task.id);
     return {
       consolidationDuplicateTaskId: duplicate.id,
       consolidationMasterEventId: master.id,
@@ -1676,7 +1702,6 @@ export class ManualInterventionService {
       consolidationLinkUpdatedAt: link.updatedAt,
       consolidationCalendarEtag: master.etag,
       consolidationMasterFingerprint: consolidationMasterFingerprint(master,plan,task.id),
-      consolidationTombstoneUpdatedAt: tombstone?.sourceUpdatedAt,
       consolidationFuturePlan: plan,
       consolidationPreview: `Keep recurring task ${task.id}; remove one-off task ${duplicate.id} and cancelled event ${cancelled.id}. ${futureSplitDescription(plan, master.start?.date)}; future starts on ${plan.newStart} (${calendarTimeZone}).`,
     };
@@ -1691,12 +1716,10 @@ export class ManualInterventionService {
     if (!this.enabled) return { caseStatus: "detector_disabled" };
     if (delivery.kind === "manual") return { caseStatus: "not_applicable" };
     let type: ManualDecisionType | undefined;
-    if (action === "calendar_snapshot_unmapped_ambiguous") type = "calendar_snapshot_unmapped_ambiguous";
-    else if (action === "calendar_snapshot_recurring_ambiguous") type = "calendar_snapshot_recurring_ambiguous";
-    else if (action === "todoist_snapshot_reconcile_conflict_both_sides_changed") type = "both_sides_changed";
-    else if (["todoist_snapshot_reconcile_unmapped_conflict", "todoist_snapshot_reconcile_unmapped_ambiguous", "calendar_task_link_ambiguous_conflict", "calendar_snapshot_recurring_identity_conflict"].includes(action)) type = "todoist_unmapped_conflict";
-    else if (action === "todoist_snapshot_reconcile_cancelled_projection_blocked") type = "todoist_cancelled_projection_blocked";
-    else if (action === "reconciliation_mutation_budget_exhausted" || action === "calendar_snapshot_reconcile_mutation_budget_exhausted") type = "operational_mutation_budget";
+    // Provider ambiguity and stale/conflicting snapshots are diagnostics, not
+    // human approval requests. Keep the objects untouched and let the next
+    // reconciliation take fresh provider reads; unrelated objects continue.
+    if (action === "reconciliation_mutation_budget_exhausted" || action === "calendar_snapshot_reconcile_mutation_budget_exhausted") type = "operational_mutation_budget";
     else if (action.includes("circuit_open") || action.includes("circuit_deferred")) type = "operational_circuit_open";
     if (!type) return { caseStatus: "not_actionable" };
 
@@ -1995,215 +2018,6 @@ export class ManualInterventionService {
    * The normal project synchronizer performs the final mapping/comment writes
    * so recurrence metadata is identical to normal Todoist-driven creation.
    */
-  private async resolveUnmappedConflict(
-    decision: ManualDecision,
-    action: "use_todoist_recurrence" | "use_calendar_version",
-    state: StateRepository,
-    slackUserId?: string,
-  ): Promise<void> {
-    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
-    if (!decision.taskId || !decision.eventId
-      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_unmapped_conflict"
-      || decision.context.candidateEventIds instanceof Array
-      || decision.context.candidateTaskIds instanceof Array) {
-      return refuse("This decision does not identify one unambiguous live Todoist task and Calendar event. No changes made.");
-    }
-    const pair = await this.providerClients(decision.profile);
-    let task: TodoistTask;
-    let event: CalendarEvent;
-    try {
-      [task, event] = await Promise.all([
-        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
-      ]);
-    } catch (error) {
-      if (providerNotFound(error)) return refuse("The task or Calendar event no longer exists. No changes made.");
-      throw error;
-    }
-    if (task.project_id !== profiles[decision.profile].todoistProjectId
-      || !unresolvedStandalonePair(task, event)) {
-      return refuse("The current objects are no longer one active, same-title, same-date standalone pair with Todoist recurrence. No changes made.");
-    }
-    const snapshots: Array<[string, string | undefined]> = [
-      ["taskTitle", task.content],
-      ["calendarTitle", event.summary],
-      ["todoistDue", todoistDue(task)],
-      ["calendarStart", eventDisplayStart(event)],
-      ["todoistDescription", task.description || ""],
-      ["calendarDescription", event.description || ""],
-      ["todoistUpdatedAt", task.updated_at],
-    ];
-    for (const [field, current] of snapshots) {
-      if (typeof decision.context[field] === "string"
-        && normalizedText(decision.context[field]) !== normalizedText(current)) {
-        return refuse(`The ${field} changed after the decision was created. No changes made.`);
-      }
-    }
-    if (decision.context.todoistRecurring === false || decision.context.calendarStatus !== "confirmed") {
-      return refuse("The original decision did not confirm an active, recurring task and Calendar event. No changes made.");
-    }
-    if (action === "use_todoist_recurrence" && !todoistRecurrenceToRrule(task)) {
-      return refuse("The Todoist recurrence cannot be represented as a supported Calendar RRULE. No changes made.");
-    }
-
-    const [taskMapping, eventMapping, tombstone, completion, history, baseline, linked] = await Promise.all([
-      this.providerMappingByTaskAnyProfile(state, task.id),
-      this.providerMappingByEvent(state, decision.profile, event.id),
-      state.getCalendarProjectionTombstone(decision.profile, task.id),
-      state.getCompletedCalendarProjectionByEvent(decision.profile, event.id),
-      state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
-      documentClient.send(new GetCommand({
-        TableName: tableName(),
-        Key: { pk: `BASELINE#${decision.profile}#TASK#${task.id}`, sk: "RECONCILE" },
-        ConsistentRead: true,
-      })),
-      pair.calendar.findByTodoistTaskId(task.id),
-    ]);
-    if (taskMapping || eventMapping || tombstone || completion || history.length || baseline.Item
-      || !linked || linked.id !== event.id) {
-      return refuse("Ownership, a tombstone, completion history, baseline or linked Calendar identity prevents safe relinking. No changes made.");
-    }
-
-    // Enumerate actual occurrences, not only extendedProperty matches. An
-    // unrelated annual series can have a 2027 instance despite a 2024 master.
-    const { start, end } = manualConflictWindow(task);
-    const [tasks, occurrences] = await Promise.all([
-      pair.todoist.listTasks(),
-      pair.calendar.listOccurrencesInWindow(start, end),
-    ]);
-    const competing = competingUnmappedIdentities(task, event, tasks, occurrences);
-    if (competing.taskIds.length || competing.eventIds.length || !competing.sawTarget) {
-      await state.audit(decision.profile, "manual_unmapped_resolution_duplicate_blocked", {
-        taskId: task.id, eventId: event.id, action,
-        candidateTaskIds: competing.taskIds, candidateEventIds: competing.eventIds,
-      });
-      return refuse("A competing Todoist task or Calendar occurrence exists, or the original event could not be verified. No changes made; inspect duplicate identities first.");
-    }
-
-    if (!event.etag) {
-      return refuse("The Calendar provider did not return an ETag for the approved event. Update-only resolution is unsafe.");
-    }
-    let currentTask = task;
-    try {
-      if (action === "use_calendar_version") {
-        // Converting a recurrence to one-off changes future Todoist scheduling.
-        // This is explicit and confirmation-gated in Slack.
-        currentTask = await pair.todoist.upsertTask(toTodoistTask(event), task.id);
-        if (currentTask.due?.is_recurring || !hasCanonicalState(event, currentTask)) {
-          throw new Error("Todoist did not accept the one-off Calendar date; mapping was not written");
-        }
-      }
-      // Only update this specific approved event. An event cancelled or
-      // changed after preflight must not turn into a replacement POST.
-      const mapped = await new ProjectAwareSynchronizer(state, undefined, this.executionClientFactory || this.clients)
-        .resolveApprovedUnmappedProjection(decision.profile, currentTask, event.id, event.etag);
-      if (!mapped || mapped.eventId !== event.id
-        || (action === "use_todoist_recurrence" && mapped.recurrenceOwner !== "todoist")
-        || (action === "use_calendar_version" && mapped.recurrenceOwner)) {
-        throw new Error("The existing synchronizer did not establish the expected mapping");
-      }
-      const [freshTask, freshEvent] = await Promise.all([
-        pair.todoist.getTask(task.id), pair.calendar.getEvent(event.id),
-      ]);
-      if (!hasCanonicalState(freshEvent, freshTask)) {
-        throw new Error("Post-action provider states are not canonical; decision remains open");
-      }
-      await state.audit(decision.profile, "manual_unmapped_resolution_applied", {
-        taskId: task.id, eventId: event.id, action,
-      });
-    } catch (error) {
-      await state.audit(decision.profile, "manual_unmapped_resolution_incomplete", {
-        taskId: task.id, eventId: event.id, action,
-        reason: error instanceof Error ? error.message : String(error),
-      }).catch(() => undefined);
-      throw error;
-    }
-    return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
-  }
-
-  /** User-confirmed, future-only recurrence ownership change (#84). */
-  private async resolveFutureRecurringConflict(
-    decision: ManualDecision,
-    state: StateRepository,
-    slackUserId?: string,
-  ): Promise<void> {
-    const refuse = (reason: string) => this.markStale(decision, reason, slackUserId);
-    if (!decision.taskId || !decision.eventId
-      || decision.sourceAuditAction !== "todoist_snapshot_reconcile_unmapped_conflict"
-      || Array.isArray(decision.context.candidateEventIds) && decision.context.candidateEventIds.length
-      || Array.isArray(decision.context.candidateTaskIds) && decision.context.candidateTaskIds.length) {
-      return refuse("Only one identified linked Todoist task and recurring master can be split. No changes made.");
-    }
-    if (typeof decision.context.futureSplitPreview !== "string"
-      || typeof decision.context.calendarRecurrenceRule !== "string"
-      || typeof decision.context.todoistRecurrenceRule !== "string"
-      || !decision.context.futureSplitPlan || typeof decision.context.futureSplitPlan !== "object"
-      || typeof decision.context.calendarEtag !== "string") {
-      await this.notifier.updateResolution(decision,
-        `A frozen recurrence cutover preview is required before approval. No provider change was made. Refresh with \`/sync resume ${decision.decisionId}\` to see the historical cutoff and new schedule.`);
-      return;
-    }
-    const pair = await this.providerClients(decision.profile);
-    let task: TodoistTask;
-    let old: CalendarEvent;
-    try {
-      [task, old] = await Promise.all([
-        pair.todoist.getTask(decision.taskId), pair.calendar.getEvent(decision.eventId),
-      ]);
-    } catch (error) {
-      if (providerNotFound(error)) return refuse("The approved task or historical Calendar master is missing");
-      throw error;
-    }
-    for (const [field, current] of [
-      ["taskTitle", task.content], ["todoistDue", todoistDue(task)],
-      ["calendarTitle", old.summary], ["calendarStart", eventDisplayStart(old)],
-      ["todoistDescription", task.description || ""],
-      ["calendarDescription", old.description || ""],
-      ["todoistUpdatedAt", task.updated_at],
-    ] as Array<[string, string | undefined]>) {
-      if (typeof decision.context[field] === "string"
-        && normalizedText(current) !== normalizedText(decision.context[field])) {
-        return refuse(`${field} changed after the original approval request. No changes made.`);
-      }
-    }
-    const archived = old.extendedProperties?.shared?.syncHistoryOnly === "true";
-    if (!archived && decision.context.calendarEtag !== old.etag) {
-      return refuse("The Calendar event version changed after approval; review the new version.");
-    }
-    if (decision.context.todoistRecurrenceRule !== todoistRecurrenceToRrule(task)) {
-      return refuse("The Todoist recurrence changed after the approved split preview.");
-    }
-    if (decision.context.calendarStatus !== "confirmed"
-      || decision.context.todoistRecurring === false
-      || decision.context.calendarRecurrenceRule && decision.context.calendarRecurrenceRule !== old.recurrence?.[0]
-        && old.extendedProperties?.shared?.syncHistoryOriginalRule !== decision.context.calendarRecurrenceRule) {
-      return refuse("The original recurring Calendar series changed since notification.");
-    }
-    try {
-      const result = await applyApprovedFutureSeriesSplit(
-        decision.profile, task, old, pair, state, {
-          expectedDue: typeof decision.context.todoistDue === "string" ? decision.context.todoistDue : undefined,
-          expectedRule: typeof decision.context.calendarRecurrenceRule === "string"
-            ? decision.context.calendarRecurrenceRule : undefined,
-          approvedPlan: decision.context.futureSplitPlan as FutureSeriesSplitPlan,
-          approvedEtag: decision.context.calendarEtag as string,
-        },
-      );
-      await this.finishResolutionWithoutReconciliation(decision, state, "split_future_todoist", slackUserId);
-      await this.notifier.postText(
-        `✅ ${futureSplitDescription(result.plan)}. Old master \`${result.plan.oldMasterId}\`, new master \`${result.plan.newMasterId}\`.`,
-        decision.slackChannelId,
-      );
-    } catch (error) {
-      if (error instanceof ManualCircuitOpenError || error instanceof ManualSyncBlockedError || isMutationBudgetExhausted(error)) throw error;
-      await state.audit(decision.profile, "manual_future_series_split_incomplete", {
-        taskId: task.id, oldMasterId: old.id, decisionId: decision.decisionId,
-        reason: error instanceof Error ? error.message : String(error),
-      }).catch(() => undefined);
-      await this.notifier.updateResolution(decision,
-        `⚠️ Future-only series change was *not* confirmed complete: ${error instanceof Error ? error.message : String(error)}. The decision remains pending. No historical Calendar occurrences were intentionally deleted. An incomplete split can be retried only after the current provider state and ownership are rechecked.`);
-    }
-  }
-
   private async resolveDuplicateConsolidation(
     decision: ManualDecision,
     state: StateRepository,
@@ -2230,11 +2044,11 @@ export class ManualInterventionService {
         this.providerRecurrenceLink(state, decision.profile, decision.taskId),
         state.getFutureSeriesSplitAnyProfile(decision.taskId),
       ]);
-      const mappingInstalled = mapping?.recurrenceOwner === "todoist"
+      const mappingInstalled = Boolean(mapping && recurrenceRepresentation(mapping) === "todoist"
         && mapping.masterEventId === approvedPlan.newMasterId && mapping.eventId === approvedPlan.newMasterId
         && link?.owner === "todoist" && link.masterEventId === approvedPlan.newMasterId
         && split?.profile === decision.profile && split.newMasterId === approvedPlan.newMasterId
-        && Boolean(alias.previousMapping);
+        && alias.previousMapping);
       if (mappingInstalled) {
         const master = await pair.calendar.getEvent(approvedPlan.newMasterId);
         const task = await pair.todoist.getTask(decision.taskId);
@@ -2289,10 +2103,10 @@ export class ManualInterventionService {
     const snapshotFields = [
       "consolidationDuplicateTaskId", "consolidationMasterEventId", "consolidationCancelledEventId",
       "consolidationTaskUpdatedAt", "consolidationDuplicateUpdatedAt", "consolidationMappingUpdatedAt",
-      "consolidationLinkUpdatedAt", "consolidationMasterFingerprint", "consolidationTombstoneUpdatedAt",
+      "consolidationLinkUpdatedAt", "consolidationMasterFingerprint",
     ];
     if (snapshotFields.some((field) => fresh[field] !== decision.context[field])) {
-      return refuse("The proposed task, Calendar series, mapping, or tombstone changed after approval. Resume for a fresh proposal.");
+      return refuse("The proposed task, Calendar series, or mapping changed after approval. Resume for a fresh proposal.");
     }
     const livePlan = fresh.consolidationFuturePlan as ReturnType<typeof planFutureSeriesSplit>;
     if (["oldMasterId", "newMasterId", "previousOccurrence", "nextOldOccurrence", "newStart", "newRule", "calendarTimeZone"]
@@ -2332,17 +2146,13 @@ export class ManualInterventionService {
     if (!previousLink) return refuse("The Calendar recurrence link is missing. No changes made.");
     const cancelled = await pair.calendar.getEvent(cancelledId);
     if (cancelled.status !== "cancelled") return refuse("The old Calendar projection is no longer cancelled. No changes made.");
-    const tombstone = await state.getCalendarProjectionTombstone(decision.profile, task.id);
-    const expectedTombstoneAt = decision.context.consolidationTombstoneUpdatedAt;
-    if ((tombstone?.sourceUpdatedAt) !== expectedTombstoneAt) {
-      return refuse("The retained task's projection tombstone changed after approval. Resume for a fresh proposal.");
-    }
     try {
       const result = await applyApprovedFutureSeriesSplit(decision.profile, task, old, pair, state, {
         expectedDue: todoistDue(task),
         expectedRule: approvedPlan.originalRule,
         approvedPlan,
         approvedEtag: approvedPlan.oldEtag,
+        providerClients: this.clients,
         consolidation: {
           retainedTaskId: task.id,
           discardedTask: duplicate,
@@ -2350,7 +2160,6 @@ export class ManualInterventionService {
           previousLink,
           cancelledEventId: cancelledId,
           decisionId: decision.decisionId,
-          tombstone,
         },
       });
       await this.finishAndReconcile(decision, state, "consolidate_duplicate", slackUserId);
@@ -2446,7 +2255,7 @@ export class ManualInterventionService {
     const fields = ["consolidationDuplicateTaskId", "consolidationMasterEventId", "consolidationCancelledEventId",
       "consolidationTaskUpdatedAt", "consolidationDuplicateUpdatedAt", "consolidationMappingUpdatedAt",
       "consolidationLinkUpdatedAt", "consolidationCalendarEtag", "consolidationMasterFingerprint",
-      "consolidationTombstoneUpdatedAt", "consolidationFuturePlan"];
+      "consolidationFuturePlan"];
     if (!fields.some((field) => stableStringify(fresh[field]) !== stableStringify(decision.context[field]))) return false;
     const key = decisionKey(decision.profile, decision.type, {
       priorDecisionId: decision.decisionId,
@@ -2481,9 +2290,9 @@ export class ManualInterventionService {
     const pair = await this.providerClients(decision.profile);
     const event = await pair.calendar.getEvent(mapping.eventId);
     const task = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
-    await state.deleteMapping(mapping);
     const next: Mapping = { ...mapping, taskId: task.id, updatedAt: isoNow() };
     await this.persistProviderMapping(state, next, pair);
+    await this.retireProviderMapping(state, pair, mapping);
   }
 
   private async resolveMappedDeletion(
@@ -2512,7 +2321,7 @@ export class ManualInterventionService {
       if (slackUserId === "AUTO_POLICY") {
         // Auto deletion must never fall through to a series or to an event
         // reassigned after the original Todoist deletion was observed.
-        if (mapping.recurrenceOwner || mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
+        if (mapping.recurrenceId || mapping.seriesId || mapping.masterEventId
           || mapping.activeInstanceId || mapping.updatedAt !== decision.mappingSnapshot?.updatedAt) {
           return this.markStale(decision, "The standalone mapping changed or belongs to a recurrence; no automatic Calendar deletion was applied.", slackUserId);
         }
@@ -2531,13 +2340,9 @@ export class ManualInterventionService {
         }
       }
       await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-      // The Calendar API and DynamoDB are not one transaction. Never remove a
-      // mapping another writer has updated while this provider call was pending.
-      const mappingRemoved = await state.deleteMappingIfUnchanged(mapping);
-      if (!mappingRemoved) {
-        return this.markStale(decision, "Calendar deletion finished but mapping ownership changed; the newer mapping was preserved for review.", slackUserId);
+      if (!await this.retireProviderMapping(state, pair, mapping)) {
+        return this.markStale(decision, "Calendar deletion finished but provider mapping ownership changed; the newer mapping was preserved for review.", slackUserId);
       }
-      await deleteMappingComments(pair.todoist, mapping);
       return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
     }
 
@@ -2549,8 +2354,7 @@ export class ManualInterventionService {
           if (!providerNotFound(error)) throw error;
           seriesAlreadyAbsent = true;
         }
-        await state.deleteMapping(mapping);
-        await deleteMappingComments(pair.todoist, mapping);
+        await this.retireProviderMapping(state, pair, mapping);
         // Auto-policy decisions that find the exact mapped Calendar series
         // already absent need no Slack alert. Keep the durable decision
         // receipt and exact mapping/link cleanup, but don't post the alert
@@ -2559,8 +2363,7 @@ export class ManualInterventionService {
           seriesAlreadyAbsent && slackUserId === "AUTO_POLICY");
       }
       if (action === "keep_calendar_unlinked") {
-        await state.deleteMapping(mapping);
-        await deleteMappingComments(pair.todoist, mapping);
+        await this.retireProviderMapping(state, pair, mapping);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
     }
@@ -2572,7 +2375,7 @@ export class ManualInterventionService {
         // one-off Calendar occurrence must not masquerade as a series.
         if (mapping.updatedAt !== decision.mappingSnapshot?.updatedAt
           || !mapping.seriesId || !mapping.masterEventId
-          || mapping.recurrenceOwner !== "calendar") {
+          || recurrenceRepresentation(mapping) !== "calendar") {
           return this.markStale(decision, "The Calendar recurrence mapping changed; automatic deletion was refused.", slackUserId);
         }
         const link = await this.providerRecurrenceLink(state, decision.profile, mapping.seriesId);
@@ -2590,14 +2393,13 @@ export class ManualInterventionService {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         // A failed post-delete cleanup is retried through the existing
         // quarantined manual delivery, never by creating a new series.
-        const removed = await state.deleteMappingIfUnchanged(mapping);
-        if (!removed) return this.markStale(decision, "Calendar deletion completed but the mapping advanced concurrently; investigate the remaining mapping.", slackUserId);
+        await this.retireProviderMapping(state, pair, mapping);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "delete_whole_series" && decision.type === "calendar_owned_recurrence_task_deleted") {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-        await state.deleteMapping(mapping);
+        await this.retireProviderMapping(state, pair, mapping);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
@@ -2620,13 +2422,13 @@ export class ManualInterventionService {
         for (const event of future) {
           await pair.calendar.deleteEvent(event.id).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         }
-        await state.deleteMapping(mapping);
+        await this.retireProviderMapping(state, pair, mapping);
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "skip_occurrence") {
         await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-        await state.deleteMapping(mapping);
+        await this.retireProviderMapping(state, pair, mapping);
         const instances = await pair.calendar.listInstances(mapping.masterEventId);
         const currentStart = Date.parse(mapping.originalStart || mapping.activeEffectiveStart || "");
         const next = instances
@@ -2688,7 +2490,6 @@ export class ManualInterventionService {
       profile: decision.profile,
       eventId: event.id,
       taskId: task.id,
-      recurrenceOwner: recurring ? "calendar" : undefined,
       seriesId: recurring ? decision.seriesId : undefined,
       masterEventId: recurring ? decision.masterEventId : undefined,
       activeInstanceId: recurring ? event.id : undefined,
@@ -2724,8 +2525,8 @@ export class ManualInterventionService {
         await pair.todoist.upsertTask(toTodoistTask(event), task.id);
       } else {
         const recreated = await pair.todoist.upsertTask(toTodoistTask(event), undefined, calendarReplaySourceIds(event));
-        await state.deleteMapping(mapping);
         await this.persistProviderMapping(state, { ...mapping, taskId: recreated.id, updatedAt: isoNow() }, pair);
+        await this.retireProviderMapping(state, pair, mapping);
       }
     } else if (action === "todoist_wins") {
       if (!task) return this.markStale(decision, "Todoist no longer exists, so Todoist cannot win this conflict.", slackUserId);
@@ -2733,8 +2534,8 @@ export class ManualInterventionService {
         await pair.calendar.upsertEvent(toCalendarEvent(task, event), event.id);
       } else {
         const recreated = await pair.calendar.upsertEvent(toCalendarEvent(task));
-        await state.deleteMapping(mapping);
         await this.persistProviderMapping(state, { ...mapping, eventId: recreated.id, updatedAt: isoNow() }, pair);
+        await this.retireProviderMapping(state, pair, mapping);
       }
     } else throw new Error(`Unsupported conflict action ${action}`);
     return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
@@ -3026,12 +2827,8 @@ export class ManualInterventionService {
       : decision.type === "todoist_cancelled_projection_blocked"
         ? MANUAL_DECISION_CATALOG.todoist_cancelled_projection_blocked.actions
       : decision.permittedActions;
-    const legacyAcknowledge = decision.type === "todoist_unmapped_conflict"
-      && manual.action === "acknowledge"
-      && decision.permittedActions.some((candidate) => candidate.id === "acknowledge");
-    const actionAllowed = legacyAcknowledge
-      || decisionActions.some((candidate) => candidate.id === manual.action)
-      || manual.action.startsWith("bind_task:");
+    const actionAllowed = decisionActions.some((candidate) => candidate.id === manual.action)
+      || (decision.type !== "todoist_unmapped_conflict" && manual.action.startsWith("bind_task:"));
     if (!actionAllowed) throw new Error(`Action ${manual.action} is not permitted for ${decision.type}`);
 
     const budget = new ReconciliationMutationBudget(MAX_MANUAL_BULK_MUTATIONS);
@@ -3061,15 +2858,6 @@ export class ManualInterventionService {
       }
       if (decision.type === "todoist_cancelled_projection_blocked" && manual.action === "consolidate_duplicate") {
         await this.resolveDuplicateConsolidation(decision, state, manual.slackUserId);
-        return;
-      }
-      if (decision.type === "todoist_unmapped_conflict" && manual.action === "split_future_todoist") {
-        await this.resolveFutureRecurringConflict(decision, state, manual.slackUserId);
-        return;
-      }
-      if (decision.type === "todoist_unmapped_conflict"
-        && (manual.action === "use_todoist_recurrence" || manual.action === "use_calendar_version")) {
-        await this.resolveUnmappedConflict(decision, manual.action, state, manual.slackUserId);
         return;
       }
       if ((manual.action === "acknowledge" && decision.type === "todoist_cancelled_projection_blocked")

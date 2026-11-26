@@ -95,6 +95,34 @@ test('health retries a failed alert post and only deduplicates confirmed deliver
   assert.equal(calls.length, 2);
 });
 
+test('scheduled health queues a full reconciliation when the profile has no prior run', async (t) => {
+  reconciliationDatabase(t);
+  const queued = [];
+  let held = false;
+  const state = { async getReconciliationState() { return undefined; } };
+  await checkReconciliationHealth(state, { enabled: false }, ['antonio', 'home'], {}, async () => {
+    held = true;
+    return async () => { held = false; };
+  }, async profile => {
+    assert.equal(held, false, 'the FIFO enqueue must acquire the profile lease itself');
+    queued.push(profile);
+    return { queued: true };
+  });
+  assert.deepEqual(queued, ['antonio', 'home']);
+  assert.equal(held, false);
+});
+
+test('scheduled health leaves an active or recently completed full run alone', async () => {
+  const recent = { profile: 'home', pending: false, reason: 'scheduled', status: 'succeeded',
+    lastCompletedAt: new Date().toISOString() };
+  const queued = [];
+  const state = { async getReconciliationState() { return recent; } };
+  const manual = { enabled: false, async retireStaleReconciliationIncidents() {} };
+  await checkReconciliationHealth(state, manual, ['home'], {}, async () => async () => {},
+    async profile => { queued.push(profile); });
+  assert.deepEqual(queued, []);
+});
+
 test('scheduled health holds admission across alert, manual-decision, and state writes', async (t) => {
   const current=run({status:'failed',lastFailedAt:old,lastError:'HTTP 503'});
   let held=false, fenceBlocked=0;

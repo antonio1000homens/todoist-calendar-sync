@@ -14,13 +14,13 @@ test("production deployment enables the existing erasure gate when explicitly ap
   assert.match(deploy,/ERASURE_EXECUTION_ENABLED must be exactly true or false/);
 });
 
-test("production deployment reads back the stack and both function gates",()=>{
-  assert.match(workflow,/Verify erasure execution flag and protocol on both deployed Lambdas/);
+test("production deployment reads back the erasure worker gate",()=>{
+  assert.match(workflow,/Verify erasure worker execution flag and protocol/);
   assert.match(workflow,/ErasureExecutionEnabled.*ParameterValue/);
-  assert.match(workflow,/for logical_id in ReviewApiFunction ErasureWorkerFunction/);
+  assert.match(workflow,/for logical_id in ErasureWorkerFunction/);
   assert.match(workflow,/Environment\.Variables\.ERASURE_EXECUTION_ENABLED/);
   assert.match(workflow,/Environment\.Variables\.ERASURE_PROTOCOL_VERSION/);
-  assert.match(workflow,/--qualifier live/);
+  assert.doesNotMatch(workflow,/ReviewApiFunction|--qualifier live/);
 });
 
 test("production deployment rejects stale master CI and non-master manual dispatches",()=>{
@@ -30,12 +30,11 @@ test("production deployment rejects stale master CI and non-master manual dispat
   assert.match(workflow,/ref: \$\{\{ github\.event_name == 'workflow_run' && github\.event\.workflow_run\.head_sha \|\| github\.sha \}\}/);
 });
 
-test("review API publishes a new live-alias version on reviewed function-property changes",()=>{
-  const review=template.split("\n  ReviewApiFunction:\n")[1]?.split("\n  ReviewApiUrlPermission:\n")[0];
-  assert.ok(review,"ReviewApiFunction SAM resource is defined");
-  assert.match(review,/AutoPublishAlias: live/);
-  assert.match(review,/AutoPublishAliasAllProperties: true/);
-  assert.match(review,/ERASURE_EXECUTION_ENABLED: !Ref ErasureExecutionEnabled/);
+test("manual review API and its unprotected function URL are removed from deployment",()=>{
+  assert.doesNotMatch(template,/ReviewApiFunction/);
+  assert.doesNotMatch(template,/ReviewApiFunctionUrl/);
+  assert.doesNotMatch(workflow,/CF_ACCESS_ISSUER|CF_ACCESS_AUDIENCE|REVIEW_OPERATOR_EMAILS/);
+  assert.doesNotMatch(deploy,/CloudflareAccessIssuer|CloudflareAccessAudience|ReviewOperatorEmails/);
 });
 
 test("CloudFormation resolves gate parameters before SAM computes alias version fingerprints",()=>{

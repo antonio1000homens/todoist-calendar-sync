@@ -4,12 +4,14 @@ import {hasGuardedRecoveryDispatchCandidate} from "../dist/guarded-recovery-disp
 import {OrphanRecoveringSynchronizer} from "../dist/orphan-recovery.js";
 import {ProjectAwareSynchronizer} from "../dist/project-sync.js";
 import {profiles} from "../dist/config.js";
+import {serializeMappingComment} from "../dist/mapping-comments.js";
 
 const task={id:"source-locked",content:"Annual item",description:"",
   project_id:profiles.home.todoistProjectId,updated_at:"2026-11-07T16:14:00Z",
   due:{date:"2027-08-16",string:"every August 16",is_recurring:true},
   is_completed:false,is_deleted:false};
-const mapping={profile:"home",taskId:task.id,eventId:"old-cancelled",updatedAt:"2026-10-23T10:35:00Z"};
+const mapping={profile:"home",projectId:profiles.home.todoistProjectId,taskId:task.id,
+  eventId:"old-cancelled",updatedAt:"2026-10-23T10:35:00Z"};
 const webhook={
   id:"blocked-upsert",kind:"todoist",profile:"home",mode:"aws",headers:{},
   receivedAt:"2026-11-07T16:14:01Z",
@@ -52,7 +54,8 @@ function harness({hasRepair=true,source=task}={}) {
   };
   const calendar={async upsertEvent(...args){writes.push(["calendar",args]);throw Error("unexpected provider write");}};
   const todoist={
-    async listProjectComments(){return [];},
+    async listProjectComments(){return [{id:"mapping-comment",project_id:profiles.home.todoistProjectId,
+      content:serializeMappingComment(mapping,profiles.home.todoistProjectId)}];},
     async getTask(id){reads.push(["provider",id]);return {...source};},
     async deleteTask(){writes.push(["todoist_delete"]);throw Error("unexpected provider write");},
   };

@@ -4,9 +4,7 @@ import {documentClient} from "../dist/dynamodb-capacity.js";
 import {StateRepository} from "../dist/repository.js";
 import {
   assertReplayAdmissionIfEnabled, mappingReplayIdentity,
-  ErasureReplayUnavailableError,
 } from "../dist/erasure-replay-barrier.js";
-import {RetirementDispositionBlockedError} from "../dist/recurrence-retirement-disposition.js";
 
 const mapping={
   profile:"work",taskId:"task-203",eventId:"event-203",
@@ -29,38 +27,28 @@ test("mapping identity protects the task and every resolved master/instance alia
     eventIds:["event-203","master-203","instance-203"]});
 });
 
-test("retirement admission remains enforced when the obsolete HMAC gate is disabled",async t=>{
+test("legacy retirement markers cannot block mapping writes",async t=>{
   setEnvironment(t,{
-    STATE_TABLE_NAME:"test-state",RETIREMENT_DISPOSITION_VERSION:"1",
-    ERASURE_REPLAY_BARRIER_VERSION:"0",
+    STATE_TABLE_NAME:"test-state",ERASURE_REPLAY_BARRIER_VERSION:"0",
   });
   let reads=0,writes=0;
   t.mock.method(documentClient,"send",async command=>{
-    if(command.constructor.name==="GetCommand"){
-      reads++;
-      assert.equal(command.input.ConsistentRead,true);
-      assert.match(command.input.Key.pk,/^RETIREMENT#work#/);
-      return {Item:{
-        profile:"work",operationId:"op-203",status:"retired",
-        taskId:mapping.taskId,seriesId:"series-203",masterEventId:mapping.masterEventId,
-        createdAt:"2026-11-10T12:00:00.000Z",
-      }};
-    }
+    if(command.constructor.name==="GetCommand")reads++;
     writes++;throw new Error("unexpected state mutation");
   });
-  await assert.rejects(new StateRepository().putMapping(mapping),RetirementDispositionBlockedError);
-  assert.equal(reads,1);
-  assert.equal(writes,0);
+  await assert.rejects(new StateRepository().putMapping(mapping),/unexpected state mutation/);
+  assert.equal(reads,0,"provider mapping writes do not consult permanent retirement markers");
+  assert.equal(writes,1,"the write proceeds to the normal mapping transaction");
 });
 
-test("obsolete HMAC gate reactivation cannot permit new state writes or reads",async t=>{
+test("obsolete HMAC gate settings do not block provider correlation writes",async t=>{
   setEnvironment(t,{
-    STATE_TABLE_NAME:"test-state",RETIREMENT_DISPOSITION_VERSION:"0",
-    ERASURE_REPLAY_BARRIER_VERSION:"1",
+    STATE_TABLE_NAME:"test-state",ERASURE_REPLAY_BARRIER_VERSION:"1",
   });
-  let accesses=0;
-  t.mock.method(documentClient,"send",async()=>{accesses++;throw Error("legacy DDB access");});
-  await assert.rejects(new StateRepository().putMapping(mapping),ErasureReplayUnavailableError);
-  await assert.rejects(assertReplayAdmissionIfEnabled({profile:"work",taskId:mapping.taskId}),ErasureReplayUnavailableError);
-  assert.equal(accesses,0);
+  const commands=[];
+  t.mock.method(documentClient,"send",async command=>{commands.push(command);return {};});
+  await assert.doesNotReject(()=>new StateRepository().putMapping(mapping));
+  await assert.doesNotReject(()=>assertReplayAdmissionIfEnabled({profile:"work",taskId:mapping.taskId}));
+  assert.equal(commands.length,1,"the test adapter can persist its mapping without consulting retired HMAC markers");
+  assert.equal(commands[0].constructor.name,"TransactWriteCommand");
 });

@@ -78,24 +78,17 @@ test("preserves downstream failures and fails closed when unconfigured", async (
   }
 });
 
-test("routes review API requests with the Access assertion and serves review assets", async () => {
+test("retires the manual review API and dashboard routes", async () => {
   const originalFetch = globalThis.fetch;
-  let forwarded;
+  let calls = 0;
   globalThis.fetch = async (url, init) => {
-    forwarded = { url:String(url), headers:new Headers(init.headers), method:init.method };
-    return new Response('{"ok":true}', { status:200 });
+    calls += 1;
+    return new Response("unexpected");
   };
-  const reviewEnv = { ...env, TODOIST_CALENDAR_SYNC_REVIEW_API_URL:"https://review.example.test/" , ASSETS:{fetch:async request=>new Response(new URL(request.url).pathname)} };
   try {
-    const apiResponse = await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/review/api/cases?profile=home", {
-      headers:{"cf-access-jwt-assertion":"signed-access-token"},
-    }), reviewEnv);
-    assert.equal(apiResponse.status,200);
-    assert.equal(forwarded.url,"https://review.example.test/review/api/cases?profile=home");
-    assert.equal(forwarded.headers.get("cf-access-jwt-assertion"),"signed-access-token");
-    assert.equal(forwarded.headers.get("host"),null);
-    const page = await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/review/"),reviewEnv);
-    assert.equal(await page.text(),"/review/");
+    assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/review/api/cases?profile=home"),env)).status,404);
+    assert.equal((await worker.fetch(new Request("https://calendar-sync.alf-broadcast.co.uk/review/"),env)).status,404);
+    assert.equal(calls,0);
   } finally {
     globalThis.fetch = originalFetch;
   }

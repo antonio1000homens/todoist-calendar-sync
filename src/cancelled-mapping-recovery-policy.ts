@@ -93,7 +93,7 @@ export function evaluateCancelledMappingRecovery(
     || task.completed_at || !task.project_id) return deny("UNSUPPORTED_SOURCE");
   const policy = recoveryPolicyForTask(task);
   if (!policy) return deny(task.due?.is_recurring ? "UNSUPPORTED_RECURRENCE" : "UNSUPPORTED_SOURCE");
-  if (task.id !== mapping.taskId || mapping.profile !== profile || mapping.recurrenceOwner
+  if (task.id !== mapping.taskId || mapping.profile !== profile
     || mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return deny("FOREIGN_OR_RECURRING_MAPPING");
   const sourceAt = Date.parse(task.updated_at || "");
   if (!Number.isFinite(sourceAt) || !mapping.updatedAt || !Number.isFinite(Date.parse(mapping.updatedAt))

@@ -79,6 +79,15 @@ test("production Todoist creation paths must supply checked Calendar provenance"
       repairs++;
     }
   }
-  assert.ok(creators>=11,"Expected normal and manual Calendar-origin task creation paths");
-  assert.ok(repairs>=4,"Expected direct and delegated idempotent task creation paths");
+  // Consolidation removes duplicated create-capable call sites; keep a floor
+  // that still covers the normal, recovery, and manual Calendar-origin paths.
+  assert.ok(creators>=8,"Expected normal, recovery, and manual Calendar-origin task creation paths");
+  const syncSource=await readFile(path.join(src,"sync.ts"),"utf8");
+  const manualSource=await readFile(path.join(src,"manual-intervention.ts"),"utf8");
+  assert.match(syncSource,/upsertTask\([^;]*calendarReplaySourceIds\(/s,
+    "Normal Calendar-origin task creation must bind checked provider provenance");
+  assert.match(manualSource,/upsertTask\([^;]*calendarReplaySourceIds\(/s,
+    "Manual Calendar-origin task creation must bind checked provider provenance");
+  assert.equal(repairs,1,
+    "only the guarded repair dispatcher retains idempotent task creation; normal sync keeps provider IDs");
 });

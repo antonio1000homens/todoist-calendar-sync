@@ -65,7 +65,7 @@ export function evaluateOrphanEvidence(op:OrphanDeletionOperation, data:OrphanEv
   checks.scope_standalone=Boolean(checks.exact_target_live && obj &&
     (op.side==="todoist" ? !(obj as TodoistTask).due?.is_recurring :
       !(obj as CalendarEvent).recurringEventId && !(obj as CalendarEvent).recurrence?.length &&
-      !(obj as CalendarEvent).extendedProperties?.shared?.syncRecurrenceOwner));
+      !(obj as CalendarEvent).extendedProperties?.shared?.syncSeriesId));
   const evidence=item?reviewCaseEvidenceIds(item):{taskIds:[],eventIds:[]};
   const sameSide=op.side==="todoist"?evidence.taskIds:evidence.eventIds;
   const otherSide=op.side==="todoist"?"calendar":"todoist";

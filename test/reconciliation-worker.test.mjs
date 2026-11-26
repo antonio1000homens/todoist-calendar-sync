@@ -1,8 +1,23 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SQSClient } from '@aws-sdk/client-sqs';
-import { processReconciliation } from '../dist/worker.js';
+import { ensureReconciliationGeneration, processReconciliation } from '../dist/worker.js';
 import { SnapshotReconciler } from '../dist/reconciliation.js';
+
+test('legacy reconciliation deliveries enter the automatic pipeline with a retry-stable generation', () => {
+  const legacy = {
+    id: 'legacy-reconcile-message-1', kind: 'reconcile', profile: 'home', mode: 'aws',
+    headers: {}, body: '', receivedAt: '2026-11-26T00:00:00.000Z',
+  };
+  const first = ensureReconciliationGeneration(legacy);
+  const retry = ensureReconciliationGeneration(legacy);
+  assert.equal(first.reconcile.reason, 'manual');
+  assert.match(first.reconcile.generation, /^legacy-home-[a-f0-9]{24}$/);
+  assert.equal(retry.reconcile.generation, first.reconcile.generation);
+  assert.equal(ensureReconciliationGeneration({ ...legacy, reconcile: {
+    reason: 'scheduled', generation: 'existing-generation',
+  } }).reconcile.generation, 'existing-generation');
+});
 
 test('Calendar continuations keep increasing after mapped/unmapped chunk IDs', async (t) => {
   const previousQueue = process.env.QUEUE_URL;

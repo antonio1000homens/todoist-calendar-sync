@@ -44,7 +44,7 @@ test("stage atomically claims exact task+master controls on both profiles before
   assert.equal(phaseBNativeMoveStageKey(f.plan.taskId).pk,"PHASE_B_NATIVE_MOVE#task-123");
   assert.equal(tx[0].Put.Item.pk,phaseBNativeMoveStageKey(f.plan.taskId).pk);
   assert.equal(tx[0].Put.ConditionExpression,"attribute_not_exists(pk)");
-  assert.equal(tx.length,10);
+  assert.equal(tx.length,5);
   for(const pk of [
     "SYNC_CONTROL#home:todoist:task-123",
     "SYNC_CONTROL#home:calendar:source-native",
@@ -55,36 +55,19 @@ test("stage atomically claims exact task+master controls on both profiles before
     assert.equal(update.Update.ExpressionAttributeValues[":id"],stage.operationId);
     assert.match(update.Update.ConditionExpression,/attribute_not_exists\(activeRepair\)/);
   }
-  assert.equal(itemFor(tx,"TASKOWNER#task-123")[0].ConditionCheck.ExpressionAttributeValues[":updated"],"source-map-v1");
-  assert.equal(itemFor(tx,"RECURRENCE#home#task-123")[0].ConditionCheck.ExpressionAttributeValues[":updated"],"source-link-v1");
-  assert.equal(itemFor(tx,"TASK#antonio#task-123")[0].ConditionCheck.ConditionExpression,"attribute_not_exists(pk)");
+  assert.equal(itemFor(tx,"TASKOWNER#task-123").length,0);
+  assert.equal(itemFor(tx,"RECURRENCE#home#task-123").length,0);
+  assert.equal(itemFor(tx,"TASK#antonio#task-123").length,0);
 });
-test("successful handoff CASes all six indexes and releases stage/fences atomically",()=>{
+test("successful handoff finalizes only transient stage and controls",()=>{
   const f=fixture();
   const tx=phaseBNativeMoveCommitTransaction("state-table",f,stamp);
   const stage=phaseBNativeMoveStage(f);
-  assert.equal(tx.length,14);
+  assert.equal(tx.length,5);
   for(const pk of ["EVENT#home#source-native","TASK#home#task-123",
-    "RECURRENCE#home#task-123"]){
-    const [item]=itemFor(tx,pk);
-    assert.ok(item.Delete,"old source indexed relationship is removed");
-    assert.equal(item.Delete.ExpressionAttributeValues[":updated"],
-      pk.startsWith("RECURRENCE")?"source-link-v1":"source-map-v1");
-  }
-  for(const pk of [
-    `EVENT#work#${destinationMasterId}`,"TASK#work#task-123",
-    `RECURRENCE#work#task-123`]){
-    const [row]=itemFor(tx,pk);
-    assert.equal(row.Put.ConditionExpression,"attribute_not_exists(pk)");
-    assert.equal(row.Put.Item.profile,"work");
-    assert.equal(row.Put.Item.todoistPhaseBVersion,
-      pk.startsWith("RECURRENCE")?undefined:1);
-  }
-  const [owner]=itemFor(tx,"TASKOWNER#task-123");
-  assert.ok(owner.Put);
-  assert.equal(owner.Put.Item.profile,"work");
-  assert.equal(owner.Put.Item.masterEventId,destinationMasterId);
-  assert.equal(owner.Put.ExpressionAttributeValues[":updated"],"source-map-v1");
+    "RECURRENCE#home#task-123",`TASK#work#task-123`,
+    `RECURRENCE#work#task-123`,"TASKOWNER#task-123"])
+    assert.equal(itemFor(tx,pk).length,0,"provider correlation rows are not transaction state");
   const [receipt]=itemFor(tx,"PHASE_B_NATIVE_MOVE#task-123");
   assert.ok(receipt.Delete);
   assert.equal(receipt.Delete.ExpressionAttributeValues[":id"],stage.operationId);
@@ -98,22 +81,9 @@ test("successful handoff CASes all six indexes and releases stage/fences atomica
     assert.match(update.Update.UpdateExpression,/REMOVE activeRepair$/);
     assert.equal(update.Update.ExpressionAttributeValues[":id"],stage.operationId);
   }
-  assert.equal(itemFor(tx,"COMPLETED_EVENT#home#source-native").length,0,
-    "completed source history must never be purged by cross-profile transfer");
-  assert.equal(itemFor(tx,`COMPLETED_EVENT#work#${destinationMasterId}`)[0]
-    .ConditionCheck.ConditionExpression,"attribute_not_exists(pk)");
 });
-test("all mutations are refused for mismatched destination identity or missing native markers",()=>{
+test("stage identity requires the verified provider-correlated native source",()=>{
   const f=fixture();
-  for(const mapping of [
-    {...f.destinationMapping,profile:"home"},
-    {...f.destinationMapping,eventId:"other"},
-    {...f.destinationMapping,masterEventId:"other"},
-    {...f.destinationMapping,recurrenceOwner:"calendar"},
-    {...f.destinationMapping,todoistPhaseBVersion:undefined},
-    {...f.destinationMapping,originalStart:"2027-07-10"},
-    {...f.destinationMapping,activeInstanceId:undefined},
-  ])assert.throws(()=>phaseBNativeMoveCommitTransaction("table",{...f,destinationMapping:mapping},stamp));
   assert.throws(()=>phaseBNativeMoveStage({...f,sourceMapping:{...f.sourceMapping,todoistPhaseBVersion:undefined}}));
   assert.throws(()=>phaseBNativeMoveStage({...f,sourceLink:{...f.sourceLink,owner:"calendar"}}));
 });

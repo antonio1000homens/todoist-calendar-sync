@@ -1,22 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { profiles } from "../dist/config.js";
+import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { Synchronizer } from "../dist/sync.js";
 
 const PROFILE = "home";
 const TASK_ID = "task-recurring";
 const MASTER_ID = "todoist-master";
 
-function recurringTask(date, content = "Water plants", updatedAt = "2026-09-14T10:00:00Z") {
+function recurringTask(date, content = "Water plants", updatedAt = "2026-09-14T10:00:00Z", rule = "every monday") {
   return {
     id: TASK_ID,
     content,
     description: "",
-    project_id: "home-project",
+    project_id: "test-home-project",
     updated_at: updatedAt,
     due: {
       date,
       is_recurring: true,
-      string: "every monday",
+      string: rule,
     },
   };
 }
@@ -30,6 +32,7 @@ function masterEvent() {
     start: { date: "2026-09-14" },
     end: { date: "2026-09-15" },
     recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+    etag: "master-etag",
     extendedProperties: {
       shared: {
         taskId: TASK_ID,
@@ -59,12 +62,26 @@ function instance(id, date) {
     originalStartTime: { date },
     start: { date },
     end: { date: next.toISOString().slice(0, 10) },
+    etag: `etag-${id}`,
     extendedProperties: {
       shared: {
         taskId: TASK_ID,
         syncRecurrenceOwner: "todoist",
       },
     },
+  };
+}
+
+function timedInstance(id, startDateTime) {
+  const end = new Date(Date.parse(startDateTime) + 60 * 60 * 1000).toISOString();
+  return {
+    id, status: "confirmed", summary: "Water plants", description: "",
+    recurringEventId: MASTER_ID,
+    originalStartTime: { dateTime: startDateTime },
+    start: { dateTime: startDateTime, timeZone: "Europe/London" },
+    end: { dateTime: end, timeZone: "Europe/London" },
+    etag: `etag-${id}`,
+    extendedProperties: { shared: { taskId: TASK_ID, syncRecurrenceOwner: "todoist" } },
   };
 }
 
@@ -110,15 +127,30 @@ class FakeState {
 
 let currentTodoistTask;
 
-function fixture({ unlinked = false, unmapped = false } = {}) {
-  const state = new FakeState(unlinked || unmapped ? undefined : mapping());
-  const events = new Map(unlinked ? [] : [[MASTER_ID, masterEvent()]]);
-  const instances = [
+function fixture({ unlinked = false, unmapped = false, timed = false, initialMapping = mapping() } = {}) {
+  const state = new FakeState(unlinked || unmapped ? undefined : initialMapping);
+  const master = masterEvent();
+  const instances = timed ? [
+    timedInstance("instance-14", "2026-09-14T09:00:00+01:00"),
+    timedInstance("instance-21", "2026-09-21T09:00:00+01:00"),
+    timedInstance("instance-28", "2026-09-28T09:00:00+01:00"),
+  ] : [
     instance("instance-14", "2026-09-14"),
     instance("instance-21", "2026-09-21"),
     instance("instance-28", "2026-09-28"),
   ];
+  if (timed) {
+    master.start = { dateTime: "2026-09-07T09:00:00+01:00", timeZone: "Europe/London" };
+    master.end = { dateTime: "2026-09-07T10:00:00+01:00", timeZone: "Europe/London" };
+  }
+  const events = new Map(unlinked ? [] : [[MASTER_ID, master]]);
+  for (const event of instances) events.set(event.id, event);
   const upserts = [];
+  const projectId = profiles[PROFILE].todoistProjectId;
+  const projectComments = !unlinked && !unmapped && initialMapping ? [{
+    id: "provider-mapping", project_id: projectId,
+    content: serializeMappingComment({ ...initialMapping, projectId, mappingRevision: 1 }, projectId),
+  }] : [];
   const calendar = {
     async getEvent(id) {
       const event = events.get(id);
@@ -135,19 +167,35 @@ function fixture({ unlinked = false, unmapped = false } = {}) {
     async listInstances() {
       return instances.map((event) => structuredClone(event));
     },
+    async listExplicitSeriesExceptions() { return []; },
     async upsertEvent(payload, existingId) {
       const id = existingId || MASTER_ID;
-      const stored = { ...structuredClone(payload), id, status: "confirmed" };
+      const stored = { ...structuredClone(payload), id, status: "confirmed", etag: `updated-${upserts.length + 1}` };
       events.set(id, stored);
       upserts.push({ id, payload: structuredClone(payload), existingId });
       return structuredClone(stored);
     },
+    async upsertEventIfUnchanged(payload, existingId, etag) {
+      assert.equal(events.get(existingId)?.etag, etag);
+      return this.upsertEvent(payload, existingId);
+    },
     async deleteEvent() {},
   };
-  const todoist = { async listProjectComments() { return []; },
-    async getTask() { return structuredClone(currentTodoistTask); } };
+  const todoist = {
+    async listProjectComments() { return projectComments.filter(comment => comment.is_deleted !== true).map(comment => structuredClone(comment)); },
+    async upsertProjectComment(nextProjectId, content, existingId) {
+      const id = existingId || "provider-mapping";
+      const comment = { id, project_id: nextProjectId, content };
+      const index = projectComments.findIndex(item => item.id === id);
+      if (index >= 0) projectComments[index] = comment; else projectComments.push(comment);
+      const parsed = parseMappingComment(comment);
+      if (parsed && !("error" in parsed)) state.mapping = mappingFromProjectMappingComment(parsed);
+      return structuredClone(comment);
+    },
+    async getTask() { return structuredClone(currentTodoistTask); },
+  };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
-  return { state, sync, upserts };
+  return { state, sync, upserts, events, calendar, todoist };
 }
 
 function delivery(task, oldTask, updateIntent = "item_updated") {
@@ -167,20 +215,139 @@ function delivery(task, oldTask, updateIntent = "item_updated") {
   };
 }
 
-test("manual date edit re-anchors a Todoist-owned recurring Calendar series", async () => {
+test("manual date edit reschedules only the mapped Todoist-owned Calendar occurrence", async () => {
   const oldTask = recurringTask("2026-09-14");
-  const task = recurringTask("2026-09-21", "Water plants", "2026-09-14T10:05:00Z");
+  const task = recurringTask("2026-09-16", "Water plants", "2026-09-14T10:05:00Z");
   const { state, sync, upserts } = fixture();
 
   await sync.process(delivery(task, oldTask));
 
-  assert.equal(upserts.length, 1, "the recurring Calendar master should be updated, not treated as a no-op");
+  assert.equal(upserts.length, 1, "the exact Calendar occurrence should be updated");
+  assert.equal(upserts[0].existingId, "instance-14");
+  assert.deepEqual(upserts[0].payload.start, { date: "2026-09-16" });
+  assert.deepEqual(upserts[0].payload.end, { date: "2026-09-17" });
+  assert.deepEqual(upserts[0].payload.originalStartTime, { date: "2026-09-14" });
+  assert.equal(state.mapping.masterEventId, MASTER_ID);
+  assert.equal(state.mapping.activeInstanceId, "instance-14");
+  assert.equal(state.mapping.originalStart, "2026-09-14");
+  assert.equal(state.mapping.activeEffectiveStart, "2026-09-16");
+  assert.deepEqual(upserts[0].payload.recurrence, undefined, "an instance update must not write the master RRULE");
+  assert.equal(state.audits.at(-1).action, "todoist_recurring_occurrence_rescheduled");
+});
+
+test("Todoist series rule edit conditionally updates and verifies the exact Calendar master", async () => {
+  const oldTask = recurringTask("2026-09-14");
+  const task = recurringTask("2026-09-14", "Water plants", "2026-09-14T10:05:00Z", "every month");
+  const { state, sync, upserts, events } = fixture();
+
+  await sync.process(delivery(task, oldTask));
+
+  assert.equal(upserts.length, 1);
   assert.equal(upserts[0].existingId, MASTER_ID);
-  assert.deepEqual(upserts[0].payload.start, { date: "2026-09-21" });
-  assert.equal(upserts[0].payload.extendedProperties.shared.todoistAnchorStart, "2026-09-21");
-  assert.equal(state.mapping.activeInstanceId, "instance-21");
-  assert.equal(state.mapping.originalStart, "2026-09-21");
-  assert.equal(state.audits.at(-1).detail.recurrenceReanchored, true);
+  assert.equal(upserts[0].payload.id, "");
+  assert.deepEqual(events.get(MASTER_ID).recurrence, ["RRULE:FREQ=MONTHLY"]);
+  assert.equal(events.get(MASTER_ID).extendedProperties.shared.taskId, TASK_ID);
+  assert.equal(events.get(MASTER_ID).extendedProperties.shared.todoistRecurrence, "every month");
+  assert.equal(state.mapping.eventId, MASTER_ID);
+  assert.equal(state.mapping.masterEventId, MASTER_ID);
+  assert.equal(state.mapping.activeInstanceId, "instance-14");
+  assert.equal(state.audits.at(-1).action, "todoist_updated_calendar");
+});
+
+test("scheduled reconciliation repairs a Todoist-native series from exact provider correlation", async () => {
+  const task = recurringTask("2026-09-14", "Water plants", "2026-09-14T10:05:00Z", "every month");
+  const { state, sync, upserts, events, todoist } = fixture();
+  currentTodoistTask = task;
+  const projectId = profiles[PROFILE].todoistProjectId;
+  const commentMapping = { ...state.mapping, projectId, mappingRevision: 1 };
+  todoist.listProjectComments = async () => [{
+    id: "project-mapping", project_id: projectId,
+    content: serializeMappingComment(commentMapping, projectId),
+  }];
+
+  await sync.reconcile(PROFILE);
+  await sync.reconcile(PROFILE);
+
+  assert.equal(upserts.length, 1, "the second full reconciliation is a no-op");
+  assert.equal(upserts[0].existingId, MASTER_ID);
+  assert.deepEqual(events.get(MASTER_ID).recurrence, ["RRULE:FREQ=MONTHLY"]);
+  assert.equal(events.get(MASTER_ID).extendedProperties.shared.taskId, TASK_ID);
+  assert.equal(state.mapping.taskId, TASK_ID);
+  assert.equal(state.mapping.masterEventId, MASTER_ID);
+});
+
+test("timed recurring due edit changes only the exact instance and preserves duration and zone", async () => {
+  const initialMapping = {
+    ...mapping(),
+    originalStart: "2026-09-14T09:00:00+01:00",
+    activeEffectiveStart: "2026-09-14T09:00:00+01:00",
+  };
+  const oldTask = recurringTask("2026-09-14T09:00:00+01:00");
+  const task = recurringTask("2026-09-14T10:30:00+01:00", "Water plants", "2026-09-14T10:05:00Z");
+  const { state, sync, upserts } = fixture({ timed: true, initialMapping });
+
+  await sync.process(delivery(task, oldTask));
+
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0].existingId, "instance-14");
+  assert.equal(upserts[0].payload.start.dateTime, "2026-09-14T10:30:00+01:00");
+  assert.equal(upserts[0].payload.end.dateTime, "2026-09-14T10:30:00.000Z");
+  assert.equal(upserts[0].payload.start.timeZone, "Europe/London");
+  assert.equal(upserts[0].payload.originalStartTime.dateTime, initialMapping.originalStart);
+  assert.equal(state.mapping.activeInstanceId, "instance-14");
+  assert.equal(state.mapping.masterEventId, MASTER_ID);
+  assert.equal(state.mapping.activeEffectiveStart, "2026-09-14T10:30:00+01:00");
+});
+
+test("date edit without old_item is detected from the exact mapped effective occurrence", async () => {
+  const task = recurringTask("2026-09-16", "Water plants", "2026-09-14T10:05:00Z");
+  const { state, sync, upserts } = fixture();
+
+  await sync.process(delivery(task, undefined));
+
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0].existingId, "instance-14");
+  assert.equal(upserts[0].payload.start.date, "2026-09-16");
+  assert.equal(upserts[0].payload.originalStartTime.date, "2026-09-14");
+  assert.equal(state.mapping.activeEffectiveStart, "2026-09-16");
+});
+
+test("Calendar-origin recurrence reschedules from exact task and master IDs without a permanent owner marker", async () => {
+  const initialMapping = { ...mapping(), recurrenceOwner: "calendar", seriesId: MASTER_ID };
+  const oldTask = recurringTask("2026-09-14");
+  const task = recurringTask("2026-09-16", "Water plants", "2026-09-14T10:05:00Z");
+  const { state, sync, upserts, events } = fixture({ initialMapping });
+  const master = events.get(MASTER_ID);
+  delete master.extendedProperties.shared.todoistRecurrence;
+  delete master.extendedProperties.shared.syncRecurrenceOwner;
+
+  await sync.process(delivery(task, oldTask));
+
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0].existingId, "instance-14");
+  assert.equal(upserts[0].payload.start.date, "2026-09-16");
+  assert.equal(state.mapping.recurrenceOwner, undefined);
+  assert.equal(state.mapping.originalStart, "2026-09-14");
+  assert.equal(state.mapping.activeEffectiveStart, "2026-09-16");
+});
+
+test("a retry after Calendar accepted the occurrence patch completes correlation without another write", async () => {
+  const oldTask = recurringTask("2026-09-14");
+  const task = recurringTask("2026-09-16", "Water plants", "2026-09-14T10:05:00Z");
+  const { state, sync, upserts, events } = fixture();
+  const accepted = events.get("instance-14");
+  accepted.start = { date: "2026-09-16" };
+  accepted.end = { date: "2026-09-17" };
+  events.set(accepted.id, accepted);
+
+  await sync.process(delivery(task, oldTask));
+
+  assert.equal(upserts.length, 0);
+  assert.equal(state.mapping.activeInstanceId, "instance-14");
+  assert.equal(state.mapping.originalStart, "2026-09-14");
+  assert.equal(state.mapping.activeEffectiveStart, "2026-09-16");
+  assert.equal(state.audits.at(-1).action, "todoist_recurring_occurrence_rescheduled");
+  assert.equal(state.audits.at(-1).detail.recoveredAppliedWrite, true);
 });
 
 test("content-only edit keeps the existing Todoist recurrence anchor", async () => {

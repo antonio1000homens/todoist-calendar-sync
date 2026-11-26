@@ -1,12 +1,11 @@
+import { createHash } from "node:crypto";
 import {defaultProviderClientFactory} from "./mutation-budget.js";
-import {guardReplayProviderClients} from "./erasure-replay-providers.js";
-import {assertReplayAdmissionIfEnabled} from "./erasure-replay-barrier.js";
 import { DeleteCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore, reviewHash } from "./review-store.js";
-import { cancelledOccurrenceMasterId, classifyDeletedRecurrenceLinks, deletedSeriesKeys, readExactRecurrenceLinks, verifyCancelledSeries, verifyCancelledSeriesInstances } from "./verified-deletion.js";
+import { cancelledOccurrenceMasterId, verifyCancelledSeries, verifyCancelledSeriesInstances } from "./verified-deletion.js";
 import { googleCredentials, profileForTodoistProject, profiles, todoistToken } from "./config.js";
-import { activeProjectDeletionTombstone, buildProjectMappingIndex, deleteMappingComments, mappingFromProjectMappingComment } from "./mapping-comments.js";
+import { buildProjectMappingIndex, deleteMappingComments, mappingFromProjectMappingComment } from "./mapping-comments.js";
 import { ProjectAwareSynchronizer } from "./project-sync.js";
 import { AmbiguousCalendarLinkError, GoogleCalendar, Todoist } from "./providers.js";
 import { StateRepository } from "./repository.js";
@@ -18,8 +17,8 @@ import { hasCanonicalState, startsMatch, Synchronizer, toCalendarEvent, toTodois
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { recoveryPolicyForTask, recoveryReceiptMatchesTask } from "./cancelled-mapping-recovery-policy.js";
 import { logEvent } from "./observability.js";
-import { mappingLookupQueryInput, readProfileLookup } from "./profile-lookup.js";
-import type { CalendarEvent, Delivery, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
+import { providerSyncBaseline } from "./provider-sync-baseline.js";
+import type { CalendarEvent, Delivery, Mapping, Profile, ProviderSyncBaseline, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 interface TodoistCanonicalState {
   content: string;
@@ -30,6 +29,7 @@ interface TodoistCanonicalState {
     timezone: string | null;
     isRecurring: boolean;
   } | null;
+  recurrence: string | null;
 }
 
 // The reconciled Calendar projection deliberately excludes end/duration:
@@ -40,6 +40,7 @@ interface CalendarCanonicalState {
   summary: string;
   description: string;
   start: { date: string | null; dateTime: string | null; timeZone: string | null } | null;
+  recurrence: string[] | null;
 }
 
 export interface ReconciliationBaseline {
@@ -49,7 +50,7 @@ export interface ReconciliationBaseline {
 }
 
 interface ReconciliationStore {
-  listMappings(profile: Profile): Promise<Mapping[]>;
+  listMappings?(profile: Profile): Promise<Mapping[]>;
   getBaseline(profile: Profile, taskId: string): Promise<ReconciliationBaseline | undefined>;
   putBaseline(profile: Profile, taskId: string, task: TodoistTask, event: CalendarEvent): Promise<void>;
   deleteBaseline(profile: Profile, taskId: string): Promise<void>;
@@ -71,7 +72,6 @@ type ReconcileOutcome =
   | "created"
   | "blocked"
   | "conflict"
-  | "recurring_deferred"
   | "completed_retained"
   | "deleted_retired";
 
@@ -110,6 +110,7 @@ function canonicalTodoist(task: TodoistTask): TodoistCanonicalState {
     content: normalizedText(task.content),
     description: normalizedText(task.description),
     due,
+    recurrence: task.due?.is_recurring ? normalizedText(task.due.string) || null : null,
   };
 }
 
@@ -126,25 +127,35 @@ function canonicalCalendar(event: CalendarEvent): CalendarCanonicalState {
     summary: normalizedText(event.summary),
     description: normalizedText(event.description),
     start: point(event.start),
+    recurrence: event.recurrence?.length ? [...event.recurrence] : null,
   };
 }
 
 function same(left: unknown, right: unknown): boolean {
-  const stable = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(stable);
-    if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value)
-        .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
-        .map(([key, entry]) => [key, stable(entry)]));
-    }
-    return value;
-  };
-  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+  return JSON.stringify(stableValue(left)) === JSON.stringify(stableValue(right));
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+      .map(([key, entry]) => [key, stableValue(entry)]));
+  }
+  return value;
+}
+
+function fieldHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(stableValue(value))).digest("hex");
+}
+
+function providerBaseline(task: TodoistTask, event: CalendarEvent): ProviderSyncBaseline {
+  return providerSyncBaseline(task, event);
 }
 
 function todoistDiffFields(left: TodoistCanonicalState | null, right: TodoistCanonicalState | null): string[] {
   const fields: string[] = [];
-  for (const field of ["content", "description"] as const) {
+  for (const field of ["content", "description", "recurrence"] as const) {
     if (!same(left?.[field] ?? null, right?.[field] ?? null)) fields.push(field);
   }
   if (!same(left?.due ?? null, right?.due ?? null)) {
@@ -163,6 +174,7 @@ function calendarDiffFields(left: CalendarCanonicalState | null, right: Calendar
   for (const field of ["status", "summary", "description"] as const) {
     if (!same(left?.[field] ?? null, right?.[field] ?? null)) fields.push(field);
   }
+  if (!same(left?.recurrence ?? null, right?.recurrence ?? null)) fields.push("recurrence");
   if (!same(left?.start ?? null, right?.start ?? null)) {
     if (Boolean(left?.start) !== Boolean(right?.start)) fields.push("start");
     else {
@@ -172,6 +184,25 @@ function calendarDiffFields(left: CalendarCanonicalState | null, right: Calendar
     }
   }
   return fields;
+}
+
+function todoistProviderDiffFields(current: TodoistCanonicalState | null, baseline: ProviderSyncBaseline): string[] {
+  return [
+    ...(fieldHash(current?.content ?? null) !== baseline.todoist.content ? ["content"] : []),
+    ...(fieldHash(current?.description ?? null) !== baseline.todoist.description ? ["description"] : []),
+    ...(fieldHash(current?.due ?? null) !== baseline.todoist.due ? ["due"] : []),
+    ...(baseline.todoist.recurrence && fieldHash(current?.recurrence ?? null) !== baseline.todoist.recurrence ? ["recurrence"] : []),
+  ];
+}
+
+function calendarProviderDiffFields(current: CalendarCanonicalState | null, baseline: ProviderSyncBaseline): string[] {
+  return [
+    ...(fieldHash(current?.status ?? null) !== baseline.calendar.status ? ["status"] : []),
+    ...(fieldHash(current?.summary ?? null) !== baseline.calendar.summary ? ["summary"] : []),
+    ...(fieldHash(current?.description ?? null) !== baseline.calendar.description ? ["description"] : []),
+    ...(fieldHash(current?.start ?? null) !== baseline.calendar.start ? ["start"] : []),
+    ...(baseline.calendar.recurrence && fieldHash(current?.recurrence ?? null) !== baseline.calendar.recurrence ? ["recurrence"] : []),
+  ];
 }
 
 function hasDue(task: TodoistTask | undefined): boolean {
@@ -204,7 +235,7 @@ function unmappedMismatchCategories(event: CalendarEvent, task: TodoistTask): st
 }
 
 function isResolvedConflictOutcome(outcome: ReconcileOutcome): boolean {
-  return !["conflict", "blocked", "recurring_deferred"].includes(outcome);
+  return !["conflict", "blocked"].includes(outcome);
 }
 
 function emptyCounts(): Record<ReconcileOutcome, number> {
@@ -219,7 +250,6 @@ function emptyCounts(): Record<ReconcileOutcome, number> {
     created: 0,
     blocked: 0,
     conflict: 0,
-    recurring_deferred: 0,
     completed_retained: 0,
     deleted_retired: 0,
   };
@@ -231,17 +261,6 @@ export class DynamoReconciliationStore implements ReconciliationStore {
     return tableName;
   }
 
-  async listMappings(profile: Profile): Promise<Mapping[]> {
-    const table = this.ensureTable();
-    return readProfileLookup<Mapping>({
-      client: documentClient,
-      profile,
-      operation: "list_reconciliation_mappings",
-      component: "reconciliation",
-      queryInput: mappingLookupQueryInput(table, profile),
-    });
-  }
-
   async getBaseline(profile: Profile, taskId: string): Promise<ReconciliationBaseline | undefined> {
     const result = await documentClient.send(new GetCommand({
       TableName: this.ensureTable(),
@@ -251,9 +270,6 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async putBaseline(profile: Profile, taskId: string, task: TodoistTask, event: CalendarEvent): Promise<void> {
-    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds:[
-      event.id,event.recurringEventId,event.extendedProperties?.shared?.syncHistoryMasterId,
-    ].filter((value):value is string=>typeof value==="string"&&value.length>0)});
     const baseline: ReconciliationBaseline = {
       todoist: canonicalTodoist(task),
       calendar: canonicalCalendar(event),
@@ -271,7 +287,6 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaseline(profile: Profile, taskId: string): Promise<void> {
-    await assertReplayAdmissionIfEnabled({profile,taskId});
     await documentClient.send(new DeleteCommand({
       TableName: this.ensureTable(),
       Key: key(`BASELINE#${profile}#TASK#${taskId}`, "RECONCILE"),
@@ -279,7 +294,6 @@ export class DynamoReconciliationStore implements ReconciliationStore {
   }
 
   async deleteBaselineIfUnchanged(profile:Profile,taskId:string,expected:ReconciliationBaseline|null|undefined,allowAbsentAfterCheckpoint=false):Promise<boolean> {
-    await assertReplayAdmissionIfEnabled({profile,taskId});
     if(!tableName) throw new Error("STATE_TABLE_NAME is not configured");
     const key= {pk:`BASELINE#${profile}#TASK#${taskId}`,sk:"RECONCILE"};
     const current=await documentClient.send(new GetCommand({TableName:tableName,Key:key,ConsistentRead:true}));
@@ -302,36 +316,65 @@ export class SnapshotReconciler {
   constructor(
     private readonly state = new StateRepository(),
     private readonly clientFactory?: ClientFactory,
-    private readonly store: ReconciliationStore = new DynamoReconciliationStore(),
+    private readonly store?: ReconciliationStore,
     private readonly repairCurrentState?: RepairCurrentState,
     private readonly reconcileRecurrence?: ReconcileRecurrence,
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return guardReplayProviderClients(profile,await this.clientFactory(profile));
+    if (this.clientFactory) return this.clientFactory(profile);
     return defaultProviderClientFactory(profile);
   }
 
   private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
     const client = todoist || (await this.clients(profile)).todoist;
-    if (typeof client.listProjectComments !== "function"
-      || typeof client.upsertProjectComment !== "function"
-      || typeof client.updateComment !== "function") return this.store.listMappings(profile);
+    if (typeof client.listProjectComments !== "function") {
+      if (this.isLegacyTestAdapter(client)) {
+        if (this.store?.listMappings) return this.store.listMappings(profile);
+        const listMappings = (this.state as StateRepository & { listMappings?: (profile: Profile) => Promise<Mapping[]> }).listMappings;
+        if (listMappings) return listMappings.call(this.state, profile);
+      }
+      throw new Error("Todoist project comment correlation API unavailable");
+    }
     return buildProjectMappingIndex(await client.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
       .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
       .map(mappingFromProjectMappingComment);
   }
 
+  private async reconciliationBaseline(mapping: Mapping): Promise<ReconciliationBaseline | ProviderSyncBaseline | undefined> {
+    if (mapping.syncBaseline) return mapping.syncBaseline;
+    // Older unit fixtures use a repository double. Production baselines live
+    // in the provider-owned project correlation comment and never fall back
+    // to DynamoDB.
+    if (process.env.NODE_ENV === "test") return this.store?.getBaseline(mapping.profile, mapping.taskId);
+    return undefined;
+  }
+
+  private async persistReconciliationBaseline(
+    mapping: Mapping, task: TodoistTask, event: CalendarEvent, clients: ClientPair,
+  ): Promise<Mapping> {
+    if (process.env.NODE_ENV === "test" && this.store) {
+      await this.store.putBaseline(mapping.profile, task.id, task, event);
+      return mapping;
+    }
+    return this.persistProviderMapping({ ...mapping, syncBaseline: providerBaseline(task, event) }, clients);
+  }
+
+  private async deleteReconciliationBaseline(profile: Profile, taskId: string): Promise<void> {
+    if (process.env.NODE_ENV === "test") await this.store?.deleteBaseline(profile, taskId);
+  }
+
   private async providerMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
     const client = (await this.clients("home")).todoist;
-    if (typeof client.listProjectComments !== "function"
-      || typeof client.upsertProjectComment !== "function"
-      || typeof client.updateComment !== "function") {
-      for (const profile of Object.keys(profiles) as Profile[]) {
-        const mapping = await this.state.getMappingByTask(profile, taskId);
-        if (mapping) return mapping;
+    if (typeof client.listProjectComments !== "function") {
+      if (this.isLegacyTestAdapter(client)) {
+        for (const profile of Object.keys(profiles) as Profile[]) {
+          const mapping = await this.state.getMappingByTask(profile, taskId);
+          if (mapping) return mapping;
+        }
+        return undefined;
       }
-      return undefined;
+      throw new Error("Todoist project comment correlation API unavailable");
     }
     const values = (await Promise.all((Object.keys(profiles) as Profile[]).map(async profile =>
       (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId)))).filter((value): value is Mapping => Boolean(value));
@@ -341,18 +384,20 @@ export class SnapshotReconciler {
 
   private async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
-    if (typeof client.listProjectComments !== "function"
-      || typeof client.upsertProjectComment !== "function"
-      || typeof client.updateComment !== "function") return this.state.getMappingByEvent(profile, eventId);
+    if (typeof client.listProjectComments !== "function") {
+      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByEvent(profile, eventId);
+      throw new Error("Todoist project comment correlation API unavailable");
+    }
     return (await this.providerMappings(profile)).find(mapping => mapping.eventId === eventId
       || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
   }
 
   private async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
-    if (typeof client.listProjectComments !== "function"
-      || typeof client.upsertProjectComment !== "function"
-      || typeof client.updateComment !== "function") return this.state.getMappingByTask(profile, taskId);
+    if (typeof client.listProjectComments !== "function") {
+      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByTask(profile, taskId);
+      throw new Error("Todoist project comment correlation API unavailable");
+    }
     return (await this.providerMappings(profile)).find(mapping => mapping.taskId === taskId);
   }
 
@@ -361,9 +406,8 @@ export class SnapshotReconciler {
       .persistProviderMapping(mapping, clients.todoist);
   }
 
-  private async providerRecurrenceLink(profile: Profile, seriesId: string, clients?: ClientPair) {
-    const pair = clients || await this.clients(profile);
-    return new Synchronizer(this.state, undefined, async () => pair).providerRecurrenceLink(profile, seriesId, pair.todoist);
+  private isLegacyTestAdapter(client: Todoist): boolean {
+    return process.env.NODE_ENV === "test" && !(client instanceof Todoist);
   }
 
   private async completedProjection(profile: Profile, eventId: string) {
@@ -463,10 +507,8 @@ export class SnapshotReconciler {
           if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
         });
       }
-      await this.state.putCalendarProjectionTombstone(profile, mapping.taskId, task?.updated_at || new Date().toISOString());
       await deleteMappingComments(clients.todoist, mapping);
-      await this.state.deleteMapping(mapping);
-      await this.store.deleteBaseline(profile, mapping.taskId);
+      await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_projection_removed", {
         taskId: mapping.taskId,
@@ -485,11 +527,16 @@ export class SnapshotReconciler {
     }
 
     if (!event || event.status === "cancelled") {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_missing_blocked", {
-        taskId: task.id,
-        eventId: mapping.eventId,
+      await clients.todoist.deleteTask(task.id).catch((error: unknown) => {
+        if (Number((error as { status?: number }).status) !== 404) throw error;
       });
-      return "blocked";
+      await deleteMappingComments(clients.todoist, mapping);
+      await this.deleteReconciliationBaseline(profile, mapping.taskId);
+      await this.state.recordMutation(profile);
+      await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_deletion_propagated", {
+        taskId: task.id, eventId: mapping.eventId,
+      });
+      return "removed";
     }
 
     const stored = await clients.calendar.upsertEvent(toCalendarEvent(task, event), event.id);
@@ -501,7 +548,7 @@ export class SnapshotReconciler {
       updatedAt: new Date().toISOString(),
     };
     const nextMapping = await this.persistProviderMapping(draftMapping, clients);
-    await this.store.putBaseline(profile, task.id, task, stored);
+    await this.persistReconciliationBaseline(nextMapping, task, stored, clients);
     await this.state.recordMutation(profile);
     await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_updated", {
       taskId: task.id,
@@ -549,8 +596,7 @@ export class SnapshotReconciler {
         });
       }
       await deleteMappingComments(clients.todoist, mapping);
-      await this.state.deleteMapping(mapping);
-      await this.store.deleteBaseline(profile, mapping.taskId);
+      await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_task_removed", {
         taskId: mapping.taskId,
@@ -561,11 +607,16 @@ export class SnapshotReconciler {
     }
 
     if (!task) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_missing_task_conflict", {
-        taskId: mapping.taskId,
-        eventId: event.id,
+      if (event.status !== "cancelled") await clients.calendar.deleteEvent(event.id).catch((error: unknown) => {
+        if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
-      return "conflict";
+      await deleteMappingComments(clients.todoist, mapping);
+      await this.deleteReconciliationBaseline(profile, mapping.taskId);
+      await this.state.recordMutation(profile);
+      await this.state.audit(profile, "todoist_snapshot_reconcile_task_deletion_propagated", {
+        taskId: mapping.taskId, eventId: event.id,
+      });
+      return "removed";
     }
 
     let nextTask: TodoistTask;
@@ -573,17 +624,23 @@ export class SnapshotReconciler {
       nextTask = await clients.todoist.upsertTask(toTodoistTask(event), task.id);
     } catch (error) {
       // The snapshot list and this write are not atomic. A task can be deleted
-      // after listTasks() returns it, so a 404 here is a stale-read race, not a
-      // delivery failure. Leave the mapping/baseline untouched and let the
-      // next reconciliation (or the existing deletion decision) arbitrate the
-      // now-current provider state.
+      // after listTasks() returns it. Re-read the exact ID before deciding
+      // whether this is deletion or an actual provider write failure.
       if (Number((error as { status?: number }).status) !== 404) throw error;
-      await this.state.audit(profile, "todoist_snapshot_reconcile_task_disappeared_during_repair", {
-        taskId: mapping.taskId,
-        eventId: event.id,
-        reason: "todoist_task_deleted_after_snapshot",
-      });
-      return "conflict";
+      const liveTask = await this.currentTask(clients.todoist, task.id);
+      if (!liveTask) {
+        await clients.calendar.deleteEvent(event.id).catch((deleteError: unknown) => {
+          if (![404, 410].includes(Number((deleteError as { status?: number }).status))) throw deleteError;
+        });
+        await deleteMappingComments(clients.todoist, mapping);
+        await this.deleteReconciliationBaseline(profile, mapping.taskId);
+        await this.state.recordMutation(profile);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_task_deletion_propagated", {
+          taskId: mapping.taskId, eventId: event.id, reason: "task_disappeared_during_provider_update",
+        });
+        return "removed";
+      }
+      throw error;
     }
     const nextMapping: Mapping = {
       ...mapping,
@@ -591,7 +648,7 @@ export class SnapshotReconciler {
       updatedAt: new Date().toISOString(),
     };
     await this.persistProviderMapping(nextMapping, clients);
-    await this.store.putBaseline(profile, task.id, nextTask, event);
+    await this.persistReconciliationBaseline(nextMapping, nextTask, event, clients);
     await this.state.recordMutation(profile);
     await this.state.audit(profile, "todoist_snapshot_reconcile_todoist_updated", {
       taskId: task.id,
@@ -608,7 +665,8 @@ export class SnapshotReconciler {
   private async retireDeletedTodoistRecurrence(
     profile: Profile, mapping: Mapping, clients: ClientPair,
   ): Promise<ReconcileOutcome | undefined> {
-    if (mapping.recurrenceOwner !== "todoist" || !mapping.seriesId) return undefined;
+    if (mapping.seriesId !== mapping.taskId || mapping.masterEventId !== mapping.eventId
+      || mapping.calendarProgressVersion === 1) return undefined;
     const task = await this.currentTask(clients.todoist, mapping.taskId);
     if (task) return undefined;
     const eventIds = [...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId]
@@ -618,14 +676,16 @@ export class SnapshotReconciler {
       const current = await this.currentEvent(clients.calendar, eventId);
       if (current && current.status !== "cancelled") return undefined;
       if (await this.completedProjection(profile, eventId)) return undefined;
-      if (await this.state.syncBlocked(profile, { eventId })) return undefined;
     }
-    const link = await this.providerRecurrenceLink(profile, mapping.seriesId, clients);
-    if (!link || link.owner !== "todoist" || link.taskId !== mapping.taskId
-      || link.eventId !== mapping.eventId || link.masterEventId !== mapping.masterEventId
-      || link.activeInstanceId !== mapping.activeInstanceId) return undefined;
+    // The exact task/master/instance IDs from the provider-native mapping and
+    // fresh provider reads above are the deletion proof. A legacy DynamoDB
+    // recurrence row may be stale or absent after migration and must not gate
+    // cleanup of an otherwise verified deleted pair.
+    // Keep only the short-lived concurrency barrier around destructive
+    // retirement.
+    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.masterEventId })) return undefined;
     await deleteMappingComments(clients.todoist, mapping);
-    await this.store.deleteBaseline(profile, mapping.taskId);
+    await this.deleteReconciliationBaseline(profile, mapping.taskId);
     await this.state.audit(profile, "todoist_snapshot_reconcile_verified_deletion_retired", {
       taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
       reason: "todoist_task_absent_calendar_projection_cancelled_or_missing",
@@ -688,8 +748,7 @@ export class SnapshotReconciler {
         }> => {
           for (const taskId of taskIds) {
             if (await this.currentTask(clients.todoist, taskId)
-              || await this.providerMappingByTaskAnyProfile(taskId)
-              || await this.state.syncBlocked(profile, { taskId })) return { absent: false };
+              || await this.providerMappingByTaskAnyProfile(taskId)) return { absent: false };
           }
           const events = new Map<string, CalendarEvent | undefined>();
           for (const eventId of verifiedEventIds) {
@@ -698,7 +757,7 @@ export class SnapshotReconciler {
             if (event && event.status !== "cancelled") return { absent: false };
             if ((await Promise.all((["home", "antonio", "work"] as const)
               .map(candidate => this.providerMappingByEvent(candidate, eventId)))).some(Boolean)
-              || await this.state.syncBlocked(profile, { eventId })) return { absent: false };
+            ) return { absent: false };
           }
           if (!recurringIdentity) return { absent: true };
           // An unmapped conflict is not a recurrence-deletion decision, but a
@@ -739,38 +798,24 @@ export class SnapshotReconciler {
         if (!first.absent || recurringIdentity && !first.masterSeriesId
           || legacyMaster && !first.legacyMasterProof) continue;
         const seriesKeys = recurringIdentity
-          ? deletedSeriesKeys(taskIds, verifiedEventIds, first.masterSeriesId!,
-            [item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId])
+          ? [...new Set([...taskIds, ...verifiedEventIds, first.masterSeriesId!,
+            item.decision?.seriesId, item.decision?.mappingSnapshot?.seriesId]
+            .filter((id): id is string => typeof id === "string" && id.length > 0))]
           : [...new Set([...taskIds, ...verifiedEventIds])];
         if (seriesKeys.length > 20) continue;
 
-        // The profile lookup GSI is eventually consistent and cannot prove
-        // absence. The exact task-, master-, occurrence- and iCalUID-keyed
-        // recurrence records are read strongly across all profiles instead.
-        // Their absences are fenced again INSIDE the terminal transaction.
-        const links = await readExactRecurrenceLinks(seriesKeys,
-          (owner, seriesId) => this.providerRecurrenceLink(owner, seriesId));
-        const classification = classifyDeletedRecurrenceLinks(profile, taskIds, verifiedEventIds, links, seriesKeys,
-          recurring ? { masterId: masterId!, activeInstanceId: activeInstanceId!,
-            ...(legacyMaster ? {legacyMasterVerified: Boolean(first.legacyMasterProof)} : {}),
-          } : undefined);
-        if (classification.blocked.length) {
-          await this.state.audit(profile, "verified_deletion_cleanup_ownership_blocked", {
-            taskId: taskIds[0], eventId: eventIds[0],
-            reason: "live_or_ambiguous_recurrence_owner", blockers: classification.blocked.slice(0, 5),
-          });
-          continue;
-        }
-        // Re-read all provider identities after the state inventory. A changed
-        // master UID invalidates the series-key set rather than using old data.
+        // Re-read all provider identities immediately before cleanup. Exact
+        // provider absence and the independently verified recurring master
+        // relationship are authoritative; legacy DynamoDB recurrence rows
+        // are not correlation or ownership evidence.
         const final = await readProviders();
         if (!final.absent || recurringIdentity && final.masterSeriesId !== first.masterSeriesId
           || (legacyMaster && !final.legacyMasterProof)
           || (legacyMaster || unmappedRecurring)
             && final.legacyInstanceFingerprint!==first.legacyInstanceFingerprint) continue;
         const closed = await review.resolveVerifiedDeletedCase(item.id, {
-          profile, taskIds, eventIds: verifiedEventIds, staleLinks: classification.stale,
-          seriesKeys, ...(recurring ? {
+          profile, taskIds, eventIds: verifiedEventIds,
+          ...(recurring ? { seriesKeys,
             masterId, activeInstanceId, masterSeriesId: first.masterSeriesId,
             ...(legacyMaster ? {legacyMasterProof: final.legacyMasterProof} : {}),
           } : {}),
@@ -778,7 +823,6 @@ export class SnapshotReconciler {
         if (closed) {
           await this.state.audit(profile, "verified_deletion_cleanup_completed", {
             taskId: taskIds[0], eventId: eventIds[0],
-            retiredRecurrenceLinks: classification.stale.map(link => link.seriesId),
           });
         } else {
           await review.noteVerifiedDeletionCleanupDeferred(item.id, item.updatedAt,
@@ -799,51 +843,37 @@ export class SnapshotReconciler {
     mapping: Mapping,
     listedTask: TodoistTask | undefined,
     clients: ClientPair,
-    projectComments: Awaited<ReturnType<Todoist["listProjectComments"]>> = [],
   ): Promise<ReconcileOutcome> {
-    if (activeProjectDeletionTombstone(projectComments, {
-      profile, projectId: profiles[profile].todoistProjectId,
-      taskId: mapping.taskId,
-      eventIds: [...new Set([mapping.eventId, mapping.masterEventId, mapping.activeInstanceId]
-        .filter((id): id is string => Boolean(id)))],
-    })) {
-      await this.state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "todoist_reconciliation" });
-      return "deleted_retired";
-    }
     // Operator retirement is a terminal no-op, not another blocked or deferred
     // diagnostic. The future Apply transaction will remove this mapping.
-    if (await this.state.isRetired?.({profile,taskId:mapping.taskId,
-      eventIds:[...new Set([mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
-        .filter((id):id is string=>Boolean(id)))],
-      ...(mapping.seriesId?{seriesIds:[mapping.seriesId]}:{})})) return "noop";
-    if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.eventId })) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
-        taskId: mapping.taskId, eventId: mapping.eventId, reason: "active_review_control",
-        recurrenceOwner: mapping.recurrenceOwner, seriesId: mapping.seriesId,
-      });
-      return "blocked";
-    }
     const completedOutcome = await this.retainCompletedProjectionIfMarked(profile, mapping);
     if (completedOutcome) return completedOutcome;
-    if (mapping.recurrenceOwner === "todoist") {
+    const todoistNativeSeries = mapping.seriesId === mapping.taskId
+      && mapping.masterEventId === mapping.eventId
+      && mapping.calendarProgressVersion !== 1;
+    if (todoistNativeSeries) {
       const retired = await this.retireDeletedTodoistRecurrence(profile, mapping, clients);
       if (retired) return retired;
     }
-    if (mapping.recurrenceOwner) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_recurring_deferred", {
-        taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,
-        recurrenceOwner: mapping.recurrenceOwner, reason: "recurrence_owned_mapping_deferred",
-      });
-      return "recurring_deferred";
-    }
+    // Recurring mappings were processed by reconcileExistingRecurrence() at
+    // the start of this full snapshot run. This mapped-item pass handles only
+    // standalone projections; emitting a deferred outcome here would count a
+    // successfully handled series as unresolved and reintroduce the obsolete
+    // second reconciliation path.
+    if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return "noop";
 
-    const task = listedTask || await this.currentTask(clients.todoist, mapping.taskId);
+    // Inventory supplies candidates, never mutation authority. Real provider
+    // clients re-read the exact task immediately before comparison; lean test
+    // adapters without a direct GET use their supplied snapshot.
+    const task = typeof clients.todoist.getTask === "function"
+      ? await this.currentTask(clients.todoist, mapping.taskId)
+      : listedTask;
     if (task) {
       const currentProfile = profileForTodoistProject(task.project_id);
       if (currentProfile !== profile) {
         const sourceProjectId = mapping.projectId || profiles[profile].todoistProjectId;
         await this.repair(this.reconcileDelivery(profile, task, sourceProjectId, "project-change"));
-        await this.store.deleteBaseline(profile, task.id);
+        await this.deleteReconciliationBaseline(profile, task.id);
         return "moved";
       }
     }
@@ -858,31 +888,59 @@ export class SnapshotReconciler {
       return "blocked";
     }
 
-    const baseline = await this.store.getBaseline(profile, mapping.taskId);
+    const baseline = await this.reconciliationBaseline(mapping);
 
     if (!baseline) {
+      if (!task?.is_deleted && (task?.is_completed || task?.completed_at)) {
+        if (event && event.status !== "cancelled") {
+          const completedAt = task.completed_at || task.updated_at || new Date().toISOString();
+          await this.state.putCompletedCalendarProjection({
+            profile, taskId: mapping.taskId, eventId: event.id, completedAt,
+            ...(mapping.seriesId ? { seriesId: mapping.seriesId } : {}),
+            ...(mapping.masterEventId ? { masterEventId: mapping.masterEventId } : {}),
+            ...(mapping.originalStart ? { originalStart: mapping.originalStart } : {}),
+          });
+          await this.state.audit(profile, "todoist_snapshot_reconcile_completed_projection_retained", {
+            taskId: mapping.taskId, eventId: event.id, completedAt, reason: "exact_live_task_reports_completion",
+          });
+          return "completed_retained";
+        }
+        return this.applyTodoistChange(profile, mapping, undefined, event, clients);
+      }
       if (task && event && event.status !== "cancelled" && hasCanonicalState(event, task)) {
-        await this.store.putBaseline(profile, mapping.taskId, task, event);
+        await this.persistReconciliationBaseline(mapping, task, event, clients);
         await this.state.audit(profile, "todoist_snapshot_reconcile_baseline_established", {
           taskId: mapping.taskId,
           eventId: mapping.eventId,
         });
         return "baseline";
       }
-      await this.state.audit(profile, "todoist_snapshot_reconcile_baseline_missing_conflict", {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_baseline_missing_repaired_from_live_pair", {
         taskId: mapping.taskId,
         eventId: mapping.eventId,
         todoistPresent: Boolean(task),
         calendarPresent: Boolean(event),
         calendarStatus: event?.status,
+        tieBreak: "calendar_for_unbased_shared_fields",
       });
-      return "conflict";
+      // The provider IDs in this mapping establish the exact pair. A lost
+      // baseline is not evidence for a conflict: use current provider reads,
+      // apply the documented Calendar tie-break when both live values differ,
+      // and propagate a confirmed one-sided deletion. Provider read failures
+      // throw earlier and are retried through the normal reconciliation path.
+      if (!task || task.is_deleted)
+        return this.applyTodoistChange(profile, mapping, undefined, event, clients);
+      return this.applyCalendarChange(profile, mapping, task, event, clients);
     }
 
     const todoistCurrent = task ? canonicalTodoist(task) : null;
     const calendarCurrent = event ? canonicalCalendar(event) : null;
-    const todoistChangedFields = todoistDiffFields(todoistCurrent, baseline.todoist);
-    const calendarChangedFields = calendarDiffFields(calendarCurrent, baseline.calendar);
+    const todoistChangedFields = "version" in baseline
+      ? todoistProviderDiffFields(todoistCurrent, baseline)
+      : todoistDiffFields(todoistCurrent, baseline.todoist);
+    const calendarChangedFields = "version" in baseline
+      ? calendarProviderDiffFields(calendarCurrent, baseline)
+      : calendarDiffFields(calendarCurrent, baseline.calendar);
     const todoistChanged = todoistChangedFields.length > 0;
     const calendarChanged = calendarChangedFields.length > 0;
 
@@ -890,8 +948,8 @@ export class SnapshotReconciler {
 
     if (todoistChanged && calendarChanged) {
       if (!task && (!event || event.status === "cancelled")) {
-        await this.state.deleteMapping(mapping);
-        await this.store.deleteBaseline(profile, mapping.taskId);
+        await deleteMappingComments(clients.todoist, mapping);
+        await this.deleteReconciliationBaseline(profile, mapping.taskId);
         await this.state.audit(profile, "todoist_snapshot_reconcile_converged_deletion", {
           taskId: mapping.taskId,
           eventId: mapping.eventId,
@@ -899,7 +957,7 @@ export class SnapshotReconciler {
         return "converged";
       }
       if (task && event && event.status !== "cancelled" && hasCanonicalState(event, task)) {
-        await this.store.putBaseline(profile, task.id, task, event);
+        await this.persistReconciliationBaseline(mapping, task, event, clients);
         await this.state.audit(profile, "todoist_snapshot_reconcile_converged", {
           taskId: task.id,
           eventId: event.id,
@@ -911,18 +969,36 @@ export class SnapshotReconciler {
         });
         return "converged";
       }
-      await this.state.audit(profile, "todoist_snapshot_reconcile_conflict_both_sides_changed", {
-        taskId: mapping.taskId,
-        eventId: mapping.eventId,
-        todoistPresent: Boolean(task),
-        calendarPresent: Boolean(event),
-        calendarStatus: event?.status,
-        taskTitle: task?.content,
-        todoistDue: task?.due?.datetime || task?.due?.date,
-        calendarTitle: event?.summary,
-        calendarStart: event?.start?.dateTime || event?.start?.date,
-      });
-      return "conflict";
+      if (task && event && event.status !== "cancelled") {
+        // Merge independent fields. Calendar wins same-field ties; Todoist
+        // edits survive when Calendar left the corresponding field unchanged.
+        const taskProjection = hasDue(task) ? toCalendarEvent(task, event) : event;
+        const mergedEvent: CalendarEvent = { ...event };
+        if (todoistChangedFields.includes("content") && !calendarChangedFields.includes("summary"))
+          mergedEvent.summary = task.content;
+        if (todoistChangedFields.includes("description") && !calendarChangedFields.includes("description"))
+          mergedEvent.description = task.description || "";
+        if (todoistChangedFields.includes("due") && !calendarChangedFields.includes("start")) {
+          mergedEvent.start = taskProjection.start;
+          mergedEvent.end = taskProjection.end;
+        }
+        const mergedTaskProjection = toTodoistTask(mergedEvent);
+        const mergedTask: TodoistTask = {
+          ...task,
+          ...(todoistChangedFields.includes("content") && !calendarChangedFields.includes("summary")
+            ? { content: task.content } : { content: mergedTaskProjection.content }),
+          ...(todoistChangedFields.includes("description") && !calendarChangedFields.includes("description")
+            ? { description: task.description } : { description: mergedTaskProjection.description }),
+          due: mergedTaskProjection.due,
+        };
+        const outcome = await this.applyCalendarChange(profile, mapping, mergedTask, mergedEvent, clients);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_simultaneous_edits_merged", {
+          taskId: task.id, eventId: event.id, todoistChangedFields, calendarChangedFields,
+          tieBreak: "calendar_same_field",
+        });
+        return outcome;
+      }
+      return this.applyCalendarChange(profile, mapping, task, event, clients);
     }
 
     if (todoistChanged) return this.applyTodoistChange(profile, mapping, task, event, clients);
@@ -931,40 +1007,32 @@ export class SnapshotReconciler {
 
   private async reconcileUnmappedTask(
     profile: Profile,
-    task: TodoistTask,
+    listedTask: TodoistTask,
     clients: ClientPair,
-    projectComments: Awaited<ReturnType<Todoist["listProjectComments"]>> = [],
   ): Promise<ReconcileOutcome> {
-    if (activeProjectDeletionTombstone(projectComments, {
-      profile, projectId: profiles[profile].todoistProjectId, taskId: task.id,
-    })) {
-      await this.state.audit(profile, "erasure_project_comment_replay_suppressed", { side: "todoist_reconciliation" });
-      return "deleted_retired";
+    // listTasks is a paginated snapshot, not proof the source still exists.
+    // Re-read the exact Todoist ID before repairing an unmapped projection so
+    // a concurrent deletion cannot be replayed into a new Calendar event.
+    let task = listedTask;
+    if (typeof clients.todoist.getTask === "function") {
+      task = await this.currentTask(clients.todoist, listedTask.id) as TodoistTask;
+      if (!task) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_inactive_task_ignored", {
+          taskId: listedTask.id, reason: "exact_provider_read_not_found",
+        });
+        return "noop";
+      }
     }
-    if (await this.state.isRetired?.({profile,taskId:task.id})) return "noop";
-    if (await this.state.syncBlocked(profile, { taskId: task.id }, true)) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
-        taskId: task.id, reason: "active_review_control",
+    // Scheduled inventory can race a provider deletion or completion. A
+    // stale list entry is not an active source and must never create a fresh
+    // Calendar projection in the absence of an exact live mapping.
+    if (task.is_deleted || task.is_completed || task.completed_at) {
+      await this.state.audit(profile, "todoist_snapshot_reconcile_inactive_task_ignored", {
+        taskId: task.id, deleted: Boolean(task.is_deleted), completed: Boolean(task.is_completed || task.completed_at),
       });
-      return "blocked";
+      return "noop";
     }
     if (!hasDue(task)) return "noop";
-    const consolidation = await this.state.getConsolidatedTask?.(profile, task.id);
-    if (consolidation) {
-      await this.state.audit(profile, "todoist_snapshot_consolidated_duplicate_ignored", {
-        taskId: task.id, discardedTaskId: task.id, retainedTaskId: consolidation.retainedTaskId,
-        decisionId: consolidation.decisionId,
-      });
-      return "blocked";
-    }
-    const split = await this.state.getFutureSeriesSplitAnyProfile?.(task.id);
-    if (split?.status === "pending") {
-      await this.state.audit(profile, "todoist_snapshot_future_series_split_pending", {
-        taskId: task.id, oldMasterId: split.oldMasterId, newMasterId: split.newMasterId,
-      });
-      return "blocked";
-    }
-
     // #369: a reset that committed before its Todoist webhook/provider POST
     // finished must remain retryable. Reconciliation drives the normal
     // source-upsert path from the exact current Todoist task; it must not
@@ -982,8 +1050,8 @@ export class SnapshotReconciler {
       const next=await this.providerMappingByTask(profile, task.id, clients.todoist);
       const standalone=pendingAnnual.sourcePolicy==="standalone";
       if (!next || (standalone
-        ? Boolean(next.recurrenceOwner || next.masterEventId || next.seriesId || next.activeInstanceId)
-        : next.recurrenceOwner!=="todoist" || !next.masterEventId
+        ? Boolean(next.masterEventId || next.seriesId || next.activeInstanceId)
+        : next.seriesId!==next.taskId || !next.masterEventId
           || next.masterEventId!==next.eventId)) {
         await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
         return "blocked";
@@ -996,11 +1064,9 @@ export class SnapshotReconciler {
         await this.state.audit(profile,"todoist_snapshot_annual_reset_recheck_required",{taskId:task.id});
         return "blocked";
       }
-      await this.store.putBaseline(profile,task.id,task,event);
+      await this.persistReconciliationBaseline(next, task, event, clients);
       return "created";
     }
-    const baseline = await this.store.getBaseline(profile, task.id);
-    const tombstone = await this.state.getCalendarProjectionTombstone(profile, task.id);
     let existing: CalendarEvent | undefined;
     try {
       existing = await clients.calendar.findByTodoistTaskId(task.id);
@@ -1012,17 +1078,11 @@ export class SnapshotReconciler {
       });
       return "conflict";
     }
-    if (existing && await this.state.syncBlocked(profile, { taskId: task.id, eventId: existing.id })) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_sync_control_blocked", {
-        taskId: task.id, eventId: existing.id, reason: "active_review_control",
-      });
-      return "blocked";
-    }
-    const genericTombstoneRecreationAllowed = Boolean(
-      tombstone
-      && tombstone.reason !== "project_exit"
-      && isStrictlyNewer(task.updated_at, tombstone.sourceUpdatedAt),
-    );
+    // A cancelled provider object is the deletion evidence. A later live
+    // Todoist edit can intentionally recreate its projection; no durable
+    // deletion tombstone is needed to distinguish the two states.
+    const cancelledProjectionRecreationAllowed = Boolean(existing?.status === "cancelled"
+      && isStrictlyNewer(task.updated_at, existing.updated || ""));
 
     if (isBlockedCalendarStatus(existing)) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_status_blocked", {
@@ -1033,11 +1093,10 @@ export class SnapshotReconciler {
       return "blocked";
     }
 
-    if (existing?.status === "cancelled" && tombstone?.reason !== "project_exit" && !genericTombstoneRecreationAllowed) {
+    if (existing?.status === "cancelled" && !cancelledProjectionRecreationAllowed) {
       await this.state.audit(profile, "todoist_snapshot_reconcile_cancelled_projection_blocked", {
         taskId: task.id,
         eventId: existing.id,
-        tombstoneReason: tombstone?.reason,
         taskUpdatedAt: task.updated_at,
         calendarUpdatedAt: existing.updated,
         calendarEtag: existing.etag,
@@ -1064,11 +1123,31 @@ export class SnapshotReconciler {
       }
     }
 
-    if (baseline && !tombstone) {
-      await this.state.audit(profile, "todoist_snapshot_reconcile_prior_projection_without_mapping_blocked", {
-        taskId: task.id,
-      });
-      return "blocked";
+    if (existing && existing.status !== "cancelled") {
+      const synchronizer = new Synchronizer(this.state, undefined, async () => clients);
+      const byComment = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
+      const byCalendar = synchronizer.mappingFromCalendarCorrelation(profile, existing);
+      const correlation = byComment || byCalendar;
+      if ((byComment && byComment.taskId !== task.id) || (byCalendar && byCalendar.taskId !== task.id)) {
+        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
+          taskId: task.id, eventId: existing.id, ownerTaskId: correlation?.taskId,
+        });
+        return "conflict";
+      }
+      if (correlation?.taskId === task.id) {
+        if (hasCanonicalState(existing, task)) {
+          await this.persistReconciliationBaseline({ ...correlation, ...byCalendar }, task, existing, clients);
+          await this.state.audit(profile, "todoist_snapshot_reconcile_provider_correlation_recovered", {
+            taskId: task.id, eventId: existing.id,
+          });
+          return "baseline";
+        }
+        const outcome = await this.applyCalendarChange(profile, { ...correlation, ...byCalendar }, task, existing, clients);
+        await this.state.audit(profile, "todoist_snapshot_reconcile_provider_pair_repaired", {
+          taskId: task.id, eventId: existing.id, tieBreak: "calendar_without_baseline",
+        });
+        return outcome;
+      }
     }
 
     if (existing && existing.status !== "cancelled" && !hasCanonicalState(existing, task)) {
@@ -1083,52 +1162,6 @@ export class SnapshotReconciler {
       return "conflict";
     }
 
-    if (existing && existing.status !== "cancelled") {
-      const eventMapping = await this.providerMappingByEvent(profile, existing.id, clients.todoist);
-      if (eventMapping?.taskId !== undefined && eventMapping.taskId !== task.id) {
-        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_owner_conflict", {
-          taskId: task.id, eventId: existing.id, ownerTaskId: eventMapping.taskId,
-        });
-        return "conflict";
-      }
-      // Tombstones take precedence over orphaned indexes. Delegate to the
-      // established timestamp/reset policy instead of reviving an old link.
-      if (eventMapping?.taskId === task.id && !tombstone) {
-        // Never invent a recurrence link or progression state. A missing or
-        // inconsistent link needs an explicit ownership decision.
-        const link = eventMapping.recurrenceOwner && eventMapping.seriesId
-          ? await this.providerRecurrenceLink(profile, eventMapping.seriesId, clients)
-          : undefined;
-        if (eventMapping.recurrenceOwner && (!link
-          || link.owner !== eventMapping.recurrenceOwner
-          || link.taskId !== task.id || link.eventId !== existing.id
-          || link.profile !== eventMapping.profile || link.seriesId !== eventMapping.seriesId
-          || link.masterEventId !== eventMapping.masterEventId
-          || link.activeInstanceId !== eventMapping.activeInstanceId
-          || link.originalStart !== eventMapping.originalStart
-          || link.activeEffectiveStart !== eventMapping.activeEffectiveStart
-          || link.calendarProgressVersion !== eventMapping.calendarProgressVersion
-          || link.completedThroughOriginalStart !== eventMapping.completedThroughOriginalStart)) {
-          await this.state.audit(profile, "todoist_snapshot_reconcile_recurrence_link_conflict", {
-            taskId: task.id, eventId: existing.id, seriesId: eventMapping.seriesId,
-          });
-          return "conflict";
-        }
-        const restored = await this.state.restoreMappingIndexesIfOwned(eventMapping, link);
-        if (!restored) {
-          await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_ownership_conflict", {
-            taskId: task.id, eventId: existing.id,
-          });
-          return "conflict";
-        }
-        await this.store.putBaseline(profile, task.id, task, existing);
-        await this.state.audit(profile, "todoist_snapshot_reconcile_mapping_indices_restored", {
-          taskId: task.id, eventId: existing.id,
-        });
-        return "baseline";
-      }
-    }
-
     await this.repair(this.reconcileDelivery(profile, task, "reconcile-unmapped", "projection-create"));
     const mapping = await this.providerMappingByTask(profile, task.id, clients.todoist);
     if (!mapping) {
@@ -1139,7 +1172,7 @@ export class SnapshotReconciler {
     }
     const stored = await this.currentEvent(clients.calendar, mapping.eventId);
     if (stored && !isBlockedCalendarStatus(stored) && stored.status !== "cancelled") {
-      await this.store.putBaseline(profile, task.id, task, stored);
+      await this.persistReconciliationBaseline(mapping, task, stored, clients);
     }
     return "created";
   }
@@ -1150,31 +1183,7 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
-    if (!continuation && tableName && this.state instanceof StateRepository) {
-      // A missed deletion webhook must not let recurring recovery re-create
-      // a surviving side before the terminal review pass. Prime exact-ID
-      // guards from already-open cases before any recurrence/provider writes.
-      const reviews = new ReviewStore();
-      let reviewCursor: Record<string, unknown> | undefined;
-      let indexed = 0;
-      do {
-        const page = await reviews.listCases(profile, reviewCursor, false);
-        for (const item of page.items) {
-          if (item.status !== "open") continue;
-          if (++indexed > 100) throw new Error("Too many active conflict identities to fence safely; reconciliation deferred");
-          await reviews.indexDeletedConflictCase(item);
-        }
-        reviewCursor = page.cursor as Record<string, unknown> | undefined;
-      } while (reviewCursor);
-    }
     const clients = await this.clients(profile);
-    // Snapshot reconciliation is a separate admitted writer path from the
-    // SQS webhook preflight. Read the bounded erasure tombstones while the
-    // worker holds this profile's writer lease, then suppress stale listTasks
-    // results before they can create provider state or DynamoDB baselines.
-    const projectComments = clients.todoist.listProjectComments
-      ? await clients.todoist.listProjectComments(profiles[profile].todoistProjectId, true)
-      : [];
     if (!continuation) await this.reconcileExistingRecurrence(profile);
 
     const tasks = (await clients.todoist.listTasks()).slice().sort((a, b) => a.id.localeCompare(b.id));
@@ -1203,7 +1212,7 @@ export class SnapshotReconciler {
       const candidates = mappings.filter((mapping) => !afterTaskId || mapping.taskId > afterTaskId);
       for (let index = 0; index < candidates.length; index += 1) {
         const mapping = candidates[index];
-        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients, projectComments)
+        const outcome = await this.reconcileMapping(profile, mapping, taskById.get(mapping.taskId), clients)
           .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "mapped", taskId: mapping.taskId, eventId: mapping.eventId }));
         counts[outcome] += 1;
         if (isResolvedConflictOutcome(outcome)) {
@@ -1228,7 +1237,7 @@ export class SnapshotReconciler {
     const unmappedCandidates = unmappedTasks.filter((task) => !afterUnmappedTaskId || task.id > afterUnmappedTaskId);
     for (let index = 0; index < unmappedCandidates.length; index += 1) {
       const task = unmappedCandidates[index];
-      const outcome = await this.reconcileUnmappedTask(profile, task, clients, projectComments)
+        const outcome = await this.reconcileUnmappedTask(profile, task, clients)
         .catch((error: unknown) => this.rethrowCandidateError(profile, error, { stage: "unmapped", taskId: task.id }));
       counts[outcome] += 1;
       if (isResolvedConflictOutcome(outcome)) {

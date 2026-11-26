@@ -3,8 +3,12 @@ import test from "node:test";
 
 import { profiles } from "../dist/config.js";
 import { SnapshotReconciler } from "../dist/reconciliation.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 
 const HOME = profiles.home.todoistProjectId;
+const commentsFor = mappings => mappings.map((mapping, index) => ({
+  id: `mapping-${index}`, project_id: HOME, content: serializeMappingComment(mapping, HOME),
+}));
 
 function task(id) {
   return {
@@ -67,7 +71,6 @@ test("snapshot reconciliation resumes after the last processed task id and does 
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
   const store = {
-    async listMappings() { return [...mappings].reverse(); },
     async getBaseline(_profile, taskId) { return baselines.get(taskId); },
     async putBaseline() {},
     async deleteBaseline() {},
@@ -76,6 +79,7 @@ test("snapshot reconciliation resumes after the last processed task id and does 
     todoist: {
       async listTasks() { return [...tasks].reverse(); },
       async getTask(taskId) { return tasks.find((candidate) => candidate.id === taskId); },
+      async listProjectComments() { return commentsFor([...mappings].reverse()); },
     },
     calendar: {
       async getEvent(eventId) {
@@ -127,7 +131,6 @@ test("mapped recurring occurrence 400 fails closed with the exact item and permi
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
   const store = {
-    async listMappings() { return mappings; },
     async getBaseline(_profile, taskId) {
       const mapping = mappings.find((m) => m.taskId === taskId);
       return baseline(task(taskId), { ...event(taskId), id: mapping.eventId });
@@ -137,6 +140,7 @@ test("mapped recurring occurrence 400 fails closed with the exact item and permi
     todoist: {
       async listTasks() { return tasks; },
       async deleteTask() { deletedTasks++; },
+      async listProjectComments() { return commentsFor(mappings); },
     },
     calendar: {
       async getEvent(id) {

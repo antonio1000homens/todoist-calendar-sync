@@ -3,6 +3,7 @@ import test from "node:test";
 import { applyApprovedFutureSeriesSplit } from "../dist/future-split-execution.js";
 import { planFutureSeriesSplit } from "../dist/recurrence-split.js";
 import { profiles } from "../dist/config.js";
+import { parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 
 const original = () => ({
   id: "old-may-master", etag: '"old-v1"', status: "confirmed",
@@ -37,6 +38,7 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
   if (expiredUntil) master.recurrence = [`RRULE:FREQ=YEARLY;UNTIL=${expiredUntil}`];
   const events = new Map([[master.id, master]]);
   const calls = [];
+  const projectComments = [];
   let created = 0;
   let failedOnce = false;
   const state = {
@@ -149,14 +151,26 @@ function fixture({ duplicateTask = false, duplicateCalendar = false, modifiedFut
     },
   };
   const todoist = {
-    async listProjectComments() { return []; },
+    async listProjectComments(projectId) { return structuredClone(projectComments.filter(item=>item.project_id===projectId)); },
+    async upsertProjectComment(projectId,content,existingId) {
+      const id=existingId||`project-comment-${projectComments.length+1}`;
+      const comment={id,project_id:projectId,content};
+      const index=projectComments.findIndex(item=>item.id===id);
+      if(index>=0)projectComments[index]=comment;else projectComments.push(comment);
+      calls.push("project-comment");return structuredClone(comment);
+    },
+    async updateComment(id,content) {
+      const comment=projectComments.find(item=>item.id===id);
+      if(!comment)throw Object.assign(new Error("Not found"),{status:404});
+      comment.content=content;calls.push("project-comment-update");return structuredClone(comment);
+    },
     async listTaskComments() { return []; },
     async listTasks() { return duplicateTask ? [task, { ...task, id: "other-smoke-task" }] : [task]; },
     async getTask() { return task; },
     async findComment() { return undefined; },
     async upsertComment() { calls.push("project-comment"); return { id: "new-project-comment" }; },
   };
-  return { state, pair: { calendar, todoist }, events, task, calls, get created() { return created; } };
+  return { state, pair: { calendar, todoist }, events, task, calls, projectComments, get created() { return created; } };
 }
 
 test("future-only approved split retains historical master and creates biennial July series", async () => {
@@ -165,7 +179,7 @@ test("future-only approved split retains historical master and creates biennial 
     fixtureValue.events.get("old-may-master"), fixtureValue.pair, fixtureValue.state, { now: today });
   assert.equal(plan.previousOccurrence, "2026-05-03");
   assert.equal(plan.newStart, "2027-07-01");
-  assert.equal(mapping.recurrenceOwner, "todoist");
+  assert.equal(mapping.recurrenceOwner, undefined);
   assert.equal(mapping.masterEventId, plan.newMasterId);
   assert.equal(mapping.activeInstanceId, plan.newMasterId + "_20270701");
   assert.equal(fixtureValue.events.get("old-may-master").recurrence[0], plan.truncatedRule);
@@ -174,13 +188,13 @@ test("future-only approved split retains historical master and creates biennial 
   assert.equal(fixtureValue.events.get(plan.newMasterId).extendedProperties.shared.syncHistoryMasterId, plan.oldMasterId);
   assert.equal(fixtureValue.created, 1);
   assert.deepEqual(fixtureValue.calls.filter((x) => typeof x === "string"), [
-    "split-pending", "cap-old", "create-future", "project-comment", "atomic-mapping", "split-completed",
+    "split-pending", "cap-old", "create-future", "project-comment", "split-completed",
   ]);
   const again = await applyApprovedFutureSeriesSplit("antonio", fixtureValue.task,
     fixtureValue.events.get("old-may-master"), fixtureValue.pair, fixtureValue.state, { now: today });
   assert.equal(again.resumed, true);
   assert.equal(fixtureValue.created, 1);
-  assert.equal(fixtureValue.calls.filter((x) => x === "atomic-mapping").length, 1);
+  assert.equal(fixtureValue.projectComments.map(item=>parseMappingComment(item)).filter(Boolean).length,1);
 });
 
 test("a partial failure after capping history resumes without duplicating future occurrences", async () => {
@@ -195,7 +209,7 @@ test("a partial failure after capping history resumes without duplicating future
     f.events.get("old-may-master"), f.pair, f.state, { now: today });
   assert.equal(resumed.resumed, true);
   assert.equal(f.created, 1);
-  assert.equal(f.state.owner.eventId, resumed.plan.newMasterId);
+  assert.equal(parseMappingComment(f.projectComments[0]).payload.eventId, resumed.plan.newMasterId);
   assert.equal(f.state.split.status, "completed");
 });
 
@@ -235,11 +249,9 @@ test("changed future Calendar exception blocks all writes", async () => {
   assert.deepEqual(f.calls, []);
 });
 
-test("competing task, calendar master, ownership or tombstone each blocks before writes", async () => {
+test("competing task or Calendar master blocks before writes", async () => {
   for (const options of [
     { duplicateTask: true }, { duplicateCalendar: true },
-    { conflictingOwner: { taskId: "smoke-task", eventId: "other" } },
-    { tombstone: { sourceUpdatedAt: "2026-10-01" } },
   ]) {
     const f = fixture(options);
     await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
@@ -247,6 +259,15 @@ test("competing task, calendar master, ownership or tombstone each blocks before
     assert.deepEqual(f.calls, []);
     assert.equal(f.created, 0);
   }
+});
+
+test("obsolete projection tombstones do not gate a provider-verified series split", async () => {
+  const f = fixture({ tombstone: { sourceUpdatedAt: "2026-10-01" } });
+  const { mapping } = await applyApprovedFutureSeriesSplit("antonio", f.task,
+    f.events.get("old-may-master"), f.pair, f.state, { now: today });
+  assert.equal(mapping.seriesId, f.task.id);
+  assert.equal(mapping.recurrenceOwner, undefined);
+  assert.equal(f.created, 1);
 });
 
 test("an explicit exception in a distant future year blocks the split before Calendar mutations", async () => {
@@ -277,17 +298,17 @@ test("future instance title-only and description-only changes are never truncate
 
 test("Calendar instance owned by another mapping or completed history blocks before cap", async () => {
   const f = fixture();
-  f.state.assertHistoricalSeriesUnowned = async () => {
-    throw new Error("Another Calendar master/instance mapping still owns historical occurrences");
-  };
+  f.projectComments.push({id:"history-owner",project_id:profiles.antonio.todoistProjectId,
+    content:serializeMappingComment({profile:"antonio",taskId:"other-task",eventId:"old-may-master_20260503",
+      updatedAt:"2026-10-19T12:00:00Z"},profiles.antonio.todoistProjectId)});
   await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
-    f.events.get("old-may-master"), f.pair, f.state, { now: today }), /instance mapping/);
+    f.events.get("old-may-master"), f.pair, f.state, { now: today }), /provider mapping comment/);
   assert.deepEqual(f.calls, []);
 });
 
-test("project mapping comments with competing owner, master or completion block first write", async () => {
+test("project mapping comments with competing series identity, master or completion block first write", async () => {
   for (const override of [
-    { recurrenceOwner: "calendar" },
+    { seriesId: "another-series" },
     { masterEventId: "different-master" },
     { completedThroughOriginalStart: "2026-05-03" },
   ]) {
@@ -302,7 +323,7 @@ test("project mapping comments with competing owner, master or completion block 
       id: "comment-1", content: "todoist-calendar-sync:mapping:v1\n" + JSON.stringify(payload),
     }];
     await assert.rejects(applyApprovedFutureSeriesSplit("antonio", f.task,
-      f.events.get("old-may-master"), f.pair, f.state, { now: today }), /project mapping comments conflict/);
+      f.events.get("old-may-master"), f.pair, f.state, { now: today }), /project mapping comments conflict|old-series owner/);
     assert.deepEqual(f.calls, []);
   }
 });
@@ -368,7 +389,7 @@ test("approved repair leaves an expired-before-anchor Calendar RRULE unchanged a
   assert.equal(f.events.get(old.id).recurrence[0], "RRULE:FREQ=YEARLY;UNTIL=20231231");
   assert.equal(f.events.get(old.id).start.date, "2025-05-03");
   assert.equal(f.events.get(result.plan.newMasterId).start.date, "2027-07-01");
-  assert.equal(f.state.owner.masterEventId, result.plan.newMasterId);
+  assert.equal(parseMappingComment(f.projectComments[0]).payload.masterEventId, result.plan.newMasterId);
   assert.ok(f.calls.some(value => Array.isArray(value) && value[0] === "manual_future_series_split_applied"));
   const retry = await applyApprovedFutureSeriesSplit("antonio", f.task, f.events.get(old.id),
     f.pair, f.state, { now: today, approvedPlan: approved, approvedEtag: old.etag });

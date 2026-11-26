@@ -3,6 +3,7 @@ import test from "node:test";
 import { profiles, profileForTodoistProject, rememberTodoistTokenProject } from "../dist/config.js";
 import { Todoist, AmbiguousCalendarLinkError } from "../dist/providers.js";
 import { ProjectAwareSynchronizer, todoistProjectTransition } from "../dist/project-sync.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 
 const HOME = profiles.home.todoistProjectId;
 const WORK = profiles.work.todoistProjectId;
@@ -118,7 +119,7 @@ class FakeState {
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
 }
 
-function fakeClients(currentTask, calendars) {
+function fakeClients(currentTask, calendars, projectComments) {
   return async (profile) => ({
     calendar: {
       async getEvent(id) {
@@ -173,6 +174,9 @@ function fakeClients(currentTask, calendars) {
       async deleteComment() {},
       async findComment() { return undefined; },
       async listTasks() { return []; },
+      ...(projectComments ? { async listProjectComments(projectId) {
+        return structuredClone(projectComments[projectId] || []);
+      } } : {}),
       async upsertTask(task) { return { id: "created-task", ...task }; },
       async deleteTask() {},
       async updateRecurringOccurrence(task) { return task; },
@@ -224,9 +228,8 @@ test("mapped -> Inbox deletes the old projection and does not create another", a
   await sync.process(delivery("d2", task, previous));
   assert.deepEqual(calendars.home.deleted, ["home-existing"]);
   assert.equal(calendars.work.created.length, 0);
-  assert.equal(state.mapping, undefined);
-  assert.ok(state.tombstones.has(`home:${task.id}`));
-  assert.ok(state.operations.indexOf(`tombstone:home:${task.id}`) < state.operations.indexOf("delete-mapping:home:home-existing"));
+  assert.equal(state.mapping?.profile, "home", "ordinary sync no longer deletes a DynamoDB correlation row");
+  assert.equal(state.tombstones.has(`home:${task.id}`), false);
 });
 
 test("mapped Home -> Work migrates the projection without recreating the Todoist task", async () => {
@@ -299,10 +302,10 @@ test("project move plus due removal deletes source but creates no destination pr
   await sync.process(delivery("d4", task, previous));
   assert.deepEqual(calendars.home.deleted, ["home-existing"]);
   assert.equal(calendars.work.created.length, 0);
-  assert.equal(state.mapping, undefined);
+  assert.equal(state.mapping?.profile, "home", "ordinary sync no longer deletes a DynamoDB correlation row");
 });
 
-test("due re-add without updated_at can recreate a tombstoned mapped projection", async () => {
+test("due re-add without updated_at recreates despite an obsolete tombstone", async () => {
   const previous = { id: "task-5", project_id: "inbox", content: "Re-add due", due: null };
   const task = { ...previous, project_id: HOME, due: { date: "2026-09-08" } };
   const calendars = calendarSet();
@@ -312,10 +315,10 @@ test("due re-add without updated_at can recreate a tombstoned mapped projection"
   await sync.process(delivery("d5", task, previous));
   assert.deepEqual(calendars.home.created, ["home-event-1"]);
   assert.equal(state.mapping?.profile, "home");
-  assert.equal(state.tombstones.has(`home:${task.id}`), false);
+  assert.equal(state.tombstones.has(`home:${task.id}`), true, "obsolete state is not consulted or mutated by ordinary sync");
 });
 
-test("destination tombstone suppression still removes the source projection", async () => {
+test("project move repairs the destination despite obsolete tombstone state", async () => {
   const previous = { id: "task-6", project_id: HOME, content: "Stale destination", due: { date: "2026-09-09" } };
   const task = { ...previous, project_id: WORK };
   const calendars = calendarSet();
@@ -325,12 +328,12 @@ test("destination tombstone suppression still removes the source projection", as
   const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
   await sync.process(delivery("d6", task, previous));
   assert.deepEqual(calendars.home.deleted, ["home-existing"]);
-  assert.deepEqual(calendars.work.created, []);
-  assert.equal(state.mapping, undefined);
-  assert.ok(state.tombstones.has(`home:${task.id}`));
+  assert.deepEqual(calendars.work.created, ["work-event-1"]);
+  assert.equal(state.mapping?.profile, "work");
+  assert.equal(state.tombstones.has(`home:${task.id}`), false);
 });
 
-test("Calendar-owned recurrence moves its master series and active-instance mapping", async () => {
+test("recurring Calendar projection moves its master and active-instance mapping without persisted owner", async () => {
   const previous = { id: "task-7", project_id: HOME, content: "Weekly task", due: { date: "2026-09-10" }, updated_at: "2026-09-03T09:00:00Z" };
   const task = { ...previous, project_id: WORK, updated_at: "2026-09-03T10:00:00Z" };
   const calendars = calendarSet();
@@ -348,7 +351,7 @@ test("Calendar-owned recurrence moves its master series and active-instance mapp
     eventId: "home-instance",
     taskId: task.id,
     commentId: "home-comment",
-    recurrenceOwner: "calendar",
+    recurrenceOwner: "todoist", // contradictory legacy label; exact series/task IDs define the relationship
     seriesId: "home-series",
     masterEventId: "home-master",
     activeInstanceId: "home-instance",
@@ -362,15 +365,16 @@ test("Calendar-owned recurrence moves its master series and active-instance mapp
   assert.deepEqual(calendars.home.deleted, ["home-master"]);
   assert.deepEqual(calendars.work.created, ["work-event-1"]);
   assert.equal(state.mapping?.profile, "work");
-  assert.equal(state.mapping?.recurrenceOwner, "calendar");
+  assert.equal(state.mapping?.recurrenceOwner, undefined);
   assert.equal(state.mapping?.masterEventId, "work-event-1");
   assert.equal(state.mapping?.eventId, "work-event-1-instance");
   assert.equal(state.mapping?.activeEffectiveStart, "2026-09-10");
   assert.equal(state.mapping?.seriesId, "work-ical-work-event-1");
-  assert.ok(state.operations.indexOf(`tombstone:home:${task.id}`) < state.operations.indexOf("delete-mapping:home:home-instance"));
+  assert.equal(state.operations.some((operation) => operation.startsWith("tombstone:")), false);
+  assert.equal(state.operations.some((operation) => operation === "delete-mapping:home:home-instance"), false);
 });
 
-test("Todoist-owned RRULE move binds the destination master and current instance separately", async () => {
+test("native Todoist RRULE move binds the destination master and current instance without persisted owner", async () => {
   const previous = {
     id: "task-rrule-move",
     project_id: HOME,
@@ -388,14 +392,14 @@ test("Todoist-owned RRULE move binds the destination master and current instance
     start: { date: "2026-09-12" },
     end: { date: "2026-09-13" },
     recurrence: ["RRULE:FREQ=DAILY"],
-    extendedProperties: { shared: { taskId: task.id, syncRecurrenceOwner: "todoist", todoistRecurrence: "every day" } },
+    extendedProperties: { shared: { taskId: task.id, syncRecurrenceOwner: "calendar", todoistRecurrence: "every day" } },
   });
   const mapping = {
     profile: "home",
     projectId: HOME,
     eventId: "home-rrule-master",
     taskId: task.id,
-    recurrenceOwner: "todoist",
+    recurrenceOwner: "calendar", // contradictory legacy label; exact series/task IDs define the relationship
     seriesId: task.id,
     masterEventId: "home-rrule-master",
     activeInstanceId: "home-rrule-instance",
@@ -411,7 +415,7 @@ test("Todoist-owned RRULE move binds the destination master and current instance
   assert.deepEqual(calendars.home.deleted, ["home-rrule-master"]);
   assert.deepEqual(calendars.work.created, ["work-event-1"]);
   assert.equal(state.mapping?.profile, "work");
-  assert.equal(state.mapping?.recurrenceOwner, "todoist");
+  assert.equal(state.mapping?.recurrenceOwner, undefined);
   assert.equal(state.mapping?.eventId, "work-event-1");
   assert.equal(state.mapping?.masterEventId, "work-event-1");
   assert.equal(state.mapping?.activeInstanceId, "work-event-1-instance");
@@ -427,7 +431,7 @@ test("Phase B native master stays intact when cross-profile copy protocol is una
   const calendars=calendarSet();
   calendars.home.events.set("phase-b-master",{id:"phase-b-master",summary:task.content,status:"confirmed",
     start:{date:"2027-01-10"},end:{date:"2027-01-11"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],
-    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}}});
+    extendedProperties:{shared:{taskId:task.id,todoistRecurrence:"every quarter",todoistPhaseBVersion:"1"}}});
   const mapping={profile:"home",projectId:HOME,eventId:"phase-b-master",taskId:task.id,
     recurrenceOwner:"todoist",seriesId:task.id,masterEventId:"phase-b-master",activeInstanceId:"phase-b-apr",
     originalStart:"2027-04-10",activeEffectiveStart:"2027-04-10",todoistPhaseBVersion:1,updatedAt:previous.updated_at};
@@ -452,7 +456,7 @@ test("Phase B native project move routes only verified signed transition through
     const master = { id: "phase-b-master", summary: task.content, status: "confirmed",
       start: { date: "2027-01-10" }, end: { date: "2027-01-11" },
       recurrence: ["RRULE:FREQ=MONTHLY;INTERVAL=3"], etag: "old-etag",
-      extendedProperties: { shared: { taskId: task.id, syncRecurrenceOwner: "todoist",
+      extendedProperties: { shared: { taskId: task.id, todoistRecurrence: "every quarter",
         todoistPhaseBVersion: "1" } } };
     calendars.home.events.set(master.id, master);
     const mapping = { profile: "home", projectId: HOME, eventId: master.id, taskId: task.id,
@@ -466,6 +470,13 @@ test("Phase B native project move routes only verified signed transition through
       updatedAt: previous.updated_at };
     const state = new FakeState(options.missingMapping ? undefined : mapping);
     if (!options.missingLink) state.recurrenceLinks.push(link);
+    const providerMapping = options.missingLink
+      ? { ...mapping, seriesId:undefined, masterEventId:undefined }
+      : mapping;
+    const providerComments = options.missingMapping ? {} : {
+      [HOME]: [{ id:"provider-phase-b-mapping", project_id:HOME,
+        content:serializeMappingComment(providerMapping, HOME, undefined, 1) }],
+    };
     const called = [];
     const runner = async input => {
       called.push(input);
@@ -473,7 +484,7 @@ test("Phase B native project move routes only verified signed transition through
       return { plan: {}, mapping, operationId: "verified-stage" };
     };
     const sync = new ProjectAwareSynchronizer(state, undefined,
-      fakeClients({ value: task }, calendars), runner);
+      fakeClients({ value: task }, calendars, providerComments), runner);
     const source = delivery("phase-b-move-delivery", task,
       options.staleOldProject ? { ...previous, project_id: ANTONIO } : previous);
     return { sync, source, state, called, calendars, mapping, link };
@@ -486,8 +497,11 @@ test("Phase B native project move routes only verified signed transition through
     assert.equal(good.called[0].task.id, task.id);
     assert.equal(good.called[0].sourceProfile, "home");
     assert.equal(good.called[0].destinationProfile, "work");
-    assert.equal(good.called[0].sourceMapping, good.mapping);
-    assert.equal(good.called[0].sourceLink, good.link);
+    assert.equal(good.called[0].sourceMapping.taskId, good.mapping.taskId);
+    assert.equal(good.called[0].sourceMapping.masterEventId, good.mapping.masterEventId);
+    assert.equal(good.called[0].sourceLink.taskId, good.link.taskId);
+    assert.equal(good.called[0].sourceLink.seriesId, good.link.seriesId);
+    assert.equal(good.called[0].sourceLink.masterEventId, good.link.masterEventId);
     assert.equal(good.called[0].state, good.state);
     assert.deepEqual(good.calendars.home.deleted, []);
     assert.deepEqual(good.calendars.work.created, []);
@@ -523,7 +537,7 @@ test("Phase B native project move routes only verified signed transition through
   }
 });
 
-test("moved orphan writes a source tombstone before dropping ownership mapping", async () => {
+test("moved orphan does not mutate DynamoDB mapping state or write a tombstone", async () => {
   const task = { id: "task-8", project_id: WORK, content: "Moved orphan", due: { date: "2026-09-11" }, updated_at: "2026-09-03T10:00:00Z" };
   const mapping = { profile: "home", projectId: HOME, eventId: "home-orphan", taskId: task.id, updatedAt: "2026-09-03T09:00:00Z" };
   const calendars = calendarSet();
@@ -539,9 +553,9 @@ test("moved orphan writes a source tombstone before dropping ownership mapping",
     body: "",
     orphan: { eventId: "home-orphan", taskId: task.id, attempt: 2 },
   });
-  assert.ok(state.tombstones.has(`home:${task.id}`));
-  assert.equal(state.mapping, undefined);
-  assert.ok(state.operations.indexOf(`tombstone:home:${task.id}`) < state.operations.indexOf("delete-mapping:home:home-orphan"));
+  assert.equal(state.tombstones.has(`home:${task.id}`), false);
+  assert.equal(state.mapping?.profile, "home");
+  assert.equal(state.operations.some((operation) => operation.startsWith("delete-mapping:")), false);
 });
 
 test("ambiguous destination project move leaves source Calendar and mapping untouched", async () => {
@@ -625,23 +639,18 @@ test("project move uses the preflighted destination event without repeating iden
   assert.equal(calendars.work.created.length, 1);
 });
 
-test("pending approved future split blocks ordinary Todoist webhook projection creation", async () => {
+test("pending legacy future split no longer intercepts ordinary Todoist webhook processing", async () => {
   const task = {
     id: "split-task", project_id: HOME, content: "Replace battery smoke alarm",
     due: { date: "2027-07-01", string: "every 2 years", is_recurring: true },
     updated_at: "2026-10-19T12:00:00Z",
   };
   const state = new FakeState();
-  state.getFutureSeriesSplitAnyProfile = async () => ({
-    profile: "home", taskId: task.id, oldMasterId: "old-may", newMasterId: "new-july", status: "pending",
-  });
+  state.getFutureSeriesSplitAnyProfile = async () => { throw new Error("legacy split fence must not be read"); };
   const calendars = calendarSet();
   const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
   await sync.process(delivery("split-pending-webhook", task, { ...task, project_id: "inbox" }));
-  assert.deepEqual(calendars.home.created, []);
-  assert.deepEqual(calendars.home.deleted, []);
-  assert.equal(state.mapping, undefined);
-  assert.ok(state.audits.some((x) => x.action === "todoist_webhook_future_series_split_pending"));
+  assert.ok(!state.audits.some((x) => x.action === "todoist_webhook_future_series_split_pending"));
 });
 
 test("Phase B tagged source blocks cross-profile move even when the mapping was lost",async()=>{
@@ -650,7 +659,7 @@ test("Phase B tagged source blocks cross-profile move even when the mapping was 
   const task={...previous,project_id:WORK,updated_at:"2027-01-10T10:00:00Z"};
   const calendars=calendarSet();
   calendars.home.events.set("phase-b-unmapped-master",{id:"phase-b-unmapped-master",
-    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    extendedProperties:{shared:{taskId:task.id,todoistRecurrence:"every quarter",todoistPhaseBVersion:"1"}},
     recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"],start:{date:"2027-01-10"}});
   for(const mapping of [undefined,{profile:"home",eventId:"phase-b-unmapped-master",
     taskId:task.id,updatedAt:previous.updated_at}]){
@@ -667,7 +676,7 @@ test("Phase B tagged orphan cannot be stripped when its mapping has vanished",as
   const task={id:"phase-b-orphan",project_id:WORK,content:"Quarter",due:{date:"2027-04-10"}};
   const calendars=calendarSet();
   calendars.home.events.set("phase-b-orphan-master",{id:"phase-b-orphan-master",
-    extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist",todoistPhaseBVersion:"1"}},
+    extendedProperties:{shared:{taskId:task.id,todoistRecurrence:"every quarter",todoistPhaseBVersion:"1"}},
     start:{date:"2027-01-10"},recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3"]});
   const state=new FakeState();
   const sync=new ProjectAwareSynchronizer(state,undefined,fakeClients({value:task},calendars));

@@ -1,5 +1,4 @@
 import { createHash, createSign, randomUUID } from "node:crypto";
-import {guardReplayCalendarClient} from "./erasure-replay-providers.js";
 import { profileForTodoistProject, profiles, todoistProjectForToken } from "./config.js";
 import { buildProjectMappingIndex, findProjectMappingComment, recoverMappingFromProjectComment, serializeMappingComment, LEGACY_TASK_COMMENT_MARKERS, type TodoistCommentRecord } from "./mapping-comments.js";
 import type { CalendarEvent, GoogleCredentials, Mapping, Profile, TodoistTask } from "./types.js";
@@ -114,7 +113,12 @@ export class GoogleCalendar {
       .find(([, config]) => config.calendarId === this.calendarId)?.[0];
     if (!profile) return event;
     const originalShared = event.extendedProperties?.shared || {};
-    const { syncSource: _legacySource, syncRecurrenceOwner: _legacyOwner, ...shared } = originalShared;
+    const {
+      syncSource: _legacySource,
+      syncRecurrenceOwner: _legacyOwner,
+      syncCalendarNative: _legacyCalendarNative,
+      ...shared
+    } = originalShared;
     if (!event.extendedProperties?.shared?.taskId && !originalShared.syncSource && !originalShared.syncRecurrenceOwner) return event;
     const taskId = event.extendedProperties?.shared?.taskId;
     return { ...event, extendedProperties: { ...event.extendedProperties, shared: {
@@ -132,7 +136,6 @@ export class GoogleCalendar {
       ...(mapping?.activeEffectiveStart ? { syncActiveEffectiveStart: mapping.activeEffectiveStart } : {}),
       ...(mapping?.calendarProgressVersion === 1 ? { syncProgressVersion: "1" } : {}),
       ...(mapping?.completedThroughOriginalStart ? { syncCompletedThrough: mapping.completedThroughOriginalStart } : {}),
-      ...(mapping?.calendarNativeRecurring ? { syncCalendarNative: "true" } : {}),
       ...(mapping?.todoistPhaseBVersion === 1 ? { syncTodoistPhaseBVersion: "1" } : {}),
       } : {}),
     } } };
@@ -533,7 +536,7 @@ export class GoogleCalendar {
     const shared = event.extendedProperties?.shared;
     if (!/^[a-f0-9]{32}$/.test(event.id) || !event.start?.date
       || event.start.dateTime || event.recurrence?.length !== 1
-      || (!shared?.todoistRecurrence && shared?.syncRecurrenceOwner !== "todoist") || !shared.taskId
+      || !shared?.todoistRecurrence || !shared.taskId
       || shared.todoistAnchorStart !== event.start.date
       || shared.todoistPhaseBVersion !== "1") {
       throw new Error("Phase B master create requires an anchored deterministic identity");
@@ -1218,7 +1221,7 @@ export class Todoist {
         && item.payload.profile === profile
         && item.payload.projectId === projectId);
       if (oldCandidates.length > 1 || oldCandidates.some((item) =>
-        item.payload.recurrenceOwner === "calendar"
+        item.payload.seriesId && item.payload.seriesId !== item.payload.taskId
         || item.payload.completedThroughOriginalStart
         || item.payload.calendarProgressVersion)) {
         throw new Error("Cannot migrate conflicting or completed historical project mapping comment");
@@ -1300,6 +1303,6 @@ export function todoistTaskPayload(task: Omit<TodoistTask, "id">): Record<string
   return payload;
 }
 
-export function calendarForProfile(credentials: GoogleCredentials, profile: Profile, calendarId: string): GoogleCalendar {
-  return guardReplayCalendarClient(profile,new GoogleCalendar(credentials, calendarId));
+export function calendarForProfile(credentials: GoogleCredentials, _profile: Profile, calendarId: string): GoogleCalendar {
+  return new GoogleCalendar(credentials, calendarId);
 }

@@ -90,24 +90,6 @@ class FakeState {
   async getRecurrenceLink(profile, seriesId) {
     return this.recurrenceLinks.get(`${profile}:${seriesId}`);
   }
-  async restoreMappingIndexesIfOwned(mapping, link) {
-    const current = this.eventMappings.get(`${mapping.profile}:${mapping.eventId}`);
-    if (!current || current.taskId !== mapping.taskId || current.updatedAt !== mapping.updatedAt) return false;
-    const conflicts = (value) => value &&
-      (value.profile !== mapping.profile || value.taskId !== mapping.taskId || value.eventId !== mapping.eventId);
-    if (conflicts(this.mapping) || conflicts(this.ownerMapping)
-      || [...this.otherProfileMappings.values()].some(Boolean)) return false;
-    if (this.tombstones.has(`${mapping.profile}:${mapping.taskId}`)
-      || this.completedProjections.has(`${mapping.profile}:${mapping.eventId}`)) return false;
-    if (mapping.recurrenceOwner) {
-      const currentLink = this.recurrenceLinks.get(`${mapping.profile}:${mapping.seriesId}`);
-      if (!link || !currentLink || link !== currentLink) return false;
-    } else if (mapping.seriesId || mapping.masterEventId || mapping.activeInstanceId) return false;
-    this.mapping = mapping;
-    this.ownerMapping = mapping;
-    this.operations.push(`restore-mapping:${mapping.eventId}`);
-    return true;
-  }
   async putMapping(mapping) {
     this.mapping = mapping;
     this.operations.push(`put-mapping:${mapping.eventId}`);
@@ -125,6 +107,10 @@ class FakeState {
   }
   async getCompletedCalendarProjectionByEvent(profile, eventId) {
     return this.completedProjections.get(`${profile}:${eventId}`);
+  }
+  async putCompletedCalendarProjection(projection) {
+    this.completedProjections.set(`${projection.profile}:${projection.eventId}`, projection);
+    this.operations.push(`completed:${projection.eventId}`);
   }
   async recordMutation(profile) { this.operations.push(`mutation:${profile}`); }
   async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); }
@@ -215,13 +201,13 @@ function mapping() {
   };
 }
 
-function makeReconciler({ state, store, clients, repairs = [] }) {
+function makeReconciler({ state, store, clients, repairs = [], reconcileRecurrence }) {
   return new SnapshotReconciler(
     state,
     clients.factory,
     store,
     async (delivery) => { repairs.push(JSON.parse(delivery.body)); },
-    async () => {},
+    reconcileRecurrence || (async () => {}),
   );
 }
 
@@ -239,6 +225,59 @@ test("establishes a baseline only when existing Todoist and Calendar state alrea
   assert.equal(clients.metrics.calendarUpdates.length, 0);
 });
 
+test("a missing baseline repairs an exact live pair using Calendar's documented tie-break", async () => {
+  const m = mapping();
+  const t = task({ content: "Older Todoist title" });
+  const e = event({ summary: "Current Calendar title" });
+  const state = new FakeState(m);
+  const store = new FakeStore(m);
+  const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+
+  assert.equal(result.counts.calendar_to_todoist, 1);
+  assert.equal(clients.metrics.todoistUpdates.length, 1);
+  assert.equal(clients.metrics.todoistUpdates[0].next.content, e.summary);
+  assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(store.baselines.has(`home:${t.id}`), true);
+  assert.equal(state.audits.some(audit => audit.action === "todoist_snapshot_reconcile_baseline_missing_repaired_from_live_pair"), true);
+});
+
+test("a missing baseline retains an exact Calendar projection when Todoist reports completion", async () => {
+  const m = mapping();
+  const completed = task({ is_completed: true, completed_at: "2026-09-03T21:00:00Z" });
+  const e = event();
+  const state = new FakeState(m);
+  const clients = fakeClients({ listedTasks: [completed], taskById: new Map([[completed.id, completed]]), calendarEvents: new Map([[e.id, e]]) });
+
+  const result = await makeReconciler({ state, store: new FakeStore(m), clients }).reconcile("home");
+
+  assert.equal(result.counts.completed_retained, 1);
+  assert.equal(state.completedProjections.get(`home:${e.id}`).completedAt, completed.completed_at);
+  assert.deepEqual(clients.metrics.calendarDeletes, []);
+  assert.deepEqual(clients.metrics.todoistDeletes, []);
+  assert.equal(state.mapping.eventId, e.id);
+});
+
+test("exact Todoist 404 prevents an unmapped stale list snapshot from creating a Calendar projection", async () => {
+  const stale = task();
+  const state = new FakeState(undefined);
+  const store = new FakeStore(undefined);
+  const clients = fakeClients({
+    listedTasks: [stale],
+    taskById: new Map(),
+    calendarEvents: new Map(),
+  });
+
+  const result = await makeReconciler({ state, store, clients }).reconcile("home");
+
+  assert.equal(result.counts.noop, 1);
+  assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(clients.metrics.todoistUpdates.length, 0);
+  assert.equal(state.audits.some(audit => audit.action === "todoist_snapshot_reconcile_inactive_task_ignored"
+    && audit.detail.reason === "exact_provider_read_not_found"), true);
+});
+
 test("repairs a missed Todoist due removal when Calendar is unchanged", async () => {
   const m = mapping();
   const oldTask = task();
@@ -249,8 +288,8 @@ test("repairs a missed Todoist due removal when Calendar is unchanged", async ()
   const clients = fakeClients({ listedTasks: [undated], taskById: new Map([[undated.id, undated]]), calendarEvents: new Map([[oldEvent.id, oldEvent]]) });
   await makeReconciler({ state, store, clients }).reconcile("home");
   assert.deepEqual(clients.metrics.calendarDeletes, [oldEvent.id]);
-  assert.equal(state.mapping, undefined);
-  assert.ok(state.tombstones.has(`home:${undated.id}`));
+  assert.equal(state.mapping.eventId, oldEvent.id);
+  assert.equal(state.operations.some((operation) => operation.startsWith("tombstone:")), false);
 });
 
 test("retained completion wins over a missing Todoist task during snapshot reconciliation", async () => {
@@ -459,7 +498,7 @@ test("repairs a missed Calendar date change by updating Todoist", async () => {
   assert.equal(clients.metrics.calendarUpdates.length, 0);
 });
 
-test("treats a Todoist deletion during Calendar repair as a conflict, not a failed delivery", async () => {
+test("retries a provider 404 when an exact Todoist reread still finds the task", async () => {
   const m = mapping();
   const oldTask = task();
   const oldEvent = event();
@@ -474,26 +513,32 @@ test("treats a Todoist deletion during Calendar repair as a conflict, not a fail
     calendarEvents: new Map([[movedEvent.id, movedEvent]]),
     upsertTaskError: notFound,
   });
-  await makeReconciler({ state, store, clients }).reconcile("home");
+  await assert.rejects(
+    makeReconciler({ state, store, clients }).reconcile("home"),
+    /Reconciliation mapped failed for task task-1, event event-1: HTTP 404/,
+  );
   assert.equal(clients.metrics.todoistUpdates.length, 0);
   assert.equal(state.mapping?.taskId, m.taskId);
-  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_task_disappeared_during_repair"), true);
+  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_item_failed"), true);
 });
 
-test("does not guess when Todoist and Calendar both changed differently", async () => {
+test("merges simultaneous edits and uses Calendar for same-field ties", async () => {
   const m = mapping();
   const oldTask = task();
   const oldEvent = event();
-  const undated = task({ due: null, description: "Todoist edit" });
+  const undated = task({ due: null, content: "Todoist title edit", description: "Todoist edit" });
   const movedEvent = event({ start: { date: "2026-09-12" }, end: { date: "2026-09-13" }, description: "Calendar edit" });
   const state = new FakeState(m);
   const store = new FakeStore(m, baseline(oldTask, oldEvent));
   const clients = fakeClients({ listedTasks: [undated], taskById: new Map([[undated.id, undated]]), calendarEvents: new Map([[movedEvent.id, movedEvent]]) });
   await makeReconciler({ state, store, clients }).reconcile("home");
-  assert.equal(clients.metrics.todoistUpdates.length, 0);
+  assert.equal(clients.metrics.todoistUpdates.length, 1);
+  assert.equal(clients.metrics.todoistUpdates[0].next.content, "Todoist title edit");
+  assert.equal(clients.metrics.todoistUpdates[0].next.description, "Calendar edit");
+  assert.equal(clients.metrics.todoistUpdates[0].next.due.date, "2026-09-12");
   assert.equal(clients.metrics.calendarUpdates.length, 0);
   assert.equal(clients.metrics.calendarDeletes.length, 0);
-  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_conflict_both_sides_changed"), true);
+  assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_simultaneous_edits_merged"), true);
 });
 
 test("accepts both-sides-changed when the two providers have already converged", async () => {
@@ -558,9 +603,9 @@ test("uses authoritative project membership to repair a missed mapped-project mo
   assert.equal(store.baselines.has(`home:${moved.id}`), false);
 });
 
-test("keeps a cancelled legacy projection blocked until project-exit reset evidence exists", async () => {
-  const t = task();
-  const cancelled = event({ status: "cancelled" });
+test("keeps a cancelled projection blocked until a newer live Todoist edit proves intentional recreation", async () => {
+  const t = task({ updated_at: "2026-09-03T19:00:00Z" });
+  const cancelled = event({ status: "cancelled", updated: "2026-09-03T20:00:00Z" });
   const state = new FakeState();
   const store = new FakeStore();
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[cancelled.id, cancelled]]) });
@@ -569,13 +614,13 @@ test("keeps a cancelled legacy projection blocked until project-exit reset evide
   assert.equal(repairs.length, 0);
   assert.equal(state.audits.some((audit) => audit.action === "todoist_snapshot_reconcile_cancelled_projection_blocked"), true);
 
-  state.tombstones.set(`home:${t.id}`, { sourceUpdatedAt: t.updated_at, reason: "project_exit" });
+  t.updated_at = "2026-09-03T21:00:00Z";
   await makeReconciler({ state, store, clients, repairs }).reconcile("home");
   assert.equal(repairs.length, 1);
   assert.equal(repairs[0].event_data_extra.old_item.project_id, "reconcile-unmapped");
 });
 
-test("unmapped canonical task restores a missing TASK index from an existing exact EVENT owner without provider writes", async () => {
+test("unmapped canonical task recovers its provider correlation without relying on a DynamoDB EVENT index", async () => {
   const t = task();
   const e = event();
   const oldMapping = mapping();
@@ -588,15 +633,14 @@ test("unmapped canonical task restores a missing TASK index from an existing exa
   const repairs = [];
   const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
   assert.equal(result.counts.baseline, 1);
-  assert.equal(state.mapping.taskId, t.id);
-  assert.equal(state.mapping.eventId, e.id);
+  assert.equal(state.mapping, undefined, "exact Calendar correlation must not restore a DynamoDB mapping");
   assert.ok(store.baselines.get(`home:${t.id}`));
   assert.equal(repairs.length, 0);
   assert.equal(clients.metrics.calendarUpdates.length, 0);
   assert.equal(clients.metrics.todoistUpdates.length, 0);
-  assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_mapping_indices_restored"));
+  assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_provider_correlation_recovered"));
   // A later run sees a mapped task and does not create another projection.
-  store.mappings.push(state.mapping);
+  store.mappings.push(mapping());
   await makeReconciler({ state, store, clients, repairs }).reconcile("home");
   assert.equal(repairs.length, 0);
 });
@@ -617,7 +661,7 @@ test("unmapped recovery will not steal a Calendar event owned by another Todoist
   assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_mapping_owner_conflict"));
 });
 
-test("does not overwrite a valid TASKOWNER in another profile while recovering a stale EVENT", async () => {
+test("exact Calendar task correlation takes precedence over a stale cross-profile DynamoDB owner", async () => {
   const t = task();
   const e = event();
   const state = new FakeState();
@@ -627,15 +671,15 @@ test("does not overwrite a valid TASKOWNER in another profile while recovering a
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const repairs = [];
   const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
-  assert.equal(result.counts.conflict, 1);
+  assert.equal(result.counts.baseline, 1);
   assert.equal(state.mapping, undefined);
   assert.equal(state.ownerMapping.profile, "work");
-  assert.equal(store.baselines.size, 0);
+  assert.equal(store.baselines.size, 1);
   assert.equal(repairs.length, 0);
-  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_mapping_ownership_conflict"));
+  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_provider_correlation_recovered"));
 });
 
-test("does not reconstruct indexes if another profile still has a TASK row", async () => {
+test("exact Calendar task correlation recovers despite a stale cross-profile TASK row", async () => {
   const t = task();
   const e = event();
   const state = new FakeState();
@@ -644,11 +688,11 @@ test("does not reconstruct indexes if another profile still has a TASK row", asy
   const store = new FakeStore();
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const result = await makeReconciler({ state, store, clients }).reconcile("home");
-  assert.equal(result.counts.conflict, 1);
+  assert.equal(result.counts.baseline, 1);
   assert.equal(state.mapping, undefined);
 });
 
-test("tombstone vetoes index restoration and delegates to the existing projection policy", async () => {
+test("provider correlation repairs a known pair without consulting a stale projection tombstone", async () => {
   const t = task();
   const e = event();
   const state = new FakeState();
@@ -657,10 +701,11 @@ test("tombstone vetoes index restoration and delegates to the existing projectio
   const store = new FakeStore();
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const repairs = [];
-  await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+  assert.equal(result.counts.baseline, 1);
   assert.equal(state.mapping, undefined);
-  assert.equal(store.baselines.size, 0);
-  assert.equal(repairs.length, 1);
+  assert.equal(store.baselines.size, 1);
+  assert.equal(repairs.length, 0);
   assert.equal(state.operations.some((x) => x.startsWith("restore-mapping:")), false);
 });
 
@@ -699,7 +744,7 @@ test("completed Calendar projection with a competing task ID blocks relinking", 
   assert.equal(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_completed_owner_conflict"), true);
 });
 
-test("recurring EVENT without matching recurrence link is blocked instead of baselined", async () => {
+test("recurring EVENT correlation recovers without requiring a DynamoDB recurrence link", async () => {
   const t = task();
   const e = event();
   const m = { ...mapping(), recurrenceOwner: "calendar", seriesId: "series-1", masterEventId: "master-1", activeInstanceId: "event-1" };
@@ -708,13 +753,12 @@ test("recurring EVENT without matching recurrence link is blocked instead of bas
   const store = new FakeStore();
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const result = await makeReconciler({ state, store, clients }).reconcile("home");
-  assert.equal(result.counts.conflict, 1);
+  assert.equal(result.counts.baseline, 1);
   assert.equal(state.mapping, undefined);
-  assert.equal(store.baselines.size, 0);
-  assert.equal(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_recurrence_link_conflict"), true);
+  assert.equal(store.baselines.size, 1);
 });
 
-test("recurring EVENT with matching persisted link permits index-only restoration without recreating provider objects", async () => {
+test("recurring EVENT correlation remains provider-native even when a legacy link exists", async () => {
   const t = task();
   const e = event();
   const m = { ...mapping(), recurrenceOwner: "calendar", seriesId: "series-1", masterEventId: "master-1", activeInstanceId: "event-1" };
@@ -729,13 +773,13 @@ test("recurring EVENT with matching persisted link permits index-only restoratio
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const result = await makeReconciler({ state, store, clients }).reconcile("home");
   assert.equal(result.counts.baseline, 1);
-  assert.equal(state.mapping?.eventId, e.id);
+  assert.equal(state.mapping, undefined);
   assert.equal(store.baselines.size, 1);
   assert.equal(clients.metrics.calendarUpdates.length, 0);
   assert.equal(clients.metrics.todoistUpdates.length, 0);
 });
 
-test("recurring projection with divergent progression watermark blocks index restoration", async () => {
+test("Calendar shared correlation supersedes a divergent legacy recurrence watermark", async () => {
   const t = task();
   const e = event();
   const m = {
@@ -754,34 +798,28 @@ test("recurring projection with divergent progression watermark blocks index res
   const store = new FakeStore();
   const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
   const result = await makeReconciler({ state, store, clients }).reconcile("home");
-  assert.equal(result.counts.conflict, 1);
+  assert.equal(result.counts.baseline, 1);
   assert.equal(state.mapping, undefined);
-  assert.equal(store.baselines.size, 0);
-  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_reconcile_recurrence_link_conflict"));
+  assert.equal(store.baselines.size, 1);
 });
 
-test("pending future-only split prevents hourly reconciliation creating a competing Calendar master", async () => {
+test("pending legacy future-only split does not block provider-state reconciliation", async () => {
   const t = task({ id: "split-task", due: { date: "2027-07-01", string: "every 2 years", is_recurring: true } });
   const state = new FakeState();
-  state.getFutureSeriesSplitAnyProfile = async () => ({
-    profile: "home", taskId: t.id, oldMasterId: "old-may", newMasterId: "new-july", status: "pending",
-  });
+  state.getFutureSeriesSplitAnyProfile = async () => { throw new Error("legacy split fence must not be read"); };
   const store = new FakeStore();
   const clients = fakeClients({
     listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map(),
   });
-  const repairs = [];
-  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
-  assert.equal(result.counts.blocked, 1);
-  assert.deepEqual(repairs, []);
+  await makeReconciler({ state, store, clients }).reconcile("home");
   assert.equal(clients.metrics.calendarUpdates.length, 0);
   assert.equal(store.putBaselineCalls, 0);
-  assert.ok(state.audits.some((x) => x.action === "todoist_snapshot_future_series_split_pending"));
+  assert.ok(!state.audits.some((x) => x.action === "todoist_snapshot_future_series_split_pending"));
 });
 
-test("Todoist-owned deleted recurrence is not recreated or retired through the mapping store", async () => {
+test("Todoist-native deleted recurrence is recognized without a permanent owner marker", async () => {
   for (const calendarStatus of ["cancelled", "missing"]) {
-    const m={...mapping(),recurrenceOwner:"todoist",seriesId:"task-1",
+    const m={...mapping(),seriesId:"task-1",
       masterEventId:"event-1",activeInstanceId:"instance-1"};
     const link={profile:"home",owner:"todoist",seriesId:m.seriesId,taskId:m.taskId,
       eventId:m.eventId,masterEventId:m.masterEventId,activeInstanceId:m.activeInstanceId,
@@ -812,7 +850,7 @@ test("Todoist-owned deleted recurrence is not recreated or retired through the m
   }
 });
 
-test("Todoist recurrence is never retired for a surviving side, changed link, or active repair", async () => {
+test("Todoist recurrence retirement follows exact provider reads without a legacy link dependency", async () => {
   for (const scenario of ["task-live","calendar-live","link-changed","repair-blocked"]) {
     const m={...mapping(),recurrenceOwner:"todoist",seriesId:"task-1",masterEventId:"event-1"};
     const state=new FakeState(m);
@@ -827,8 +865,9 @@ test("Todoist recurrence is never retired for a surviving side, changed link, or
     let retired=0;
     state.retireDeletedTodoistRecurrenceIfUnchanged=async()=>{retired++;return true;};
     const result=await makeReconciler({state,store:new FakeStore(m),clients}).reconcile("home");
+    const providerPairAbsent = scenario === "link-changed";
     assert.equal(retired,0,scenario);
-    assert.equal(result.counts.deleted_retired,0,scenario);
+    assert.equal(result.counts.deleted_retired,providerPairAbsent ? 1 : 0,scenario);
     assert.deepEqual(clients.metrics.todoistUpdates,[]);
     assert.deepEqual(clients.metrics.calendarUpdates,[]);
   }

@@ -1,18 +1,7 @@
-/**
- * #349 now requires zero retained deleted identity, including removal of the
- * former 18-day project-comment tombstone. The historical HMAC marker writer
- * and reader are retired. Until #347 proves marker-free replay admission for
- * every invokable writer, neither retired mechanism is a valid fallback.
- *
- * Keep the old gate as a FAIL-CLOSED tripwire for old deployment settings.
- * Never silently treat an unexpected enabled legacy gate as an allow.
- *
- * The separate retirement-disposition admission check below remains active.
- */
+/** Exact identity helpers retained for the legacy cutover and exclusion paths. */
 import {GetCommand, TransactWriteCommand, type DynamoDBDocumentClient} from "@aws-sdk/lib-dynamodb";
 import {documentClient} from "./dynamodb-capacity.js";
 import type {Profile} from "./types.js";
-import { assertRetirementAdmissionIfEnabled } from "./recurrence-retirement-disposition.js";
 
 export const REPLAY_PROFILES = ["home","antonio","work"] as const satisfies readonly Profile[];
 export type ReplayIdentity = {
@@ -138,22 +127,13 @@ export async function verifyConfirmedErasureCompletion(proof:ConfirmedErasureCom
 }
 
 
-/**
- * Legacy HMAC marker admission cannot be re-enabled. #349 now requires zero
- * retained identity and #347 must establish marker-free writer admission.
- * Reject any unexpected nonzero or unknown setting before admitting writes.
- */
-export function replayAdmissionEnabled():boolean {
-  const version=process.env.ERASURE_REPLAY_BARRIER_VERSION;
-  if(version===undefined||version===""||version==="0")return false;
-  throw new ErasureReplayUnavailableError(
-    "Legacy HMAC replay admission was retired; remove ERASURE_REPLAY_BARRIER_VERSION; marker-free writer admission is not yet proven");
-}
-
-/** Retirement exclusions are independent from the retired HMAC mechanism. */
+/** Explicitly configured retirement exclusions remain independent of sync admission. */
 export async function assertReplayAdmissionIfEnabled(identity:ReplayIdentity,db:Db=documentClient):Promise<void> {
-  replayAdmissionEnabled();
-  await assertRetirementAdmissionIfEnabled(identity,db);
+  // Legacy call sites are retired. Keep the helper temporarily so rolling
+  // migration code can be removed without making provider identity writes
+  // depend on permanent per-item markers.
+  void identity;
+  void db;
 }
 
 /** Normalise all exact known Calendar recurrence aliases for callers. */
@@ -163,10 +143,4 @@ export function mappingReplayIdentity(mapping:{
   return {profile:mapping.profile,taskId:mapping.taskId,
     eventIds:[...new Set([mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
       .filter((id):id is string=>typeof id==="string"&&id.length>0))]};
-}
-
-/** Never authorise an old direct HMAC marker check after reader retirement. */
-export async function assertReplayAdmission(_identity:ReplayIdentity,_db:Db=documentClient):Promise<void> {
-  throw new ErasureReplayUnavailableError(
-    "Direct HMAC marker admission was retired; marker-free writer admission is not yet proven");
 }

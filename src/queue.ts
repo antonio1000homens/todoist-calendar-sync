@@ -1,7 +1,5 @@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { StateRepository } from "./repository.js";
-import { acquireProfileAdmissionLeaseWithEpoch, ErasureEpochChangedError } from "./erasure-protocol.js";
-import { assertReplayAdmission, ErasureReplayUnavailableError, replayAdmissionEnabled } from "./erasure-replay-barrier.js";
 import { sha256 } from "./security.js";
 import { syncMessageGroupId, type Delivery, type Profile, type ReconciliationReason } from "./types.js";
 
@@ -19,55 +17,12 @@ export function messageDeduplicationId(delivery: Pick<Delivery, "profile" | "kin
 }
 
 export async function enqueueDelivery(delivery: Delivery): Promise<void> {
-  const protocolEnabled = process.env.ERASURE_PROTOCOL_VERSION === "1";
-  const replayEnabled = replayAdmissionEnabled();
-  const checkTodoistReplay = delivery.kind === "todoist" && replayEnabled;
-  // A replay lookup outside an admission lease cannot serialize with a fence
-  // and must never be used to authorize an SQS write.
-  if (checkTodoistReplay && !protocolEnabled) {
-    throw new ErasureReplayUnavailableError("Todoist replay admission requires an enabled erasure protocol lease");
-  }
-  let epoch: number | undefined;
-  let release: (() => Promise<void>) | undefined;
-  if (protocolEnabled) {
-    // Never resample and re-enqueue an in-flight payload after an epoch race.
-    // A provider retry gets a fresh invocation and passes through live-state checks.
-    try {
-      const admission=await acquireProfileAdmissionLeaseWithEpoch(delivery.profile);
-      release=admission.release;
-      epoch=admission.epoch;
-    } catch (error) {
-      if (error instanceof ErasureEpochChangedError) {
-        throw new Error("Admission rejected because the erasure epoch changed; retry from the source after revalidation");
-      }
-      throw error;
-    }
-  }
-  try {
-    if (checkTodoistReplay) {
-      let taskId: string | undefined;
-      try {
-        const payload = JSON.parse(delivery.body) as { event_data?: { id?: unknown } };
-        if (typeof payload.event_data?.id === "string" && payload.event_data.id)
-          taskId = payload.event_data.id;
-      } catch { /* Missing or invalid identity is denied below. */ }
-      if (!taskId) throw new ErasureReplayUnavailableError("Queued Todoist webhook has no verified task identity");
-      // This second, strongly consistent lookup MUST run after acquiring the
-      // admission lease. Keep the lease until SQS acknowledges the send.
-      await assertReplayAdmission({ profile: delivery.profile, taskId });
-    }
-    const admittedDelivery = protocolEnabled
-      ? { ...delivery, erasureEpoch: epoch }
-      : delivery;
-    await queue.send(new SendMessageCommand({
-      QueueUrl: queueUrl(),
-      MessageBody: JSON.stringify(admittedDelivery),
-      MessageGroupId: syncMessageGroupId(admittedDelivery.profile),
-      MessageDeduplicationId: messageDeduplicationId(admittedDelivery),
-    }));
-  } finally {
-    await release?.();
-  }
+  await queue.send(new SendMessageCommand({
+    QueueUrl: queueUrl(),
+    MessageBody: JSON.stringify(delivery),
+    MessageGroupId: syncMessageGroupId(delivery.profile),
+    MessageDeduplicationId: messageDeduplicationId(delivery),
+  }));
 }
 
 export interface ReconciliationRequestResult {
@@ -92,10 +47,10 @@ export interface ReconciliationRequestContext {
 /**
  * Durably marks a profile dirty before attempting SQS delivery. If the SQS
  * send fails the pending marker remains without a fresh lastEnqueuedAt value;
- * a later explicit Slack request can safely re-enqueue the same generation.
+ * the next scheduled check or manual request can safely re-enqueue the generation.
  *
  * enqueue is injectable for behavioral tests; production callers use the FIFO
- * SQS implementation above.
+ * SQS implementation above for manual and scheduled full reconciliations.
  */
 export async function requestReconciliation(
   state: StateRepository,

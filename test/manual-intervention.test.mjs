@@ -3,6 +3,8 @@ import test from 'node:test';
 import { StateRepository } from '../dist/repository.js';
 import { ReviewStore, SyncControls } from '../dist/review-store.js';
 import { documentClient } from '../dist/dynamodb-capacity.js';
+import { profiles } from '../dist/config.js';
+import { serializeMappingComment } from '../dist/mapping-comments.js';
 import {
   decisionBlocks,
   MANUAL_DECISION_CATALOG,
@@ -86,6 +88,18 @@ function mappedCalendarRecurrence() {
     originalStart: '2026-09-15T00:00:00Z',
     activeEffectiveStart: '2026-09-15T00:00:00Z',
     updatedAt: '2026-09-07T13:59:00.000Z',
+  };
+}
+
+function providerMappingReader(mapping) {
+  const projectId = profiles[mapping.profile].todoistProjectId;
+  return {
+    async listProjectComments() {
+      return [{ id: 'provider-mapping', project_id: projectId,
+        content: serializeMappingComment({ ...mapping, projectId }, projectId) }];
+    },
+    async upsertProjectComment() { throw new Error('mapping detection must not write provider comments'); },
+    async updateComment() { throw new Error('mapping detection must not update provider comments'); },
   };
 }
 
@@ -265,9 +279,9 @@ test('observe mode detects and blocks a pre-mutation ambiguity without posting S
     async getMappingByTask() { return mapping; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
-  const service = new ManualInterventionService(decisions, notifier, async () => {
-    throw new Error('observe mode must not call providers');
-  }, policies);
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: providerMappingReader(mapping), calendar: {},
+  }), policies);
 
   assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), true);
   assert.equal(notifier.posted.length, 0);
@@ -287,9 +301,9 @@ test('off mode disconnects the detector and allows the legacy synchronizer path'
     async getMappingByTask() { return mapping; },
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
   };
-  const service = new ManualInterventionService(decisions, notifier, async () => {
-    throw new Error('off detector must not call providers');
-  }, policies);
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: providerMappingReader(mapping), calendar: {},
+  }), policies);
 
   assert.equal(await service.interceptTodoistDeletion(todoistDeleteDelivery(), state), false);
   assert.equal(audits.at(-1).action, 'manual_detector_disabled');
@@ -488,10 +502,9 @@ test('calendar_wins recreates a missing Todoist side instead of DLQing the confl
     manual: { decisionId: decision.decisionId, action: 'calendar_wins', slackUserId: 'U123' },
   }, state);
 
-  assert.deepEqual(operations.slice(0, 4), [
+  assert.deepEqual(operations.slice(0, 3), [
     'todoist:create',
     'state:recordMutation',
-    'state:deleteMapping',
     'state:putMapping:task-new',
   ]);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'resolved');
@@ -553,17 +566,16 @@ test('delete whole recurrence uses circuit/budgeted provider write before removi
     },
   }, state);
 
-  assert.deepEqual(operations.slice(0, 3), [
+  assert.deepEqual(operations.slice(0, 2), [
     'calendar:delete:master-1',
     'state:recordMutation',
-    'state:deleteMapping',
   ]);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'resolved');
   assert.match(notifier.updated.at(-1).text, /Delete whole Calendar series/);
   assert.ok(notifier.updated.at(-1).blocks, 'resolved prompt should offer future policy controls');
 });
 
-test('unmapped conflict creates one stable non-destructive manual decision', async (t) => {
+test('unmapped conflict remains a non-blocking diagnostic without a manual decision', async (t) => {
   t.mock.method(ReviewStore.prototype, 'observeDecision', async () => {});
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
@@ -579,25 +591,12 @@ test('unmapped conflict creates one stable non-destructive manual decision', asy
   const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-1' };
   const detail = { taskId: 'task-1', eventId: 'legacy-event', mismatchCategories:['title_mismatch'],
     taskUpdatedAt:'2026-09-07T13:59:00.000Z', calendarEtag:'etag-1' };
-  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
-  await service.observeAudit({ ...delivery, id: 'reconcile-2' }, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail);
-  assert.equal(notifier.posted.length, 1);
-  const decision = notifier.posted[0];
-  assert.equal(decision.type, 'todoist_unmapped_conflict');
-  assert.equal(decision.context.taskTitle, 'Renew annually');
-  assert.equal(decision.context.todoistRecurring, true);
-  assert.match(decision.context.conflictKey, /^[a-f0-9]{64}$/);
-  assert.deepEqual(decision.permittedActions.map((action) => action.id), [
-    'use_todoist_recurrence', 'split_future_todoist', 'use_calendar_version', 'keep_separate', 'reconcile_now',
-  ]);
-  assert.equal(decision.permittedActions[0].destructive, true);
-  assert.equal(decision.permittedActions[1].destructive, true);
-  assert.equal(decision.permittedActions[2].destructive, true);
-  assert.equal(decision.permittedActions[3].destructive, undefined);
-  assert.ok(decision.permittedActions.every((action) => !action.autoAllowed));
+  assert.equal((await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail)).caseStatus, 'not_actionable');
+  assert.equal((await service.observeAudit({ ...delivery, id: 'reconcile-2' }, 'antonio', 'todoist_snapshot_reconcile_unmapped_conflict', detail)).caseStatus, 'not_actionable');
+  assert.equal(notifier.posted.length, 0);
 });
 
-test('changed provider state after dismissal creates a new case while unchanged repeats coalesce', async (t) => {
+test('provider conflicts never create or retain manual decisions', async (t) => {
   t.mock.method(ReviewStore.prototype, 'observeDecision', async () => {});
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions=new FakeDecisionStore(),notifier=new FakeNotifier();
@@ -609,21 +608,19 @@ test('changed provider state after dismissal creates a new case while unchanged 
   const first=await service.observeAudit(delivery,'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
     taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch'],taskUpdatedAt:'task-v1',calendarEtag:'etag-v1',
   });
-  await decisions.finish(first.caseId,'resolved','dismiss');
   const changed=await service.observeAudit(delivery,'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
     taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch','start_mismatch'],taskUpdatedAt:'task-v2',calendarEtag:'etag-v2',
   });
   const repeated=await service.observeAudit({...delivery,id:'reconcile-state-change-2'},'antonio','todoist_snapshot_reconcile_unmapped_conflict',{
     taskId:'task-1',eventId:'event-1',mismatchCategories:['title_mismatch','start_mismatch'],taskUpdatedAt:'task-v2',calendarEtag:'etag-v2',
   });
-  assert.notEqual(first.caseId,changed.caseId);
-  assert.equal(first.caseStatus,'open');
-  assert.equal(changed.caseStatus,'open');
-  assert.equal(repeated.caseId,changed.caseId);
-  assert.equal(notifier.posted.length,2);
+  assert.equal(first.caseStatus,'not_actionable');
+  assert.equal(changed.caseStatus,'not_actionable');
+  assert.equal(repeated.caseStatus,'not_actionable');
+  assert.equal(notifier.posted.length,0);
 });
 
-test('cancelled Calendar projection conflict is a distinct manual decision type', async () => {
+test('cancelled Calendar projection conflict is left for fresh reconciliation without a decision', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
@@ -636,16 +633,15 @@ test('cancelled Calendar projection conflict is a distinct manual decision type'
     new FakePolicyStore(),
   );
   const delivery = { ...todoistDeleteDelivery(), kind: 'reconcile' };
-  await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_cancelled_projection_blocked', {
+  const result = await service.observeAudit(delivery, 'antonio', 'todoist_snapshot_reconcile_cancelled_projection_blocked', {
     taskId: 'task-1', eventId: 'cancelled',
   });
-  assert.equal(notifier.posted[0].type, 'todoist_cancelled_projection_blocked');
-  assert.equal(notifier.posted[0].context.calendarStatus, 'cancelled');
-  assert.equal(notifier.posted[0].permittedActions[0].id, 'acknowledge');
+  assert.equal(result.caseStatus, 'not_actionable');
+  assert.equal(notifier.posted.length, 0);
 });
 
 
-test('guarded retry keeps an unresolved unmapped decision pending and actionable', async () => {
+test('unmapped conflicts no longer expose a manual retry action', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
@@ -665,7 +661,7 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
   };
   const service = new ManualInterventionService(decisions, notifier, async () => ({}), new FakePolicyStore());
 
-  await service.processManualDelivery({
+  await assert.rejects(service.processManualDelivery({
     id: 'manual:unmapped-retry',
     kind: 'manual',
     profile: 'antonio',
@@ -674,15 +670,15 @@ test('guarded retry keeps an unresolved unmapped decision pending and actionable
     headers: {},
     body: '',
     manual: { decisionId: decision.decisionId, action: 'reconcile_now', slackUserId: 'U123' },
-  }, state);
+  }, state), /not permitted/);
 
-  assert.equal(requested, 1);
+  assert.equal(requested, 0);
   assert.equal(decisions.decisions.get(decision.decisionId).status, 'pending');
-  assert.match(notifier.text.at(-1), /Reconciliation already active/);
+  assert.equal(notifier.text.length, 0);
   assert.equal(notifier.updated.length, 0, 'the originating incident card stays open during reconciliation');
 });
 
-test('Calendar-only ambiguity enriches and renders bounded candidate details read-only', async () => {
+test('Calendar-only ambiguity does not create a manual decision', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
@@ -708,23 +704,15 @@ test('Calendar-only ambiguity enriches and renders bounded candidate details rea
     }),
     new FakePolicyStore(),
   );
-  await service.observeAudit(
+  const result = await service.observeAudit(
     { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-calendar-only' },
     'antonio',
     'calendar_snapshot_recurring_identity_conflict',
     { eventId: 'series-event', seriesId: 'series-1', candidateTaskIds: ['task-a', 'task-b'] },
   );
 
-  const decision = notifier.posted[0];
-  assert.equal(decision.type, 'todoist_unmapped_conflict');
-  assert.equal(decision.context.calendarTitle, 'Renewal series');
-  assert.equal(decision.context.calendarStart, '2027-06-11');
-  assert.deepEqual(decision.context.readOnlyCandidates.map((candidate) => candidate.id), ['task-a', 'task-b']);
-  const rendered = JSON.stringify(decisionBlocks(decision));
-  assert.match(rendered, /Conflicting provider objects \(read-only\)/);
-  assert.match(rendered, /Renewal task/);
-  assert.match(rendered, /recurring: yes/);
-  assert.doesNotMatch(rendered, /bind_task:/);
+  assert.equal(result.caseStatus, 'not_actionable');
+  assert.equal(notifier.posted.length, 0);
 });
 
 test('reconciliation actions cannot be saved as automatic policies', async () => {
@@ -795,7 +783,7 @@ for (const entry of ['decision', 'command']) {
 }
 
 for (const protection of ['activeRepair','excluded','rejectedPair']) {
-  for (const ownRepair of [false,true]) test(`Slack Calendar-wins action respects ${protection} with ownRepair=${ownRepair}`,async t=>{
+  for (const ownRepair of [false,true]) test(`Slack Calendar-wins action handles ${protection} with ownRepair=${ownRepair}`,async t=>{
     process.env.STATE_TABLE_NAME ||= 'test-state';
     const decisions=new FakeDecisionStore(),notifier=new FakeNotifier(),writes=[];
     const decision=decisionFor('both_sides_changed',{decisionId:'protected-pair',taskId:'task-1',eventId:'event-1'});
@@ -820,9 +808,11 @@ for (const protection of ['activeRepair','excluded','rejectedPair']) {
     }),new FakePolicyStore());
     await service.processManualDelivery({id:'manual-protected',kind:'manual',profile:'antonio',mode:'aws',headers:{},body:'',
       manual:{decisionId:decision.decisionId,action:'calendar_wins'}},state);
-    assert.equal(writes.length,ownRepair?1:0);
-    assert.equal(decision.status,ownRepair?'resolved':'pending');
-    if(!ownRepair)assert.match(notifier.updated[0].text,/protected by a repair, exclusion, or rejected link/);
+    const persistentlyRejected = protection === 'rejectedPair';
+    const blocked = !persistentlyRejected && !ownRepair;
+    assert.equal(writes.length,blocked?0:1);
+    assert.equal(decision.status,blocked?'pending':'resolved');
+    if(blocked)assert.match(notifier.updated[0].text,/protected by an in-flight repair or explicit exclusion/);
   });
 }
 
