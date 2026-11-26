@@ -515,7 +515,7 @@ export class StateRepository {
         await client.send(new UpdateCommand({
           TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
           UpdateExpression: "SET calendarSyncState = :running, calendarSyncRunningGeneration = :generation, calendarSyncQueuedGeneration = :queuedGeneration REMOVE calendarSyncLeaseUntil",
-          ConditionExpression: "calendarSyncGeneration = :current AND ((calendarSyncState IN (:queued, :dispatching) AND calendarSyncQueuedGeneration = :queuedGeneration) OR calendarSyncState = :idle OR calendarSyncState = :pending)",
+          ConditionExpression: "calendarSyncGeneration = :current AND (attribute_not_exists(calendarSyncCompletedGeneration) OR calendarSyncCompletedGeneration < :current) AND (attribute_not_exists(calendarSyncFailedGeneration) OR calendarSyncFailedGeneration < :current) AND ((calendarSyncState IN (:queued, :dispatching) AND calendarSyncQueuedGeneration = :queuedGeneration) OR calendarSyncState = :idle OR calendarSyncState = :pending)",
           ExpressionAttributeValues: { ":running": "running", ":idle": "idle", ":pending": "pending", ":queued": "queued", ":dispatching": "dispatching", ":generation": dirtyGeneration, ":queuedGeneration": queuedGeneration, ":current": dirtyGeneration },
         }));
         return dirtyGeneration;
