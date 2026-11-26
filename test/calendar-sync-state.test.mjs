@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { GetCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "../dist/dynamodb-capacity.js";
-import { StateRepository } from "../dist/repository.js";
+import { CalendarSyncStartContentionError, StateRepository } from "../dist/repository.js";
 
-function stateDb(t, beforeComplete = async () => {}) {
+function stateDb(t, beforeComplete = async () => {}, beforeStart = async () => {}) {
   const rows = new Map();
   const keyOf = key => `${key.pk}|${key.sk}`;
   let ranCompletionHook = false;
@@ -48,13 +48,17 @@ function stateDb(t, beforeComplete = async () => {}) {
       delete row.calendarSyncRunningGeneration;
       delete row.calendarSyncQueuedGeneration;
     } else if (condition.includes("calendarSyncGeneration = :current")) {
+      await beforeStart(row);
       const canStart = (row.calendarSyncState === "queued" || row.calendarSyncState === "dispatching")
           && row.calendarSyncQueuedGeneration === values[":queuedGeneration"]
         || row.calendarSyncState === "idle" || row.calendarSyncState === "pending";
-      if (row.calendarSyncGeneration !== values[":current"] || !canStart)
+      if (row.calendarSyncGeneration !== values[":current"] || !canStart
+        || (row.calendarSyncCompletedGeneration || 0) >= values[":current"]
+        || (row.calendarSyncFailedGeneration || 0) >= values[":current"])
         throw Object.assign(new Error("conditional"), { name: "ConditionalCheckFailedException" });
       row.calendarSyncState = values[":running"];
       row.calendarSyncRunningGeneration = values[":generation"];
+      row.calendarSyncQueuedGeneration = values[":queuedGeneration"];
       delete row.calendarSyncLeaseUntil;
     } else if (condition.includes("calendarSyncState IN")) {
       const expired = ["queued", "dispatching"].includes(row.calendarSyncState)
@@ -251,4 +255,101 @@ test("duplicate messages for completed or failed generations are acknowledged wi
   assert.equal(await repo.markCalendarWatchNotification("antonio", "duplicate", "channel-a", "2"), second);
   assert.equal(await repo.claimCalendarSyncDispatch("antonio"), undefined);
   assert.equal(await repo.calendarSyncAlreadyHandled("antonio"), true);
+});
+
+test("notification racing the admission CAS is covered by the newest generation", async t => {
+  let repo, attempts = 0;
+  const rows = stateDb(t, undefined, async () => {
+    if (++attempts === 1) await repo.markCalendarWatchNotification("home", "t2", "channel-a", "2");
+  });
+  repo = new StateRepository();
+  const first = await repo.markCalendarWatchNotification("home", "t1", "channel-a", "1");
+  await repo.claimCalendarSyncDispatch("home");
+  await repo.markCalendarSyncQueued("home", first);
+  assert.equal(await repo.startCalendarSync("home", first), first + 1);
+  assert.equal(attempts, 2);
+  assert.equal(await repo.startCalendarSync("home", first), first + 1, "retry resumes exact claim");
+  assert.equal(await repo.completeCalendarSync("home", first + 1), false);
+  assert.equal(await repo.startCalendarSync("home", first), undefined);
+  assert.equal([...rows.values()][0].calendarSyncCompletedGeneration, first + 1);
+});
+
+for (const outcome of ["completed", "superseded", "running"]) {
+  test("admission CAS re-evaluates " + outcome + " state without stealing work", async t => {
+    let attempts = 0;
+    const rows = stateDb(t, undefined, async row => {
+      if (++attempts !== 1) return;
+      if (outcome === "completed") {
+        row.calendarSyncState = "idle";
+        row.calendarSyncCompletedGeneration = row.calendarSyncGeneration;
+        delete row.calendarSyncQueuedGeneration;
+      } else {
+        row.calendarSyncGeneration++;
+        row.calendarSyncQueuedGeneration = row.calendarSyncGeneration;
+        row.calendarSyncState = outcome === "running" ? "running" : "queued";
+        if (outcome === "running") row.calendarSyncRunningGeneration = row.calendarSyncGeneration;
+      }
+    });
+    const repo = new StateRepository();
+    const first = await repo.markCalendarWatchNotification("home", "t1", "channel-a", "1");
+    await repo.claimCalendarSyncDispatch("home");
+    await repo.markCalendarSyncQueued("home", first);
+    assert.equal(await repo.startCalendarSync("home", first), undefined);
+    assert.equal(attempts, 1);
+    const row = [...rows.values()][0];
+    if (outcome === "running") {
+      await repo.failCalendarSync("home", first);
+      assert.equal(row.calendarSyncState, "running");
+      assert.equal(row.calendarSyncRunningGeneration, first + 1);
+    }
+  });
+}
+
+test("bounded admission contention leaves dirty work retryable and later converges", async t => {
+  let repo, attempts = 0, race = true;
+  const rows = stateDb(t, undefined, async () => {
+    attempts++;
+    if (race) await repo.markCalendarWatchNotification("home", "race", "channel-a", String(attempts + 1));
+  });
+  repo = new StateRepository();
+  const first = await repo.markCalendarWatchNotification("home", "t1", "channel-a", "1");
+  await repo.claimCalendarSyncDispatch("home");
+  await repo.markCalendarSyncQueued("home", first);
+  await assert.rejects(repo.startCalendarSync("home", first), CalendarSyncStartContentionError);
+  assert.equal(attempts, 8);
+  const row = [...rows.values()][0];
+  assert.equal(row.calendarSyncState, "queued");
+  assert.equal(row.calendarSyncGeneration, first + 8);
+  assert.equal(row.calendarSyncFailedGeneration, undefined);
+  race = false;
+  assert.equal(await repo.startCalendarSync("home", first), first + 8);
+  assert.equal(await repo.completeCalendarSync("home", first + 8), false);
+  assert.equal(row.calendarSyncCompletedGeneration, first + 8);
+});
+
+test("admission propagates nonconditional errors without retrying", async t => {
+  let attempts = 0;
+  const error = Object.assign(new Error("access denied"), { name:"AccessDeniedException" });
+  stateDb(t, undefined, async () => { attempts++; throw error; });
+  const repo = new StateRepository();
+  const first = await repo.markCalendarWatchNotification("home", "t1", "channel-a", "1");
+  await repo.claimCalendarSyncDispatch("home");
+  await repo.markCalendarSyncQueued("home", first);
+  await assert.rejects(repo.startCalendarSync("home", first), e => e === error);
+  assert.equal(attempts, 1);
+});
+
+test("pending dirty work claimed by an old copy remembers its queued identity for retry", async t => {
+  const rows = stateDb(t);
+  const repo = new StateRepository();
+  const first = await repo.markCalendarWatchNotification("home", "t1", "channel-a", "1");
+  await repo.claimCalendarSyncDispatch("home");
+  await repo.markCalendarSyncQueued("home", first);
+  await repo.startCalendarSync("home", first);
+  const next = await repo.markCalendarWatchNotification("home", "t2", "channel-a", "2");
+  assert.equal(await repo.completeCalendarSync("home", first), true);
+  assert.equal(await repo.startCalendarSync("home", first), next);
+  assert.equal([...rows.values()][0].calendarSyncQueuedGeneration, first);
+  assert.equal(await repo.startCalendarSync("home", first), next);
+  assert.equal(await repo.completeCalendarSync("home", next), false);
 });

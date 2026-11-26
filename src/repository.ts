@@ -182,6 +182,14 @@ function latestOriginalStart(...values: Array<string | undefined>): string | und
   }, undefined);
 }
 
+/** Admission contention is retryable before any provider processing starts. */
+export class CalendarSyncStartContentionError extends Error {
+  constructor() {
+    super("Calendar sync admission raced repeated notifications; retain the source delivery");
+    this.name = "CalendarSyncStartContentionError";
+  }
+}
+
 export class StateRepository {
   constructor(readonly repairOperationId?: string) {}
 
@@ -484,23 +492,40 @@ export class StateRepository {
   /** Worker snapshots the latest dirty generation. A crash leaves it running;
    * the original FIFO record retries and may safely take the same lease. */
   async startCalendarSync(profile: Profile, queuedGeneration: number): Promise<number | undefined> {
-    const watch = await this.getCalendarSyncState(profile);
-    const dirtyGeneration = watch.generation || 0;
-    const completedGeneration = Math.max(watch.completedGeneration || 0, watch.failedGeneration || 0);
-    const pendingNewerWork = watch.state === "pending" && dirtyGeneration > completedGeneration;
-    if ((watch.state === "queued" || watch.state === "dispatching")
-      && (watch.queuedGeneration || 0) > queuedGeneration) return undefined;
-    if (watch.state !== "running" && queuedGeneration <= completedGeneration && !pendingNewerWork) return undefined;
-    if (watch.state === "running" && watch.queuedGeneration === queuedGeneration
-      && Number.isSafeInteger(watch.runningGeneration)) return watch.runningGeneration!;
-    const generation = watch.generation || queuedGeneration;
-    await client.send(new UpdateCommand({
-      TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
-      UpdateExpression: "SET calendarSyncState = :running, calendarSyncRunningGeneration = :generation REMOVE calendarSyncLeaseUntil",
-      ConditionExpression: "calendarSyncGeneration = :current AND ((calendarSyncState IN (:queued, :dispatching) AND calendarSyncQueuedGeneration = :queuedGeneration) OR calendarSyncState = :idle OR calendarSyncState = :pending)",
-      ExpressionAttributeValues: { ":running": "running", ":idle": "idle", ":pending": "pending", ":queued": "queued", ":dispatching": "dispatching", ":generation": generation, ":queuedGeneration": queuedGeneration, ":current": generation },
-    }));
-    return generation;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const watch = await this.getCalendarSyncState(profile);
+      const dirtyGeneration = watch.generation || 0;
+      const completedGeneration = Math.max(watch.completedGeneration || 0, watch.failedGeneration || 0);
+      const pendingNewerWork = watch.state === "pending" && dirtyGeneration > completedGeneration;
+      if (watch.state === "running") {
+        // Only the original queued generation may resume its running pass.
+        if (watch.queuedGeneration === queuedGeneration && Number.isSafeInteger(watch.runningGeneration))
+          return watch.runningGeneration!;
+        if (queuedGeneration <= completedGeneration || (watch.queuedGeneration || 0) > queuedGeneration)
+          return undefined;
+        throw new CalendarSyncStartContentionError();
+      }
+      if ((watch.state === "queued" || watch.state === "dispatching")
+        && (watch.queuedGeneration || 0) > queuedGeneration) return undefined;
+      if (queuedGeneration <= completedGeneration && !pendingNewerWork) return undefined;
+      if (!dirtyGeneration || dirtyGeneration < queuedGeneration
+        || (watch.state !== "queued" && watch.state !== "dispatching" && watch.state !== "idle" && watch.state !== "pending"))
+        throw new CalendarSyncStartContentionError();
+      try {
+        await client.send(new UpdateCommand({
+          TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
+          UpdateExpression: "SET calendarSyncState = :running, calendarSyncRunningGeneration = :generation, calendarSyncQueuedGeneration = :queuedGeneration REMOVE calendarSyncLeaseUntil",
+          ConditionExpression: "calendarSyncGeneration = :current AND (attribute_not_exists(calendarSyncCompletedGeneration) OR calendarSyncCompletedGeneration < :current) AND (attribute_not_exists(calendarSyncFailedGeneration) OR calendarSyncFailedGeneration < :current) AND ((calendarSyncState IN (:queued, :dispatching) AND calendarSyncQueuedGeneration = :queuedGeneration) OR calendarSyncState = :idle OR calendarSyncState = :pending)",
+          ExpressionAttributeValues: { ":running": "running", ":idle": "idle", ":pending": "pending", ":queued": "queued", ":dispatching": "dispatching", ":generation": dirtyGeneration, ":queuedGeneration": queuedGeneration, ":current": dirtyGeneration },
+        }));
+        return dirtyGeneration;
+      } catch (error) {
+        if (!conditionalFailure(error)) throw error;
+        // Ingress can advance the dirty generation between Get and Update.
+        // Re-read all admission predicates instead of retrying a stale CAS.
+      }
+    }
+    throw new CalendarSyncStartContentionError();
   }
 
   /** Complete a pass with a compare-and-swap against the dirty generation. */
@@ -524,10 +549,11 @@ export class StateRepository {
 
   /** A quarantined pass remains dirty, so a later provider retry can dispatch
    * fresh work from the last committed Calendar token. */
-  async failCalendarSync(profile: Profile): Promise<void> {
+  async failCalendarSync(profile: Profile, expectedGeneration?: number): Promise<void> {
     const state = await this.getCalendarSyncState(profile);
     const runningGeneration = state.runningGeneration;
-    if (!Number.isSafeInteger(runningGeneration)) return;
+    if (!Number.isSafeInteger(runningGeneration)
+      || (expectedGeneration !== undefined && runningGeneration !== expectedGeneration)) return;
     try {
       await client.send(new UpdateCommand({
         TableName: this.ensureTable(), Key: key(`CALSYNC#${profile}`),
