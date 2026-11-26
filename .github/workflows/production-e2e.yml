@@ -1,6 +1,8 @@
 name: Production E2E
 
 on:
+  repository_dispatch:
+    types: [automatic-project-comment-migration]
   workflow_dispatch:
     inputs:
       profile:
@@ -30,7 +32,7 @@ concurrency:
 jobs:
   full-journey:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 300
     environment: production
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
@@ -39,6 +41,7 @@ jobs:
       SSM_PREFIX: ${{ vars.SSM_PREFIX }}
       SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
       E2E_RESULT_FILE: e2e-result.json
+      RECONCILIATION_RESULT_FILE: reconciliation-acceptance-result.json
       E2E_RUN_TAG: gh-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Validate protected environment configuration
@@ -86,6 +89,20 @@ jobs:
             --query 'StackResourceDetail.PhysicalResourceId' \
             --output text)"
 
+          sync_queue_physical="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SyncQueue \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+
+          state_table="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id SyncState \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+
           if [[ "$dlq_physical" == https://* ]]; then
             dlq_url="$dlq_physical"
           else
@@ -96,18 +113,35 @@ jobs:
               --output text)"
           fi
 
+          if [[ "$sync_queue_physical" == https://* ]]; then
+            sync_queue_url="$sync_queue_physical"
+          else
+            sync_queue_url="$(aws sqs get-queue-url \
+              --region "$AWS_REGION" \
+              --queue-name "$sync_queue_physical" \
+              --query QueueUrl \
+              --output text)"
+          fi
+
           {
             echo "SYNC_DLQ_URL=$dlq_url"
+            echo "QUEUE_URL=$sync_queue_url"
+            echo "STATE_TABLE_NAME=$state_table"
             echo "GOOGLE_CREDENTIALS_PARAMETER_PREFIX=${SSM_PREFIX%/}/google"
             echo "TODOIST_TOKEN_PARAMETER_PREFIX=${SSM_PREFIX%/}/todoist"
           } >> "$GITHUB_ENV"
 
       - name: Run full provider journey
         env:
-          E2E_PROFILE: ${{ inputs.profile }}
-          E2E_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+          E2E_PROFILE: ${{ inputs.profile || 'antonio' }}
+          E2E_TIMEOUT_SECONDS: ${{ inputs.timeout_seconds || '300' }}
           E2E_CLEANUP: 'true'
         run: node scripts/production-e2e.mjs
+
+      - name: Verify two consecutive clean reconciliations for every profile
+        env:
+          RECONCILIATION_ACCEPTANCE_TIMEOUT_MS: '12600000'
+        run: node scripts/production-reconciliation-acceptance.mjs
 
       - name: Publish E2E summary
         if: always()
@@ -137,6 +171,20 @@ jobs:
             console.log('');
             console.log(`Failure: \`${String(result.error).replaceAll('`', '\\`')}\``);
           }
+          const reconciliationFile = process.env.RECONCILIATION_RESULT_FILE;
+          if (reconciliationFile && fs.existsSync(reconciliationFile)) {
+            const reconciliation = JSON.parse(fs.readFileSync(reconciliationFile, 'utf8'));
+            console.log('');
+            console.log('## Two-pass reconciliation convergence');
+            console.log('');
+            console.log(`Status: **${reconciliation.status}**`);
+            console.log('');
+            console.log('| Profile | Pass 1 | Pass 2 |');
+            console.log('| --- | --- | --- |');
+            for (const [profile, passes] of Object.entries(reconciliation.profiles || {})) {
+              console.log(`| ${profile} | ${passes[0]?.status || 'pending'} | ${passes[1]?.status || 'pending'} |`);
+            }
+          }
           NODE
 
       - name: Upload E2E result
@@ -145,4 +193,12 @@ jobs:
         with:
           name: production-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: e2e-result.json
+          retention-days: 14
+
+      - name: Upload reconciliation convergence result
+        if: always() && hashFiles('reconciliation-acceptance-result.json') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: production-reconciliation-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reconciliation-acceptance-result.json
           retention-days: 14

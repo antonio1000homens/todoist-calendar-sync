@@ -15,11 +15,10 @@ const worker=prefix+"-worker-"+stage;
 test("template inventory discovers expected functions without hardcoding deployment names",()=>{
   const template=[
     "FunctionName: !Sub "+"$"+"{ResourceNamePrefix}-worker-"+"$"+"{Stage}",
-    "FunctionName: !Sub "+"$"+"{ResourceNamePrefix}-review-api-"+"$"+"{Stage}",
     "SomeOtherName: other",
   ].join("\n");
   assert.deepEqual(expectedTemplateFunctions(template,prefix,stage),[
-    prefix+"-review-api-"+stage,worker,
+    worker,
   ]);
   assert.throws(()=>expectedTemplateFunctions("Resources: {}",prefix,stage),/No deployed Lambda/);
 });

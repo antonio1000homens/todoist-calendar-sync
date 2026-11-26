@@ -6,9 +6,7 @@ import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
-import { serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
-import { StateRepository } from "../dist/repository.js";
-import { ReviewStore } from "../dist/review-store.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 
 test("matches Calendar events by normalized title and all-day date", () => {
   const event = { id: "event-1", summary: "  Pay\nInvoice ", start: { date: "2026-09-01" } };
@@ -251,6 +249,7 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
   const audits = [];
   const calendarDeletes = [];
   let todoistUpserts = 0;
+  let currentCompleted = false;
   let deltaItems = [];
 
   const state = {
@@ -290,17 +289,22 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
     async findByTodoistTaskId(taskId) { return taskId === mapping.taskId ? structuredClone(event) : undefined; },
     async deleteEvent(id) { calendarDeletes.push(id); },
   };
+  const projectComment = { id: "provider-mapping", project_id: profiles.home.todoistProjectId,
+    content: serializeMappingComment({ ...mapping, projectId: profiles.home.todoistProjectId }, profiles.home.todoistProjectId) };
   const todoist = {
-    async listProjectComments() { return []; },
+    async listProjectComments(projectId) { return projectId === profiles.home.todoistProjectId ? [projectComment] : []; },
     async getTask(taskId) {
       return { id: taskId, content: event.summary, project_id: profiles.home.todoistProjectId,
-        due: { date: "2026-09-28" }, is_completed: false,
+        due: { date: "2026-09-28" }, is_completed: currentCompleted,
         updated_at: "2026-09-29T13:00:00Z" };
     },
     async upsertTask() { todoistUpserts += 1; return { id: "resurrected" }; },
+    async upsertProjectComment(_projectId, content) { projectComment.content = content; return projectComment; },
+    async updateComment(_id, content) { projectComment.content = content; return projectComment; },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
   const task = { id: mapping.taskId, content: event.summary, due: { date: "2026-09-28" } };
+  currentCompleted = true;
 
   await sync.process({
     id: "complete-history", kind: "todoist", profile: "home", mode: "aws", receivedAt: "2026-09-28T12:00:00Z", headers: {},
@@ -309,7 +313,7 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
 
   assert.equal(activeMapping?.taskId, mapping.taskId, "completion must retain the mapping for seven days");
   assert.deepEqual(calendarDeletes, []);
-  assert.equal(completed.length, 1);
+  assert.equal(completed.length, 1, JSON.stringify(audits));
   assert.equal(completed[0].eventId, event.id);
   assert.equal(audits.at(-1).action, "todoist_completed_calendar_retained");
 
@@ -325,8 +329,9 @@ test("completion retains a standalone Calendar event and blocks resurrection unt
   assert.deepEqual(calendarDeletes, [], "late task deletion must not delete completed Calendar history");
   assert.equal(completed.length, 1);
   assert.equal(activeMapping?.eventId, event.id);
-  assert.equal(audits.at(-1).action, "todoist_completed_mapping_deletion_ignored");
+  assert.equal(audits.at(-1).action, "todoist_stale_delete_replay_suppressed");
 
+  currentCompleted = false;
   await sync.process({
     id: "reopen-history", kind: "todoist", profile: "home", mode: "aws",
     receivedAt: "2026-09-29T13:00:00Z", headers: {},
@@ -628,7 +633,7 @@ test("Todoist canonical no-op preserves canonical project-comment mapping refere
   assert.ok(persisted.mappingRevision>=7);
 });
 
-test("erased Todoist upsert and delete replays emit identity-free suppression audits", async () => {
+test("missing Todoist tasks are confirmed from live provider reads before stale deliveries are ignored", async () => {
   const audits = [];
   const state = {
     async audit(profile, action, detail) { audits.push({ profile, action, detail }); },
@@ -652,9 +657,8 @@ test("erased Todoist upsert and delete replays emit identity-free suppression au
   }
   assert.equal(audits.length, 3);
   for (const audit of audits) {
-    assert.equal(audit.action, "todoist_erased_item_replay_suppressed");
-    assert.equal(Object.hasOwn(audit.detail, "taskId"), false);
-    assert.equal(Object.hasOwn(audit.detail, "deliveryId"), false);
+    assert.equal(audit.action, "todoist_missing_task_delivery_ignored");
+    assert.equal(audit.detail.reason, "provider_task_not_found");
   }
 });
 
@@ -705,7 +709,7 @@ test("deleted Todoist task removes its exact project mapping comment even withou
   assert.equal(commentExists.has(userNote.id), true);
 });
 
-test("Todoist project-comment cleanup failure retries before deletion is acknowledged", async () => {
+test("Calendar deletion failure preserves project-comment correlation for retry", async () => {
   const projectId = profiles.home.todoistProjectId;
   const taskId = "deleted-task-comment-retry";
   const mapping = { profile: "home", eventId: "event-retry", taskId, updatedAt: "2026-11-11T11:00:00.000Z" };
@@ -714,7 +718,7 @@ test("Todoist project-comment cleanup failure retries before deletion is acknowl
       updatedAt: "2026-11-11T12:00:00.000Z" }, projectId) };
   const effects = [];
   let commentExists = true;
-  let commentDeleteAttempts = 0;
+  let calendarDeleteAttempts = 0;
   const state = {
     async getMappingByTaskAnyProfile() { return mapping; },
     async getMappingByTask() { return mapping; },
@@ -729,18 +733,21 @@ test("Todoist project-comment cleanup failure retries before deletion is acknowl
   };
   const todoist = {
     async listProjectComments() { return commentExists ? [comment] : []; },
+    async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
     async getComment() {
       if (!commentExists) { const error = new Error("not found"); error.status = 404; throw error; }
       return comment;
     },
     async deleteComment() {
       effects.push("comment-delete");
-      commentDeleteAttempts++;
-      if (commentDeleteAttempts === 1) { const error = new Error("provider unavailable"); error.status = 503; throw error; }
       commentExists = false;
     },
   };
-  const calendar = { async deleteEvent() { effects.push("calendar-delete"); } };
+  const calendar = { async deleteEvent() {
+    effects.push("calendar-delete");
+    calendarDeleteAttempts++;
+    if (calendarDeleteAttempts === 1) { const error = new Error("provider unavailable"); error.status = 503; throw error; }
+  } };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
 
   const delivery = { id: "deleted-task-comment-retry", kind: "todoist", profile: "home", mode: "aws",
@@ -750,101 +757,31 @@ test("Todoist project-comment cleanup failure retries before deletion is acknowl
     } }),
   };
   await assert.rejects(sync.process(delivery), /provider unavailable/);
-  assert.deepEqual(effects, ["comment-delete"], "do not delete the Calendar event or mapping until comment cleanup can be retried");
-  commentDeleteAttempts = 1;
+  assert.deepEqual(effects, ["calendar-delete"], "keep the exact provider mapping until Calendar confirms deletion");
+  assert.equal(commentExists, true);
   await sync.process(delivery);
-  assert.deepEqual(effects, ["comment-delete", "comment-delete", "calendar-delete", "mapping-delete"]);
+  assert.deepEqual(effects, ["calendar-delete", "calendar-delete", "comment-delete"],
+    "the retry uses the same provider-native mapping and retires it after Calendar confirms absence");
+  assert.equal(commentExists, false);
 });
 
-test("temporary project tombstone suppresses a stale Todoist webhook before task reads or writes",async()=>{
-  const audits=[];let taskReads=0,taskWrites=0;
-  const state={async audit(profile,action,detail){audits.push({profile,action,detail});}};
-  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
-    projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
-    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"});
-  const todoist={async listProjectComments(projectId){assert.equal(projectId,profiles.home.todoistProjectId);return [
-    {id:"tombstone-comment",project_id:projectId,content},
-  ];},async getTask(){taskReads++;return {id:"purged-task"};},async upsertTask(){taskWrites++;}};
-  const sync=new Synchronizer(state,undefined,async()=>({calendar:{},todoist}));
-  await sync.process({id:"late-webhook",kind:"todoist",profile:"home",mode:"aws",
-    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},
-    body:JSON.stringify({event_name:"item:updated",event_data:{id:"purged-task",content:"stale",due:{date:"2026-11-20"}}})});
-  assert.equal(taskReads,0);
-  assert.equal(taskWrites,0);
-  assert.equal(audits.length,1);
-  assert.equal(audits[0].action,"erasure_project_comment_replay_suppressed");
-  assert.deepEqual(audits[0].detail,{side:"todoist",event:"item:updated"});
-});
-
-test("temporary project tombstone suppresses completion lifecycle webhooks before mapping writes",async()=>{
+test("a stale due-bearing Todoist webhook uses current task state and cannot recreate an undated Calendar projection",async()=>{
   const projectId=profiles.home.todoistProjectId;
-  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
-    taskId:"purged-task",eventIds:["purged-event"],createdAt:"2026-11-08T12:00:00.000Z",
-    expiresAt:"2026-11-26T12:00:00.000Z"});
-  for(const [eventName,isCompleted] of [["item:completed",true],["item:uncompleted",false]]) {
-    const audits=[];let taskReads=0,mappingReads=0,writes=0,commentReads=0;
-    const state={async isRetired(){return false;},async getMappingByTaskAnyProfile(){mappingReads++;},
-      async audit(profile,action,detail){audits.push({profile,action,detail});},
-      async putMapping(){writes++;},async deleteMapping(){writes++;},async putRecurrenceLink(){writes++;}};
-    const todoist={async listProjectComments(){commentReads++;return [
-      {id:"tombstone-comment",project_id:projectId,content},
-    ];},async getTask(){taskReads++;return {id:"purged-task",is_completed:isCompleted};}};
-    const sync=new Synchronizer(state,undefined,async()=>({calendar:{},todoist}));
-    await sync.process({id:`late-${eventName}`,kind:"todoist",profile:"home",mode:"aws",
-      receivedAt:"2026-11-08T12:01:00.000Z",headers:{},
-      body:JSON.stringify({event_name:eventName,event_data:{id:"purged-task",is_completed:isCompleted,
-        content:"stale",due:{date:"2026-11-20"}}})});
-    assert.equal(commentReads,1,eventName);
-    assert.equal(taskReads,0,eventName);
-    assert.equal(mappingReads,0,eventName);
-    assert.equal(writes,0,eventName);
-    assert.equal(audits.length,1,eventName);
-    assert.deepEqual(audits[0].detail,{side:"todoist",event:eventName});
-  }
-});
-
-test("temporary project tombstone suppresses a stale Calendar delta before Todoist creation",async()=>{
-  const audits=[];let creates=0;
-  const state={async getSyncToken(){return "sync-token";},async putSyncToken(){},
-    async audit(profile,action,detail){audits.push({profile,action,detail});}};
-  const event={id:"purged-event",status:"confirmed",summary:"stale event",start:{date:"2026-11-20"},end:{date:"2026-11-21"},
-    extendedProperties:{shared:{taskId:"purged-task"}}};
-  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",
-    projectId:profiles.home.todoistProjectId,taskId:"purged-task",eventIds:["purged-event"],
-    createdAt:"2026-11-08T12:00:00.000Z",expiresAt:"2026-11-26T12:00:00.000Z"});
-  const calendar={async listDelta(){return {items:[event],nextSyncToken:"next-token"};}};
-  const todoist={async listProjectComments(projectId){return [{id:"tombstone-comment",project_id:projectId,content}];},
-    async upsertTask(){creates++;}};
+  const audits=[];let taskReads=0,calendarWrites=0;
+  const current={id:"undated-task",content:"Reminder",project_id:projectId,
+    is_completed:false,is_deleted:false,updated_at:"2026-11-12T12:00:00Z"};
+  const state={async audit(_profile,action){audits.push(action);},async syncBlocked(){return false;},
+    async acceptTaskVersion(){return true;}};
+  const todoist={async listProjectComments(){return [];},async getTask(id){assert.equal(id,current.id);taskReads++;return current;}};
+  const calendar={async upsertEvent(){calendarWrites++;throw new Error("stale task must not create a Calendar projection");}};
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
-  await sync.process({id:"late-calendar-delta",kind:"calendar",profile:"home",mode:"aws",
-    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},body:""});
-  assert.equal(creates,0);
-  assert.equal(audits.some(entry=>entry.action==="erasure_project_comment_replay_suppressed"),true);
-});
-
-test("a cancelled Calendar delta for an active project tombstone does not create deleted-conflict review state",async t=>{
-  const projectId=profiles.home.todoistProjectId;
-  const content=serializeDeletionTombstoneComment({schemaVersion:1,profile:"home",projectId,
-    taskId:"purged-task",eventIds:["purged-event"],createdAt:"2026-11-08T12:00:00.000Z",
-    expiresAt:"2026-11-26T12:00:00.000Z"});
-  const audits=[],tokens=[];let reviewLookups=0;
-  const originalListCases=ReviewStore.prototype.listCases;
-  ReviewStore.prototype.listCases=async()=>{reviewLookups++;return {items:[]};};
-  t.after(()=>{ReviewStore.prototype.listCases=originalListCases;});
-  const state=Object.assign(Object.create(StateRepository.prototype),{
-    async getSyncToken(){return "old-sync-token";},async putSyncToken(_profile,token){tokens.push(token);},
-    async isRetired(){return false;},async audit(profile,action,detail){audits.push({profile,action,detail});},
-  });
-  const event={id:"purged-event",status:"cancelled",summary:"deleted by sync worker"};
-  const calendar={async listDelta(token){assert.equal(token,"old-sync-token");return {items:[event],nextSyncToken:"new-sync-token"};}};
-  const todoist={async listProjectComments(id,refresh){assert.equal(id,projectId);assert.equal(refresh,true);
-    return [{id:"tombstone-comment",project_id:id,content}];}};
-  const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
-  await sync.process({id:"cancelled-tombstone-delta",kind:"calendar",profile:"home",mode:"aws",
-    receivedAt:"2026-11-08T12:01:00.000Z",headers:{},body:""});
-  assert.deepEqual(tokens,["new-sync-token"],"the safely suppressed cancellation can advance the Calendar cursor");
-  assert.equal(reviewLookups,0,"the cancellation-only review path must not persist deleted identity");
-  assert.equal(audits.some(entry=>entry.action==="erasure_project_comment_replay_suppressed"),true);
+  await sync.process({id:"late-task-added",kind:"todoist",profile:"home",mode:"aws",
+    receivedAt:"2026-11-12T12:01:00Z",headers:{},
+    body:JSON.stringify({event_name:"item:added",event_data:{id:current.id,content:current.content,
+      project_id:projectId,due:{date:"2026-11-20"}}})});
+  assert.equal(taskReads,2);
+  assert.equal(calendarWrites,0);
+  assert.ok(audits.includes("todoist_calendar_skipped_undated"));
 });
 
 test("pending cancelled annual reset creates a NEW yearly master without reusing deleted Calendar aliases",async()=>{
@@ -876,6 +813,11 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
   };
   let master;
   const calendar={
+    async getEvent(id){
+      if(id==="old-cancelled")return {id,status:"cancelled",updated:"2026-11-07T15:00:00Z"};
+      if(master?.id===id)return structuredClone(master);
+      const error=new Error("Calendar event not found");error.status=404;throw error;
+    },
     async listLinkedEventsByTodoistTaskId(){
       return master?[{id:"old-cancelled",status:"cancelled"},master]
         :[{id:"old-cancelled",status:"cancelled"}];
@@ -907,7 +849,7 @@ test("pending cancelled annual reset creates a NEW yearly master without reusing
   assert.equal(completion,1);
   assert.equal(receipt,undefined);
   assert.equal(mapping.eventId,"new-yearly-master");
-  assert.equal(mapping.recurrenceOwner,"todoist");
+  assert.equal(mapping.recurrenceOwner,undefined);
   assert.equal(mapping.taskId,task.id);
   assert.equal(lease,false);
   assert.ok(logs.some(x=>x.action==="todoist_created_calendar"));

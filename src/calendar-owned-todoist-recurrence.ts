@@ -305,6 +305,15 @@ function localDate(value: string, timeZone: string): string {
   return `${parts.day} ${month} ${parts.year}`;
 }
 
+function localIsoDate(value: string, timeZone: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const parts = localParts(value, timeZone);
+  const month = monthLookup.get(parts.month.toLowerCase().slice(0, 3));
+  const day = Number(parts.day);
+  if (!month || !Number.isInteger(day)) throw new Error("Calendar recurrence date is invalid");
+  return `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
 function ruleFields(rule: string): Record<string, string> | undefined {
   const match = rule.match(/^RRULE:(.+)$/i);
   if (!match) return undefined;
@@ -413,8 +422,8 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
     const originalWeekday = weekdayNames.find((name) => name.toLowerCase().startsWith(originalParts.weekday.toLowerCase()));
     if (!originalMonth || !originalWeekday || !Number.isInteger(originalDay)) return undefined;
     if (fields.FREQ === "DAILY") {
-      const anchorDate = localDate(start, timeZone);
-      const originalDate = localDate(original, timeZone);
+      const anchorDate = localIsoDate(start, timeZone);
+      const originalDate = localIsoDate(original, timeZone);
       const dayDelta = (Date.parse(`${originalDate}T00:00:00Z`) - Date.parse(`${anchorDate}T00:00:00Z`)) / 86_400_000;
       if (!Number.isInteger(dayDelta) || dayDelta < 0 || dayDelta % interval !== 0) return undefined;
     }
@@ -428,8 +437,8 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   }
   const startPhrase = localDate(start, timeZone);
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
-  const localIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const base = { rule, startDate: localIsoDate, ...(time ? { time } : {}) };
+  const recurrenceStartIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const base = { rule, startDate: recurrenceStartIsoDate, ...(time ? { time } : {}) };
   if (fields.FREQ === "DAILY") {
     return { ...base, frequency: "daily", ...(interval > 1 ? { interval } : {}),
       dueString: `every ${interval > 1 ? `${interval} days` : "day"}${timePhrase} starting ${startPhrase}` };

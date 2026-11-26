@@ -29,7 +29,7 @@ function fixture({name="quarterly",start="2027-01-10",due="2027-04-10",
     todoistTimeZone:"Europe/London",today:"2027-02-15",historicalInstances,
     historyInventoryComplete:true,exceptionInventoryComplete:true,explicitExceptions:[],
     destinationHasLinkedEvent:false,destinationHasMapping:false,
-    destinationHasTombstone:false,activeRepairOrErasure:false};
+    activeRepairOrErasure:false};
 }
 const variants=[
   {name:"quarterly", start:"2027-01-10",due:"2027-04-10",
@@ -80,7 +80,7 @@ test("reject unsafe ownership or pending repair before any Calendar write",()=>{
   const e=fixture();
   for(const change of [
     {destinationHasLinkedEvent:true},{destinationHasMapping:true},
-    {destinationHasTombstone:true},{activeRepairOrErasure:true},
+    {activeRepairOrErasure:true},
     {destinationProjectId:"another-project"},
     {mapping:{...e.mapping,originalStart:"2027-01-10"}},
     {sourceProfile:"work"}, {destinationProfile:"home"},
@@ -88,7 +88,7 @@ test("reject unsafe ownership or pending repair before any Calendar write",()=>{
     {today:"2027-05-01"}, {task:{...e.task,project_id:undefined}},
     {task:{...e.task,due:{...e.task.due,date:"2027-04-11"}}},
     {mapping:{...e.mapping,todoistPhaseBVersion:undefined}},
-    {mapping:{...e.mapping,recurrenceOwner:"calendar"}},
+    {mapping:{...e.mapping,seriesId:"another-series"}},
     {sourceMaster:{...e.sourceMaster,etag:undefined}},
     {sourceMaster:{...e.sourceMaster,recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=3;COUNT=3"]}},
     {sourceMaster:{...e.sourceMaster,extendedProperties:{

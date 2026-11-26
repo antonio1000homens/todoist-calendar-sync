@@ -58,7 +58,7 @@ test("no-write, case, source and mapping denial codes are stable",()=>{
     "SOURCE_UNCHANGED");
   assert.equal(assess({...task,is_completed:true}),"UNSUPPORTED_SOURCE");
   assert.equal(assess({...task,project_id:""}),"UNSUPPORTED_SOURCE");
-  assert.equal(assess(task,{...mapping,recurrenceOwner:"calendar"}),"FOREIGN_OR_RECURRING_MAPPING");
+  assert.equal(assess(task,{...mapping,recurrenceOwner:"calendar"}),"ELIGIBLE");
   assert.equal(assess(task,mapping,{...operation,writeStarted:true}),"REPAIR_WRITE_EVIDENCE");
   assert.equal(assess(task,mapping,{...operation,steps:{validated:{status:"done"},provider:{status:"running"}}}),
     "REPAIR_WRITE_EVIDENCE");

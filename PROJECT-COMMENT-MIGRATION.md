@@ -1,16 +1,13 @@
 # Todoist project-comment mapping migration
 
-Issue #64 moves the Todoist-side Calendar mapping breadcrumb from comments on individual tasks to versioned comments on the containing Todoist project.
-
-DynamoDB remains authoritative. Project comments are a recoverable provider-side index, not a replacement for the state table.
+This migration installs the provider-owned correlation used by the current synchronization engine: versioned Todoist project comments paired with Google Calendar `extendedProperties.shared`. Those provider objects identify the live pair; DynamoDB correlation and recurrence rows are legacy migration input and must be retired after the provider pair is verified. DynamoDB retains only the operational state still required during cutover and in-flight work.
 
 ## Runtime behavior after deployment
 
-- Mapping discovery checks `gcp-app2-sync:mapping:v1` project comments first.
-- Legacy task comments are read only when the project index has no matching mapping.
+- Mapping discovery reads versioned project comments and Calendar shared properties. It does not use a DynamoDB mapping or recurrence row to recover a live pair.
 - New/updated mapping comments are written only to the Todoist project and their IDs are persisted as `projectCommentId`.
 - Runtime code no longer persists newly written project-comment IDs in the deprecated `commentId` field.
-- Legacy task comments are read-only migration fallback evidence; they are not updated. Permanent mapping removal may delete a known legacy breadcrumb together with the project mapping comment.
+- Legacy task comments are migration-only evidence; normal synchronization does not use them as a fallback or update them. Cleanup may delete an exact verified legacy breadcrumb after the project mapping is live.
 - Project comments are fetched with cursor pagination and cached for the lifetime of a Todoist client so reconciliation does not issue one comment-list request per task.
 
 ## Phase 1: report
@@ -38,7 +35,7 @@ Review at least these counters before applying:
 - `legacyTaskCommentsAlreadyMissing`: stale IDs removed from mapping metadata when the Todoist comment is already gone.
 - `malformedProjectComments`: v1-marked comments that could not be parsed safely.
 - `duplicateProjectComments`: ambiguous exact task/event project mappings; these are not auto-migrated unless DynamoDB already points at one canonical `projectCommentId`.
-- `missingTasks`, `completedTasks`, `deletedTasks`, `missingCalendarEvents`, `tombstonedMappings`, and `projectMismatches`: mappings not safe to backfill. Completed Todoist tasks may retain Calendar history but must not be re-indexed as live mappings.
+- `missingTasks`, `completedTasks`, `deletedTasks`, `missingCalendarEvents`, and `projectMismatches`: mappings not safe to backfill. Completed Todoist tasks may retain Calendar history but must not be re-indexed as live mappings. Legacy projection tombstones do not override fresh exact provider reads.
 - `failures`: provider/state errors that require investigation.
 
 ## Phase 2: apply
@@ -54,20 +51,20 @@ npm run migrate:project-comments -- work --apply
 Apply mode is idempotent:
 
 1. Existing project mappings are reused rather than duplicated.
-2. DynamoDB mappings are normalized to `projectCommentId` / `mappingRevision`.
-3. A known legacy task-comment ID is retained in `taskCommentId` as migration fallback.
-4. Missing project mappings are created only after the DynamoDB mapping, Todoist task/project ownership, Calendar event, and tombstone state validate successfully.
-5. No task comment is created, edited, or deleted.
+2. Each project mapping is checked against exact Todoist task/project and Calendar event IDs before legacy correlation state is retired.
+3. A known legacy task-comment ID is used only to verify safe cleanup; no live fallback reference is needed afterward.
+4. Missing project mappings are created only when exact provider IDs and live provider reads establish the intended pair.
+5. No task comment is created or edited. A known, exact legacy mapping comment may be deleted only in the separate cleanup phase.
 
 ## Phase 3: verify
 
 Run report mode again. The expected steady state is:
 
-- `projectCommentsMissing = 0` for valid live mappings;
+- `projectCommentsMissing = 0` for valid live provider pairs;
 - no unexplained malformed or duplicate project mappings;
-- remaining legacy task comments are fallback-only and do not receive new writes.
+- legacy DynamoDB correlation rows are retired only after the provider pair verifies.
 
-Do not bulk-delete legacy task comments as part of the initial rollout. Keeping them temporarily makes rollback safe and preserves recovery evidence while the new project index beds in.
+Do not delete legacy task comments during backfill. Verify all provider pairs first, then use the separate cleanup phase to remove only comments whose task ID, application marker, and exact event ID match.
 
 ## Phase 4: clean up legacy task comments
 
@@ -93,7 +90,7 @@ Cleanup is deliberately two-phase. If a mapping is still missing its project com
 
 ## Rollback
 
-Rolling back application code does not require deleting project comments. DynamoDB is still authoritative, and the migration does not remove legacy task comments. If a rollback is required, leave both comment forms in place until the old runtime has been retired again.
+Rolling back application code does not require deleting provider comments. Keep verified project comments in place. A rollback to code that depends on legacy DynamoDB correlation rows is not supported after those rows are retired; use the documented migration rollback window before running correlation retirement.
 
 ## Production GitHub Actions entry point
 
@@ -103,6 +100,17 @@ The [Project comment mapping migration workflow](.github/workflows/project-comme
 - Preview safe deletion with `operation=cleanup-report` first. Production cleanup requires one profile, `operation=cleanup-apply` and exact confirmation `DELETE_VERIFIED_LEGACY_COMMENTS`.
 - After each write, run report mode again and investigate duplicates, provider mismatches, tombstones, failures and rejected comment IDs. Reports contain summary counts only.
 - Do not treat missing Todoist tasks as successful migration: completed, moved, or deleted mappings require a separate ownership/tombstone assessment, not a blind comment creation.
+
+After the automatic post-deployment migration, the workflow runs
+`scripts/legacy-erasure-cutover-audit.mjs`. It strongly scans the state table
+for unfinished erasure operations, active profile leases/fences, journals and
+replay markers, and polls both the operation queue and its DLQ. It waits for
+three consecutive empty snapshots before removing only terminal operation
+records and idle profile markers with conditional writes. It then strongly
+rescans state and queues; live acceptance starts only after no legacy rows or
+messages remain. An unresolved operation, DLQ message, active lease/fence,
+journal, conditional-write race, or scan failure prevents acceptance. Queues
+are never purged, and aggregate counts only are uploaded as evidence.
 
 ## Owner-authorized production migration commands
 

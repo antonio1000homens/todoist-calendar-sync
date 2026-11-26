@@ -4,10 +4,20 @@ import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { googleCredentials, profiles, todoistToken } from "../dist/config.js";
 import { buildProjectMappingIndex } from "../dist/mapping-comments.js";
 import { GoogleCalendar, Todoist } from "../dist/providers.js";
+import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
 
 const PROFILE_NAMES = ["antonio"];
 const DEFAULT_TIMEOUT_SECONDS = 180;
 const POLL_INTERVAL_MS = 3000;
+let lastAcceptanceStage = "provider_scope_verification";
+
+class AcceptanceTimeoutError extends Error {
+  constructor(stage) {
+    super(`Timed out waiting for ${stage}`);
+    this.name = "AcceptanceTimeoutError";
+    this.stage = stage;
+  }
+}
 
 function parseArgs(argv) {
   const values = new Map();
@@ -32,18 +42,18 @@ function parseArgs(argv) {
 }
 
 function log(event, detail = {}) {
+  if (!event.endsWith("_failed") && event !== "run_started" && event !== "run_passed") {
+    lastAcceptanceStage = event.replace(/\b(?:home|antonio|work)\b/gi, "profile");
+  }
   console.log(JSON.stringify({ service: "todoist-calendar-sync-production-e2e", event, ...detail }));
 }
 
-function providerStatus(error) {
-  return Number(error?.status || error?.$metadata?.httpStatusCode || 0);
-}
-
-function providerNotFound(error) {
-  return [404, 410].includes(providerStatus(error));
-}
-
 function safeFailure(error) {
+  if (error instanceof AcceptanceTimeoutError) {
+    const stage = error.stage.replace(/\b(?:home|antonio|work)\b/gi, "profile");
+    return `timeout:${stage}`;
+  }
+  if (error?.name === "AbortError" || error?.name === "TimeoutError") return "provider_request_timeout";
   const status = providerStatus(error);
   return status ? `provider_http_status_${status}` : "acceptance_operation_failed";
 }
@@ -53,21 +63,17 @@ function sleep(ms) {
 }
 
 async function poll(description, timeoutMs, operation, predicate) {
+  lastAcceptanceStage = description.replace(/\b(?:home|antonio|work)\b/gi, "profile");
   const deadline = Date.now() + timeoutMs;
   let lastValue;
-  let lastError;
   while (Date.now() < deadline) {
     try {
       lastValue = await operation();
-      lastError = undefined;
       if (await predicate(lastValue)) return lastValue;
-    } catch (error) {
-      lastError = error;
-    }
+    } catch {}
     await sleep(POLL_INTERVAL_MS);
   }
-  const suffix = lastError ? `; last error: ${lastError.message}` : "";
-  throw new Error(`Timed out waiting for ${description}${suffix}`);
+  throw new AcceptanceTimeoutError(description);
 }
 
 function futureWindow() {
@@ -93,29 +99,27 @@ async function queueDepth(client, url) {
     .reduce((total, name) => total + Number(attributes[name] || 0), 0);
 }
 
-async function safeDeleteCalendar(calendar, eventId) {
-  if (!eventId) return;
-  try {
-    await calendar.deleteEvent(eventId);
-  } catch (error) {
-    if (!providerNotFound(error)) throw error;
-  }
-}
-
-async function safeDeleteTodoist(todoist, taskId) {
-  if (!taskId) return;
-  try {
-    await todoist.deleteTask(taskId);
-  } catch (error) {
-    if (!providerNotFound(error)) throw error;
-  }
-}
-
 async function providerMapping(todoist, projectId, eventId, taskId) {
   const comments = await todoist.listProjectComments(projectId, true);
   const index = buildProjectMappingIndex(comments);
-  return (index.byEventId.get(eventId) || []).find((entry) =>
+  return [...(index.byEventId.get(eventId) || []), ...index.parsed.filter((entry) => entry.payload.masterEventId === eventId)]
+    .find((entry) =>
     entry.payload.taskId === taskId && entry.payload.projectId === projectId)?.payload;
+}
+
+async function providerMappingComment(todoist, projectId, eventId, taskId) {
+  const comments = await todoist.listProjectComments(projectId, true);
+  const index = buildProjectMappingIndex(comments);
+  return [...(index.byEventId.get(eventId) || []), ...index.parsed.filter((entry) => entry.payload.masterEventId === eventId)]
+    .find((entry) =>
+    entry.payload.taskId === taskId && entry.payload.projectId === projectId)?.comment;
+}
+
+async function providerMappingByTask(todoist, projectId, taskId) {
+  const comments = await todoist.listProjectComments(projectId, true);
+  const index = buildProjectMappingIndex(comments);
+  return (index.byTaskId.get(taskId) || []).find((entry) =>
+    entry.payload.projectId === projectId)?.payload;
 }
 
 async function fixtureStillPresent(calendar, todoist, projectId, eventId, taskId) {
@@ -130,10 +134,11 @@ async function fixtureStillPresent(calendar, todoist, projectId, eventId, taskId
     catch (error) { if (!providerNotFound(error)) throw error; }
   }
   const mapping = eventId && taskId ? await providerMapping(todoist, projectId, eventId, taskId) : undefined;
-  return Boolean((event && event.status !== "cancelled") || task || mapping);
+  return Boolean((event && event.status !== "cancelled") || (task && !task.is_deleted) || mapping);
 }
 
 async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
+  lastAcceptanceStage = "provider_scope_verification";
   const config = profiles[profile];
   const calendar = new GoogleCalendar(await googleCredentials(profile), config.calendarId);
   const todoist = new Todoist(await todoistToken(profile));
@@ -169,9 +174,12 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
   let todoistRecurringTaskId;
   let recurringEventId;
   let recurringTaskId;
+  const recurrenceMatrixFixtures = [];
+  const seriesDeletionFixtures = [];
 
   log("profile_started", { profile, token, cleanup });
   try {
+    lastAcceptanceStage = "calendar_event_create";
     const createdEvent = await calendar.upsertEvent({
       summary: title,
       description: "Disposable todoist-calendar-sync production E2E item. Safe to delete.",
@@ -339,7 +347,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       content: todoistRecurringTitle,
       description: "Disposable todoist-calendar-sync production recurring acceptance item. Safe to delete.",
       project_id: config.todoistProjectId,
-      due: { datetime: recurringStart.toISOString(), string: "every day", timezone: calendarTimeZone },
+      due: { string: "every day", is_recurring: true },
     });
     todoistRecurringTaskId = todoistRecurringTask.id;
     if (!todoistRecurringTaskId || !todoistRecurringTask.due?.is_recurring) {
@@ -703,7 +711,420 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       : (afterActiveDeletion.task.due?.datetime || afterActiveDeletion.task.due?.date) === successorStart)) {
       throw new Error("Deleting the active Calendar occurrence did not advance Todoist to the verified successor");
     }
+
+    await safeDeleteCalendar(calendar, recurringEventId);
+    await poll(
+      `${profile} deleting a Calendar recurring master deletes its exact Todoist task and mapping`, timeoutMs,
+      () => fixtureStillPresent(calendar, todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+      present => !present,
+    );
+    log("calendar_series_deletion_verified", { profile, taskId: recurringTaskId, masterId: recurringEventId });
+
+    const todoistSeriesDeletionFixture = {
+      cadence: "todoist_series_delete",
+      title: `[E2E ${token}] Todoist series deletion`,
+      eventId: undefined,
+      taskId: undefined,
+    };
+    seriesDeletionFixtures.push(todoistSeriesDeletionFixture);
+    const todoistSeriesDeletionTask = await todoist.upsertTask({
+      content: todoistSeriesDeletionFixture.title,
+      description: "Disposable recurring series deletion acceptance fixture. Safe to delete.",
+      project_id: config.todoistProjectId,
+      due: { string: "every week", is_recurring: true },
+    });
+    todoistSeriesDeletionFixture.taskId = todoistSeriesDeletionTask.id;
+    const todoistSeriesDeletionMaster = await poll(
+      `${profile} Todoist recurring series creation before deletion`, timeoutMs,
+      () => calendar.findByTodoistTaskId(todoistSeriesDeletionTask.id),
+      event => Boolean(event?.id && event.recurrence?.length),
+    );
+    todoistSeriesDeletionFixture.eventId = todoistSeriesDeletionMaster.id;
+    await poll(
+      `${profile} Todoist recurring series correlation before deletion`, timeoutMs,
+      () => providerMapping(todoist, config.todoistProjectId, todoistSeriesDeletionMaster.id, todoistSeriesDeletionTask.id),
+      mapping => mapping?.taskId === todoistSeriesDeletionTask.id
+        && mapping.masterEventId === todoistSeriesDeletionMaster.id,
+    );
+    await safeDeleteTodoist(todoist, todoistSeriesDeletionTask.id);
+    await poll(
+      `${profile} deleting a Todoist recurring task deletes its exact Calendar master and mapping`, timeoutMs,
+      () => fixtureStillPresent(calendar, todoist, config.todoistProjectId,
+        todoistSeriesDeletionMaster.id, todoistSeriesDeletionTask.id),
+      present => !present,
+    );
+    log("todoist_series_deletion_verified", {
+      profile, taskId: todoistSeriesDeletionTask.id, masterId: todoistSeriesDeletionMaster.id,
+    });
     log("current_occurrence_deletion_verified", { profile, taskIdPreserved: true, successorMapped: true });
+
+    const recurrenceMatrix = [
+      { cadence: "weekly", start: new Date(recurringStart.getTime() + 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10), rule: "RRULE:FREQ=WEEKLY" },
+      { cadence: "monthly", start: new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + 1, 15)).toISOString().slice(0, 10), rule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=15" },
+      { cadence: "yearly", start: new Date(Date.UTC(new Date().getUTCFullYear() + 1, new Date().getUTCMonth(), 15)).toISOString().slice(0, 10), rule: "RRULE:FREQ=YEARLY" },
+      { cadence: "finite_weekly", start: new Date(recurringStart.getTime() + 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10), rule: "RRULE:FREQ=WEEKLY;COUNT=4" },
+    ];
+    for (const spec of recurrenceMatrix) {
+      const fixture = {
+        cadence: spec.cadence,
+        title: `[E2E ${token}] Calendar ${spec.cadence} recurrence`,
+        eventId: undefined,
+        taskId: undefined,
+      };
+      recurrenceMatrixFixtures.push(fixture);
+      const matrixStart = new Date(`${spec.start}T00:00:00.000Z`);
+      const matrixEnd = new Date(matrixStart.getTime() + 24 * 60 * 60 * 1000);
+      const master = await calendar.upsertEvent({
+        summary: fixture.title,
+        description: "Disposable recurrence matrix fixture for production acceptance. Safe to delete.",
+        start: { date: spec.start },
+        end: { date: matrixEnd.toISOString().slice(0, 10) },
+        recurrence: [spec.rule],
+      });
+      fixture.eventId = master.id;
+      if (!fixture.eventId) throw new Error(`Calendar ${spec.cadence} fixture has no master ID`);
+      const projected = await poll(
+        `${profile} Calendar ${spec.cadence} recurrence becomes one native Todoist task`, timeoutMs,
+        () => todoist.listTasks(config.todoistProjectId),
+        (tasks) => tasks.filter((candidate) => candidate.content === fixture.title && candidate.due?.is_recurring).length === 1,
+      ).then((tasks) => tasks.find((candidate) => candidate.content === fixture.title && candidate.due?.is_recurring));
+      fixture.taskId = projected?.id;
+      if (!fixture.taskId) throw new Error(`Calendar ${spec.cadence} recurrence did not retain a native Todoist task`);
+      await poll(
+        `${profile} Calendar ${spec.cadence} recurrence correlation readback`, timeoutMs,
+        async () => {
+          const [readback, mapping] = await Promise.all([
+            calendar.getEvent(fixture.eventId),
+            providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+          ]);
+          return { readback, mapping };
+        },
+        ({ readback, mapping }) => readback.recurrence?.length === 1
+          && readback.extendedProperties?.shared?.taskId === fixture.taskId
+          && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
+          && mapping.calendarProgressVersion === 1 && mapping.activeInstanceId,
+      );
+      if (spec.cadence === "weekly") {
+        const mappingComment = await providerMappingComment(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId);
+        if (!mappingComment?.id) throw new Error("Calendar correlation recovery fixture has no exact project mapping comment");
+        await todoist.deleteComment(mappingComment.id);
+        const eventBeforeRecovery = await calendar.getEvent(fixture.eventId);
+        const recoveryDescription = `${eventBeforeRecovery.description || ""}\nCalendar correlation recovery ${token}`;
+        const retriedDescription = `${recoveryDescription}\nCalendar correlation retry ${token}`;
+        const firstRecoveryWrite = await calendar.upsertEventIfUnchanged({
+          ...eventBeforeRecovery, description: recoveryDescription,
+        }, fixture.eventId, eventBeforeRecovery.etag);
+        // Consecutive provider changes exercise duplicate/out-of-order worker
+        // deliveries after a partial correlation write. The latest live state
+        // must win while the exact task/master pair is repaired in place.
+        await calendar.upsertEventIfUnchanged({
+          ...firstRecoveryWrite, description: retriedDescription,
+        }, fixture.eventId, firstRecoveryWrite.etag);
+        await poll(
+          `${profile} Calendar task ID repairs a missing Todoist project mapping`, timeoutMs,
+          async () => {
+            const [event, task, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { event, task, mapping };
+          },
+          ({ event, task, mapping }) => event.extendedProperties?.shared?.taskId === fixture.taskId
+            && task.id === fixture.taskId && task.description === retriedDescription
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId,
+        );
+        log("calendar_provider_correlation_retry_verified", { profile, taskIdPreserved: true, masterIdPreserved: true, latestStateWon: true });
+
+        const before = await todoist.getTask(fixture.taskId);
+        const masterBeforeRuleEdit = await calendar.getEvent(fixture.eventId);
+        const changed = await calendar.upsertEventIfUnchanged({
+          ...masterBeforeRuleEdit, recurrence: ["RRULE:FREQ=YEARLY"],
+        }, fixture.eventId, masterBeforeRuleEdit.etag);
+        await poll(
+          `${profile} Calendar series rule edit updates its exact Todoist task`, timeoutMs,
+          async () => {
+            const [event, task, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId),
+              todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { event, task, mapping };
+          },
+          ({ event, task, mapping }) => event.recurrence?.includes("RRULE:FREQ=YEARLY")
+            && task.due?.is_recurring && task.due?.string !== before.due?.string
+            && task.id === fixture.taskId && mapping?.taskId === fixture.taskId
+            && mapping.masterEventId === fixture.eventId,
+        );
+        if (changed.id !== fixture.eventId) throw new Error("Calendar series edit changed the master ID");
+        log("calendar_series_rule_edit_verified", { profile, taskIdPreserved: true, masterIdPreserved: true });
+
+        const seriesTitle = `${fixture.title} renamed in Calendar`;
+        const seriesDescription = `Calendar series description edit ${token}`;
+        const beforeCalendarMetadata = await calendar.getEvent(fixture.eventId);
+        const updatedCalendarMetadata = await calendar.upsertEventIfUnchanged({
+          ...beforeCalendarMetadata, summary: seriesTitle, description: seriesDescription,
+        }, fixture.eventId, beforeCalendarMetadata.etag);
+        await poll(
+          `${profile} Calendar series metadata updates its exact Todoist task`, timeoutMs,
+          async () => {
+            const [event, task, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { event, task, mapping };
+          },
+          ({ event, task, mapping }) => event.summary === seriesTitle
+            && event.description === seriesDescription && task.id === fixture.taskId
+            && task.content === seriesTitle && task.description === seriesDescription
+            && task.due?.is_recurring && mapping?.taskId === fixture.taskId
+            && mapping.masterEventId === fixture.eventId,
+        );
+        if (updatedCalendarMetadata.id !== fixture.eventId) throw new Error("Calendar series metadata edit changed the master ID");
+        log("calendar_series_metadata_edit_verified", { profile, taskIdPreserved: true, masterIdPreserved: true });
+      }
+      log("recurrence_matrix_case_verified", { profile, cadence: spec.cadence, nativeTaskPreserved: true });
+    }
+    for (const spec of recurrenceMatrix.filter((candidate) => candidate.cadence !== "finite_weekly")) {
+      const fixture = {
+        cadence: `todoist_${spec.cadence}`,
+        title: `[E2E ${token}] Todoist ${spec.cadence} recurrence`,
+        eventId: undefined,
+        taskId: undefined,
+      };
+      recurrenceMatrixFixtures.push(fixture);
+      const phrase = spec.cadence === "weekly" ? "every week"
+        : spec.cadence === "monthly" ? "every month" : "every year";
+      const task = await todoist.upsertTask({
+        content: fixture.title,
+        description: "Disposable recurrence matrix fixture for production acceptance. Safe to delete.",
+        project_id: config.todoistProjectId,
+        due: { string: phrase, is_recurring: true },
+      });
+      fixture.taskId = task.id;
+      if (!fixture.taskId || !task.due?.is_recurring) throw new Error(`Todoist ${spec.cadence} fixture is not a native recurring task`);
+      const master = await poll(
+        `${profile} Todoist ${spec.cadence} recurrence becomes one Calendar master`, timeoutMs,
+        () => calendar.findByTodoistTaskId(fixture.taskId),
+        (candidate) => Boolean(candidate?.recurrence?.length),
+      );
+      fixture.eventId = master.id;
+      if (!fixture.eventId) throw new Error(`Todoist ${spec.cadence} recurrence did not expose a Calendar master ID`);
+      await poll(
+        `${profile} Todoist ${spec.cadence} recurrence correlation readback`, timeoutMs,
+        async () => {
+          const [readback, mapping] = await Promise.all([
+            calendar.getEvent(fixture.eventId),
+            providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+          ]);
+          return { readback, mapping };
+        },
+        ({ readback, mapping }) => readback.recurrence?.length === 1
+          && readback.extendedProperties?.shared?.taskId === fixture.taskId
+          && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId
+          && mapping.seriesId === fixture.taskId,
+      );
+      if (spec.cadence === "weekly") {
+        const eventBeforeRecovery = await calendar.getEvent(fixture.eventId);
+        const shared = eventBeforeRecovery.extendedProperties?.shared || {};
+        const lostKeys = Object.keys(shared).filter((key) => key === "taskId" || key.startsWith("sync"));
+        if (!lostKeys.includes("taskId") || !lostKeys.includes("syncTaskId"))
+          throw new Error("Todoist correlation recovery fixture does not contain the expected Calendar task identifiers");
+        const clearCorrelation = Object.fromEntries(lostKeys.map((key) => [key, null]));
+        await calendar.updateSharedEventPropertiesIfUnchanged(fixture.eventId, eventBeforeRecovery.etag, clearCorrelation);
+        const taskBeforeRecovery = await todoist.getTask(fixture.taskId);
+        const recoveryDescription = `${taskBeforeRecovery.description || ""}\nTodoist correlation recovery ${token}`;
+        const retriedDescription = `${recoveryDescription}\nTodoist correlation retry ${token}`;
+        await todoist.upsertTask({ ...taskBeforeRecovery, description: recoveryDescription }, fixture.taskId);
+        await todoist.upsertTask({ ...taskBeforeRecovery, description: retriedDescription }, fixture.taskId);
+        await poll(
+          `${profile} Todoist project mapping repairs missing Calendar correlation`, timeoutMs,
+          async () => {
+            const [event, currentTask, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { event, currentTask, mapping };
+          },
+          ({ event, currentTask, mapping }) => event.extendedProperties?.shared?.taskId === fixture.taskId
+            && event.extendedProperties?.shared?.syncTaskId === fixture.taskId
+            && currentTask.id === fixture.taskId && currentTask.description === retriedDescription
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId,
+        );
+        log("todoist_provider_correlation_retry_verified", { profile, taskIdPreserved: true, masterIdPreserved: true, latestStateWon: true });
+
+        const beforeCalendarRuleEdit = await todoist.getTask(fixture.taskId);
+        const masterBeforeCalendarRuleEdit = await calendar.getEvent(fixture.eventId);
+        const changedCalendarRule = await calendar.upsertEventIfUnchanged({
+          ...masterBeforeCalendarRuleEdit, recurrence: ["RRULE:FREQ=YEARLY"],
+        }, fixture.eventId, masterBeforeCalendarRuleEdit.etag);
+        await poll(
+          `${profile} Calendar edit updates a Todoist-created series`, timeoutMs,
+          async () => {
+            const [readback, currentTask, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { readback, currentTask, mapping };
+          },
+          ({ readback, currentTask, mapping }) => readback.recurrence?.includes("RRULE:FREQ=YEARLY")
+            && currentTask.id === fixture.taskId && currentTask.due?.is_recurring
+            && currentTask.due?.string !== beforeCalendarRuleEdit.due?.string
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId,
+        );
+        if (changedCalendarRule.id !== fixture.eventId) throw new Error("Calendar edit changed the Todoist-created master ID");
+        log("calendar_rule_edit_on_todoist_created_series_verified", { profile, taskIdPreserved: true, masterIdPreserved: true });
+
+        const beforeTaskRuleChange = await todoist.getTask(fixture.taskId);
+        const before = beforeTaskRuleChange.due?.string;
+        const changed = await todoist.upsertTask({
+          ...beforeTaskRuleChange,
+          due: { ...beforeTaskRuleChange.due, string: "every month", is_recurring: true },
+        }, fixture.taskId);
+        await poll(
+          `${profile} Todoist series rule edit updates its exact Calendar master`, timeoutMs,
+          async () => {
+            const [readback, currentTask, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId),
+              todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { readback, currentTask, mapping };
+          },
+          ({ readback, currentTask, mapping }) => readback.recurrence?.includes("RRULE:FREQ=MONTHLY")
+            && currentTask.id === fixture.taskId && currentTask.due?.is_recurring
+            && currentTask.due?.string !== before && mapping?.taskId === fixture.taskId
+            && mapping.masterEventId === fixture.eventId && mapping.seriesId === fixture.taskId,
+        );
+        if (changed.id !== fixture.taskId) throw new Error("Todoist series edit changed the task ID");
+        log("todoist_series_rule_edit_verified", { profile, taskIdPreserved: true, masterIdPreserved: true });
+
+        const seriesTitle = `${fixture.title} renamed in Todoist`;
+        const seriesDescription = `Todoist series description edit ${token}`;
+        const beforeTaskMetadata = await todoist.getTask(fixture.taskId);
+        const updatedTaskMetadata = await todoist.upsertTask({
+          ...beforeTaskMetadata, content: seriesTitle, description: seriesDescription,
+        }, fixture.taskId);
+        await poll(
+          `${profile} Todoist series metadata updates its exact Calendar master`, timeoutMs,
+          async () => {
+            const [event, task, mapping] = await Promise.all([
+              calendar.getEvent(fixture.eventId), todoist.getTask(fixture.taskId),
+              providerMapping(todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+            ]);
+            return { event, task, mapping };
+          },
+          ({ event, task, mapping }) => event.summary === seriesTitle
+            && event.description === seriesDescription && task.id === fixture.taskId
+            && task.content === seriesTitle && task.description === seriesDescription
+            && task.due?.is_recurring && event.recurrence?.includes("RRULE:FREQ=MONTHLY")
+            && mapping?.taskId === fixture.taskId && mapping.masterEventId === fixture.eventId,
+        );
+        if (updatedTaskMetadata.id !== fixture.taskId) throw new Error("Todoist series metadata edit changed the task ID");
+        log("todoist_series_metadata_edit_verified", { profile, taskIdPreserved: true, masterIdPreserved: true });
+      }
+      log("recurrence_matrix_case_verified", { profile, cadence: fixture.cadence, nativeMasterPreserved: true });
+    }
+
+    const unsupportedFixture = {
+      cadence: "todoist_finite_unsupported",
+      title: `[E2E ${token}] Todoist finite unsupported recurrence`,
+      eventId: undefined,
+      taskId: undefined,
+    };
+    recurrenceMatrixFixtures.push(unsupportedFixture);
+    const unsupportedUntilDate = new Date(Date.now() + 45 * 24 * 60 * 60 * 1000);
+    const unsupportedUntil = new Intl.DateTimeFormat("en-US", {
+      month: "short", day: "numeric", year: "numeric", timeZone: "UTC",
+    }).format(unsupportedUntilDate);
+    const unsupportedTask = await todoist.upsertTask({
+      content: unsupportedFixture.title,
+      description: "Disposable unsupported recurrence fixture for production acceptance. Safe to delete.",
+      project_id: config.todoistProjectId,
+      due: { string: `every 2 weeks until ${unsupportedUntil}`, is_recurring: true },
+    });
+    unsupportedFixture.taskId = unsupportedTask.id;
+    if (!unsupportedTask.due?.is_recurring) throw new Error("Finite Todoist recurrence fixture was not natively recurring");
+    const unsupportedNativeFixture = {
+      cadence: "todoist_rrule_without_native_admission",
+      title: `[E2E ${token}] Todoist RRULE without native admission`,
+      eventId: undefined,
+      taskId: undefined,
+    };
+    recurrenceMatrixFixtures.push(unsupportedNativeFixture);
+    const unsupportedNativeTask = await todoist.upsertTask({
+      content: unsupportedNativeFixture.title,
+      description: "Disposable RRULE recurrence outside native admission for production acceptance. Safe to delete.",
+      project_id: config.todoistProjectId,
+      due: { string: "every 2 years", is_recurring: true },
+    });
+    unsupportedNativeFixture.taskId = unsupportedNativeTask.id;
+    if (!unsupportedNativeTask.due?.is_recurring) throw new Error("RRULE recurrence fixture was not natively recurring");
+    const unsupportedNativeDue = JSON.stringify({
+      date: unsupportedNativeTask.due.date,
+      datetime: unsupportedNativeTask.due.datetime,
+      string: unsupportedNativeTask.due.string,
+      timezone: unsupportedNativeTask.due.timezone,
+      is_recurring: unsupportedNativeTask.due.is_recurring,
+    });
+    const unsupportedDue = JSON.stringify({
+      date: unsupportedTask.due.date,
+      datetime: unsupportedTask.due.datetime,
+      string: unsupportedTask.due.string,
+      timezone: unsupportedTask.due.timezone,
+      is_recurring: unsupportedTask.due.is_recurring,
+    });
+    const unrelatedFixture = {
+      cadence: "unrelated_one_off_during_unsupported_recurrence",
+      title: `[E2E ${token}] One-off beside unsupported recurrence`,
+      eventId: undefined,
+      taskId: undefined,
+    };
+    recurrenceMatrixFixtures.push(unrelatedFixture);
+    const unrelatedTask = await todoist.upsertTask({
+      content: unrelatedFixture.title,
+      description: "Disposable one-off proving unsupported recurrence does not pause unrelated synchronization. Safe to delete.",
+      project_id: config.todoistProjectId,
+      due: { date: recurringStart.toISOString().slice(0, 10) },
+    });
+    unrelatedFixture.taskId = unrelatedTask.id;
+    const unrelatedEvent = await poll(
+      `${profile} unrelated one-off sync completes beside unsupported recurrence`, timeoutMs,
+      () => calendar.findByTodoistTaskId(unrelatedFixture.taskId),
+      (candidate) => Boolean(candidate?.id && !candidate.recurrence?.length),
+    );
+    unrelatedFixture.eventId = unrelatedEvent.id;
+    const unsupportedCheckDeadline = Date.now() + Math.min(timeoutMs, 30_000);
+    while (Date.now() < unsupportedCheckDeadline) {
+      const [event, mapping, currentTask, nativeEvent, nativeMapping, nativeCurrentTask] = await Promise.all([
+        calendar.findByTodoistTaskId(unsupportedFixture.taskId),
+        providerMappingByTask(todoist, config.todoistProjectId, unsupportedFixture.taskId),
+        todoist.getTask(unsupportedFixture.taskId),
+        calendar.findByTodoistTaskId(unsupportedNativeFixture.taskId),
+        providerMappingByTask(todoist, config.todoistProjectId, unsupportedNativeFixture.taskId),
+        todoist.getTask(unsupportedNativeFixture.taskId),
+      ]);
+      const currentDue = JSON.stringify({
+        date: currentTask.due?.date,
+        datetime: currentTask.due?.datetime,
+        string: currentTask.due?.string,
+        timezone: currentTask.due?.timezone,
+        is_recurring: currentTask.due?.is_recurring,
+      });
+      const nativeCurrentDue = JSON.stringify({
+        date: nativeCurrentTask.due?.date,
+        datetime: nativeCurrentTask.due?.datetime,
+        string: nativeCurrentTask.due?.string,
+        timezone: nativeCurrentTask.due?.timezone,
+        is_recurring: nativeCurrentTask.due?.is_recurring,
+      });
+      if (event || mapping || currentDue !== unsupportedDue
+        || nativeEvent || nativeMapping || nativeCurrentDue !== unsupportedNativeDue)
+        throw new Error("Unsupported Todoist recurrence was projected or changed during unrelated sync");
+      await sleep(POLL_INTERVAL_MS);
+    }
+    log("unsupported_recurrence_nonblocking_behavior_verified", {
+      profile, sourcePreserved: true, oneOffProjectionCreated: false, unrelatedOneOffSynchronized: true,
+    });
 
     if (cleanup) {
       await safeDeleteCalendar(calendar, recurringEventId);
@@ -728,11 +1149,30 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           && !tasks.some((task) => task.id === recurringTaskId) && !mapping,
       );
       log("recurring_cleanup_verified", { profile });
+      for (const fixture of recurrenceMatrixFixtures) {
+        await safeDeleteCalendar(calendar, fixture.eventId);
+        await safeDeleteTodoist(todoist, fixture.taskId);
+        await poll(
+          `${profile} ${fixture.cadence} recurrence fixture cleanup`, timeoutMs,
+          () => fixtureStillPresent(calendar, todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+          (present) => !present,
+        );
+      }
+      log("recurrence_matrix_cleanup_verified", { profile, fixtureCount: recurrenceMatrixFixtures.length });
+      for (const fixture of seriesDeletionFixtures) {
+        await safeDeleteCalendar(calendar, fixture.eventId);
+        await safeDeleteTodoist(todoist, fixture.taskId);
+        await poll(
+          `${profile} ${fixture.cadence} fixture cleanup`, timeoutMs,
+          () => fixtureStillPresent(calendar, todoist, config.todoistProjectId, fixture.eventId, fixture.taskId),
+          present => !present,
+        );
+      }
     }
 
     return { profile, token, cleanup, status: "passed" };
   } catch (error) {
-    log("profile_failed", { profile, error: safeFailure(error) });
+    log("profile_failed", { profile, stage: lastAcceptanceStage, error: safeFailure(error) });
     if (cleanup) {
       try { await safeDeleteCalendar(calendar, eventId); } catch (cleanupError) { log("fallback_calendar_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
       try { await safeDeleteTodoist(todoist, taskId); } catch (cleanupError) { log("fallback_todoist_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
@@ -742,11 +1182,27 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       try { await safeDeleteCalendar(calendar, todoistRecurringEventId); } catch (cleanupError) { log("fallback_calendar_recurrence_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
       try { await safeDeleteCalendar(calendar, recurringEventId); } catch (cleanupError) { log("fallback_recurring_calendar_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
       try { await safeDeleteTodoist(todoist, recurringTaskId); } catch (cleanupError) { log("fallback_recurring_todoist_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
+      for (const fixture of recurrenceMatrixFixtures) {
+        try { await safeDeleteCalendar(calendar, fixture.eventId); } catch (cleanupError) { log("fallback_matrix_calendar_cleanup_failed", { profile, cadence: fixture.cadence, error: safeFailure(cleanupError) }); }
+        try {
+          if (!fixture.taskId) {
+            fixture.taskId = (await todoist.listTasks(config.todoistProjectId))
+              .find((task) => task.content === fixture.title)?.id;
+          }
+          await safeDeleteTodoist(todoist, fixture.taskId);
+        } catch (cleanupError) { log("fallback_matrix_todoist_cleanup_failed", { profile, cadence: fixture.cadence, error: safeFailure(cleanupError) }); }
+      }
+      for (const fixture of seriesDeletionFixtures) {
+        try { await safeDeleteCalendar(calendar, fixture.eventId); } catch (cleanupError) { log("fallback_series_calendar_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
+        try { await safeDeleteTodoist(todoist, fixture.taskId); } catch (cleanupError) { log("fallback_series_todoist_cleanup_failed", { profile, error: safeFailure(cleanupError) }); }
+      }
       const fixtures = [
         [eventId, taskId],
         [reverseEventId, reverseTaskId],
         [todoistRecurringEventId, todoistRecurringTaskId],
         [recurringEventId, recurringTaskId],
+        ...recurrenceMatrixFixtures.map((fixture) => [fixture.eventId, fixture.taskId]),
+        ...seriesDeletionFixtures.map((fixture) => [fixture.eventId, fixture.taskId]),
       ].filter(([fixtureEventId, fixtureTaskId]) => fixtureEventId || fixtureTaskId);
       const verification = await Promise.allSettled(fixtures.map(([fixtureEventId, fixtureTaskId]) => poll(
         `${profile} failure cleanup verification`, Math.min(timeoutMs, 30_000),
@@ -788,13 +1244,19 @@ async function main() {
   } catch (error) {
     let finalDlqDepth;
     try { finalDlqDepth = await queueDepth(sqs, process.env.SYNC_DLQ_URL); } catch { finalDlqDepth = undefined; }
-    const summary = { status: "failed", initialDlqDepth, finalDlqDepth, results, error: safeFailure(error) };
+    const summary = {
+      status: "failed", initialDlqDepth, finalDlqDepth, results,
+      stage: lastAcceptanceStage, error: safeFailure(error),
+    };
     await writeFile(resultFile, `${JSON.stringify(summary, null, 2)}\n`);
     throw error;
   }
 }
 
 main().catch((error) => {
-  console.error(JSON.stringify({ service: "todoist-calendar-sync-production-e2e", event: "run_failed", error: safeFailure(error) }));
+  console.error(JSON.stringify({
+    service: "todoist-calendar-sync-production-e2e", event: "run_failed",
+    stage: lastAcceptanceStage, error: safeFailure(error),
+  }));
   process.exitCode = 1;
 });

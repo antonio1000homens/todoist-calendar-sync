@@ -18,9 +18,6 @@ todoist_calendar_sync_slack_channel="${TODOIST_CALENDAR_SYNC_SLACK_CHANNEL:-}"
 slack_control_allowed_user_ids="${TODOIST_SLACK_ALLOWED_USER_IDS:-}"
 sync_profile_config_json="${SYNC_PROFILE_CONFIG_JSON:-}"
 erasure_calendar_provenance_public_key="${ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64:-}"
-cloudflare_access_issuer="${CF_ACCESS_ISSUER:-}"
-cloudflare_access_audience="${CF_ACCESS_AUDIENCE:-}"
-review_operator_emails="${REVIEW_OPERATOR_EMAILS:-}"
 # A destructive production feature; deployments must explicitly opt in.
 erasure_execution_enabled="${ERASURE_EXECUTION_ENABLED:-false}"
 capacity_reduction_approved="${DYNAMODB_CAPACITY_REDUCTION_APPROVED:-false}"
@@ -71,9 +68,6 @@ validate_parameter_name() {
 require_value STACK_NAME
 require_value TODOIST_CALENDAR_SYNC_SLACK_CHANNEL
 require_value SYNC_PROFILE_CONFIG_JSON
-require_value CF_ACCESS_ISSUER
-require_value CF_ACCESS_AUDIENCE
-require_value REVIEW_OPERATOR_EMAILS
 
 if [[ ! "$stack_name" =~ ^[a-zA-Z][-a-zA-Z0-9]*$ ]]; then
   echo "STACK_NAME is not a valid CloudFormation stack name: $stack_name" >&2
@@ -205,9 +199,6 @@ parameter_overrides=(
   "SlackBotTokenParameter=$slack_bot_token_parameter"
   "TodoistCalendarSyncSlackChannel=$todoist_calendar_sync_slack_channel"
   "ProfileConfigJson=$sam_profile_config_json"
-  "CloudflareAccessIssuer=$cloudflare_access_issuer"
-  "CloudflareAccessAudience=$cloudflare_access_audience"
-  "ReviewOperatorEmails=$review_operator_emails"
 )
 if [[ -n "$erasure_calendar_provenance_public_key" ]]; then
   parameter_overrides+=("ErasureCalendarProvenancePublicKeySpki=$erasure_calendar_provenance_public_key")

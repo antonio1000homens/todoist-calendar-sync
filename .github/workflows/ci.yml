@@ -22,7 +22,6 @@ jobs:
       full: ${{ steps.select.outputs.full }}
       unit: ${{ steps.select.outputs.unit }}
       base: ${{ steps.select.outputs.base }}
-      review: ${{ steps.select.outputs.review }}
       worker: ${{ steps.select.outputs.worker }}
       sam: ${{ steps.select.outputs.sam }}
       public: ${{ steps.select.outputs.public }}
@@ -50,13 +49,13 @@ jobs:
           node scripts/select-ci-checks.mjs "${files[@]}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        if: steps.select.outputs.unit == 'true' || steps.select.outputs.review == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
+        if: steps.select.outputs.unit == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
         with:
           node-version: '22'
           cache: npm
 
       - name: Install dependencies
-        if: steps.select.outputs.unit == 'true' || steps.select.outputs.review == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
+        if: steps.select.outputs.unit == 'true' || steps.select.outputs.worker == 'true' || steps.select.outputs.sam == 'true'
         run: npm ci
 
       - name: Validate production E2E harness syntax
@@ -79,10 +78,6 @@ jobs:
           else
             node --import ./test/setup-env.mjs --test "${changed_tests[@]}"
           fi
-
-      - name: Build review UI
-        if: steps.select.outputs.review == 'true'
-        run: npm run build:review
 
       - name: Test Calendar Cloudflare Worker
         if: steps.select.outputs.worker == 'true'

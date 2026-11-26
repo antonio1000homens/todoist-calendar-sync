@@ -36,9 +36,6 @@ jobs:
       TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL: ${{ vars.TODOIST_CALENDAR_SYNC_BILLING_ALARM_EMAIL }}
       SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
       ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64: ${{ vars.ERASURE_CALENDAR_PROVENANCE_PUBLIC_KEY_SPKI_B64 }}
-      CF_ACCESS_ISSUER: ${{ vars.CF_ACCESS_ISSUER }}
-      CF_ACCESS_AUDIENCE: ${{ vars.CF_ACCESS_AUDIENCE }}
-      REVIEW_OPERATOR_EMAILS: ${{ vars.REVIEW_OPERATOR_EMAILS }}
       # Explicit operator direction on 11 Nov 2026 enables the existing
       # two-Lambda execution gate irrespective of #347/#349 ticket status.
       # Per-operation guards and profile fences remain enforced.
@@ -59,7 +56,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in AWS_REGION AWS_ROLE_TO_ASSUME CODE_BUCKET STACK_NAME RESOURCE_NAME_PREFIX SSM_PREFIX TODOIST_CALENDAR_SYNC_SLACK_CHANNEL SYNC_PROFILE_CONFIG_JSON CF_ACCESS_ISSUER CF_ACCESS_AUDIENCE REVIEW_OPERATOR_EMAILS CLOUDFLARE_API_TOKEN; do
+          for name in AWS_REGION AWS_ROLE_TO_ASSUME CODE_BUCKET STACK_NAME RESOURCE_NAME_PREFIX SSM_PREFIX TODOIST_CALENDAR_SYNC_SLACK_CHANNEL SYNC_PROFILE_CONFIG_JSON CLOUDFLARE_API_TOKEN; do
             if [ -z "${!name:-}" ]; then
               echo "Missing production environment variable: $name" >&2
               exit 1
@@ -95,9 +92,6 @@ jobs:
 
       - name: Build SAM application
         run: PATH="$PWD/node_modules/.bin:$PATH" sam build --template template.yaml
-
-      - name: Build review page
-        run: npm run build:review
 
       - name: Test Calendar Cloudflare Worker
         run: node --test cloudflare/calendar-sync/worker.test.mjs
@@ -170,7 +164,7 @@ jobs:
           fi
           echo "Completed-history cleanup mode and schedule verified."
 
-      - name: Verify erasure execution flag and protocol on both deployed Lambdas
+      - name: Verify erasure worker execution flag and protocol
         shell: bash
         run: |
           set -euo pipefail
@@ -180,12 +174,10 @@ jobs:
             echo "ErasureExecutionEnabled stack parameter mismatch." >&2
             exit 1
           fi
-          for logical_id in ReviewApiFunction ErasureWorkerFunction; do
+          for logical_id in ErasureWorkerFunction; do
             function_name="$(aws cloudformation describe-stack-resource --region "$AWS_REGION" --stack-name "$STACK_NAME" --logical-resource-id "$logical_id" --query 'StackResourceDetail.PhysicalResourceId' --output text)"
-            qualifier=()
-            if [ "$logical_id" = "ReviewApiFunction" ]; then qualifier=(--qualifier live); fi
-            deployed_flag="$(aws lambda get-function-configuration --region "$AWS_REGION" --function-name "$function_name" "${qualifier[@]}" --query 'Environment.Variables.ERASURE_EXECUTION_ENABLED' --output text)"
-            deployed_protocol="$(aws lambda get-function-configuration --region "$AWS_REGION" --function-name "$function_name" "${qualifier[@]}" --query 'Environment.Variables.ERASURE_PROTOCOL_VERSION' --output text)"
+            deployed_flag="$(aws lambda get-function-configuration --region "$AWS_REGION" --function-name "$function_name" --query 'Environment.Variables.ERASURE_EXECUTION_ENABLED' --output text)"
+            deployed_protocol="$(aws lambda get-function-configuration --region "$AWS_REGION" --function-name "$function_name" --query 'Environment.Variables.ERASURE_PROTOCOL_VERSION' --output text)"
             if [ "$deployed_flag" != "$expected" ] || [ "$deployed_protocol" != "1" ]; then
               echo "$logical_id: deployed erasure flag/protocol differs from approved configuration." >&2
               exit 1
@@ -206,11 +198,4 @@ jobs:
 
       - name: Deploy Calendar Cloudflare Worker
         shell: bash
-        run: |
-          set -euo pipefail
-          review_api_url="$(aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='ReviewApiFunctionUrl'].OutputValue | [0]" --output text)"
-          if [ -z "$review_api_url" ] || [ "$review_api_url" = "None" ]; then
-            echo "ReviewApiFunctionUrl output is missing from the deployed stack." >&2
-            exit 1
-          fi
-          npx wrangler deploy --config cloudflare/calendar-sync/wrangler.toml --var "TODOIST_CALENDAR_SYNC_REVIEW_API_URL:$review_api_url"
+        run: npx wrangler deploy --config cloudflare/calendar-sync/wrangler.toml

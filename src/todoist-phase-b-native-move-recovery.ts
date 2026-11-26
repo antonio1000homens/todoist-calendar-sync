@@ -1,5 +1,5 @@
 import { profiles } from "./config.js";
-import { buildProjectMappingIndex, attachProjectCommentReference } from "./mapping-comments.js";
+import { buildProjectMappingIndex, attachProjectCommentReference, mappingFromProjectMappingComment } from "./mapping-comments.js";
 import { classifyCalendarRule, occurrenceDates } from "./recurrence-semantics.js";
 import { phaseBNativeMoveStage, type PhaseBNativeMoveStage } from "./todoist-phase-b-move-handoff.js";
 import {
@@ -26,8 +26,7 @@ import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } fro
  */
 export type PhaseBNativeRecoveryState = Pick<StateRepository,
   "getPhaseBNativeMoveStage" | "phaseBNativeMoveControlsMatch"
-  | "getMappingByTaskAnyProfile" | "getRecurrenceLink"
-  | "getCalendarProjectionTombstone" | "mutationAllowed"
+  | "mutationAllowed"
   | "commitPhaseBNativeMoveIfUnchanged" | "audit">;
 
 export interface PhaseBNativeRecoveryRequest {
@@ -64,21 +63,6 @@ function equalStage(before: PhaseBNativeMoveStage, after: PhaseBNativeMoveStage 
   return Boolean(after && Object.entries(before).every(([field, value]) =>
     (after as unknown as Record<string, unknown>)[field] === value));
 }
-function stageMatchedMapping(stage: PhaseBNativeMoveStage, m: Mapping, l: RecurrenceLink): boolean {
-  return m.profile === stage.sourceProfile && m.projectId === profiles[stage.sourceProfile].todoistProjectId
-    && m.taskId === stage.taskId && m.eventId === stage.sourceMasterId
-    && m.masterEventId === stage.sourceMasterId
-    && m.recurrenceOwner === "todoist" && m.todoistPhaseBVersion === 1
-    && m.seriesId === stage.taskId && m.updatedAt === stage.sourceMappingUpdatedAt
-    && Boolean(m.activeInstanceId && m.projectCommentId)
-    && m.originalStart === stage.destinationStart && m.activeEffectiveStart === stage.destinationStart
-    && l.profile === stage.sourceProfile && l.owner === "todoist"
-    && l.taskId === stage.taskId && l.eventId === m.eventId
-    && l.masterEventId === m.masterEventId && l.seriesId === stage.taskId
-    && l.activeInstanceId === m.activeInstanceId
-    && l.originalStart === stage.destinationStart && l.activeEffectiveStart === stage.destinationStart
-    && l.updatedAt === stage.sourceLinkUpdatedAt;
-}
 function exactHistoryLineage(master: CalendarEvent, stage: PhaseBNativeMoveStage): boolean {
   const s=master.extendedProperties?.shared;
   return Boolean(master.id===stage.sourceMasterId
@@ -111,17 +95,10 @@ export async function inspectInterruptedPhaseBNativeMove(
       "missing_or_mismatched_immutable_stage");
     requireEvidence(await state.phaseBNativeMoveControlsMatch(stage),
       "stage_controls_incomplete_or_owned_by_another_operation");
-    const [allowedFrom,allowedTo,mapping,link,existingDestinationLink,sourceTombstone,destinationTombstone]=await Promise.all([
+    const [allowedFrom,allowedTo]=await Promise.all([
       state.mutationAllowed(sourceProfile),state.mutationAllowed(destinationProfile),
-      state.getMappingByTaskAnyProfile(taskId),state.getRecurrenceLink(sourceProfile,taskId),
-      state.getRecurrenceLink(destinationProfile,taskId),
-      state.getCalendarProjectionTombstone(sourceProfile,taskId),
-      state.getCalendarProjectionTombstone(destinationProfile,taskId),
     ]);
-    requireEvidence(allowedFrom && allowedTo && !sourceTombstone && !destinationTombstone,
-      "erasure_or_tombstone_prevents_stage_recovery");
-    requireEvidence(mapping && link && !existingDestinationLink && stageMatchedMapping(stage,mapping,link),
-      "source_mapping_or_recurrence_link_version_drift");
+    requireEvidence(allowedFrom && allowedTo,"erasure_prevents_stage_recovery");
     const [task,sourceMaster,destinationMaster,sourceZone,destinationZone,todoistZone,
       sourceComments,destinationComments]=await Promise.all([
         destination.todoist.getTask(taskId),
@@ -169,8 +146,6 @@ export async function inspectInterruptedPhaseBNativeMove(
       destinationStart:stage.destinationStart,destinationRule:stage.destinationRule,
       firstThreeDestinationOccurrences:next as [string,string,string],historyTaskId:taskId,
     };
-    requireEvidence(equalStage(stage,phaseBNativeMoveStage({plan,sourceMapping:mapping,sourceLink:link})),
-      "stage_operation_fingerprint_differs_from_verified_handoff");
     verifyHistoryMaster(sourceMaster,sourceMaster,plan);
     const intended=newNativeMaster(task,plan,destinationZone);
     verifyDestinationMaster(destinationMaster,intended);
@@ -205,8 +180,23 @@ export async function inspectInterruptedPhaseBNativeMove(
       && !dstIndex.malformed.some(e=>String(e.comment.content||"").includes(taskId))
       && dst[0].payload.profile===destinationProfile
       && dst[0].payload.eventId===stage.successorMasterId
-      && dst[0].comment.id!==mapping.projectCommentId,
+      && dst[0].payload.seriesId===taskId
+      && dst[0].payload.todoistPhaseBVersion===1,
       "project_breadcrumb_handoff_not_complete_or_ambiguous");
+    const mapping=mappingFromProjectMappingComment(dst[0]);
+    requireEvidence(mapping.masterEventId===stage.successorMasterId
+      && mapping.originalStart===stage.destinationStart
+      && mapping.activeInstanceId===active.id,
+      "destination_project_breadcrumb_identity_mismatch");
+    const sourceMapping:Mapping={...mapping,profile:sourceProfile,
+      projectId:profiles[sourceProfile].todoistProjectId,eventId:stage.sourceMasterId,
+      masterEventId:stage.sourceMasterId,updatedAt:stage.sourceMappingUpdatedAt};
+    const link:RecurrenceLink={profile:sourceProfile,owner:"todoist",taskId,
+      seriesId:taskId,eventId:stage.sourceMasterId,masterEventId:stage.sourceMasterId,
+      activeInstanceId:active.id,originalStart:stage.destinationStart,
+      activeEffectiveStart:stage.destinationStart,updatedAt:stage.sourceLinkUpdatedAt};
+    requireEvidence(equalStage(stage,phaseBNativeMoveStage({plan,sourceMapping,sourceLink:link})),
+      "stage_operation_fingerprint_differs_from_provider_verified_handoff");
     const timestamp=new Date().toISOString();
     const draft:Mapping={
       ...mapping,profile:destinationProfile,projectId:profiles[destinationProfile].todoistProjectId,
@@ -229,8 +219,9 @@ export async function inspectInterruptedPhaseBNativeMove(
       && sourceMaster.etag===(await source.calendar.getEvent(stage.sourceMasterId)).etag
       && destinationMaster.etag===(await destination.calendar.getEvent(stage.successorMasterId)).etag,
       "stage_or_provider_changed_during_read_only_verification");
-    return {status:"ready_to_commit",stage,plan,sourceMapping:mapping,sourceLink:link,
-      destinationMapping,destinationLink,sourceEtag:sourceMaster.etag!,
+    return {status:"ready_to_commit",stage,plan,sourceMapping,destinationLink,
+      sourceLink:link,
+      destinationMapping,sourceEtag:sourceMaster.etag!,
       destinationEtag:destinationMaster.etag!,task};
   } catch(error) {
     return {status:"quarantined",operationId:expectedOperationId,
@@ -238,13 +229,11 @@ export async function inspectInterruptedPhaseBNativeMove(
   }
 }
 
-/** Explicit operator-only CAS repair of a FULLY finished provider move.
- * Not wired to webhooks, reconciliation, reviews or unattended Lambda jobs. */
+/** Retry-safe finalization of a fully completed provider move. Eligibility
+ * comes from exact live provider evidence plus the immutable stage and controls. */
 export async function completeVerifiedPhaseBNativeMoveStage(
   input: PhaseBNativeRecoveryRequest,
 ): Promise<PhaseBNativeRecoveryReady> {
-  if(process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_RECOVERY_APPROVED!=="true")
-    throw new Error("Exact-stage native recovery requires explicit operator approval");
   const release=await (input.acquireWriterLeases||acquireCrossProfileWriterLeases)(
     input.sourceProfile,input.destinationProfile);
   try {
@@ -264,7 +253,7 @@ export async function completeVerifiedPhaseBNativeMoveStage(
       destinationMapping:verifiedAgain.destinationMapping,
       destinationLink:verifiedAgain.destinationLink,
     });
-    if(!committed)throw new Error("Exact-stage atomic owner handoff CAS failed");
+    if(!committed)throw new Error("Exact-stage control finalization CAS failed");
     await input.state.audit(input.destinationProfile,
       "todoist_phase_b_native_staged_handoff_verified_and_committed",{
         taskId:input.taskId,operationId:input.expectedOperationId,

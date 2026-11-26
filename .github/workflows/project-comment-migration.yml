@@ -8,6 +8,9 @@ on:
       - infrastructure/github-actions-migration-access.yaml
   issue_comment:
     types: [created]
+  workflow_run:
+    workflows: [Deploy production]
+    types: [completed]
   workflow_dispatch:
     inputs:
       profile:
@@ -38,7 +41,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 concurrency:
@@ -47,13 +50,17 @@ concurrency:
 
 jobs:
   migrate:
-    # Only the repository owner can author migration commands, and only on the
-    # merged safety PR #61 (not arbitrary issues or pull requests).
+    # Manual migration commands are owner-issued. Successful production deploys
+    # automatically start the all-profile migration.
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.number == 61 &&
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'master') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.number == 61 &&
        github.event.comment.user.login == github.repository_owner &&
-       startsWith(github.event.comment.body, '/mapping-migrate '))
+       startsWith(github.event.comment.body, '/mapping-migrate ')) ||
+      (github.event_name != 'workflow_run' && github.event_name != 'issue_comment')
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 45
@@ -64,7 +71,7 @@ jobs:
       SSM_PREFIX: ${{ vars.SSM_PREFIX }}
       SYNC_PROFILE_CONFIG_JSON: ${{ vars.SYNC_PROFILE_CONFIG_JSON }}
       MIGRATION_PROFILE: ${{ inputs.profile || 'all' }}
-      MIGRATION_OPERATION: ${{ inputs.operation || 'report' }}
+      MIGRATION_OPERATION: ${{ inputs.operation || (github.event_name == 'workflow_run' && 'automatic-post-deployment' || 'report') }}
       MIGRATION_CONFIRMATION: ${{ inputs.confirmation }}
       MIGRATION_REQUEST: ${{ github.event.comment.body || '' }}
     steps:
@@ -100,6 +107,10 @@ jobs:
 
       - name: Validate migration guardrails
         shell: bash
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          GITHUB_EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
           for name in AWS_REGION AWS_ROLE_TO_ASSUME STACK_NAME SSM_PREFIX SYNC_PROFILE_CONFIG_JSON; do
@@ -110,6 +121,12 @@ jobs:
           done
           case "$MIGRATION_OPERATION" in
             report|cleanup-report) ;;
+            automatic-post-deployment)
+              [[ "$GITHUB_EVENT_NAME" == workflow_run && "$MIGRATION_PROFILE" == all && \
+                 "$GITHUB_EVENT_CONCLUSION" == success && "$GITHUB_EVENT_BRANCH" == master ]] || {
+                echo 'Automatic migration requires a successful production deployment from master' >&2
+                exit 1
+              } ;;
             tombstones-report)
               [[ "$MIGRATION_PROFILE" != all ]] || {
                 echo 'Expired tombstone report requires one profile' >&2
@@ -135,7 +152,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -165,8 +182,28 @@ jobs:
             --logical-resource-id SyncState \
             --query 'StackResourceDetail.PhysicalResourceId' \
             --output text)"
+          erasure_queue="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id ErasureOperationQueue \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+          erasure_dlq="$(aws cloudformation describe-stack-resource \
+            --region "$AWS_REGION" \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id ErasureOperationDlq \
+            --query 'StackResourceDetail.PhysicalResourceId' \
+            --output text)"
+          if [[ "$erasure_queue" != https://* ]]; then
+            erasure_queue="$(aws sqs get-queue-url --region "$AWS_REGION" --queue-name "$erasure_queue" --query QueueUrl --output text)"
+          fi
+          if [[ "$erasure_dlq" != https://* ]]; then
+            erasure_dlq="$(aws sqs get-queue-url --region "$AWS_REGION" --queue-name "$erasure_dlq" --query QueueUrl --output text)"
+          fi
           {
             echo "STATE_TABLE_NAME=$state_table"
+            echo "ERASURE_OPERATION_QUEUE_URL=$erasure_queue"
+            echo "ERASURE_OPERATION_DLQ_URL=$erasure_dlq"
             echo "GOOGLE_CREDENTIALS_PARAMETER_PREFIX=${SSM_PREFIX%/}/google"
             echo "TODOIST_TOKEN_PARAMETER_PREFIX=${SSM_PREFIX%/}/todoist"
           } >> "$GITHUB_ENV"
@@ -183,6 +220,10 @@ jobs:
             npm run cleanup:erasure-tombstones -- "${args[@]}" | tee project-comment-migration-results.json
             exit 0
           fi
+          if [[ "$MIGRATION_OPERATION" == automatic-post-deployment ]]; then
+            node scripts/automatic-project-comment-migration.mjs | tee project-comment-migration-results.json
+            exit 0
+          fi
           args=("$MIGRATION_PROFILE")
           case "$MIGRATION_OPERATION" in
             report) ;;
@@ -191,6 +232,13 @@ jobs:
             cleanup-apply) args+=(--cleanup-legacy --apply) ;;
           esac
           npm run migrate:project-comments -- "${args[@]}" | tee project-comment-migration-results.json
+
+      - name: Wait for legacy erasure operations and fences to drain
+        if: success() && github.event_name == 'workflow_run' && env.MIGRATION_OPERATION == 'automatic-post-deployment'
+        env:
+          LEGACY_CUTOVER_RESULT_FILE: legacy-cutover-audit-result.json
+          LEGACY_CUTOVER_TIMEOUT_MS: '1500000'
+        run: node scripts/legacy-erasure-cutover-audit.mjs
 
       - name: Summarise migration results
         if: always()
@@ -213,19 +261,31 @@ jobs:
             process.exit(0);
           }
           const result = JSON.parse(text.slice(start).trim());
-          const columns = ['mappingsScanned','projectCommentsMissing','projectCommentsCreated','legacyTaskCommentsFound','legacyTaskCommentsCleanupEligible','legacyTaskCommentsDeleted','legacyTaskCommentsAlreadyMissing','legacyTaskCommentsCleanupRejected','duplicateProjectComments','missingTasks','missingCalendarEvents','tombstonedMappings','failures'];
-          console.log('| Profile | ' + columns.join(' | ') + ' |');
-          console.log('| --- | ' + columns.map(() => '---:').join(' | ') + ' |');
-          for (const [profile, info] of Object.entries(result.results || {})) {
-            console.log('| ' + profile + ' | ' + columns.map(k => info[k] ?? 0).join(' | ') + ' |');
+          const columns = ['mappingsScanned','projectCommentsMissing','projectCommentsCreated','legacyTaskCommentsFound','legacyTaskCommentsCleanupEligible','legacyTaskCommentsDeleted','legacyTaskCommentsAlreadyMissing','legacyTaskCommentsCleanupRejected','legacyCorrelationRowsRetired','legacyCorrelationRetirementRejected','duplicateProjectComments','missingTasks','missingCalendarEvents','failures'];
+          console.log('| Phase | Profile | ' + columns.join(' | ') + ' |');
+          console.log('| --- | --- | ' + columns.map(() => '---:').join(' | ') + ' |');
+          const phases = result.phases || { results: result.results || {} };
+          for (const [phase, profiles] of Object.entries(phases)) {
+            for (const [profile, info] of Object.entries(profiles || {})) {
+              console.log('| ' + phase + ' | ' + profile + ' | ' + columns.map(k => info[k] ?? 0).join(' | ') + ' |');
+            }
           }
           NODE
           fi
 
       - name: Upload sanitized migration result
-        if: always() && hashFiles('project-comment-migration-results.json') != ''
+        if: always() && (hashFiles('project-comment-migration-results.json') != '' || hashFiles('legacy-cutover-audit-result.json') != '')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: project-comment-migration-${{ github.run_id }}-${{ github.run_attempt }}
-          path: project-comment-migration-results.json
+          path: |
+            project-comment-migration-results.json
+            legacy-cutover-audit-result.json
           retention-days: 14
+
+      - name: Dispatch production acceptance after automatic migration
+        if: success() && github.event_name == 'workflow_run' && env.MIGRATION_OPERATION == 'automatic-post-deployment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/dispatches" -f event_type=automatic-project-comment-migration

@@ -14,14 +14,14 @@ import {
 import { defaultProviderClientFactory, type ProviderClientFactory } from "./mutation-budget.js";
 import { assertReplayAdmissionIfEnabled, mappingReplayIdentity } from "./erasure-replay-barrier.js";
 import { acquireErasureProtocolLease, getErasureEpoch } from "./erasure-protocol.js";
-import { StateRepository, type CalendarProjectionTombstone } from "./repository.js";
-import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
+import { StateRepository } from "./repository.js";
+import type { CalendarEvent, CompletedCalendarProjection, Mapping, Profile, TodoistTask } from "./types.js";
 
 const tableName = process.env.STATE_TABLE_NAME || "";
 
 export interface ProjectCommentMigrationState {
-  putMapping(mapping: Mapping): Promise<void>;
-  getCalendarProjectionTombstone(profile: Profile, taskId: string): Promise<CalendarProjectionTombstone | undefined>;
+  retireMigratedMappingCorrelation?(mapping: Mapping): Promise<boolean>;
+  putCompletedCalendarProjection?(projection: CompletedCalendarProjection): Promise<void>;
   audit(profile: Profile, action: string, detail: Record<string, unknown>): Promise<void>;
 }
 
@@ -31,6 +31,8 @@ export interface ProjectCommentMigrationClients {
   };
   calendar: {
     getEvent(eventId: string): Promise<CalendarEvent>;
+    ensureTaskCorrelation?(eventId: string, taskId: string, expectedTaskId?: string,
+      mapping?: Partial<Mapping>): Promise<CalendarEvent>;
   };
 }
 
@@ -52,7 +54,8 @@ export interface ProjectCommentMigrationSummary {
   completedTasks: number;
   deletedTasks: number;
   missingCalendarEvents: number;
-  tombstonedMappings: number;
+  legacyCorrelationRowsRetired: number;
+  legacyCorrelationRetirementRejected: number;
   projectMismatches: number;
   duplicateProjectComments: number;
   failures: number;
@@ -77,7 +80,8 @@ function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommen
     completedTasks: 0,
     deletedTasks: 0,
     missingCalendarEvents: 0,
-    tombstonedMappings: 0,
+    legacyCorrelationRowsRetired: 0,
+    legacyCorrelationRetirementRejected: 0,
     projectMismatches: 0,
     duplicateProjectComments: 0,
     failures: 0,
@@ -86,6 +90,41 @@ function emptySummary(apply: boolean, index: ProjectMappingIndex): ProjectCommen
 
 function providerMissing(error: unknown): boolean {
   return [404, 410].includes(Number((error as { status?: number }).status));
+}
+
+async function ensureCalendarCorrelation(
+  profile: Profile, mapping: Mapping, event: CalendarEvent,
+  calendar: ProjectCommentMigrationClients["calendar"],
+): Promise<void> {
+  if (typeof calendar.ensureTaskCorrelation !== "function")
+    throw new Error("Calendar conditional correlation writer unavailable");
+  const eventId = mapping.masterEventId || mapping.eventId;
+  const current = await calendar.getEvent(eventId);
+  const shared = current.extendedProperties?.shared || {};
+  if (shared.taskId && shared.taskId !== mapping.taskId)
+    throw new Error("Calendar event already names a different Todoist task");
+  await calendar.ensureTaskCorrelation(eventId, mapping.taskId, undefined, mapping);
+  const readback = await calendar.getEvent(eventId);
+  const observed = readback.extendedProperties?.shared || {};
+  const expected = {
+    taskId: mapping.taskId,
+    syncTaskId: mapping.taskId,
+    syncSchemaVersion: "2",
+    syncProfile: profile,
+    syncCalendarId: profiles[profile].calendarId,
+    syncEventId: eventId,
+    ...(mapping.seriesId ? { syncSeriesId: mapping.seriesId } : {}),
+    ...(mapping.masterEventId ? { syncMasterEventId: mapping.masterEventId } : {}),
+    ...(mapping.activeInstanceId ? { syncActiveInstanceId: mapping.activeInstanceId } : {}),
+    ...(mapping.originalStart ? { syncOriginalStart: mapping.originalStart } : {}),
+    ...(mapping.activeEffectiveStart ? { syncActiveEffectiveStart: mapping.activeEffectiveStart } : {}),
+    ...(mapping.calendarProgressVersion === 1 ? { syncProgressVersion: "1" } : {}),
+    ...(mapping.completedThroughOriginalStart ? { syncCompletedThrough: mapping.completedThroughOriginalStart } : {}),
+  };
+  if (readback.id !== eventId
+    || (event.id !== eventId && event.recurringEventId !== eventId)
+    || Object.entries(expected).some(([key, value]) => observed[key] !== value))
+    throw new Error("Calendar provider correlation readback did not match the exact Todoist mapping");
 }
 
 function exactProjectComments(index: ProjectMappingIndex, mapping: Mapping): TodoistCommentRecord[] {
@@ -127,12 +166,8 @@ async function validateMapping(
   state: ProjectCommentMigrationState,
   clients: ProjectCommentMigrationClients,
   summary: ProjectCommentMigrationSummary,
+  allowCompleted = false,
 ): Promise<{ task: TodoistTask; event: CalendarEvent } | undefined> {
-  if (await state.getCalendarProjectionTombstone(profile, mapping.taskId)) {
-    summary.tombstonedMappings += 1;
-    return undefined;
-  }
-
   let task: TodoistTask;
   try {
     task = await clients.todoist.getTask(mapping.taskId);
@@ -149,7 +184,7 @@ async function validateMapping(
   }
   if (task.is_completed || taskState.checked || taskState.completed_at) {
     summary.completedTasks += 1;
-    return undefined;
+    if (!allowCompleted) return undefined;
   }
   if (task.project_id && task.project_id !== projectId) {
     summary.projectMismatches += 1;
@@ -188,10 +223,56 @@ export async function migrateProjectComments(
   clients: ProjectCommentMigrationClients,
   apply = false,
   cleanupLegacy = false,
+  retireLegacyCorrelation = false,
 ): Promise<ProjectCommentMigrationSummary> {
   const projectId = profiles[profile].todoistProjectId;
   const index = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId));
   const summary = emptySummary(apply, index);
+  const retireVerifiedCorrelation = async (mapping: Mapping, task?: TodoistTask): Promise<void> => {
+    const observed = buildProjectMappingIndex(await clients.todoist.listProjectComments(projectId, true));
+    const verified = findProjectMappingComment(observed, mapping);
+    if (!verified || verified.payload.profile !== profile || verified.payload.projectId !== projectId
+      || verified.payload.taskId !== mapping.taskId || verified.payload.eventId !== mapping.eventId) {
+      summary.legacyCorrelationRetirementRejected += 1;
+      await state.audit(profile, "project_comment_migration_correlation_retirement_rejected", {
+        taskId: mapping.taskId, eventId: mapping.eventId,
+        reason: "provider_project_comment_readback_mismatch",
+      });
+      return;
+    }
+    if (task && (task.is_completed || task.completed_at)) {
+      const completedAt = task.completed_at || task.updated_at;
+      if (!completedAt || !state.putCompletedCalendarProjection) {
+        summary.legacyCorrelationRetirementRejected += 1;
+        await state.audit(profile, "project_comment_migration_correlation_retirement_rejected", {
+          taskId: mapping.taskId, eventId: mapping.eventId,
+          reason: "completed_history_retention_marker_unavailable",
+        });
+        return;
+      }
+      await state.putCompletedCalendarProjection({
+        profile, taskId: mapping.taskId, eventId: mapping.eventId, completedAt,
+        ...(mapping.seriesId ? { seriesId: mapping.seriesId } : {}),
+        ...(mapping.masterEventId ? { masterEventId: mapping.masterEventId } : {}),
+        ...(mapping.originalStart ? { originalStart: mapping.originalStart } : {}),
+      });
+    }
+    const retired = await state.retireMigratedMappingCorrelation?.(mapping) ?? false;
+    if (retired) summary.legacyCorrelationRowsRetired += 1;
+    else {
+      summary.legacyCorrelationRetirementRejected += 1;
+      await state.audit(profile, "project_comment_migration_correlation_retirement_rejected", {
+        taskId: mapping.taskId, eventId: mapping.eventId,
+        reason: "legacy_rows_changed_or_cross_profile_owner_conflict",
+      });
+    }
+  };
+  const rejectCorrelationRetirement = async (mapping: Mapping, reason: string): Promise<void> => {
+    summary.legacyCorrelationRetirementRejected += 1;
+    await state.audit(profile, "project_comment_migration_correlation_retirement_rejected", {
+      taskId: mapping.taskId, eventId: mapping.eventId, reason,
+    });
+  };
 
   for (const mapping of mappings) {
     summary.mappingsScanned += 1;
@@ -220,10 +301,32 @@ export async function migrateProjectComments(
         if (explicitLegacyId) summary.legacyTaskCommentsFound += 1;
         const recovered = recoverMappingFromProjectComment(mapping, projectEntry);
 
+        let validatedPair: { task: TodoistTask; event: CalendarEvent } | undefined;
+        if (apply) {
+          validatedPair = await validateMapping(profile, projectId, recovered, state, clients, summary, true);
+          if (!validatedPair) continue;
+          await ensureCalendarCorrelation(profile, recovered, validatedPair.event, clients.calendar);
+        }
+
+        let correlationRetirementValidated = false;
+        let retirementTask: TodoistTask | undefined;
+        if (retireLegacyCorrelation) {
+          const valid = validatedPair
+            || await validateMapping(profile, projectId, recovered, state, clients, summary, true);
+          if (!valid) {
+            await rejectCorrelationRetirement(mapping, "provider_pair_not_eligible_for_verified_retirement");
+            continue;
+          }
+          correlationRetirementValidated = true;
+          retirementTask = valid.task;
+        }
+
         let cleanupValidated = false;
         let legacyCommentPresent = false;
         if (cleanupLegacy && explicitLegacyId) {
-          const valid = await validateMapping(profile, projectId, mapping, state, clients, summary);
+          const pairTaskCompleted = validatedPair?.task.is_completed || validatedPair?.task.completed_at;
+          const valid = pairTaskCompleted ? undefined : validatedPair
+            || await validateMapping(profile, projectId, recovered, state, clients, summary);
           if (valid) {
             try {
               const legacyComment = await clients.todoist.getComment(explicitLegacyId);
@@ -279,8 +382,12 @@ export async function migrateProjectComments(
             projectEntry.comment.id,
             projectEntry.payload.mappingRevision,
           );
-          await state.putMapping(normalized);
+          await upsertProjectMappingComment(clients.todoist, normalized, projectId,
+            projectEntry.payload.calendarUrl, index);
           summary.migratedMappings += 1;
+        }
+        if (apply && retireLegacyCorrelation && correlationRetirementValidated) {
+          await retireVerifiedCorrelation(mapping, retirementTask);
         }
         continue;
       }
@@ -288,8 +395,15 @@ export async function migrateProjectComments(
       summary.projectCommentsMissing += 1;
       const legacy = await findLegacyComment(clients.todoist, mapping);
       if (legacy) summary.legacyTaskCommentsFound += 1;
-      const valid = await validateMapping(profile, projectId, mapping, state, clients, summary);
-      if (!valid || !apply) continue;
+      const valid = await validateMapping(profile, projectId, mapping, state, clients, summary, retireLegacyCorrelation);
+      if (!valid) {
+        if (retireLegacyCorrelation) await rejectCorrelationRetirement(mapping,
+          "provider_pair_not_eligible_for_verified_retirement");
+        continue;
+      }
+      if (!apply) continue;
+
+      await ensureCalendarCorrelation(profile, mapping, valid.event, clients.calendar);
 
       const migrated = await upsertProjectMappingComment(
         clients.todoist,
@@ -303,9 +417,11 @@ export async function migrateProjectComments(
         valid.event.htmlLink,
         index,
       );
-      await state.putMapping(migrated);
       summary.projectCommentsCreated += 1;
       summary.migratedMappings += 1;
+      if (retireLegacyCorrelation) {
+        await retireVerifiedCorrelation(mapping, valid.task);
+      }
     } catch (error) {
       summary.failures += 1;
       if (apply) await state.audit(profile, "project_comment_migration_mapping_failed", {
@@ -345,8 +461,50 @@ export async function runProjectCommentMigration(
   cleanupLegacy = false,
   state: ProjectCommentMigrationState = new StateRepository(),
   clientFactory: ProviderClientFactory = defaultProviderClientFactory,
+  retireLegacyCorrelation = false,
 ): Promise<ProjectCommentMigrationSummary> {
   const mappings = await listMappingsForProjectCommentMigration(profile);
   const clients = await clientFactory(profile);
-  return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy);
+  return migrateProjectComments(profile, mappings, state, clients, apply, cleanupLegacy, retireLegacyCorrelation);
+}
+
+export interface AutomaticProjectCommentMigrationResult {
+  mode: "automatic-post-deployment";
+  status: "completed" | "failed";
+  phases: Record<string, Partial<Record<Profile, ProjectCommentMigrationSummary>>>;
+}
+
+/** Backfill every profile, then clean verified task-comment fallbacks. A
+ * bounded second cleanup pass handles mappings created during the first one.
+ * The runner is injectable so ordering and retry behavior stay testable. */
+export async function runAutomaticProjectCommentMigration(
+  run: (profile: Profile, apply: boolean, cleanupLegacy: boolean, retireLegacyCorrelation?: boolean) => Promise<ProjectCommentMigrationSummary> =
+    (profile, apply, cleanupLegacy, retireLegacyCorrelation = false) =>
+      runProjectCommentMigration(profile, apply, cleanupLegacy, undefined, undefined, retireLegacyCorrelation),
+  selectedProfiles: Profile[] = ["antonio", "home", "work"],
+): Promise<AutomaticProjectCommentMigrationResult> {
+  const profilesToRun = [...new Set(selectedProfiles)];
+  const phases: AutomaticProjectCommentMigrationResult["phases"] = {
+    backfill: {}, cleanup: {}, cleanupRetry: {}, correlationRetirement: {},
+  };
+  for (const profile of profilesToRun)
+    phases.backfill[profile] = await run(profile, true, false);
+  for (const profile of profilesToRun)
+    phases.cleanup[profile] = await run(profile, true, true);
+  const retryProfiles = profilesToRun.filter(profile =>
+    (phases.cleanup[profile]?.projectCommentsCreated || 0) > 0);
+  for (const profile of retryProfiles)
+    phases.cleanupRetry[profile] = await run(profile, true, true);
+  for (const profile of profilesToRun)
+    phases.correlationRetirement[profile] = await run(profile, true, true, true);
+
+  const allSummaries = Object.values(phases).flatMap(phase => Object.values(phase));
+  const unresolvedCleanupCreation = retryProfiles.some(profile =>
+    (phases.cleanupRetry[profile]?.projectCommentsCreated || 0) > 0);
+  const status = allSummaries.some(summary => summary.failures > 0
+    || summary.malformedProjectComments > 0 || summary.duplicateProjectComments > 0
+    || summary.legacyTaskCommentsCleanupRejected > 0
+    || summary.legacyCorrelationRetirementRejected > 0) || unresolvedCleanupCreation
+    ? "failed" : "completed";
+  return { mode: "automatic-post-deployment", status, phases };
 }

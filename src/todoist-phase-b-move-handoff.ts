@@ -1,25 +1,8 @@
 import {createHash} from "node:crypto";
-import {mappingEventLookupAttributes,mappingLookupAttributes,mappingOwnerLookupAttributes,
-  recurrenceLookupAttributes} from "./profile-lookup.js";
 import type {PhaseBNativeMovePlan} from "./todoist-phase-b-native-move.js";
 import type {Mapping,Profile,RecurrenceLink} from "./types.js";
 
-const profiles:Profile[]=["home","antonio","work"];
 const key=(pk:string,sk="STATE")=>({pk,sk});
-const versionedSource=(previous:Mapping)=>({
-  ConditionExpression:"#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND recurrenceOwner = :owner AND seriesId = :series AND masterEventId = :master AND todoistPhaseBVersion = :native",
-  ExpressionAttributeNames:{"#profile":"profile"},
-  ExpressionAttributeValues:{":profile":previous.profile,":task":previous.taskId,
-    ":event":previous.eventId,":updated":previous.updatedAt,":owner":"todoist",
-    ":series":previous.seriesId,":master":previous.masterEventId,":native":1},
-});
-const versionedLink=(link:RecurrenceLink)=>({
-  ConditionExpression:"#profile = :profile AND taskId = :task AND eventId = :event AND updatedAt = :updated AND #owner = :owner AND seriesId = :series AND masterEventId = :master",
-  ExpressionAttributeNames:{"#profile":"profile","#owner":"owner"},
-  ExpressionAttributeValues:{":profile":link.profile,":task":link.taskId,
-    ":event":link.eventId,":updated":link.updatedAt,":owner":"todoist",
-    ":series":link.seriesId,":master":link.masterEventId},
-});
 
 /** Must stay until a verified resume or a successful handoff; no TTL silently
  * removes a partially applied Calendar cutover. Success deletes it atomically. */
@@ -58,7 +41,7 @@ export function phaseBNativeMoveStage(input:Pick<PhaseBNativeMoveHandoff,
     || !m.updatedAt || !l.updatedAt || m.todoistPhaseBVersion!==1
     || m.profile!==plan.sourceProfile || m.taskId!==plan.taskId
     || m.eventId!==plan.sourceMasterId || m.masterEventId!==plan.sourceMasterId
-    || m.recurrenceOwner!=="todoist" || m.seriesId!==plan.taskId
+    || m.seriesId!==plan.taskId
     || l.profile!==m.profile || l.taskId!==m.taskId
     || l.owner!=="todoist" || l.masterEventId!==m.masterEventId
     || l.eventId!==m.eventId || l.seriesId!==m.seriesId)
@@ -101,49 +84,15 @@ export function phaseBNativeMoveBeginTransaction(table:string,
     {Put:{TableName:table,Item:{...phaseBNativeMoveStageKey(stage.taskId),...stage,createdAt},
       ConditionExpression:"attribute_not_exists(pk)"}},
     ...controls,
-    {ConditionCheck:{TableName:table,
-      Key:key(`TASKOWNER#${stage.taskId}`,"MAP"),...versionedSource(m)}},
-    {ConditionCheck:{TableName:table,
-      Key:key(`RECURRENCE#${stage.sourceProfile}#${stage.taskId}`),...versionedLink(l)}},
-    {ConditionCheck:{TableName:table,
-      Key:key(`TASK#${stage.destinationProfile}#${stage.taskId}`,"MAP"),
-      ConditionExpression:"attribute_not_exists(pk)"}},
-    {ConditionCheck:{TableName:table,
-      Key:key(`EVENT#${stage.destinationProfile}#${stage.successorMasterId}`,"MAP"),
-      ConditionExpression:"attribute_not_exists(pk)"}},
-    ...profiles.filter(p=>p!==stage.sourceProfile&&p!==stage.destinationProfile).map(profile=>({
-      ConditionCheck:{TableName:table,
-        Key:key(`TASK#${profile}#${stage.taskId}`,"MAP"),
-        ConditionExpression:"attribute_not_exists(pk)"},
-    })),
   ];
 }
 
-/** Atomic handoff AFTER independent provider verification: no source row can
- * disappear before the new task owner, destination rows and link are stored.
- * Completed history on the source calendar is untouched. */
+/** Finalize only transient coordination state after provider comments, masters,
+ * and occurrences have independently verified the completed handoff. */
 export function phaseBNativeMoveCommitTransaction(table:string,
   input:PhaseBNativeMoveHandoff, now:string):Record<string,unknown>[]{
   const stage=phaseBNativeMoveStage(input);
-  const previous=input.sourceMapping,oldLink=input.sourceLink;
-  const next=input.destinationMapping,newLink=input.destinationLink;
-  if(!table||!now || next.profile!==stage.destinationProfile
-    || next.taskId!==stage.taskId || next.eventId!==stage.successorMasterId
-    || next.masterEventId!==stage.successorMasterId
-    || next.recurrenceOwner!=="todoist" || next.todoistPhaseBVersion!==1
-    || next.seriesId!==stage.taskId || next.originalStart!==stage.destinationStart
-    || !next.activeInstanceId || !next.updatedAt
-    || newLink.profile!==next.profile || newLink.taskId!==next.taskId
-    || newLink.owner!=="todoist" || newLink.eventId!==next.eventId
-    || newLink.masterEventId!==next.masterEventId
-    || newLink.seriesId!==next.seriesId || newLink.activeInstanceId!==next.activeInstanceId
-    || !newLink.updatedAt)
-    throw new Error("Phase B move destination mapping must be independently verified");
-  const incoming={...next,updatedAt:now};
-  const destRow=(Key:{pk:string;sk:string},attributes:Record<string,string>)=>({
-    Put:{TableName:table,Item:{...incoming,...Key,...attributes},
-      ConditionExpression:"attribute_not_exists(pk)"},
-  });
+  if(!table||!now)throw new Error("Phase B move finalization needs table and timestamp");
   const controls=phaseBNativeMoveControlKeys(stage).map(Key=>({
     Update:{TableName:table,Key,
       UpdateExpression:"SET fencedAt = :now, providerUpdatedAt = :empty REMOVE activeRepair",
@@ -151,37 +100,9 @@ export function phaseBNativeMoveCommitTransaction(table:string,
       ExpressionAttributeValues:{":id":stage.operationId,":now":now,":empty":""}},
   }));
   return [
-    {Delete:{TableName:table,
-      Key:key(`EVENT#${stage.sourceProfile}#${stage.sourceMasterId}`,"MAP"),
-      ...versionedSource(previous)}},
-    {Delete:{TableName:table,
-      Key:key(`TASK#${stage.sourceProfile}#${stage.taskId}`,"MAP"),
-      ...versionedSource(previous)}},
-    destRow(key(`EVENT#${stage.destinationProfile}#${stage.successorMasterId}`,"MAP"),
-      mappingEventLookupAttributes(incoming)),
-    destRow(key(`TASK#${stage.destinationProfile}#${stage.taskId}`,"MAP"),
-      mappingLookupAttributes(incoming)),
-    {Put:{TableName:table,
-      Item:{...incoming,...key(`TASKOWNER#${stage.taskId}`,"MAP"),
-        ...mappingOwnerLookupAttributes(incoming)},
-      ...versionedSource(previous)}},
-    {Delete:{TableName:table,Key:key(`RECURRENCE#${stage.sourceProfile}#${stage.taskId}`),
-      ...versionedLink(oldLink)}},
-    {Put:{TableName:table,Item:{...newLink,updatedAt:now,
-      ...key(`RECURRENCE#${stage.destinationProfile}#${stage.taskId}`),
-      ...recurrenceLookupAttributes(newLink)},
-      ConditionExpression:"attribute_not_exists(pk)"}},
     {Delete:{TableName:table,Key:phaseBNativeMoveStageKey(stage.taskId),
-      ConditionExpression:"operationId = :id AND sourceMappingUpdatedAt = :version AND sourceLinkUpdatedAt = :link",
-      ExpressionAttributeValues:{":id":stage.operationId,":version":previous.updatedAt,
-        ":link":oldLink.updatedAt}}},
+      ConditionExpression:"operationId = :id",
+      ExpressionAttributeValues:{":id":stage.operationId}}},
     ...controls,
-    {ConditionCheck:{TableName:table,Key:key(`COMPLETED_EVENT#${stage.destinationProfile}#${stage.successorMasterId}`),
-      ConditionExpression:"attribute_not_exists(pk)"}},
-    ...profiles.filter(p=>p!==stage.sourceProfile&&p!==stage.destinationProfile).map(profile=>({
-      ConditionCheck:{TableName:table,
-        Key:key(`TASK#${profile}#${stage.taskId}`,"MAP"),
-        ConditionExpression:"attribute_not_exists(pk)"},
-    })),
   ];
 }

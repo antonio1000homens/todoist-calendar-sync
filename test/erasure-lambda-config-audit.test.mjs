@@ -34,7 +34,7 @@ test("Lambda config audit reads every published version and alias target but omi
     }
     throw new Error("Unexpected AWS command");
   }};
-  const report=await collectRuntimeConfigAudit(client,{functionNames:["todoist-calendar-sync-review-api-production"],region:"eu-west-2"});
+  const report=await collectRuntimeConfigAudit(client,{functionNames:["todoist-calendar-sync-worker-production"],region:"eu-west-2"});
   const fn=report.functions[0];
   assert.equal(fn.versionCount,3);assert.equal(fn.publishedVersionCount,2);
   assert.deepEqual(fn.aliases,[{name:"live",version:"2",revisionId:null,weightedTargets:{"1":0.25}}]);

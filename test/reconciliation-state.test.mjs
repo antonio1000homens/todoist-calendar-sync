@@ -43,6 +43,14 @@ test('progress and terminal results persist with reserved attributes aliased', a
   assert.deepEqual(db.get('RECONCILE_OUTCOME#home', 'old').result, { repaired: 3, scanned: 5 });
 });
 
+test('scheduled reconciliation records operational completion without creating a Slack notification', async (t) => {
+  const db = reconciliationDatabase(t, [run({ reason: 'scheduled', requester: 'scheduler' })]);
+  await new StateRepository().completeReconciliation('home', 'old', 0, { scanned: 12 });
+  assert.equal(db.get('RECONCILE#home').notificationPending, false);
+  assert.equal(db.get('RECONCILE_OUTCOME#home', 'old').notificationPending, false);
+  assert.equal(db.get('RECONCILE_OUTCOME#home', 'old').result.scanned, 12);
+});
+
 for (const terminal of ['succeeded', 'needs_review']) {
   test(`run-scoped ${terminal} summary remains distinct from open review cases after an earlier failure`, async (t) => {
     const db = reconciliationDatabase(t, [run()]);

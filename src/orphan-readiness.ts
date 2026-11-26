@@ -48,9 +48,9 @@ function recurring(snapshot: ReviewSnapshot): boolean {
   }
   const event = object as {
     recurringEventId?: string; recurrence?: string[];
-    extendedProperties?: { shared?: { syncRecurrenceOwner?: string } };
+    extendedProperties?: { shared?: { syncSeriesId?: string } };
   };
-  return Boolean(event.recurringEventId || event.recurrence?.length || event.extendedProperties?.shared?.syncRecurrenceOwner);
+  return Boolean(event.recurringEventId || event.recurrence?.length || event.extendedProperties?.shared?.syncSeriesId);
 }
 function displayedTitle(snapshot: ReviewSnapshot | undefined, id: string): string {
   if (!snapshot?.object) return "Title unavailable";

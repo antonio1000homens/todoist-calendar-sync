@@ -1,4 +1,4 @@
-import type { Mapping, Profile } from "./types.js";
+import type { Mapping, Profile, ProviderSyncBaseline } from "./types.js";
 
 export const MAPPING_COMMENT_MARKER = "todoist-calendar-sync:mapping:v2";
 export const LEGACY_MAPPING_COMMENT_MARKER_V1 = "todoist-calendar-sync:mapping:v1";
@@ -29,6 +29,7 @@ export interface ProjectMappingCommentPayload {
   taskId: string;
   eventId: string;
   calendarUrl?: string;
+  /** Legacy read-only field. New comments never write owner labels. */
   recurrenceOwner?: "calendar" | "todoist";
   seriesId?: string;
   masterEventId?: string;
@@ -42,6 +43,7 @@ export interface ProjectMappingCommentPayload {
   syncedTitle?: string;
   syncedDescription?: string;
   syncedDue?: string;
+  syncBaseline?: ProviderSyncBaseline;
   baselineVersion?: 1;
   mappingRevision: number;
   updatedAt: string;
@@ -77,10 +79,6 @@ export function mappingFromProjectMappingComment(parsed: ParsedMappingComment): 
     eventId: payload.eventId, projectCommentId: comment.id,
     ...(payload.calendarId ? { calendarId: payload.calendarId } : {}),
     ...(payload.mappingRevision ? { mappingRevision: payload.mappingRevision } : {}),
-    ...(payload.calendarProgressVersion === 1 || payload.calendarNativeRecurring
-      ? { recurrenceOwner: "calendar" as const }
-      : payload.todoistPhaseBVersion === 1 ? { recurrenceOwner: "todoist" as const }
-        : payload.recurrenceOwner ? { recurrenceOwner: payload.recurrenceOwner } : {}),
     ...(payload.seriesId ? { seriesId: payload.seriesId } : {}),
     ...(payload.masterEventId ? { masterEventId: payload.masterEventId } : {}),
     ...(payload.activeInstanceId ? { activeInstanceId: payload.activeInstanceId } : {}),
@@ -88,11 +86,11 @@ export function mappingFromProjectMappingComment(parsed: ParsedMappingComment): 
     ...(payload.activeEffectiveStart ? { activeEffectiveStart: payload.activeEffectiveStart } : {}),
     ...(payload.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(payload.completedThroughOriginalStart ? { completedThroughOriginalStart: payload.completedThroughOriginalStart } : {}),
-    ...(payload.calendarNativeRecurring === true ? { calendarNativeRecurring: true } : {}),
     ...(payload.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 as const } : {}),
     ...(payload.syncedTitle !== undefined ? { syncedTitle: payload.syncedTitle } : {}),
     ...(payload.syncedDescription !== undefined ? { syncedDescription: payload.syncedDescription } : {}),
     ...(payload.syncedDue !== undefined ? { syncedDue: payload.syncedDue } : {}),
+    ...(payload.syncBaseline ? { syncBaseline: payload.syncBaseline } : {}),
     updatedAt: payload.updatedAt,
   };
 }
@@ -137,6 +135,19 @@ function validDueBaseline(value: unknown): value is string {
   return /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value));
 }
 
+function validSyncBaseline(value: unknown): value is ProviderSyncBaseline {
+  if (!value || typeof value !== "object") return false;
+  const baseline = value as Partial<ProviderSyncBaseline>;
+  const hash = (item: unknown): item is string => typeof item === "string" && /^[a-f0-9]{64}$/.test(item);
+  return baseline.version === 1 && Boolean(baseline.todoist) && Boolean(baseline.calendar)
+    && hash(baseline.todoist?.content) && hash(baseline.todoist?.description) && hash(baseline.todoist?.due)
+    && hash(baseline.calendar?.status) && hash(baseline.calendar?.summary)
+    && hash(baseline.calendar?.description) && hash(baseline.calendar?.start)
+    && (baseline.todoist?.recurrence === undefined || hash(baseline.todoist.recurrence))
+    && (baseline.calendar?.recurrence === undefined || hash(baseline.calendar.recurrence))
+    && typeof baseline.updatedAt === "string" && Number.isFinite(Date.parse(baseline.updatedAt));
+}
+
 function laterLogicalStart(left: string | undefined, right: string | undefined): string | undefined {
   if (!left) return right;
   if (!right) return left;
@@ -171,11 +182,11 @@ export function serializeMappingComment(
     ...(mapping.activeEffectiveStart ? { activeEffectiveStart: mapping.activeEffectiveStart } : {}),
     ...(mapping.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 as const } : {}),
     ...(mapping.completedThroughOriginalStart ? { completedThroughOriginalStart: mapping.completedThroughOriginalStart } : {}),
-    ...(mapping.calendarNativeRecurring ? { calendarNativeRecurring: true as const } : {}),
     ...(mapping.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 as const } : {}),
     ...(mapping.syncedTitle !== undefined ? { syncedTitle: mapping.syncedTitle } : {}),
     ...(mapping.syncedDescription !== undefined ? { syncedDescription: mapping.syncedDescription } : {}),
     ...(mapping.syncedDue !== undefined ? { syncedDue: mapping.syncedDue } : {}),
+    ...(mapping.syncBaseline ? { syncBaseline: mapping.syncBaseline } : {}),
     ...(mapping.syncedTitle !== undefined || mapping.syncedDescription !== undefined || mapping.syncedDue !== undefined ? { baselineVersion: 1 as const } : {}),
     mappingRevision: revision,
     updatedAt: mapping.updatedAt || new Date().toISOString(),
@@ -294,12 +305,7 @@ export function parseMappingComment(comment: TodoistCommentRecord): ParsedMappin
     if (value.syncedDescription !== undefined && typeof value.syncedDescription !== "string") throw new Error("invalid syncedDescription");
     if (value.syncedDue !== undefined && !validDueBaseline(value.syncedDue)) throw new Error("invalid syncedDue");
     if (value.baselineVersion !== undefined && value.baselineVersion !== 1) throw new Error("invalid baselineVersion");
-    // Normalize legacy owner metadata from the durable recurrence markers.
-    // The normalized value is in-memory only; serialization never writes it.
-    if (value.recurrenceOwner === undefined) {
-      if (value.calendarProgressVersion === 1 || value.calendarNativeRecurring === true) value.recurrenceOwner = "calendar";
-      else if (value.todoistPhaseBVersion === 1) value.recurrenceOwner = "todoist";
-    }
+    if (value.syncBaseline !== undefined && !validSyncBaseline(value.syncBaseline)) throw new Error("invalid syncBaseline");
     return { comment, payload: value as ProjectMappingCommentPayload };
   } catch (error) {
     return { comment, error: error instanceof Error ? error.message : String(error) };
@@ -368,22 +374,20 @@ export function recoverMappingFromProjectComment(mapping: Mapping, parsed: Parse
   if (payload.profile !== mapping.profile || payload.taskId !== mapping.taskId || payload.eventId !== mapping.eventId) {
     throw new Error("project mapping comment identity does not match mapping");
   }
-  const recurrenceOwner = mapping.recurrenceOwner
-    || (payload.calendarProgressVersion === 1 || payload.calendarNativeRecurring ? "calendar" : undefined)
-    || (payload.todoistPhaseBVersion === 1 ? "todoist" : undefined)
-    || payload.recurrenceOwner;
-  const completedThroughOriginalStart = recurrenceOwner === "calendar"
+  const seriesId = mapping.seriesId || payload.seriesId;
+  const masterEventId = mapping.masterEventId || payload.masterEventId;
+  const calendarSeries = Boolean(seriesId && seriesId !== mapping.taskId);
+  const completedThroughOriginalStart = calendarSeries
     ? laterLogicalStart(mapping.completedThroughOriginalStart, payload.completedThroughOriginalStart)
     : undefined;
   return {
     ...mapping,
-    ...(recurrenceOwner ? { recurrenceOwner } : {}),
-    ...(mapping.seriesId || payload.seriesId ? { seriesId: mapping.seriesId || payload.seriesId } : {}),
-    ...(mapping.masterEventId || payload.masterEventId ? { masterEventId: mapping.masterEventId || payload.masterEventId } : {}),
+    ...(seriesId ? { seriesId } : {}),
+    ...(masterEventId ? { masterEventId } : {}),
     ...(mapping.activeInstanceId || payload.activeInstanceId ? { activeInstanceId: mapping.activeInstanceId || payload.activeInstanceId } : {}),
     ...(mapping.originalStart || payload.originalStart ? { originalStart: mapping.originalStart || payload.originalStart } : {}),
     ...(mapping.activeEffectiveStart || payload.activeEffectiveStart ? { activeEffectiveStart: mapping.activeEffectiveStart || payload.activeEffectiveStart } : {}),
-    ...(recurrenceOwner === "calendar" && (mapping.calendarProgressVersion === 1 || payload.calendarProgressVersion === 1)
+    ...(calendarSeries && (mapping.calendarProgressVersion === 1 || payload.calendarProgressVersion === 1)
       ? { calendarProgressVersion: 1 as const }
       : {}),
     ...(completedThroughOriginalStart ? { completedThroughOriginalStart } : {}),
@@ -490,6 +494,7 @@ export function isOwnedLegacyTaskMappingComment(comment: TodoistCommentRecord, m
 export async function deleteMappingComments(client: ProjectCommentClient, mapping: Mapping): Promise<number> {
   let deleted = 0;
   const ids = mappingCommentIds(mapping);
+  const deletedIds = new Set<string>();
   if (ids.project) {
     try {
       const comment = await client.getComment(ids.project);
@@ -500,8 +505,31 @@ export async function deleteMappingComments(client: ProjectCommentClient, mappin
         && parsed.payload.eventId === mapping.eventId) {
         await client.deleteComment(ids.project);
         deleted += 1;
+        deletedIds.add(ids.project);
       }
     } catch { /* Missing or inaccessible provider comments must not break mapping deletion. */ }
+  }
+  // Provider mapping comments are the authoritative correlation. A mapping
+  // recovered from an exact Calendar task ID or legacy recurrence record can
+  // lack the comment ID, so fall back to an exact payload match in the
+  // configured project instead of leaving a stale correlation behind.
+  if (mapping.projectId && client.listProjectComments) {
+    const comments = await client.listProjectComments(mapping.projectId, true);
+    for (const candidate of comments) {
+      if (deletedIds.has(candidate.id) || candidate.project_id !== mapping.projectId || candidate.task_id) continue;
+      const parsed = parseMappingComment(candidate);
+      if (!parsed || "error" in parsed || parsed.payload.profile !== mapping.profile
+        || parsed.payload.projectId !== mapping.projectId || parsed.payload.taskId !== mapping.taskId
+        || parsed.payload.eventId !== mapping.eventId) continue;
+      const current = await client.getComment(candidate.id);
+      const verified = parseMappingComment(current);
+      if (!verified || "error" in verified || current.project_id !== mapping.projectId || current.task_id
+        || verified.payload.profile !== mapping.profile || verified.payload.projectId !== mapping.projectId
+        || verified.payload.taskId !== mapping.taskId || verified.payload.eventId !== mapping.eventId) continue;
+      await client.deleteComment(current.id);
+      deletedIds.add(current.id);
+      deleted += 1;
+    }
   }
   if (ids.legacyTask && ids.legacyTask !== ids.project) {
     try {

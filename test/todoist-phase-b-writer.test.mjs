@@ -13,18 +13,13 @@ function eventInstance(id,date,masterId="phase-b-master") {
     extendedProperties:{shared:{taskId:task.id,syncRecurrenceOwner:"todoist"}}};
 }
 class State {
-  constructor(){this.mapping=undefined;this.audits=[];this.mutations=0;this.links=[];this.completed=[];this.quarantine=[];}
+  constructor(){this.mapping=undefined;this.audits=[];this.mutations=0;this.links=[];this.completed=[];}
   async isRetired(){return false;}
   async getMappingByTaskAnyProfile(){return this.mapping;}
   async getMappingByTask(){return this.mapping;}
   async getCalendarProjectionTombstone(){return undefined;}
   async getCancelledAnnualRecoveryReceipt(){return undefined;}
-  async syncBlocked(profile,{taskId,eventId}={}){
-    return this.quarantine.some(q=>q.profile===profile&&(q.taskId===taskId||q.eventId===eventId));
-  }
-  async quarantinePhaseBNative(profile,taskId,eventId,reason){
-    this.quarantine.push({profile,taskId,eventId,reason});
-  }
+  async syncBlocked(){return false;}
   async acceptTaskVersion(){return true;}
   async mutationAllowed(){return true;}
   async putMapping(mapping){this.mapping=structuredClone(mapping);}
@@ -41,7 +36,7 @@ class State {
 }
 function setup({exception=false, lookupExisting=false, missingVersion=false,
   changedBeforeRollback=false, rollbackFailure=false, createdConflict=false,
-  unconfirmedCreation=false}={}){
+  unconfirmedCreation=false, sourceTask=task}={}){
   const state=new State(), instances=["2027-01-10","2027-04-10","2027-07-10"].map((d,i)=>eventInstance(`phase-b-instance-${i}`,d));
   const projectComments=[];
   const master={id:"phase-b-master",etag:"etag-1",status:"confirmed",summary:task.content,description:task.description,
@@ -50,6 +45,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
       todoistAnchorStart:"2027-01-10",todoistAnchorEnd:"2027-01-11",todoistAnchorAllDay:"true",
       todoistAnchorTimeZone:"Europe/London",todoistPhaseBVersion:"1"}}};
   const events=new Map([[master.id,master]]), creates=[], upserts=[], deletes=[];
+  let taskExists=true;
   const calendar={
     async findByTodoistTaskId(){return lookupExisting ? [...events.values()].find(
       e=>e.extendedProperties?.shared?.taskId===task.id) : undefined;},
@@ -57,6 +53,7 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
     async getEvent(id){const e=events.get(id);if(!e){const err=new Error("missing");err.status=404;throw err;}return structuredClone(e);},
     async createTodoistPhaseBNativeMasterOnce(e){
       creates.push(structuredClone(e));
+      if(events.has(e.id)) return {event:structuredClone(events.get(e.id)),created:false};
       events.set(e.id,{...structuredClone(e),etag:"etag-1",status:"confirmed"});
       const creationReadback=structuredClone(events.get(e.id));
       if(missingVersion) delete events.get(e.id).extendedProperties.shared.todoistPhaseBVersion;
@@ -99,13 +96,14 @@ function setup({exception=false, lookupExisting=false, missingVersion=false,
     async getComment(id){const found=projectComments.find(value=>value.id===id);if(!found)throw Object.assign(new Error("missing"),{status:404});return structuredClone(found);},
     async deleteComment(id){const index=projectComments.findIndex(value=>value.id===id);if(index>=0)projectComments.splice(index,1);},
     async findLegacyTaskComment(){return undefined;},
-    async getTask(){return structuredClone(task);},
+    async getTask(){if(!taskExists)throw Object.assign(new Error("missing task"),{status:404});return structuredClone(sourceTask);},
     async getTimeZone(){return "Europe/London";},
   };
   const sync=new Synchronizer(state,undefined,async()=>({calendar,todoist}));
   const delivery={id:"phase-b-item-added",kind:"todoist",profile:"home",mode:"aws",receivedAt:"2026-11-09T12:00:00Z",
     headers:{},body:JSON.stringify({event_name:"item:added",event_data:task})};
-  return {state,calendar,sync,delivery,creates,upserts,deletes,events};
+  return {state,calendar,sync,delivery,creates,upserts,deletes,events,projectComments,
+    deleteSourceTask(){taskExists=false;}};
 }
 function withGate(_enabled,fn){const old=process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
   delete process.env.TODOIST_CALENDAR_SYNC_PHASE_B_NATIVE_ENABLED;
@@ -146,6 +144,20 @@ test("supported recurrence uses native Calendar creation without a feature flag"
   assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_calendar_created");
 }));
 
+test("recurrence outside the native admission families is not flattened into a one-off Calendar event",()=>withGate(true,async()=>{
+  const source={...task,due:{date:"2027-01-10",is_recurring:true,string:"every 2 years"}};
+  const f=setup({sourceTask:source});
+  await f.sync.process({...f.delivery,id:"unsupported-new-recurrence",body:JSON.stringify({
+    event_name:"item:added",event_data:source,
+  })});
+  assert.equal(f.creates.length,0);
+  assert.equal(f.upserts.length,0);
+  assert.equal(f.events.size,1,"no standalone or alternate Calendar mirror is created");
+  assert.equal(f.state.mapping,undefined);
+  assert.ok(f.state.audits.some(x=>x.action==="todoist_recurrence_unsupported_rule"
+    && x.detail.outcome==="source_left_unchanged"));
+}));
+
 test("provider exception after create deletes only the uncommitted deterministic master",()=>withGate(true,async()=>{
   const f=setup({exception:true});
   await f.sync.process(f.delivery);
@@ -161,11 +173,12 @@ test("ordinary Todoist deletion still deletes the tagged native Calendar series"
   const f=setup();
   await f.sync.process(f.delivery);
   const masterId=f.state.mapping.masterEventId;
+  f.deleteSourceTask();
   await f.sync.process({...f.delivery,id:"delete-native-task",body:JSON.stringify({
     event_name:"item:deleted",event_data:task,
   })});
   assert.equal(f.events.has(masterId),false);
-  assert.equal(f.state.mapping,undefined);
+  assert.equal(f.projectComments.some(comment=>comment.content.startsWith(MAPPING_COMMENT_MARKER)),false);
   assert.ok(f.state.audits.some(x=>x.action==="todoist_deleted_calendar_recurrence_projection"));
 }));
 
@@ -200,15 +213,40 @@ test("Todoist completion retains the finished occurrence and advances within the
   task.updated_at="2026-11-09T11:59:00Z";
 }));
 
-test("mapping loss rediscovers the tagged master and restores a versioned native mapping",()=>withGate(true,async()=>{
+test("mapping loss rediscovers the tagged master and restores exact provider correlation",()=>withGate(true,async()=>{
   const f=setup({lookupExisting:true});
   // Do not rely on a durable mapping: provider master is the independent proof.
   await f.sync.process({...f.delivery,id:"provider-native-recovery",
     body:JSON.stringify({event_name:"item:updated",event_data:task})});
   assert.equal(f.creates.length,0);
   assert.equal(f.upserts.length,0,"never flatten a tagged provider master");
-  assert.equal(f.state.mapping?.todoistPhaseBVersion,1);
+  assert.equal(f.state.mapping?.taskId,task.id);
+  assert.equal(f.state.mapping?.seriesId,task.id);
   assert.equal(f.state.mapping?.masterEventId,"phase-b-master");
+}));
+
+test("exact Calendar series IDs restore the project mapping without a phase owner marker",()=>withGate(true,async()=>{
+  const f=setup({lookupExisting:true});
+  const shared=f.events.get("phase-b-master").extendedProperties.shared;
+  delete shared.todoistPhaseBVersion;
+  shared.syncSchemaVersion="2";
+  shared.syncTaskId=task.id;
+  shared.syncSeriesId=task.id;
+  shared.syncEventId="phase-b-master";
+  shared.syncMasterEventId="phase-b-master";
+  delete shared.syncRecurrenceOwner;
+
+  await f.sync.process({...f.delivery,id:"phase-owner-marker-lost",body:JSON.stringify({
+    event_name:"item:updated",event_data:task,
+  })});
+
+  assert.equal(f.creates.length,0);
+  assert.equal(f.upserts.length,0);
+  assert.equal(f.state.mapping?.taskId,task.id);
+  assert.equal(f.state.mapping?.seriesId,task.id);
+  assert.equal(f.state.mapping?.masterEventId,"phase-b-master");
+  assert.equal(f.projectComments.filter(comment=>comment.content.startsWith(MAPPING_COMMENT_MARKER)).length,1);
+  assert.ok(f.state.audits.some(entry=>entry.action==="todoist_calendar_series_correlation_recovered"));
 }));
 
 test("initial native readback without version marker never commits a mapping",()=>withGate(true,async()=>{
@@ -220,27 +258,28 @@ test("initial native readback without version marker never commits a mapping",()
   assert.equal(f.state.audits.at(-1).detail.reason,"master_identity_or_anchor_drift");
 }));
 
-test("rollback is ETag conditional and quarantines user edits instead of deleting them",()=>withGate(true,async()=>{
+test("rollback is ETag conditional and retries a user-edited deterministic master without blocking",()=>withGate(true,async()=>{
   const f=setup({exception:true,changedBeforeRollback:true});
   await f.sync.process(f.delivery);
   assert.deepEqual(f.deletes,[]);
   assert.equal(f.events.has(f.creates[0].id),true);
   assert.equal(f.state.mapping,undefined);
-  assert.equal(f.state.quarantine.length,1);
   await f.sync.process({...f.delivery,id:"replayed-after-failed-rollback"});
-  assert.equal(f.creates.length,1);
+  assert.equal(f.creates.length,2,"retry reads the same deterministic event ID");
   assert.equal(f.upserts.length,0);
-  assert.equal(f.state.audits.at(-1).action,"todoist_task_sync_control_blocked");
+  assert.equal(f.state.audits.at(-1).action,"todoist_phase_b_native_write_retryable");
+  assert.equal(f.events.has(f.creates[0].id),true,"the edited provider object remains intact");
 }));
 
-test("failed rollback and deterministic conflict quarantine instead of adopting a master",()=>withGate(true,async()=>{
+test("failed rollback and uncertain POST remain retryable without adopting a mismatched master",()=>withGate(true,async()=>{
   for(const options of [{exception:true,rollbackFailure:true},{exception:true,createdConflict:true},
     {unconfirmedCreation:true}]){
     const f=setup(options);
     await f.sync.process(f.delivery);
     assert.equal(f.state.mapping,undefined);
-    assert.equal(f.state.quarantine.length,1);
     assert.deepEqual(f.deletes,[]);
+    assert.ok(f.state.audits.some(x=>x.action==="todoist_phase_b_native_write_retryable"
+      || x.action==="todoist_phase_b_native_create_retryable"));
   }
 }));
 

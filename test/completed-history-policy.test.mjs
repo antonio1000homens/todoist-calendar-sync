@@ -45,29 +45,28 @@ test("partial recurrence identity never falls through to one-off cleanup", () =>
     assert.equal(terminalCompletionDecision([oneOff({ [field]: undefined })], boundary), "ambiguous");
   }
   assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "migrated", terminalVerified: true })], boundary), "ambiguous");
-  assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "" })], boundary), "ambiguous");
+  assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "" })], boundary), "eligible",
+    "legacy owner labels do not define whether a projection is one-off");
   assert.equal(terminalCompletionDecision([oneOff({ recurrenceOwner: "calendar", seriesId: "", terminalVerified: true })], boundary), "ambiguous");
 });
 
 test("weekly/yearly active recurrence occurrence history is never terminal by age", () => {
-  for (const owner of ["calendar", "todoist"]) {
-    const previous = oneOff({ recurrenceOwner: owner, seriesId: "series-1" });
-    const another = oneOff({ ...previous, eventId: "next-instance", completedAt: "2026-10-05T12:00:00Z" });
-    assert.equal(terminalCompletionDecision([previous], boundary + 365 * 86_400_000), "ambiguous");
-    assert.equal(terminalCompletionDecision([previous, another], boundary + 365 * 86_400_000), "ambiguous");
-    const verified = { ...another, terminalVerified: true };
-    assert.equal(terminalCompletionDecision([previous, verified], Date.parse(verified.completedAt) + COMPLETED_TASK_GRACE_MS - 1), "too_recent");
-    assert.equal(terminalCompletionDecision([previous, verified], Date.parse(verified.completedAt) + COMPLETED_TASK_GRACE_MS), "eligible");
-    assert.equal(terminalCompletionDecision([previous, { ...verified, seriesId: "different" }], boundary + 365 * 86_400_000), "ambiguous");
-  }
+  const previous = oneOff({ seriesId: "series-1" });
+  const another = oneOff({ ...previous, eventId: "next-instance", completedAt: "2026-10-05T12:00:00Z" });
+  assert.equal(terminalCompletionDecision([previous], boundary + 365 * 86_400_000), "ambiguous");
+  assert.equal(terminalCompletionDecision([previous, another], boundary + 365 * 86_400_000), "ambiguous");
+  const verified = { ...another, terminalVerified: true };
+  assert.equal(terminalCompletionDecision([previous, verified], Date.parse(verified.completedAt) + COMPLETED_TASK_GRACE_MS - 1), "too_recent");
+  assert.equal(terminalCompletionDecision([previous, verified], Date.parse(verified.completedAt) + COMPLETED_TASK_GRACE_MS), "eligible");
+  assert.equal(terminalCompletionDecision([previous, { ...verified, seriesId: "different" }], boundary + 365 * 86_400_000), "ambiguous");
 });
 
 test("immutable series certificate makes prior finite recurring occurrences eligible only after last completion", () => {
   const prior = oneOff({
-    recurrenceOwner: "calendar", seriesId: "finite", masterEventId: "master",
+    seriesId: "finite", masterEventId: "master",
   });
   const certificate = {
-    profile: "home", seriesId: "finite", recurrenceOwner: "calendar",
+    profile: "home", seriesId: "finite",
     masterEventId: "master", terminalCompletedAt: "2026-10-17T12:00:00Z",
   };
   assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-18T12:00:00Z"), certificate), "too_recent");
@@ -77,5 +76,5 @@ test("immutable series certificate makes prior finite recurring occurrences elig
   }), "ambiguous");
   assert.equal(terminalCompletionDecision([prior], Date.parse("2026-10-24T12:00:00Z"), {
     ...certificate, recurrenceOwner: "todoist",
-  }), "ambiguous");
+  }), "eligible", "legacy owner labels do not override exact series IDs");
 });

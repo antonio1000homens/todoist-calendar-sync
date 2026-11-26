@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { normalizedText } from "./security.js";
 import { calendarLocalDay } from "./recurrence-split.js";
 import { calendarRecurrenceMatchesTodoist, selectTodoistCurrentInstance, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
-import { hasCanonicalState, toCalendarEvent } from "./sync.js";
-import type { ProviderClients } from "./mutation-budget.js";
+import { hasCanonicalState, Synchronizer, toCalendarEvent } from "./sync.js";
+import type { ProviderClientFactory, ProviderClients } from "./mutation-budget.js";
+import { buildProjectMappingIndex, mappingFromProjectMappingComment } from "./mapping-comments.js";
+import { profiles } from "./config.js";
 import type { StateRepository } from "./repository.js";
-import type { CalendarEvent, Mapping, Profile, RecurrenceLink, TodoistTask } from "./types.js";
+import type { CalendarEvent, Mapping, Profile, TodoistTask } from "./types.js";
 
 /** A standalone event has no RRULE to cap. Never move a historical DTSTART. */
 export interface StandaloneAnnualPlan {
@@ -82,19 +84,42 @@ export function planStandaloneAnnualRepair(
 export async function verifyStandaloneAnnualOwnership(
   profile: Profile, task: TodoistTask, source: CalendarEvent,
   plan: StandaloneAnnualPlan, pair: ProviderClients, state: StateRepository,
-  allowApprovedResume = false,
+  allowApprovedResume = false, providerClients?: ProviderClientFactory,
 ): Promise<void> {
-  const [taskMapping, sourceMapping, link, tombstone, completed, history, otherTasks, occurrences, linked] = await Promise.all([
-    state.getMappingByTaskAnyProfile(task.id), state.getMappingByEvent(profile, source.id),
-    state.getRecurrenceLink(profile, task.id),
-    state.getCalendarProjectionTombstone(profile, task.id),
+  const mappings = await Promise.all((Object.keys(profiles) as Profile[]).map(async candidateProfile => {
+    const clients = candidateProfile === profile ? pair : await providerClients?.(candidateProfile);
+    if (clients?.todoist.listProjectComments) {
+      return buildProjectMappingIndex(await clients.todoist.listProjectComments(profiles[candidateProfile].todoistProjectId,true))
+        .parsed.filter(entry=>entry.payload.profile===candidateProfile
+          &&entry.payload.projectId===profiles[candidateProfile].todoistProjectId)
+        .map(mappingFromProjectMappingComment);
+    }
+    if (process.env.NODE_ENV === "test" && !providerClients) return [];
+    throw new Error("Todoist project comment correlation API unavailable for annual ownership verification");
+  }));
+  const allMappings=mappings.flat();
+  const taskMappings=allMappings.filter(mapping=>mapping.taskId===task.id);
+  const taskProfiles=new Set(taskMappings.map(mapping=>mapping.profile));
+  if(taskProfiles.size>1) throw new Error("Todoist task has provider mapping comments in multiple profiles");
+  const taskMapping=taskMappings.sort((a,b)=>(b.mappingRevision||0)-(a.mappingRevision||0)
+    ||Date.parse(b.updatedAt)-Date.parse(a.updatedAt))[0];
+  const sourceMappings=allMappings.filter(mapping=>mapping.profile===profile
+    &&(mapping.eventId===source.id||mapping.masterEventId===source.id||mapping.activeInstanceId===source.id));
+  const sourceMapping=sourceMappings[0];
+  if(sourceMappings.length>1&&new Set(sourceMappings.map(mapping=>JSON.stringify([mapping.taskId,mapping.eventId,mapping.masterEventId]))).size>1)
+    throw new Error("Calendar source has conflicting provider mapping comments");
+  const link=taskMapping?.seriesId===task.id?taskMapping:undefined;
+  const [completed, history, otherTasks, occurrences, linked] = await Promise.all([
     state.getCompletedCalendarProjectionByEvent(profile, source.id),
     state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
     pair.todoist.listTasks(),
     pair.calendar.listOccurrencesInWindow(addDays(plan.start, -2) + "T00:00:00Z", addDays(plan.start, 3) + "T00:00:00Z"),
     pair.calendar.findByTodoistTaskId(task.id),
   ]);
-  if (taskMapping || sourceMapping || link || tombstone || completed || history.length) {
+  const approvedResumeMapping=allowApprovedResume&&taskMapping?.profile===profile
+    &&taskMapping.eventId===plan.masterId&&taskMapping.masterEventId===plan.masterId
+    &&taskMapping.seriesId===task.id;
+  if ((taskMapping&&!approvedResumeMapping) || sourceMapping || (link&&!approvedResumeMapping) || completed || history.length) {
     throw new Error("The selected task or historical event already has a mapping, recurrence owner or completed-history record; use a guarded ownership transfer, not a new-series repair");
   }
   if (linked && linked.id !== source.id && !(allowApprovedResume && linked.id === plan.masterId)) {
@@ -142,7 +167,7 @@ export function assertStandaloneHistory(source: CalendarEvent | null, plan: Stan
 /** Creates no Todoist object and installs EVENT/TASK/TASKOWNER/RECURRENCE atomically. */
 export async function applyStandaloneAnnualRepair(
   profile: Profile, approvedTask: TodoistTask, approvedSource: CalendarEvent,
-  plan: StandaloneAnnualPlan, pair: ProviderClients, state: StateRepository,
+  plan: StandaloneAnnualPlan, pair: ProviderClients, state: StateRepository, providerClients?: ProviderClientFactory,
 ): Promise<{ mapping: Mapping; master: CalendarEvent }> {
   const [task, source, zone] = await Promise.all([
     pair.todoist.getTask(approvedTask.id),
@@ -173,13 +198,15 @@ export async function applyStandaloneAnnualRepair(
     }
     // A previous attempt may have committed the four mapping indexes before
     // losing the completion acknowledgement. Only the same exact ownership can resume.
-    const previous = await state.getMappingByTaskAnyProfile(task.id);
+    const currentMappings = buildProjectMappingIndex(await pair.todoist.listProjectComments(task.project_id!,true)).parsed
+      .filter(entry=>entry.payload.profile===profile&&entry.payload.projectId===profiles[profile].todoistProjectId
+        &&entry.payload.taskId===task.id).map(mappingFromProjectMappingComment)
+      .sort((a,b)=>(b.mappingRevision||0)-(a.mappingRevision||0)||Date.parse(b.updatedAt)-Date.parse(a.updatedAt));
+    const previous=currentMappings[0];
     if (previous) {
-      const link = await state.getRecurrenceLink(profile,task.id);
       if (previous.profile !== profile || previous.eventId !== plan.masterId
         || previous.masterEventId !== plan.masterId || previous.seriesId !== task.id
-        || previous.recurrenceOwner !== "todoist" || link?.taskId !== task.id
-        || link.masterEventId !== plan.masterId || link.activeInstanceId !== previous.activeInstanceId) {
+        || previous.seriesId !== previous.taskId || !previous.activeInstanceId) {
         throw new Error("Another mapping owns the partial annual repair; manual recovery required");
       }
       const complete = await pair.calendar.getEvent(plan.masterId);
@@ -197,7 +224,7 @@ export async function applyStandaloneAnnualRepair(
       if (recalculated[field] !== plan[field]) throw new Error(`Approved annual repair changed (${field}); refresh the preview`);
     }
   }
-  await verifyStandaloneAnnualOwnership(profile, task, source, plan, pair, state, started);
+  await verifyStandaloneAnnualOwnership(profile, task, source, plan, pair, state, started, providerClients);
   // Fence Todoist deliveries before Calendar becomes a visible recurring master.
   await state.beginFutureSeriesSplit(profile, task.id, source.id, plan.masterId,
     plan.mode !== "annualize-in-place" ? plan.originalStart : undefined);
@@ -262,18 +289,11 @@ export async function applyStandaloneAnnualRepair(
   const timestamp = new Date().toISOString();
   const mapping: Mapping = {
     profile, projectId:task.project_id, taskId:task.id, eventId:master.id,
-    recurrenceOwner:"todoist", seriesId:task.id, masterEventId:master.id,
+    seriesId:task.id, masterEventId:master.id,
     activeInstanceId:active.id, originalStart:active.originalStartTime?.date || active.start?.date,
     activeEffectiveStart:active.start?.date, updatedAt:timestamp,
   };
-  const link: RecurrenceLink = {
-    profile, owner:"todoist", seriesId:task.id, taskId:task.id,
-    eventId:master.id, masterEventId:master.id, activeInstanceId:active.id,
-    originalStart:mapping.originalStart, activeEffectiveStart:mapping.activeEffectiveStart, updatedAt:timestamp,
-  };
-  if (!await state.putNewRecurrenceMappingIfUnowned(mapping, link)) {
-    throw new Error("A competing Calendar or Todoist owner appeared during the annual repair; no mapping was overwritten");
-  }
+  const persisted=await new Synchronizer(state,undefined,async()=>pair).persistProviderMapping(mapping,pair.todoist);
   await state.completeFutureSeriesSplit(profile,task.id,master.id);
-  return {mapping,master};
+  return {mapping:persisted,master};
 }

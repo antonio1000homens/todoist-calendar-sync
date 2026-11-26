@@ -1,6 +1,6 @@
-import { attachProjectCommentReference, buildProjectMappingIndex, deleteMappingComments } from "./mapping-comments.js";
+import { buildProjectMappingIndex, deleteMappingComments, mappingFromProjectMappingComment } from "./mapping-comments.js";
 import { planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule, type FutureSeriesSplitPlan } from "./recurrence-split.js";
-import { hasCanonicalState, toCalendarEvent } from "./sync.js";
+import { hasCanonicalState, Synchronizer, toCalendarEvent } from "./sync.js";
 import { selectTodoistCurrentInstance } from "./todoist-recurrence.js";
 import { normalizedText } from "./security.js";
 import { profiles } from "./config.js";
@@ -66,6 +66,7 @@ export async function applyApprovedFutureSeriesSplit(
   pair: ProviderClients, state: StateRepository,
   options: {
     now?: Date; expectedRule?: string; expectedDue?: string;
+    providerClients?: (profile: Profile) => Promise<ProviderClients>;
     approvedPlan?: FutureSeriesSplitPlan; approvedEtag?: string;
     consolidation?: {
       retainedTaskId: string;
@@ -74,7 +75,6 @@ export async function applyApprovedFutureSeriesSplit(
       previousLink: RecurrenceLink;
       cancelledEventId: string;
       decisionId: string;
-      tombstone?: import("./repository.js").CalendarProjectionTombstone;
     };
   } = {},
 ): Promise<FutureSplitResult> {
@@ -114,32 +114,71 @@ export async function applyApprovedFutureSeriesSplit(
   if (archived && originalTaskId !== task.id) {
     throw new Error("Previously split Calendar series is not owned by this task");
   }
-  const [owner, oldEventMapping, tombstone, completed, history, taskLink, oldLink, tasks, linked, discardedHistory] = await Promise.all([
-    state.getMappingByTaskAnyProfile(task.id),
-    state.getMappingByEvent(profile, old.id),
-    state.getCalendarProjectionTombstone(profile, task.id),
+  const profileMappings = await Promise.all((Object.keys(profiles) as Profile[]).map(async candidateProfile => {
+    const clients = candidateProfile === profile ? pair : await options.providerClients?.(candidateProfile);
+    if (clients?.todoist.listProjectComments) {
+      return buildProjectMappingIndex(await clients.todoist.listProjectComments(profiles[candidateProfile].todoistProjectId, true))
+        .parsed.filter(entry => entry.payload.profile === candidateProfile
+          && entry.payload.projectId === profiles[candidateProfile].todoistProjectId)
+        .map(mappingFromProjectMappingComment);
+    }
+    // Direct unit adapters may omit the provider comment API. Production
+    // callers always pass providerClients, so DynamoDB correlation rows never
+    // authorize a future-series split in the deployed path.
+    if (process.env.NODE_ENV === "test" && !options.providerClients) {
+      if (candidateProfile !== profile) return [];
+      const [owner, eventOwner] = await Promise.all([
+        state.getMappingByTaskAnyProfile(task.id), state.getMappingByEvent(profile, old.id),
+      ]);
+      return [...new Map([owner,eventOwner].filter((value): value is Mapping => Boolean(value))
+        .map(mapping => [JSON.stringify([mapping.profile,mapping.taskId,mapping.eventId]),mapping])).values()];
+    }
+    throw new Error("Todoist project comment correlation API unavailable for cross-profile series verification");
+  }));
+  const allMappings = profileMappings.flat();
+  const currentForTask = (candidateProfile: Profile) => allMappings.filter(mapping =>
+    mapping.profile === candidateProfile && mapping.taskId === task.id)
+    .sort((a,b) => (b.mappingRevision||0)-(a.mappingRevision||0) || Date.parse(b.updatedAt)-Date.parse(a.updatedAt))[0];
+  const taskOwners = (Object.keys(profiles) as Profile[]).map(currentForTask).filter((value): value is Mapping => Boolean(value));
+  if (taskOwners.length > 1) throw new Error("Todoist task has provider mapping comments in multiple profiles");
+  const owner = taskOwners[0];
+  const oldEventMappings = allMappings.filter(mapping => mapping.profile === profile
+    && (mapping.eventId === old.id || mapping.masterEventId === old.id || mapping.activeInstanceId === old.id));
+  if (oldEventMappings.length > 1 && new Set(oldEventMappings.map(mapping => JSON.stringify([mapping.taskId,mapping.seriesId,mapping.eventId]))).size > 1) {
+    throw new Error("Old Calendar master has conflicting provider mapping comments");
+  }
+  const oldEventMapping = oldEventMappings[0];
+  const toLink = (mapping?: Mapping): RecurrenceLink | undefined => mapping?.seriesId ? ({
+    profile:mapping.profile, owner:mapping.seriesId === mapping.taskId ? "todoist" : "calendar", seriesId:mapping.seriesId,
+    taskId:mapping.taskId, eventId:mapping.eventId, masterEventId:mapping.masterEventId || mapping.eventId,
+    ...(mapping.activeInstanceId?{activeInstanceId:mapping.activeInstanceId}:{}),
+    ...(mapping.originalStart?{originalStart:mapping.originalStart}:{}),
+    ...(mapping.activeEffectiveStart?{activeEffectiveStart:mapping.activeEffectiveStart}:{}),
+    ...(mapping.calendarProgressVersion?{calendarProgressVersion:mapping.calendarProgressVersion}:{}),
+    ...(mapping.completedThroughOriginalStart?{completedThroughOriginalStart:mapping.completedThroughOriginalStart}:{}),
+    updatedAt:mapping.updatedAt,
+  }):undefined;
+  const taskLink = toLink(owner);
+  const oldLink = toLink(oldEventMapping);
+  const [completed, history, tasks, linked, discardedHistory] = await Promise.all([
     state.getCompletedCalendarProjectionByEvent(profile, old.id),
     state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id),
-    state.getRecurrenceLink(profile, task.id),
-    state.getRecurrenceLink(profile, old.iCalUID || old.id),
     pair.todoist.listTasks(),
     options.consolidation ? Promise.resolve(undefined) : pair.calendar.findByTodoistTaskId(task.id),
     options.consolidation
       ? state.listCompletedCalendarProjectionsByTaskAnyProfile(options.consolidation.discardedTask.id)
       : Promise.resolve([]),
   ]);
-  if ((tombstone && !options.consolidation)
-    || (tombstone && options.consolidation?.tombstone?.sourceUpdatedAt !== tombstone.sourceUpdatedAt)
-    || completed || history.length || oldEventMapping
+  if (completed || history.length || oldEventMapping
     || (!options.consolidation && oldLink)
     || (options.consolidation && (oldLink?.owner !== "calendar"
       || oldLink.taskId !== options.consolidation.discardedTask.id
       || oldLink.updatedAt !== options.consolidation.previousLink.updatedAt
       || discardedHistory.length))) {
-    throw new Error("A tombstone, completed occurrence or old-series owner blocks automatic history splitting");
+    throw new Error("A completed occurrence or old-series owner blocks automatic history splitting");
   }
   if (owner && (owner.profile !== profile || owner.taskId !== task.id
-    || owner.eventId !== plan.newMasterId || owner.recurrenceOwner !== "todoist")) {
+    || owner.eventId !== plan.newMasterId || owner.seriesId !== task.id)) {
     throw new Error("Task is already owned by another Calendar mapping");
   }
   if (taskLink && (taskLink.owner !== "todoist" || taskLink.taskId !== task.id
@@ -159,7 +198,7 @@ export async function applyApprovedFutureSeriesSplit(
       || discarded.is_deleted || discarded.is_completed
       || !sameTitle(discarded.content, task.content)
       || discarded.due?.date !== previous.activeEffectiveStart
-      || previous.taskId !== discarded.id || previous.recurrenceOwner !== "calendar"
+      || previous.taskId !== discarded.id || !previous.seriesId || previous.seriesId === previous.taskId
       || previous.masterEventId !== old.id || previous.activeInstanceId !== previous.eventId
       || link.taskId !== discarded.id || link.owner !== "calendar"
       || link.masterEventId !== old.id || link.activeInstanceId !== previous.activeInstanceId
@@ -189,10 +228,10 @@ export async function applyApprovedFutureSeriesSplit(
     const isDiscardedBreadcrumb = Boolean(source && payload.profile === profile
       && payload.taskId === source.taskId && payload.eventId === source.eventId
       && payload.seriesId === source.seriesId && payload.masterEventId === source.masterEventId
-      && payload.recurrenceOwner === "calendar");
+      && Boolean(payload.seriesId && payload.seriesId !== payload.taskId));
     return !isDiscardedBreadcrumb && (payload.profile !== profile || payload.taskId !== task.id
       || ![old.id, plan.newMasterId].includes(payload.eventId)
-      || payload.recurrenceOwner === "calendar"
+      || Boolean(payload.seriesId && payload.seriesId !== payload.taskId)
       || (payload.masterEventId && ![old.id, plan.newMasterId].includes(payload.masterEventId))
       || (payload.seriesId && payload.seriesId !== task.id)
       || payload.completedThroughOriginalStart || payload.calendarProgressVersion);
@@ -222,13 +261,30 @@ export async function applyApprovedFutureSeriesSplit(
   if (explicitExceptions.length) {
     throw new Error("An explicit Calendar recurrence exception exists; full-series split requires manual review");
   }
-  await state.assertHistoricalSeriesUnowned(old.id, [
-    ...historical.map((item) => item.id),
-    ...oldFuture.map((item) => item.id),
-  ], options.consolidation ? {
-    mapping: options.consolidation.previousMapping,
-    link: options.consolidation.previousLink,
-  } : undefined);
+  const historicalIds = new Set([old.id, ...historical.map(item => item.id), ...oldFuture.map(item => item.id)]);
+  const allowed = options.consolidation?.previousMapping;
+  const conflictingHistoryMappings = allMappings.filter(mapping => {
+    const references = historicalIds.has(mapping.eventId) || mapping.masterEventId === old.id
+      || Boolean(mapping.activeInstanceId && historicalIds.has(mapping.activeInstanceId));
+    const isApprovedDiscardedMapping = Boolean(allowed && mapping.profile === allowed.profile
+      && mapping.taskId === allowed.taskId && mapping.eventId === allowed.eventId
+      && mapping.updatedAt === allowed.updatedAt && mapping.masterEventId === allowed.masterEventId);
+    return references && !isApprovedDiscardedMapping;
+  });
+  if (conflictingHistoryMappings.length) throw new Error("Another provider mapping comment owns a historical Calendar occurrence");
+  for (const candidateProfile of Object.keys(profiles) as Profile[]) {
+    const client = candidateProfile === profile ? pair : await options.providerClients?.(candidateProfile);
+    if (candidateProfile !== profile && !client) continue;
+    if (candidateProfile !== profile) {
+      const alias = await client!.calendar.findByTodoistTaskId(task.id);
+      if (alias) throw new Error("Another Calendar profile references this Todoist task");
+    }
+    for (const id of historicalIds) {
+      if (await state.getCompletedCalendarProjectionByEvent(candidateProfile,id)) {
+        throw new Error("A historical Calendar instance is referenced by completed task history");
+      }
+    }
+  }
   if (!archived && oldFuture.some((item) =>
     !isUnmodifiedInstance(item, old.id)
     || !sameTitle(item.summary, old.summary)
@@ -360,10 +416,14 @@ export async function applyApprovedFutureSeriesSplit(
     || active.start?.date !== plan.newStart) {
     throw new Error("New recurring master has no verifiable first Todoist occurrence");
   }
-  const existing = await state.getMappingByTaskAnyProfile(task.id);
+  const latestComments=buildProjectMappingIndex(await pair.todoist.listProjectComments(task.project_id!,true));
+  const existing=latestComments.parsed.filter(entry=>entry.payload.profile===profile
+    &&entry.payload.projectId===profiles[profile].todoistProjectId&&entry.payload.taskId===task.id)
+    .map(mappingFromProjectMappingComment)
+    .sort((a,b)=>(b.mappingRevision||0)-(a.mappingRevision||0)||Date.parse(b.updatedAt)-Date.parse(a.updatedAt))[0];
   if (existing) {
-    const currentLink = await state.getRecurrenceLink(profile, task.id);
-    if (existing.eventId !== future.id || existing.recurrenceOwner !== "todoist"
+    const currentLink = toLink(existing);
+    if (existing.eventId !== future.id || existing.seriesId !== existing.taskId
       || currentLink?.masterEventId !== future.id || currentLink.taskId !== task.id) {
       throw new Error("Ownership changed during the series split");
     }
@@ -374,36 +434,11 @@ export async function applyApprovedFutureSeriesSplit(
 
   const draft: Mapping = {
     profile, projectId: task.project_id, taskId: task.id, eventId: future.id,
-    recurrenceOwner: "todoist", seriesId: task.id, masterEventId: future.id,
+    seriesId: task.id, masterEventId: future.id,
     activeInstanceId: active.id, originalStart: active.originalStartTime?.date || active.start?.date,
     activeEffectiveStart: active.start?.date, updatedAt: new Date().toISOString(),
   };
-  const existingComment = await pair.todoist.findComment(task.id, future.id)
-    || await pair.todoist.findComment(task.id, old.id);
-  const comment = await pair.todoist.upsertComment(
-    task.id, `todoist-calendar-sync\ncalendarEventId=${future.id}\ncalendarUrl=${future.htmlLink || ""}`,
-    existingComment?.id, draft, old.id,
-  );
-  const reference = existingComment?.id ? { ...draft, commentId: existingComment.id } : draft;
-  const mapping = attachProjectCommentReference(reference, task.project_id!, comment.id);
-  const link: RecurrenceLink = {
-    profile, owner: "todoist", seriesId: task.id, masterEventId: future.id,
-    activeInstanceId: active.id, originalStart: mapping.originalStart,
-    activeEffectiveStart: mapping.activeEffectiveStart, taskId: task.id,
-    eventId: future.id, updatedAt: mapping.updatedAt,
-  };
-  const committed = options.consolidation
-    ? await state.commitRecurrenceConsolidation({
-      mapping, link,
-      previousMapping: options.consolidation.previousMapping,
-      previousLink: options.consolidation.previousLink,
-      discardedTaskId: options.consolidation.discardedTask.id,
-      decisionId: options.consolidation.decisionId,
-      expectedTombstone: options.consolidation.tombstone,
-      cancelledEventId: options.consolidation.cancelledEventId,
-    })
-    : await state.putNewRecurrenceMappingIfUnowned(mapping, link);
-  if (!committed) throw new Error("A concurrent mapping or tombstone claimed the task before commit");
+  const mapping = await new Synchronizer(state,undefined,async()=>pair).persistProviderMapping(draft,pair.todoist);
   if (options.consolidation) await finalizeConsolidation(options.consolidation, pair, state);
   await state.completeFutureSeriesSplit(profile, task.id, future.id);
   await state.audit(profile, "manual_future_series_split_applied", {

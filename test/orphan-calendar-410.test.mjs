@@ -65,7 +65,7 @@ function fixture({ deleteError, readError, readEvent, taskExists = false, mapped
     },
   };
   const sync = new Synchronizer(state, undefined, async () => ({ calendar, todoist }));
-  return { state, calls, sync };
+  return { state, calls, comments, sync };
 }
 
 test("an orphan DELETE 410 with no deletion reason is retired after the exact Calendar GET returns 404", async () => {
@@ -73,7 +73,7 @@ test("an orphan DELETE 410 with no deletion reason is retired after the exact Ca
   await f.sync.process(delivery);
   assert.deepEqual(f.calls.delete, ["calendar-event"]);
   assert.deepEqual(f.calls.read, ["calendar-event"]);
-  assert.equal(f.state.mapping, undefined);
+  assert.equal(f.comments.length, 0, "confirmed deletion retires provider correlation");
   assert.equal(f.state.audits.at(-1).action, "orphan_confirmed_deleted");
   assert.equal(f.state.audits.at(-1).detail.alreadyDeleted, true);
 });
@@ -81,7 +81,7 @@ test("an orphan DELETE 410 with no deletion reason is retired after the exact Ca
 test("an orphan DELETE 410 is terminal after the exact event GET also returns a bare 410", async () => {
   const f = fixture({ deleteError: providerError(410), readError: providerError(410) });
   await f.sync.process(delivery);
-  assert.equal(f.state.mapping, undefined);
+  assert.equal(f.comments.length, 0, "confirmed deletion retires provider correlation");
   assert.deepEqual(f.calls.read, ["calendar-event"]);
 });
 
@@ -90,18 +90,18 @@ test("Google's structured deleted 410 needs no second read", async () => {
     deleteError: providerError(410, JSON.stringify({ error: { errors: [{ reason: "deleted" }] } })),
   });
   await f.sync.process(delivery);
-  assert.equal(f.state.mapping, undefined);
+  assert.equal(f.comments.length, 0, "confirmed deletion retires provider correlation");
   assert.deepEqual(f.calls.read, []);
 });
 
 test("a cancelled event is a terminal orphan; a live event after 410 is not", async () => {
   const cancelled = fixture({ deleteError: providerError(410), readEvent: { id: "calendar-event", status: "cancelled" } });
   await cancelled.sync.process(delivery);
-  assert.equal(cancelled.state.mapping, undefined);
+  assert.equal(cancelled.comments.length, 0);
 
   const live = fixture({ deleteError: providerError(410), readEvent: { id: "calendar-event", status: "confirmed" } });
   await assert.rejects(live.sync.process(delivery), { status: 410 });
-  assert.ok(live.state.mapping);
+  assert.equal(live.comments.length, 1, "a live Calendar event keeps provider correlation for retry");
   assert.equal(live.state.audits.length, 0);
 });
 

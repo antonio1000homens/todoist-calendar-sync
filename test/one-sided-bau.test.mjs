@@ -40,7 +40,7 @@ function deletion(profile) {
 function setup(profile, { taskExists = false, differentOwner = false, recurringEvent = false,
   mappingRecurrenceId = false, mappingActiveInstanceId = false,
   syncRecurrenceOwner = false, todoistRecurrence = false, missingTaskId = false,
-  historicalEvent = false, raceAfterProviderDelete = false } = {}) {
+  historicalEvent = false, raceAfterProviderDelete = false, promptPreference = false } = {}) {
   const operations = [], decisions = new Decisions(), notifier = new Notifier();
   const original = {
     profile, taskId: "task-1", eventId: "event-1", updatedAt: "2026-10-26T09:00:00.000Z",
@@ -92,7 +92,9 @@ function setup(profile, { taskExists = false, differentOwner = false, recurringE
       },
     },
   });
-  const policies = { async resolve(_profile, _type, _seriesId, mode) { return { mode, source: "catalog" }; } };
+  const policies = { async resolve(_profile, _type, _seriesId, mode) {
+    return { mode: promptPreference ? "prompt" : mode, source: promptPreference ? "profile" : "catalog" };
+  } };
   const service = new ManualInterventionService(decisions, notifier, clients, policies);
   const changeMapping = () => { current = { ...original, updatedAt: "2026-10-26T10:01:00.000Z" }; };
   return { operations, decisions, notifier, state, service, changeMapping };
@@ -112,7 +114,9 @@ test("standalone Todoist deletion is auto-applied without an approval in all pro
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = "true";
   try {
     for (const profile of ["work", "home", "antonio"]) {
-      const h = setup(profile);
+      // A stale saved prompt preference cannot turn an explicit provider
+      // deletion into a human approval gate.
+      const h = setup(profile, { promptPreference: profile === "work" });
       const before = sent.length;
       assert.equal(await h.service.interceptTodoistDeletion(deletion(profile), h.state), true);
       assert.equal(h.notifier.posted.length, 0, "no Slack approval card");
@@ -122,7 +126,8 @@ test("standalone Todoist deletion is auto-applied without an approval in all pro
       assert.equal(auto.manual.action, "delete_calendar_event");
       assert.equal(auto.manual.slackUserId, "AUTO_POLICY");
       await h.service.processManualDelivery(auto, h.state);
-      assert.deepEqual(h.operations, ["calendar event-1 deleted", `mutation ${profile}`, "mapping event-1 removed"]);
+      assert.deepEqual(h.operations, ["calendar event-1 deleted", `mutation ${profile}`],
+        "provider-native correlation is retired from the Todoist project comment; no DynamoDB index is written");
       assert.equal(h.decisions.rows.get(auto.manual.decisionId).status, "resolved");
     }
   } finally {

@@ -1,7 +1,7 @@
 export type Profile = "home" | "antonio" | "work";
 export type CutoverMode = "aws";
 export type DeliveryKind = "calendar" | "todoist" | "orphan" | "reconcile" | "manual" | "repair";
-export type ReconciliationReason = "manual";
+export type ReconciliationReason = "manual" | "scheduled";
 export type CalendarWatchStatus = "active" | "replaced" | "missing";
 
 export interface CalendarWatchState {
@@ -220,10 +220,19 @@ export interface Mapping {
   syncedTitle?: string;
   syncedDescription?: string;
   syncedDue?: string;
+  /** Last mutually observed provider state, stored beside the provider correlation. */
+  syncBaseline?: ProviderSyncBaseline;
   /** True when the Calendar-owned mirror is one native recurring Todoist task. */
   calendarNativeRecurring?: boolean;
   /** Versioned marker for a verified Todoist-owned native Phase B Calendar master. */
   todoistPhaseBVersion?: 1;
+  updatedAt: string;
+}
+
+export interface ProviderSyncBaseline {
+  version: 1;
+  todoist: { content: string; description: string; due: string; recurrence?: string };
+  calendar: { status: string; summary: string; description: string; start: string; recurrence?: string };
   updatedAt: string;
 }
 
@@ -232,9 +241,10 @@ export interface CompletedCalendarProjection {
   taskId: string;
   eventId: string;
   completedAt: string;
+  /** @deprecated Read-only compatibility for existing completed rows. New rows infer recurrence from exact IDs. */
+  recurrenceOwner?: "calendar" | "todoist";
   /** Only set true after direct evidence that the final recurring occurrence completed and no active successor exists. */
   terminalVerified?: true;
-  recurrenceOwner?: "calendar" | "todoist";
   seriesId?: string;
   masterEventId?: string;
   originalStart?: string;

@@ -139,20 +139,26 @@ test("initial item:added signature and fresh GET remain independent: changed due
   assert.equal(f.writes.length,0,"stale original due cannot be silently reanchored as a native master");
   assert.equal(f.normal.length,0,"changed due cannot fall back to a rolling mirror");
   assert.equal(f.state.mapping?.todoistPhaseBVersion,undefined);
-  assert.ok(f.state.audits.some(x=>x.action==="todoist_recurrence_unsupported_rule"
-    && x.detail.outcome==="source_left_unchanged"));
+  assert.ok(f.state.audits.length>0,"unsupported recurrence is diagnosed");
+  assert.equal(f.state.audits.at(-1).detail.outcome,"source_left_unchanged");
 }));
-test("actual project re-entry never promotes a historic rolling mapping",()=>withGate(true,async()=>{
+test("actual project re-entry never creates a flattened recurring mirror",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{oldProjectId:"unmapped-inbox-project"});
   await f.sync.process(f.delivery);
   assert.equal(f.writes.length,0);
-  assert.equal(f.normal.length,1);
+  assert.equal(f.normal.length,0);
+  assert.equal(f.state.mapping?.todoistPhaseBVersion,undefined);
+  assert.ok(f.state.audits.some(x=>x.action==="todoist_project_recurrence_unsupported"
+    || x.action==="todoist_recurrence_unsupported_rule"));
 }));
-test("month-end provider divergence never enters native writer",()=>withGate(true,async()=>{
+test("month-end provider divergence remains unmirrored instead of flattening recurrence",()=>withGate(true,async()=>{
   const family={name:"quarterly-month-end",phrase:"every quarter",due:"2027-01-31",
     dates:["2027-01-31","2027-04-30","2027-07-30"],rrule:""};
   const f=setup(family);
   await f.sync.process(f.delivery);
   assert.equal(f.writes.length,0);
-  assert.equal(f.normal.length,1);
+  assert.equal(f.normal.length,0);
+  assert.equal(f.state.mapping?.todoistPhaseBVersion,undefined);
+  assert.ok(f.state.audits.length>0,"unsupported recurrence is diagnosed");
+  assert.equal(f.state.audits.at(-1).detail.outcome,"source_left_unchanged");
 }));

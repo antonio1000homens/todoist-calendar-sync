@@ -1,6 +1,5 @@
 import { googleCredentials, profiles, todoistToken } from "./config.js";
 import { GoogleCalendar, Todoist } from "./providers.js";
-import {guardReplayProviderClients,REPLAY_GUARDED_PROVIDER_WRITES} from "./erasure-replay-providers.js";
 import type { Profile } from "./types.js";
 
 export const DEFAULT_RECONCILIATION_MUTATION_LIMIT = 10;
@@ -67,8 +66,18 @@ export class ReconciliationMutationBudget {
   }
 }
 
-const CALENDAR_MUTATIONS = new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.calendar);
-const TODOIST_MUTATIONS = new Set<string>(REPLAY_GUARDED_PROVIDER_WRITES.todoist);
+// Provider write surface used by the reconciliation mutation budget. Keep
+// this independent from the retired replay-admission wrapper.
+const CALENDAR_MUTATIONS = new Set<string>([
+  "createFutureMasterOnce", "createTodoistPhaseBNativeMasterOnce", "upsertEvent",
+  "patchEventMetadataIfUnchanged", "createRepairEventOnce", "upsertEventIfUnchanged",
+  "updateSharedEventPropertiesIfUnchanged", "ensureTaskCorrelation", "deleteEvent", "deleteEventIfUnchanged",
+]);
+const TODOIST_MUTATIONS = new Set<string>([
+  "upsertTask", "updateTaskMetadata", "createTaskOnce", "moveTask", "updateRecurringOccurrence",
+  "deleteTask", "createProjectComment", "completeTask", "updateComment", "upsertProjectComment",
+  "upsertComment", "deleteComment",
+]);
 
 function mutationReservation(provider: "calendar" | "todoist", operation: string, args: unknown[]): number {
   // Todoist.upsertComment(existingId) first attempts an update and, when the
@@ -139,7 +148,7 @@ export function createObservedProviderClientFactory(
   };
 }
 
-export const defaultProviderClientFactory: ProviderClientFactory = async (profile,options) => guardReplayProviderClients(profile,{
+export const defaultProviderClientFactory: ProviderClientFactory = async (profile,options) => ({
   calendar: new GoogleCalendar(await googleCredentials(profile), profiles[profile].calendarId,options),
   todoist: new Todoist(await todoistToken(profile),options),
 });
@@ -149,7 +158,7 @@ export function createBudgetedClientFactory(
   baseFactory: ProviderClientFactory = defaultProviderClientFactory,
 ): ProviderClientFactory {
   return async (profile) => {
-    const clients = guardReplayProviderClients(profile,await baseFactory(profile));
+    const clients = await baseFactory(profile);
     return {
       calendar: budgetedProvider(clients.calendar, "calendar", profile, budget, CALENDAR_MUTATIONS),
       todoist: budgetedProvider(clients.todoist, "todoist", profile, budget, TODOIST_MUTATIONS),

@@ -58,7 +58,7 @@ test("project mapping comment recovery restores missing progress state", () => {
     completedThroughOriginalStart: undefined,
   }), parsed);
 
-  assert.equal(recovered.recurrenceOwner, "calendar");
+  assert.equal(recovered.recurrenceOwner, undefined, "provider comments must not persist a permanent recurrence owner");
   assert.equal(recovered.seriesId, "series-1");
   assert.equal(recovered.masterEventId, "master-1");
   assert.equal(recovered.activeInstanceId, "event-1");

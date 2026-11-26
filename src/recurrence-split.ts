@@ -124,9 +124,10 @@ export function planFutureSeriesSplit(
   }
   const previousTaskMatches = expectedPreviousTaskId
     ? old.extendedProperties?.shared?.taskId === expectedPreviousTaskId
-      && old.extendedProperties?.shared?.syncRecurrenceOwner === "calendar"
+      && old.extendedProperties?.shared?.syncSeriesId !== expectedPreviousTaskId
     : old.extendedProperties?.shared?.taskId === task.id
-      && old.extendedProperties?.shared?.syncRecurrenceOwner !== "calendar";
+      && (!old.extendedProperties?.shared?.syncSeriesId
+        || old.extendedProperties.shared.syncSeriesId === task.id);
   if ((!previousTaskMatches
       && !(old.extendedProperties?.shared?.syncHistoryOnly === "true"
         && old.extendedProperties?.shared?.syncHistoryTaskId === task.id))

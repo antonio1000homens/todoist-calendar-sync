@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import {GetResourcePolicyCommand,PutResourcePolicyCommand} from "@aws-sdk/client-lambda";
 import {ensureBoundary,invocationBoundaryStatement,mergeInvocationBoundary} from "../scripts/enforce-erasure-lambda-invocation-boundary.mjs";
 
-const versionArn="arn:aws:lambda:eu-west-2:243857182133:function:todoist-calendar-sync-review-api-production:139";
-const aliasArn="arn:aws:lambda:eu-west-2:243857182133:function:todoist-calendar-sync-review-api-production:live";
+const versionArn="arn:aws:lambda:eu-west-2:243857182133:function:todoist-calendar-sync-worker-production:139";
+const aliasArn="arn:aws:lambda:eu-west-2:243857182133:function:todoist-calendar-sync-worker-production:live";
 const functionArn="arn:aws:lambda:eu-west-2:243857182133:function:todoist-calendar-sync-worker-production";
 
 test("numeric versions receive an unconditional deny for direct invoke and legacy async",()=>{

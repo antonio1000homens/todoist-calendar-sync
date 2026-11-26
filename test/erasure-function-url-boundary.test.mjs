@@ -19,28 +19,34 @@ for(const line of resources.split("\n")) {
 }
 const resource=name=>(resourceBlocks.get(name)||[]).join("\n");
 
-test("public Function URLs are limited to the two application-authenticated endpoints",()=>{
+test("public Function URL is limited to the proxy-authenticated ingress endpoint",()=>{
   const functions=[...resourceBlocks].filter(([,lines])=>lines.some(line=>/Type: AWS::Serverless::Function/.test(line)))
     .map(([name])=>name);
   const withUrl=functions.filter(name=>/FunctionUrlConfig:/.test(resource(name)));
-  assert.deepEqual(withUrl.sort(),["IngressFunction","ReviewApiFunction"]);
+  assert.deepEqual(withUrl.sort(),["IngressFunction"]);
   for(const name of withUrl)assert.match(resource(name),/FunctionUrlConfig:\n\s+AuthType: NONE/);
 
-  const publicPermissions=["IngressUrlPermission","IngressInvokePermission",
-    "ReviewApiUrlPermission","ReviewApiInvokePermission"];
+  const publicPermissions=["IngressUrlPermission","IngressInvokePermission"];
   for(const name of publicPermissions)assert.ok(resource(name),`${name} is explicitly declared`);
-  for(const name of ["IngressUrlPermission","ReviewApiUrlPermission"]) {
+  for(const name of ["IngressUrlPermission"]) {
     const block=resource(name);
     assert.match(block,/Principal: "\*"/);
     assert.match(block,/Action: lambda:InvokeFunctionUrl/);
     assert.match(block,/FunctionUrlAuthType: NONE/);
   }
-  for(const name of ["IngressInvokePermission","ReviewApiInvokePermission"]) {
+  for(const name of ["IngressInvokePermission"]) {
     const block=resource(name);
     assert.match(block,/Principal: "\*"/);
     assert.match(block,/Action: lambda:InvokeFunction/);
     assert.match(block,/InvokedViaFunctionUrl: true/);
   }
+});
+
+test("manual review API Lambda and public dashboard output are retired",()=>{
+  assert.equal(resource("ReviewApiFunction"),"");
+  assert.equal(resource("ReviewApiUrlPermission"),"");
+  assert.equal(resource("ReviewApiInvokePermission"),"");
+  assert.doesNotMatch(template,/ReviewApiFunctionUrl/);
 });
 
 test("direct unauthenticated ingress URL requests stop before state or queue access",async t=>{

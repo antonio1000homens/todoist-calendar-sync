@@ -3,7 +3,7 @@ import test from "node:test";
 import { reconcileUnmappedCalendar, recurringTaskIdentityCandidates } from "../dist/calendar-reconciliation.js";
 import { ReconciliationMutationBudget } from "../dist/mutation-budget.js";
 import { profiles } from "../dist/config.js";
-import { serializeDeletionTombstoneComment } from "../dist/mapping-comments.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 
 function futureEvent(id, day, summary = `Event ${id}`) {
   return {
@@ -48,8 +48,10 @@ function fakeState() {
 
 function fakeClients(events, initialTasks = []) {
   const tasks = initialTasks.map((task) => ({ ...task }));
+  const projectComments = [];
   let created = 0;
   let comments = 0;
+  let deletedEvents = 0;
   let deletions = 0;
   let listInstancesCalls = 0;
   return {
@@ -60,10 +62,16 @@ function fakeClients(events, initialTasks = []) {
         async listInstancesInWindow(masterId) { return this.listInstances(masterId); },
         async listExplicitSeriesExceptions() { return []; },
         async getTimeZone() { return "Europe/London"; },
+        async deleteEvent() { deletedEvents += 1; },
       },
       todoist: {
         async listTasks() { return tasks; },
-        async listProjectComments() { return []; },
+        async listProjectComments() { return projectComments; },
+        async getTask(id) {
+          const task = tasks.find((candidate) => candidate.id === id);
+          if (task) return task;
+          const error = new Error("not found"); error.status = 404; throw error;
+        },
         async getTimeZone() { return "Europe/London"; },
         async upsertTask(task) {
           created += 1;
@@ -77,8 +85,10 @@ function fakeClients(events, initialTasks = []) {
     },
     get created() { return created; },
     get comments() { return comments; },
+    get deletedEvents() { return deletedEvents; },
     get deletions() { return deletions; },
     get tasks() { return tasks; },
+    projectComments,
     get listInstancesCalls() { return listInstancesCalls; },
   };
 }
@@ -102,7 +112,7 @@ for (const [series,control] of [[false,"event"],[false,"task"],[false,"pair"],[t
 
 test("Calendar import rechecks a resolved pair after comment lookup before writing",async()=>{
   const state=fakeState(),source={...futureEvent("event",10,"Calendar item"),extendedProperties:{shared:{taskId:"candidate"}}};
-  const clients=fakeClients([source],[{id:"candidate",content:source.summary,description:"",due:{date:source.start.date}}]);
+  const clients=fakeClients([source],[{id:"candidate",content:source.summary,description:"",project_id:profiles.home.todoistProjectId,due:{date:source.start.date}}]);
   let blocked=false;
   state.syncBlocked=async(_profile,ids)=>blocked&&ids.taskId==="candidate";
   clients.pair.todoist.findComment=async()=>{blocked=true;return undefined;};
@@ -127,29 +137,11 @@ test("unsupported Calendar recurrence exception inventory never creates a flatte
     && detail.reason === "native_rule_or_complete_exception_inventory_not_representable"));
 });
 
-test("Calendar snapshot recovery does not recreate a task for an erased event retained in Calendar", async () => {
-  const event = futureEvent("erased-calendar-event", 10, "Erased appointment");
+test("Calendar snapshot recovery removes an event whose exact correlated Todoist task is gone", async () => {
+  const event = { ...futureEvent("erased-calendar-event", 10, "Erased appointment"),
+    extendedProperties: { shared: { taskId: "erased-todoist-task" } } };
   const state = fakeState();
   const clients = fakeClients([event]);
-  const projectId = profiles.home.todoistProjectId;
-  const createdAt = new Date().toISOString();
-  clients.pair.todoist.listProjectComments = async (requestedProjectId, refresh) => {
-    assert.equal(requestedProjectId, projectId);
-    assert.equal(refresh, true);
-    return [{
-      id: "bounded-erasure-marker",
-      project_id: projectId,
-      content: serializeDeletionTombstoneComment({
-        schemaVersion: 1,
-        profile: "home",
-        projectId,
-        taskId: "erased-todoist-task",
-        eventIds: [event.id],
-        createdAt,
-        expiresAt: new Date(Date.parse(createdAt) + 18 * 24 * 60 * 60 * 1000).toISOString(),
-      }),
-    }];
-  };
 
   const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
 
@@ -157,10 +149,10 @@ test("Calendar snapshot recovery does not recreate a task for an erased event re
   assert.equal(summary.rebound, 0);
   assert.equal(summary.skipped, 1);
   assert.equal(clients.created, 0);
+  assert.equal(clients.deletedEvents, 1);
   assert.equal(clients.comments, 0);
   assert.equal(state.mappings.length, 0);
-  assert.ok(state.audits.some(entry => entry.action === "erasure_project_comment_replay_suppressed"
-    && Object.keys(entry.detail).join(",") === "side"));
+  assert.ok(state.audits.some(entry => entry.action === "calendar_snapshot_deleted_task_projection_removed"));
 });
 
 test("snapshot recovery imports one future unmapped Calendar event and binds it", async () => {
@@ -273,7 +265,9 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(tasks[0].due.string, "every Wednesday at 2:00pm starting 4 Nov 2099 and ending 25 Nov 2099");
   assert.equal(state.mappings.length, 1);
   assert.equal(state.mappings[0].taskId, "one-task");
-  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+  assert.equal(state.mappings[0].recurrenceOwner, undefined);
+  assert.equal(state.mappings[0].eventId, master.id);
+  assert.equal(state.mappings[0].seriesId, master.iCalUID || master.id);
 });
 
 
@@ -321,7 +315,9 @@ test("snapshot import creates one native recurring Todoist task for indefinite w
     assert.equal(tasks.length, 1, rule);
     assert.equal(tasks[0].due.is_recurring, true, rule);
     assert.ok(tasks[0].due.string.includes(fragment), rule);
-    assert.equal(state.mappings[0].recurrenceOwner, "calendar", rule);
+    assert.equal(state.mappings[0].recurrenceOwner, undefined, rule);
+    assert.equal(state.mappings[0].eventId, master.id, rule);
+    assert.equal(state.mappings[0].seriesId, master.iCalUID || master.id, rule);
   }
 });
 
@@ -339,10 +335,11 @@ test("existing Calendar-owned one-off mirror is upgraded in place only with exac
       activeInstanceId: active.id, originalStart: active.start.date,
       calendarProgressVersion: 1, updatedAt: "2099-01-01T00:00:00Z" };
     state.mappings.push(mapping);
-    state.getRecurrenceLink = async () => ({ ...mapping, owner: "calendar" });
     const existing = { id: "existing-task", content: changed ? "Edited independently" : master.summary,
       description: "", due: { date: active.start.date, is_recurring: false } };
     const clients = fakeClients([master], [existing]);
+    clients.projectComments.push({ id: "existing-project-correlation", project_id: profiles.home.todoistProjectId,
+      content: serializeMappingComment({ ...mapping, projectId: profiles.home.todoistProjectId }, profiles.home.todoistProjectId) });
     clients.pair.calendar.listInstances = async () => [active];
     clients.pair.todoist.getTask = async (id) => {
       assert.equal(id, existing.id);
@@ -365,7 +362,8 @@ test("existing Calendar-owned one-off mirror is upgraded in place only with exac
     assert.equal(state.mappings.at(-1).taskId, "existing-task");
     assert.equal(state.mappings.at(-1).calendarProgressVersion, 1);
     if (!changed) {
-      assert.equal(state.mappings.at(-1).calendarNativeRecurring, true);
+      assert.equal(state.mappings.at(-1).calendarNativeRecurring, undefined);
+      assert.notEqual(state.mappings.at(-1).seriesId, state.mappings.at(-1).taskId);
       assert.equal(state.mappings.at(-1).syncedTitle, "Appointment");
     }
   }
@@ -424,7 +422,9 @@ test("snapshot recovery retains an ending-only recurrence returned with a zone-l
   assert.equal(deletes, 0, "a matching provider readback must not be rolled back");
   assert.equal(state.mappings.length, 1);
   assert.equal(state.mappings[0].taskId, "normalized-local-task");
-  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
+  assert.equal(state.mappings[0].recurrenceOwner, undefined);
+  assert.equal(state.mappings[0].eventId, master.id);
+  assert.notEqual(state.mappings[0].seriesId, state.mappings[0].taskId);
   assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"), false);
 });
 
@@ -680,8 +680,8 @@ test("snapshot recovery will not bind a canonical task already owned by another 
   assert.equal(state.mappings.length, 1);
   const audit = state.audits.find((entry) => entry.action === "calendar_snapshot_unmapped_ambiguous");
   assert.deepEqual(audit.detail.candidateTaskIds, ["task-bound"]);
-  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, []);
-  assert.deepEqual(audit.detail.mappedCandidateTaskIds, ["task-bound"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, ["task-bound"]);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, []);
   assert.deepEqual(audit.detail.reservedCandidateTaskIds, []);
 });
 
@@ -703,7 +703,7 @@ test("snapshot recovery stops provider writes at the ten-mutation budget", async
 
 test("rejected worst-case reservation still keeps reconciliation pending", async () => {
   const event = { ...futureEvent("calendar-reservation", 14, "Reservation appointment"), extendedProperties: { shared: { taskId: "task-reservation" } } };
-  const task = { id: "task-reservation", content: "Reservation appointment", description: "", project_id: "home-project", due: { date: "2099-01-14" } };
+  const task = { id: "task-reservation", content: "Reservation appointment", description: "", project_id: profiles.home.todoistProjectId, due: { date: "2099-01-14" } };
   const state = fakeState();
   const clients = fakeClients([event], [task]);
   clients.pair.todoist.findComment = async () => ({ id: "existing-comment" });
@@ -777,12 +777,12 @@ test("ambiguous series recovery audits every canonical candidate and mapped owne
   const audit = state.audits.find((entry) => ["calendar_snapshot_recurring_ambiguous", "calendar_snapshot_recurring_identity_conflict"].includes(entry.action));
   assert.ok(audit, "the second series must not reuse the task reserved by the first");
   assert.deepEqual(audit.detail.candidateTaskIds, ["eligible-task-a", "eligible-task-b", "mapped-task"]);
-  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, ["eligible-task-a", "eligible-task-b"]);
-  assert.deepEqual(audit.detail.mappedCandidateTaskIds, ["mapped-task"]);
+  assert.deepEqual(audit.detail.eligibleCandidateTaskIds, ["eligible-task-a", "eligible-task-b", "mapped-task"]);
+  assert.deepEqual(audit.detail.mappedCandidateTaskIds, []);
   assert.deepEqual(audit.detail.reservedCandidateTaskIds, []);
 });
 
-test("ambiguous series recovery classifies reserved candidates without mutating the second series", async () => {
+test("ambiguous series recovery keeps the exact native master identity without mutating the second series", async () => {
   const firstMaster = { ...futureEvent("a-series", 11, "Same appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
   const secondMaster = { ...futureEvent("b-series", 11, "Same appointment"), recurrence: ["RRULE:FREQ=YEARLY"] };
   const firstOccurrence = { ...futureEvent("a-series_20990111", 11, "Same appointment"), recurringEventId: firstMaster.id,
@@ -802,7 +802,8 @@ test("ambiguous series recovery classifies reserved candidates without mutating 
   assert.equal(summary.providerMutations, 1);
   assert.equal(clients.created, 1);
   assert.equal(state.mappings.length, 1);
-  assert.equal(state.mappings[0].eventId, firstOccurrence.id);
+  assert.equal(state.mappings[0].eventId, firstMaster.id);
+  assert.equal(state.mappings[0].masterEventId, firstMaster.id);
   assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_identity_unverified"
     && entry.detail.candidateTaskIds.includes("created-1")));
 });
@@ -855,10 +856,12 @@ test("Calendar-owned recurring series creates one native recurring mirror", asyn
   assert.equal(first.imported, 1);
   assert.equal(clients.created, 1);
   assert.equal(writes[0].due.is_recurring, true);
-  assert.equal(state.mappings[0].recurrenceOwner, "calendar");
-  assert.equal(state.mappings[0].eventId, occurrence.id);
-  // Second run should see the recorded recurrence link, not create another task.
-  state.getRecurrenceLink = async () => ({ seriesId: master.id, owner: "calendar", taskId: "created-1" });
+  assert.equal(state.mappings[0].recurrenceOwner, undefined);
+  assert.notEqual(state.mappings[0].seriesId, state.mappings[0].taskId,
+    "Calendar master ID carries native series identity without a permanent owner marker");
+  assert.equal(state.mappings[0].eventId, master.id,
+    "native recurrence correlation uses the stable Calendar master ID");
+  // Second run should recover the exact provider mapping, not create another task.
   const second = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
   assert.equal(second.imported, 0);
   assert.equal(clients.created, 1);

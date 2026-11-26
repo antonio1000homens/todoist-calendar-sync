@@ -5,8 +5,9 @@
 import { GetCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient } from "./dynamodb-capacity.js";
 import { ReviewStore } from "./review-store.js";
+import { buildProjectMappingIndex, mappingFromProjectMappingComment } from "./mapping-comments.js";
+import { profiles as profileConfig } from "./config.js";
 import { entityKey, type RepairOperation, type ReviewCase, type EntityRef } from "./review-types.js";
-import { assertReplayAdmissionIfEnabled } from "./erasure-replay-barrier.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
 import { knownPrewriteRecoveryValidationCase } from "./guarded-recovery-incidents.js";
 import { logEvent } from "./observability.js";
@@ -39,7 +40,8 @@ export interface AnnualRecoveryInput {
   calendar:Pick<GoogleCalendar,"getEvent"|"listLinkedEventsByTodoistTaskId"|"listExplicitSeriesExceptions">;
   /** Required for new #378 policy families; a missing inventory is not absence. */
   calendarForProfile?:(profile:Profile)=>Promise<Pick<GoogleCalendar,"listLinkedEventsByTodoistTaskId">>;
-  todoist:Pick<Todoist,"getTask">;
+  todoistForProfile?:(profile:Profile)=>Promise<Pick<Todoist,"listProjectComments">>;
+  todoist:Pick<Todoist,"getTask"|"listProjectComments">;
 }
 export async function attemptCancelledAnnualRecovery(
   input:AnnualRecoveryInput,
@@ -66,12 +68,9 @@ export async function attemptCancelledAnnualRecovery(
   const refs=operation.preview.snapshots.map(s=>s.ref);
   const oldCalendarIds=[...new Set([...refs.filter(r=>r.side==="calendar").map(r=>r.id),mapping.eventId])];
   if (oldCalendarIds.length>15) return deny("AMBIGUOUS_REPAIR_SNAPSHOT");
-  // A stale source webhook, active completed history, third-party mapping,
-  // explicit exclusion, pending erasure or a surviving Calendar identity stop.
-  await assertReplayAdmissionIfEnabled({profile,taskId:task.id,eventIds:oldCalendarIds});
-  if (await state.isRetired({profile,taskId:task.id,eventIds:oldCalendarIds})) return deny("STATE_GUARD_BLOCKED");
-  if (await state.getCalendarProjectionTombstone(profile,task.id)) return deny("STATE_GUARD_BLOCKED");
-  if (await state.getRecurrenceLinkByTaskAnyProfile(task.id)) return deny("STATE_GUARD_BLOCKED");
+  // A stale source webhook, active completed history, explicit exclusion or
+  // surviving Calendar identity stop. Deleted-item retirement markers are not
+  // part of ordinary sync admission.
   if ((await state.listCompletedCalendarProjectionsByTaskAnyProfile(task.id)).length) return deny("STATE_GUARD_BLOCKED");
   if (await review.hasActiveDeletionGuard(profile,"todoist",task.id)) return deny("STATE_GUARD_BLOCKED");
   // An independent open review case may own the same identity even without a
@@ -90,11 +89,22 @@ export async function attemptCancelledAnnualRecovery(
     if(!caseCursor){openCaseComplete=true;break;}
   }
   if(!openCaseComplete) return deny("STATE_GUARD_BLOCKED");
-  for (const other of profiles) {
-    const current=await state.getMappingByTask(other,task.id);
-    if (other!==profile && current) return deny("FOREIGN_OR_RECURRING_MAPPING");
-    if (other===profile && (!current || current.eventId!==mapping.eventId || current.updatedAt!==mapping.updatedAt)) return deny("MAPPING_INDEX_MISMATCH");
-  }
+  if (!input.todoistForProfile) return deny("PROVIDER_GUARD_BLOCKED");
+  const providerMappings=(await Promise.all(profiles.map(async candidateProfile=>{
+    const client=candidateProfile===profile?input.todoist:await input.todoistForProfile!(candidateProfile);
+    const comments=await client.listProjectComments(profileConfig[candidateProfile].todoistProjectId,true);
+    return buildProjectMappingIndex(comments).parsed
+      .filter(entry=>entry.payload.profile===candidateProfile
+        &&entry.payload.projectId===profileConfig[candidateProfile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
+  }))).flat().filter(candidate=>candidate.taskId===task.id);
+  const ownersByProfile=new Set(providerMappings.map(candidate=>candidate.profile));
+  if(ownersByProfile.size>1) return deny("FOREIGN_OR_RECURRING_MAPPING");
+  const liveMapping=providerMappings.filter(candidate=>candidate.profile===profile)
+    .sort((a,b)=>(b.mappingRevision||0)-(a.mappingRevision||0)||Date.parse(b.updatedAt)-Date.parse(a.updatedAt))[0];
+  if(!liveMapping||liveMapping.eventId!==mapping.eventId||liveMapping.updatedAt!==mapping.updatedAt
+    ||liveMapping.mappingRevision!==mapping.mappingRevision||liveMapping.seriesId||liveMapping.masterEventId
+    ||liveMapping.activeInstanceId) return deny("MAPPING_INDEX_MISMATCH");
   for (const id of oldCalendarIds) {
     if (await state.getCompletedCalendarProjectionByEvent(profile,id)) return deny("STATE_GUARD_BLOCKED");
     if (await review.hasActiveDeletionGuard(profile,"calendar",id)) return deny("STATE_GUARD_BLOCKED");
@@ -147,17 +157,11 @@ export async function attemptCancelledAnnualRecovery(
     || recoverySourceFingerprint(current)!==recoverySourceFingerprint(task)
     || current.is_completed || current.is_deleted || current.completed_at) return deny("SOURCE_READBACK_CHANGED");
   const read=async (pk:string,sk="STATE") => (await db.send(new GetCommand({TableName:table,Key:key(pk,sk),ConsistentRead:true}))).Item as Record<string,unknown>|undefined;
-  const [taskMap,ownerMap,eventMap,baseline,reset,otherReceipt]=await Promise.all([
-    read("TASK#"+profile+"#"+task.id,"MAP"),read("TASKOWNER#"+task.id,"MAP"),
-    read("EVENT#"+profile+"#"+mapping.eventId,"MAP"),
+  const [baseline,reset,otherReceipt]=await Promise.all([
     read("BASELINE#"+profile+"#TASK#"+task.id,"RECONCILE"),
     read("ANNUAL_RECOVERY#"+profile+"#"+task.id),read("REJECTED_PAIR#"+profile+"#"+task.id+"#"+mapping.eventId),
   ]);
-  if (reset || otherReceipt || !taskMap || !ownerMap || !eventMap) return deny("MAPPING_INDEX_MISMATCH");
-  const maps=[taskMap,ownerMap,eventMap];
-  if (maps.some(row=>row.taskId!==task.id || row.eventId!==mapping.eventId
-    || row.profile!==profile || row.updatedAt!==mapping.updatedAt
-    || row.recurrenceOwner || row.seriesId || row.masterEventId)) return deny("MAPPING_INDEX_MISMATCH");
+  if (reset || otherReceipt) return deny("MAPPING_INDEX_MISMATCH");
   const mappedControl=await read("SYNC_CONTROL#"+profile+":calendar:"+mapping.eventId);
   if (mappedControl?.activeRepair || mappedControl?.excluded) return deny("REPAIR_CONTROL_MISMATCH");
   const controls=await Promise.all(refs.map(async ref=>{
@@ -168,13 +172,6 @@ export async function attemptCancelledAnnualRecovery(
   // A queued refresh token is included in the conditional release; it stays
   // pending after reset instead of being silently acknowledged/lost.
   const now=(deps.now||(()=>new Date()))().toISOString();
-  const exactMap=(sk:string)=>({
-    Delete:{TableName:table,Key:key(sk==="owner"?"TASKOWNER#"+task.id
-      :sk==="task"?"TASK#"+profile+"#"+task.id:"EVENT#"+profile+"#"+mapping.eventId,"MAP"),
-      ConditionExpression:"#p = :p AND taskId = :task AND eventId = :event AND updatedAt = :at AND attribute_not_exists(recurrenceOwner) AND attribute_not_exists(seriesId)",
-      ExpressionAttributeNames:{"#p":"profile"},
-      ExpressionAttributeValues:{":p":profile,":task":task.id,":event":mapping.eventId,":at":mapping.updatedAt}}
-  });
   const tx:Array<Record<string,unknown>>=[
     {ConditionCheck:{TableName:table,Key:key("CALENDAR_WRITE#"+task.id),
       ConditionExpression:"#leaseToken = :leaseToken AND leaseUntilMs > :now",
@@ -206,12 +203,9 @@ export async function attemptCancelledAnnualRecovery(
       ExpressionAttributeValues:{":no":false}}},
     {ConditionCheck:{TableName:table,Key:key("REJECTED_PAIR#"+profile+"#"+task.id+"#"+mapping.eventId),
       ConditionExpression:"attribute_not_exists(pk)"}},
-    exactMap("owner"),exactMap("task"),exactMap("event"),
     {Delete:{TableName:table,Key:key("BASELINE#"+profile+"#TASK#"+task.id,"RECONCILE"),
       ConditionExpression:baseline ? "updatedAt = :at" : "attribute_not_exists(pk)",
       ...(baseline?{ExpressionAttributeValues:{":at":baseline.updatedAt}}:{})}},
-    {ConditionCheck:{TableName:table,Key:key("PROJECTION#"+profile+"#TASK#"+task.id,"TOMBSTONE"),
-      ConditionExpression:"attribute_not_exists(pk)"}},
     ...oldCalendarIds.map(id=>({ConditionCheck:{TableName:table,Key:key("COMPLETED_EVENT#"+profile+"#"+id),
       ConditionExpression:"attribute_not_exists(pk)"}})),
     {Put:{TableName:table,Item:{...key("ANNUAL_RECOVERY#"+profile+"#"+task.id),

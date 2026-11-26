@@ -102,7 +102,7 @@ async function memory(t,seed=[]){
 
 const completed=(owner,profile="home",taskId="finite-task",eventId="occurrence-final")=>({
   profile,taskId,eventId,completedAt,
-  recurrenceOwner:owner,seriesId:"series-finite",masterEventId:"master-finite",
+  seriesId:owner === "todoist" ? taskId : "series-finite",masterEventId:"master-finite",
   originalStart:"2026-10-22T09:00:00Z",
 });
 
@@ -113,13 +113,12 @@ test("#358 Todoist-owned final iteration writes terminal certificate with immuta
   await repo.putCompletedCalendarProjection(projection);
   const taskKey="COMPLETED_TASK#home#finite-task|EVENT#occurrence-final";
   const eventKey="COMPLETED_EVENT#home#occurrence-final|STATE";
-  const seriesKey="COMPLETED_SERIES#home#series-finite|STATE";
+  const seriesKey=`COMPLETED_SERIES#home#${projection.seriesId}|STATE`;
   assert.equal(db.rows.get(eventKey).terminalVerified,true);
   assert.equal(db.rows.get(taskKey).terminalVerified,true);
   assert.deepEqual(
-    [db.rows.get(seriesKey).recurrenceOwner,db.rows.get(seriesKey).masterEventId,
-      db.rows.get(seriesKey).terminalCompletedAt],
-    ["todoist","master-finite",completedAt]
+    [db.rows.get(seriesKey).masterEventId,db.rows.get(seriesKey).terminalCompletedAt],
+    ["master-finite",completedAt]
   );
   assert.equal(db.transactions[0].filter(op=>op.Put).length,3,
     "event, task, and series evidence commit in the same transaction");
@@ -151,7 +150,7 @@ test("#358 an earlier recurring completion must not manufacture terminal proof o
   assert.equal(db.rows.has("COMPLETED_EVENT#home#occurrence-final|STATE"),true);
 });
 
-test("#358 Calendar-owned final iteration certifies only after conditionally retiring the exact link",async t=>{
+test("#358 Calendar final iteration retains terminal history without mutating legacy recurrence indexes",async t=>{
   const link={pk:"RECURRENCE#work#series-finite",sk:"STATE",
     profile:"work",owner:"calendar",taskId:"finite-task",eventId:"occurrence-final",
     seriesId:"series-finite",masterEventId:"master-finite",activeInstanceId:"occurrence-final",
@@ -162,12 +161,12 @@ test("#358 Calendar-owned final iteration certifies only after conditionally ret
   await repo.putCompletedCalendarProjection(projection);
   assert.equal(db.rows.has("COMPLETED_SERIES#work#series-finite|STATE"),false);
   assert.equal(await repo.verifyTerminalCompletedCalendarProjection(projection,link),true);
-  assert.equal(db.rows.has(storageKey(link)),false);
+  assert.equal(db.rows.has(storageKey(link)),true,"terminal retention does not depend on or retire a DynamoDB recurrence row");
   assert.equal(db.rows.get("COMPLETED_EVENT#work#occurrence-final|STATE").terminalVerified,true);
   assert.equal(db.rows.get("COMPLETED_TASK#work#finite-task|EVENT#occurrence-final").terminalVerified,true);
-  assert.equal(db.rows.get("COMPLETED_SERIES#work#series-finite|STATE").recurrenceOwner,"calendar");
-  assert.ok(db.transactions.at(-1).some(x=>x.Delete?.Key.pk===link.pk));
-  assert.ok(db.transactions.at(-1).some(x=>x.ConditionCheck?.Key.pk==="TASKOWNER#finite-task"));
+  assert.equal(db.rows.get("COMPLETED_SERIES#work#series-finite|STATE").recurrenceOwner,undefined);
+  assert.equal(db.transactions.at(-1).some(x=>x.Delete?.Key.pk===link.pk),false);
+  assert.equal(db.transactions.at(-1).some(x=>x.ConditionCheck?.Key.pk==="TASKOWNER#finite-task"),false);
   const before=await runCompletedHistoryCleanup({apply:true,maxPages:1,nowMs:at(7,-1)});
   assert.equal(before.too_recent,1);
   const after=await runCompletedHistoryCleanup({apply:true,maxPages:1,nowMs:at(7)});
@@ -176,7 +175,7 @@ test("#358 Calendar-owned final iteration certifies only after conditionally ret
   assert.equal(db.rows.has("COMPLETED_EVENT#work#occurrence-final|STATE"),true);
 });
 
-test("#358 competing or future mapping blocks terminal certification and leaves all records intact",async t=>{
+test("#358 stale competing DynamoDB correlation rows do not block provider-verified terminal certification",async t=>{
   const link={pk:"RECURRENCE#work#series-finite",sk:"STATE",
     profile:"work",owner:"calendar",taskId:"finite-task",eventId:"occurrence-final",
     seriesId:"series-finite",masterEventId:"master-finite",activeInstanceId:"occurrence-final",
@@ -188,12 +187,12 @@ test("#358 competing or future mapping blocks terminal certification and leaves 
   const repo=new StateRepository();
   const projection=completed("calendar","work");
   await repo.putCompletedCalendarProjection(projection);
-  assert.equal(await repo.verifyTerminalCompletedCalendarProjection(projection,link),false);
+  assert.equal(await repo.verifyTerminalCompletedCalendarProjection(projection,link),true);
   assert.equal(db.rows.has(storageKey(link)),true);
   assert.equal(db.rows.has(storageKey(futureMapping)),true);
-  assert.equal(db.rows.has("COMPLETED_SERIES#work#series-finite|STATE"),false);
+  assert.equal(db.rows.has("COMPLETED_SERIES#work#series-finite|STATE"),true);
   const cleanup=await runCompletedHistoryCleanup({apply:true,maxPages:1,nowMs:at(30)});
-  assert.equal(cleanup.skipped_ambiguous,1,"elapsed time must not invent missing terminal evidence");
+  assert.equal(cleanup.skipped_active,1,"legacy correlation rows remain for the migration cleanup to retire before history cleanup");
 });
 
 test("#358 retired associations are ignored on repeated snapshot reconciliation without touching providers",async()=>{
@@ -219,7 +218,6 @@ test("#358 retired associations are ignored on repeated snapshot reconciliation 
   const second=await reconciler.reconcileMapping("work",target,undefined,clients);
   assert.equal(first,"noop");
   assert.equal(second,"noop");
-  assert.equal(checked.length,2);
-  assert.ok(checked.every(i=>i.seriesIds.includes("historic-series")));
+  assert.equal(checked.length,0,"ordinary reconciliation does not consult persistent retired-identity state");
   assert.deepEqual(activeIndexes.get(future.taskId),future,"unrelated future series remains mapped");
 });

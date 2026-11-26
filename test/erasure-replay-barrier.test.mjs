@@ -2,32 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   ErasureReplayUnavailableError, atomicConfirmedErasureCompletion,
-  verifyConfirmedErasureCompletion, replayAdmissionEnabled,
-  assertReplayAdmission, mappingReplayIdentity,
+  verifyConfirmedErasureCompletion, mappingReplayIdentity,
 } from "../dist/erasure-replay-barrier.js";
-
-test("legacy HMAC replay gate stays disabled and any attempted reactivation fails closed",async t=>{
-  const prior=process.env.ERASURE_REPLAY_BARRIER_VERSION;
-  t.after(()=>{if(prior===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
-    else process.env.ERASURE_REPLAY_BARRIER_VERSION=prior;});
-  for(const disabled of [undefined,"","0"]) {
-    if(disabled===undefined)delete process.env.ERASURE_REPLAY_BARRIER_VERSION;
-    else process.env.ERASURE_REPLAY_BARRIER_VERSION=disabled;
-    assert.equal(replayAdmissionEnabled(),false);
-  }
-  for(const unexpected of ["1","2","unrecognised"]) {
-    process.env.ERASURE_REPLAY_BARRIER_VERSION=unexpected;
-    assert.throws(()=>replayAdmissionEnabled(),ErasureReplayUnavailableError);
-  }
-});
-
-test("direct HMAC marker admission is retired and performs no DynamoDB reads",async()=>{
-  let reads=0;
-  await assert.rejects(assertReplayAdmission({profile:"work",taskId:"task-1"},{
-    async send(){reads++;throw new Error("a legacy marker must not be read");}
-  }),ErasureReplayUnavailableError);
-  assert.equal(reads,0);
-});
 
 test("mapping identity retains all known recurrence aliases for retirement admission",()=>{
   assert.deepEqual(mappingReplayIdentity({

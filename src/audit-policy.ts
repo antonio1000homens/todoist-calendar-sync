@@ -24,6 +24,12 @@ const SIGNIFICANT_EXACT_ACTIONS = new Set([
 
 const ROUTINE_EXACT_ACTIONS = new Set([
   "todoist_snapshot_reconcile_baseline_established",
+  // Unsupported recurrence is an intentional non-mutating result. Retaining
+  // it as a conflict would recreate the permanent review loop the provider
+  // native engine is meant to remove; the source and any existing mirror are
+  // left intact and the structured diagnostic remains in normal telemetry.
+  "calendar_recurrence_unsupported_rule",
+  "todoist_recurrence_unsupported_rule",
   // These are expected no-op Calendar changes, not actionable incidents.
   // Keep their structured CloudWatch telemetry without writing AUDIT# rows.
   "calendar_elapsed_standalone_event_ignored",

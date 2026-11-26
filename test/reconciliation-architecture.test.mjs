@@ -7,17 +7,22 @@ const readText = async (path) => (await readFile(new URL(path, import.meta.url),
 const template = await readText("../template.yaml");
 const workerSource = await readText("../src/worker.ts");
 const handlerSource = await readText("../src/handler.ts");
-const erasureProtocolSource = await readText("../src/erasure-protocol.ts");
 const repositorySource = await readText("../src/repository.ts");
 const reconciliationSource = await readText("../src/reconciliation.ts");
+const reviewStoreSource = await readText("../src/review-store.ts");
+const syncSource = await readText("../src/sync.ts");
+const mappingCommentsSource = await readText("../src/mapping-comments.ts");
 const queueSource = await readText("../src/queue.ts");
 const healthSource = await readText("../src/reconcile.ts");
 const typesSource = await readText("../src/types.ts");
 const backfillSource = await readText("../scripts/backfill-profile-lookup-index.mjs");
 const deployPolicy = await readText("../infrastructure/github-actions-deploy-role.yaml");
 const deployRoleBootstrap = await readText("../infrastructure/bootstrap-deployment-role.sh");
+const migrationAccessPolicy = await readText("../infrastructure/github-actions-migration-access.yaml");
 const deployScript = await readText("../deploy.sh");
 const productionWorkflow = await readText("../.github/workflows/deploy.yml");
+const migrationWorkflow = await readText("../.github/workflows/project-comment-migration.yml");
+const legacyCutoverAuditSource = await readText("../scripts/legacy-erasure-cutover-audit.mjs");
 
 test("completed-history EventBridge rule is conditionally managed after SAM transform", () => {
   assert.match(template, /CompletedHistoryCleanupApply:[\s\S]*?Default:\s*"false"/);
@@ -80,18 +85,22 @@ test("capped or circuit-blocked reconciliation keeps its durable generation pend
   assert.match(workerSource, /continuationRequired/);
 });
 
-test("webhooks never start full reconciliation and the scheduled health check is read-only", () => {
+test("webhooks never start full reconciliation and the scheduled health check queues bounded full runs", () => {
   assert.match(workerSource, /let meaningfulMutation = false/);
   assert.match(workerSource, /meaningfulMutation = true/);
   assert.match(workerSource, /let calendarMutationBlocked = false/);
   assert.match(workerSource, /calendarMutationBlocked = true/);
-  assert.doesNotMatch(workerSource, /requestReconciliation\(/);
+  const legacyRepairBranch = workerSource.match(/if \(delivery\.kind === "repair"\) \{([\s\S]*?)\n\s*continue;\n\s*\}/)?.[1] || "";
+  assert.match(legacyRepairBranch, /requestReconciliation/);
+  assert.equal((workerSource.match(/requestReconciliation\(/g) || []).length, 1);
   assert.match(workerSource, /calendar_sync_token_withheld_circuit_block/);
   assert.match(workerSource, /incremental_sync_completed/);
-  assert.doesNotMatch(healthSource, /requestReconciliation|enqueueDelivery|listDelta|listTasks/);
+  assert.match(healthSource, /requestReconciliation/);
+  assert.match(healthSource, /SCHEDULED_RECONCILIATION_INTERVAL_MS/);
+  assert.doesNotMatch(healthSource, /listDelta|listTasks/);
   assert.match(template, /ScheduleExpression:\s*rate\(5 minutes\)/);
   const healthBlock = template.match(/ReconcilerFunction:[\s\S]*?ReconcilerFunctionEveryFifteenMinutes:/)?.[0] || "";
-  assert.doesNotMatch(healthBlock, /SQSSendMessagePolicy/);
+  assert.match(healthBlock, /Action: sqs:SendMessage/);
 });
 
 test("Calendar snapshot continuations run to exhaustion before terminal reconciliation status", () => {
@@ -146,38 +155,28 @@ test("ingress no longer claims DynamoDB delivery state before SQS enqueue", () =
   assert.match(handlerSource, /await enqueueDelivery\(delivery\)/);
 });
 
-test("ingress grants only the DynamoDB table actions required by admission lease protocol", () => {
-  const ingressBlock = template.match(/IngressFunction:[\s\S]*?ReviewApiLogGroup:/)?.[0] || "";
-  const tablePolicy = ingressBlock.match(/Action:\n((?:\s+- dynamodb:[^\n]+\n)+)\s+Resource: !GetAtt SyncState\.Arn/)?.[1] || "";
-  const granted = new Set([...tablePolicy.matchAll(/dynamodb:([A-Za-z]+)/g)].map((match) => match[1]));
-
-  const epochRead = erasureProtocolSource.match(/export async function getErasureEpoch[\s\S]*?\n}\n/)?.[0] || "";
-  const admissionLease = erasureProtocolSource.match(/export async function acquireErasureProtocolLease[\s\S]*?\n}\n/)?.[0] || "";
-  assert.ok(epochRead && admissionLease, "expected epoch read and admission lease implementations");
-
-  const required = new Set();
-  if (/new GetCommand\(/.test(epochRead) || /new GetCommand\(/.test(admissionLease)) required.add("GetItem");
-  if (/ConditionCheck\s*:/.test(admissionLease)) required.add("ConditionCheckItem");
-  if (/\bPut\s*:/.test(admissionLease)) required.add("PutItem");
-  if (/new DeleteCommand\(/.test(admissionLease)) required.add("DeleteItem");
-
-  for (const action of required) assert.ok(granted.has(action), `IngressFunction must allow dynamodb:${action}`);
-  assert.deepEqual([...granted].sort(), ["ConditionCheckItem", "DeleteItem", "GetItem", "PutItem", "UpdateItem"].sort(),
-    "the state-table policy should contain only current ingress state and admission-lease actions");
-  assert.match(ingressBlock, /Resource: !GetAtt SyncState\.Arn/);
-  assert.doesNotMatch(tablePolicy, /\*/);
+test("ordinary ingress and processing do not use persistent erasure admission state", () => {
+  assert.doesNotMatch(handlerSource, /assertReplayAdmission|replayAdmissionEnabled|ERASURE_PROTOCOL_VERSION/);
+  assert.doesNotMatch(queueSource, /assertReplayAdmission|replayAdmissionEnabled|acquireProfileAdmissionLease|ERASURE_PROTOCOL_VERSION/);
+  assert.doesNotMatch(workerSource, /assertReplayAdmission|replayAdmissionEnabled|acquireErasureProtocolLease|getErasureEpoch|ERASURE_PROTOCOL_VERSION/);
+  assert.doesNotMatch(workerSource, /ReviewEngine|deliverRepairOutcome/);
+  assert.match(workerSource, /legacy_repair_replaced_by_reconciliation/);
+  assert.doesNotMatch(reconciliationSource, /guardReplayProviderClients|assertReplayAdmissionIfEnabled/);
 });
 
-test("only verified erased-item replay is acknowledged; all other enqueue failures stay retryable", () => {
+test("snapshot reconciliation relies on fresh provider state, not retained deletion comments", () => {
+  assert.doesNotMatch(reconciliationSource, /activeProjectDeletionTombstone|DELETION_TOMBSTONE_COMMENT_MARKER/);
+  assert.doesNotMatch(reconciliationSource, /projectComments/);
+  assert.match(reconciliationSource, /currentTask\(clients\.todoist, listedTask\.id\)/);
+  assert.doesNotMatch(reviewStoreSource, /activeProjectDeletionTombstone|DELETION_TOMBSTONE_COMMENT_MARKER/);
+});
+
+test("enqueue failures stay retryable without an erased-item suppression branch", () => {
   const enqueueCatch = handlerSource.match(/await enqueueDelivery\(delivery\);([\s\S]*?)log\("webhook_enqueued"/)?.[1] || "";
-  // A newly installed tombstone can appear after ingress but before SQS sends.
-  // Suppression is the sole acceptable 202 branch, because retrying a deleted
-  // item indefinitely would reintroduce identity-bearing webhook deliveries.
-  assert.match(enqueueCatch, /if\s*\(error instanceof ErasureReplayBlockedError\)\s*\{[\s\S]*?return response\(202,\s*\{\s*accepted:\s*true,\s*suppressed:\s*true/);
   const fallback = enqueueCatch.split('logError("webhook_enqueue_failed"')[1];
   assert.ok(fallback, "generic enqueue errors must be logged and handled separately");
   assert.match(fallback, /return response\(503,\s*\{\s*error:\s*"enqueue_failed",\s*accepted:\s*false/);
-  assert.doesNotMatch(fallback, /response\(202/, "non-erasure failures must never be accepted");
+  assert.doesNotMatch(enqueueCatch, /ErasureReplayBlockedError|suppressed/);
 });
 
 test("state table uses budgeted 20/20 provisioned capacity, remains protected and worker can transact mappings", () => {
@@ -205,10 +204,45 @@ test("profile lookup GSI is additive and validated hot paths are query-only", ()
   assert.match(repositorySource, /mappingOwnerLookupAttributes\(mapping\)/);
   assert.match(repositorySource, /recurrenceLookupAttributes\(next\)/);
   assert.match(repositorySource, /recurrenceLookupQueryInput\(table, profile\)/);
-  assert.match(reconciliationSource, /readProfileLookup/);
-  assert.doesNotMatch(reconciliationSource, /list_reconciliation_mappings_scan_fallback|pacedScan/);
-  assert.match(reconciliationSource, /mappingLookupQueryInput\(table, profile\)/);
+  assert.match(reconciliationSource, /listProjectComments\(profiles\[profile\]\.todoistProjectId, true\)/,
+    'production snapshot reconciliation must enumerate authoritative Todoist project comments');
+  assert.match(reconciliationSource, /if \(this\.isLegacyTestAdapter\(client\)\)/,
+    'DynamoDB mapping reads may remain only behind the explicit legacy test-adapter seam');
   assert.match(backfillSource, /Limit:\s*25/);
   assert.match(backfillSource, /profileLookupBackfillCondition\(lookup\)/);
   assert.match(backfillSource, /PROFILE_LOOKUP_READY_KEY/);
+});
+
+test("production mapping correlation is written only to provider-native records", () => {
+  const writer = syncSource.match(/async persistProviderMapping\([\s\S]*?\n  async providerMappingByTaskAnyProfile/)?.[0] || "";
+  const testAdapterWrite = writer.match(/if \(this\.isLegacyTestAdapter\(commentClient\)\) \{[\s\S]*?\n    \}/)?.[0] || "";
+  assert.match(testAdapterWrite, /this\.state\.putMapping\(/,
+    "test-only adapters may seed the legacy repository to preserve focused unit fixtures");
+  assert.doesNotMatch(writer.replace(testAdapterWrite, ""), /this\.state\.(?:putMapping|putRecurrenceLink)\(/,
+    "the production mapping writer must not persist correlation in DynamoDB");
+  const serializer = mappingCommentsSource.match(/export function serializeMappingComment\([\s\S]*?\n\}/)?.[0] || "";
+  assert.doesNotMatch(serializer, /recurrenceOwner|syncSource/,
+    "provider correlation stores exact IDs and progress, not a permanent owner/source label");
+  assert.match(serializer, /seriesId: mapping\.seriesId/);
+  assert.match(serializer, /masterEventId: mapping\.masterEventId/);
+});
+
+test("automatic migration drains legacy erasure work before live acceptance dispatch", () => {
+  const migration = migrationWorkflow.indexOf("scripts/automatic-project-comment-migration.mjs");
+  const drain = migrationWorkflow.indexOf("scripts/legacy-erasure-cutover-audit.mjs");
+  const dispatch = migrationWorkflow.indexOf("event_type=automatic-project-comment-migration");
+  assert.ok(migration >= 0 && drain > migration && dispatch > drain);
+  assert.match(migrationWorkflow, /logical-resource-id ErasureOperationQueue/);
+  assert.match(migrationWorkflow, /logical-resource-id ErasureOperationDlq/);
+  assert.match(migrationWorkflow, /LEGACY_CUTOVER_TIMEOUT_MS: '1500000'/);
+  assert.match(legacyCutoverAuditSource, /idleObservations >= 3/);
+  assert.match(legacyCutoverAuditSource, /await retireDrainedLegacyRows\(current\.rows\)/);
+  assert.match(legacyCutoverAuditSource, /result = await snapshot\(\)/);
+  assert.match(legacyCutoverAuditSource, /const clean = !cleanupFailure && result\?\.clean === true/);
+  assert.doesNotMatch(legacyCutoverAuditSource, /PurgeQueueCommand|PurgeQueue/);
+  const migrationWrites = migrationAccessPolicy.match(/Sid: PersistVerifiedMappingMigration[\s\S]*?(?=\n          - Sid:|$)/)?.[0] || "";
+  assert.match(migrationWrites, /dynamodb:DeleteItem/);
+  assert.match(migrationWrites, /dynamodb:UpdateItem/);
+  assert.match(migrationWrites, /table\/\$\{ResourceNamePrefix\}-state-\*/);
+  assert.doesNotMatch(migrationAccessPolicy, /Resource:\s*"\*"/);
 });

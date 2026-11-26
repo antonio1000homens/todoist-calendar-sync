@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {assessOrphanReadiness} from "../dist/orphan-readiness.js";
-import {readFileSync} from "node:fs";
 
 const now="2026-11-03T17:40:00.000Z";
 const item={
@@ -31,7 +30,6 @@ test("exact one-sided missing evidence is diagnostic only, never permission to e
   assert.match(find(result,"todoist").blockers.join(" "),/Exhaustive cross-provider/);
   assert.match(find(result,"todoist").blockers.join(" "),/replay fence/);
 });
-
 test("a live linked pair blocks either side even if an operator asks to delete only one",()=>{
   const result=report([s("todoist","task-one",task()),s("calendar","event-one",event())]);
   for(const entry of result.items){
@@ -39,7 +37,6 @@ test("a live linked pair blocks either side even if an operator asks to delete o
     assert.match(entry.blockers.join(" "),/live .* counterpart/);
   }
 });
-
 test("failed direct reads, stale snapshots and missing timestamps never prove deletion",()=>{
   const failed=report([s("todoist","task-one",task()),
     s("calendar","event-one",null,{lookupError:"provider 429"})]);
@@ -94,15 +91,4 @@ test("no counterpart ID, invalid IDs or unknown provider state remain blocked",(
   assert.match(find(result,"todoist").blockers.join(" "),/No exact recorded counterpart/);
   const bad=report([], {...item,taskId:"illegal\nid",eventId:"event-one"});
   assert.match(bad.blockers.join(" "),/invalid/);
-});
-
-test("UI readiness remains GET-only; independent POST issues a safety preview but cannot confirm deletion",()=>{
-  const panel=readFileSync(new URL("../review-ui/orphan-deletion-panel.tsx",import.meta.url),"utf8");
-  assert.match(panel,/\/orphan-readiness/);
-  assert.match(panel,/Inspect deletion readiness \(read-only\)/);
-  assert.match(panel,/no deletion is enabled/);
-  assert.doesNotMatch(panel,/\/orphan-previews/);
-  assert.doesNotMatch(panel,/method:"POST"/);
-  assert.match(panel,/Orphan identity inspection \(read-only\)/);
-  assert.doesNotMatch(panel,/orphan-confirmations|deleteTask\(|deleteEvent\(|startErasure|enqueueErasure/);
 });

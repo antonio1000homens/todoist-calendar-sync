@@ -20,6 +20,7 @@ import {
   upsertProjectMappingComment,
 } from "../dist/mapping-comments.js";
 import { Todoist } from "../dist/providers.js";
+import { Synchronizer } from "../dist/sync.js";
 
 function mapping(overrides = {}) {
   return {
@@ -58,7 +59,7 @@ test("v1 project mapping comment round-trips recurrence metadata", () => {
 
 test("provider-native v2 mapping preserves calendar identity and the last-synced field baseline", () => {
   const comment={id:"v2",content:serializeMappingComment(mapping({calendarId:"calendar-home",
-    calendarNativeRecurring:true,todoistPhaseBVersion:1,calendarProgressVersion:1,
+    todoistPhaseBVersion:1,calendarProgressVersion:1,
     completedThroughOriginalStart:"2026-11-25T09:00:00Z",
     syncedTitle:"Title",syncedDescription:"Description",syncedDue:"2026-12-01T10:00:00Z"}),"project-home")};
   const parsed=parseMappingComment(comment);
@@ -69,18 +70,56 @@ test("provider-native v2 mapping preserves calendar identity and the last-synced
   assert.equal(parsed.payload.syncedTitle,"Title");
   assert.equal(parsed.payload.syncedDescription,"Description");
   assert.equal(parsed.payload.syncedDue,"2026-12-01T10:00:00Z");
-  assert.equal(parsed.payload.calendarNativeRecurring,true);
+  assert.equal(parsed.payload.calendarNativeRecurring,undefined,
+    "legacy calendar-native flags are ignored; native shape is derived from provider IDs");
   assert.equal(parsed.payload.todoistPhaseBVersion,1);
   assert.equal(parsed.payload.calendarProgressVersion,1);
   assert.equal(Object.hasOwn(JSON.parse(comment.content.split("\n")[1]), "recurrenceOwner"), false);
   assert.equal(parsed.payload.completedThroughOriginalStart,"2026-11-25T09:00:00Z");
-  assert.deepEqual(mappingFromProjectMappingComment(parsed),mapping({calendarId:"calendar-home",
-    calendarNativeRecurring:true,todoistPhaseBVersion:1,calendarProgressVersion:1,
+  const expectedMapping = mapping({calendarId:"calendar-home",
+    todoistPhaseBVersion:1,calendarProgressVersion:1,
     completedThroughOriginalStart:"2026-11-25T09:00:00Z",
-    projectCommentId:"v2",syncedTitle:"Title",syncedDescription:"Description",syncedDue:"2026-12-01T10:00:00Z"}));
+    projectCommentId:"v2",syncedTitle:"Title",syncedDescription:"Description",syncedDue:"2026-12-01T10:00:00Z"});
+  delete expectedMapping.recurrenceOwner;
+  assert.deepEqual(mappingFromProjectMappingComment(parsed),expectedMapping);
   const emptyBaseline=parseMappingComment({id:"empty-baseline",content:serializeMappingComment(mapping({
     syncedTitle:"",syncedDescription:"",syncedDue:"2099-05-01"}),"project-home")});
   assert.ok(emptyBaseline&&!('error' in emptyBaseline),"empty titles/descriptions are valid synced values");
+});
+
+test("production mapping writes fail closed when provider comments are unavailable instead of writing DynamoDB correlation", async () => {
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = "production";
+  let dynamoWrites = 0;
+  try {
+    const state = { async putMapping() { dynamoWrites++; } };
+    const sync = new Synchronizer(state, undefined, async () => ({ todoist: {}, calendar: {} }));
+    await assert.rejects(sync.persistProviderMapping(mapping()), /Todoist project comment correlation API unavailable/);
+    assert.equal(dynamoWrites, 0);
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previous;
+  }
+});
+
+test("legacy recurrence owner labels do not override provider ID-derived series routing", () => {
+  const calendarPayload = JSON.parse(serializeMappingComment(mapping(), "project-home").split("\n")[1]);
+  calendarPayload.recurrenceOwner = "todoist";
+  const calendarParsed = parseMappingComment({ id: "legacy-calendar", content: `${MAPPING_COMMENT_MARKER}\n${JSON.stringify(calendarPayload)}` });
+  assert.ok(calendarParsed && !("error" in calendarParsed));
+  const recoveredCalendarMapping = mappingFromProjectMappingComment(calendarParsed);
+  assert.equal(recoveredCalendarMapping.recurrenceOwner, undefined);
+  assert.notEqual(recoveredCalendarMapping.seriesId, recoveredCalendarMapping.taskId,
+    "provider IDs retain the Calendar-native series identity without a permanent owner field");
+
+  const todoistPayload = JSON.parse(serializeMappingComment(mapping({ taskId: "same-id", seriesId: "same-id", eventId: "calendar-master", masterEventId: "calendar-master" }), "project-home").split("\n")[1]);
+  todoistPayload.recurrenceOwner = "calendar";
+  const todoistParsed = parseMappingComment({ id: "legacy-todoist", content: `${MAPPING_COMMENT_MARKER}\n${JSON.stringify(todoistPayload)}` });
+  assert.ok(todoistParsed && !("error" in todoistParsed));
+  const recoveredTodoistMapping = mappingFromProjectMappingComment(todoistParsed);
+  assert.equal(recoveredTodoistMapping.recurrenceOwner, undefined);
+  assert.equal(recoveredTodoistMapping.seriesId, recoveredTodoistMapping.taskId,
+    "provider IDs retain the Todoist-native series identity without a permanent owner field");
 });
 
 test("a rolling recurring series keeps one project correlation when its successor task ID changes", async () => {

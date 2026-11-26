@@ -2,20 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { GetCommand, PutCommand, QueryCommand, ScanCommand, TransactWriteCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { documentClient as client } from "./dynamodb-capacity.js";
 import type { ManualDecision } from "./manual-intervention.js";
-import type { CalendarEvent, Mapping, Profile, RecurrenceLink } from "./types.js";
+import type { CalendarEvent, Mapping, Profile } from "./types.js";
 import { verifyCancelledSeries } from "./verified-deletion.js";
 import { retainedAuditProviderIds, retainedConflictEntity, retainedConflictIdentity } from "./audit-policy.js";
 import { reviewCaseEvidenceIds } from "./deleted-review-identities.js";
 import { entityKey, operationHasWriteEvidence, type EntityRef, type RepairOperation, type RepairPreview, type RepairRelease, type ReviewActor, type ReviewCase, type ReviewSnapshot } from "./review-types.js";
-import { assertReplayAdmissionIfEnabled, ErasureReplayBlockedError, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
-import { activeProjectDeletionTombstone } from "./mapping-comments.js";
-import { profiles, todoistToken } from "./config.js";
+import { assertReplayAdmissionIfEnabled, REPLAY_PROFILES } from "./erasure-replay-barrier.js";
+import { todoistToken } from "./config.js";
 import { Todoist } from "./providers.js";
 type VerifiedDeletionEvidence = {
   profile: Profile; taskIds: string[]; eventIds: string[];
   staleMappings?: Mapping[];
   staleMappingRows?: Array<{ pk: string; sk: string; profile: Profile; taskId: string; eventId: string; updatedAt: string }>;
-  staleLinks?: RecurrenceLink[]; seriesKeys?: string[];
+  seriesKeys?: string[];
   masterId?: string; activeInstanceId?: string; masterSeriesId?: string;
   legacyMasterProof?: { master: CalendarEvent; occurrence: CalendarEvent };
 };
@@ -42,22 +41,10 @@ async function admitReviewIdentities(refs: Iterable<EntityRef>, clientFactory: P
   for (const ref of unique.values()) await assertReplayAdmissionIfEnabled({ profile: ref.profile,
     ...(ref.side === "todoist" ? { taskId: ref.id } : { eventIds: [ref.id] }) });
 
-  // The bounded tombstone lives only in the Todoist project comment after
-  // successful erasure. Old review/repair decisions are another replay source,
-  // so an enabled writer protocol must consult that marker before recording or
-  // executing a decision that carries the deleted identity.
-  if (process.env.ERASURE_PROTOCOL_VERSION !== "1") return;
-  const byProfile = new Map<Profile, EntityRef[]>();
-  for (const ref of unique.values()) byProfile.set(ref.profile, [...(byProfile.get(ref.profile) || []), ref]);
-  for (const [profile, profileRefs] of byProfile) {
-    const clients = await clientFactory(profile);
-    const projectId = profiles[profile].todoistProjectId;
-    const comments = await clients.todoist.listProjectComments(projectId, true);
-    for (const ref of profileRefs) if (activeProjectDeletionTombstone(comments, {
-      profile, projectId,
-      ...(ref.side === "todoist" ? { taskId: ref.id } : { eventIds: [ref.id] }),
-    })) throw new ErasureReplayBlockedError();
-  }
+  // Legacy deletion comments are not synchronization authority. Every
+  // delivery re-reads the exact current provider objects; explicit user
+  // exclusions and transient repair locks remain enforced by SyncControls.
+  void clientFactory;
 }
 function nestedReviewIdentities(value: unknown, defaultProfile: Profile,
   terminal?: { seriesKeys: string[] },
@@ -574,8 +561,8 @@ export class ReviewStore {
   }
   /**
    * Close an obsolete conflict only after the caller has freshly verified that
-   * every provider identity is deleted and no mapping, recurrence or repair
-   * still owns it. Keep a small terminal case/decision receipt so replayed
+   * every provider identity is deleted and no explicit repair control
+   * protects it. Keep a small terminal case receipt so replayed
    * audits and deterministic decision seeding cannot reopen the old case.
    *
    * Remove strictly attributable audit and incident pointers within the same
@@ -733,25 +720,6 @@ export class ReviewStore {
       || current.decision?.seriesId && !seriesKeys.includes(current.decision.seriesId)
       || current.decision?.mappingSnapshot?.seriesId && !seriesKeys.includes(current.decision.mappingSnapshot.seriesId)))
       return blocked("recurrence_ownership_proof_incomplete_or_changed");
-    const staleLinks = expected.staleLinks || [];
-    const seenLinks = new Set<string>();
-    for (const link of staleLinks) {
-      const identity = `${link.profile}/${link.seriesId}`;
-      if (seenLinks.has(identity) || link.profile !== expected.profile || link.owner !== "todoist"
-        || link.seriesId !== link.taskId || !expected.taskIds.includes(link.taskId)
-        || !expected.eventIds.includes(link.eventId)
-        || (!link.masterEventId && !(recurring && verifiedLegacyMaster
-          && link.eventId===expected.activeInstanceId))
-        || (link.masterEventId && !expected.eventIds.includes(link.masterEventId))
-        || !link.activeInstanceId || !expected.eventIds.includes(link.activeInstanceId)
-        || link.activeInstanceId === link.masterEventId
-        || recurring && (link.masterEventId !== expected.masterId
-          && !(verifiedLegacyMaster && !link.masterEventId
-            && link.eventId===expected.activeInstanceId)
-          || link.activeInstanceId !== expected.activeInstanceId)
-        || !seriesKeys.includes(link.seriesId) || !link.updatedAt) return blocked("recurrence_link_ownership_or_revision_changed");
-      seenLinks.add(identity);
-    }
     const staleMappings=expected.staleMappings||[];
     const mappingKeys=new Set<string>(),mappingTasks=new Set<string>();
     for(const mapping of staleMappings){
@@ -827,29 +795,6 @@ export class ReviewStore {
         ConditionExpression:condition,ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
       items.push({Delete:{TableName:reviewTable(),Key:{pk:`TASKOWNER#${mapping.taskId}`,sk:"MAP"},
         ConditionExpression:condition,ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
-    }
-    // Retire the stale active link inside the same transaction as the case and
-    // pending manual decision. All identity/ownership/version fields are CAS
-    // fenced; a revived or re-owned series cancels the entire operation.
-    for (const link of staleLinks) {
-      const values: Record<string, unknown> = {
-        ":profile": link.profile, ":owner": "todoist", ":series": link.seriesId,
-        ":task": link.taskId, ":event": link.eventId, ":updated": link.updatedAt,
-      };
-      const conditions = [
-        "#profile = :profile", "#owner = :owner", "seriesId = :series",
-        "taskId = :task", "eventId = :event", "updatedAt = :updated",
-      ];
-      for (const field of ["masterEventId", "activeInstanceId"] as const) {
-        if (link[field]) { conditions.push(`${field} = :${field}`); values[`:${field}`] = link[field]; }
-        else conditions.push(`attribute_not_exists(${field})`);
-      }
-      items.push({ Delete: { TableName: reviewTable(),
-        Key: key(`RECURRENCE#${link.profile}#${link.seriesId}`),
-        ConditionExpression: conditions.join(" AND "),
-        ExpressionAttributeNames: { "#profile": "profile", "#owner": "owner" },
-        ExpressionAttributeValues: values,
-      } });
     }
     // Remove exact case-scoped deletion-review guards. Their unique case sort
     // key means this cannot remove guards owned by other unresolved cases.
@@ -950,8 +895,8 @@ export class ReviewStore {
           ||auditIds.taskIds.some(id=>!expected.taskIds.includes(id))
           ||auditIds.eventIds.some(id=>!expected.eventIds.includes(id)))continue;
         // Conditional child receipt, pointer and audit deletion are part of the
-        // SAME DynamoDB transaction as the keeper and stale recurrence link.
-        // A concurrent reopen, ownership change or case coalescing cancels all.
+        // SAME DynamoDB transaction as the keeper. A concurrent reopen or case
+        // coalescing cancels all.
         items.push({Update:{TableName:reviewTable(),Key:key(`REVIEW_CASE#${id}`),
           UpdateExpression:"SET #status = :resolved, #result = :result, #title = :title, #reason = :reason, updatedAt = :now, expiresAt = :expiry REMOVE sourceAuditKey, lookupPk, lookupSk, conflictKey, coalescedInto, taskId, eventId, decision, reconciliationGeneration, progressCheckpoint",
           ConditionExpression:"#status = :dismissed AND updatedAt = :version AND coalescedInto = :keeper AND sourceAuditKey = :audit AND conflictKey = :conflict AND attribute_not_exists(operationId)",
@@ -1186,8 +1131,6 @@ export class ReviewStore {
       for (const candidateProfile of cleanupProfiles) {
         if(!mappingDeleteKeys.has(`TASK#${candidateProfile}#${taskId}|MAP`)
           &&!staleMappings.some(mapping=>mapping.profile===candidateProfile&&mapping.taskId===taskId))checkAbsent(`TASK#${candidateProfile}#${taskId}`);
-        // Every recurrence identity is fenced together below, including
-        // the Calendar iCalUID key rather than only task-ID keys.
       }
     }
     for (const eventId of expected.eventIds) {
@@ -1197,9 +1140,6 @@ export class ReviewStore {
         // Completed task/event projections remain untouched and are not
         // considered live ownership of a deleted recurrence.
       }
-    }
-    for (const seriesId of seriesKeys) for (const candidateProfile of cleanupProfiles) {
-      checkAbsent(`RECURRENCE#${candidateProfile}#${seriesId}`, "STATE");
     }
     // Never ConditionCheck a key that is also deleted in this transaction.
     // Such a duplicate would invalidate all DynamoDB transactions.
@@ -1235,7 +1175,6 @@ export class ReviewStore {
         const pk=typeof failedKey?.pk==="string"?failedKey.pk:"";
         const category=pk.startsWith("REVIEW_CASE#")?"case_revision_or_status_changed"
           :pk.startsWith("MANUAL#")?"manual_decision_revision_or_status_changed"
-          :pk.startsWith("RECURRENCE#")?"recurrence_link_revision_or_owner_changed"
           :pk.startsWith("AUDIT")?"audit_or_pointer_revision_changed"
           :pk.startsWith("SYNC_CONTROL#")?"repair_or_exclusion_guard_changed"
           :pk.startsWith("ERASURE#")?"fence_or_scoped_admission_changed"

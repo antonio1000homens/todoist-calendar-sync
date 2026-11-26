@@ -131,6 +131,28 @@ test("Calendar write lease release aliases the reserved DynamoDB token field", a
   }
 });
 
+test("completed recurrence retention stores exact IDs without a permanent recurrence owner label", async () => {
+  const original = documentClient.send;
+  let writes;
+  documentClient.send = async (command) => {
+    if (command instanceof TransactWriteCommand) { writes = command.input.TransactItems; return {}; }
+    throw new Error("Unexpected operation: " + command.constructor.name);
+  };
+  try {
+    const completedAt = new Date(Date.now() - 60_000).toISOString();
+    await state.putCompletedCalendarProjection(completion({ completedAt,
+      seriesId: "fence-task", masterEventId: "fence-master", terminalVerified: true,
+    }));
+    const persistedItems = writes.filter(item => item.Put).map(item => item.Put.Item);
+    assert.ok(persistedItems.length >= 3, "completion history and terminal series retain their exact provider IDs");
+    for (const item of persistedItems) {
+      assert.equal(Object.hasOwn(item, "recurrenceOwner"), false);
+      assert.equal(item.expiresAt, Math.floor(Date.parse(completedAt) / 1000) + 7 * 24 * 60 * 60,
+        "terminal provider identity expires after the seven-day retention window");
+    }
+  } finally { documentClient.send = original; }
+});
+
 test("Calendar write lease release still ignores a replaced lease but propagates other errors", async () => {
   const original = documentClient.send;
   let error = Object.assign(new Error("Lease owned by another worker"), { name: "ConditionalCheckFailedException" });

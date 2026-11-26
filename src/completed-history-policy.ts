@@ -5,7 +5,6 @@ export const COMPLETED_TASK_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 export interface VerifiedTerminalSeries {
   profile: string;
   seriesId: string;
-  recurrenceOwner: "calendar" | "todoist";
   terminalCompletedAt: string;
   masterEventId?: string;
 }
@@ -23,20 +22,15 @@ export function terminalCompletionDecision(
     || !p.eventId || typeof p.completedAt !== "string"
     || !Number.isFinite(Date.parse(p.completedAt))
     || Date.parse(p.completedAt) > nowMs)) return "ambiguous";
-  // This is persisted input, so do not rely on the TypeScript union or
-  // truthiness. Unknown owners and empty-but-present recurrence identifiers
-  // are malformed/partial state, not proof of a standalone task.
-  const recurrenceOwners = new Set(["calendar", "todoist"]);
+  // Exact IDs describe the recurrence relation; do not persist or trust an
+  // owner label in completion retention state.
   const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key);
   for (const p of projections) {
-    const ownerPresent = hasOwn(p, "recurrenceOwner");
     const terminalBitPresent = hasOwn(p, "terminalVerified");
-    if (ownerPresent && !recurrenceOwners.has(p.recurrenceOwner as string)) return "ambiguous";
     if (terminalBitPresent && p.terminalVerified !== true) return "ambiguous";
     const hasRecurrenceIdentity = ["seriesId", "masterEventId", "originalStart"]
       .some((field) => hasOwn(p, field));
-    if (!ownerPresent && (hasRecurrenceIdentity || terminalBitPresent)) return "ambiguous";
-    if (p.recurrenceOwner && (typeof p.seriesId !== "string" || !p.seriesId.trim())) return "ambiguous";
+    if (terminalBitPresent && !p.seriesId) return "ambiguous";
     for (const field of ["seriesId", "masterEventId", "originalStart"] as const) {
       if (hasOwn(p, field)) {
         const value = p[field];
@@ -49,18 +43,16 @@ export function terminalCompletionDecision(
   // A rolling / RRULE occurrence has *not* ended the series. Only an explicit
   // terminal verification made at provider completion can qualify a recurrence.
   let finalAt = Date.parse(newest.completedAt);
-  if (projections.some((p) => p.recurrenceOwner)) {
-    const confirmedByOccurrence = newest.terminalVerified === true && Boolean(newest.recurrenceOwner);
+  if (projections.some((p) => p.seriesId || p.masterEventId || p.originalStart)) {
+    const confirmedByOccurrence = newest.terminalVerified === true && Boolean(newest.seriesId);
     const confirmedBySeries = terminalSeries?.profile === first.profile
       && terminalSeries.seriesId === newest.seriesId
-      && terminalSeries.recurrenceOwner === newest.recurrenceOwner
       && Number.isFinite(Date.parse(terminalSeries.terminalCompletedAt))
       && Date.parse(terminalSeries.terminalCompletedAt) >= finalAt
       && Date.parse(terminalSeries.terminalCompletedAt) <= nowMs
       && projections.every((p) => p.masterEventId === terminalSeries.masterEventId);
     if (!confirmedByOccurrence && !confirmedBySeries) return "ambiguous";
-    if (projections.some((p) => p.recurrenceOwner !== newest.recurrenceOwner
-      || p.seriesId !== newest.seriesId)) return "ambiguous";
+    if (projections.some((p) => p.seriesId !== newest.seriesId)) return "ambiguous";
     if (confirmedBySeries) finalAt = Date.parse(terminalSeries.terminalCompletedAt);
   }
   return nowMs - finalAt >= COMPLETED_TASK_GRACE_MS

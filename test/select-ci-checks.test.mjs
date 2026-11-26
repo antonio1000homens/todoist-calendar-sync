@@ -12,7 +12,7 @@ function select(...files) {
 
 test("documentation changes keep stable CI green without running builds", () => {
   assert.deepEqual(select("README.md", "docs/runbook.md"), {
-    full: false, unit: false, review: false, worker: false, sam: false, public: true, e2eSyntax: false,
+    full: false, unit: false, worker: false, sam: false, public: true, e2eSyntax: false,
   });
 });
 
@@ -24,8 +24,7 @@ test("test-only changes select unit tests while source and workflow changes sele
   assert.equal(select(".github/workflows/ci.yml").full, true);
 });
 
-test("UI, Worker and infrastructure changes select their relevant checks", () => {
-  assert.equal(select("review-ui/main.tsx").review, true);
+test("Worker and infrastructure changes select their relevant checks", () => {
   assert.equal(select("cloudflare/calendar-sync/worker.ts").worker, true);
   assert.equal(select("template.yaml").sam, true);
 });

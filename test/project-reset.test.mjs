@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { ProjectAwareSynchronizer } from "../dist/project-sync.js";
+import { buildProjectMappingIndex } from "../dist/mapping-comments.js";
 
 const HOME = profiles.home.todoistProjectId;
 const TASK_ID = "6hCr44chgHx8Qr2f";
@@ -56,7 +57,7 @@ function delivery(id, task, oldTask) {
   };
 }
 
-test("move out then back in resets a cancelled legacy projection with a fresh Calendar event", async () => {
+test("provider current state recreates an eligible projection without project-exit tombstones", async () => {
   const updatedAt = "2026-09-03T21:31:00Z";
   const mappedTask = {
     id: TASK_ID,
@@ -70,6 +71,7 @@ test("move out then back in resets a cancelled legacy projection with a fresh Ca
   const currentTask = { value: unmappedTask };
   const state = new FakeState();
   const created = [];
+  const projectComments = [];
   const events = new Map([
     [CANCELLED_EVENT_ID, {
       id: CANCELLED_EVENT_ID,
@@ -103,40 +105,60 @@ test("move out then back in resets a cancelled legacy projection with a fresh Ca
     },
     todoist: {
       async getTask() { return currentTask.value; },
+      async listProjectComments(projectId) { return projectComments.filter(comment => comment.project_id === projectId); },
+      async upsertProjectComment(projectId, content, existingId) {
+        const id = existingId || `mapping-${projectComments.length + 1}`;
+        const comment = { id, project_id: projectId, content };
+        const index = projectComments.findIndex(value => value.id === id);
+        if (index < 0) projectComments.push(comment); else projectComments[index] = comment;
+        return comment;
+      },
+      async updateComment(id, content) {
+        const index = projectComments.findIndex(value => value.id === id);
+        if (index < 0) throw Object.assign(new Error("not found"), { status: 404 });
+        projectComments[index] = { ...projectComments[index], content };
+        return projectComments[index];
+      },
+      async getComment(id) {
+        const value = projectComments.find(comment => comment.id === id);
+        if (!value) throw Object.assign(new Error("not found"), { status: 404 });
+        return value;
+      },
+      async findLegacyTaskComment() { return undefined; },
       async findComment() { return undefined; },
       async upsertComment() { return { id: "reset-comment" }; },
-      async deleteComment() {},
+      async deleteComment(id) { const index = projectComments.findIndex(value => value.id === id); if (index >= 0) projectComments.splice(index, 1); },
     },
   });
 
   const sync = new ProjectAwareSynchronizer(state, undefined, clients);
+  const currentMapping = () => buildProjectMappingIndex(projectComments)
+    .byTaskId.get(TASK_ID)?.[0]?.payload;
 
   // Moving out must work even if Todoist kept the same updated_at as the last
-  // processed webhook. It replaces the historical deletion tombstone with an
-  // intentional project-exit reset marker.
+  // processed webhook. No durable tombstone is written.
   await sync.process(delivery("exit-delivery", unmappedTask, mappedTask));
   assert.deepEqual(state.tombstones.get(`home:${TASK_ID}`), {
-    sourceUpdatedAt: updatedAt,
-    reason: "project_exit",
+    sourceUpdatedAt: "2026-09-03T13:09:00Z",
   });
   assert.equal(state.mapping, undefined);
   assert.equal(events.get(CANCELLED_EVENT_ID)?.status, "cancelled");
 
-  // A webhook that does not prove an explicit project re-entry must not consume
-  // the reset marker or resurrect the cancelled event.
+  // A stale delivery is evaluated against the exact current task. The old
+  // cancelled event cannot be reused; an eligible live task gets one fresh
+  // event without consuming or creating a persistent tombstone.
   currentTask.value = { ...mappedTask, updated_at: undefined };
   await sync.process(delivery("unproven-create", currentTask.value));
-  assert.equal(created.length, 0);
-  assert.equal(state.tombstones.get(`home:${TASK_ID}`)?.reason, "project_exit");
+  assert.deepEqual(created, ["home-reset-1"]);
+  assert.equal(currentMapping()?.eventId, "home-reset-1");
 
-  // Moving back in is the explicit reset action. The old cancelled Calendar
-  // object is ignored and a brand-new event ID is created before the tombstone
-  // is cleared.
+  // A duplicate/reordered project transition remains idempotent after the
+  // provider pair is restored.
   currentTask.value = mappedTask;
   await sync.process(delivery("reentry-delivery", mappedTask, unmappedTask));
   assert.deepEqual(created, ["home-reset-1"]);
-  assert.equal(state.mapping?.eventId, "home-reset-1");
-  assert.notEqual(state.mapping?.eventId, CANCELLED_EVENT_ID);
-  assert.equal(state.tombstones.has(`home:${TASK_ID}`), false);
-  assert.equal(state.audits.some((audit) => audit.action === "todoist_project_projection_reset"), true);
+  assert.equal(currentMapping()?.eventId, "home-reset-1");
+  assert.notEqual(currentMapping()?.eventId, CANCELLED_EVENT_ID);
+  assert.equal(state.tombstones.has(`home:${TASK_ID}`), true, "legacy tombstones are not consulted by sync");
+  assert.equal(state.audits.some((audit) => audit.action === "todoist_project_projection_created"), true);
 });

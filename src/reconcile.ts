@@ -6,20 +6,23 @@ import { ManualDecisionStore } from "./manual-intervention.js";
 import { ReviewStore } from "./review-store.js";
 import { acquireProfileAdmissionLease } from "./erasure-protocol.js";
 import type { Profile } from "./types.js";
+import { requestReconciliation } from "./queue.js";
 
 const profileList: Profile[] = ["home", "antonio", "work"];
 const QUEUED_ALERT_MS = 10 * 60_000;
 const RUNNING_ALERT_MS = 15 * 60_000;
+const SCHEDULED_RECONCILIATION_INTERVAL_MS = 30 * 60_000;
 
 function log(event: string, detail: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ service: "todoist-calendar-sync-health", event, ...detail }));
 }
 
-/** Health watchdog; serialize its state and Slack writes against profile erasure fences. */
+/** Queue periodic full reconciliations and inspect health under profile admission fences. */
 export async function checkReconciliationHealth(
   state: StateRepository, manual: ManualInterventionService, profiles: Profile[] = profileList,
   lookupBudget: { deadlineAtMs?: number; requestId?: string } = {},
   acquireWriteLease: (profile:Profile)=>Promise<()=>Promise<void>> = acquireProfileAdmissionLease,
+  scheduleReconciliation?: (profile: Profile) => Promise<unknown>,
 ): Promise<void> {
   for (const profile of profiles) {
     let releaseLease:(()=>Promise<void>)|undefined;
@@ -29,6 +32,32 @@ export async function checkReconciliationHealth(
       // all provider/Slack delivery and the final state checkpoint.
       releaseLease=await acquireWriteLease(profile);
       const current = await state.getReconciliationState(profile);
+      const lastRunAt = current?.lastCompletedAt || current?.lastFailedAt;
+      const retryPendingFailure = Boolean(current?.pending && current.lastFailedAt
+        && Date.now() - Date.parse(current.lastFailedAt) >= SCHEDULED_RECONCILIATION_INTERVAL_MS);
+      const scheduleFreshRun = !current || retryPendingFailure || (!current.pending
+        && (!lastRunAt || Date.now() - Date.parse(lastRunAt) >= SCHEDULED_RECONCILIATION_INTERVAL_MS));
+      if (scheduleReconciliation && scheduleFreshRun) {
+        // enqueueDelivery acquires this same profile lease before sending to
+        // FIFO. Release the health-check lease first to avoid a nested lease,
+        // then reacquire it for the remaining health reads and writes.
+        await releaseLease?.();
+        releaseLease = undefined;
+        try {
+          const result = await scheduleReconciliation(profile);
+          const outcome = result as { queued?: boolean; coalesced?: boolean; recoveredPending?: boolean; enqueueError?: string };
+          log("scheduled_reconciliation_requested", {
+            profile, queued: outcome.queued === true, coalesced: outcome.coalesced === true,
+            recoveredPending: outcome.recoveredPending === true, enqueueFailed: Boolean(outcome.enqueueError),
+          });
+        } catch (error) {
+          log("scheduled_reconciliation_request_failed", {
+            profile, error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          releaseLease = await acquireWriteLease(profile);
+        }
+      }
       // Notifications belong to generations, so a new run cannot hide an
       // undelivered outcome from an earlier one.
       if (manual.enabled) {
@@ -138,8 +167,11 @@ export const handler: Handler = async (_event, context) => {
   log("reconciliation_health_check", { awsRequestId: context.awsRequestId, profiles: profileList });
   const remainingMs = typeof context.getRemainingTimeInMillis === "function" ? context.getRemainingTimeInMillis() : 25_000;
   const deadlineAtMs = Date.now() + Math.max(0, remainingMs - 4_000);
-  await checkReconciliationHealth(new StateRepository(), new ManualInterventionService(), profileList, {
+  const state = new StateRepository();
+  await checkReconciliationHealth(state, new ManualInterventionService(), profileList, {
     deadlineAtMs,
     requestId: context.awsRequestId,
-  });
+  }, acquireProfileAdmissionLease, async profile => requestReconciliation(state, profile, "scheduled", undefined, {
+    requester: "scheduled",
+  }));
 };

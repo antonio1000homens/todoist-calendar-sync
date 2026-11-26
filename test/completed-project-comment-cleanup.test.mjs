@@ -83,38 +83,37 @@ test("no event-side guard, malformed/human/foreign comment or missing project id
   }
 });
 
-test("cross-profile task owner, partial event mapping and task still available all block provider deletion",async()=>{
+test("legacy DynamoDB indexes do not block cleanup, while a live Todoist task does",async()=>{
   for(const pk of ["TASKOWNER#completed-1","TASK#work#completed-1","EVENT#antonio#historical-1"]){
     const s=scenario();
     s.rows.set(key(pk,"MAP"),{taskId:target.taskId});
     const r=await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true});
-    assert.equal(r.status,"skipped_active",pk);
-    assert.deepEqual(s.calls.deleted,[]);
+    assert.equal(r.status,"retired",pk);
+    assert.deepEqual(s.calls.deleted,[target.commentId]);
   }
   const s=scenario({taskAbsent:false});
   assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true})).status,"skipped_active");
   assert.deepEqual(s.calls.deleted,[]);
 });
 
-test("recurring history requires matched terminal certificate and no live recurrence in ANY profile",async()=>{
-  const history={...marker,recurrenceOwner:"calendar",calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"};
-  const content=commentContent({recurrenceOwner:"calendar",calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"});
+test("recurring history requires a matching terminal certificate; legacy recurrence rows do not gate it",async()=>{
+  const history={...marker,calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"};
+  const content=commentContent({calendarProgressVersion:1,seriesId:"finite",masterEventId:"master"});
   const s=scenario({history,content});
-  const certificate={profile:"home",seriesId:"finite",recurrenceOwner:"calendar",
-    masterEventId:"master",terminalCompletedAt:completedAt};
+  const certificate={profile:"home",seriesId:"finite",masterEventId:"master",terminalCompletedAt:completedAt};
   const nowMs=t0+week+1;
   assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs})).status,"skipped_ambiguous");
   s.rows.set(key("COMPLETED_SERIES#home#finite"),certificate);
   assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs})).status,"eligible");
   s.rows.set(key("RECURRENCE#work#finite"),{taskId:"different-task"});
-  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs,apply:true})).status,"skipped_active");
-  assert.deepEqual(s.calls.deleted,[]);
+  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs,apply:true})).status,"retired");
+  assert.deepEqual(s.calls.deleted,[target.commentId]);
   s.rows.delete(key("RECURRENCE#work#finite"));
   s.rows.set(key("COMPLETED_SERIES#home#finite"),{...certificate,masterEventId:"other"});
   assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs})).status,"skipped_ambiguous");
 });
 
-test("an owner or comment change between the first and second preflight aborts the provider delete",async()=>{
+test("legacy owner indexes do not gate cleanup, but changed provider comment identity does",async()=>{
   const s=scenario();
   const get=s.adapter.get;
   let rounds=0;
@@ -125,8 +124,8 @@ test("an owner or comment change between the first and second preflight aborts t
     return get(pk,sk);
   };
   const r=await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true});
-  assert.equal(r.status,"skipped_active");
-  assert.deepEqual(s.calls.deleted,[]);
+  assert.equal(r.status,"retired");
+  assert.deepEqual(s.calls.deleted,[target.commentId]);
   const second=scenario();
   const read=second.adapter.getComment;
   second.adapter.getComment=async(id)=>{
@@ -163,7 +162,7 @@ test("provider response comment ID must match explicit approval on BOTH prefligh
   assert.equal(second.calls.comments,2);
 });
 
-test("a live recurrence rebound to another series ID or linked Calendar event blocks deletion",async()=>{
+test("legacy recurrence rows do not gate exact terminal-comment cleanup",async()=>{
   for(const row of [
     {taskId:target.taskId,seriesId:"unrelated-series",eventId:"new-event"},
     {taskId:"other-task",seriesId:"unrelated-series",eventId:target.eventId},
@@ -173,27 +172,28 @@ test("a live recurrence rebound to another series ID or linked Calendar event bl
     const s=scenario();
     s.rows.set(key("RECURRENCE#work#unrelated-series"),row);
     const result=await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true});
-    assert.equal(result.status,"skipped_active",JSON.stringify(row));
-    assert.deepEqual(s.calls.deleted,[]);
-    assert.equal(s.calls.scans,1);
+    assert.equal(result.status,"retired",JSON.stringify(row));
+    assert.deepEqual(s.calls.deleted,[target.commentId]);
+    assert.equal(s.calls.scans,0);
   }
 });
 
-test("recurrence-enumeration failures abort without any provider deletion",async()=>{
+test("terminal-comment cleanup does not enumerate DynamoDB recurrence links",async()=>{
   const s=scenario();
   s.adapter.findRelatedRecurrenceLink=async()=>{throw new Error("DynamoDB recurrence scan incomplete");};
-  await assert.rejects(retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true}),/DynamoDB recurrence scan incomplete/);
-  assert.deepEqual(s.calls.deleted,[]);
+  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true})).status,"retired");
+  assert.deepEqual(s.calls.deleted,[target.commentId]);
+  assert.equal(s.calls.scans,0);
 });
 
-test("apply re-enumerates recurrence links and aborts if one appears between checks",async()=>{
+test("apply re-reads provider completion and comment without re-enumerating recurrence links",async()=>{
   const s=scenario();
   const original=s.adapter.findRelatedRecurrenceLink;
   s.adapter.findRelatedRecurrenceLink=async(...args)=>{
     if(s.calls.scans===1) s.rows.set(key("RECURRENCE#antonio#newly-bound"),{taskId:target.taskId,seriesId:"newly-bound"});
     return original(...args);
   };
-  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true})).status,"skipped_active");
-  assert.equal(s.calls.scans,2);
-  assert.deepEqual(s.calls.deleted,[]);
+  assert.equal((await retireCompletedProjectMappingComment(target,s.adapter,{nowMs:t0+week+1,apply:true})).status,"retired");
+  assert.equal(s.calls.scans,0);
+  assert.deepEqual(s.calls.deleted,[target.commentId]);
 });

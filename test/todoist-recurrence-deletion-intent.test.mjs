@@ -30,7 +30,7 @@ class Notifier {
 
 const mapping = {
   profile: "antonio", taskId: "task-1", eventId: "instance-1", masterEventId: "master-1",
-  activeInstanceId: "instance-1", seriesId: "series-1", recurrenceOwner: "todoist",
+  activeInstanceId: "instance-1", seriesId: "task-1", recurrenceOwner: "calendar",
   updatedAt: "2026-10-24T12:00:00.000Z",
 };
 
@@ -55,8 +55,6 @@ test("Todoist recurrence deletion queues Calendar deletion without a Slack appro
     async syncBlocked() { return false; },
     async mutationAllowed() { return true; },
     async recordMutation() {},
-    async deleteMapping() { operations.push("mapping removed"); },
-    async deleteRecurrenceLink() { operations.push("recurrence link removed"); },
     async audit() {},
   };
   const clients = async () => ({
@@ -80,7 +78,7 @@ test("Todoist recurrence deletion queues Calendar deletion without a Slack appro
     assert.equal(delivery.manual.slackUserId, "AUTO_POLICY");
 
     await service.processManualDelivery(delivery, state);
-    assert.deepEqual(operations, ["Calendar series master-1 deleted", "mapping removed"]);
+    assert.deepEqual(operations, ["Calendar series master-1 deleted"]);
     assert.equal(decisions.decisions.get(delivery.manual.decisionId).status, "resolved");
     assert.equal(notifier.updated.length, 1, "completion is posted only after all provider and mapping operations finish");
     assert.match(notifier.updated[0].text, /Todoist recurrence deletion completed/);
@@ -112,8 +110,6 @@ test("auto cleanup of an already absent Calendar series removes exact state with
     async syncBlocked(){return false;},
     async mutationAllowed(){return true;},
     async recordMutation(){},
-    async deleteMapping(){operations.push("mapping removed");},
-    async deleteRecurrenceLink(){operations.push("recurrence link removed");},
     async audit(){},
   };
   const clients=async()=>({
@@ -128,7 +124,7 @@ test("auto cleanup of an already absent Calendar series removes exact state with
       body:JSON.stringify({event_name:"item:deleted",event_data:{id:"task-1",content:"Recurring item",is_deleted:true}})},state);
     const delivery=JSON.parse(sent[0].input.MessageBody);
     await service.processManualDelivery(delivery,state);
-    assert.deepEqual(operations,["Calendar series master-1 checked","mapping removed"]);
+    assert.deepEqual(operations,["Calendar series master-1 checked"]);
     assert.equal(decisions.decisions.get(delivery.manual.decisionId).status,"resolved");
     assert.equal(decisions.decisions.get(delivery.manual.decisionId).resolvedBySlackUserId,"AUTO_POLICY");
     assert.equal(notifier.posted.length,0);
