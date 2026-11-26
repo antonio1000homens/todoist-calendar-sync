@@ -81,3 +81,23 @@ test("Todoist read retries stop at their configured bound when the provider rema
   await assert.rejects(()=>todoist.listProjectComments("project-1",true),{status:429});
   assert.equal(calls,3,"the initial request plus two configured retries");
 });
+
+test("Todoist maintenance retries explicitly rejected 429 comment writes only",async t=>{
+  const originalFetch=globalThis.fetch;
+  t.after(()=>{globalThis.fetch=originalFetch;});
+  let calls=0;
+  globalThis.fetch=async()=>{
+    calls++;
+    if(calls===1)return Response.json({error:"Too many requests",error_extra:{retry_after:0}}, {status:429});
+    return Response.json({id:"comment-created",content:"sync mapping"});
+  };
+  const todoist=new Todoist("test-token",{rateLimitRetries:2,maxRetryDelayMs:10_000});
+  const comment=await todoist.createProjectComment("project-1","sync mapping");
+  assert.equal(calls,2);
+  assert.equal(comment.id,"comment-created");
+
+  calls=0;
+  globalThis.fetch=async()=>{calls++;return Response.json({error:"unavailable"},{status:503});};
+  await assert.rejects(()=>todoist.createProjectComment("project-1","sync mapping"),{status:503});
+  assert.equal(calls,1,"ambiguous write failures are never replayed");
+});

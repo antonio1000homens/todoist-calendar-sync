@@ -9,6 +9,7 @@ export type ProviderClientOptions = {
   signal?:AbortSignal;
   timeoutMs?:number;
   readRetries?:number;
+  rateLimitRetries?:number;
   maxRetryDelayMs?:number;
 };
 export type ProviderClientFactory = (profile: Profile, options?:ProviderClientOptions) => Promise<ProviderClients>;
