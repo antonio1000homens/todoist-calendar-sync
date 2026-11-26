@@ -2591,7 +2591,7 @@ export class Synchronizer {
       && shared.syncCalendarId === profiles[delivery.profile].calendarId
       && shared.syncEventId === event.id && shared.taskId === task.id && shared.syncTaskId === task.id
       && shared.syncSource === undefined && shared.syncRecurrenceOwner === undefined);
-    if (task && !exactLocalPair) {
+    if (task && !(exactLocalPair && hasCanonicalState(event, task))) {
       const owner = await this.providerMappingByTaskAnyProfile(task.id);
       if (owner && (owner.profile !== delivery.profile || ![owner.eventId,owner.masterEventId,owner.activeInstanceId].includes(event.id))) {
         return this.state.audit(delivery.profile,"calendar_task_link_ambiguous_conflict",{eventId:event.id,taskId:task.id,ownerProfile:owner.profile,mappedEventId:owner.eventId});
