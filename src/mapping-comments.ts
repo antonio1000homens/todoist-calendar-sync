@@ -328,6 +328,7 @@ export function buildProjectMappingIndex(comments: TodoistCommentRecord[]): Proj
     malformed: [],
   };
   for (const comment of comments) {
+    if (comment.is_deleted === true) continue;
     const parsed = parseMappingComment(comment);
     if (!parsed) continue;
     if ("error" in parsed) {

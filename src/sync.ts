@@ -1041,11 +1041,7 @@ export class Synchronizer {
     if (!this.providerCommentReaderAvailable(client)) {
       return await this.state.listMappings?.(profile) || [];
     }
-    const comments = await client.listProjectComments(profiles[profile].todoistProjectId, true);
-    const providerMappings = buildProjectMappingIndex(comments).parsed
-      .filter(entry => entry.payload.profile === profile
-        && entry.payload.projectId === profiles[profile].todoistProjectId)
-      .map(mappingFromProjectMappingComment);
+    const providerMappings = await this.providerCommentMappings(profile, client);
     // During cutover, retain old DynamoDB correlations as a read fallback.
     // Provider-owned comments always win for a task or event identity.
     const legacy = await this.state.listMappings?.(profile) || [];
@@ -1059,11 +1055,11 @@ export class Synchronizer {
   async providerMappingByTask(profile: Profile, taskId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (!this.providerCommentReaderAvailable(client)) {
-      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByTask(profile, taskId);
+      if (this.isLegacyTestAdapter(client)) return this.legacyMappingByTask(profile, taskId);
       throw new Error("Todoist project comment correlation API unavailable");
     }
-    const candidates = (await this.providerMappings(profile, client)).filter(mapping => mapping.taskId === taskId);
-    if (!candidates.length) return undefined;
+    const candidates = (await this.providerCommentMappings(profile, client)).filter(mapping => mapping.taskId === taskId);
+    if (!candidates.length) return this.legacyMappingByTask(profile, taskId);
     candidates.sort((a, b) => (b.mappingRevision || 0) - (a.mappingRevision || 0)
       || Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     const latest = candidates[0];
@@ -1179,12 +1175,14 @@ export class Synchronizer {
   async providerMappingByEvent(profile: Profile, eventId: string, todoist?: Todoist): Promise<Mapping | undefined> {
     const client = todoist || (await this.clients(profile)).todoist;
     if (!this.providerCommentReaderAvailable(client)) {
-      if (this.isLegacyTestAdapter(client)) return this.state.getMappingByEvent(profile, eventId);
+      if (this.isLegacyTestAdapter(client)) return this.legacyMappingByEvent(profile, eventId);
       throw new Error("Todoist project comment correlation API unavailable");
     }
-    const candidates = (await this.providerMappings(profile, client)).filter(mapping =>
+    const candidates = (await this.providerCommentMappings(profile, client)).filter(mapping =>
       mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
-    if (!candidates.length) return undefined;
+    if (!candidates.length) {
+      return this.legacyMappingByEvent(profile, eventId);
+    }
     candidates.sort((a, b) => (b.mappingRevision || 0) - (a.mappingRevision || 0)
       || Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     const latest = candidates[0];
@@ -1196,6 +1194,33 @@ export class Synchronizer {
       throw new Error(`Calendar event ${eventId} has conflicting provider mapping comments`);
     }
     return latest;
+  }
+
+  private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
+    const comments = await todoist.listProjectComments(profiles[profile].todoistProjectId, true);
+    return buildProjectMappingIndex(comments).parsed
+      .filter(entry => entry.payload.profile === profile
+        && entry.payload.projectId === profiles[profile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
+  }
+
+  private async legacyMappingByTask(profile: Profile, taskId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByTask === "function") {
+      const mapping = await this.state.getMappingByTask(profile, taskId);
+      return mapping?.profile === profile ? mapping : undefined;
+    }
+    return (await this.state.listMappings?.(profile) || []).find(mapping => mapping.taskId === taskId);
+  }
+
+  private async legacyMappingByEvent(profile: Profile, eventId: string): Promise<Mapping | undefined> {
+    if (typeof this.state.getMappingByEvent === "function") {
+      const direct = await this.state.getMappingByEvent(profile, eventId);
+      if (direct?.profile === profile) return direct;
+      return (await this.state.listMappings?.(profile) || []).find(mapping =>
+        mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
+    }
+    return (await this.state.listMappings?.(profile) || []).find(mapping =>
+      mapping.eventId === eventId || mapping.masterEventId === eventId || mapping.activeInstanceId === eventId);
   }
 
   async providerMappingsForCalendarIdentity(
@@ -1303,7 +1328,7 @@ export class Synchronizer {
         && entry.payload.seriesId && entry.payload.masterEventId
         && (entry.payload.seriesId === seriesId || (masterEventId && entry.payload.masterEventId === masterEventId)))
       .map(mappingFromProjectMappingComment);
-    if (!candidates.length) return undefined;
+    if (!candidates.length) return this.legacyMappingBySeries(profile, seriesId, masterEventId);
     candidates.sort((a, b) => (b.mappingRevision || 0) - (a.mappingRevision || 0)
       || Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
     const latest = candidates[0];
@@ -1320,6 +1345,25 @@ export class Synchronizer {
       return undefined;
     }
     return latest;
+  }
+
+  private async legacyMappingBySeries(
+    profile: Profile, seriesId: string, masterEventId?: string,
+  ): Promise<Mapping | undefined> {
+    if (typeof this.state.getRecurrenceLink === "function") {
+      const link = await this.state.getRecurrenceLink(profile, seriesId);
+      if (link) {
+        const mapping = await this.legacyMappingByTask(profile, link.taskId);
+        if (mapping && (!masterEventId || mapping.masterEventId === masterEventId)) return mapping;
+      }
+    }
+    const byTask = await this.legacyMappingByTask(profile, seriesId);
+    if (byTask?.seriesId === seriesId && (!masterEventId || byTask.masterEventId === masterEventId)) return byTask;
+    if (masterEventId) {
+      const byMaster = await this.legacyMappingByEvent(profile, masterEventId);
+      if (byMaster?.seriesId === seriesId && (!byMaster.masterEventId || byMaster.masterEventId === masterEventId)) return byMaster;
+    }
+    return undefined;
   }
 
   /** Compatibility adapter for review and verified-deletion workflows.
@@ -2917,7 +2961,7 @@ export class Synchronizer {
       const taskOccurrenceStart = taskOccurrence ? recurrenceOriginalStart(taskOccurrence) : undefined;
       const activeOccurrenceStart = recurrenceOriginalStart(active);
       const providerProgressAtOrBeyondActive = Boolean(taskOccurrenceStart && activeOccurrenceStart
-        && compareLogicalStarts(taskOccurrenceStart, activeOccurrenceStart) >= 0);
+        && compareLogicalStarts(taskOccurrenceStart, activeOccurrenceStart) > 0);
       if (providerProgressAtOrBeyondActive) {
         // An in-flight Todoist completion may have advanced the provider's due
         // date to this or a later occurrence while provider mapping metadata
@@ -2937,6 +2981,17 @@ export class Synchronizer {
         && normalizedText(active.summary) === normalizedText(task.content)
         && normalizedDescription(active.description) === normalizedDescription(task.description)
         : hasCanonicalState(active, task))) {
+      const verifiedMapping: Mapping = {
+        ...(existing || {}), profile: delivery.profile,
+        projectId: existing?.projectId || profiles[delivery.profile].todoistProjectId,
+        calendarId: profiles[delivery.profile].calendarId,
+        eventId: active.id, taskId: task.id, seriesId, masterEventId: master.id,
+        activeInstanceId: active.id,
+        originalStart: recurrenceOriginalStart(active),
+        activeEffectiveStart: eventEffectiveStart(active),
+        updatedAt: existing?.updatedAt || new Date().toISOString(),
+      };
+      await this.persistProviderMapping(verifiedMapping, todoist);
       await this.state.audit(delivery.profile, "calendar_recurrence_noop_active_instance", { seriesId, eventId: active.id, taskId: task.id });
       return providerChanged ? "repaired" : "converged";
     }
@@ -3705,6 +3760,9 @@ export class Synchronizer {
         });
       }
       if (mappedEvent?.status === "cancelled") {
+        if (!current) return this.state.audit(delivery.profile, "todoist_missing_task_delivery_ignored", {
+          event: payload.event_name, reason: "provider_task_not_found",
+        });
         return this.state.audit(delivery.profile, "todoist_recurrence_completion_suppressed_cancelled_calendar", { taskId: task.id, eventId: mapping.eventId });
       }
 
