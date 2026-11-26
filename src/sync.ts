@@ -5,7 +5,7 @@ import { profileForTodoistProject, profiles, googleCredentials, todoistToken } f
 import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, buildProjectMappingIndex,
   deleteExactTaskProjectMappingComments, deleteMappingComments, mappingFromProjectMappingComment,
-  upsertProjectMappingComment } from "./mapping-comments.js";
+  upsertProjectMappingComment, serializeMappingComment } from "./mapping-comments.js";
 import { GoogleCalendar, Todoist, withTodoistInventoryScope } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
@@ -2723,6 +2723,244 @@ export class Synchronizer {
     markReplayVerified();
   }
 
+  /**
+   * Recover only an exact, same-cadence all-day weekly Google split. The
+   * deterministic Google successor ID alone is NOT authority: require
+   * independent provider-native task correlation or reciprocal split lineage,
+   * a unique versioned project comment, and a non-overlapping history cap.
+   * No provider create/delete or recurrence/date mutation is permitted here.
+   */
+  private async repairStaleWeeklySplit(
+    delivery: Delivery, stale: Mapping, master: CalendarEvent, active: CalendarEvent,
+    task: TodoistTask, recurrence: CalendarOwnedTodoistRecurrence, timeZone: string | undefined,
+    calendar: GoogleCalendar, todoist: Todoist,
+  ): Promise<boolean> {
+    const profile = delivery.profile;
+    const { calendarId, todoistProjectId: projectId } = profiles[profile];
+    const oldId = stale.masterEventId;
+    const decline = async (reason: string): Promise<false> => {
+      await this.state.audit(profile, "calendar_split_mapping_repair_blocked", {
+        taskId: task.id, oldMasterEventId: oldId, masterEventId: master.id, eventId: active.id, reason,
+      });
+      return false;
+    };
+    if (!oldId || oldId === master.id || stale.eventId !== oldId
+      || stale.profile !== profile || stale.calendarId !== calendarId || stale.projectId !== projectId
+      || stale.taskId !== task.id || stale.seriesId !== task.id || !stale.projectCommentId
+      || !Number.isSafeInteger(stale.mappingRevision) || !stale.mappingRevision
+      || stale.calendarProgressVersion || stale.todoistPhaseBVersion || stale.completedThroughOriginalStart
+      || !calendar.listLinkedEventsByTodoistTaskId || !calendar.listExplicitSeriesExceptions
+      || !calendar.listInstancesInWindow || !calendar.updateSharedEventPropertiesIfUnchanged
+      || !todoist.updateComment || !todoist.updateTaskMetadata) return decline("unsupported_mapping_shape");
+    const ids = [oldId, master.id, active.id];
+    const allowed = async () => modeAllowsMutations(delivery, await this.state.mutationAllowed(profile))
+      && !(await this.state.syncBlocked(profile, { taskId: task.id, eventId: oldId }))
+      && !(await this.state.syncBlocked(profile, { taskId: task.id, eventId: master.id }))
+      && !(await this.state.syncBlocked(profile, { taskId: task.id, eventId: active.id }))
+      && !(await this.calendarMutationBlockedByCompletion(delivery, active.id));
+    if (!await allowed()) return decline("sync_control_blocked");
+    const [old, current, occurrence, liveTask] = await Promise.all([
+      calendar.getEvent(oldId), calendar.getEvent(master.id), calendar.getEvent(active.id), todoist.getTask(task.id),
+    ]);
+    const date = (s: string | undefined) => {
+      if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return undefined;
+      const t = Date.parse(s + "T00:00:00Z");
+      return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === s ? t : undefined;
+    };
+    const day = 86_400_000;
+    const start = date(current.start?.date), oldStart = date(old.start?.date);
+    const original = date(occurrence.originalStartTime?.date), effective = date(occurrence.start?.date);
+    const weekly = (event: CalendarEvent, capped: boolean) => {
+      if (event.recurrence?.length !== 1 || !event.recurrence[0].startsWith("RRULE:")) return undefined;
+      const fields = new Map<string, string>();
+      for (const part of event.recurrence[0].slice(6).split(";")) {
+        const m = /^([A-Z]+)=([^;=]+)$/.exec(part);
+        if (!m || fields.has(m[1]) || !["FREQ", "BYDAY", "INTERVAL", "WKST", "UNTIL"].includes(m[1])) return undefined;
+        fields.set(m[1], m[2]);
+      }
+      const weekday = fields.get("BYDAY"), until = fields.get("UNTIL");
+      if (fields.get("FREQ") !== "WEEKLY" || !weekday || !/^(SU|MO|TU|WE|TH|FR|SA)$/.test(weekday)
+        || (fields.get("INTERVAL") || "1") !== "1" || (fields.get("WKST") || "MO") !== "MO"
+        || (capped ? !until || !/^\d{8}$/.test(until) : until !== undefined)) return undefined;
+      return { weekday, until };
+    };
+    const historicalRule = weekly(old, true), successorRule = weekly(current, false);
+    if (old.id !== oldId || current.id !== master.id || occurrence.id !== active.id
+      || old.status !== "confirmed" || current.status !== "confirmed" || occurrence.status !== "confirmed"
+      || old.recurringEventId || current.recurringEventId || occurrence.recurringEventId !== current.id
+      || !old.etag || !current.etag || !occurrence.etag || current.etag !== master.etag
+      || !historicalRule || !successorRule || historicalRule.weekday !== successorRule.weekday
+      || start === undefined || oldStart === undefined || original === undefined || effective === undefined
+      || old.start?.dateTime || old.end?.dateTime || current.start?.dateTime || current.end?.dateTime
+      || occurrence.start?.dateTime || occurrence.end?.dateTime || occurrence.originalStartTime?.dateTime
+      || date(old.end?.date) !== oldStart + day || date(current.end?.date) !== start + day
+      || date(occurrence.end?.date) !== effective + day || original !== effective || original < start
+      || oldStart > start - 7 * day || (start - oldStart) % (7 * day) !== 0
+      || (original - start) % (7 * day) !== 0
+      || ["SU","MO","TU","WE","TH","FR","SA"][new Date(start).getUTCDay()] !== successorRule.weekday
+      || historicalRule.until !== new Date(start - day).toISOString().slice(0, 10).replace(/-/g, "")
+      || liveTask.id !== task.id || liveTask.project_id !== projectId || liveTask.is_completed
+      || liveTask.is_deleted || liveTask.completed_at || !liveTask.due?.is_recurring
+      || !sameCalendarDeltaTaskEvidence(task, liveTask)
+      || !matchesCalendarOwnedRecurringTask(liveTask, occurrence, recurrence, timeZone)
+      || normalizedText(current.summary) !== normalizedText(occurrence.summary)
+      || normalizedDescription(current.description) !== normalizedDescription(occurrence.description))
+      return decline("split_schedule_or_provider_version_unverified");
+    const oldShared = old.extendedProperties?.shared || {};
+    const shared = current.extendedProperties?.shared || {};
+    const instanceShared = occurrence.extendedProperties?.shared || {};
+    const previous = new Date(start - 7 * day).toISOString().slice(0, 10);
+    const linked = (s: Record<string, string>) => s.taskId === task.id || s.syncTaskId === task.id;
+    const exactHistory = oldShared.syncHistoryOnly === "true" && oldShared.syncHistoryTaskId === task.id
+      && oldShared.syncHistorySuccessorId === current.id && oldShared.syncHistoryCutoff === previous;
+    const reciprocal = exactHistory && shared.syncHistoryMasterId === oldId && shared.syncSplitVersion === "1";
+    const googleSplit = current.id === oldId + "_R" + current.start!.date!.replace(/-/g, "")
+      && (linked(oldShared) || exactHistory) && linked(shared);
+    const foreign = (s: Record<string, string>) =>
+      [s.taskId, s.syncTaskId, s.syncHistoryTaskId].some(id => Boolean(id && id !== task.id))
+      || Boolean(s.syncProfile && s.syncProfile !== profile)
+      || Boolean(s.syncCalendarId && s.syncCalendarId !== calendarId)
+      || Boolean(s.syncSchemaVersion && s.syncSchemaVersion !== "2");
+    if ((!reciprocal && !googleSplit) || foreign(oldShared) || foreign(shared) || foreign(instanceShared)
+      || otherProfileCalendarOrganizer(profile, old) || otherProfileCalendarOrganizer(profile, current)
+      || (oldShared.syncHistoryOnly !== undefined && !exactHistory)
+      || (oldShared.syncHistorySuccessorId && oldShared.syncHistorySuccessorId !== current.id)
+      || (shared.syncHistoryMasterId && shared.syncHistoryMasterId !== oldId)
+      || (shared.syncHistoryCutoff && shared.syncHistoryCutoff !== previous)
+      || (shared.syncHistoryOnly === "true")
+      || [shared.syncMasterEventId, shared.syncEventId].some(id => Boolean(id && id !== oldId && id !== current.id)))
+      return decline("split_lineage_unverified");
+
+    // Without a baseline, the historical master is admissible only when the
+    // task still agrees with that field (or already agrees with the successor).
+    const content = normalizedText(current.summary), description = normalizedDescription(current.description);
+    const safeField = (before: string | undefined, historical: string, actual: string, desired: string) =>
+      actual === desired || actual === (before ?? historical);
+    if (!safeField(stale.syncedTitle, normalizedText(old.summary), normalizedText(liveTask.content), content)
+      || !safeField(stale.syncedDescription, normalizedDescription(old.description), normalizedDescription(liveTask.description), description))
+      return decline("concurrent_metadata_edit");
+
+    const [aliases, oldFuture, exceptions, owner, claims] = await Promise.all([
+      calendar.listLinkedEventsByTodoistTaskId(task.id),
+      calendar.listInstancesInWindow(oldId, new Date(start).toISOString(), new Date(Math.max(effective, start) + 8 * day).toISOString()),
+      calendar.listExplicitSeriesExceptions(oldId),
+      this.providerMappingByTaskAnyProfile(task.id),
+      this.providerMappingsForCalendarIdentity(profile, ids, todoist),
+    ]);
+    const notHistorical = (e: CalendarEvent) => {
+      const originalDate = date(e.originalStartTime?.date), effectiveDate = date(e.start?.date);
+      return e.recurringEventId !== oldId || originalDate === undefined || originalDate >= start
+        || (e.status !== "cancelled" && (effectiveDate === undefined || effectiveDate >= start));
+    };
+    const sameMapping = (m: Mapping | undefined) => Boolean(m && m.profile === profile
+      && m.taskId === task.id && m.masterEventId === oldId && m.eventId === stale.eventId
+      && m.projectCommentId === stale.projectCommentId && m.mappingRevision === stale.mappingRevision
+      && m.updatedAt === stale.updatedAt);
+    if (!sameMapping(owner) || claims.some(m => !sameMapping(m))
+      || aliases.some(e => e.status !== "cancelled" && !ids.includes(e.id)
+        && e.recurringEventId !== oldId && e.recurringEventId !== current.id)
+      || oldFuture.some(notHistorical) || exceptions.some(notHistorical))
+      return decline("competing_claim_or_future_history");
+    const loadExact = async () => {
+      const index = buildProjectMappingIndex(await todoist.listProjectComments(projectId, true));
+      const entries = index.parsed.filter(e => e.payload.taskId === task.id
+        || [e.payload.eventId, e.payload.masterEventId, e.payload.activeInstanceId].some(id => id && ids.includes(id)));
+      if (entries.length !== 1 || entries[0].payload.schemaVersion !== 2
+        || !sameMapping(mappingFromProjectMappingComment(entries[0]))
+        || index.malformed.some(e => [task.id, ...ids].some(id => e.comment.content?.includes(id)))) return undefined;
+      return entries[0];
+    };
+    const entry = await loadExact();
+    if (!entry || !await allowed()) return decline("mapping_revision_or_controls_changed");
+    const [oldCheck, newCheck, activeCheck, taskCheck] = await Promise.all([
+      calendar.getEvent(oldId), calendar.getEvent(current.id), calendar.getEvent(occurrence.id), todoist.getTask(task.id),
+    ]);
+    if (oldCheck.etag !== old.etag || newCheck.etag !== current.etag || activeCheck.etag !== occurrence.etag
+      || !sameCalendarDeltaTaskEvidence(liveTask, taskCheck)) return decline("provider_version_changed");
+
+    // First stamp the successor (conditional PATCH), then archive the capped
+    // history, then update metadata and the SAME project comment. A retry
+    // after either PATCH still has the exact reciprocal lineage to resume.
+    const nextShared: Record<string, string | null> = {
+      taskId: task.id, syncTaskId: task.id, syncSchemaVersion: "2", syncProfile: profile,
+      syncCalendarId: calendarId, syncEventId: current.id, syncSeriesId: task.id,
+      syncMasterEventId: current.id, syncActiveInstanceId: occurrence.id,
+      syncOriginalStart: occurrence.originalStartTime!.date!, syncActiveEffectiveStart: occurrence.start!.date!,
+      syncHistoryMasterId: oldId, syncHistoryCutoff: previous, syncSplitVersion: "1",
+      syncSource: null, syncRecurrenceOwner: null, syncCalendarNative: null,
+    };
+    const historyShared: Record<string, string | null> = {
+      syncHistoryOnly: "true", syncHistoryTaskId: task.id, syncHistorySuccessorId: current.id,
+      syncHistoryCutoff: previous, syncHistoryOriginalRule: current.recurrence![0],
+    };
+    for (const key of ["taskId", "syncTaskId", "taskUrl", "syncEventId", "syncSeriesId", "syncMasterEventId",
+      "syncActiveInstanceId", "syncOriginalStart", "syncActiveEffectiveStart", "syncProgressVersion",
+      "syncCompletedThrough", "syncTodoistPhaseBVersion", "todoistRecurrence", "todoistAnchorStart",
+      "todoistAnchorEnd", "todoistAnchorAllDay", "todoistAnchorTimeZone", "todoistTemplateSummary",
+      "todoistTemplateDescription", "todoistPhaseBVersion", "syncSource", "syncRecurrenceOwner", "syncCalendarNative"])
+      historyShared[key] = null;
+    const patch = async (event: CalendarEvent, desired: Record<string, string | null>) => {
+      const props = event.extendedProperties?.shared || {};
+      const changes = Object.fromEntries(Object.entries(desired).filter(([k,v]) => v === null ? props[k] !== undefined : props[k] !== v));
+      if (Object.keys(changes).length) {
+        await calendar.updateSharedEventPropertiesIfUnchanged(event.id, event.etag!, changes);
+        await this.state.recordMutation(profile);
+      }
+      const read = await calendar.getEvent(event.id);
+      if (read.id !== event.id || read.status !== "confirmed"
+        || JSON.stringify(read.recurrence) !== JSON.stringify(event.recurrence)
+        || JSON.stringify(read.start) !== JSON.stringify(event.start) || JSON.stringify(read.end) !== JSON.stringify(event.end)
+        || normalizedText(read.summary) !== normalizedText(event.summary)
+        || normalizedDescription(read.description) !== normalizedDescription(event.description)
+        || Object.entries(desired).some(([k,v]) => v === null ? read.extendedProperties?.shared?.[k] !== undefined
+          : read.extendedProperties?.shared?.[k] !== v))
+        throw new Error("Weekly split correlation PATCH did not verify");
+      return read;
+    };
+    const nextMaster = await patch(newCheck, nextShared);
+    await patch(oldCheck, historyShared);
+    if (!await allowed()) return decline("sync_control_changed_after_correlation");
+    const beforeMetadata = await todoist.getTask(task.id);
+    if (!sameCalendarDeltaTaskEvidence(liveTask, beforeMetadata)) return decline("task_changed_after_correlation");
+    let nextTask = beforeMetadata;
+    if (normalizedText(nextTask.content) !== content || normalizedDescription(nextTask.description) !== description) {
+      nextTask = await todoist.updateTaskMetadata(task.id, { content, description });
+      await this.state.recordMutation(profile);
+      if (!sameCalendarDeltaTaskEvidence({ ...beforeMetadata, content, description }, nextTask))
+        throw new Error("Weekly split Todoist metadata write did not verify");
+    }
+    const [latest, finalMaster, finalActive, finalTask] = await Promise.all([
+      loadExact(), calendar.getEvent(current.id), calendar.getEvent(occurrence.id), todoist.getTask(task.id),
+    ]);
+    if (!latest || latest.comment.content !== entry.comment.content || finalMaster.etag !== nextMaster.etag
+      || finalActive.recurringEventId !== current.id || finalActive.status !== "confirmed"
+      || recurrenceOriginalStart(finalActive) !== recurrenceOriginalStart(occurrence)
+      || eventEffectiveStart(finalActive) !== eventEffectiveStart(occurrence)
+      || !sameCalendarDeltaTaskEvidence(nextTask, finalTask) || !await allowed())
+      return decline("provider_or_mapping_changed_before_commit");
+    const next: Mapping = {
+      profile, calendarId, projectId, taskId: task.id, eventId: current.id, seriesId: task.id,
+      masterEventId: current.id, activeInstanceId: occurrence.id,
+      originalStart: occurrence.originalStartTime!.date, activeEffectiveStart: occurrence.start!.date,
+      projectCommentId: stale.projectCommentId, mappingRevision: stale.mappingRevision! + 1,
+      syncedTitle: content, syncedDescription: description, syncedDue: occurrence.start!.date,
+      syncBaseline: providerSyncBaseline(finalTask, finalActive, finalMaster), updatedAt: new Date().toISOString(),
+    };
+    // Use exact comment update, not a create-on-403/404 compatibility fallback.
+    await todoist.updateComment(stale.projectCommentId!, serializeMappingComment(next, projectId));
+    await this.state.recordMutation(profile);
+    const committed = buildProjectMappingIndex(await todoist.listProjectComments(projectId, true));
+    const matches = committed.parsed.filter(e => e.payload.taskId === task.id);
+    if (matches.length !== 1 || matches[0].comment.id !== stale.projectCommentId
+      || matches[0].payload.mappingRevision !== next.mappingRevision || matches[0].payload.masterEventId !== current.id
+      || matches[0].payload.eventId !== current.id || matches[0].payload.activeInstanceId !== occurrence.id)
+      throw new Error("Weekly split mapping comment did not verify");
+    await this.state.audit(profile, "calendar_split_mapping_repaired", {
+      taskId: task.id, oldMasterEventId: oldId, masterEventId: current.id, eventId: occurrence.id,
+    });
+    return true;
+  }
+
   private async applyCalendarSeries(delivery: Delivery, master: CalendarEvent, todoist: Todoist): Promise<RecurrenceReconciliationOutcome> {
     const { calendar } = await this.clients(delivery.profile);
     let providerChanged = false;
@@ -2992,6 +3230,21 @@ export class Synchronizer {
     if (await this.state.syncBlocked(delivery.profile, { eventId:master.id, taskId:task?.id }, !existing)) {
       await this.state.audit(delivery.profile, "calendar_event_sync_control_blocked", { eventId:master.id, taskId:task?.id });
       return this.recurrenceControlOutcome(delivery.profile, { taskId: task?.id, eventId: master.id });
+    }
+    // A provider-confirmed split can leave a unique stale project comment.
+    // Repair only after independent lineage, history and current-due proof;
+    // the ordinary conflict guard remains unchanged for every other mismatch.
+    if (!existing && task?.due?.is_recurring && calendarRecurrence) {
+      const stale = await this.providerMappingByTask(delivery.profile, task.id, todoist);
+      if (stale?.masterEventId && stale.masterEventId !== master.id) {
+        if (await this.repairStaleWeeklySplit(delivery, stale, master, active, task,
+          calendarRecurrence, calendarTimeZone, calendar, todoist)) return "repaired";
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "durable_mapping_missing_or_changed",
+        });
+        return "blocked";
+      }
     }
     if (discoveredTaskCandidate && task && calendarRecurrence) {
       const [liveTask, liveMaster, liveActive] = await Promise.all([
