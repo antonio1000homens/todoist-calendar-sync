@@ -4,6 +4,7 @@ import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeMappingComment } from "../dist/mapping-comments.js";
 import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
+import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
@@ -1721,4 +1722,67 @@ test("native Todoist completion already at next Calendar occurrence updates mapp
   assert.equal(state.mappingsByTask.get(oldTask.id).eventId, "nov-04");
   assert.equal(state.mappingsByTask.get(oldTask.id).completedThroughOriginalStart, "2026-10-28");
   assert.ok(state.audits.some(e => e.action === "calendar_owned_completion_provider_already_advanced"));
+});
+
+
+test("unchanged v2 one-off on moved final annual occurrence avoids correlation and cross-profile reads", async () => {
+  const taskId = "guardian-one-off";
+  const active = {
+    ...instance("annual-final", "2099-11-27", "2099-11-28"),
+    originalStartTime: { date: "2099-11-15" },
+    extendedProperties: { shared: {
+      taskId, syncTaskId: taskId, syncSchemaVersion: "2", syncProfile: PROFILE,
+      syncCalendarId: profiles[PROFILE].calendarId, syncEventId: "annual-final",
+    } },
+  };
+  const master = {
+    id: MASTER, status: "confirmed", start: { date: "2096-11-15" },
+    end: { date: "2096-11-16" }, recurrence: ["RRULE:FREQ=YEARLY;UNTIL=20991115;INTERVAL=1"],
+  };
+  const task = {
+    id: taskId, project_id: profiles[PROFILE].todoistProjectId,
+    content: active.summary, description: "", due: { date: active.start.date, is_recurring: false },
+  };
+  const state = new FakeState();
+  const clients = fakeClients(state, [active], new Map([[taskId, task]]), active, [master]);
+  const projectId = profiles[PROFILE].todoistProjectId;
+  const mapping = {
+    profile: PROFILE, projectId, calendarId: profiles[PROFILE].calendarId,
+    eventId: active.id, taskId, syncedTitle: active.summary, syncedDescription: "",
+    syncedDue: active.start.date, syncBaseline: providerSyncBaseline(task, active),
+    mappingRevision: 1, updatedAt: "2026-11-26T12:21:32.498Z",
+  };
+  clients.projectComments.push({ id: "exact-v2", project_id: projectId,
+    content: serializeMappingComment(mapping, projectId) });
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  let crossProfileReads = 0, taskReads = 0, correlationAttempts = 0, replayVerified = 0;
+  sync.providerMappingByTaskAnyProfile = async () => { crossProfileReads++; return mapping; };
+  const getTask = clients.todoist.getTask.bind(clients.todoist);
+  clients.todoist.getTask = async (...args) => { taskReads++; return getTask(...args); };
+  clients.calendar.ensureTaskCorrelation = async () => { correlationAttempts++; throw new Error("unexpected correlation attempt"); };
+  const originalComments = structuredClone(clients.projectComments);
+  const delivery = { id: "guardian-delta", kind: "calendar", profile: PROFILE, mode: "aws", receivedAt: "2026-11-26T12:30:00Z", headers: {}, body: "" };
+  for (let i = 0; i < 3; i++)
+    await sync.applyCalendarEvent(delivery, structuredClone(active), clients.calendar, clients.todoist, () => replayVerified++);
+  assert.equal(crossProfileReads, 0);
+  assert.equal(taskReads, 3, "one task read per delta, no additional baseline read");
+  assert.equal(correlationAttempts, 0);
+  assert.equal(replayVerified, 0);
+  assert.equal(clients.todoistUpserts.length, 0);
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.deepEqual(clients.projectComments, originalComments);
+  assert.equal(state.audits.filter(entry => entry.action === "calendar_noop_canonical_state").length, 3);
+
+  // An actual edit and an open-ended master must still take the guarded path.
+  const changed = { ...active, summary: "Edited reminder" };
+  clients.calendar.ensureTaskCorrelation = async () => { throw new Error("guarded correlation path"); };
+  await assert.rejects(sync.applyCalendarEvent(delivery, changed, clients.calendar, clients.todoist, () => {}),
+    /guarded correlation path/);
+  assert.equal(crossProfileReads, 1, "real change still checks cross-profile ownership");
+  assert.equal(clients.todoistUpserts.length, 1, "real change still reaches the existing task writer");
+  clients.tasks.set(taskId, task);
+  clients.events.set(MASTER, { ...master, recurrence: ["RRULE:FREQ=YEARLY"] });
+  await assert.rejects(sync.applyCalendarEvent(delivery, active, clients.calendar, clients.todoist, () => {}),
+    /guarded correlation path/);
+  assert.equal(crossProfileReads, 2, "uncapped series never uses the special no-op shortcut");
 });
