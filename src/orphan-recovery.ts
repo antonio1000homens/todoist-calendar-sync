@@ -51,7 +51,7 @@ export class OrphanRecoveringSynchronizer {
     private readonly state = new StateRepository(),
     private readonly scheduleOrphan?: ScheduleOrphan,
     private readonly clientFactory: ProviderClientFactory = defaultProviderClientFactory,
-    private readonly onCalendarItemCompleted?: () => void,
+    private readonly onCalendarItemCompleted?: (replayVerified: boolean) => void,
   ) {}
 
   private async clients(profile: Profile): Promise<ProviderClients> {

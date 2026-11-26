@@ -885,7 +885,7 @@ export class Synchronizer {
     private readonly state = new StateRepository(),
     private readonly scheduleOrphan?: (delivery: Delivery, eventId: string, taskId: string) => Promise<void>,
     private readonly clientFactory?: ClientFactory,
-    private readonly onCalendarItemCompleted?: () => void,
+    private readonly onCalendarItemCompleted?: (replayVerified: boolean) => void,
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
@@ -2008,11 +2008,13 @@ export class Synchronizer {
       return;
     }
     for (const event of delta.items) {
+      let replayVerified = false;
       try {
-        await this.applyCalendarEvent(delivery, event, calendar, todoist);
-        // Only a fully returned item is a safe boundary. Keep the delta cursor
-        // unchanged until the whole batch finishes; replay re-reads provider links.
-        this.onCalendarItemCompleted?.();
+        await this.applyCalendarEvent(delivery, event, calendar, todoist, () => { replayVerified = true; });
+        // Returning a diagnostic is not proof that a prior mutation converged.
+        // Only explicitly verified item outcomes can release an attempted-write
+        // boundary; the worker retains uncertainty across subsequent items.
+        this.onCalendarItemCompleted?.(replayVerified);
       } catch (error) {
         if (error instanceof ReconciliationItemError) throw error;
         throw new ReconciliationItemError(error, {
@@ -2029,7 +2031,7 @@ export class Synchronizer {
   }
 
   private async applyCalendarEvent(delivery: Delivery, event: CalendarEvent, calendar: GoogleCalendar,
-    todoist: Todoist): Promise<void> {
+    todoist: Todoist, markReplayVerified: () => void): Promise<void> {
     // Historical masters and ALL their instances are immutable history. Google
     // instance deltas do not always inherit the parent's shared properties;
     // resolve that identity before any provider mutation.
@@ -2657,7 +2659,9 @@ export class Synchronizer {
         updatedAt: new Date().toISOString(),
       };
       await this.persistProviderMapping(nextMapping);
-      return this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
+      await this.state.audit(delivery.profile, "calendar_noop_canonical_state", { eventId: event.id, taskId: task.id });
+      markReplayVerified();
+      return;
     }
     if (task) {
       // Cached evidence is only sufficient to discard an unchanged echo.
@@ -2687,6 +2691,9 @@ export class Synchronizer {
     await this.persistProviderMapping(nextMapping);
     await this.state.recordMutation(delivery.profile);
     await this.state.audit(delivery.profile, task ? "calendar_updated_task" : "calendar_created_task", { eventId: event.id, taskId: nextTask.id });
+    // Both native links have independently verified and mutation accounting
+    // has finished. A subsequent delta replay must rediscover this exact pair.
+    markReplayVerified();
   }
 
   private async applyCalendarSeries(delivery: Delivery, master: CalendarEvent, todoist: Todoist): Promise<RecurrenceReconciliationOutcome> {

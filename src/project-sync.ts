@@ -179,7 +179,7 @@ export class ProjectAwareSynchronizer {
     // Tests inject a no-write runner; production always uses the verified
     // provider executor, which claims durable two-profile controls first.
     private readonly nativeMoveRunner: typeof executePhaseBNativeMove = executePhaseBNativeMove,
-    onCalendarItemCompleted?: () => void,
+    onCalendarItemCompleted?: (replayVerified: boolean) => void,
   ) {
     this.delegate = new Synchronizer(state, scheduleOrphan, clientFactory, onCalendarItemCompleted);
   }

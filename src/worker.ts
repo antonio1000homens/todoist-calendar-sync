@@ -381,6 +381,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
     let meaningfulMutation = false;
     // Separate delivery-wide diagnostics from an in-flight Calendar item.
     let calendarItemMutationObserved: boolean | undefined;
+    let earlierCalendarMutationUnverified = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     try {
@@ -662,8 +663,11 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
         if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = true;
       });
       await withTodoistInventoryScope(() =>
-        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory, () => {
-          if (calendarItemMutationObserved !== undefined) calendarItemMutationObserved = false;
+        new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory, replayVerified => {
+          if (calendarItemMutationObserved !== undefined) {
+            if (calendarItemMutationObserved && !replayVerified) earlierCalendarMutationUnverified = true;
+            calendarItemMutationObserved = false;
+          }
         }).process(delivery!));
 
       if (calendarSyncGeneration !== undefined) {
@@ -719,7 +723,8 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       const retryAfterMs = providerRetryAfterMs(error);
       // The actual Todoist request boundary persists credential-specific
       // cooldowns. Calendar Retry-After hints only affect FIFO visibility.
-      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount, calendarItemMutationObserved);
+      const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount,
+        earlierCalendarMutationUnverified ? true : calendarItemMutationObserved);
       if (disposition.kind === "retry_fifo") {
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is

@@ -1289,21 +1289,26 @@ test("completed Calendar item boundary permits replay after later cooldown witho
     todoist:{async upsertTask(event){writes++;return {id:event.id};}},
   }));
   const state={async getSyncToken(){return cursor;},async putSyncToken(_p,value){cursor=value;},async audit(){}};
-  const sync=new Synchronizer(state,undefined,factory,()=>{itemAttempt=false;});
+  let earlierUnverified=false, verifyFirst=true;
+  const sync=new Synchronizer(state,undefined,factory,verified=>{
+    if(itemAttempt&&!verified)earlierUnverified=true;
+    itemAttempt=false;
+  });
   // Exercise real delta orchestration and observed provider boundary with a
   // minimal idempotent item fixture. Full native mapping replay is covered
   // separately by provider integration and live acceptance tests.
-  sync.applyCalendarEvent=async (_delivery,event,_calendar,todoist)=>{
+  sync.applyCalendarEvent=async (_delivery,event,_calendar,todoist,markReplayVerified)=>{
     if(committed.has(event.id)) return;
     if(event.id==="second" && rateLimited) throw Object.assign(new Error("cooldown"),{status:429,code:"todoist_account_cooldown"});
     await todoist.upsertTask(event);
     committed.add(event.id);
+    if(event.id!=="first" || verifyFirst) markReplayVerified();
   };
   const delivery={id:"boundary",kind:"calendar",profile:"home",mode:"aws",headers:{},body:"",receivedAt:new Date().toISOString()};
   await assert.rejects(sync.process(delivery),error=>{
     assert.equal(totalAttempt,true);
     assert.equal(itemAttempt,false);
-    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,itemAttempt).kind,"retry_fifo");
+    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,earlierUnverified||itemAttempt).kind,"retry_fifo");
     return true;
   });
   assert.equal(cursor,"old");
@@ -1313,4 +1318,19 @@ test("completed Calendar item boundary permits replay after later cooldown witho
   assert.equal(cursor,"new");
   assert.equal(writes,2);
   assert.deepEqual([...committed],["first","second"]);
+
+  // A mutation followed by a non-convergence diagnostic (normal return, no
+  // verified boundary) must stay quarantinable even after a later read-only item.
+  items.splice(1,0,{id:"read-only"});
+  committed.clear(); committed.add("read-only");
+  cursor="old";writes=0;rateLimited=true;verifyFirst=false;
+  totalAttempt=false;itemAttempt=false;earlierUnverified=false;
+  await assert.rejects(sync.process(delivery),error=>{
+    assert.equal(earlierUnverified,true);
+    assert.equal(itemAttempt,false);
+    assert.equal(failedDeliveryDisposition(error,delivery,totalAttempt,5,earlierUnverified||itemAttempt).reason,"partial_provider_mutation");
+    return true;
+  });
+  assert.equal(cursor,"old");
+  assert.equal(writes,1);
 });
