@@ -182,6 +182,21 @@ export function calendarRecurrenceMatchesTodoist(event: { recurrence?: string[];
   );
 }
 
+/** Canonical comparison for provider RRULEs used only while discovering a
+ * previously unlinked pair. Redundant INTERVAL=1 and field ordering do not
+ * change recurrence semantics. */
+export function normalizedRecurrenceRule(rule: string | undefined): string | undefined {
+  if (!rule?.startsWith("RRULE:")) return undefined;
+  const fields = rule.slice("RRULE:".length).split(";").map(field => {
+    const [rawKey, ...parts] = field.split("=");
+    const key = rawKey.toUpperCase();
+    const value = parts.join("=").toUpperCase();
+    if (key === "INTERVAL" && value === "1") return undefined;
+    return `${key}=${value.split(",").sort().join(",")}`;
+  }).filter((field): field is string => Boolean(field)).sort();
+  return `RRULE:${fields.join(";")}`;
+}
+
 /** Immutable logical identity for a Google recurring instance. */
 export function recurrenceOriginalStart(event: CalendarEvent): string | undefined {
   return event.originalStartTime?.dateTime || event.originalStartTime?.date || event.start?.dateTime || event.start?.date;

@@ -34,11 +34,22 @@ test("alternate Friday and normalized quarterly aliases use anchored exact rules
     assert.equal(quarter.rule,"RRULE:FREQ=MONTHLY;INTERVAL=3");
   }
 });
+test("supported recurrence repair uses the fresh current due as its new anchor",()=>{
+  const source=task("2027-06-11","every June 11",{updated_at:"2026-11-26T10:42:42Z"});
+  const repair=evidence(source,structuredClone(source));
+  repair.eventName="item:updated";
+  repair.receivedAt="2026-11-26T10:43:00Z";
+  const admitted=admitNewTodoistPhaseBNative(repair);
+  assert.equal(admitted.admitted,true);
+  assert.equal(admitted.rule,"RRULE:FREQ=YEARLY;BYMONTHDAY=11;BYMONTH=6");
+  assert.equal(admitted.anchor.start,"2027-06-11");
+  assert.equal(admitted.anchor.source,"verified_current_schedule");
+});
 test("existing mapping, provider alias, recovery, edits, stale replay and task switch never infer DTSTART",()=>{
   const base=evidence(task());
   const faults=[
     {hasMapping:true}, {hasCalendarAlias:true}, {hasPendingRecovery:true},
-    {eventName:"item:updated"}, {receivedAt:"2026-11-09T09:20:00Z"},
+    {receivedAt:"2026-11-09T09:20:00Z"},
     {source:task(undefined,undefined,{id:"another"})},
     {providerReadback:task("2027-01-15")},
     {providerReadback:task(undefined,undefined,{project_id:"other-profile"})},
@@ -49,6 +60,10 @@ test("existing mapping, provider alias, recovery, edits, stale replay and task s
     {source:task(undefined,undefined,{completed_at:"2026-11-07T10:00:00Z"})},
   ];
   for(const change of faults) assert.equal(admitNewTodoistPhaseBNative({...base,...change}).admitted,false,JSON.stringify(change));
+  const staleRepair={...base,eventName:"item:updated",providerReadback:task("2027-01-15")};
+  assert.equal(admitNewTodoistPhaseBNative(staleRepair).admitted,false);
+  const versionMismatch={...base,eventName:"item:updated",providerReadback:task(undefined,undefined,{updated_at:"2026-11-08T09:19:30Z"})};
+  assert.equal(admitNewTodoistPhaseBNative(versionMismatch).admitted,false);
 });
 test("refuse overdue, timed, completion-relative, unsupported finite and month-end drift",()=>{
   for(const source of [

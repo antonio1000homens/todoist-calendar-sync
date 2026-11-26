@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
+import { serializeMappingComment } from "../dist/mapping-comments.js";
 import { SnapshotReconciler } from "../dist/reconciliation.js";
 
 const HOME = profiles.home.todoistProjectId;
@@ -137,56 +138,60 @@ function fakeClients({ listedTasks, taskById, calendarEvents, upsertTaskError })
   const calendarDeletes = [];
   const todoistDeletes = [];
   const comments = [];
+  const factoryCalls = [];
 
   return {
-    metrics: { todoistUpdates, calendarUpdates, calendarDeletes, todoistDeletes, comments },
-    factory: async () => ({
-      todoist: {
-        async listTasks() { return listedTasks; },
-        async getTask(taskId) {
-          const value = taskById.get(taskId);
-          if (value) return value;
-          const error = new Error("not found");
-          error.status = 404;
-          throw error;
+    metrics: { todoistUpdates, calendarUpdates, calendarDeletes, todoistDeletes, comments, factoryCalls },
+    factory: async (profile) => {
+      factoryCalls.push(profile);
+      return {
+        todoist: {
+          async listTasks() { return listedTasks; },
+          async getTask(taskId) {
+            const value = taskById.get(taskId);
+            if (value) return value;
+            const error = new Error("not found");
+            error.status = 404;
+            throw error;
+          },
+          async upsertTask(next, existingId) {
+            if (upsertTaskError) throw upsertTaskError;
+            todoistUpdates.push({ next, existingId });
+            const previous = taskById.get(existingId) || { id: existingId, project_id: HOME };
+            const updated = { ...previous, ...next, id: existingId, project_id: previous.project_id || HOME };
+            taskById.set(existingId, updated);
+            return updated;
+          },
+          async deleteTask(taskId) { todoistDeletes.push(taskId); taskById.delete(taskId); },
+          async findComment() { return undefined; },
+          async upsertComment(taskId, content, existingId) {
+            comments.push({ taskId, content, existingId });
+            return { id: existingId || "comment-1" };
+          },
+          async deleteComment() {},
         },
-        async upsertTask(next, existingId) {
-          if (upsertTaskError) throw upsertTaskError;
-          todoistUpdates.push({ next, existingId });
-          const previous = taskById.get(existingId) || { id: existingId, project_id: HOME };
-          const updated = { ...previous, ...next, id: existingId, project_id: previous.project_id || HOME };
-          taskById.set(existingId, updated);
-          return updated;
+        calendar: {
+          async getEvent(eventId) {
+            const value = calendarEvents.get(eventId);
+            if (value) return value;
+            const error = new Error("not found");
+            error.status = 404;
+            throw error;
+          },
+          async findByTodoistTaskId(taskId) {
+            return [...calendarEvents.values()].find((value) => value.extendedProperties?.shared?.taskId === taskId);
+          },
+          async upsertEvent(next, existingId) {
+            const id = existingId || `created-${calendarUpdates.length + 1}`;
+            const stored = { ...next, id, status: "confirmed", htmlLink: `https://calendar/${id}` };
+            calendarUpdates.push({ next, existingId, stored });
+            calendarEvents.set(id, stored);
+            return stored;
+          },
+          async deleteEvent(eventId) { calendarDeletes.push(eventId); calendarEvents.delete(eventId); },
         },
-        async deleteTask(taskId) { todoistDeletes.push(taskId); taskById.delete(taskId); },
-        async findComment() { return undefined; },
-        async upsertComment(taskId, content, existingId) {
-          comments.push({ taskId, content, existingId });
-          return { id: existingId || "comment-1" };
-        },
-        async deleteComment() {},
-      },
-      calendar: {
-        async getEvent(eventId) {
-          const value = calendarEvents.get(eventId);
-          if (value) return value;
-          const error = new Error("not found");
-          error.status = 404;
-          throw error;
-        },
-        async findByTodoistTaskId(taskId) {
-          return [...calendarEvents.values()].find((value) => value.extendedProperties?.shared?.taskId === taskId);
-        },
-        async upsertEvent(next, existingId) {
-          const id = existingId || `created-${calendarUpdates.length + 1}`;
-          const stored = { ...next, id, status: "confirmed", htmlLink: `https://calendar/${id}` };
-          calendarUpdates.push({ next, existingId, stored });
-          calendarEvents.set(id, stored);
-          return stored;
-        },
-        async deleteEvent(eventId) { calendarDeletes.push(eventId); calendarEvents.delete(eventId); },
-      },
-    }),
+      };
+    },
   };
 }
 
@@ -223,6 +228,8 @@ test("establishes a baseline only when existing Todoist and Calendar state alrea
   assert.deepEqual(store.baselines.get(`home:${t.id}`).calendar, canonicalCalendar(e));
   assert.equal(clients.metrics.todoistUpdates.length, 0);
   assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(clients.metrics.factoryCalls.filter((profile) => profile === "home").length, 1,
+    "one fresh Todoist comment cache is shared across this reconciliation snapshot");
 });
 
 test("a missing baseline repairs an exact live pair using Calendar's documented tie-break", async () => {
@@ -693,6 +700,62 @@ test("unmapped recovery will not steal a Calendar event owned by another Todoist
   assert.equal(state.mapping, undefined);
   assert.equal(repairs.length, 0);
   assert.ok(state.audits.some((entry) => entry.action === "todoist_snapshot_reconcile_mapping_owner_conflict"));
+});
+
+test("snapshot reconciliation adopts an untagged recurring master through its current instance", async () => {
+  const due = "2099-06-10";
+  const recurringTask = task({ content: "Daily task", description: "details",
+    due: { date: due, string: "every day", is_recurring: true } });
+  const master = { id: "untagged-master", status: "confirmed", summary: "Daily task", description: "details",
+    start: { date: "2020-01-01" }, recurrence: ["RRULE:FREQ=DAILY;INTERVAL=1"] };
+  const active = { id: "active-instance", status: "confirmed", recurringEventId: master.id,
+    summary: "Daily task", description: "details", originalStartTime: { date: due }, start: { date: due } };
+  const state = new FakeState();
+  const store = new FakeStore();
+  const clients = fakeClients({ listedTasks: [recurringTask], taskById: new Map([[recurringTask.id, recurringTask]]),
+    calendarEvents: new Map([[master.id, master], [active.id, active]]) });
+  const pair = await clients.factory();
+  pair.calendar.listDelta = async () => ({ items: [master] });
+  pair.calendar.listInstancesInWindow = async (masterId) => {
+    assert.equal(masterId, master.id);
+    return [active];
+  };
+  clients.factory = async () => pair;
+  const repairs = [];
+
+  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+
+  assert.equal(result.counts.baseline, 1);
+  assert.equal(state.mapping.eventId, master.id);
+  assert.equal(state.mapping.masterEventId, master.id);
+  assert.equal(state.mapping.activeInstanceId, active.id);
+  assert.equal(state.mapping.seriesId, recurringTask.id);
+  assert.equal(repairs.length, 0);
+});
+
+test("snapshot recovery does not adopt an untagged event whose master alias has a comment-only owner", async () => {
+  const t = task({ content: "Existing appointment", description: "", due: { date: "2099-01-11" } });
+  const e = event({ id: "comment-owned-event", summary: t.content, description: "", start: { date: "2099-01-11" },
+    extendedProperties: undefined });
+  const state = new FakeState();
+  const store = new FakeStore();
+  const clients = fakeClients({ listedTasks: [t], taskById: new Map([[t.id, t]]), calendarEvents: new Map([[e.id, e]]) });
+  const pair = await clients.factory();
+  pair.todoist.listProjectComments = async projectId => projectId === WORK ? [{
+    id: "comment-only-owner", project_id: WORK,
+    content: serializeMappingComment({ profile: "work", projectId: WORK, eventId: e.id,
+      taskId: "different-task", updatedAt: "2098-01-01T00:00:00Z" }, WORK),
+  }] : [];
+  pair.calendar.listDelta = async () => ({ items: [e] });
+  clients.factory = async () => pair;
+  const repairs = [];
+
+  const result = await makeReconciler({ state, store, clients, repairs }).reconcile("home");
+
+  assert.equal(result.counts.conflict, 1);
+  assert.equal(state.mapping, undefined);
+  assert.equal(repairs.length, 0);
+  assert.ok(state.audits.some(entry => entry.action === "todoist_snapshot_reconcile_mapping_owner_conflict"));
 });
 
 test("exact Calendar task correlation takes precedence over a stale cross-profile DynamoDB owner", async () => {
