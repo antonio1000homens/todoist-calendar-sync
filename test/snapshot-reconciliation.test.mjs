@@ -138,56 +138,60 @@ function fakeClients({ listedTasks, taskById, calendarEvents, upsertTaskError })
   const calendarDeletes = [];
   const todoistDeletes = [];
   const comments = [];
+  const factoryCalls = [];
 
   return {
-    metrics: { todoistUpdates, calendarUpdates, calendarDeletes, todoistDeletes, comments },
-    factory: async () => ({
-      todoist: {
-        async listTasks() { return listedTasks; },
-        async getTask(taskId) {
-          const value = taskById.get(taskId);
-          if (value) return value;
-          const error = new Error("not found");
-          error.status = 404;
-          throw error;
+    metrics: { todoistUpdates, calendarUpdates, calendarDeletes, todoistDeletes, comments, factoryCalls },
+    factory: async (profile) => {
+      factoryCalls.push(profile);
+      return {
+        todoist: {
+          async listTasks() { return listedTasks; },
+          async getTask(taskId) {
+            const value = taskById.get(taskId);
+            if (value) return value;
+            const error = new Error("not found");
+            error.status = 404;
+            throw error;
+          },
+          async upsertTask(next, existingId) {
+            if (upsertTaskError) throw upsertTaskError;
+            todoistUpdates.push({ next, existingId });
+            const previous = taskById.get(existingId) || { id: existingId, project_id: HOME };
+            const updated = { ...previous, ...next, id: existingId, project_id: previous.project_id || HOME };
+            taskById.set(existingId, updated);
+            return updated;
+          },
+          async deleteTask(taskId) { todoistDeletes.push(taskId); taskById.delete(taskId); },
+          async findComment() { return undefined; },
+          async upsertComment(taskId, content, existingId) {
+            comments.push({ taskId, content, existingId });
+            return { id: existingId || "comment-1" };
+          },
+          async deleteComment() {},
         },
-        async upsertTask(next, existingId) {
-          if (upsertTaskError) throw upsertTaskError;
-          todoistUpdates.push({ next, existingId });
-          const previous = taskById.get(existingId) || { id: existingId, project_id: HOME };
-          const updated = { ...previous, ...next, id: existingId, project_id: previous.project_id || HOME };
-          taskById.set(existingId, updated);
-          return updated;
+        calendar: {
+          async getEvent(eventId) {
+            const value = calendarEvents.get(eventId);
+            if (value) return value;
+            const error = new Error("not found");
+            error.status = 404;
+            throw error;
+          },
+          async findByTodoistTaskId(taskId) {
+            return [...calendarEvents.values()].find((value) => value.extendedProperties?.shared?.taskId === taskId);
+          },
+          async upsertEvent(next, existingId) {
+            const id = existingId || `created-${calendarUpdates.length + 1}`;
+            const stored = { ...next, id, status: "confirmed", htmlLink: `https://calendar/${id}` };
+            calendarUpdates.push({ next, existingId, stored });
+            calendarEvents.set(id, stored);
+            return stored;
+          },
+          async deleteEvent(eventId) { calendarDeletes.push(eventId); calendarEvents.delete(eventId); },
         },
-        async deleteTask(taskId) { todoistDeletes.push(taskId); taskById.delete(taskId); },
-        async findComment() { return undefined; },
-        async upsertComment(taskId, content, existingId) {
-          comments.push({ taskId, content, existingId });
-          return { id: existingId || "comment-1" };
-        },
-        async deleteComment() {},
-      },
-      calendar: {
-        async getEvent(eventId) {
-          const value = calendarEvents.get(eventId);
-          if (value) return value;
-          const error = new Error("not found");
-          error.status = 404;
-          throw error;
-        },
-        async findByTodoistTaskId(taskId) {
-          return [...calendarEvents.values()].find((value) => value.extendedProperties?.shared?.taskId === taskId);
-        },
-        async upsertEvent(next, existingId) {
-          const id = existingId || `created-${calendarUpdates.length + 1}`;
-          const stored = { ...next, id, status: "confirmed", htmlLink: `https://calendar/${id}` };
-          calendarUpdates.push({ next, existingId, stored });
-          calendarEvents.set(id, stored);
-          return stored;
-        },
-        async deleteEvent(eventId) { calendarDeletes.push(eventId); calendarEvents.delete(eventId); },
-      },
-    }),
+      };
+    },
   };
 }
 
@@ -224,6 +228,8 @@ test("establishes a baseline only when existing Todoist and Calendar state alrea
   assert.deepEqual(store.baselines.get(`home:${t.id}`).calendar, canonicalCalendar(e));
   assert.equal(clients.metrics.todoistUpdates.length, 0);
   assert.equal(clients.metrics.calendarUpdates.length, 0);
+  assert.equal(clients.metrics.factoryCalls.filter((profile) => profile === "home").length, 1,
+    "one fresh Todoist comment cache is shared across this reconciliation snapshot");
 });
 
 test("a missing baseline repairs an exact live pair using Calendar's documented tie-break", async () => {

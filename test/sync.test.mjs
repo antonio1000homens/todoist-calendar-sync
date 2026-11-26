@@ -276,12 +276,13 @@ test("normal provider mapping lookups use exact DynamoDB fallback only after com
   let comments = [{ id: "provider-comment", project_id: profiles.home.todoistProjectId,
     content: serializeMappingComment(provider, profiles.home.todoistProjectId) }];
   let taskReads = 0, eventReads = 0, listReads = 0;
+  const commentRefreshFlags = [];
   const state = {
     async getMappingByTask(profile, taskId) { taskReads++; return profile === legacy.profile && taskId === legacy.taskId ? legacy : undefined; },
     async getMappingByEvent(profile, eventId) { eventReads++; return profile === legacy.profile && eventId === legacy.eventId ? legacy : undefined; },
     async listMappings() { listReads++; return [legacy]; },
   };
-  const todoist = { async listProjectComments() { return comments; } };
+  const todoist = { async listProjectComments(_projectId, refresh) { commentRefreshFlags.push(refresh); return comments; } };
   const sync = new Synchronizer(state, undefined, async () => ({ todoist, calendar: {} }));
 
   assert.equal((await sync.providerMappingByTask("home", provider.taskId, todoist)).eventId, provider.eventId);
@@ -292,6 +293,8 @@ test("normal provider mapping lookups use exact DynamoDB fallback only after com
   assert.equal((await sync.providerMappingByEvent("home", legacy.eventId, todoist)).taskId, legacy.taskId);
   assert.equal(eventReads, 1, "event fallback also uses the exact DynamoDB key");
   assert.equal(listReads, 0, "ordinary task/event lookups do not enumerate the legacy mapping table");
+  assert.deepEqual(commentRefreshFlags, [undefined, undefined, undefined],
+    "ordinary mapping reads reuse the Todoist client's per-project comment cache");
 });
 
 test("multi-day Calendar events use only their first day as the Todoist due date", () => {

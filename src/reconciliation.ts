@@ -333,6 +333,8 @@ export class DynamoReconciliationStore implements ReconciliationStore {
 }
 
 export class SnapshotReconciler {
+  private readonly clientPairs = new Map<Profile, Promise<ClientPair>>();
+
   constructor(
     private readonly state = new StateRepository(),
     private readonly clientFactory?: ClientFactory,
@@ -342,8 +344,19 @@ export class SnapshotReconciler {
   ) {}
 
   private async clients(profile: Profile): Promise<ClientPair> {
-    if (this.clientFactory) return this.clientFactory(profile);
-    return defaultProviderClientFactory(profile);
+    let pending = this.clientPairs.get(profile);
+    if (!pending) {
+      pending = this.clientFactory
+        ? this.clientFactory(profile)
+        : defaultProviderClientFactory(profile);
+      this.clientPairs.set(profile, pending);
+    }
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.clientPairs.get(profile) === pending) this.clientPairs.delete(profile);
+      throw error;
+    }
   }
 
   private async providerMappings(profile: Profile, todoist?: Todoist): Promise<Mapping[]> {
@@ -352,7 +365,12 @@ export class SnapshotReconciler {
       return this.store?.listMappings ? this.store.listMappings(profile)
         : await this.state.listMappings?.(profile) || [];
     }
-    const providerMappings = await this.providerCommentMappings(profile, client);
+    const providerMappings = buildProjectMappingIndex(
+      await client.listProjectComments(profiles[profile].todoistProjectId, true),
+    ).parsed
+      .filter(entry => entry.payload.profile === profile
+        && entry.payload.projectId === profiles[profile].todoistProjectId)
+      .map(mappingFromProjectMappingComment);
     const legacyMappings = this.store?.listMappings
       ? await this.store.listMappings(profile)
       : await this.state.listMappings?.(profile) || [];
@@ -364,7 +382,7 @@ export class SnapshotReconciler {
   }
 
   private async providerCommentMappings(profile: Profile, todoist: Todoist): Promise<Mapping[]> {
-    return buildProjectMappingIndex(await todoist.listProjectComments(profiles[profile].todoistProjectId, true)).parsed
+    return buildProjectMappingIndex(await todoist.listProjectComments(profiles[profile].todoistProjectId)).parsed
       .filter(entry => entry.payload.profile === profile && entry.payload.projectId === profiles[profile].todoistProjectId)
       .map(mappingFromProjectMappingComment);
   }
@@ -1363,6 +1381,10 @@ export class SnapshotReconciler {
     maxCandidates = reconciliationCandidateLimit(),
   ): Promise<SnapshotReconciliationResult> {
     if (!Number.isInteger(maxCandidates) || maxCandidates < 1) throw new Error("Reconciliation candidate limit must be a positive integer");
+    // Reuse one provider client per profile within this snapshot so cached
+    // project comment pages are shared across mapping lookups. A new
+    // reconciliation gets a fresh provider inventory.
+    this.clientPairs.clear();
     const clients = await this.clients(profile);
     const recurrence = continuation?.recurrence
       ?? (await this.reconcileExistingRecurrence(profile))
