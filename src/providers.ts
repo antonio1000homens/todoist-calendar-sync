@@ -151,6 +151,18 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const todoistRequestPacing = new Map<string, { nextAt: number; intervalMs: number }>();
 const todoistCooldownUntil = new Map<string, number>();
 
+type TodoistCooldownStore = {
+  getTodoistCooldown(accountIdentity: string): Promise<number | undefined>;
+  extendTodoistCooldown(accountIdentity: string, until: number): Promise<void>;
+};
+const todoistCooldownStore = new AsyncLocalStorage<TodoistCooldownStore>();
+
+/** Scope durable admission to the worker invocation, including cross-profile
+ * provider clients and nested reconciliation/manual operations. */
+export function withTodoistCooldownStore<T>(store: TodoistCooldownStore, operation: () => Promise<T>): Promise<T> {
+  return todoistCooldownStore.run(store, operation);
+}
+
 function abortError(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
@@ -858,22 +870,59 @@ export class Todoist {
     }
   }
 
-  private async paceRequest(): Promise<void> {
-    const cooldownUntil = todoistCooldownUntil.get(this.pacingKey) || 0;
-    if (cooldownUntil > Date.now()) {
-      const error = new Error("Todoist account is in a shared rate-limit cooldown") as Error & { status: number; retryAfterMs: number; body: string };
-      error.status = 429;
-      error.retryAfterMs = cooldownUntil - Date.now();
-      error.body = '{"error_tag":"LIMITS_REACHED"}';
-      throw error;
+  private async assertNotCooling(): Promise<void> {
+    const local = todoistCooldownUntil.get(this.pacingKey) || 0;
+    const store = todoistCooldownStore.getStore();
+    const durable = local > Date.now() ? 0 : (await store?.getTodoistCooldown(this.pacingKey)) || 0;
+    const until = Math.max(local, durable, todoistCooldownUntil.get(this.pacingKey) || 0);
+    if (until > Date.now()) {
+      todoistCooldownUntil.set(this.pacingKey, until);
+      throw Object.assign(new Error("Todoist account is in a shared rate-limit cooldown"), {
+        status: 429, retryAfterMs: until - Date.now(), body: '{"error_tag":"LIMITS_REACHED"}',
+        provider: "todoist", todoistAccountIdentity: this.pacingKey, code: "todoist_account_cooldown",
+      });
     }
+  }
+
+  private async recordRateLimit(error: unknown, requestSent: boolean): Promise<number | undefined> {
+    const rateError = error as { retryAfterMs?: number; provider?: string; todoistAccountIdentity?: string; code?: string };
+    rateError.provider = "todoist";
+    rateError.todoistAccountIdentity = this.pacingKey;
+    const store = todoistCooldownStore.getStore();
+    const hint = Number(rateError.retryAfterMs);
+    const delay = Number.isFinite(hint) && hint > 0 ? Math.ceil(hint) : store && requestSent ? 30_000 : 0;
+    if (requestSent && delay > 0) {
+      const until = Math.max(todoistCooldownUntil.get(this.pacingKey) || 0, Date.now() + delay);
+      todoistCooldownUntil.set(this.pacingKey, until);
+      if (store) {
+        rateError.retryAfterMs = until - Date.now();
+        rateError.code = "todoist_account_cooldown";
+        // Persist at the failing credential's boundary before returning to
+        // the worker. A persistence failure is visible and must not retry HTTP.
+        try { await store.extendTodoistCooldown(this.pacingKey, until); }
+        catch (cause) {
+          logEvent("todoist_shared_cooldown_persist_failed", { accountId: this.pacingKey.slice(0, 16),
+            errorName: cause instanceof Error ? cause.name : "unknown" });
+          // Keep the original rate-limit evidence for FIFO deferral.
+        }
+      }
+    }
+    return todoistCooldownUntil.get(this.pacingKey);
+  }
+
+  private async paceRequest(): Promise<void> {
+    await this.assertNotCooling();
     const pacing=todoistRequestPacing.get(this.pacingKey);
     if(!pacing||pacing.intervalMs<=0)return;
     const now = Date.now();
     const startsAt = Math.max(now, pacing.nextAt);
     pacing.nextAt = startsAt + pacing.intervalMs;
     const delay = startsAt - now;
-    if (delay > 0) await abortableDelay(delay,this.requestOptions.signal);
+    if (delay > 0) {
+      await abortableDelay(delay,this.requestOptions.signal);
+      // A different worker can receive 429 while this caller is waiting.
+      await this.assertNotCooling();
+    }
   }
 
   private observeRequest(path: string, method: string, retryCount: number, status: number, requestSent: boolean): void {
@@ -930,10 +979,8 @@ export class Todoist {
         }
         if(name==="AbortError"||name==="TimeoutError")throw error;
         if (status === 429) {
-          const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
-          if (Number.isFinite(retryAfterMs) && retryAfterMs > 0)
-            todoistCooldownUntil.set(this.pacingKey, Math.max(todoistCooldownUntil.get(this.pacingKey) || 0, Date.now() + retryAfterMs));
-          observedCooldown = todoistCooldownUntil.get(this.pacingKey);
+          observedCooldown = await this.recordRateLimit(error, requestSent);
+          if (todoistCooldownStore.getStore()) throw error;
         }
         const transient = !status || status === 408 || status === 429 || status >= 500;
         const retryLimit = status === 429 ? rateLimitRetries : readOnly ? readRetries : 0;
@@ -973,10 +1020,8 @@ export class Todoist {
         if (!requestSent) this.observeRequest("/sync", readOnly ? "GET" : "POST", attempt,
           Number((error as { status?: number }).status) || httpStatus, false);
         if (Number((error as { status?: number }).status) === 429) {
-          const retryAfterMs = Number((error as { retryAfterMs?: number }).retryAfterMs);
-          if (Number.isFinite(retryAfterMs) && retryAfterMs > 0)
-            todoistCooldownUntil.set(this.pacingKey, Math.max(todoistCooldownUntil.get(this.pacingKey) || 0, Date.now() + retryAfterMs));
-          observedCooldown = todoistCooldownUntil.get(this.pacingKey);
+          observedCooldown = await this.recordRateLimit(error, requestSent);
+          if (todoistCooldownStore.getStore()) throw error;
         }
         const name = (error as { name?: string })?.name;
         const status = Number((error as { status?: number }).status);

@@ -112,7 +112,18 @@ export function failedDeliveryDisposition(
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
   const safeReplay = isSafeProviderReplay(error);
-  const accountCooldown = fields(error).code === "todoist_account_cooldown";
+  let accountCooldown = false;
+  const seen = new Set<object>();
+  let cause: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && cause && typeof cause === "object"; depth++) {
+    if (seen.has(cause)) break;
+    seen.add(cause);
+    if (fields(cause).code === "todoist_account_cooldown") {
+      accountCooldown = true;
+      break;
+    }
+    cause = fields(cause).cause;
+  }
   const transientDynamoDb = isTransientDynamoDbFailure(error);
   const transientProvider = !transientDynamoDb && (accountCooldown || safeReplay || isTransientProviderFailure(error));
   if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
