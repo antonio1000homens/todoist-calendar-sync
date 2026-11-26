@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { unsupportedCalendarRecurrencePreserved } from "../scripts/production-e2e-assertions.mjs";
+import {
+  uniqueProjectEventMapping,
+  uniqueProjectTaskMapping,
+  uniqueProjectTaskMappingForEvent,
+  unsupportedCalendarRecurrencePreserved,
+} from "../scripts/production-e2e-assertions.mjs";
 
 const rule = "RRULE:FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1";
 const title = "[E2E fixture] Unsupported Calendar recurrence";
@@ -35,4 +40,36 @@ test("unsupported Calendar recurrence acceptance requires the rule and source to
     ...passingState,
     mapping: { taskId: "unexpected-task", masterEventId: "calendar-master" },
   }), false, "provider correlation was created for an unsupported rule");
+});
+
+const mappingEntry = (id, payload) => ({ comment: { id }, payload });
+
+test("live acceptance requires exactly one mapping for a project task and the expected event or master", () => {
+  const current = mappingEntry("comment-current", {
+    projectId: "project-1", taskId: "task-1", eventId: "instance-1", masterEventId: "master-1",
+  });
+  const index = { parsed: [current, mappingEntry("unrelated", {
+    projectId: "project-1", taskId: "task-2", eventId: "other-master",
+  })] };
+  assert.equal(uniqueProjectTaskMapping(index, "project-1", "task-1"), current);
+  assert.equal(uniqueProjectTaskMappingForEvent(index, "project-1", "master-1", "task-1"), current);
+  assert.equal(uniqueProjectTaskMappingForEvent(index, "project-1", "wrong-event", "task-1"), undefined);
+  assert.equal(uniqueProjectEventMapping(index, "project-1", "master-1"), current);
+});
+
+test("live acceptance rejects duplicate mapping comments instead of accepting the first page match", () => {
+  const index = { parsed: [
+    mappingEntry("comment-current", { projectId: "project-1", taskId: "task-1", eventId: "event-1" }),
+    mappingEntry("comment-stale", { projectId: "project-1", taskId: "task-1", eventId: "event-2" }),
+  ] };
+  assert.throws(() => uniqueProjectTaskMapping(index, "project-1", "task-1"), /found 2/);
+  assert.throws(() => uniqueProjectTaskMappingForEvent(index, "project-1", "event-1", "task-1"), /found 2/);
+});
+
+test("live acceptance rejects multiple tasks claiming one Calendar event", () => {
+  const index = { parsed: [
+    mappingEntry("comment-one", { projectId: "project-1", taskId: "task-1", eventId: "event-1" }),
+    mappingEntry("comment-two", { projectId: "project-1", taskId: "task-2", masterEventId: "event-1" }),
+  ] };
+  assert.throws(() => uniqueProjectEventMapping(index, "project-1", "event-1"), /found 2/);
 });
