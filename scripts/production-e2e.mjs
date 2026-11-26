@@ -1253,10 +1253,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().catch(() => {
   console.error(JSON.stringify({
     service: "todoist-calendar-sync-production-e2e", event: "run_failed",
-    stage: lastAcceptanceStage, error: safeFailure(error),
   }));
   process.exitCode = 1;
 });
