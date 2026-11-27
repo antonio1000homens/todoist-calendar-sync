@@ -9,6 +9,9 @@ const projectId = profiles.home.todoistProjectId;
 const receivedAt = "2026-11-10T13:56:00Z";
 const updatedAt = "2026-11-10T13:55:30Z";
 const fixtures = [
+  { name: "Honda annual expiry", phrase: "every June 6", due: "2027-06-06",
+    rrule: "RRULE:FREQ=YEARLY;BYMONTHDAY=6;BYMONTH=6",
+    dates: ["2027-06-06", "2028-06-06", "2029-06-06"] },
   { name: "monthly day list", phrase: "every 2, 15, 27", due: "2027-01-02",
     rrule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27",
     dates: ["2027-01-02", "2027-01-15", "2027-01-27"] },

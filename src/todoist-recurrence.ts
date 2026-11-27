@@ -81,14 +81,12 @@ export function calendarRecurrenceMatchesTodoist(event: {
   const todoistStart = task.due?.datetime || task.due?.date;
   const calendarStart = event.start?.dateTime || event.start?.date;
   const zone = event.start?.timeZone || task.due?.timezone;
-  if (!todoistStart || !calendarStart) return false;
+  if (!todoistStart || !calendarStart || !hasSingleRrule(event.recurrence)) return false;
   const todoist = classifyTodoistRule(key, { start: todoistStart, timeZone: zone }).semantic;
   const dueDate = recurrenceCivilAnchor(todoistStart, zone)?.date;
   if (!todoist || !dueDate || !event.recurrence?.length) return false;
-  const compatible = event.recurrence.some(rule => {
-    const calendar = classifyCalendarRule(rule, { start: calendarStart, timeZone: zone }).semantic;
-    return Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate));
-  });
+  const calendar = classifyCalendarRule(event.recurrence![0], { start: calendarStart, timeZone: zone }).semantic;
+  const compatible = Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate));
   return compatible && (!event.extendedProperties?.shared?.todoistRecurrence
     || event.extendedProperties.shared.todoistRecurrence === key);
 }
@@ -100,14 +98,19 @@ export function calendarRuleMatches(event: {
   start?: { date?: string; dateTime?: string; timeZone?: string };
 }, expectedRule: string): boolean {
   const start = event.start?.dateTime || event.start?.date;
-  if (!start || !event.recurrence?.length) return false;
+  if (!start || !hasSingleRrule(event.recurrence)) return false;
   const context = { start, timeZone: event.start?.timeZone };
   const expected = classifyCalendarRule(expectedRule, context).semantic;
   if (!expected) return false;
-  return event.recurrence.some((rule) => {
-    const actual = classifyCalendarRule(rule, context).semantic;
-    return Boolean(actual && compareOccurrenceSemantics(expected, actual).equivalent);
-  });
+  const actual = classifyCalendarRule(event.recurrence![0], context).semantic;
+  return Boolean(actual && compareOccurrenceSemantics(expected, actual).equivalent);
+}
+
+/** Google stores a series schedule as recurrence components. A rule match is
+ * only sufficient when the entire stored schedule consists of that one RRULE;
+ * RDATE/EXDATE/EXRULE or extra RRULE components need explicit handling. */
+function hasSingleRrule(recurrence: string[] | undefined): recurrence is [string] {
+  return Boolean(recurrence?.length === 1 && /^RRULE:/i.test(recurrence[0].trim()));
 }
 
 /** Immutable logical identity for a Google recurring instance. */

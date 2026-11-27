@@ -1769,9 +1769,13 @@ export class ManualInterventionService {
     const recurrenceConflictAudit = action === "calendar_snapshot_recurring_identity_conflict"
       || action === "calendar_recurrence_rule_edit_identity_unverified"
       || action === "calendar_recurrence_rule_edit_readback_mismatch"
+      || action === "calendar_recurrence_todoist_readback_mismatch"
+      || action === "calendar_provider_pair_ambiguous"
       || action === "calendar_owned_metadata_conflict";
     if (recurrenceConflictAudit) type = "calendar_recurrence_conflict";
-    if (action === "todoist_project_recurrence_unsupported") type = "unsupported_recurrence";
+    if (action === "todoist_project_recurrence_unsupported"
+      || action === "todoist_recurrence_unsupported_rule" && detail.nonBlocking !== true)
+      type = "unsupported_recurrence";
     // Provider ambiguity and stale/conflicting snapshots are diagnostics, not
     // human approval requests. Keep the objects untouched and let the next
     // reconciliation take fresh provider reads; unrelated objects continue.
@@ -2647,6 +2651,7 @@ export class ManualInterventionService {
       || mapping.calendarId !== profiles[decision.profile].calendarId
       || mapping.taskId !== decision.taskId || mapping.masterEventId !== decision.masterEventId
       || mapping.eventId !== decision.eventId && mapping.eventId !== decision.masterEventId
+        && mapping.eventId !== decision.activeInstanceId
       || mapping.activeInstanceId !== decision.activeInstanceId
       || mapping.seriesId !== decision.seriesId && mapping.seriesId !== decision.taskId)
       return this.markStale(decision, "The provider mapping changed after this review was created.", slackUserId);

@@ -707,7 +707,7 @@ test('recurring Calendar identity ambiguity opens a review case without repair a
   const result = await service.observeAudit(
     { ...todoistDeleteDelivery(), kind: 'reconcile', id: 'reconcile-calendar-only' },
     'antonio',
-    'calendar_snapshot_recurring_identity_conflict',
+    'calendar_provider_pair_ambiguous',
     { eventId: 'series-event', seriesId: 'series-1', candidateTaskIds: ['task-a', 'task-b'] },
   );
 
@@ -730,7 +730,7 @@ test('unsupported recurrence projection opens a Todoist-only review decision', a
     calendar: {},
   }), new FakePolicyStore());
   const delivery = { ...todoistDeleteDelivery(), kind: 'todoist', id: 'unsupported-recurrence' };
-  const observed = await service.observeAudit(delivery, 'antonio', 'todoist_project_recurrence_unsupported', {
+  const observed = await service.observeAudit(delivery, 'antonio', 'todoist_recurrence_unsupported_rule', {
     taskId: task.id, outcome: 'source_left_unchanged', existingMirrorPreserved: false,
   });
 
@@ -747,6 +747,15 @@ test('unsupported recurrence projection opens a Todoist-only review decision', a
   }, { async syncBlocked() { return false; } });
   assert.equal(decisions.decisions.get(notifier.posted[0].decisionId).status, 'resolved');
   assert.equal(providerWrites, 0);
+});
+
+test('benign unsupported recurrence telemetry does not open an intervention case', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const service = new ManualInterventionService(new FakeDecisionStore(), new FakeNotifier(), async () => ({}), new FakePolicyStore());
+  const result = await service.observeAudit(todoistDeleteDelivery(), 'antonio', 'todoist_recurrence_unsupported_rule', {
+    taskId: 'task-unsupported', outcome: 'source_left_unchanged', nonBlocking: true,
+  });
+  assert.equal(result.caseStatus, 'not_actionable');
 });
 
 test('reconciliation actions cannot be saved as automatic policies', async () => {

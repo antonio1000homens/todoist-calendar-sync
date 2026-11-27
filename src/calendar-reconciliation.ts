@@ -22,7 +22,7 @@ import {
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedDescription, normalizedText } from "./security.js";
-import { providerSyncBaseline } from "./provider-sync-baseline.js";
+import { providerRecurrenceChanges, providerSyncBaseline } from "./provider-sync-baseline.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, startsMatch, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
@@ -578,10 +578,12 @@ export async function reconcileUnmappedCalendar(
         if (!matchesCalendarOwnedRecurringRule(currentTask, recurrence, seriesTimeZone)) {
           const baseline = existingMapping.syncBaseline;
           const observed = providerSyncBaseline(currentTask, active, master);
+          const recurrenceChanges = providerRecurrenceChanges(currentTask, master, baseline);
           const competing = recurringTaskIdentityCandidates(active, tasks).filter(id => id !== currentTask.id);
-          if (!baseline?.todoist.due || !baseline.todoist.recurrence
+          if (!baseline?.todoist.due || !baseline.todoist.recurrence || !recurrenceChanges
+            || recurrenceChanges.todoistChanged
             || observed.todoist.due !== baseline.todoist.due
-            || observed.todoist.recurrence !== baseline.todoist.recurrence || competing.length) {
+            || competing.length) {
             summary.conflicts += 1;
             await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
               seriesId, masterEventId: master.id, eventId: active.id,
@@ -594,9 +596,10 @@ export async function reconcileUnmappedCalendar(
           if (!await canMutate(master.id, currentTask.id)) return;
           const liveTask = await pair.todoist.getTask(currentTask.id);
           const liveObserved = providerSyncBaseline(liveTask, active, master);
+          const liveRecurrenceChanges = providerRecurrenceChanges(liveTask, master, baseline);
           if (liveTask.updated_at !== currentTask.updated_at
             || liveObserved.todoist.due !== observed.todoist.due
-            || liveObserved.todoist.recurrence !== observed.todoist.recurrence) {
+            || !liveRecurrenceChanges || liveRecurrenceChanges.todoistChanged) {
             summary.conflicts += 1;
             await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
               seriesId, masterEventId: master.id, eventId: active.id,

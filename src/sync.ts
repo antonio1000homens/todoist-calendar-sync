@@ -3150,13 +3150,14 @@ export class Synchronizer {
       }
       const baseline = providerMapping?.syncBaseline;
       const observed = providerSyncBaseline(task, active, master);
-      // A stale due anchor needs independent baseline proof before Calendar
-      // can repair it. For the established exact-current-occurrence rule-edit
-      // path, keep its prior behavior: the verified active occurrence itself
-      // is the anchor and only the recurrence grammar changed.
-      if (!startsMatch(active, task) && (!baseline?.todoist.due || !baseline.todoist.recurrence
-        || observed.todoist.due !== baseline.todoist.due
-        || observed.todoist.recurrence !== baseline.todoist.recurrence)) {
+      const recurrenceChanges = providerRecurrenceChanges(task, master, baseline);
+      // Recurrence authority is a field-level comparison: Todoist must still
+      // match the shared baseline while Calendar alone changed. Due alignment
+      // only relaxes the separate due-anchor check for the active occurrence.
+      if (!baseline?.todoist.recurrence || !recurrenceChanges
+        || recurrenceChanges.todoistChanged || !recurrenceChanges.calendarChanged
+        || !startsMatch(active, task) && (!baseline.todoist.due
+          || observed.todoist.due !== baseline.todoist.due)) {
         await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
           seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
           reason: "todoist_recurrence_changed_since_verified_baseline",
@@ -3171,9 +3172,10 @@ export class Synchronizer {
       }
       const priorTask = task;
       const liveTask = await todoist.getTask(task.id);
+      const liveChanges = providerRecurrenceChanges(liveTask, master, baseline);
       if (liveTask.updated_at !== priorTask.updated_at
         || providerSyncBaseline(liveTask, active, master).todoist.due !== observed.todoist.due
-        || providerSyncBaseline(liveTask, active, master).todoist.recurrence !== observed.todoist.recurrence) {
+        || !liveChanges || liveChanges.todoistChanged) {
         await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
           seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
           reason: "todoist_recurrence_changed_before_guarded_repair",
@@ -4171,7 +4173,7 @@ export class Synchronizer {
       if (current?.due?.is_recurring && !todoistRecurrenceToRrule(current) && !hasVerifiedPhaseBNativeMaster) {
         return this.state.audit(delivery.profile, "todoist_recurrence_unsupported_rule", {
           taskId: task.id, eventId: mapping.eventId,
-          existingMirrorPreserved: true, outcome: "source_left_unchanged",
+          existingMirrorPreserved: true, outcome: "source_left_unchanged", nonBlocking: true,
         });
       }
       if (current?.due?.is_recurring && (todoistRecurrenceToRrule(current) || hasVerifiedPhaseBNativeMaster)
@@ -4935,7 +4937,7 @@ export class Synchronizer {
     if (task.due?.is_recurring && !todoistRecurrenceToRrule(task)) {
       return this.state.audit(delivery.profile, "todoist_recurrence_unsupported_rule", {
         taskId: task.id, eventId: existingEvent?.id || mapping?.eventId,
-        existingMirrorPreserved: Boolean(existingEvent), outcome: "source_left_unchanged",
+        existingMirrorPreserved: Boolean(existingEvent), outcome: "source_left_unchanged", nonBlocking: true,
       });
     }
     // Even when provider mapping correlation is missing, the Calendar master
