@@ -57,6 +57,47 @@ export interface RecurrenceContext {
   evidence?: Partial<RecurrenceEvidence>;
 }
 
+export interface TodoistStartBoundary {
+  expression: string;
+  hasBoundary: boolean;
+  startDate?: string;
+  startMonthDay?: string;
+  invalid: boolean;
+}
+
+const monthNumbers = new Map("january february march april may june july august september october november december"
+  .split(" ").flatMap((name, index) => [[name, index + 1], [name.slice(0, 3), index + 1] as const]));
+monthNumbers.set("sept", 9);
+
+/** Parse a Todoist projection boundary once for translation, comparison and baselines. */
+export function parseTodoistStartBoundary(value: string): TodoistStartBoundary {
+  const match = /^(.*?)\s+starting(?:\s+on)?\s+(.+?)(?=\s+and\s+ending\b|$)(?:\s+and\s+ending\b.*)?$/i.exec(value.trim());
+  if (!match) return { expression: value, hasBoundary: false, invalid: false };
+  const suffix = match[2].trim().replace(/,/g, "").replace(/(\d)(?:st|nd|rd|th)\b/gi, "$1");
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(suffix);
+  const dayFirst = /^(\d{1,2})\s+([a-z]+)(?:\s+(\d{4}))?$/i.exec(suffix);
+  const monthFirst = /^([a-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$/i.exec(suffix);
+  let date: string | undefined;
+  let monthDay: string | undefined;
+  if (iso) date = iso[1] + "-" + iso[2] + "-" + iso[3];
+  else {
+    const named = dayFirst || monthFirst;
+    if (named) {
+      const monthName = (dayFirst ? named[2] : named[1]).toLowerCase().replace(/\.$/, "");
+      const month = monthNumbers.get(monthName);
+      const dayText = dayFirst ? named[1] : named[2];
+      const yearText = named[3];
+      if (month && !yearText && Number(dayText) >= 1 && Number(dayText) <= 31)
+        monthDay = String(month).padStart(2, "0") + "-" + String(Number(dayText)).padStart(2, "0");
+      else if (month && yearText && Number(dayText) >= 1 && Number(dayText) <= 31)
+        date = yearText + "-" + String(month).padStart(2, "0") + "-" + String(Number(dayText)).padStart(2, "0");
+    }
+  }
+  if (monthDay) return { expression: match[1], hasBoundary: true, startMonthDay: monthDay, invalid: false };
+  if (!date || !validDate(date)) return { expression: match[1], hasBoundary: true, invalid: true };
+  return { expression: match[1], hasBoundary: true, startDate: date, invalid: false };
+}
+
 const days = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
 const dayNames: Record<string, string> = {
   mon:"MO", monday:"MO", tue:"TU", tues:"TU", tuesday:"TU",
@@ -464,6 +505,24 @@ export function recurrenceIncludesDate(rule: RecurrenceSemantics, iso: string): 
     ? rule.byMonth.includes(date.getUTCMonth()+1) : date.getUTCMonth()===start.getUTCMonth())) return false;
   if (rule.byDay?.length && rule.frequency !== "WEEKLY" && rule.frequency !== "MONTHLY") return false;
   return true;
+}
+
+/** Validate an explicit Todoist start against the canonical RRULE phase and current due. */
+export function recurrenceStartBoundaryMatches(
+  boundary: TodoistStartBoundary, rule: RecurrenceSemantics, dueDate: string,
+): boolean {
+  if (boundary.invalid) return false;
+  if (!boundary.hasBoundary) return true;
+  if (boundary.startDate)
+    return boundary.startDate <= dueDate && recurrenceIncludesDate(rule, boundary.startDate);
+  if (!boundary.startMonthDay) return false;
+  const firstYear = Number(rule.startDate.slice(0, 4));
+  const lastYear = Number(dueDate.slice(0, 4));
+  for (let year = firstYear; year <= lastYear; year++) {
+    const candidate = String(year) + "-" + boundary.startMonthDay;
+    if (candidate <= dueDate && recurrenceIncludesDate(rule, candidate)) return true;
+  }
+  return false;
 }
 
 /** Compare the rule shapes while proving that Todoist's current due is an

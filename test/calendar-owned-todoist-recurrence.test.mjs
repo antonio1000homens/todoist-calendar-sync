@@ -72,6 +72,25 @@ test("all-day finite weekly recurrence preserves date-only Todoist due values", 
   }, schedule[0], recurrence), true);
 });
 
+test("historical finite weekly projection preserves its remaining inclusive end bound", () => {
+  const master = { id: "finite-historical", status: "confirmed", summary: "Weekly task",
+    start: { date: "2099-09-02" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"] };
+  const schedule = [2, 9, 16, 23].map((day, index) => ({
+    id: "finite-historical-" + index, recurringEventId: master.id, status: "confirmed",
+    originalStartTime: { date: `2099-09-${String(day).padStart(2, "0")}` },
+    start: { date: `2099-09-${String(day).padStart(2, "0")}` },
+  }));
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  const payload = calendarOwnedRecurringTaskPayload(schedule[1], recurrence, "Europe/London");
+  assert.equal(payload.due.date, "2099-09-09");
+  assert.equal(payload.due.string, "every Wednesday starting 9 Sep 2099 and ending 23 Sep 2099");
+  const task = { id: "finite-projection", ...payload };
+  assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[1], recurrence, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringTask({ ...task, due: { ...task.due, date: "2099-09-02" } },
+    schedule[1], recurrence, "Europe/London"), false);
+  assert.equal(recurrence.semantic.startDate, "2099-09-02");
+});
+
 test("unsupported or incomplete finite weekly recurrence inventories fail closed", () => {
   const master = weeklyMaster("2026-11-04T14:00:00Z", "RRULE:FREQ=DAILY;COUNT=4");
   const schedule = instances(["2026-11-04T14:00:00Z"]);

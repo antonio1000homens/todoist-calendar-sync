@@ -34,3 +34,27 @@ test("historical v1 recurrence baseline uses its original Todoist text and Calen
     todoistChanged: true, calendarChanged: false,
   });
 });
+
+test("projection boundaries normalize with Calendar cadence and preserve old v2 baselines", () => {
+  const master = { id: "historical-master", start: { date: "2026-01-01" },
+    recurrence: ["RRULE:FREQ=YEARLY"] };
+  const task = { id: "projected", due: { date: "2027-01-01", is_recurring: true,
+    string: "every 1 Jan starting 1 Jan 2027" } };
+  const baseline = providerSyncBaseline(task, master, master);
+  for (const phrase of ["every January 1 starting 2027-01-01", "every Jan 1", "every 1 January starting 1 Jan"]) {
+    assert.deepEqual(providerRecurrenceChanges({ ...task, due: { ...task.due, string: phrase } }, master, baseline), {
+      todoistChanged: false, calendarChanged: false,
+    }, phrase);
+  }
+  assert.deepEqual(providerRecurrenceChanges({ ...task,
+    due: { ...task.due, string: "every 1 Jan starting 2 Jan 2027" } }, master, baseline), {
+    todoistChanged: true, calendarChanged: false,
+  }, "an off-phase explicit boundary is never normalized away");
+
+  const oldV2 = structuredClone(baseline);
+  oldV2.todoist.recurrence = sha256(JSON.stringify("every 1 jan starting 1 jan 2027"));
+  assert.deepEqual(providerRecurrenceChanges({ ...task,
+    due: { ...task.due, string: "every January 1 starting 2027-01-01" } }, master, oldV2), {
+    todoistChanged: false, calendarChanged: false,
+  }, "a prior v2 raw-text hash migrates when current state proves the Calendar cadence");
+});
