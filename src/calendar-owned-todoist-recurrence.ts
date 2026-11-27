@@ -527,7 +527,11 @@ function openRuleMatches(
   const parsed = parseOpenTodoistRule(task.due?.string, task, verifiedTimeZone);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
-  const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
+  // DTSTART is the immutable Calendar cadence anchor. A provider may retain
+  // a later, explicitly projected start after a historical series is first
+  // mirrored. Validate that start independently instead of demanding equality
+  // with the master date. Never accept a future or off-phase explicit start.
+  const originalStartMatches = Boolean(expectedStart && anchor && anchor.day === expectedStart.day
     && anchor.month === expectedStart.month && (!anchor.year || anchor.year === expectedStart.year));
   const due = occurrence?.originalStartTime?.dateTime || occurrence?.originalStartTime?.date
     || occurrence?.start?.dateTime || occurrence?.start?.date
@@ -553,6 +557,18 @@ function openRuleMatches(
   }
   const expectedCadenceDate = Boolean(currentDay && recurrence.semantic
     && recurrenceIncludesDate(recurrence.semantic, currentDay));
+  const projectedStartMatches = Boolean(anchor && recurrence.semantic && currentDay && (() => {
+    // A yearless provider normalization can refer to a prior eligible
+    // occurrence, so try the bounded range between original and active years.
+    const first = anchor.year || Number(recurrence.semantic!.startDate.slice(0, 4));
+    const last = anchor.year || Number(currentDay!.slice(0, 4));
+    for (let year = first; year <= last; year++) {
+      const candidate = formatParsedDate({ ...anchor, year });
+      if (candidate <= currentDay! && recurrenceIncludesDate(recurrence.semantic!, candidate)) return true;
+    }
+    return false;
+  })());
+  const correctStart = !anchor || originalStartMatches || projectedStartMatches;
   // Provider due time and zone are semantic readback, not just phrase text.
   const zoneMatches = !task.due?.timezone || task.due.timezone === verifiedTimeZone;
   const dueValue = task.due?.datetime || task.due?.date;
@@ -726,6 +742,34 @@ export function calendarOwnedTodoistRecurrence(
   return { dueString, endDate, weekday, rule };
 }
 
+/**
+ * Todoist's starting clause takes precedence over the structured due date.
+ * Re-anchor an open native projection only at an independently verified,
+ * unmodified occurrence of the original RRULE. Keep the master semantic
+ * anchor untouched for reverse sync, completion and readback.
+ */
+function projectionDueString(
+  event: CalendarEvent,
+  recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
+): string {
+  const semantic = recurrence.semantic;
+  const original = event.originalStartTime?.dateTime || event.originalStartTime?.date;
+  const effective = event.start?.dateTime || event.start?.date;
+  const zone = verifiedTimeZone || semantic?.timeZone;
+  if (!semantic || semantic.count || semantic.until || !original || !effective
+    || (original.includes("T") && !zone)) return recurrence.dueString;
+  const anchor = recurrenceCivilAnchor(original, zone);
+  const active = recurrenceCivilAnchor(effective, zone);
+  if (!anchor || !active || anchor.date !== active.date || anchor.time !== active.time
+    || anchor.time !== semantic.localTime || anchor.date <= semantic.startDate
+    || !recurrenceIncludesDate(semantic, anchor.date)) return recurrence.dueString;
+  // Only rewrite the generated boundary clause of an already supported
+  // unbounded schedule; no change to the recurrence selector or interval.
+  return recurrence.dueString.replace(/\s+starting(?:\s+on)?\s+.+$/i,
+    " starting " + localDate(original, zone || "UTC"));
+}
+
 export function calendarOwnedRecurringTaskPayload(
   event: CalendarEvent,
   recurrence: CalendarOwnedTodoistRecurrence,
@@ -738,7 +782,7 @@ export function calendarOwnedRecurringTaskPayload(
     due: {
       ...(start.dateTime ? { datetime: start.dateTime, ...(verifiedTimeZone || start.timeZone ? { timezone: verifiedTimeZone || start.timeZone } : {}) } : {}),
       ...(start.date ? { date: start.date } : {}),
-      string: recurrence.dueString,
+      string: projectionDueString(event, recurrence, verifiedTimeZone),
       lang: "en",
       is_recurring: true,
     },
