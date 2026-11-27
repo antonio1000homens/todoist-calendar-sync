@@ -777,6 +777,10 @@ test("historical projection boundary preserves the mapped Calendar DTSTART in re
     string: "every year starting 1 Jan 2027", is_recurring: true } };
   assert.equal(todoistRecurrenceToRrule(task, { start: master.start.date, timeZone: "Europe/London" }), "RRULE:FREQ=YEARLY");
   assert.equal(calendarRecurrenceMatchesTodoist(master, task), true);
+  const normalized = { ...task, due: { ...task.due, date: "2028-01-01", string: "every year starting 1 Jan" } };
+  assert.equal(todoistRecurrenceToRrule(normalized, { start: master.start.date, timeZone: "Europe/London" }), "RRULE:FREQ=YEARLY");
+  assert.equal(calendarRecurrenceMatchesTodoist(master, normalized), true,
+    "yearless provider normalization can still be checked against the historical Calendar phase");
   const offPhase = { ...task, due: { ...task.due, string: "every year starting 2 Jan 2027" } };
   assert.equal(todoistRecurrenceToRrule(offPhase, { start: master.start.date, timeZone: "Europe/London" }), undefined);
   assert.equal(calendarRecurrenceMatchesTodoist(master, offPhase), false);

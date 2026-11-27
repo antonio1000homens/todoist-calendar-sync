@@ -35,17 +35,22 @@ export function todoistRecurrenceKey(task: TodoistTask): string | undefined {
 const recurrenceMonths = new Map("january february march april may june july august september october november december"
   .split(" ").flatMap((name, index) => [[name, index + 1], [name.slice(0, 3), index + 1] as const]));
 
-function recurrenceStartClause(value: string): { expression: string; startDate?: string; invalid: boolean } {
+function recurrenceStartClause(value: string): { expression: string; startDate?: string; startMonthDay?: string; invalid: boolean } {
   const match = /^(.*?)\s+starting(?:\s+on)?\s+(.+)$/i.exec(value.trim());
   if (!match) return { expression: value, invalid: false };
   const suffix = match[2].trim().replace(/,/g, "").replace(/(\d)(?:st|nd|rd|th)\b/gi, "$1");
   let date: string | undefined;
   const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(suffix);
-  const named = /^(\d{1,2})\s+([a-z]+)\s+(\d{4})$/i.exec(suffix);
+  const named = /^(\d{1,2})\s+([a-z]+)(?:\s+(\d{4}))?$/i.exec(suffix);
   if (iso) date = `${iso[1]}-${iso[2]}-${iso[3]}`;
   else if (named) {
     const month = recurrenceMonths.get(named[2].toLowerCase().replace(/\.$/, ""));
-    if (month) date = `${named[3]}-${String(month).padStart(2, "0")}-${named[1].padStart(2, "0")}`;
+    if (month && !named[3]) {
+      const day = Number(named[1]);
+      if (day >= 1 && day <= 31) return { expression: match[1],
+        startMonthDay: `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`, invalid: false };
+    }
+    if (month && named[3]) date = `${named[3]}-${String(month).padStart(2, "0")}-${named[1].padStart(2, "0")}`;
   }
   if (!date) return { expression: match[1], invalid: true };
   const [year, month, day] = date.split("-").map(Number);
@@ -83,10 +88,23 @@ export function todoistRecurrenceToRrule(task: TodoistTask, anchor?: { start: st
   // provider anchor and a parseable, non-bounded rule can become an RRULE.
   const context = anchor || { start, timeZone: task.due?.timezone };
   const classified = classifyTodoistRule(key, context);
-  if (projection.startDate && (!anchor || !classified.semantic)) return undefined;
+  if ((projection.startDate || projection.startMonthDay) && (!anchor || !classified.semantic)) return undefined;
   if (projection.startDate && anchor) {
     const dueDate = recurrenceCivilAnchor(start, anchor.timeZone || task.due?.timezone)?.date;
     if (!dueDate || projection.startDate > dueDate || !recurrenceIncludesDate(classified.semantic!, projection.startDate)) return undefined;
+  }
+  if (projection.startMonthDay && anchor) {
+    const dueDate = recurrenceCivilAnchor(start, anchor.timeZone || task.due?.timezone)?.date;
+    const anchorDate = recurrenceCivilAnchor(anchor.start, anchor.timeZone)?.date;
+    const throughYear = Number(dueDate?.slice(0, 4));
+    if (!anchorDate || !dueDate) return undefined;
+    const fromYear = Number(anchorDate.slice(0, 4));
+    let validProjection = false;
+    for (let year = fromYear; year <= throughYear; year++) {
+      const candidate = `${year}-${projection.startMonthDay}`;
+      if (candidate <= dueDate && recurrenceIncludesDate(classified.semantic!, candidate)) validProjection = true;
+    }
+    if (!validProjection) return undefined;
   }
   if (!anchor && classified.semantic?.localTime) {
     const dueAnchor = recurrenceCivilAnchor(start, task.due?.timezone);
@@ -119,8 +137,18 @@ export function calendarRecurrenceMatchesTodoist(event: {
   const dueDate = recurrenceCivilAnchor(todoistStart, zone)?.date;
   if (!todoist || !dueDate || !event.recurrence?.length) return false;
   const calendar = classifyCalendarRule(event.recurrence![0], { start: calendarStart, timeZone: zone }).semantic;
+  let projectedStartMatches = !key.startDate && !key.startMonthDay;
+  if (calendar && key.startDate) projectedStartMatches = key.startDate <= dueDate && recurrenceIncludesDate(calendar, key.startDate);
+  if (calendar && key.startMonthDay) {
+    const fromYear = Number(calendar.startDate.slice(0, 4));
+    const throughYear = Number(dueDate.slice(0, 4));
+    for (let year = fromYear; year <= throughYear; year++) {
+      const candidate = `${year}-${key.startMonthDay}`;
+      if (candidate <= dueDate && recurrenceIncludesDate(calendar, candidate)) projectedStartMatches = true;
+    }
+  }
   const compatible = Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate)
-    && (!key.startDate || key.startDate <= dueDate && recurrenceIncludesDate(calendar, key.startDate)));
+    && projectedStartMatches);
   return compatible && (!event.extendedProperties?.shared?.todoistRecurrence
     || event.extendedProperties.shared.todoistRecurrence === rawKey);
 }
