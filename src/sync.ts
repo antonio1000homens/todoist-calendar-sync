@@ -3128,12 +3128,13 @@ export class Synchronizer {
       && existing?.taskId === task.id && existing.masterEventId === master.id
       && (existing.seriesId === seriesId
         || existing.seriesId === task.id)
-      && startsMatch(active, task)
       && !conflictingIds.length
       && !matchesCalendarOwnedRecurringRule(task, calendarRecurrence, calendarTimeZone));
     if (exactCalendarRuleEdit && task) {
       const providerMapping = await this.providerMappingByTask(delivery.profile, task.id, todoist);
       const linkVerified = providerMapping?.profile === delivery.profile
+        && providerMapping.projectId === profiles[delivery.profile].todoistProjectId
+        && providerMapping.calendarId === profiles[delivery.profile].calendarId
         && providerMapping.taskId === task.id
         && (providerMapping.seriesId === seriesId
           || isTodoistNativeSeries(providerMapping) && providerMapping.seriesId === task.id)
@@ -3145,6 +3146,21 @@ export class Synchronizer {
         });
         return "blocked";
       }
+      // A rule mismatch is repairable only when the exact mapped task's due
+      // and recurrence still match the last mutually observed Todoist state.
+      // This lets a stale Calendar-owned anchor be repaired in place while
+      // refusing to overwrite an independent/newer Todoist schedule edit.
+      const baseline = providerMapping?.syncBaseline;
+      const observed = providerSyncBaseline(task, active, master);
+      if (!baseline?.todoist.due || !baseline.todoist.recurrence
+        || observed.todoist.due !== baseline.todoist.due
+        || observed.todoist.recurrence !== baseline.todoist.recurrence) {
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "todoist_recurrence_changed_since_verified_baseline",
+        });
+        return "blocked";
+      }
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
         await this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_suppressed", {
           seriesId, masterEventId: master.id, taskId: task.id, mode: delivery.mode,
@@ -3152,6 +3168,16 @@ export class Synchronizer {
         return "blocked";
       }
       const priorTask = task;
+      const liveTask = await todoist.getTask(task.id);
+      if (liveTask.updated_at !== priorTask.updated_at
+        || providerSyncBaseline(liveTask, active, master).todoist.due !== observed.todoist.due
+        || providerSyncBaseline(liveTask, active, master).todoist.recurrence !== observed.todoist.recurrence) {
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "todoist_recurrence_changed_before_guarded_repair",
+        });
+        return "blocked";
+      }
       const updated = await todoist.upsertTask(
         calendarOwnedRecurringTaskPayload(active, calendarRecurrence!, calendarTimeZone), task.id,
       );
