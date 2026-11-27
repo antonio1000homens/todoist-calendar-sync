@@ -515,6 +515,69 @@ test("snapshot recovery imports an all-day finite recurrence using the verified 
   assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"), false);
 });
 
+test("snapshot recovery projects a historical annual master from its next eligible occurrence", async () => {
+  const master = {
+    id: "historical-annual-master", iCalUID: "historical-annual-series", status: "confirmed",
+    summary: "Annual review", description: "Keep the original series history",
+    start: { date: "2026-01-01" }, end: { date: "2026-01-02" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  };
+  const dates = ["2026-01-01", "2027-01-01", "2028-01-01", "2029-01-01", "2030-01-01"];
+  const occurrences = dates.map((date, index) => ({
+    id: `historical-annual-${index}`, status: "confirmed", recurringEventId: master.id,
+    originalStartTime: { date }, start: { date }, end: { date: `${date.slice(0, 4)}-01-02` },
+  }));
+  const state = fakeState();
+  const tasks = [];
+  const clients = {
+    calendar: {
+      async listDelta() { return { items: [master] }; },
+      async listInstancesInWindow() { return occurrences; },
+      async listExplicitSeriesExceptions() { return []; },
+      async getTimeZone() { return "Europe/London"; },
+    },
+    todoist: {
+      async listProjectComments() { return []; },
+      async listTasks() { return tasks.map((task) => structuredClone(task)); },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask(payload) {
+        // Model Todoist honoring the explicit recurrence start, independently
+        // of the structured due value included in the create request.
+        const starting = payload.due.string.match(/\bstarting\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})$/);
+        assert.ok(starting, payload.due.string);
+        const month = new Map([["Jan", "01"], ["Feb", "02"], ["Mar", "03"], ["Apr", "04"], ["May", "05"], ["Jun", "06"],
+          ["Jul", "07"], ["Aug", "08"], ["Sep", "09"], ["Oct", "10"], ["Nov", "11"], ["Dec", "12"]]).get(starting[2]);
+        const providerDue = `${starting[3]}-${month}-${starting[1].padStart(2, "0")}`;
+        const task = { id: "historical-annual-task", ...structuredClone(payload),
+          due: { ...structuredClone(payload.due), date: providerDue } };
+        tasks.push(task);
+        return structuredClone(task);
+      },
+      async deleteTask(id) { const index = tasks.findIndex((task) => task.id === id); if (index >= 0) tasks.splice(index, 1); },
+      async findComment() { return undefined; },
+      async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-11-27T12:00:00Z");
+  try {
+    const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(summary.imported, 1);
+    assert.equal(summary.conflicts, 0);
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].due.date, "2027-01-01");
+  assert.equal(tasks[0].due.is_recurring, true);
+  assert.match(tasks[0].due.string, /starting 1 Jan 2027$/);
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].eventId, master.id);
+  assert.equal(state.mappings[0].activeInstanceId, "historical-annual-1");
+  assert.equal(state.mappings[0].originalStart, "2027-01-01");
+  assert.equal(state.completedProjections.length, 0, "the historical occurrence is not fabricated as a completion");
+  assert.equal(master.start.date, "2026-01-01", "the Calendar DTSTART remains unchanged");
+});
+
 test("all-day recurrence timezone mismatch fails closed before Todoist or mapping writes", async () => {
   const master = {
     id: "all-day-master", iCalUID: "all-day-series", status: "confirmed", summary: "All-day task", description: "",

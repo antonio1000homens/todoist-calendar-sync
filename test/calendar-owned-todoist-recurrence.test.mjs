@@ -127,6 +127,34 @@ test("daily Calendar rules, including intervals, map to equivalent Todoist recur
   }
 });
 
+test("historical weekly, monthly, and yearly interval rules project from an active date without resetting phase", () => {
+  const cases = [
+    { rule: "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO", dates: ["2026-11-02", "2026-11-16", "2026-11-30", "2026-12-14"], phrase: "every other mon starting 16 Nov 2026" },
+    { rule: "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15", dates: ["2026-01-15", "2026-04-15", "2026-07-15", "2026-10-15"], phrase: "every 3 months starting 15 Apr 2026" },
+    { rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=1", dates: ["2023-01-01", "2025-01-01", "2027-01-01", "2029-01-01"], phrase: "every 2 years starting 1 Jan 2025" },
+  ];
+  for (const example of cases) {
+    const master = { id: "interval-master", start: { date: example.dates[0] }, recurrence: [example.rule] };
+    const schedule = example.dates.map((date, index) => ({ id: `interval-${index}`, recurringEventId: master.id,
+      status: "confirmed", originalStartTime: { date }, start: { date } }));
+    assert.equal(nativeCalendarRecurrenceCandidate(master), true, example.rule);
+    const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+    assert.ok(recurrence, example.rule);
+    const active = schedule[1];
+    const payload = calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London");
+    assert.equal(payload.due.string, example.phrase);
+    const task = { id: "interval-task", ...payload };
+    assert.equal(matchesCalendarOwnedRecurringTask(task, active, recurrence, "Europe/London"), true,
+      `${example.rule}: ${JSON.stringify(calendarOwnedRecurringTaskReadback(task, active, recurrence, "Europe/London"))}`);
+    for (const occurrence of schedule.slice(1)) {
+      const advanced = { ...task, due: { ...task.due, date: occurrence.start.date } };
+      assert.equal(matchesCalendarOwnedRecurringTask(advanced, occurrence, recurrence, "Europe/London"), true,
+        `${example.rule} at ${occurrence.start.date}`);
+    }
+    assert.equal(recurrence.semantic.startDate, example.dates[0], "the immutable RRULE anchor remains unchanged");
+  }
+});
+
 test("all-day native rules and Todoist's normalized no-start recurrence remain valid", () => {
   const shapes = [
     { date: "2099-09-02", rule: "RRULE:FREQ=WEEKLY", normalized: "every Wednesday" },
@@ -195,7 +223,6 @@ test("complex or finite non-weekly Calendar recurrences are never silently appro
     ["2026-11-15", "RRULE:FREQ=MONTHLY;UNTIL=20271231"],
     ["2028-02-29", "RRULE:FREQ=YEARLY"],
     ["2026-11-04", "RRULE:FREQ=WEEKLY;BYDAY=WE,FR"],
-    ["2026-11-04", "RRULE:FREQ=WEEKLY;INTERVAL=2"],
     ["2026-11-04", "RRULE:FREQ=WEEKLY;BYSETPOS=1"],
     ["2026-11-15", "RRULE:FREQ=MONTHLY;BYDAY=3SU"],
   ];

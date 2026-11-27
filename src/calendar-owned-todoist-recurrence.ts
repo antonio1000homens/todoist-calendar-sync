@@ -336,8 +336,8 @@ export function nativeCalendarRecurrenceCandidate(master: CalendarEvent, verifie
   }).semantic;
   if (!semantic || semantic.count || semantic.until) return false;
   if (semantic.frequency === "DAILY") return semantic.interval <= 999;
-  if (semantic.interval !== 1) return false;
   if (semantic.frequency === "WEEKLY") return !semantic.byMonthDay && !semantic.byMonth
+    && (semantic.interval === 1 || !semantic.byDay || semantic.byDay.length === 1)
     && !semantic.byDay?.some((day) => day.length > 2);
   if (semantic.frequency === "MONTHLY") return !semantic.byMonth && (
     semantic.byDay?.length === 1 && /^(?:-1|[1-5])(?:MO|TU|WE|TH|FR)$/.test(semantic.byDay[0])
@@ -442,9 +442,10 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const startPhrase = localDate(start, timeZone);
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
   const recurrenceStartIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const base = { rule, semantic, startDate: recurrenceStartIsoDate, ...(time ? { time } : {}) };
+  const base = { rule, semantic, startDate: recurrenceStartIsoDate,
+    ...(interval > 1 ? { interval } : {}), ...(time ? { time } : {}) };
   if (fields.FREQ === "DAILY") {
-    return { ...base, frequency: "daily", ...(interval > 1 ? { interval } : {}),
+    return { ...base, frequency: "daily",
       dueString: `every ${interval > 1 ? `${interval} days` : "day"}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "WEEKLY") {
@@ -453,25 +454,27 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
     if (fields.BYMONTH || fields.BYMONTHDAY || weekdays.some((value) => !value)
       || !weekdays.includes(weekday)) return undefined;
     const weekdayPhrase = weekdays.join(", ");
+    if (interval > 1 && weekdays.length !== 1) return undefined;
     return { ...base, frequency: "weekly", ...(weekdays.length === 1 ? { weekday } : {}),
-      dueString: `every ${weekdayPhrase}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} weeks` : weekdayPhrase}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "MONTHLY") {
     if (position !== undefined) {
+      if (interval > 1) return undefined;
       return { ...base, frequency: "monthly", weekday, monthlyOrdinal: position,
         dueString: `every ${position === -1 ? "last" : ordinalLabels[position - 1]} ${weekday}${timePhrase} starting ${startPhrase}` };
     }
     if (fields.BYDAY || fields.BYSETPOS || fields.BYMONTH || day > 28
       || (fields.BYMONTHDAY && fields.BYMONTHDAY !== String(day))) return undefined;
     return { ...base, frequency: "monthly", dayOfMonth: day,
-      dueString: `every ${day}${day % 100 >= 11 && day % 100 <= 13 ? "th" : day % 10 === 1 ? "st" : day % 10 === 2 ? "nd" : day % 10 === 3 ? "rd" : "th"}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} months` : `${day}${day % 100 >= 11 && day % 100 <= 13 ? "th" : day % 10 === 1 ? "st" : day % 10 === 2 ? "nd" : day % 10 === 3 ? "rd" : "th"}`}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "YEARLY") {
     if (fields.BYDAY || (month === 2 && day === 29)
       || (fields.BYMONTH && fields.BYMONTH !== String(month))
       || (fields.BYMONTHDAY && fields.BYMONTHDAY !== String(day))) return undefined;
     return { ...base, frequency: "yearly", dayOfMonth: day, month,
-      dueString: `every ${day} ${monthNames[month - 1]}${timePhrase} starting ${startPhrase}` };
+      dueString: `every ${interval > 1 ? `${interval} years` : `${day} ${monthNames[month - 1]}`}${timePhrase} starting ${startPhrase}` };
   }
   return undefined;
 }

@@ -3,7 +3,7 @@ import test from "node:test";
 import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasConflictingCalendarCandidate, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { Todoist, todoistTaskPayload } from "../dist/providers.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
-import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
+import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
 import { validTodoistSignature } from "../dist/security.js";
 import { createHmac } from "node:crypto";
 import { profiles } from "../dist/config.js";
@@ -768,6 +768,19 @@ test("translates an anchored annual month-day Todoist recurrence", () => {
   }
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, string: "every 2 November" } }), undefined,
     "an explicit annual date must agree with the provider due anchor");
+});
+
+test("historical projection boundary preserves the mapped Calendar DTSTART in reverse recurrence checks", () => {
+  const master = { id: "historical-master", start: { date: "2026-01-01", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=YEARLY"] };
+  const task = { id: "historical-task", content: "Annual task", due: { date: "2027-01-01",
+    string: "every year starting 1 Jan 2027", is_recurring: true } };
+  assert.equal(todoistRecurrenceToRrule(task, { start: master.start.date, timeZone: "Europe/London" }), "RRULE:FREQ=YEARLY");
+  assert.equal(calendarRecurrenceMatchesTodoist(master, task), true);
+  const offPhase = { ...task, due: { ...task.due, string: "every year starting 2 Jan 2027" } };
+  assert.equal(todoistRecurrenceToRrule(offPhase, { start: master.start.date, timeZone: "Europe/London" }), undefined);
+  assert.equal(calendarRecurrenceMatchesTodoist(master, offPhase), false);
+  assert.equal(master.start.date, "2026-01-01", "reverse translation never infers DTSTART from the active due");
 });
 
 test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {
