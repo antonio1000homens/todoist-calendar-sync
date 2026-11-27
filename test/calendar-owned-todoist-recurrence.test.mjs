@@ -144,7 +144,8 @@ test("all-day native rules and Todoist's normalized no-start recurrence remain v
       for (const phrase of ["every year", "yearly", "annually", "annual", "every 10 Oct",
         "every 10 October", "every October 10th", "every 10th October", "every Oct 10"]) {
         const matching = { ...task, due: { ...task.due, string: phrase } };
-        assert.equal(todoistRecurrenceToRrule(matching), rule, phrase);
+        const genericAnnual = ["every year", "yearly", "annually", "annual"].includes(phrase.toLowerCase());
+        assert.equal(todoistRecurrenceToRrule(matching), genericAnnual ? rule : "RRULE:FREQ=YEARLY;BYMONTHDAY=10;BYMONTH=10", phrase);
         assert.equal(classifyTodoistRule(phrase, { start: date }).semantic.frequency, "YEARLY", phrase);
         assert.equal(matchesCalendarOwnedRecurringRule(matching, recurrence, "Europe/London"), true, phrase);
         assert.equal(matchesCalendarOwnedRecurringTask(matching, event, recurrence, "Europe/London"), true, phrase);
@@ -488,7 +489,7 @@ test("Google default WKST=MO preserves a native timed weekly Friday recurrence",
   const master = weeklyMaster(start, "RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=FR");
   const schedule = instances([start, "2026-12-04T16:00:00Z", "2026-12-11T16:00:00Z"]);
   assert.equal(nativeCalendarRecurrenceCandidate(master), true);
-  const recurrence = await verifiedCalendarOwnedRecurrence(master, schedule, "Europe/London", async () => []);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
   assert.equal(recurrence?.dueString, "every Friday at 4:00pm starting 27 Nov 2026");
   const implicit = calendarOwnedTodoistRecurrence(weeklyMaster(start, "RRULE:FREQ=WEEKLY;BYDAY=FR"), schedule, "Europe/London");
   assert.equal(recurrence.dueString, implicit.dueString);
@@ -512,4 +513,24 @@ test("Google default WKST=MO preserves a native timed weekly Friday recurrence",
     assert.equal(nativeCalendarRecurrenceCandidate(invalid), false, rule);
     assert.equal(calendarOwnedTodoistRecurrence(invalid, schedule, "Europe/London"), undefined, rule);
   }
+});
+
+test("weekly weekday lists translate through the shared RRULE semantics", async () => {
+  const start = "2026-11-23";
+  const master = {
+    id: "weekday-list", status: "confirmed", start: { date: start },
+    end: { date: "2026-11-24" },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"],
+  };
+  const schedule = ["2026-11-23", "2026-11-25", "2026-11-30"].map((date, index) => {
+    const end = new Date(date + "T00:00:00Z");
+    end.setUTCDate(end.getUTCDate() + 1);
+    return { id: `weekday-instance-${index}`, status: "confirmed", recurringEventId: master.id,
+      originalStartTime: { date }, start: { date }, end: { date: end.toISOString().slice(0, 10) } };
+  });
+  assert.equal(nativeCalendarRecurrenceCandidate(master), true);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  assert.equal(recurrence?.dueString, "every mon, wed starting 23 Nov 2026");
+  const task = { id: "weekday-list-task", due: { date: "2026-11-25", is_recurring: true, string: recurrence.dueString } };
+  assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[1], recurrence, "Europe/London"), true);
 });

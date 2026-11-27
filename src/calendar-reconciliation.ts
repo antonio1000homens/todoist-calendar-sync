@@ -26,7 +26,7 @@ import { providerSyncBaseline } from "./provider-sync-baseline.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, startsMatch, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
-import { normalizedRecurrenceRule, todoistRecurrenceKey, todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { calendarRecurrenceMatchesTodoist } from "./todoist-recurrence.js";
 import type { CalendarEvent, Mapping, Profile, ReconciliationContinuation, TodoistTask } from "./types.js";
 
 const MAX_PROVIDER_MUTATIONS = 10;
@@ -65,11 +65,7 @@ function taskComment(event: CalendarEvent): string {
 }
 
 function todoistTaskMatchesCalendarRecurrence(master: CalendarEvent, task: TodoistTask): boolean {
-  const rule = todoistRecurrenceToRrule(task);
-  return Boolean(rule && master.recurrence?.some(candidate =>
-    normalizedRecurrenceRule(candidate) === normalizedRecurrenceRule(rule))
-    && (!master.extendedProperties?.shared?.todoistRecurrence
-      || master.extendedProperties.shared.todoistRecurrence === todoistRecurrenceKey(task)));
+  return calendarRecurrenceMatchesTodoist(master, task);
 }
 
 

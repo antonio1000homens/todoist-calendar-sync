@@ -1,27 +1,9 @@
 import { normalizedText } from "./security.js";
-import { parseAnnualCadence } from "./recurrence-semantics.js";
+import {
+  classifyCalendarRule, classifyTodoistRule, compareOccurrenceSemantics, recurrenceCadenceMatchesAtDate,
+  recurrenceCivilAnchor,
+} from "./recurrence-semantics.js";
 import type { CalendarEvent, TodoistTask } from "./types.js";
-
-const weekdays: Record<string, string> = {
-  mon: "MO",
-  monday: "MO",
-  tue: "TU",
-  tues: "TU",
-  tuesday: "TU",
-  wed: "WE",
-  weds: "WE",
-  wednesday: "WE",
-  thu: "TH",
-  thur: "TH",
-  thurs: "TH",
-  thursday: "TH",
-  fri: "FR",
-  friday: "FR",
-  sat: "SA",
-  saturday: "SA",
-  sun: "SU",
-  sunday: "SU",
-};
 
 function hasOffset(value: string): boolean {
   return /(?:Z|[+-]\d{2}:\d{2})$/i.test(value);
@@ -59,98 +41,27 @@ export function todoistRecurrenceKey(task: TodoistTask): string | undefined {
  * recurrence strings either as `every day at 9am` or as the normalized API
  * form `every week 09:30`.
  */
-export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined {
+export function todoistRecurrenceToRrule(task: TodoistTask, anchor?: { start: string; timeZone?: string }): string | undefined {
   const key = todoistRecurrenceKey(task);
-  if (!key || key.includes("every!")) return undefined;
-  if (/\b(until|starting|ending)\b/.test(key)) return undefined;
-  const value = key
-    .replace(/\s+at\s+.+$/, "")
-    .replace(/\s+(?:(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[ap]m)?|(?:0?[1-9]|1[0-2])\s*[ap]m)$/i, "")
-    .trim();
-
-  if (value === "every day" || value === "daily") return "RRULE:FREQ=DAILY";
-  if (value === "every weekday" || value === "every workday" || value === "weekdays") {
-    return "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR";
+  const start = task.due?.datetime || task.due?.date;
+  if (!key || !start || /\b(until|starting|ending)\b/.test(key)) return undefined;
+  // Todoist's "every other Monday" idiom remains Phase B gated until its
+  // completion progression has been verified from provider readback.
+  if (/^every other (?:mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)$/i.test(key)) return undefined;
+  const anchorDate = recurrenceCivilAnchor(start, anchor?.timeZone || task.due?.timezone)?.date;
+  if (anchorDate && Number(anchorDate.slice(-2)) > 28
+    && (/^(?:every\s+)?quarter(?:ly)?$/.test(key)
+      || /^every\s+\d{1,2}(?:\s*,\s*\d{1,2})+$/.test(key))) return undefined;
+  // Natural-language translation is owned by the shared semantic parser.
+  // Native projection eligibility remains here: only a task with a verified
+  // provider anchor and a parseable, non-bounded rule can become an RRULE.
+  const context = anchor || { start, timeZone: task.due?.timezone };
+  const classified = classifyTodoistRule(key, context);
+  if (!anchor && classified.semantic?.localTime) {
+    const dueAnchor = recurrenceCivilAnchor(start, task.due?.timezone);
+    if (!dueAnchor || dueAnchor.time !== classified.semantic.localTime) return undefined;
   }
-  if (value === "every week" || value === "weekly") return "RRULE:FREQ=WEEKLY";
-  if (value === "every month" || value === "monthly") return "RRULE:FREQ=MONTHLY";
-  const annual = /^(?:every\s+.+|yearly|annual|annually)$/.test(value)
-    ? parseAnnualCadence(value.replace(/^every\s+/, "")) : undefined;
-  if (annual) {
-    if (annual.month === undefined) return "RRULE:FREQ=YEARLY";
-    // A fixed annual phrase needs a matching provider DTSTART. Keep the
-    // existing projection guard independent from semantic phrase parsing.
-    const dueDate = task.due?.date?.slice(0, 10)
-      || (task.due?.datetime
-        ? task.due.timezone
-          ? localDateTime(task.due.datetime, task.due.timezone).slice(0, 10)
-          : task.due.datetime.slice(0, 10)
-        : undefined);
-    const anchor = dueDate?.match(/^\d{4}-(\d{2})-(\d{2})$/);
-    const parsedAnchor = anchor && dueDate ? new Date(`${dueDate}T00:00:00.000Z`) : undefined;
-    if (!anchor || !parsedAnchor || Number.isNaN(parsedAnchor.getTime())
-      || parsedAnchor.toISOString().slice(0, 10) !== dueDate
-      || Number(anchor[1]) !== annual.month || Number(anchor[2]) !== annual.dayOfMonth) return undefined;
-    return "RRULE:FREQ=YEARLY";
-  }
-
-  const interval = value.match(/^every\s+(\d+)\s+(days?|weeks?|months?|years?)$/);
-  if (interval) {
-    const count = Number(interval[1]);
-    if (!Number.isInteger(count) || count < 1) return undefined;
-    const unit = interval[2].replace(/s$/, "");
-    const frequency = unit === "day" ? "DAILY"
-      : unit === "week" ? "WEEKLY"
-        : unit === "month" ? "MONTHLY"
-          : unit === "year" ? "YEARLY"
-            : undefined;
-    return frequency ? `RRULE:FREQ=${frequency};INTERVAL=${count}` : undefined;
-  }
-
-  // A monthly ordinal is a calendar position, never a 28-day interval.
-  // Fifth weekdays occur only in some months; the recurrence must skip the rest.
-  const ordinal = value.match(/^every\s+(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last)\s+([a-z]+)(?:\s+of\s+(?:the\s+)?month)?$/);
-  if (ordinal) {
-    const position = ordinal[1] === "last" ? -1
-      : ["1st", "2nd", "3rd", "4th", "5th"].indexOf(ordinal[1]) >= 0
-        ? ["1st", "2nd", "3rd", "4th", "5th"].indexOf(ordinal[1]) + 1
-        : ["first", "second", "third", "fourth", "fifth"].indexOf(ordinal[1]) + 1;
-    const weekday = weekdays[ordinal[2]];
-    if (!weekday || !["MO", "TU", "WE", "TH", "FR"].includes(weekday)) return undefined;
-    const dueValue = task.due?.date || task.due?.datetime;
-    // Offset timestamps must be resolved to the provider's verified local day.
-    // A UTC date can differ from the ordinal weekday in the user's timezone.
-    const date = dueValue
-      ? hasOffset(dueValue) ? task.due?.timezone
-        ? localDateTime(dueValue, task.due.timezone).slice(0, 10) : undefined
-        : dueValue.slice(0, 10)
-      : undefined;
-    const match = date?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (!match) return undefined;
-    const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
-    const current = new Date(Date.UTC(year, month - 1, day));
-    const weekdayIndex = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].indexOf(weekday);
-    if (current.getUTCFullYear() !== year || current.getUTCMonth() !== month - 1
-      || current.getUTCDate() !== day || current.getUTCDay() !== weekdayIndex
-      || (position === -1 ? day + 7 <= new Date(Date.UTC(year, month, 0)).getUTCDate()
-        : Math.floor((day - 1) / 7) + 1 !== position)) return undefined;
-    return `RRULE:FREQ=MONTHLY;BYDAY=${position}${weekday}`;
-  }
-
-  const dayExpression = value.match(/^every\s+(.+)$/)?.[1];
-  if (dayExpression) {
-    const tokens = dayExpression
-      .replace(/,/g, " ")
-      .replace(/\band\b/g, " ")
-      .split(/\s+/)
-      .filter(Boolean);
-    if (tokens.length && tokens.every((token) => Boolean(weekdays[token]))) {
-      const days = [...new Set(tokens.map((token) => weekdays[token]))];
-      return `RRULE:FREQ=WEEKLY;BYDAY=${days.join(",")}`;
-    }
-  }
-
-  return undefined;
+  return classified.canonicalRrule;
 }
 
 export function isTodoistOwnedCalendarRecurrence(event: { recurrence?: string[]; extendedProperties?: { shared?: Record<string, string> } }): boolean {
@@ -160,29 +71,43 @@ export function isTodoistOwnedCalendarRecurrence(event: { recurrence?: string[];
   );
 }
 
-export function calendarRecurrenceMatchesTodoist(event: { recurrence?: string[]; extendedProperties?: { shared?: Record<string, string> } }, task: TodoistTask): boolean {
-  const rrule = todoistRecurrenceToRrule(task);
-  if (!rrule) return !event.recurrence?.length;
-  return Boolean(
-    event.recurrence?.includes(rrule)
-    && Boolean(event.extendedProperties?.shared?.todoistRecurrence)
-    && (!event.extendedProperties?.shared?.todoistRecurrence || event.extendedProperties?.shared?.todoistRecurrence === todoistRecurrenceKey(task)),
-  );
+export function calendarRecurrenceMatchesTodoist(event: {
+  recurrence?: string[];
+  start?: { date?: string; dateTime?: string; timeZone?: string };
+  extendedProperties?: { shared?: Record<string, string> };
+}, task: TodoistTask): boolean {
+  const key = todoistRecurrenceKey(task);
+  if (!key) return !event.recurrence?.length;
+  const todoistStart = task.due?.datetime || task.due?.date;
+  const calendarStart = event.start?.dateTime || event.start?.date;
+  const zone = event.start?.timeZone || task.due?.timezone;
+  if (!todoistStart || !calendarStart) return false;
+  const todoist = classifyTodoistRule(key, { start: todoistStart, timeZone: zone }).semantic;
+  const dueDate = recurrenceCivilAnchor(todoistStart, zone)?.date;
+  if (!todoist || !dueDate || !event.recurrence?.length) return false;
+  const compatible = event.recurrence.some(rule => {
+    const calendar = classifyCalendarRule(rule, { start: calendarStart, timeZone: zone }).semantic;
+    return Boolean(calendar && recurrenceCadenceMatchesAtDate(calendar, todoist, dueDate));
+  });
+  return compatible && (!event.extendedProperties?.shared?.todoistRecurrence
+    || event.extendedProperties.shared.todoistRecurrence === key);
 }
 
-/** Canonical comparison for provider RRULEs used only while discovering a
- * previously unlinked pair. Redundant INTERVAL=1 and field ordering do not
- * change recurrence semantics. */
-export function normalizedRecurrenceRule(rule: string | undefined): string | undefined {
-  if (!rule?.startsWith("RRULE:")) return undefined;
-  const fields = rule.slice("RRULE:".length).split(";").map(field => {
-    const [rawKey, ...parts] = field.split("=");
-    const key = rawKey.toUpperCase();
-    const value = parts.join("=").toUpperCase();
-    if (key === "INTERVAL" && value === "1") return undefined;
-    return `${key}=${value.split(",").sort().join(",")}`;
-  }).filter((field): field is string => Boolean(field)).sort();
-  return `RRULE:${fields.join(";")}`;
+/** Compare a provider RRULE readback to an expected rule using the shared
+ * semantic parser and the event's own DTSTART/timezone context. */
+export function calendarRuleMatches(event: {
+  recurrence?: string[];
+  start?: { date?: string; dateTime?: string; timeZone?: string };
+}, expectedRule: string): boolean {
+  const start = event.start?.dateTime || event.start?.date;
+  if (!start || !event.recurrence?.length) return false;
+  const context = { start, timeZone: event.start?.timeZone };
+  const expected = classifyCalendarRule(expectedRule, context).semantic;
+  if (!expected) return false;
+  return event.recurrence.some((rule) => {
+    const actual = classifyCalendarRule(rule, context).semantic;
+    return Boolean(actual && compareOccurrenceSemantics(expected, actual).equivalent);
+  });
 }
 
 /** Immutable logical identity for a Google recurring instance. */

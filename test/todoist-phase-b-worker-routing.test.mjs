@@ -57,7 +57,7 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
   let instanceReadCount=0,commentWriteCount=0;
   const instances=family.dates.map((date,index)=>{
     const end=new Date(date+"T00:00:00Z");end.setUTCDate(end.getUTCDate()+1);
-    return {id:`instance-${index}`,status:"confirmed",recurringEventId:"",
+    return {id:`instance-${index}`,status:"confirmed",summary:task.content,description:task.description,recurringEventId:"",
       originalStartTime:{date},start:{date},end:{date:end.toISOString().slice(0,10)}};
   });
   const calendar={
@@ -84,6 +84,9 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     async listInstancesInWindow(id){
       instanceReadCount++;
       if(delayFirstInstances&&instanceReadCount===1)return [];
+      return instances.map(x=>({...structuredClone(x),recurringEventId:id}));
+    },
+    async listInstances(id){
       return instances.map(x=>({...structuredClone(x),recurringEventId:id}));
     },
     async listExplicitSeriesExceptions(){return [];},

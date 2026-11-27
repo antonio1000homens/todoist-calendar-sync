@@ -139,7 +139,7 @@ function validSyncBaseline(value: unknown): value is ProviderSyncBaseline {
   if (!value || typeof value !== "object") return false;
   const baseline = value as Partial<ProviderSyncBaseline>;
   const hash = (item: unknown): item is string => typeof item === "string" && /^[a-f0-9]{64}$/.test(item);
-  return baseline.version === 1 && Boolean(baseline.todoist) && Boolean(baseline.calendar)
+  return (baseline.version === 1 || baseline.version === 2) && Boolean(baseline.todoist) && Boolean(baseline.calendar)
     && hash(baseline.todoist?.content) && hash(baseline.todoist?.description) && hash(baseline.todoist?.due)
     && hash(baseline.calendar?.status) && hash(baseline.calendar?.summary)
     && hash(baseline.calendar?.description) && hash(baseline.calendar?.start)

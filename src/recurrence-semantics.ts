@@ -90,7 +90,7 @@ export function recurrenceCivilAnchor(start: string | undefined, timeZone?: stri
 }
 
 const frequencies: RecurrenceFrequency[] = ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
-const knownFields = new Set(["FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "COUNT", "UNTIL", "WKST"]);
+const knownFields = new Set(["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTHDAY", "BYMONTH", "COUNT", "UNTIL", "WKST"]);
 const pad = (value: number): string => String(value).padStart(2, "0");
 
 function validDate(iso: string): boolean {
@@ -139,6 +139,22 @@ function canonical(semantic: RecurrenceSemantics): string {
   if (semantic.count) result.push("COUNT=" + semantic.count);
   if (semantic.until) result.push("UNTIL=" + semantic.until);
   return result.join(";");
+}
+
+function recurrencePhraseTime(value: string): string | undefined | null {
+  const match = value.match(/\s+(?:at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)|(\d{1,2}:\d{2}))$/i);
+  if (!match) return undefined;
+  const raw = (match[1] || match[2]).trim().toLowerCase();
+  const parts = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/.exec(raw);
+  if (!parts) return null;
+  let hour = Number(parts[1]);
+  const minute = Number(parts[2] || 0);
+  if (minute > 59) return null;
+  if (parts[3]) {
+    if (hour < 1 || hour > 12) return null;
+    hour = hour % 12 + (parts[3] === "pm" ? 12 : 0);
+  } else if (hour > 23) return null;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function finish(semantic: RecurrenceSemantics, context: RecurrenceContext,
@@ -200,9 +216,18 @@ export function classifyCalendarRule(rule: string, context: RecurrenceContext): 
       return weekdayOrder || Number(a.slice(0, -2) || "0") - Number(b.slice(0, -2) || "0");
     });
   }
+  let bySetPos: number | undefined;
+  if (fields.BYSETPOS) {
+    if (!/^(?:-1|[1-5])$/.test(fields.BYSETPOS)) return decline("invalid_component");
+    bySetPos = Number(fields.BYSETPOS);
+    if (fields.FREQ !== "MONTHLY" || !byDay || byDay.length !== 1 || byDay[0].length !== 2)
+      return decline("compound_rule_not_verified");
+    byDay = [`${bySetPos}${byDay[0]}`];
+  }
   if ((fields.FREQ === "DAILY" && (byDay || byMonthDay || byMonth))
     || (fields.FREQ === "WEEKLY" && (byMonthDay || byMonth || byDay?.some((value) => value.length !== 2)))
     || (fields.FREQ === "MONTHLY" && byMonth)
+    || (fields.BYSETPOS && fields.FREQ !== "MONTHLY")
     || (byDay && byMonthDay)) return decline("compound_rule_not_verified");
   const count = fields.COUNT ? positive(fields.COUNT, 1000) : undefined;
   if (fields.COUNT && !count) return decline("invalid_component");
@@ -227,7 +252,7 @@ export function classifyCalendarRule(rule: string, context: RecurrenceContext): 
   };
   return finish(semantic, context, fields.COUNT || fields.UNTIL ? "finite_provider_validation_required"
     : fields.FREQ === "YEARLY" && byDay ? "compound_rule_not_verified"
-      : fields.FREQ === "MONTHLY" && byDay ? "compound_rule_not_verified"
+    : fields.FREQ === "MONTHLY" && byDay && !bySetPos ? "compound_rule_not_verified"
         : byDay?.some((value) => value.length !== 2) ? "compound_rule_not_verified" : undefined);
 }
 
@@ -236,6 +261,9 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
   const anchor = localAnchor(context);
   if (typeof anchor === "string") return decline(anchor);
   const value = phrase.toLowerCase().trim().replace(/\s+/g, " ");
+  const phraseTime = recurrencePhraseTime(value);
+  if (phraseTime === null) return decline("invalid_component");
+  if (phraseTime && (!anchor.time || anchor.time !== phraseTime)) return decline("occurrence_mismatch");
   if (/every!/.test(value)) return { disposition: "rolling_required", reason: "completion_relative" };
   if (/\b(starting|ending|until|from)\b/.test(value))
     return { disposition: "rolling_required", reason: "finite_provider_validation_required" };
@@ -250,9 +278,11 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
   let byMonth: number[] | undefined;
   const every = expression.replace(/^every\s+/, "");
   const monthDays = every.match(/^\d{1,2}(?:\s*,\s*\d{1,2})+$/);
+  const monthDay = every.match(/^(\d{1,2})(?:st|nd|rd|th)?$/);
   const alternate = every.match(/^other\s+([a-z]+)$/);
   const quantity = every.match(/^(\d+)\s+(day|week|month|year)s?$/);
   const annual = parseAnnualCadence(every);
+  const ordinalWeekday = every.match(/^(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last)\s+([a-z]+)(?:\s+of\s+(?:the\s+)?month)?$/);
   if (["day", "daily"].includes(every)) frequency = "DAILY";
   else if (["week", "weekly"].includes(every)) frequency = "WEEKLY";
   else if (["month", "monthly"].includes(every)) frequency = "MONTHLY";
@@ -264,11 +294,30 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
     byMonthDay = [...new Set(every.split(",").map((day) => Number(day.trim())))].sort((a, b) => a - b);
     if (byMonthDay.some((day) => day < 1 || day > 31)) return decline("invalid_component");
     frequency = "MONTHLY";
+  } else if (monthDay) {
+    const day = Number(monthDay[1]);
+    if (day < 1 || day > 28 || Number(anchor.date.slice(8, 10)) !== day) return decline("invalid_component");
+    byMonthDay = [day];
+    frequency = "MONTHLY";
   } else if (annual?.month !== undefined && annual.dayOfMonth !== undefined) {
     const { month, dayOfMonth: day } = annual;
     if (Number(anchor.date.slice(5, 7)) !== month
       || Number(anchor.date.slice(8, 10)) !== day) return decline("invalid_component");
     frequency = "YEARLY"; byMonth = [month]; byMonthDay = [day];
+  } else if (ordinalWeekday) {
+    const weekday = dayNames[ordinalWeekday[2]];
+    const position = ordinalWeekday[1] === "last" ? -1
+      : ["1st", "2nd", "3rd", "4th", "5th"].includes(ordinalWeekday[1])
+        ? ["1st", "2nd", "3rd", "4th", "5th"].indexOf(ordinalWeekday[1]) + 1
+        : ["first", "second", "third", "fourth", "fifth"].indexOf(ordinalWeekday[1]) + 1;
+    if (!weekday || !["MO", "TU", "WE", "TH", "FR"].includes(weekday)
+      || !(position === -1 || position >= 1 && position <= 5)) return decline("unknown_todoist_phrase");
+    const anchorDate = new Date(anchor.date + "T00:00:00Z");
+    const weekdayIndex = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"].indexOf(weekday);
+    if (anchorDate.getUTCDay() !== weekdayIndex
+      || (position === -1 ? anchorDate.getUTCDate() + 7 <= new Date(Date.UTC(anchorDate.getUTCFullYear(), anchorDate.getUTCMonth() + 1, 0)).getUTCDate()
+        : Math.floor((anchorDate.getUTCDate() - 1) / 7) + 1 !== position)) return decline("invalid_component");
+    frequency = "MONTHLY"; byDay = [`${position}${weekday}`];
   } else if (alternate && dayNames[alternate[1]]) {
     frequency = "WEEKLY"; interval = 2; byDay = [dayNames[alternate[1]]];
   } else if (quantity) {
@@ -366,4 +415,64 @@ export function compareOccurrenceSemantics(left: RecurrenceSemantics, right: Rec
     && leftDates.every((value, index) => value === rightDates[index])
     && left.count === right.count && left.until === right.until;
   return { equivalent, reason: equivalent ? "verified_equivalent" : "occurrence_mismatch", leftDates, rightDates };
+}
+
+function cadenceFields(rule: RecurrenceSemantics): string {
+  const anchor = new Date(rule.startDate + "T00:00:00Z");
+  const weekday = days[(anchor.getUTCDay() + 6) % 7];
+  const month = anchor.getUTCMonth() + 1;
+  const day = anchor.getUTCDate();
+  const byDay = rule.byDay?.length ? [...rule.byDay].sort().join(",")
+    : rule.frequency === "WEEKLY" ? weekday : "";
+  const byMonthDay = rule.byMonthDay?.length ? [...rule.byMonthDay].sort((a,b)=>a-b).join(",")
+    : rule.frequency === "MONTHLY" && !rule.byDay?.length || rule.frequency === "YEARLY" && !rule.byDay?.length
+      ? String(day) : "";
+  const byMonth = rule.byMonth?.length ? [...rule.byMonth].sort((a,b)=>a-b).join(",")
+    : rule.frequency === "YEARLY" ? String(month) : "";
+  return [rule.frequency, rule.interval, byDay, byMonthDay, byMonth,
+    rule.localTime || "", rule.timeZone || ""].join("|");
+}
+
+/** Check one civil due date against an independently parsed anchored RRULE. */
+export function recurrenceIncludesDate(rule: RecurrenceSemantics, iso: string): boolean {
+  if (!validDate(iso) || !validDate(rule.startDate) || iso < rule.startDate || rule.until && iso > rule.until.slice(0, 8).replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3")) return false;
+  const date = new Date(iso + "T00:00:00Z");
+  const start = new Date(rule.startDate + "T00:00:00Z");
+  const offset = (date.getTime() - start.getTime()) / 86_400_000;
+  const weekday = days[(date.getUTCDay() + 6) % 7];
+  const startWeekday = days[(start.getUTCDay() + 6) % 7];
+  const monthDistance = (date.getUTCFullYear() - start.getUTCFullYear()) * 12
+    + date.getUTCMonth() - start.getUTCMonth();
+  const weekDistance = Math.floor((date.getTime() - (start.getTime() - ((start.getUTCDay() + 6) % 7) * 86_400_000)) / 604_800_000);
+  const intervalMatch = rule.frequency === "DAILY" ? offset % rule.interval === 0
+    : rule.frequency === "WEEKLY" ? weekDistance % rule.interval === 0
+      : rule.frequency === "MONTHLY" ? monthDistance % rule.interval === 0
+        : (date.getUTCFullYear() - start.getUTCFullYear()) % rule.interval === 0;
+  if (!intervalMatch) return false;
+  if (rule.frequency === "WEEKLY" && !(rule.byDay?.length ? rule.byDay.some(day=>day.slice(-2)===weekday) : weekday===startWeekday)) return false;
+  if (rule.frequency === "MONTHLY" && rule.byDay?.length) {
+    if (!rule.byDay.some(entry => {
+      if (entry.slice(-2) !== weekday) return false;
+      const ordinal = entry.slice(0,-2);
+      return !ordinal || (ordinal === "-1"
+        ? date.getUTCDate()+7>new Date(Date.UTC(date.getUTCFullYear(),date.getUTCMonth()+1,0)).getUTCDate()
+        : Math.floor((date.getUTCDate()-1)/7)+1===Number(ordinal));
+    })) return false;
+  } else if ((rule.frequency === "MONTHLY" || rule.frequency === "YEARLY")
+    && !(rule.byMonthDay?.length ? rule.byMonthDay.includes(date.getUTCDate()) : date.getUTCDate()===start.getUTCDate())) return false;
+  if (rule.frequency === "YEARLY" && !(rule.byMonth?.length
+    ? rule.byMonth.includes(date.getUTCMonth()+1) : date.getUTCMonth()===start.getUTCMonth())) return false;
+  if (rule.byDay?.length && rule.frequency !== "WEEKLY" && rule.frequency !== "MONTHLY") return false;
+  return true;
+}
+
+/** Compare the rule shapes while proving that Todoist's current due is an
+ * occurrence in the Calendar series. DTSTART is context: it supplies omitted
+ * weekday/month/day fields but does not require both providers to share a year. */
+export function recurrenceCadenceMatchesAtDate(
+  calendar: RecurrenceSemantics, todoist: RecurrenceSemantics, dueDate: string,
+): boolean {
+  return cadenceFields(calendar) === cadenceFields(todoist)
+    && recurrenceIncludesDate(calendar, dueDate) && recurrenceIncludesDate(todoist, dueDate)
+    && calendar.count === todoist.count && calendar.until === todoist.until;
 }
