@@ -141,7 +141,8 @@ test("all-day native rules and Todoist's normalized no-start recurrence remain v
     assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, is_recurring: false } }, recurrence), false);
     if (rule === "RRULE:FREQ=YEARLY") {
-      for (const phrase of ["every year", "yearly", "annually", "annual", "every 10 Oct"]) {
+      for (const phrase of ["every year", "yearly", "annually", "annual", "every 10 Oct",
+        "every 10 October", "every October 10th", "every 10th October", "every Oct 10"]) {
         const matching = { ...task, due: { ...task.due, string: phrase } };
         assert.equal(todoistRecurrenceToRrule(matching), rule, phrase);
         assert.equal(classifyTodoistRule(phrase, { start: date }).semantic.frequency, "YEARLY", phrase);

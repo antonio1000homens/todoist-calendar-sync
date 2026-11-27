@@ -9,7 +9,7 @@
  */
 import {
   classifyCalendarRule, classifyTodoistRule, compareOccurrenceSemantics,
-  occurrenceDates,
+  occurrenceDates, parseAnnualCadence,
   type RecurrenceSemantics,
 } from "./recurrence-semantics.js";
 import { todoistRecurrenceKey } from "./todoist-recurrence.js";
@@ -57,7 +57,7 @@ function familyFor(key: string): TodoistPhaseBFamily | undefined {
   if (new RegExp("^every\\s+other\\s+" + weekdays + "$").test(phrase)) return "alternate_weekday";
   if (phrase === "every quarter" || phrase === "quarterly" || phrase === "every quarterly"
     || phrase === "every 3 months") return "quarterly";
-  if (/^every\s+[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?$/.test(phrase)) return "fixed_annual_date";
+  if (parseAnnualCadence(phrase.replace(/^every\s+/, ""))?.month !== undefined) return "fixed_annual_date";
   return undefined;
 }
 

@@ -3146,15 +3146,15 @@ export class Synchronizer {
         });
         return "blocked";
       }
-      // A rule mismatch is repairable only when the exact mapped task's due
-      // and recurrence still match the last mutually observed Todoist state.
-      // This lets a stale Calendar-owned anchor be repaired in place while
-      // refusing to overwrite an independent/newer Todoist schedule edit.
       const baseline = providerMapping?.syncBaseline;
       const observed = providerSyncBaseline(task, active, master);
-      if (!baseline?.todoist.due || !baseline.todoist.recurrence
+      // A stale due anchor needs independent baseline proof before Calendar
+      // can repair it. For the established exact-current-occurrence rule-edit
+      // path, keep its prior behavior: the verified active occurrence itself
+      // is the anchor and only the recurrence grammar changed.
+      if (!startsMatch(active, task) && (!baseline?.todoist.due || !baseline.todoist.recurrence
         || observed.todoist.due !== baseline.todoist.due
-        || observed.todoist.recurrence !== baseline.todoist.recurrence) {
+        || observed.todoist.recurrence !== baseline.todoist.recurrence)) {
         await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
           seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
           reason: "todoist_recurrence_changed_since_verified_baseline",
