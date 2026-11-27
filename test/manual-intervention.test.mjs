@@ -678,7 +678,7 @@ test('unmapped conflicts no longer expose a manual retry action', async () => {
   assert.equal(notifier.updated.length, 0, 'the originating incident card stays open during reconciliation');
 });
 
-test('Calendar-only ambiguity does not create a manual decision', async () => {
+test('recurring Calendar identity ambiguity opens a review case without repair action', async () => {
   process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
   const decisions = new FakeDecisionStore();
   const notifier = new FakeNotifier();
@@ -711,8 +711,42 @@ test('Calendar-only ambiguity does not create a manual decision', async () => {
     { eventId: 'series-event', seriesId: 'series-1', candidateTaskIds: ['task-a', 'task-b'] },
   );
 
-  assert.equal(result.caseStatus, 'not_actionable');
-  assert.equal(notifier.posted.length, 0);
+  assert.equal(result.caseStatus, 'open');
+  assert.equal(notifier.posted.length, 1);
+  assert.deepEqual(notifier.posted[0].permittedActions.map(action => action.id), ['repair_from_calendar', 'leave_unchanged']);
+  assert.equal(notifier.posted[0].context.repairEligible, false);
+});
+
+test('unsupported recurrence projection opens a Todoist-only review decision', async () => {
+  process.env.TODOIST_CALENDAR_SYNC_MANUAL_INTERVENTION_ENABLED = 'true';
+  const decisions = new FakeDecisionStore();
+  const notifier = new FakeNotifier();
+  const task = { id: 'task-unsupported', content: 'Quarterly on month end', due: {
+    date: '2027-01-31', string: 'every 3 months on the last day', is_recurring: true,
+  } };
+  let providerWrites = 0;
+  const service = new ManualInterventionService(decisions, notifier, async () => ({
+    todoist: { async getTask() { return task; }, async upsertTask() { providerWrites += 1; } },
+    calendar: {},
+  }), new FakePolicyStore());
+  const delivery = { ...todoistDeleteDelivery(), kind: 'todoist', id: 'unsupported-recurrence' };
+  const observed = await service.observeAudit(delivery, 'antonio', 'todoist_project_recurrence_unsupported', {
+    taskId: task.id, outcome: 'source_left_unchanged', existingMirrorPreserved: false,
+  });
+
+  assert.equal(observed.caseStatus, 'open');
+  assert.equal(notifier.posted.length, 1);
+  assert.equal(notifier.posted[0].type, 'unsupported_recurrence');
+  assert.equal(notifier.posted[0].taskId, task.id);
+  assert.deepEqual(notifier.posted[0].permittedActions.map(action => action.id), ['keep_todoist_only']);
+  assert.equal(notifier.posted[0].context.todoistRecurrenceText, task.due.string);
+
+  await service.processManualDelivery({
+    ...todoistDeleteDelivery(), kind: 'manual', id: 'manual-unsupported-recurrence',
+    manual: { decisionId: notifier.posted[0].decisionId, action: 'keep_todoist_only', slackUserId: 'U123' },
+  }, { async syncBlocked() { return false; } });
+  assert.equal(decisions.decisions.get(notifier.posted[0].decisionId).status, 'resolved');
+  assert.equal(providerWrites, 0);
 });
 
 test('reconciliation actions cannot be saved as automatic policies', async () => {
