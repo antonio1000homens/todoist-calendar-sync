@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   classifyCalendarRule, classifyTodoistRule, occurrenceDates, compareOccurrenceSemantics,
+  recurrenceCadenceMatchesAtDate,
 } from "../dist/recurrence-semantics.js";
 
 const london = { timeZone: "Europe/London", start: "2027-01-01" };
@@ -244,4 +245,32 @@ test("yearly and larger yearly intervals provide the full comparison window", ()
   const leap = classifyCalendarRule("RRULE:FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
     verified("2028-02-29"));
   assert.equal(occurrenceDates(leap.semantic, 12).length, 12);
+});
+
+test("canonical cadence matching uses verified DTSTART defaults and current-date phase for every frequency", () => {
+  const pairs = [
+    ["every day", "RRULE:FREQ=DAILY", "2027-01-03", "2027-01-05"],
+    ["every Wednesday", "RRULE:FREQ=WEEKLY;BYDAY=WE", "2027-01-06", "2027-01-13"],
+    ["every other Friday", "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", "2027-01-08", "2027-01-22"],
+    ["every month", "RRULE:FREQ=MONTHLY", "2027-01-15", "2027-03-15"],
+    ["every 4th Friday", "RRULE:FREQ=MONTHLY;BYDAY=4FR", "2027-01-22", "2027-02-26"],
+    ["every year", "RRULE:FREQ=YEARLY", "2027-06-06", "2028-06-06"],
+    ["every 6 June", "RRULE:FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=6", "2027-06-06", "2028-06-06"],
+  ];
+  for (const [phrase, rrule, start, due] of pairs) {
+    const calendar = classifyCalendarRule(rrule, { start, evidence });
+    const todoist = classifyTodoistRule(phrase, { start: due, evidence });
+    assert.ok(calendar.semantic && todoist.semantic, `${phrase} and ${rrule} parse`);
+    assert.equal(recurrenceCadenceMatchesAtDate(calendar.semantic, todoist.semantic, due), true,
+      `${phrase} is equivalent to ${rrule} at ${due}`);
+  }
+
+  const hondaCalendar = classifyCalendarRule("RRULE:FREQ=YEARLY", { start: "2027-06-06", evidence });
+  const hondaTodoist = classifyTodoistRule("every year", { start: "2026-11-26", evidence });
+  assert.equal(recurrenceCadenceMatchesAtDate(hondaCalendar.semantic, hondaTodoist.semantic, "2026-11-26"), false,
+    "a generic annual phrase takes its own due anchor and cannot inherit the compared Calendar month/day");
+  const offPhase = classifyCalendarRule("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=FR", { start: "2027-01-08", evidence });
+  const shiftedPhase = classifyTodoistRule("every other Friday", { start: "2027-01-15", evidence });
+  assert.equal(recurrenceCadenceMatchesAtDate(offPhase.semantic, shiftedPhase.semantic, "2027-01-15"), false,
+    "matching RRULE fields do not hide an interval phase mismatch");
 });

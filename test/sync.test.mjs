@@ -750,17 +750,24 @@ test("translates common interval, weekday and timed recurrence phrases", () => {
 
 test("translates an anchored annual month-day Todoist recurrence", () => {
   const task = { id: "annual-date", content: "Annual date", due: { date: "2027-11-01", string: "every November 1", is_recurring: true } };
-  assert.equal(todoistRecurrenceToRrule(task), "RRULE:FREQ=YEARLY");
+  const explicitAnnualRule = "RRULE:FREQ=YEARLY;BYMONTHDAY=1;BYMONTH=11";
+  assert.equal(todoistRecurrenceToRrule(task), explicitAnnualRule);
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, date: "2027-11-02" } }), undefined,
     "a month-day rule that conflicts with its due-date anchor must remain unsupported");
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, date: "2027-02-31", string: "every February 31" } }), undefined,
     "an impossible calendar date must not become a yearly rule");
-  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", string: "every November 1", is_recurring: true } }), "RRULE:FREQ=YEARLY",
-    "an offset datetime without a named timezone keeps the provider's written local date");
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", string: "every November 1", is_recurring: true } }), undefined,
+    "an offset datetime without a named timezone has no verified local recurrence anchor");
   assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T00:30:00+14:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), undefined,
     "a named timezone converts the instant to its local recurrence date before comparing the anchor");
-  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T12:30:00+00:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), "RRULE:FREQ=YEARLY",
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { datetime: "2027-11-01T12:30:00+00:00", timezone: "Europe/London", string: "every November 1", is_recurring: true } }), explicitAnnualRule,
     "a named timezone accepts an instant whose local date matches the recurrence anchor");
+  for (const phrase of ["every 1 November", "every November 1st", "every 1st November",
+    "every 1 Nov", "every Nov 1", "EVERY 1ST NOVEMBER"]) {
+    assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, string: phrase } }), explicitAnnualRule, phrase);
+  }
+  assert.equal(todoistRecurrenceToRrule({ ...task, due: { ...task.due, string: "every 2 November" } }), undefined,
+    "an explicit annual date must agree with the provider due anchor");
 });
 
 test("projects Todoist normalized timed weekly recurrence as a Calendar RRULE master", () => {

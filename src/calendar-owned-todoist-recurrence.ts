@@ -1,5 +1,9 @@
 import type { CalendarEvent, TodoistTask } from "./types.js";
 import {
+  classifyCalendarRule, classifyTodoistRule, recurrenceCadenceMatchesAtDate,
+  recurrenceCivilAnchor, recurrenceIncludesDate, type RecurrenceSemantics,
+} from "./recurrence-semantics.js";
+import {
   calendarPhaseCCandidate, calendarPhaseCInstancesConform,
   matchesCalendarPhaseCTask, type CalendarPhaseCCandidate,
 } from "./calendar-todoist-phase-c.js";
@@ -21,6 +25,8 @@ export function isPhaseCNativeCandidate(master: CalendarEvent, timeZone = master
 export interface CalendarOwnedTodoistRecurrence {
   dueString: string;
   endDate?: string;
+  /** Canonical RRULE semantics plus its verified DTSTART/timezone context. */
+  semantic?: RecurrenceSemantics;
   weekday?: string;
   rule: string;
   /** Native Todoist cadence; omitted for legacy finite-weekly rules. */
@@ -314,51 +320,48 @@ function localIsoDate(value: string, timeZone: string): string {
   return `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
-function ruleFields(rule: string): Record<string, string> | undefined {
-  const match = rule.match(/^RRULE:(.+)$/i);
-  if (!match) return undefined;
-  const fields: Record<string, string> = {};
-  for (const component of match[1].split(";")) {
-    const separator = component.indexOf("=");
-    if (separator < 1) return undefined;
-    const key = component.slice(0, separator).toUpperCase();
-    if (fields[key] !== undefined) return undefined;
-    fields[key] = component.slice(separator + 1).toUpperCase();
-  }
-  return fields;
-}
-
-
 /** Only exact, indefinitely repeating Gregorian rules can be expressed with these
  * Todoist natural-language patterns.  Finite non-weekly/UNTIL and exceptional
  * rules deliberately stay on the Calendar-owned rolling mirror path. */
-export function nativeCalendarRecurrenceCandidate(master: CalendarEvent): boolean {
+export function nativeCalendarRecurrenceCandidate(master: CalendarEvent, verifiedTimeZone = master.start?.timeZone): boolean {
   if (master.recurrence?.length !== 1) return false;
-  const phaseC = calendarPhaseCCandidate(master, master.start?.timeZone);
+  const phaseC = calendarPhaseCCandidate(master, verifiedTimeZone);
   // Without the explicit opt-in, these formerly unsupported families must
   // retain their original rolling representation and scanning policy.
   if (phaseC.family) return isPhaseCNativeCandidate(master);
-  const fields = ruleFields(master.recurrence[0]);
-  return Boolean(fields && ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"].includes(fields.FREQ)
-    && !fields.COUNT && !fields.UNTIL && (!fields.INTERVAL || (fields.FREQ === "DAILY"
-      ? Number.isInteger(Number(fields.INTERVAL)) && Number(fields.INTERVAL) >= 1 && Number(fields.INTERVAL) <= 999
-      : fields.INTERVAL === "1"))
-    && !fields.BYDAY?.includes(",") && !fields.BYMONTHDAY?.includes(",")
-    && !(fields.BYDAY && fields.BYMONTHDAY)
-    && (fields.FREQ !== "WEEKLY" || (!fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
-    && (fields.FREQ !== "DAILY" || (!fields.BYDAY && !fields.BYMONTH && !fields.BYMONTHDAY && !fields.BYSETPOS))
-    // Google commonly includes the RFC 5545 default week start explicitly.
-    // For a single weekly weekday, WKST=MO is equivalent to omitting WKST.
-    && (fields.WKST === undefined || (fields.FREQ === "WEEKLY" && fields.WKST === "MO"))
-    && Object.keys(fields).every((key) => ["FREQ", "INTERVAL", "BYDAY", "BYSETPOS", "BYMONTH", "BYMONTHDAY", "WKST"].includes(key)));
+  const start = master.start?.dateTime || master.start?.date;
+  if (!start) return false;
+  const semantic = classifyCalendarRule(master.recurrence[0], {
+    start, timeZone: verifiedTimeZone,
+  }).semantic;
+  if (!semantic || semantic.count || semantic.until) return false;
+  if (semantic.frequency === "DAILY") return semantic.interval <= 999;
+  if (semantic.interval !== 1) return false;
+  if (semantic.frequency === "WEEKLY") return !semantic.byMonthDay && !semantic.byMonth
+    && !semantic.byDay?.some((day) => day.length > 2);
+  if (semantic.frequency === "MONTHLY") return !semantic.byMonth && (
+    semantic.byDay?.length === 1 && /^(?:-1|[1-5])(?:MO|TU|WE|TH|FR)$/.test(semantic.byDay[0])
+      && !semantic.byMonthDay?.length
+    || !semantic.byDay?.length && (semantic.byMonthDay?.length || 0) <= 1);
+  return semantic.frequency === "YEARLY" && (semantic.byMonth?.length || 0) <= 1
+    && (semantic.byMonthDay?.length || 0) <= 1 && !semantic.byDay?.length;
 }
 
 function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[], timeZone: string): CalendarOwnedTodoistRecurrence | undefined {
-  if (!nativeCalendarRecurrenceCandidate(master)) return undefined;
+  if (!nativeCalendarRecurrenceCandidate(master, timeZone)) return undefined;
   const rule = master.recurrence![0];
-  const fields = ruleFields(rule)!;
   const start = master.start?.dateTime || master.start?.date;
   if (!start) return undefined;
+  const classified = classifyCalendarRule(rule, { start, timeZone });
+  const semantic = classified.semantic;
+  if (!semantic || classified.disposition === "unsupported") return undefined;
+  const fields: Record<string, string> = {
+    FREQ: semantic.frequency,
+    ...(semantic.interval !== 1 ? { INTERVAL: String(semantic.interval) } : {}),
+    ...(semantic.byDay ? { BYDAY: semantic.byDay.join(",") } : {}),
+    ...(semantic.byMonthDay ? { BYMONTHDAY: semantic.byMonthDay.join(",") } : {}),
+    ...(semantic.byMonth ? { BYMONTH: semantic.byMonth.join(",") } : {}),
+  };
   const interval = fields.INTERVAL === undefined ? 1 : Number(fields.INTERVAL);
   if (!Number.isInteger(interval) || interval < 1 || interval > 999) return undefined;
   // Newly whitelisted Phase C families use exact two-provider-verified phrases.
@@ -368,7 +371,7 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   if (phaseC?.reason === "provider_readback_required" && phaseC.semantic && phaseC.todoistPhrase) {
     if (!calendarPhaseCInstancesConform(master, instances, phaseC, timeZone)) return undefined;
     return {
-      rule, startDate: phaseC.semantic.startDate,
+      rule, semantic: phaseC.semantic, startDate: phaseC.semantic.startDate,
       ...(phaseC.semantic.localTime ? { time: phaseC.semantic.localTime } : {}),
       frequency: phaseC.semantic.frequency === "WEEKLY" ? "weekly" : "monthly",
       dueString: phaseC.todoistPhrase + " starting " + localDate(start, timeZone),
@@ -386,16 +389,11 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const time = parts.hour ? parseTime(`${parts.hour}:${parts.minute}${(parts.dayPeriod || "").toLowerCase()}`) : undefined;
   if (parts.hour && !time) return undefined;
   const timePhrase = parts.hour ? ` at ${parts.hour}:${parts.minute}${(parts.dayPeriod || "").toLowerCase()}` : "";
-  const monthlyDay = fields.FREQ === "MONTHLY" ? fields.BYDAY?.match(/^(-?[1-5])?(MO|TU|WE|TH|FR)$/) : undefined;
-  const position = monthlyDay
-    ? monthlyDay[1] ? Number(monthlyDay[1])
-      : fields.BYSETPOS && /^(?:[1-5]|-1)$/.test(fields.BYSETPOS) ? Number(fields.BYSETPOS) : undefined
-    : undefined;
+  const monthlyDay = fields.FREQ === "MONTHLY" ? fields.BYDAY?.match(/^(-1|[1-5])(MO|TU|WE|TH|FR)$/) : undefined;
+  const position = monthlyDay ? Number(monthlyDay[1]) : undefined;
   if (fields.FREQ === "MONTHLY" && fields.BYDAY && (position === undefined
     || (position !== -1 && (position < 1 || position > 5))
-    || !monthlyDay || weekdayCodes[monthlyDay[2]] !== weekday || fields.BYMONTHDAY || fields.BYMONTH
-    || (fields.BYSETPOS && monthlyDay[1]) || (fields.BYSETPOS && !/^(?:[1-5]|-1)$/.test(fields.BYSETPOS)))) return undefined;
-  if (fields.BYSETPOS && position === undefined) return undefined;
+    || !monthlyDay || weekdayCodes[monthlyDay[2]] !== weekday || fields.BYMONTHDAY || fields.BYMONTH)) return undefined;
   // A provider instance's immutable originalStartTime must satisfy the master
   // cadence. Its effective start and metadata may be an explicit occurrence
   // exception; the task keeps the base recurrence and applies that exception
@@ -430,7 +428,10 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
       const dayDelta = (Date.parse(`${originalDate}T00:00:00Z`) - Date.parse(`${anchorDate}T00:00:00Z`)) / 86_400_000;
       if (!Number.isInteger(dayDelta) || dayDelta < 0 || dayDelta % interval !== 0) return undefined;
     }
-    if (fields.FREQ === "WEEKLY" && originalWeekday !== weekday) return undefined;
+    if (fields.FREQ === "WEEKLY") {
+      const allowedWeekdays = semantic.byDay?.map((code) => weekdayCodes[code]) || [weekday];
+      if (!allowedWeekdays.includes(originalWeekday)) return undefined;
+    }
     if (fields.FREQ === "MONTHLY" && (position !== undefined
       ? !matchingMonthlyWeekday(
         `${originalParts.year}-${String(originalMonth).padStart(2, "0")}-${String(originalDay).padStart(2, "0")}`,
@@ -441,15 +442,19 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
   const startPhrase = localDate(start, timeZone);
   // The UTC date of an offset timestamp can differ from its Calendar-local day.
   const recurrenceStartIsoDate = `${parts.year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const base = { rule, startDate: recurrenceStartIsoDate, ...(time ? { time } : {}) };
+  const base = { rule, semantic, startDate: recurrenceStartIsoDate, ...(time ? { time } : {}) };
   if (fields.FREQ === "DAILY") {
     return { ...base, frequency: "daily", ...(interval > 1 ? { interval } : {}),
       dueString: `every ${interval > 1 ? `${interval} days` : "day"}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "WEEKLY") {
-    if (fields.BYMONTH || fields.BYMONTHDAY
-      || (fields.BYDAY && fields.BYDAY !== Object.keys(weekdayCodes).find((code) => weekdayCodes[code] === weekday))) return undefined;
-    return { ...base, frequency: "weekly", weekday, dueString: `every ${weekday}${timePhrase} starting ${startPhrase}` };
+    const byDays = semantic.byDay?.map((code) => weekdayCodes[code]);
+    const weekdays = byDays?.length ? byDays : [weekday];
+    if (fields.BYMONTH || fields.BYMONTHDAY || weekdays.some((value) => !value)
+      || !weekdays.includes(weekday)) return undefined;
+    const weekdayPhrase = weekdays.join(", ");
+    return { ...base, frequency: "weekly", ...(weekdays.length === 1 ? { weekday } : {}),
+      dueString: `every ${weekdayPhrase}${timePhrase} starting ${startPhrase}` };
   }
   if (fields.FREQ === "MONTHLY") {
     if (position !== undefined) {
@@ -473,50 +478,44 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
 
 /** Parse Todoist's normalized, possibly start-date-free representation.
  * Only a single cadence is accepted; unrecognized modifiers fail closed. */
-function parseOpenTodoistRule(value: string | undefined): {
+function parseOpenTodoistRule(value: string | undefined, task: TodoistTask, verifiedTimeZone?: string): {
   frequency: "daily" | "weekly" | "monthly" | "yearly"; interval?: number; weekday?: string;
   dayOfMonth?: number; monthlyOrdinal?: number; month?: number; time?: string; start?: ParsedDate;
+  semantic: RecurrenceSemantics;
 } | undefined {
   if (!value) return undefined;
-  const match = value.trim().replace(/\s+/g, " ").match(/^every\s+(.+?)(?:\s+starting(?:\s+on)?\s+(.+))?$/i);
-  if (!match) return undefined;
-  const withTime = match[1].match(/^(.+?)(?:\s+(?:at\s+)?(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm)))?$/i);
-  if (!withTime) return undefined;
-  const name = withTime[1].trim().toLowerCase();
-  const time = withTime[2] ? parseTime(withTime[2]) : undefined;
-  if (withTime[2] && !time) return undefined;
-  const start = match[2] ? parseNaturalDate(match[2]) : undefined;
-  if (match[2] && !start) return undefined;
-  const extra = { ...(time ? { time } : {}), ...(start ? { start } : {}) };
-  const daily = name.match(/^(?:(\d+)\s+)?days?$/);
-  if (daily) {
-    const interval = Number(daily[1] || 1);
-    if (!Number.isInteger(interval) || interval < 1 || interval > 999) return undefined;
-    return { frequency: "daily", ...(interval > 1 ? { interval } : {}), ...extra };
-  }
-  const weekday = weekdayLookup.get(name);
-  if (weekday) return { frequency: "weekly", weekday, ...extra };
-  const ordinal = name.match(/^(1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|last)\s+([a-z]+)(?:\s+of\s+(?:the\s+)?month)?$/);
-  if (ordinal) {
-    const position = ordinal[1] === "last" ? -1
-      : ordinalLabels.indexOf(ordinal[1]) !== -1 ? ordinalLabels.indexOf(ordinal[1]) + 1
-        : ordinalWords.indexOf(ordinal[1]) + 1;
-    const dayName = weekdayLookup.get(ordinal[2]);
-    if (position && dayName && ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].includes(dayName))
-      return { frequency: "monthly", weekday: dayName, monthlyOrdinal: position, ...extra };
-    return undefined;
-  }
-  const monthly = name.match(/^(\d{1,2})(?:st|nd|rd|th)?$/);
-  if (monthly && Number(monthly[1]) >= 1 && Number(monthly[1]) <= 28)
-    return { frequency: "monthly", dayOfMonth: Number(monthly[1]), ...extra };
-  const yearly = name.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)$|^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
-  if (yearly) {
-    const day = Number(yearly[1] || yearly[4]);
-    const month = monthLookup.get((yearly[2] || yearly[3]).toLowerCase());
-    if (month && day >= 1 && day <= 31 && !(month === 2 && day === 29))
-      return { frequency: "yearly", dayOfMonth: day, month, ...extra };
-  }
-  return undefined;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  const starting = normalized.match(/^(.*?)\s+starting(?:\s+on)?\s+(.+)$/i);
+  const expression = starting ? starting[1] : normalized;
+  const start = starting ? parseNaturalDate(starting[2]) : undefined;
+  if (starting && !start) return undefined;
+  const dueAnchor = task.due?.datetime || task.due?.date;
+  if (!dueAnchor) return undefined;
+  const anchor = recurrenceCivilAnchor(dueAnchor, verifiedTimeZone);
+  if (!anchor) return undefined;
+  const classification = classifyTodoistRule(expression, { start: dueAnchor, timeZone: verifiedTimeZone });
+  const semantic = classification.semantic;
+  if (!semantic) return undefined;
+  const frequency = semantic.frequency.toLowerCase() as "daily" | "weekly" | "monthly" | "yearly";
+  const byDay = semantic.byDay?.length === 1 ? semantic.byDay[0] : undefined;
+  const ordinal = byDay && /^(-1|[1-5])(?:MO|TU|WE|TH|FR)$/.exec(byDay);
+  const weekdayCode = ordinal ? byDay!.slice(ordinal[1].length) : byDay;
+  const weekday = weekdayCode ? weekdayCodes[weekdayCode] : undefined;
+  if (semantic.byDay?.length && !weekday) return undefined;
+  const month = semantic.byMonth?.length === 1 ? semantic.byMonth[0] : Number(anchor.date.slice(5, 7));
+  const dayOfMonth = semantic.byMonthDay?.length === 1 ? semantic.byMonthDay[0] : Number(anchor.date.slice(8, 10));
+  if (frequency === "yearly" && month === 2 && dayOfMonth === 29) return undefined;
+  return {
+    frequency,
+    ...(semantic.interval > 1 ? { interval: semantic.interval } : {}),
+    ...(frequency === "weekly" ? { weekday: weekday || weekdayNames[new Date(anchor.date + "T00:00:00Z").getUTCDay()] } : {}),
+    ...(frequency === "monthly" && ordinal ? { weekday, monthlyOrdinal: Number(ordinal[1]) } : {}),
+    ...(frequency === "monthly" && !ordinal ? { dayOfMonth } : {}),
+    ...(frequency === "yearly" ? { month, dayOfMonth } : {}),
+    ...(semantic.localTime ? { time: semantic.localTime } : anchor.time ? { time: anchor.time } : {}),
+    ...(start ? { start } : {}),
+    semantic,
+  };
 }
 
 function openRuleMatches(
@@ -525,7 +524,7 @@ function openRuleMatches(
   verifiedTimeZone?: string,
   occurrence?: CalendarEvent,
 ): { matches: boolean; ruleMatches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule> } {
-  const parsed = parseOpenTodoistRule(task.due?.string);
+  const parsed = parseOpenTodoistRule(task.due?.string, task, verifiedTimeZone);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
   const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
@@ -552,21 +551,8 @@ function openRuleMatches(
       }
     } else if (verifiedTimeZone) currentDay = due.slice(0, 10);
   }
-  const expectedCadenceDate = Boolean(currentDay && (() => {
-    const parsedDate = parseNaturalDate(currentDay);
-    if (!parsedDate || (recurrence.startDate && currentDay < recurrence.startDate)) return false;
-    if (recurrence.frequency === "daily") {
-      const anchor = recurrence.startDate || currentDay;
-      const elapsed = (Date.parse(`${currentDay}T00:00:00Z`) - Date.parse(`${anchor}T00:00:00Z`)) / 86_400_000;
-      return Number.isInteger(elapsed) && elapsed >= 0 && elapsed % (recurrence.interval || 1) === 0;
-    }
-    if (recurrence.frequency === "monthly" && recurrence.monthlyOrdinal !== undefined)
-      return Boolean(recurrence.weekday && matchingMonthlyWeekday(currentDay, recurrence.weekday, recurrence.monthlyOrdinal));
-    if (recurrence.frequency === "monthly") return parsedDate.day === recurrence.dayOfMonth;
-    if (recurrence.frequency === "yearly") return parsedDate.day === recurrence.dayOfMonth && parsedDate.month === recurrence.month;
-    const instant = new Date(currentDay + "T12:00:00Z");
-    return weekdayNames[instant.getUTCDay()] === recurrence.weekday;
-  })());
+  const expectedCadenceDate = Boolean(currentDay && recurrence.semantic
+    && recurrenceIncludesDate(recurrence.semantic, currentDay));
   // Provider due time and zone are semantic readback, not just phrase text.
   const zoneMatches = !task.due?.timezone || task.due.timezone === verifiedTimeZone;
   const dueValue = task.due?.datetime || task.due?.date;
@@ -587,7 +573,10 @@ function openRuleMatches(
     } else observedTime = timeValue.slice(11, 16);
   }
   const timeMatches = recurrence.time ? observedTime === recurrence.time : Boolean(timeValue && !timeValue.includes("T"));
+  const semanticMatch = Boolean(recurrence.semantic && parsed?.semantic && currentDay
+    && recurrenceCadenceMatchesAtDate(recurrence.semantic, parsed.semantic, currentDay));
   const ruleMatches = Boolean(task.due?.is_recurring && parsed && correctStart && expectedCadenceDate && zoneMatches && timeMatches
+    && semanticMatch
     && parsed.frequency === recurrence.frequency
     && parsed.interval === recurrence.interval
     && parsed.weekday === recurrence.weekday
@@ -611,14 +600,14 @@ export async function verifiedCalendarOwnedRecurrence(
   timeZone: string,
   listExplicitSeriesExceptions?: (masterId: string) => Promise<CalendarEvent[]>,
 ): Promise<CalendarOwnedTodoistRecurrence | undefined> {
-  if (!nativeCalendarRecurrenceCandidate(master) && !finiteWeeklyCalendarRuleCandidate(master)) {
+  if (!nativeCalendarRecurrenceCandidate(master, timeZone) && !finiteWeeklyCalendarRuleCandidate(master, timeZone)) {
     return calendarOwnedTodoistRecurrence(master, instances, timeZone);
   }
   // A finite COUNT rule plus a fully paginated instances endpoint is itself a
   // complete inventory, including canceled exceptions. Open-ended series need
   // the dedicated exception list because a bounded range cannot prove there
   // are no exceptions outside it.
-  if (finiteWeeklyCalendarRuleCandidate(master)) return calendarOwnedTodoistRecurrence(master, instances, timeZone);
+  if (finiteWeeklyCalendarRuleCandidate(master, timeZone)) return calendarOwnedTodoistRecurrence(master, instances, timeZone);
   if (!listExplicitSeriesExceptions) return undefined;
   const exceptions = await listExplicitSeriesExceptions(master.id);
   const exceptionById = new Map<string, CalendarEvent>();
@@ -676,12 +665,17 @@ export async function verifiedCalendarOwnedRecurrence(
   return calendarOwnedTodoistRecurrence(master, [...combined.values()], timeZone);
 }
 
-export function finiteWeeklyCalendarRuleCandidate(master: CalendarEvent): boolean {
+export function finiteWeeklyCalendarRuleCandidate(master: CalendarEvent, verifiedTimeZone = master.start?.timeZone): boolean {
   if (master.recurrence?.length !== 1) return false;
-  const fields = ruleFields(master.recurrence[0]);
-  const count = Number(fields?.COUNT);
-  return Boolean(fields?.FREQ === "WEEKLY" && !fields.INTERVAL && !fields.UNTIL
-    && Number.isInteger(count) && count >= 2 && count <= 1000);
+  const start = master.start?.dateTime || master.start?.date;
+  if (!start) return false;
+  const semantic = classifyCalendarRule(master.recurrence[0], {
+    start, timeZone: verifiedTimeZone,
+  }).semantic;
+  return Boolean(semantic?.frequency === "WEEKLY" && semantic.interval === 1
+    && semantic.count !== undefined && semantic.count >= 2 && semantic.count <= 1000
+    && !semantic.until && (!semantic.byDay || semantic.byDay.length === 1
+      && semantic.byDay[0].length === 2));
 }
 
 /**
@@ -698,19 +692,17 @@ export function calendarOwnedTodoistRecurrence(
   const open = openCalendarRecurrence(master, instances, timeZone);
   if (open) return open;
   const rule = master.recurrence[0];
-  const fields = ruleFields(rule);
-  const count = Number(fields?.COUNT);
-  if (!fields || fields.FREQ !== "WEEKLY" || fields.INTERVAL
-    || !Number.isInteger(count) || count < 2 || count > 1000 || fields.UNTIL || fields.BYMONTHDAY || fields.BYSETPOS
-    || fields.BYYEARDAY || fields.BYWEEKNO || fields.BYMONTH || fields.BYHOUR || fields.BYMINUTE
-    || fields.BYSECOND || fields.BYSETPOS) return undefined;
-
   const startValue = master.start?.dateTime || master.start?.date;
   if (!startValue) return undefined;
+  const semantic = classifyCalendarRule(rule, { start: startValue, timeZone }).semantic;
+  const count = semantic?.count;
+  if (!semantic || semantic.frequency !== "WEEKLY" || semantic.interval !== 1
+    || !count || count < 2 || count > 1000 || semantic.until
+    || semantic.byDay && (semantic.byDay.length !== 1 || semantic.byDay[0].length !== 2)) return undefined;
   const startParts = localParts(startValue, timeZone);
   const startWeekday = weekdayNames.find((name) => name.toLowerCase().startsWith(startParts.weekday.toLowerCase()));
   if (!startWeekday) return undefined;
-  const byDay = fields.BYDAY?.split(",");
+  const byDay = semantic.byDay;
   const weekday = byDay?.length === 1 && weekdayCodes[byDay[0]]
     ? weekdayCodes[byDay[0]] : !byDay ? startWeekday : undefined;
   if (!weekday || weekday !== startWeekday) return undefined;

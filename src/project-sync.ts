@@ -10,6 +10,7 @@ import { hasGuardedRecoveryDispatchCandidate } from "./guarded-recovery-dispatch
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import { executePhaseBNativeMove } from "./todoist-phase-b-native-move-executor.js";
 import {
+  calendarRuleMatches,
   calendarRecurrenceMatchesTodoist,
   recurrenceEffectiveStart,
   recurrenceOriginalStart,
@@ -468,6 +469,18 @@ export class ProjectAwareSynchronizer {
         && todoistPhaseBCandidate(rawPayload.event_data, {
           start: originalDue, source: "verified_original_schedule",
         }).reason === "provider_readback_required");
+      const phaseBFamily = Boolean(task.due?.is_recurring && originalDue
+        && todoistPhaseBCandidate(task, {
+          start: originalDue, source: "verified_current_schedule",
+        }).family);
+      if (transition.action === "create_projection" && explicitProjectChange && phaseBFamily
+        && mapping?.todoistPhaseBVersion !== 1 && !nativeSource && !mapping?.seriesId) {
+        return this.state.audit(mapping?.profile || transition.fromProfile || delivery.profile,
+          "todoist_project_recurrence_unsupported", {
+            taskId: task.id, fromProfile: transition.fromProfile, toProfile: transition.toProfile,
+            outcome: "source_left_unchanged", existingMirrorPreserved: Boolean(mapping), nonBlocking: true,
+          });
+      }
       if ((transition.action === "move_projection" || transition.action === "create_projection")
         && lifecycle.action === "upsert" && task.due?.is_recurring
         && !todoistRecurrenceToRrule(task)
@@ -698,7 +711,7 @@ export class ProjectAwareSynchronizer {
     }
     if (!approved && existingEvent?.status === "cancelled") existingEvent = undefined;
     const calendarWriteRequired = !existingEvent || !hasCanonicalState(existingEvent, task)
-      || Boolean(requestedRrule && !existingEvent.recurrence?.includes(requestedRrule));
+      || Boolean(requestedRrule && !calendarRuleMatches(existingEvent, requestedRrule));
     const stored = existingEvent && !calendarWriteRequired
       ? existingEvent
       : approved
@@ -707,7 +720,7 @@ export class ProjectAwareSynchronizer {
         )
         : await clients.calendar.upsertEvent(toCalendarEvent(task, existingEvent), existingEvent?.id);
     if (calendarWriteRequired) await this.state.recordMutation(destinationProfile);
-    if (requestedRrule && !stored.recurrence?.includes(requestedRrule)) {
+    if (requestedRrule && !calendarRuleMatches(stored, requestedRrule)) {
       let rollback = "unavailable";
       try {
         if (existingEvent && existingEvent.id === stored.id && stored.etag) {

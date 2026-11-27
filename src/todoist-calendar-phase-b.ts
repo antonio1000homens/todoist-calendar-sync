@@ -48,16 +48,13 @@ export interface TodoistPhaseBProviderReadback {
   timeZoneVerified: boolean;
 }
 
-const clockSuffix = /\s+(?:at\s+)?(?:(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[ap]m)?|(?:0?[1-9]|1[0-2])\s*[ap]m)$/i;
-const weekdays = "(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday|s)?|thu(?:rs(?:day)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)";
-
-function familyFor(key: string): TodoistPhaseBFamily | undefined {
-  const phrase = key.replace(clockSuffix, "").trim();
-  if (/^every\s+\d{1,2}(?:\s*,\s*\d{1,2})+$/.test(phrase)) return "multi_month_day";
-  if (new RegExp("^every\\s+other\\s+" + weekdays + "$").test(phrase)) return "alternate_weekday";
-  if (phrase === "every quarter" || phrase === "quarterly" || phrase === "every quarterly"
-    || phrase === "every 3 months") return "quarterly";
-  if (/^every\s+[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?$/.test(phrase)) return "fixed_annual_date";
+function familyFor(semantic: RecurrenceSemantics): TodoistPhaseBFamily | undefined {
+  if (semantic.frequency === "MONTHLY" && (semantic.byMonthDay?.length || 0) > 1) return "multi_month_day";
+  if (semantic.frequency === "WEEKLY" && semantic.interval === 2 && semantic.byDay?.length === 1) return "alternate_weekday";
+  if (semantic.frequency === "MONTHLY" && semantic.interval === 3
+    && !semantic.byMonthDay?.length && !semantic.byDay?.length) return "quarterly";
+  if (semantic.frequency === "YEARLY" && semantic.byMonth?.length === 1
+    && semantic.byMonthDay?.length === 1) return "fixed_annual_date";
   return undefined;
 }
 
@@ -89,16 +86,16 @@ function localDue(task: TodoistTask, timeZone?: string, allowFloating = false): 
 function candidate(task: TodoistTask, anchor?: TodoistPhaseBAnchor): TodoistPhaseBResult {
   const key = todoistRecurrenceKey(task);
   if (!key) return { disposition: "unsupported", reason: "not_recurring" };
-  const family = familyFor(key);
-  if (!family) return { disposition: "unsupported", reason: "not_phase_b_family" };
   const due = localDue(task, anchor?.timeZone || task.due?.timezone,
     Boolean(anchor?.timeZone && anchor.timeZone === task.due?.timezone));
-  if (!due) return { disposition: "rolling_required", reason: "invalid_or_unverified_due", family };
+  if (!due) return { disposition: "rolling_required", reason: "invalid_or_unverified_due" };
   // A current Todoist due date is only a parser hint, never the original
   // DTSTART for a newly promoted recurrence.
   const context = { start: anchor?.start || (due.time ? (task.due?.datetime || task.due?.date || "") : due.date),
     timeZone: anchor?.timeZone || task.due?.timezone };
   const classified = classifyTodoistRule(key, context);
+  const family = classified.semantic && familyFor(classified.semantic);
+  if (!family) return { disposition: "unsupported", reason: "not_phase_b_family" };
   if (!classified.semantic || !classified.canonicalRrule)
     return { disposition: classified.disposition === "unsupported" ? "unsupported" : "rolling_required",
       reason: classified.reason, family };

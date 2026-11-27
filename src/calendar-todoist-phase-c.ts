@@ -114,11 +114,12 @@ function normalizedTaskMatches(task: TodoistTask, candidate: CalendarPhaseCCandi
   const semantic = candidate.semantic;
   if (!semantic || !task.due?.is_recurring || !task.due.string) return false;
   const normalized = task.due.string.trim().replace(/\s+/g, " ");
+  const expression = normalized.replace(/\s+starting(?:\s+on)?\s+.+$/i, "");
   if (semantic.localTime) {
     if (phraseTime(normalized) !== semantic.localTime) return false;
   } else if (/\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)$/i.test(normalized)
     || /\s+(?:at\s+)?(?:[01]?\d|2[0-3]):[0-5]\d$/i.test(normalized)) return false;
-  const parsed = classifyTodoistRule(normalized, { start: anchor, timeZone: zone });
+  const parsed = classifyTodoistRule(expression, { start: anchor, timeZone: zone });
   return Boolean(parsed.semantic && parsed.canonicalRrule === candidate.candidateRrule
     && compareOccurrenceSemantics(semantic, parsed.semantic).equivalent);
 }

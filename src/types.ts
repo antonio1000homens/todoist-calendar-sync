@@ -245,7 +245,7 @@ export interface Mapping {
 }
 
 export interface ProviderSyncBaseline {
-  version: 1;
+  version: 1 | 2;
   todoist: { content: string; description: string; due: string; recurrence?: string };
   calendar: { status: string; summary: string; description: string; start: string; recurrence?: string };
   updatedAt: string;

@@ -449,7 +449,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
         if (delivery && action !== "todoist_erased_item_replay_suppressed"
           && action !== "erasure_project_comment_replay_suppressed"
           && action !== "erasure_replay_admission_suppressed") {
-          const observedCase = await manual?.observeAudit(delivery, profile, action, detail);
+          const observedCase = await manual?.observeAudit(delivery, profile, action, detail, state!);
           if (delivery.kind === "reconcile" && delivery.reconcile?.generation) {
             try {
               let linkedCase = observedCase;

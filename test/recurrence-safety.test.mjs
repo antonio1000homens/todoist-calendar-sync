@@ -77,6 +77,7 @@ function mappingFromLink(link) {
     ...(link.calendarProgressVersion === 1 ? { calendarProgressVersion: 1 } : {}),
     ...(link.todoistPhaseBVersion === 1 ? { todoistPhaseBVersion: 1 } : {}),
     ...(link.completedThroughOriginalStart ? { completedThroughOriginalStart: link.completedThroughOriginalStart } : {}),
+    ...(link.syncBaseline ? { syncBaseline: link.syncBaseline } : {}),
     updatedAt: link.updatedAt,
   };
 }
@@ -567,8 +568,14 @@ test("Calendar series rule edit updates the exact native Todoist task in place",
     description: "", start: structuredClone(current.start), end: structuredClone(current.end),
     recurrence: ["RRULE:FREQ=YEARLY"], etag: "master-etag",
   };
+  link.syncBaseline = providerSyncBaseline(task, current, { ...master,
+    recurrence: ["RRULE:FREQ=WEEKLY"] });
+  state.links[0].syncBaseline = link.syncBaseline;
+  state.storeMapping({ ...mappingFromLink(link), projectId: profiles[PROFILE].todoistProjectId,
+    calendarId: profiles[PROFILE].calendarId });
   const clients = fakeClients(state, [current, next], tasks, undefined, [master]);
   const sync = new Synchronizer(state, undefined, async () => clients);
+  assert.ok((await sync.providerMappingByTask(PROFILE, task.id, clients.todoist))?.syncBaseline);
 
   await sync.applyCalendarSeries({ id: "calendar-rule-edit", kind: "calendar", profile: PROFILE,
     mode: "aws", receivedAt: "2026-10-26T12:00:00Z", headers: {}, body: "" }, master, clients.todoist);
@@ -1523,7 +1530,11 @@ test("Calendar series rule edit updates the Todoist-owned task without replacing
   const successor = todoistInstance(projected.id, task.id, "instance-8", "2099-01-08");
   const edited = { ...projected, recurrence: ["RRULE:FREQ=WEEKLY"] };
   const link = todoistOwnedLink(projected, active, task.id);
+  link.syncBaseline = providerSyncBaseline(task, active, projected);
   const state = new FakeState(link);
+  state.links[0].syncBaseline = link.syncBaseline;
+  state.storeMapping({ ...mappingFromLink(link), projectId: profiles[PROFILE].todoistProjectId,
+    calendarId: profiles[PROFILE].calendarId });
   const tasks = new Map([[task.id, task]]);
   const clients = fakeClients(state, [active, successor], tasks, edited);
   const sync = new Synchronizer(state, undefined, async () => clients);
@@ -1608,11 +1619,9 @@ for (const shape of ["title-date", "shared-master", "shared-instance", "one-off-
     await sync.process(delivery);
     await sync.process({...delivery,id:"retry"});
     if (shape === "recurring-existing-mirror") {
-      assert.equal(clients.todoistUpserts.length, 1);
-      assert.equal(clients.todoistUpserts[0].existingId, task.id);
-      assert.equal(clients.tasks.get(task.id).due.is_recurring, true);
-      assert.match(clients.tasks.get(task.id).due.string, /starting 1 Jan 2099/i);
-      assert.equal(state.audits.some(item => item.action === "calendar_snapshot_recurring_identity_conflict"), false);
+      assert.equal(clients.todoistUpserts.length, 0);
+      assert.equal(clients.tasks.get(task.id).due.string, "every week");
+      assert.equal(state.audits.some(item => item.action === "calendar_snapshot_recurring_identity_conflict"), true);
     } else {
       assert.deepEqual(clients.todoistUpserts,[]);
       assert.equal(state.audits.filter(item => item.action === "calendar_snapshot_recurring_identity_conflict").length,2);

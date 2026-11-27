@@ -11,11 +11,11 @@ import { StateRepository } from "./repository.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
 import {
+  calendarRuleMatches,
   calendarRecurrenceMatchesTodoist,
   isTodoistOwnedCalendarRecurrence,
   recurrenceEffectiveStart,
   recurrenceOriginalStart,
-  normalizedRecurrenceRule,
   selectNextEffectiveTodoistInstance,
   selectTodoistCurrentInstance,
   todoistRecurrenceKey,
@@ -278,19 +278,18 @@ export async function discoverCompatibleCalendarCandidates(
     return matches;
   }
 
-  const expectedRule = normalizedRecurrenceRule(todoistRecurrenceToRrule(task));
-  if (!expectedRule) return [];
+  if (!todoistRecurrenceToRrule(task)) return [];
   const recurrenceKey = todoistRecurrenceKey(task);
   const potentialMasters = inventory.filter(master => master.status !== "cancelled"
     && !master.recurringEventId && Boolean(master.recurrence?.length)
-    && master.recurrence!.some(rule => normalizedRecurrenceRule(rule) === expectedRule)
+    && calendarRecurrenceMatchesTodoist(master, task)
     && (!master.extendedProperties?.shared?.todoistRecurrence
       || master.extendedProperties.shared.todoistRecurrence === recurrenceKey));
   const matches: CompatibleCalendarCandidate[] = [];
   for (const listedMaster of potentialMasters) {
     const master = await calendar.getEvent(listedMaster.id);
     if (master.status === "cancelled" || master.recurringEventId || !master.recurrence?.length
-      || !master.recurrence.some(rule => normalizedRecurrenceRule(rule) === expectedRule)
+      || !calendarRecurrenceMatchesTodoist(master, task)
       || master.extendedProperties?.shared?.todoistRecurrence
         && master.extendedProperties.shared.todoistRecurrence !== recurrenceKey) continue;
     const instances = await listBoundedRecurrenceInstances(calendar, master.id,
@@ -967,11 +966,16 @@ export class Synchronizer {
       });
     const oldDue = oldTask?.due?.datetime || oldTask?.due?.date || mapping.activeEffectiveStart;
     const nextDue = task.due?.datetime || task.due?.date;
-    const nextRule = todoistRecurrenceToRrule(task);
+    if (!mapping.masterEventId) return unsupported("recurrence_or_identity_changed");
+    const master = await calendar.getEvent(mapping.masterEventId);
+    const masterStart = master.start?.dateTime || master.start?.date;
+    const recurrenceAnchor = masterStart ? { start: masterStart, timeZone: master.start?.timeZone } : undefined;
+    const nextRule = recurrenceAnchor ? todoistRecurrenceToRrule(task, recurrenceAnchor) : undefined;
+    const oldRule = oldTask && recurrenceAnchor ? todoistRecurrenceToRrule(oldTask, recurrenceAnchor) : nextRule;
     if (!mapping.masterEventId || !mapping.activeInstanceId || !mapping.originalStart
       || (oldTask && !oldTask.due?.is_recurring) || !task.due?.is_recurring || !oldDue || !nextDue
       || !nextRule
-      || (oldTask && (todoistRecurrenceToRrule(oldTask) !== nextRule
+      || (oldTask && (oldRule !== nextRule
         || todoistRecurrenceKey(oldTask) !== todoistRecurrenceKey(task)
         || oldTask.due?.timezone !== task.due?.timezone))) return unsupported("recurrence_or_identity_changed");
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
@@ -981,7 +985,6 @@ export class Synchronizer {
       });
     }
 
-    const master = await calendar.getEvent(mapping.masterEventId);
     const current = await calendar.getEvent(mapping.activeInstanceId);
     const masterTaskId = master.extendedProperties?.shared?.taskId;
     const masterShared = master.extendedProperties?.shared;
@@ -1002,7 +1005,7 @@ export class Synchronizer {
       || sameStart(mapping.activeEffectiveStart, oldDue);
     if (mapping.profile !== delivery.profile || mapping.taskId !== task.id
       || task.project_id !== profiles[delivery.profile].todoistProjectId
-      || master.id !== mapping.masterEventId || master.status !== "confirmed" || !master.recurrence?.includes(nextRule)
+      || master.id !== mapping.masterEventId || master.status !== "confirmed" || !calendarRuleMatches(master, nextRule)
       || masterTaskId !== task.id
       || (masterShared?.todoistRecurrence && masterShared.todoistRecurrence !== todoistRecurrenceKey(task))
       || (masterShared?.syncProfile && masterShared.syncProfile !== delivery.profile)
@@ -1161,8 +1164,7 @@ export class Synchronizer {
       || mapping?.taskId !== taskId || mapping?.masterEventId !== masterEventId) reasons.push("mapping_identity_mismatch");
     if (!task.due?.is_recurring || master.status === "cancelled" || !master.recurrence?.length)
       reasons.push("recurrence_object_not_live");
-    if (!(calendarRecurrenceMatchesTodoist(master, task)
-      || Boolean(expectedRule && master.recurrence?.includes(expectedRule)))) reasons.push("recurrence_rule_mismatch");
+    if (!calendarRecurrenceMatchesTodoist(master, task)) reasons.push("recurrence_rule_mismatch");
     if (!exactSeriesId || !exactMappingEvent || !exactMasterCorrelation) reasons.push("provider_correlation_mismatch");
     if (!exactActiveInstance) reasons.push("active_occurrence_mismatch");
     if (reasons.length) {
@@ -1817,7 +1819,7 @@ export class Synchronizer {
         const canBootstrapProviderBaseline = Boolean(exactMapping && !exactMapping.syncBaseline
           && exactMapping.profile === profile && exactMapping.taskId === exactTask.id
           && exactMapping.masterEventId === master.id && shared.taskId === exactTask.id
-          && expectedRule && master.recurrence?.includes(expectedRule)
+          && expectedRule && calendarRuleMatches(master, expectedRule)
           && mappedActive?.status === "confirmed" && mappedActive.recurringEventId === master.id
           && startsMatch(mappedActive, exactTask)
           && normalizedText(master.summary) === normalizedText(exactTask.content)
@@ -3128,12 +3130,13 @@ export class Synchronizer {
       && existing?.taskId === task.id && existing.masterEventId === master.id
       && (existing.seriesId === seriesId
         || existing.seriesId === task.id)
-      && startsMatch(active, task)
       && !conflictingIds.length
       && !matchesCalendarOwnedRecurringRule(task, calendarRecurrence, calendarTimeZone));
     if (exactCalendarRuleEdit && task) {
       const providerMapping = await this.providerMappingByTask(delivery.profile, task.id, todoist);
       const linkVerified = providerMapping?.profile === delivery.profile
+        && providerMapping.projectId === profiles[delivery.profile].todoistProjectId
+        && providerMapping.calendarId === profiles[delivery.profile].calendarId
         && providerMapping.taskId === task.id
         && (providerMapping.seriesId === seriesId
           || isTodoistNativeSeries(providerMapping) && providerMapping.seriesId === task.id)
@@ -3145,6 +3148,22 @@ export class Synchronizer {
         });
         return "blocked";
       }
+      const baseline = providerMapping?.syncBaseline;
+      const observed = providerSyncBaseline(task, active, master);
+      const recurrenceChanges = providerRecurrenceChanges(task, master, baseline);
+      // Recurrence authority is a field-level comparison: Todoist must still
+      // match the shared baseline while Calendar alone changed. Due alignment
+      // only relaxes the separate due-anchor check for the active occurrence.
+      if (!baseline?.todoist.recurrence || !recurrenceChanges
+        || recurrenceChanges.todoistChanged || !recurrenceChanges.calendarChanged
+        || !startsMatch(active, task) && (!baseline.todoist.due
+          || observed.todoist.due !== baseline.todoist.due)) {
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "todoist_recurrence_changed_since_verified_baseline",
+        });
+        return "blocked";
+      }
       if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
         await this.state.audit(delivery.profile, "calendar_recurrence_rule_edit_suppressed", {
           seriesId, masterEventId: master.id, taskId: task.id, mode: delivery.mode,
@@ -3152,6 +3171,17 @@ export class Synchronizer {
         return "blocked";
       }
       const priorTask = task;
+      const liveTask = await todoist.getTask(task.id);
+      const liveChanges = providerRecurrenceChanges(liveTask, master, baseline);
+      if (liveTask.updated_at !== priorTask.updated_at
+        || providerSyncBaseline(liveTask, active, master).todoist.due !== observed.todoist.due
+        || !liveChanges || liveChanges.todoistChanged) {
+        await this.state.audit(delivery.profile, "calendar_snapshot_recurring_identity_conflict", {
+          seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [task.id],
+          reason: "todoist_recurrence_changed_before_guarded_repair",
+        });
+        return "blocked";
+      }
       const updated = await todoist.upsertTask(
         calendarOwnedRecurringTaskPayload(active, calendarRecurrence!, calendarTimeZone), task.id,
       );
@@ -3773,7 +3803,6 @@ export class Synchronizer {
     const oldTaskForDateEdit = payload.event_data_extra?.old_item;
     const recurrenceRuleUnchanged = !oldTaskForDateEdit || Boolean(oldTaskForDateEdit.due?.is_recurring
       && task.due?.is_recurring
-      && todoistRecurrenceToRrule(oldTaskForDateEdit) === todoistRecurrenceToRrule(task)
       && todoistRecurrenceKey(oldTaskForDateEdit) === todoistRecurrenceKey(task)
       && oldTaskForDateEdit.due?.timezone === task.due?.timezone);
     if (lifecycle.action === "upsert" && recurringDateEdit && recurrenceRuleUnchanged && mapping?.masterEventId) {
@@ -4144,7 +4173,7 @@ export class Synchronizer {
       if (current?.due?.is_recurring && !todoistRecurrenceToRrule(current) && !hasVerifiedPhaseBNativeMaster) {
         return this.state.audit(delivery.profile, "todoist_recurrence_unsupported_rule", {
           taskId: task.id, eventId: mapping.eventId,
-          existingMirrorPreserved: true, outcome: "source_left_unchanged",
+          existingMirrorPreserved: true, outcome: "source_left_unchanged", nonBlocking: true,
         });
       }
       if (current?.due?.is_recurring && (todoistRecurrenceToRrule(current) || hasVerifiedPhaseBNativeMaster)
@@ -4255,7 +4284,7 @@ export class Synchronizer {
         }
         return "not_attempted";
       };
-      if (!readback.recurrence?.includes(projectedRrule)) {
+      if (!calendarRuleMatches(readback, projectedRrule)) {
         const rollback = await rollbackUnverifiedWrite();
         await this.state.audit(delivery.profile, "todoist_recurrence_completion_readback_mismatch", {
           taskId: task.id, eventId: stored.id, expectedRrule: projectedRrule,
@@ -4663,7 +4692,14 @@ export class Synchronizer {
       && (existingShared.todoistPhaseBVersion === "1"
         || isTodoistNativeSeries(mapping) && mapping.masterEventId === existingEvent.id
           && existingShared.syncSeriesId === task.id));
-    if (task.due?.is_recurring && !todoistRecurrenceToRrule(task) && (existingEvent || mapping)
+    const mappedRecurrenceAnchor = existingEvent?.recurrence?.length
+      ? existingEvent.start?.dateTime || existingEvent.start?.date
+      : undefined;
+    const mappedRecurrenceZone = existingEvent?.start?.timeZone || task.due?.timezone;
+    const mappedDesiredRrule = mappedRecurrenceAnchor
+      ? todoistRecurrenceToRrule(task, { start: mappedRecurrenceAnchor, timeZone: mappedRecurrenceZone })
+      : todoistRecurrenceToRrule(task);
+    if (task.due?.is_recurring && !mappedDesiredRrule && (existingEvent || mapping)
       && !verifiedTodoistNativeMaster) {
       return this.state.audit(delivery.profile, "todoist_recurrence_unsupported_rule", {
         taskId: task.id, eventId: existingEvent?.id || mapping?.eventId,
@@ -4701,11 +4737,11 @@ export class Synchronizer {
     // Revalidate after all remote lookups. The write fence prevents a new
     // completion from racing this check until the provider write is finished.
     if (existingEvent && await this.calendarMutationBlockedByCompletion(delivery, existingEvent.id)) return;
-    const desiredRrule = todoistRecurrenceToRrule(task);
+    const desiredRrule = mappedDesiredRrule;
     const todoistSeriesRuleEdit = Boolean(isTodoistNativeSeries(mapping)
       && mapping.masterEventId && existingEvent?.id === mapping.masterEventId
       && existingEvent.recurrence?.length && desiredRrule
-      && !existingEvent.recurrence.includes(desiredRrule));
+      && !calendarRuleMatches(existingEvent, desiredRrule));
     const beforeSeriesExceptions = todoistSeriesRuleEdit && calendar.listExplicitSeriesExceptions
       ? await calendar.listExplicitSeriesExceptions(existingEvent!.id)
       : undefined;
@@ -4901,7 +4937,7 @@ export class Synchronizer {
     if (task.due?.is_recurring && !todoistRecurrenceToRrule(task)) {
       return this.state.audit(delivery.profile, "todoist_recurrence_unsupported_rule", {
         taskId: task.id, eventId: existingEvent?.id || mapping?.eventId,
-        existingMirrorPreserved: Boolean(existingEvent), outcome: "source_left_unchanged",
+        existingMirrorPreserved: Boolean(existingEvent), outcome: "source_left_unchanged", nonBlocking: true,
       });
     }
     // Even when provider mapping correlation is missing, the Calendar master
@@ -5082,7 +5118,7 @@ export class Synchronizer {
       const phaseBNative = verifiedStored.extendedProperties?.shared?.todoistPhaseBVersion === "1"
         && verifiedStored.extendedProperties.shared.taskId === task.id;
       const recurrenceVerified = desiredRrule
-        ? Boolean(verifiedStored.recurrence?.includes(desiredRrule))
+        ? Boolean(calendarRuleMatches(verifiedStored, desiredRrule))
         : phaseBNative && Boolean(verifiedStored.recurrence?.length);
       if (!recurrenceVerified) {
         let rollback = "not_attempted";
@@ -5161,7 +5197,7 @@ export class Synchronizer {
       const identityVerified = verifiedStored.id === mapping!.masterEventId
         && verifiedStored.status === "confirmed"
         && shared?.taskId === task.id
-        && verifiedStored.recurrence?.includes(desiredRrule!)
+        && calendarRuleMatches(verifiedStored, desiredRrule!)
         && shared.todoistRecurrence === todoistRecurrenceKey(task)
         && Boolean(active && occurrenceStateMatches(active, task));
       const exceptionsVerified = beforeSeriesExceptions === undefined

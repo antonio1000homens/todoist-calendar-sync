@@ -3,11 +3,15 @@ import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { MAPPING_COMMENT_MARKER } from "../dist/mapping-comments.js";
 import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
+import { todoistPhaseBCandidate } from "../dist/todoist-calendar-phase-b.js";
 
 const projectId = profiles.home.todoistProjectId;
 const receivedAt = "2026-11-10T13:56:00Z";
 const updatedAt = "2026-11-10T13:55:30Z";
 const fixtures = [
+  { name: "Honda annual expiry", phrase: "every June 6", due: "2027-06-06",
+    rrule: "RRULE:FREQ=YEARLY;BYMONTHDAY=6;BYMONTH=6",
+    dates: ["2027-06-06", "2028-06-06", "2029-06-06"] },
   { name: "monthly day list", phrase: "every 2, 15, 27", due: "2027-01-02",
     rrule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=2,15,27",
     dates: ["2027-01-02", "2027-01-15", "2027-01-27"] },
@@ -56,7 +60,7 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
   let instanceReadCount=0,commentWriteCount=0;
   const instances=family.dates.map((date,index)=>{
     const end=new Date(date+"T00:00:00Z");end.setUTCDate(end.getUTCDate()+1);
-    return {id:`instance-${index}`,status:"confirmed",recurringEventId:"",
+    return {id:`instance-${index}`,status:"confirmed",summary:task.content,description:task.description,recurringEventId:"",
       originalStartTime:{date},start:{date},end:{date:end.toISOString().slice(0,10)}};
   });
   const calendar={
@@ -83,6 +87,9 @@ function setup(family, {currentDue, oldProjectId, flag=true, eventName="item:add
     async listInstancesInWindow(id){
       instanceReadCount++;
       if(delayFirstInstances&&instanceReadCount===1)return [];
+      return instances.map(x=>({...structuredClone(x),recurringEventId:id}));
+    },
+    async listInstances(id){
       return instances.map(x=>({...structuredClone(x),recurringEventId:id}));
     },
     async listExplicitSeriesExceptions(){return [];},
@@ -195,6 +202,26 @@ test("reconciliation repairs a fixed annual task after unsupported creation synt
   await f.sync.process({...f.delivery,id:"annual-reconciliation-replay"});
   assert.equal(f.writes.length,1);
 }));
+for (const phrase of ["every 6 June", "every June 6", "every 6 Jun", "every Jun 6", "every 6th June", "every June 6th"]) {
+  test(`fresh item:added creates one verified native annual Calendar series for ${phrase}`,()=>withGate(true,async()=>{
+    const annual={name:"fixed June 6 annual",phrase,due:"2027-06-06",
+      rrule:"RRULE:FREQ=YEARLY;BYMONTHDAY=6;BYMONTH=6",
+      dates:["2027-06-06","2028-06-06","2029-06-06"]};
+    const f=setup(annual,{eventName:"item:added"});
+    assert.equal(todoistPhaseBCandidate(f.task,{start:annual.due,source:"verified_original_schedule"}).candidateRrule,annual.rrule);
+    await f.sync.process(f.delivery);
+    assert.equal(f.writes.length,1);
+    assert.equal(f.normal.length,0);
+    assert.equal(f.writes[0].start.date,annual.due);
+    assert.deepEqual(f.writes[0].recurrence,[annual.rrule]);
+    assert.equal(f.state.mapping.taskId,f.task.id);
+    assert.equal(f.state.mapping.todoistPhaseBVersion,1);
+    assert.equal(f.projectComments.length,1);
+    await f.sync.process({...f.delivery,id:`replay-${phrase.replaceAll(" ","-")}`});
+    assert.equal(f.writes.length,1,"replayed item:added must not create another master");
+    assert.equal(f.projectComments.length,1);
+  }));
+}
 test("delayed Calendar instances leave the deterministic master intact and retry until correlation commits",()=>withGate(true,async()=>{
   const f=setup(fixtures[2],{eventName:"item:updated",delayFirstInstances:true});
   f.delivery.body=JSON.stringify({event_name:"item:updated",event_data:f.task,

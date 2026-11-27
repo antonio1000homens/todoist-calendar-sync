@@ -10,6 +10,8 @@ import {
   matchesCalendarOwnedRecurringTask,
 } from "../dist/calendar-owned-todoist-recurrence.js";
 import { Todoist } from "../dist/providers.js";
+import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
+import { classifyTodoistRule } from "../dist/recurrence-semantics.js";
 
 function weeklyMaster(start, rule = "RRULE:FREQ=WEEKLY;COUNT=4") {
   return {
@@ -138,9 +140,37 @@ test("all-day native rules and Todoist's normalized no-start recurrence remain v
     assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, is_recurring: false } }, recurrence), false);
+    if (rule === "RRULE:FREQ=YEARLY") {
+      for (const phrase of ["every year", "yearly", "annually", "annual", "every 10 Oct",
+        "every 10 October", "every October 10th", "every 10th October", "every Oct 10"]) {
+        const matching = { ...task, due: { ...task.due, string: phrase } };
+        const genericAnnual = ["every year", "yearly", "annually", "annual"].includes(phrase.toLowerCase());
+        assert.equal(todoistRecurrenceToRrule(matching), genericAnnual ? rule : "RRULE:FREQ=YEARLY;BYMONTHDAY=10;BYMONTH=10", phrase);
+        assert.equal(classifyTodoistRule(phrase, { start: date }).semantic.frequency, "YEARLY", phrase);
+        assert.equal(matchesCalendarOwnedRecurringRule(matching, recurrence, "Europe/London"), true, phrase);
+        assert.equal(matchesCalendarOwnedRecurringTask(matching, event, recurrence, "Europe/London"), true, phrase);
+        assert.equal(matchesCalendarOwnedRecurringTask({ ...matching, due: { ...matching.due, date: "2099-11-26" } },
+          event, recurrence, "Europe/London"), false, phrase);
+      }
+    }
   }
 });
 
+
+test("generic annual cadence uses the task's own verified civil date, not the compared occurrence", () => {
+  const master = { id: "master", start: { date: "2027-06-06" }, recurrence: ["RRULE:FREQ=YEARLY"] };
+  const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+  const task = { id: "task", due: { date: "2026-11-26", string: "every year", is_recurring: true } };
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), false);
+  assert.equal(calendarOwnedRecurringTaskReadback(task, master, recurrence, "Europe/London").observed.month, 11);
+  const missing = { ...task, due: { string: "every year", is_recurring: true } };
+  assert.equal(calendarOwnedRecurringTaskReadback(missing, master, recurrence, "Europe/London").observed.recurrenceParsed, false);
+  const timed = weeklyMaster("2027-06-05T23:30:00Z", "RRULE:FREQ=YEARLY");
+  const timedRule = calendarOwnedTodoistRecurrence(timed, [], "Europe/London");
+  const timedTask = { id: "task", due: { datetime: "2027-06-05T23:30:00Z", string: "every year", is_recurring: true } };
+  assert.equal(matchesCalendarOwnedRecurringRule(timedTask, timedRule, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringRule(timedTask, timedRule), false);
+});
 
 test("native weekly recurrence checks the London-local day across UTC midnight", () => {
   const master = weeklyMaster("2027-07-06T23:30:00Z", "RRULE:FREQ=WEEKLY;BYDAY=WE");
@@ -459,7 +489,7 @@ test("Google default WKST=MO preserves a native timed weekly Friday recurrence",
   const master = weeklyMaster(start, "RRULE:FREQ=WEEKLY;WKST=MO;BYDAY=FR");
   const schedule = instances([start, "2026-12-04T16:00:00Z", "2026-12-11T16:00:00Z"]);
   assert.equal(nativeCalendarRecurrenceCandidate(master), true);
-  const recurrence = await verifiedCalendarOwnedRecurrence(master, schedule, "Europe/London", async () => []);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
   assert.equal(recurrence?.dueString, "every Friday at 4:00pm starting 27 Nov 2026");
   const implicit = calendarOwnedTodoistRecurrence(weeklyMaster(start, "RRULE:FREQ=WEEKLY;BYDAY=FR"), schedule, "Europe/London");
   assert.equal(recurrence.dueString, implicit.dueString);
@@ -483,4 +513,24 @@ test("Google default WKST=MO preserves a native timed weekly Friday recurrence",
     assert.equal(nativeCalendarRecurrenceCandidate(invalid), false, rule);
     assert.equal(calendarOwnedTodoistRecurrence(invalid, schedule, "Europe/London"), undefined, rule);
   }
+});
+
+test("weekly weekday lists translate through the shared RRULE semantics", async () => {
+  const start = "2026-11-23";
+  const master = {
+    id: "weekday-list", status: "confirmed", start: { date: start },
+    end: { date: "2026-11-24" },
+    recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE"],
+  };
+  const schedule = ["2026-11-23", "2026-11-25", "2026-11-30"].map((date, index) => {
+    const end = new Date(date + "T00:00:00Z");
+    end.setUTCDate(end.getUTCDate() + 1);
+    return { id: `weekday-instance-${index}`, status: "confirmed", recurringEventId: master.id,
+      originalStartTime: { date }, start: { date }, end: { date: end.toISOString().slice(0, 10) } };
+  });
+  assert.equal(nativeCalendarRecurrenceCandidate(master), true);
+  const recurrence = calendarOwnedTodoistRecurrence(master, schedule, "Europe/London");
+  assert.equal(recurrence?.dueString, "every mon, wed starting 23 Nov 2026");
+  const task = { id: "weekday-list-task", due: { date: "2026-11-25", is_recurring: true, string: recurrence.dueString } };
+  assert.equal(matchesCalendarOwnedRecurringTask(task, schedule[1], recurrence, "Europe/London"), true);
 });
