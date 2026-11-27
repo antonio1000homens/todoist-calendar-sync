@@ -22,6 +22,7 @@ import {
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
 import { normalizedDescription, normalizedText } from "./security.js";
+import { providerSyncBaseline } from "./provider-sync-baseline.js";
 import { ReconciliationItemError, reconciliationFailureDetails } from "./reconciliation-diagnostics.js";
 import { logEvent } from "./observability.js";
 import { calendarEventHasElapsed, calendarOwnedMetadataResolution, hasCanonicalState, startsMatch, ignorableElapsedStandaloneCalendarEvent, selectCalendarRecurrenceInstance, recurringTaskIdentityCandidates, Synchronizer, toTodoistTask } from "./sync.js";
@@ -552,6 +553,9 @@ export async function reconcileUnmappedCalendar(
       // Rebind only the exact standalone/master pair. The provider IDs prove
       // identity; an old ownership marker or recurrence row is unnecessary.
       const exactMappedPair = Boolean(recurrence && existingMapping
+        && existingMapping.profile === profile
+        && existingMapping.projectId === profiles[profile].todoistProjectId
+        && existingMapping.calendarId === profiles[profile].calendarId
         && existingMapping.taskId === existingLink.taskId
         && [active.id, master.id].includes(existingMapping.eventId)
         && (!existingMapping.masterEventId || existingMapping.masterEventId === master.id)
@@ -576,11 +580,49 @@ export async function reconcileUnmappedCalendar(
         // Todoist itself advanced its due. Reconcile metadata and persist a
         // durable baseline, not just the recurrence rule.
         if (!matchesCalendarOwnedRecurringRule(currentTask, recurrence, seriesTimeZone)) {
-          summary.conflicts += 1;
-          await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
-            seriesId, masterEventId: master.id, eventId: active.id, candidateTaskIds: [currentTask.id],
-          });
-          return;
+          const baseline = existingMapping.syncBaseline;
+          const observed = providerSyncBaseline(currentTask, active, master);
+          const competing = recurringTaskIdentityCandidates(active, tasks).filter(id => id !== currentTask.id);
+          if (!baseline?.todoist.due || !baseline.todoist.recurrence
+            || observed.todoist.due !== baseline.todoist.due
+            || observed.todoist.recurrence !== baseline.todoist.recurrence || competing.length) {
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+              seriesId, masterEventId: master.id, eventId: active.id,
+              candidateTaskIds: [...new Set([currentTask.id, ...competing])].sort(),
+              reason: competing.length ? "competing_recurring_task" : "todoist_recurrence_changed_since_verified_baseline",
+            });
+            return;
+          }
+          if (await controlsBlockRecovery([master.id, active.id], currentTask.id)) return;
+          if (!await canMutate(master.id, currentTask.id)) return;
+          const liveTask = await pair.todoist.getTask(currentTask.id);
+          const liveObserved = providerSyncBaseline(liveTask, active, master);
+          if (liveTask.updated_at !== currentTask.updated_at
+            || liveObserved.todoist.due !== observed.todoist.due
+            || liveObserved.todoist.recurrence !== observed.todoist.recurrence) {
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_snapshot_recurring_identity_conflict", {
+              seriesId, masterEventId: master.id, eventId: active.id,
+              candidateTaskIds: [currentTask.id], reason: "todoist_recurrence_changed_before_guarded_repair",
+            });
+            return;
+          }
+          const repaired = await pair.todoist.upsertTask(
+            calendarOwnedRecurringTaskPayload(active, recurrence, seriesTimeZone), currentTask.id,
+          );
+          await state.recordMutation(profile);
+          if (repaired.id !== currentTask.id
+            || !calendarOwnedRecurringTaskReadback(repaired, active, recurrence, seriesTimeZone).matches) {
+            await pair.todoist.upsertTask(currentTask, currentTask.id);
+            await state.recordMutation(profile);
+            summary.conflicts += 1;
+            await state.audit(profile, "calendar_recurrence_todoist_readback_mismatch", {
+              seriesId, masterEventId: master.id, eventId: active.id, taskId: currentTask.id,
+            });
+            return;
+          }
+          currentTask = repaired;
         }
         const metadata = calendarOwnedMetadataResolution(existingMapping, master, currentTask);
         if (metadata.conflicts.length || metadata.calendarChanged && !master.etag) {

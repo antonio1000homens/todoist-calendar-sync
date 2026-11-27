@@ -4,6 +4,7 @@ import { reconcileUnmappedCalendar, recurringTaskIdentityCandidates } from "../d
 import { ReconciliationMutationBudget } from "../dist/mutation-budget.js";
 import { profiles } from "../dist/config.js";
 import { serializeMappingComment } from "../dist/mapping-comments.js";
+import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 
 function futureEvent(id, day, summary = `Event ${id}`) {
   return {
@@ -861,6 +862,50 @@ test("recurrence snapshot guard trusts an exact shared task ID when title and st
   assert.ok(state.audits.some(({ action, detail }) =>
     action === "calendar_recurrence_todoist_rule_unsupported"
     && detail.taskId === annualTask.id));
+});
+
+test("snapshot repairs an exact mapped annual task and Calendar rename in place from an unchanged Todoist baseline", async () => {
+  const master = {
+    id: "bike-series", iCalUID: "bike-series-uid", status: "confirmed", etag: "calendar-v2",
+    summary: "honda MOT Bike Expiry", description: "", start: { date: "2027-06-06" },
+    end: { date: "2027-06-07" }, recurrence: ["RRULE:FREQ=YEARLY"],
+  };
+  const occurrence = {
+    id: "bike-series_20270606", status: "confirmed", summary: master.summary, description: "",
+    start: { date: "2027-06-06" }, end: { date: "2027-06-07" }, recurringEventId: master.id,
+    originalStartTime: { date: "2027-06-06" },
+  };
+  const task = {
+    id: "bike-task", content: "MOT Bike Expiry", description: "", project_id: profiles.home.todoistProjectId,
+    due: { date: "2026-11-26", is_recurring: true, string: "every year" }, updated_at: "todoist-v1",
+  };
+  const priorMaster = { ...master, summary: "MOT Bike Expiry", start: { date: "2026-06-06" }, etag: "calendar-v1" };
+  const mapping = {
+    profile: "home", projectId: profiles.home.todoistProjectId, calendarId: profiles.home.calendarId,
+    taskId: task.id, eventId: master.id, masterEventId: master.id, seriesId: master.iCalUID,
+    activeInstanceId: occurrence.id, originalStart: occurrence.originalStartTime.date,
+    activeEffectiveStart: occurrence.start.date, syncedTitle: "MOT Bike Expiry", syncedDescription: "",
+    syncBaseline: providerSyncBaseline(task, priorMaster, priorMaster), mappingRevision: 5,
+    updatedAt: "2026-11-26T08:57:01.091Z",
+  };
+  const state = fakeState();
+  const clients = fakeClients([master], [task]);
+  clients.projectComments.push({ id: "mapping-comment", project_id: mapping.projectId,
+    content: serializeMappingComment(mapping, mapping.projectId) });
+  clients.pair.calendar.listInstances = async () => [occurrence];
+  clients.pair.calendar.listExplicitSeriesExceptions = async () => [];
+
+  const summary = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+
+  assert.equal(summary.conflicts, 0);
+  assert.equal(summary.imported, 0);
+  assert.equal(clients.created, 0);
+  assert.equal(clients.tasks.length, 1);
+  assert.equal(clients.tasks[0].id, task.id);
+  assert.equal(clients.tasks[0].content, master.summary);
+  assert.equal(clients.tasks[0].due.date, "2027-06-06");
+  assert.equal(clients.tasks[0].due.is_recurring, true);
+  assert.equal(state.audits.some(({ action }) => action === "calendar_snapshot_recurring_identity_conflict"), false);
 });
 
 test("Calendar-owned recurring series creates one native recurring mirror", async () => {
