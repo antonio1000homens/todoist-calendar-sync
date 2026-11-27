@@ -554,8 +554,8 @@ export async function reconcileUnmappedCalendar(
       // identity; an old ownership marker or recurrence row is unnecessary.
       const exactMappedPair = Boolean(recurrence && existingMapping
         && existingMapping.profile === profile
-        && existingMapping.projectId === profiles[profile].todoistProjectId
-        && existingMapping.calendarId === profiles[profile].calendarId
+        && (!existingMapping.projectId || existingMapping.projectId === profiles[profile].todoistProjectId)
+        && (!existingMapping.calendarId || existingMapping.calendarId === profiles[profile].calendarId)
         && existingMapping.taskId === existingLink.taskId
         && [active.id, master.id].includes(existingMapping.eventId)
         && (!existingMapping.masterEventId || existingMapping.masterEventId === master.id)
