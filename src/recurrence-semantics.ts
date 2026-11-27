@@ -68,6 +68,27 @@ const monthNames: Record<string, number> = {
   january:1, february:2, march:3, april:4, may:5, june:6,
   july:7, august:8, september:9, october:10, november:11, december:12,
 };
+/** Shared annual phrase grammar. The date-less aliases require a verified
+ * provider due anchor when comparing cadence, not the other provider's date. */
+export function parseAnnualCadence(name: string): { month?: number; dayOfMonth?: number } | undefined {
+  const value = name.trim().toLowerCase();
+  if (["year", "yearly", "annual", "annually"].includes(value)) return {};
+  const match = /^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)$|^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(value);
+  if (!match) return undefined;
+  const monthName = match[2] || match[3];
+  const month = monthNames[monthName] || Object.entries(monthNames).find(([key]) => key.slice(0, 3) === monthName)?.[1];
+  const dayOfMonth = Number(match[1] || match[4]);
+  if (!month || dayOfMonth < 1 || dayOfMonth > new Date(Date.UTC(2000, month, 0)).getUTCDate()) return undefined;
+  return { month, dayOfMonth };
+}
+
+/** Resolve a provider's own civil anchor, refusing unverified timed dates. */
+export function recurrenceCivilAnchor(start: string | undefined, timeZone?: string): { date: string; time?: string } | undefined {
+  if (!start) return undefined;
+  const result = localAnchor({ start, timeZone });
+  return typeof result === "string" ? undefined : result;
+}
+
 const frequencies: RecurrenceFrequency[] = ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
 const knownFields = new Set(["FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "COUNT", "UNTIL", "WKST"]);
 const pad = (value: number): string => String(value).padStart(2, "0");
@@ -231,11 +252,11 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
   const monthDays = every.match(/^\d{1,2}(?:\s*,\s*\d{1,2})+$/);
   const alternate = every.match(/^other\s+([a-z]+)$/);
   const quantity = every.match(/^(\d+)\s+(day|week|month|year)s?$/);
-  const fixedAnnual = every.match(/^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
+  const annual = parseAnnualCadence(every);
   if (["day", "daily"].includes(every)) frequency = "DAILY";
   else if (["week", "weekly"].includes(every)) frequency = "WEEKLY";
   else if (["month", "monthly"].includes(every)) frequency = "MONTHLY";
-  else if (["year", "yearly", "annual", "annually"].includes(every)) frequency = "YEARLY";
+  else if (annual && annual.month === undefined) frequency = "YEARLY";
   else if (["quarter", "quarterly"].includes(every)) { frequency = "MONTHLY"; interval = 3; }
   else if (["weekday", "workday", "weekdays"].includes(every)) {
     frequency = "WEEKLY"; byDay = ["MO", "TU", "WE", "TH", "FR"];
@@ -243,10 +264,9 @@ export function classifyTodoistRule(phrase: string, context: RecurrenceContext):
     byMonthDay = [...new Set(every.split(",").map((day) => Number(day.trim())))].sort((a, b) => a - b);
     if (byMonthDay.some((day) => day < 1 || day > 31)) return decline("invalid_component");
     frequency = "MONTHLY";
-  } else if (fixedAnnual && monthNames[fixedAnnual[1]]) {
-    const month = monthNames[fixedAnnual[1]];
-    const day = Number(fixedAnnual[2]);
-    if (day < 1 || day > 31 || Number(anchor.date.slice(5, 7)) !== month
+  } else if (annual?.month !== undefined && annual.dayOfMonth !== undefined) {
+    const { month, dayOfMonth: day } = annual;
+    if (Number(anchor.date.slice(5, 7)) !== month
       || Number(anchor.date.slice(8, 10)) !== day) return decline("invalid_component");
     frequency = "YEARLY"; byMonth = [month]; byMonthDay = [day];
   } else if (alternate && dayNames[alternate[1]]) {

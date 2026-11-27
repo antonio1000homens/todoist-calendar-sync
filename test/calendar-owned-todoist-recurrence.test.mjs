@@ -10,6 +10,8 @@ import {
   matchesCalendarOwnedRecurringTask,
 } from "../dist/calendar-owned-todoist-recurrence.js";
 import { Todoist } from "../dist/providers.js";
+import { todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
+import { classifyTodoistRule } from "../dist/recurrence-semantics.js";
 
 function weeklyMaster(start, rule = "RRULE:FREQ=WEEKLY;COUNT=4") {
   return {
@@ -138,9 +140,35 @@ test("all-day native rules and Todoist's normalized no-start recurrence remain v
     assert.equal(matchesCalendarOwnedRecurringTask(task, event, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, is_recurring: false } }, recurrence), false);
+    if (rule === "RRULE:FREQ=YEARLY") {
+      for (const phrase of ["every year", "yearly", "annually", "annual", "every 10 Oct"]) {
+        const matching = { ...task, due: { ...task.due, string: phrase } };
+        assert.equal(todoistRecurrenceToRrule(matching), rule, phrase);
+        assert.equal(classifyTodoistRule(phrase, { start: date }).semantic.frequency, "YEARLY", phrase);
+        assert.equal(matchesCalendarOwnedRecurringRule(matching, recurrence, "Europe/London"), true, phrase);
+        assert.equal(matchesCalendarOwnedRecurringTask(matching, event, recurrence, "Europe/London"), true, phrase);
+        assert.equal(matchesCalendarOwnedRecurringTask({ ...matching, due: { ...matching.due, date: "2099-11-26" } },
+          event, recurrence, "Europe/London"), false, phrase);
+      }
+    }
   }
 });
 
+
+test("generic annual cadence uses the task's own verified civil date, not the compared occurrence", () => {
+  const master = { id: "master", start: { date: "2027-06-06" }, recurrence: ["RRULE:FREQ=YEARLY"] };
+  const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+  const task = { id: "task", due: { date: "2026-11-26", string: "every year", is_recurring: true } };
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), false);
+  assert.equal(calendarOwnedRecurringTaskReadback(task, master, recurrence, "Europe/London").observed.month, 11);
+  const missing = { ...task, due: { string: "every year", is_recurring: true } };
+  assert.equal(calendarOwnedRecurringTaskReadback(missing, master, recurrence, "Europe/London").observed.recurrenceParsed, false);
+  const timed = weeklyMaster("2027-06-05T23:30:00Z", "RRULE:FREQ=YEARLY");
+  const timedRule = calendarOwnedTodoistRecurrence(timed, [], "Europe/London");
+  const timedTask = { id: "task", due: { datetime: "2027-06-05T23:30:00Z", string: "every year", is_recurring: true } };
+  assert.equal(matchesCalendarOwnedRecurringRule(timedTask, timedRule, "Europe/London"), true);
+  assert.equal(matchesCalendarOwnedRecurringRule(timedTask, timedRule), false);
+});
 
 test("native weekly recurrence checks the London-local day across UTC midnight", () => {
   const master = weeklyMaster("2027-07-06T23:30:00Z", "RRULE:FREQ=WEEKLY;BYDAY=WE");

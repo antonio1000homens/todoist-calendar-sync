@@ -1,4 +1,5 @@
 import { normalizedText } from "./security.js";
+import { parseAnnualCadence } from "./recurrence-semantics.js";
 import type { CalendarEvent, TodoistTask } from "./types.js";
 
 const weekdays: Record<string, string> = {
@@ -20,11 +21,6 @@ const weekdays: Record<string, string> = {
   saturday: "SA",
   sun: "SU",
   sunday: "SU",
-};
-
-const months: Record<string, number> = {
-  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
 };
 
 function hasOffset(value: string): boolean {
@@ -78,17 +74,12 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
   }
   if (value === "every week" || value === "weekly") return "RRULE:FREQ=WEEKLY";
   if (value === "every month" || value === "monthly") return "RRULE:FREQ=MONTHLY";
-  if (value === "every year" || value === "yearly" || value === "annually" || value === "annual") {
-    return "RRULE:FREQ=YEARLY";
-  }
-
-  // Todoist can express a fixed annual date as "every November 1". Its due
-  // date supplies the DTSTART anchor, so the RRULE itself is yearly. Reject
-  // inconsistent anchors rather than silently exporting the wrong date.
-  const monthDay = value.match(/^every\s+([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
-  if (monthDay) {
-    const month = months[monthDay[1]];
-    const day = Number(monthDay[2]);
+  const annual = /^(?:every\s+.+|yearly|annual|annually)$/.test(value)
+    ? parseAnnualCadence(value.replace(/^every\s+/, "")) : undefined;
+  if (annual) {
+    if (annual.month === undefined) return "RRULE:FREQ=YEARLY";
+    // A fixed annual phrase needs a matching provider DTSTART. Keep the
+    // existing projection guard independent from semantic phrase parsing.
     const dueDate = task.due?.date?.slice(0, 10)
       || (task.due?.datetime
         ? task.due.timezone
@@ -96,13 +87,10 @@ export function todoistRecurrenceToRrule(task: TodoistTask): string | undefined 
           : task.due.datetime.slice(0, 10)
         : undefined);
     const anchor = dueDate?.match(/^\d{4}-(\d{2})-(\d{2})$/);
-    const parsedAnchor = anchor && dueDate
-      ? new Date(`${dueDate}T00:00:00.000Z`)
-      : undefined;
-    if (!month || day < 1 || day > 31 || !anchor || !parsedAnchor
-      || Number.isNaN(parsedAnchor.getTime())
+    const parsedAnchor = anchor && dueDate ? new Date(`${dueDate}T00:00:00.000Z`) : undefined;
+    if (!anchor || !parsedAnchor || Number.isNaN(parsedAnchor.getTime())
       || parsedAnchor.toISOString().slice(0, 10) !== dueDate
-      || Number(anchor[1]) !== month || Number(anchor[2]) !== day) return undefined;
+      || Number(anchor[1]) !== annual.month || Number(anchor[2]) !== annual.dayOfMonth) return undefined;
     return "RRULE:FREQ=YEARLY";
   }
 

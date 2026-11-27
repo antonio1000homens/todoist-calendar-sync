@@ -1,4 +1,5 @@
 import type { CalendarEvent, TodoistTask } from "./types.js";
+import { parseAnnualCadence, recurrenceCivilAnchor } from "./recurrence-semantics.js";
 import {
   calendarPhaseCCandidate, calendarPhaseCInstancesConform,
   matchesCalendarPhaseCTask, type CalendarPhaseCCandidate,
@@ -473,12 +474,14 @@ function openCalendarRecurrence(master: CalendarEvent, instances: CalendarEvent[
 
 /** Parse Todoist's normalized, possibly start-date-free representation.
  * Only a single cadence is accepted; unrecognized modifiers fail closed. */
-function parseOpenTodoistRule(value: string | undefined): {
+function parseOpenTodoistRule(value: string | undefined, task: TodoistTask, verifiedTimeZone?: string): {
   frequency: "daily" | "weekly" | "monthly" | "yearly"; interval?: number; weekday?: string;
   dayOfMonth?: number; monthlyOrdinal?: number; month?: number; time?: string; start?: ParsedDate;
 } | undefined {
   if (!value) return undefined;
-  const match = value.trim().replace(/\s+/g, " ").match(/^every\s+(.+?)(?:\s+starting(?:\s+on)?\s+(.+))?$/i);
+  const normalized = value.trim().replace(/\s+/g, " ");
+  const expression = /^(?:annual|annually|yearly)(?:\s|$)/i.test(normalized) ? `every ${normalized}` : normalized;
+  const match = expression.match(/^every\s+(.+?)(?:\s+starting(?:\s+on)?\s+(.+))?$/i);
   if (!match) return undefined;
   const withTime = match[1].match(/^(.+?)(?:\s+(?:at\s+)?(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm)))?$/i);
   if (!withTime) return undefined;
@@ -509,12 +512,17 @@ function parseOpenTodoistRule(value: string | undefined): {
   const monthly = name.match(/^(\d{1,2})(?:st|nd|rd|th)?$/);
   if (monthly && Number(monthly[1]) >= 1 && Number(monthly[1]) <= 28)
     return { frequency: "monthly", dayOfMonth: Number(monthly[1]), ...extra };
-  const yearly = name.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]+)$|^([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?$/);
-  if (yearly) {
-    const day = Number(yearly[1] || yearly[4]);
-    const month = monthLookup.get((yearly[2] || yearly[3]).toLowerCase());
-    if (month && day >= 1 && day <= 31 && !(month === 2 && day === 29))
-      return { frequency: "yearly", dayOfMonth: day, month, ...extra };
+  const annual = parseAnnualCadence(name);
+  if (annual) {
+    // Only a verified Todoist due can supply a generic annual cadence.
+    // Never infer month/day from the Calendar occurrence being compared.
+    const ownAnchor = annual.month === undefined
+      ? recurrenceCivilAnchor(task.due?.datetime || task.due?.date, verifiedTimeZone) : undefined;
+    const month = annual.month ?? (ownAnchor ? Number(ownAnchor.date.slice(5, 7)) : undefined);
+    const day = annual.dayOfMonth ?? (ownAnchor ? Number(ownAnchor.date.slice(8, 10)) : undefined);
+    if (month && day && !(month === 2 && day === 29))
+      return { frequency: "yearly", dayOfMonth: day, month, ...extra,
+        ...(!time && ownAnchor?.time ? { time: ownAnchor.time } : {}) };
   }
   return undefined;
 }
@@ -525,7 +533,7 @@ function openRuleMatches(
   verifiedTimeZone?: string,
   occurrence?: CalendarEvent,
 ): { matches: boolean; ruleMatches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule> } {
-  const parsed = parseOpenTodoistRule(task.due?.string);
+  const parsed = parseOpenTodoistRule(task.due?.string, task, verifiedTimeZone);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
   const correctStart = !anchor || Boolean(expectedStart && anchor.day === expectedStart.day
