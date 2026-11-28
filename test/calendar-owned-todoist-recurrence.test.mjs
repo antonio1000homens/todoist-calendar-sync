@@ -7,6 +7,7 @@ import {
   verifiedCalendarOwnedRecurrence,
   nativeCalendarRecurrenceCandidate,
   matchesCalendarOwnedRecurringRule,
+  matchesCalendarOwnedRecurringRuleAtOccurrence,
   matchesCalendarOwnedRecurringTask,
 } from "../dist/calendar-owned-todoist-recurrence.js";
 import { Todoist } from "../dist/providers.js";
@@ -144,6 +145,23 @@ test("daily Calendar rules, including intervals, map to equivalent Todoist recur
     assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), true);
     assert.equal(matchesCalendarOwnedRecurringRule({ ...task, due: { ...task.due, string: "every day" } }, recurrence, "Europe/London"), interval === undefined);
   }
+});
+
+test("Calendar-owned recurrence rule remains verifiable when the active Todoist due needs restoration", () => {
+  const master = { id: "master", start: { dateTime: "2026-11-04T15:00:00Z", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=DAILY"] };
+  const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+  const event = { id: "active", recurringEventId: "master", status: "confirmed",
+    originalStartTime: { dateTime: "2026-11-08T15:00:00Z", timeZone: "Europe/London" },
+    start: { dateTime: "2026-11-08T15:00:00Z", timeZone: "Europe/London" },
+    end: { dateTime: "2026-11-08T15:30:00Z", timeZone: "Europe/London" } };
+  const task = { id: "task", due: { datetime: "2026-11-08T15:30:00Z", timezone: "Europe/London",
+    string: recurrence.dueString, is_recurring: true } };
+
+  assert.equal(matchesCalendarOwnedRecurringRule(task, recurrence, "Europe/London"), false,
+    "the active due time differs while the recurrence text remains unchanged");
+  assert.equal(matchesCalendarOwnedRecurringRuleAtOccurrence(task, event, recurrence, "Europe/London"), true,
+    "the rule is checked using the immutable Calendar occurrence anchor");
 });
 
 test("historical weekly, monthly, and yearly interval rules project from an active date without resetting phase", () => {
