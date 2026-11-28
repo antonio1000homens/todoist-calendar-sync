@@ -1779,7 +1779,8 @@ test("genuine Todoist title and description edits PATCH only the Calendar master
     id: "edit", kind: "todoist", profile: PROFILE, mode: "aws",
     receivedAt: "2026-10-26T15:10:27Z", headers: {},
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
-      event_data_extra: { old_item: { ...task, content: "Weekly test", description: "" } } }),
+      event_data_extra: { update_intent: "item_updated",
+        old_item: { ...task, content: "Weekly test", description: "" } } }),
   });
   assert.equal(clients.calendarUpserts.length, 1);
   assert.equal(clients.calendarUpserts[0].metadataOnly, true);
@@ -1787,6 +1788,7 @@ test("genuine Todoist title and description edits PATCH only the Calendar master
   assert.equal(clients.events.get(MASTER).description, "Updated from Todoist");
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;BYDAY=WE"]);
   assert.equal(tasks.get(task.id).due.date, "2026-11-04");
+  assert.equal(state.audits.some((entry) => entry.action === "calendar_owned_todoist_date_edit_requires_review"), false);
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
   assert.equal(state.mappingsByTask.get(task.id).syncedDescription, "Updated from Todoist");
 });
