@@ -8,7 +8,7 @@ import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, 
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 import { SnapshotReconciler } from "../dist/reconciliation.js";
-import { calendarOwnedRecurringTaskPayload, calendarOwnedTodoistRecurrence } from "../dist/calendar-owned-todoist-recurrence.js";
+import { calendarOwnedRecurringTaskPayload, calendarOwnedTodoistRecurrence, verifiedCalendarOwnedRecurrence } from "../dist/calendar-owned-todoist-recurrence.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
@@ -1999,7 +1999,7 @@ test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, 
     { name: "monthly interval", rule: "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15", next: "2027-04-15" },
     { name: "monthly selector", rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", anchor: "2023-01-10", active: "2026-12-08", next: "2027-01-12" },
     { name: "yearly interval selector", rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15", next: "2029-01-15" },
-    { name: "weekly London DST", rule: "RRULE:FREQ=WEEKLY;BYDAY=SU",
+    { name: "weekly London DST", rule: "RRULE:FREQ=WEEKLY",
       anchor: "2023-03-26T09:00:00+01:00", active: "2027-03-28T09:00:00+01:00",
       next: "2027-04-04T09:00:00+01:00", timed: true },
   ];
@@ -2010,10 +2010,12 @@ test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, 
         date.setUTCDate(date.getUTCDate() + 1);
         return { start: { date: value }, end: { date: date.toISOString().slice(0, 10) } };
       }
-      const dateTime = new Date(Date.parse(value) + durationHours * 3_600_000).toISOString();
-      // Preserve the London wall-clock offset represented by this case.
+      const [, year, month, day, hour, minute, second, offset] =
+        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})([+-]\d{2}:\d{2})$/.exec(value) || [];
+      const wallEnd = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour),
+        Number(minute), Number(second)) + durationHours * 3_600_000).toISOString().slice(0, 19);
       return { start: { dateTime: value, timeZone: "Europe/London" },
-        end: { dateTime: dateTime.replace("Z", "+01:00"), timeZone: "Europe/London" } };
+        end: { dateTime: `${wallEnd}${offset}`, timeZone: "Europe/London" } };
     };
     const anchorSpan = at(item.anchor);
     const master = { id: MASTER, etag: `"matrix-${index}-v1"`, iCalUID: SERIES, status: "confirmed",
@@ -2076,14 +2078,14 @@ test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, 
     assert.equal(snapshotResult.counts.noop, 1, `${item.name} snapshot preserves the exact native recurrence pair`);
     assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length, snapshotWrites,
       `${item.name} snapshot makes no unnecessary provider writes`);
-    if (item.timed) continue;
-
     const nextSpan = at(item.next, 1);
     const next = { id: `matrix-next-${index}`, status: "confirmed", recurringEventId: MASTER,
       iCalUID: SERIES, originalStartTime: structuredClone(nextSpan.start), ...nextSpan,
       summary: edited.content, description: edited.description, etag: `"matrix-next-${index}-v1"` };
     seriesInstances.push(next);
     clients.events.set(next.id, structuredClone(next));
+    if (item.timed) assert.ok(await verifiedCalendarOwnedRecurrence(master, seriesInstances, "Europe/London",
+      clients.calendar.listExplicitSeriesExceptions.bind(clients.calendar)));
     const activeEnd = item.timed ? Date.parse(item.active) + 2 * 3_600_000
       : Date.parse(`${item.active}T00:00:00Z`) + 36 * 3_600_000;
     t.mock.timers.setTime(activeEnd);
