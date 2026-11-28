@@ -59,6 +59,9 @@ function log(event, detail = {}) {
 }
 
 function safeFailure(error) {
+  if (typeof error?.message === "string" && error.message.startsWith("series_edit_invariants_failed:")) {
+    return error.message;
+  }
   if (error instanceof AcceptanceTimeoutError) {
     const stage = error.stage.replace(/\b(?:home|antonio|work)\b/gi, "profile");
     return `timeout:${stage}`;
@@ -654,12 +657,15 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
     );
     const preservedException = await calendar.getEvent(movedInstance.id);
     const seriesEditTask = await todoist.getTask(recurringTaskId);
-    if (preservedException.summary !== exceptionTitle
-      || !timestampsMatch(preservedException.start?.dateTime, movedStart.toISOString())
-      || !sameProviderInstant(seriesEditTask.due?.datetime || seriesEditTask.due?.date, completedDue)
-      || !seriesEditTask.due?.is_recurring
-      || todoistSeriesEdit.master.extendedProperties?.shared?.taskId !== recurringTaskId) {
-      throw new Error("Bidirectional series title edits changed recurrence identity or erased an explicit Calendar exception");
+    const failedSeriesEditInvariants = [
+      preservedException.summary !== exceptionTitle && "preserved_exception_title",
+      !timestampsMatch(preservedException.start?.dateTime, movedStart.toISOString()) && "moved_exception_start",
+      !sameProviderInstant(seriesEditTask.due?.datetime || seriesEditTask.due?.date, completedDue) && "task_due",
+      !seriesEditTask.due?.is_recurring && "task_is_recurring",
+      todoistSeriesEdit.master.extendedProperties?.shared?.taskId !== recurringTaskId && "master_task_link",
+    ].filter(Boolean);
+    if (failedSeriesEditInvariants.length) {
+      throw new Error(`series_edit_invariants_failed:${failedSeriesEditInvariants.join(",")}`);
     }
     log("bidirectional_series_edits_verified", {
       profile, calendarToTodoist: true, todoistToCalendar: true, exceptionPreserved: true,
