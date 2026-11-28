@@ -1797,6 +1797,20 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
       event_data_extra: { update_intent: "item_updated", old_item: oldTask } }),
   };
+  const originalMasterRead = calendar.getEvent.bind(calendar);
+  let masterReads = 0;
+  calendar.getEvent = async (id) => {
+    const event = await originalMasterRead(id);
+    if (id !== MASTER) return event;
+    masterReads += 1;
+    return masterReads === 2 ? { ...event, etag: '"concurrently-updated-master"' } : event;
+  };
+  const writesBeforeStaleProviderRead = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-cadence-edit-stale-provider" });
+  assert.ok(masterReads >= 2, "worker rereads the Calendar master before applying a cadence edit");
+  assert.equal(clients.calendarUpserts.length, writesBeforeStaleProviderRead);
+  assert.equal(state.audits.at(-1).detail.reason, "fresh_provider_identity_or_exception_check_failed");
+  calendar.getEvent = originalMasterRead;
   await assert.rejects(() => sync.process(delivery), /needs retry/);
   assert.equal(clients.events.get(MASTER).extendedProperties.shared.syncHistoryOnly, "true",
     "the first attempt safely caps history before a transient successor failure");
