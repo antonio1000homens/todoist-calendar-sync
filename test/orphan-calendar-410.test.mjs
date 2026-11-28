@@ -20,7 +20,7 @@ function providerError(status, body) {
 }
 
 function fixture({ deleteError, readError, readEvent, taskExists = false, mappedTaskId = "todoist-task", completed = false } = {}) {
-  const calls = { delete: [], read: [], task: [] };
+  const calls = { delete: [], read: [], task: [], purges: [] };
   const mapping = { profile: "home", taskId: mappedTaskId, eventId: "calendar-event", updatedAt: "2026-10-21T12:00:00Z" };
   const projectId=profiles.home.todoistProjectId;
   const comments=[{id:"mapping-comment",project_id:projectId,content:serializeMappingComment({
@@ -40,6 +40,7 @@ function fixture({ deleteError, readError, readEvent, taskExists = false, mapped
       assert.equal(this.mapping?.taskId, expected.taskId);
       this.mapping = undefined;
     },
+    async purgeDeletedPair(input) { calls.purges.push(input); return true; },
     async audit(profile, action, detail) { this.audits.push({ profile, action, detail }); },
   };
   const calendar = {
@@ -74,8 +75,17 @@ test("an orphan DELETE 410 with no deletion reason is retired after the exact Ca
   assert.deepEqual(f.calls.delete, ["calendar-event"]);
   assert.deepEqual(f.calls.read, ["calendar-event"]);
   assert.equal(f.comments.length, 0, "confirmed deletion retires provider correlation");
+  assert.deepEqual(f.calls.purges,[{profile:"home",taskId:"todoist-task",eventIds:["calendar-event"],seriesIds:[]}]);
   assert.equal(f.state.audits.at(-1).action, "orphan_confirmed_deleted");
   assert.equal(f.state.audits.at(-1).detail.alreadyDeleted, true);
+});
+
+test("orphan cleanup failure surfaces after provider absence without reporting completion",async()=>{
+  const f=fixture();
+  f.state.purgeDeletedPair=async()=>false;
+  await assert.rejects(f.sync.process(delivery),/Deletion state cleanup changed concurrently/);
+  assert.equal(f.comments.length,0,"provider-native link was retired after deletion verification");
+  assert.equal(f.state.audits.length,0,"delivery is not acknowledged as complete when DynamoDB cleanup is incomplete");
 });
 
 test("an orphan DELETE 410 is terminal after the exact event GET also returns a bare 410", async () => {

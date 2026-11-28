@@ -20,13 +20,30 @@ type TodoistInventoryScope = {
   mappingIndexes: Map<string, Promise<ReturnType<typeof buildProjectMappingIndex>>>;
   timeZones: Map<string, Promise<string>>;
   snapshots: Map<string, Promise<Awaited<ReturnType<Todoist["listAllTaskCommentsForErasureAudit"]>> | undefined>>;
+  exactStateReads: Map<string, Promise<unknown>>;
 };
 const todoistInventoryScope = new AsyncLocalStorage<TodoistInventoryScope>();
 
 /** Share provider inventories across clients for one bounded sync operation. */
 export function withTodoistInventoryScope<T>(operation: () => Promise<T>): Promise<T> {
   if (todoistInventoryScope.getStore()) return operation();
-  return todoistInventoryScope.run({ comments: new Map(), tasks: new Map(), exactTasks: new Map(), mappingIndexes: new Map(), timeZones: new Map(), snapshots: new Map() }, operation);
+  return todoistInventoryScope.run({ comments: new Map(), tasks: new Map(), exactTasks: new Map(), mappingIndexes: new Map(), timeZones: new Map(), snapshots: new Map(), exactStateReads:new Map() }, operation);
+}
+
+/** Cache exact ownership reads only for one delivery; conditional write paths still revalidate at commit. */
+export async function readScopedExactState<T>(key:string,read:()=>Promise<T>):Promise<T> {
+  const scope=todoistInventoryScope.getStore();
+  if(!scope)return read();
+  let pending=scope.exactStateReads.get(key) as Promise<T>|undefined;
+  if(!pending) {
+    pending=read();scope.exactStateReads.set(key,pending);
+    void pending.catch(()=>{if(scope.exactStateReads.get(key)===pending)scope.exactStateReads.delete(key);});
+  }
+  return pending;
+}
+
+export function invalidateScopedExactState(key:string):void {
+  todoistInventoryScope.getStore()?.exactStateReads.delete(key);
 }
 
 /** Stable non-secret key for coordinating cooldowns across profile tokens. */

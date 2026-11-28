@@ -368,7 +368,50 @@ export class ProjectAwareSynchronizer {
     const rawPayload = JSON.parse(delivery.body) as TodoistWebhookPayload;
     if (!rawPayload.event_data?.id) return;
 
-    const mapping = await this.delegate.providerMappingByTaskAnyProfile(rawPayload.event_data.id);
+    const eventTask=rawPayload.event_data;
+    const localRoute=profileForTodoistProject(eventTask.project_id);
+    const deletion=todoistCalendarLifecycle(rawPayload);
+    let mapping:Mapping|undefined;
+    if(deletion?.reason==="deleted"&&localRoute===delivery.profile
+      && !rawPayload.event_data_extra?.old_item?.project_id) {
+      // A routed deletion is resolved against its own project first. A
+      // completed primary deletion has already removed its provider comment
+      // and exact DynamoDB mapping; its webhook echo is then a read-only no-op.
+      // If any exact legacy owner remains, fall through to guarded cross-profile
+      // resolution so moves and partial cleanup are never mistaken for echoes.
+      const localClients=await this.clients(delivery.profile);
+      mapping=await this.delegate.providerMappingByTask(delivery.profile,eventTask.id,localClients.todoist);
+      if(!mapping) {
+        const legacyOwner=await this.state.getMappingByTaskAnyProfile?.(eventTask.id,[delivery.profile]);
+        if(legacyOwner?.profile!==undefined&&legacyOwner.profile!==delivery.profile)
+          mapping=await this.delegate.providerMappingByTaskAnyProfile(eventTask.id)||legacyOwner;
+        else if(legacyOwner) mapping=legacyOwner;
+        else {
+          const {todoist,calendar}=localClients;
+          const calendarAlias=await calendar.findByTodoistTaskId?.(eventTask.id);
+          if(calendarAlias&&calendarAlias.status!=="cancelled") {
+            // Provider-native Calendar correlation still proves this may be a
+            // legitimate Todoist-origin deletion. Let the normal guarded path
+            // process it rather than acknowledging it as a completed echo.
+            mapping=undefined;
+          } else {
+            try {
+              const current=await todoist.getTask(eventTask.id);
+              if(!current.is_deleted) return this.state.audit(delivery.profile,"todoist_stale_delete_replay_suppressed",{
+                taskId:eventTask.id,currentUpdatedAt:current.updated_at,
+              });
+            } catch(error) {
+              if(Number((error as {status?:number}).status)!==404) throw error;
+            }
+            return this.state.audit(delivery.profile,"todoist_deleted_echo_noop",{
+              taskId:eventTask.id,verifiedLocalRoute:true,meaningfulMutation:false,
+            });
+          }
+        }
+      }
+    } else {
+      mapping=await this.delegate.providerMappingByTaskAnyProfile(eventTask.id);
+    }
     const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {
       const recoverable=await hasGuardedRecoveryDispatchCandidate({

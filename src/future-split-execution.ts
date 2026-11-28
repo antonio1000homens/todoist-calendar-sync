@@ -476,5 +476,12 @@ async function finalizeConsolidation(
   await pair.todoist.deleteTask(consolidation.discardedTask.id).catch((error: unknown) => {
     if (Number((error as { status?: number }).status) !== 404) throw error;
   });
+  if(!await state.purgeDeletedPair({profile:consolidation.previousMapping.profile,
+    taskId:consolidation.discardedTask.id,eventIds:[consolidation.cancelledEventId,
+      consolidation.previousMapping.eventId,consolidation.previousMapping.masterEventId,
+      consolidation.previousMapping.activeInstanceId].filter((id):id is string=>Boolean(id)),
+    seriesIds:[consolidation.previousMapping.seriesId,consolidation.previousLink.seriesId]
+      .filter((id):id is string=>Boolean(id))}))
+    throw new Error("Discarded recurrence state changed during cleanup and needs review");
   await state.recordMutation(consolidation.previousMapping.profile);
 }

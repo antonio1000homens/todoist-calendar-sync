@@ -1183,10 +1183,11 @@ export class StateRepository {
     return result.Item as Mapping | undefined;
   }
 
-  async getMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
+  async getMappingByTaskAnyProfile(taskId: string, alreadyCheckedProfiles: Profile[] = []): Promise<Mapping | undefined> {
     const owner = await client.send(new GetCommand({ TableName: this.ensureTable(), Key: key(`TASKOWNER#${taskId}`, "MAP"), ConsistentRead: true }));
     if (owner.Item) return owner.Item as Mapping;
-    for (const profile of allProfiles) {
+    const checked=new Set(alreadyCheckedProfiles);
+    for (const profile of allProfiles.filter(profile=>!checked.has(profile))) {
       const mapping = await this.getMappingByTask(profile, taskId);
       if (mapping) return mapping;
     }
@@ -1642,6 +1643,77 @@ export class StateRepository {
       // inspection and cleanup. Conditional cancellation means there is
       // nothing safe to delete; leave the newer index untouched.
       if ((error as { name?: string }).name === "TransactionCanceledException") return;
+      throw error;
+    }
+  }
+
+  /**
+   * Retire legacy operational correlation state after the caller has verified
+   * deletion at the provider. Every row is read consistently and deleted with
+   * its observed version/identity so a concurrent successor is preserved.
+   * Audit and delivery records are deliberately retained for deduplication and
+   * diagnostics; they are not mapping sources.
+   */
+  async purgeDeletedPair(input: { profile: Profile; taskId: string; eventIds: string[]; seriesIds?: string[] }): Promise<boolean> {
+    const {profile,taskId}=input;
+    const eventIds=[...new Set(input.eventIds.filter(Boolean))];
+    const seriesIds=[...new Set((input.seriesIds||[]).filter(Boolean))];
+    if(!taskId||!eventIds.length) throw new Error("Verified deletion cleanup requires exact task and event identities");
+    await assertReplayAdmissionIfEnabled({profile,taskId,eventIds});
+    const table=this.ensureTable();
+    const keys=[
+      key(`TASK#${profile}#${taskId}`,"MAP"), key(`TASKOWNER#${taskId}`,"MAP"),
+      ...eventIds.map(id=>key(`EVENT#${profile}#${id}`,"MAP")),
+      ...seriesIds.map(id=>key(`RECURRENCE#${profile}#${id}`)),
+      key(`BASELINE#${profile}#TASK#${taskId}`,"RECONCILE"),
+      key(`VERSION#TASK#${taskId}`),
+      key(`ANNUAL_RECOVERY#${profile}#${taskId}`),
+      key(`FUTURE_SPLIT#TASK#${taskId}`),
+      key(`CANONICAL#${profile}#todoist#${taskId}`),
+      ...eventIds.map(id=>key(`CANONICAL#${profile}#calendar#${id}`)),
+    ];
+    const snapshots=await Promise.all(keys.map(Key=>client.send(new GetCommand({TableName:table,Key,ConsistentRead:true}))));
+    const items:Record<string,unknown>[]=[];
+    let identityConflict=false;
+    for(let i=0;i<keys.length;i++) {
+      const row=snapshots[i].Item;
+      if(!row) continue;
+      const pk=keys[i].pk;
+      const isEvent=pk.startsWith(`EVENT#${profile}#`);
+      const isCanonical=pk.startsWith(`CANONICAL#${profile}#`);
+      const isRecurrence=pk.startsWith(`RECURRENCE#${profile}#`);
+      const isAnnualRecovery=pk===`ANNUAL_RECOVERY#${profile}#${taskId}`;
+      const isFutureSplit=pk===`FUTURE_SPLIT#TASK#${taskId}`;
+      if(isEvent&&(row.profile!==profile||row.taskId!==taskId||!eventIds.includes(String(row.eventId||pk.slice(`EVENT#${profile}#`.length))))) {identityConflict=true;continue;}
+      if(pk===`TASK#${profile}#${taskId}`&&(row.profile!==profile||row.taskId!==taskId||!eventIds.includes(String(row.eventId)))) {identityConflict=true;continue;}
+      if(pk===`TASKOWNER#${taskId}`&&(row.profile!==profile||row.taskId!==taskId||!eventIds.includes(String(row.eventId)))) {identityConflict=true;continue;}
+      if(isRecurrence&&(row.profile!==profile||row.taskId!==taskId||!seriesIds.includes(String(row.seriesId)))) {identityConflict=true;continue;}
+      if(isAnnualRecovery&&(row.profile!==profile||row.taskId!==taskId
+        ||!eventIds.includes(String(row.oldEventId)))) {identityConflict=true;continue;}
+      if(isFutureSplit&&(row.profile!==profile||row.taskId!==taskId
+        ||![row.oldMasterId,row.newMasterId,row.previousOccurrence].some(id=>typeof id==="string"&&eventIds.includes(id)))) {identityConflict=true;continue;}
+      if(isCanonical) {
+        const expectedSide=pk.includes("#todoist#")?"todoist":"calendar";
+        const expectedId=expectedSide==="todoist"?taskId:pk.slice(`CANONICAL#${profile}#calendar#`.length);
+        if(row.profile!==profile||row.side!==expectedSide||row.providerId!==expectedId) {identityConflict=true;continue;}
+      }
+      const names:Record<string,string>={"#pk":"pk"};
+      const values:Record<string,unknown>={":pk":pk};
+      const predicates=["#pk = :pk"];
+      let attrIndex=0;
+      for(const field of ["updatedAt","profile","taskId","eventId","seriesId","owner","masterEventId","activeInstanceId","side","providerId","identity","baseline","sourceUpdatedAt","deliveryId","oldEventId","operationId","status","sourceDueDate","sourcePolicy","sourceFingerprint","candidateEventId","oldMasterId","newMasterId","previousOccurrence","startedAt","completedAt","expiresAt"]) {
+        if(!Object.hasOwn(row,field)) continue;
+        const name=`#a${attrIndex}`,value=`:v${attrIndex++}`;
+        names[name]=field;values[value]=row[field];predicates.push(`${name} = ${value}`);
+      }
+      items.push({Delete:{TableName:table,Key:keys[i],ConditionExpression:predicates.join(" AND "),
+        ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
+    }
+    if(identityConflict) return false;
+    if(!items.length) return true;
+    try { await client.send(new TransactWriteCommand({TransactItems:items as never})); return true; }
+    catch(error) {
+      if((error as {name?:string}).name==="TransactionCanceledException") return false;
       throw error;
     }
   }

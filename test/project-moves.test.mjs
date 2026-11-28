@@ -232,6 +232,40 @@ test("mapped -> Inbox deletes the old projection and does not create another", a
   assert.equal(state.tombstones.has(`home:${task.id}`), false);
 });
 
+test("verified same-profile deletion echo is a read-only no-op without cross-profile lookups",async()=>{
+  for(const [fixture,taskId] of [["standalone-1","deleted-home-1"],["standalone-2","deleted-home-2"],["recurring","deleted-home-series"]]) {
+    const profilesRequested=[];const calls={comments:0,taskReads:0,calendarDeletes:0,audits:[],ownerReads:0};
+    const state={
+      async getMappingByTaskAnyProfile(id){assert.equal(id,taskId);calls.ownerReads++;return undefined;},
+      async syncBlocked(){return false;},
+      async mutationAllowed(){return true;},
+      async audit(profile,action,detail){calls.audits.push({profile,action,detail});},
+    };
+    const clientFactory=async profile=>{
+      profilesRequested.push(profile);
+      return {
+        calendar:{async findByTodoistTaskId(){return undefined;},async deleteEvent(){calls.calendarDeletes++;}},
+        todoist:{
+          async listProjectComments(){calls.comments++;return [];},
+          async getTask(){calls.taskReads++;const error=new Error("not found");error.status=404;throw error;},
+        },
+      };
+    };
+    const sync=new ProjectAwareSynchronizer(state,undefined,clientFactory);
+    await sync.process({id:`delete-echo-${fixture}`,kind:"todoist",profile:"home",mode:"aws",
+      receivedAt:"2026-11-28T08:41:00Z",headers:{},
+      body:JSON.stringify({event_name:"item:deleted",event_data:{id:taskId,project_id:HOME,is_deleted:true}})});
+    assert.deepEqual(profilesRequested,["home"],"exact local deletion must not query other profile clients");
+    assert.equal(calls.comments,1);
+    assert.equal(calls.ownerReads,1,"uses one exact legacy-owner read");
+    assert.equal(calls.taskReads,1,"freshly confirms Todoist absence");
+    assert.equal(calls.calendarDeletes,0);
+    assert.deepEqual(calls.audits,[{profile:"home",action:"todoist_deleted_echo_noop",detail:{
+      taskId,verifiedLocalRoute:true,meaningfulMutation:false,
+    }}]);
+  }
+});
+
 test("mapped Home -> Work migrates the projection without recreating the Todoist task", async () => {
   const previous = { id: "task-3", project_id: HOME, content: "Move me", due: { date: "2026-09-06" }, updated_at: "2026-09-03T09:00:00Z" };
   const task = { ...previous, project_id: WORK, updated_at: "2026-09-03T10:00:00Z" };

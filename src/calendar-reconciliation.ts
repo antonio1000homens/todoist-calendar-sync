@@ -342,6 +342,10 @@ export async function reconcileUnmappedCalendar(
       await pair.calendar.deleteEvent(event.id).catch((error: unknown) => {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
+      if(staleMapping && !await state.purgeDeletedPair({profile,taskId:staleMapping.taskId,
+        eventIds:[staleMapping.eventId,staleMapping.masterEventId,staleMapping.activeInstanceId,event.id].filter((id):id is string=>Boolean(id)),
+        seriesIds:[staleMapping.seriesId,staleMapping.masterEventId].filter((id):id is string=>Boolean(id))}))
+        throw new Error(`Deleted Calendar projection cleanup changed concurrently for task ${staleMapping.taskId}; retry or review`);
       await state.recordMutation(profile);
       summary.skipped += 1;
       await state.audit(profile, "calendar_snapshot_deleted_task_projection_removed", {
