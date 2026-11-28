@@ -40,6 +40,7 @@ import {
   nativeCalendarRecurrenceCandidate,
   isPhaseCNativeCandidate,
   matchesCalendarOwnedRecurringRule,
+  matchesCalendarOwnedRecurringRuleAtOccurrence,
   matchesCalendarOwnedRecurringTask,
   resolveCalendarTimeZone,
 } from "./calendar-owned-todoist-recurrence.js";
@@ -1721,8 +1722,10 @@ export class Synchronizer {
         existingMirrorPreserved: true, outcome: "source_left_unchanged",
       });
     }
-    const currentStateMatches = calendarOwnedRecurringTaskReadback(task, current, recurrence, timeZone).matches;
-    if (!currentStateMatches && !matchesCalendarOwnedRecurringRule(task, recurrence, timeZone)) {
+    const currentReadback = calendarOwnedRecurringTaskReadback(task, current, recurrence, timeZone);
+    const currentStateMatches = currentReadback.matches;
+    if (!currentStateMatches
+      && !matchesCalendarOwnedRecurringRuleAtOccurrence(task, current, recurrence, timeZone)) {
       return this.state.audit(delivery.profile, "calendar_recurrence_unsupported_rule", {
         taskId: task.id, eventId: current.id, masterEventId: master.id,
         existingMirrorPreserved: true, outcome: "source_left_unchanged",

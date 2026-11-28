@@ -531,7 +531,13 @@ function openRuleMatches(
   verifiedTimeZone?: string,
   occurrence?: CalendarEvent,
 ): { matches: boolean; ruleMatches: boolean; parsed: ReturnType<typeof parseOpenTodoistRule> } {
-  const parsed = parseOpenTodoistRule(task.due?.string, task, verifiedTimeZone);
+  const occurrenceAnchor = occurrence?.originalStartTime?.dateTime || occurrence?.originalStartTime?.date;
+  const ruleTask = occurrenceAnchor ? {
+    ...task,
+    due: { ...task.due, ...(occurrenceAnchor.includes("T")
+      ? { datetime: occurrenceAnchor } : { date: occurrenceAnchor }) },
+  } : task;
+  const parsed = parseOpenTodoistRule(task.due?.string, ruleTask, verifiedTimeZone);
   const expectedStart = recurrence.startDate ? parseNaturalDate(recurrence.startDate) : undefined;
   const anchor = parsed?.start;
   // DTSTART is the immutable Calendar cadence anchor. A provider may retain
@@ -824,6 +830,26 @@ export function matchesCalendarOwnedRecurringRule(
     && expected.time === observed.time
     && scheduleStartMatches(expected, observed, allowYearOmission, observedParse.diagnostics.phraseKind)
     && sameDate(expected.end, observed.end, allowYearOmission));
+}
+
+/**
+ * Verify a recurring Todoist rule against a Calendar occurrence while allowing
+ * the task's active due value to differ from that occurrence. Calendar-owned
+ * occurrence edits can temporarily leave those dates out of step; the rule
+ * text still has to match the verified Calendar cadence before Calendar may
+ * repair the active date.
+ */
+export function matchesCalendarOwnedRecurringRuleAtOccurrence(
+  task: TodoistTask,
+  event: CalendarEvent,
+  recurrence: CalendarOwnedTodoistRecurrence,
+  verifiedTimeZone?: string,
+): boolean {
+  if (recurrence.phaseCCandidate)
+    return matchesCalendarPhaseCTask(task, recurrence.phaseCCandidate, recurrence.startDate!, verifiedTimeZone);
+  if (recurrence.frequency)
+    return openRuleMatches(task, recurrence, verifiedTimeZone, event).ruleMatches;
+  return matchesCalendarOwnedRecurringRule(task, recurrence, verifiedTimeZone);
 }
 
 /**
