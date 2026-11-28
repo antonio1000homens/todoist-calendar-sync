@@ -194,6 +194,20 @@ test("historical standalone Calendar deltas bypass orphan ownership reads and pr
   assert.ok(f.state.audits.some((item) => item.action === "calendar_elapsed_standalone_event_ignored"));
 });
 
+test("same-profile Todoist deletion echoes skip the orphan cross-profile inventory", async () => {
+  const f=fixture();
+  const profilesRequested=[];
+  const clients=async profile=>{profilesRequested.push(profile);return {calendar:f.calendar,todoist:f.todoist};};
+  const sync=new OrphanRecoveringSynchronizer(f.state,undefined,clients);
+  await sync.process({...delivery("todoist",JSON.stringify({
+    event_name:"item:deleted",
+    event_data:{id:"deleted-home-task",project_id:HOME},
+    event_data_extra:{old_item:{id:"deleted-home-task",project_id:HOME}},
+  }))});
+  assert.deepEqual(profilesRequested,["home"]);
+  assert.equal(f.state.audits.at(-1).action,"todoist_deleted_echo_noop");
+});
+
 test("old recurring instance stays on the ownership path even when its end is historical", async () => {
   // The helper must never treat a historical instance as a standalone event:
   // a past exception may belong to an active series with future occurrences.

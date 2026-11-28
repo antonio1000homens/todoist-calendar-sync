@@ -150,6 +150,19 @@ export class OrphanRecoveringSynchronizer {
       return;
     }
 
+    const lifecycle=todoistCalendarLifecycle(payload);
+    const deletionOldProjectId=payload.event_data_extra?.old_item?.project_id;
+    const deletionRoute=profileForTodoistProject(task.project_id);
+    const deletionOldRoute=profileForTodoistProject(deletionOldProjectId);
+    if(lifecycle?.reason==="deleted"&&deletionRoute===delivery.profile
+      &&(!deletionOldProjectId||deletionOldRoute===deletionRoute)) {
+      // The project-aware deletion path uses exact local correlation and
+      // targeted state keys. A profile-wide native ownership inventory here
+      // would repeat sync reads before it can classify a converged echo.
+      await new ProjectAwareSynchronizer(this.state,this.scheduleOrphan,this.clientFactory).process(delivery);
+      return;
+    }
+
     const sourceProfile = profileForTodoistProject(task.project_id) || delivery.profile;
 
     // Validate an otherwise-unmapped upsert against Todoist before orphan
