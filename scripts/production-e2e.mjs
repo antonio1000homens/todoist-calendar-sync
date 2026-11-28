@@ -10,6 +10,7 @@ import {
   uniqueProjectTaskMapping,
   uniqueProjectTaskMappingForEvent,
   calendarResourceAbsent,
+  calendarOwnedRecurrenceCorrelationMatches,
   unsupportedCalendarRecurrencePreserved,
 } from "./production-e2e-assertions.mjs";
 import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
@@ -466,15 +467,10 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         ]);
         return { event, mapping };
       },
-      ({ event, mapping }) => event.extendedProperties?.shared?.taskId === recurringTaskId
-        && event.extendedProperties.shared.syncProfile === profile
-        && event.extendedProperties.shared.syncCalendarId === config.calendarId
-        && event.extendedProperties.shared.syncEventId === recurringEventId
-        && event.extendedProperties.shared.syncTaskId === recurringTaskId
-        && !event.extendedProperties.shared.syncSource && !event.extendedProperties.shared.syncRecurrenceOwner
-        && mapping?.profile === profile && mapping.eventId === recurringEventId
-        && mapping.calendarId === config.calendarId && mapping.taskId === recurringTaskId
-        && mapping.calendarProgressVersion === 1,
+      ({ event, mapping }) => calendarOwnedRecurrenceCorrelationMatches({
+        event, mapping, profile, calendarId: config.calendarId, masterEventId: recurringEventId,
+      }) && mapping.taskId === recurringTaskId
+        && !event.extendedProperties.shared.syncSource && !event.extendedProperties.shared.syncRecurrenceOwner,
     );
     log("recurring_provider_correlation_verified", { profile });
 

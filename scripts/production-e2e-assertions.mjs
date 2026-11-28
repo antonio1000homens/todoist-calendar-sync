@@ -34,6 +34,18 @@ export function calendarResourceAbsent(event) {
   return !event || event.status === "cancelled";
 }
 
+export function calendarOwnedRecurrenceCorrelationMatches({ event, mapping, profile, calendarId, masterEventId }) {
+  const shared = event?.extendedProperties?.shared;
+  return Boolean(shared && mapping
+    && shared.taskId === mapping.taskId && shared.syncTaskId === mapping.taskId
+    && shared.syncProfile === profile && shared.syncCalendarId === calendarId
+    && shared.syncEventId === masterEventId && shared.syncMasterEventId === masterEventId
+    && shared.syncActiveInstanceId === mapping.activeInstanceId && shared.syncProgressVersion === "1"
+    && mapping.profile === profile && mapping.calendarId === calendarId
+    && mapping.masterEventId === masterEventId && mapping.taskId
+    && mapping.eventId === mapping.activeInstanceId && mapping.calendarProgressVersion === 1);
+}
+
 export function unsupportedCalendarRecurrencePreserved({
   readback,
   expectedEventId,
