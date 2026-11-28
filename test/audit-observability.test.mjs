@@ -34,12 +34,16 @@ test("telemetry sanitization retains correlation metadata and drops content/payl
     error: "provider response with a secret",
     providerBody: "raw provider payload",
     response: { access_token: "secret" },
+    readCount: 12, readCapacityUnits: 6, candidateDeleteCount: 4, writeCapacityUnits: 3,
+    outcome: "deleted",
   }), {
     profile: "home",
     taskId: "task-1",
     eventId: "event-1",
     calendarStatus: "cancelled",
     changedFields: ["description", "due.date"],
+    readCount: 12, readCapacityUnits: 6, candidateDeleteCount: 4, writeCapacityUnits: 3,
+    outcome: "deleted",
   });
   assert.deepEqual(sanitizeTelemetryDetail({
     summary: { scanned: 12, conflicts: 1, providerMutations: 2, title: "drop me" },

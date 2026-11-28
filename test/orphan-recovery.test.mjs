@@ -194,7 +194,7 @@ test("historical standalone Calendar deltas bypass orphan ownership reads and pr
   assert.ok(f.state.audits.some((item) => item.action === "calendar_elapsed_standalone_event_ignored"));
 });
 
-test("same-profile Todoist deletion echoes skip the orphan cross-profile inventory", async () => {
+test("same-profile Todoist deletion checks cross-profile correlations", async () => {
   const f=fixture();
   const profilesRequested=[];
   const clients=async profile=>{profilesRequested.push(profile);return {calendar:f.calendar,todoist:f.todoist};};
@@ -204,8 +204,8 @@ test("same-profile Todoist deletion echoes skip the orphan cross-profile invento
     event_data:{id:"deleted-home-task",project_id:HOME},
     event_data_extra:{old_item:{id:"deleted-home-task",project_id:HOME}},
   }))});
-  assert.deepEqual(profilesRequested,["home"]);
-  assert.equal(f.state.audits.at(-1).action,"todoist_deleted_echo_noop");
+  assert.ok(profilesRequested.includes("work"));
+  assert.ok(profilesRequested.includes("antonio"));
 });
 
 test("old recurring instance stays on the ownership path even when its end is historical", async () => {

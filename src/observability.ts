@@ -4,7 +4,7 @@ const SAFE_STRING_KEYS = new Set([
   "targetId", "targetType", "slackUserId", "commentId", "projectId", "oldProjectId",
   "newProjectId", "calendarStatus", "mode", "reason", "type", "action", "event",
   "eventName", "kind", "stage", "operation", "status", "code", "generation",
-  "endpointClass", "accountId",
+  "endpointClass", "accountId", "outcome",
   "handlingMode", "defaultAction", "source", "auditClass", "updatedAt", "createdAt", "providerReason",
   "sourceUpdatedAt", "taskUpdatedAt", "awsRequestId", "fromProfile", "toProfile",
 ]);
@@ -13,7 +13,7 @@ const SAFE_NUMBER_KEYS = new Set([
   "count", "scannedCount", "evaluatedCount", "returnedCount", "pages", "consumedCapacityUnits", "durationMs",
   "pacedDelayMs", "pacingDelayMs", "receiveCount", "bodyBytes", "mutationCount", "limit",
   "used", "scanned", "skipped", "conflicts", "blocked", "imported", "rebound", "providerMutations", "providerStatus",
-  "retryCount", "httpStatus",
+  "retryCount", "httpStatus", "readCount", "candidateDeleteCount", "readCapacityUnits", "writeCapacityUnits",
 ]);
 
 const SAFE_BOOLEAN_KEYS = new Set([

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { profiles } from "../dist/config.js";
 import { mappingFromProjectMappingComment, parseMappingComment, serializeDeletionTombstoneComment, serializeMappingComment } from "../dist/mapping-comments.js";
+import { isSafeCalendarDeletionReplay } from "../dist/safe-provider-replay.js";
 import {
   Synchronizer,
   selectCalendarRecurrenceInstance,
@@ -1064,4 +1065,41 @@ test("incremental Google weekly WKST series creates exactly one native recurring
   assert.equal(clients.tasks.size, 1);
   assert.equal(clients.todoistUpserts.length, 1);
   assert.equal(clients.calendarDeletes.length, 0);
+});
+
+test("cancelled recurring master retains provider identity until state purge succeeds", async () => {
+  const active = instance("retry-active", "2099-09-17", "2099-09-18");
+  const link = linkFor(active, { calendarProgressVersion: 1 });
+  const state = new FakeState(link);
+  const clients = fakeClients(state, [active], link, { id: MASTER, status: "cancelled", iCalUID: SERIES });
+  const providerRequests=[];
+  for (const [provider,client] of [["calendar",clients.calendar],["todoist",clients.todoist]]) {
+    for (const name of Object.keys(client)) if (typeof client[name] === "function") {
+      const original=client[name].bind(client);
+      client[name]=(...args)=>{providerRequests.push(`${provider}.${name}`);return original(...args);};
+    }
+  }
+  let attempts = 0;
+  state.purgeDeletedPair = async input => {
+    attempts++;
+    assert.equal(input.taskId, link.taskId);
+    assert.ok(input.eventIds.includes(MASTER));
+    assert.ok(input.eventIds.includes(active.id));
+    assert.ok(input.seriesIds.includes(SERIES));
+    if (attempts === 1) throw new Error("injected purge failure");
+    return true;
+  };
+  const delivery = { id: "master-retry", kind: "calendar", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-16T10:00:00Z", headers: {}, body: "" };
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  await assert.rejects(sync.process(delivery), error => isSafeCalendarDeletionReplay(error));
+  assert.equal(attempts, 1);
+  assert.equal(clients.projectComments.find(comment => comment.id === "provider-mapping").is_deleted, undefined);
+  await sync.process({ ...delivery, id: "master-retry-2" });
+  assert.equal(attempts, 2);
+  assert.equal(clients.projectComments.find(comment => comment.id === "provider-mapping").is_deleted, true);
+  assert.equal(providerRequests.filter(name=>name==="calendar.listDelta").length,2);
+  assert.equal(providerRequests.filter(name=>name==="todoist.deleteTask").length,2);
+  assert.equal(providerRequests.filter(name=>name==="todoist.deleteComment").length,1,
+    "the provider mapping remains available after the failed purge and is retired once after retry succeeds");
 });

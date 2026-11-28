@@ -1268,6 +1268,16 @@ export class StateRepository {
     });
   }
 
+  /** A bounded fallback for old occurrence-keyed mappings. A partial result
+   * cannot prove that an identity is unowned, so exceeding the cap fails closed. */
+  async listMappingsForOwnership(profile: Profile): Promise<Mapping[]> {
+    return readProfileLookup<Mapping>({
+      client, profile, operation: "calendar_identity_legacy_ownership",
+      component: "state-repository", maxPages: 5,
+      queryInput: { ...mappingLookupQueryInput(this.ensureTable(), profile), Limit: 100 },
+    });
+  }
+
   /**
    * Historical ownership is not necessarily indexed by the Calendar master:
    * Calendar-owned recurrences put EVENT mappings on individual instances.
@@ -1672,7 +1682,10 @@ export class StateRepository {
       key(`CANONICAL#${profile}#todoist#${taskId}`),
       ...eventIds.map(id=>key(`CANONICAL#${profile}#calendar#${id}`)),
     ];
-    const snapshots=await Promise.all(keys.map(Key=>client.send(new GetCommand({TableName:table,Key,ConsistentRead:true}))));
+    const snapshots=await Promise.all(keys.map(Key=>client.send(new GetCommand({
+      TableName:table,Key,ConsistentRead:true,ReturnConsumedCapacity:"TOTAL",
+    }))));
+    const readCapacityUnits=snapshots.reduce((sum,result)=>sum+Number(result.ConsumedCapacity?.CapacityUnits||0),0);
     const items:Record<string,unknown>[]=[];
     let identityConflict=false;
     for(let i=0;i<keys.length;i++) {
@@ -1709,11 +1722,29 @@ export class StateRepository {
       items.push({Delete:{TableName:table,Key:keys[i],ConditionExpression:predicates.join(" AND "),
         ExpressionAttributeNames:names,ExpressionAttributeValues:values}});
     }
-    if(identityConflict) return false;
-    if(!items.length) return true;
-    try { await client.send(new TransactWriteCommand({TransactItems:items as never})); return true; }
+    if(identityConflict) {
+      logEvent("dynamodb_verified_deletion_cleanup",{profile,readCount:keys.length,readCapacityUnits,
+        candidateDeleteCount:items.length,outcome:"identity_conflict"},"state-repository");
+      return false;
+    }
+    if(!items.length) {
+      logEvent("dynamodb_verified_deletion_cleanup",{profile,readCount:keys.length,readCapacityUnits,
+        candidateDeleteCount:0,writeCapacityUnits:0,outcome:"already_absent"},"state-repository");
+      return true;
+    }
+    try {
+      const result=await client.send(new TransactWriteCommand({TransactItems:items as never,ReturnConsumedCapacity:"TOTAL"}));
+      const writeCapacityUnits=Number(result.ConsumedCapacity?.reduce((sum,item)=>sum+Number(item.CapacityUnits||0),0)||0);
+      logEvent("dynamodb_verified_deletion_cleanup",{profile,readCount:keys.length,readCapacityUnits,
+        candidateDeleteCount:items.length,writeCapacityUnits,outcome:"deleted"},"state-repository");
+      return true;
+    }
     catch(error) {
-      if((error as {name?:string}).name==="TransactionCanceledException") return false;
+      if((error as {name?:string}).name==="TransactionCanceledException") {
+        logEvent("dynamodb_verified_deletion_cleanup",{profile,readCount:keys.length,readCapacityUnits,
+          candidateDeleteCount:items.length,outcome:"transaction_conflict"},"state-repository");
+        return false;
+      }
       throw error;
     }
   }

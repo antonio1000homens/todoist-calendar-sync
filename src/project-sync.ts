@@ -372,47 +372,48 @@ export class ProjectAwareSynchronizer {
     const localRoute=profileForTodoistProject(eventTask.project_id);
     const deletion=todoistCalendarLifecycle(rawPayload);
     const deletionOldProjectId=rawPayload.event_data_extra?.old_item?.project_id;
-    const deletionOldRoute=profileForTodoistProject(deletionOldProjectId);
-    let mapping:Mapping|undefined;
-    if(deletion?.reason==="deleted"&&localRoute===delivery.profile
-      && (!deletionOldProjectId||deletionOldRoute===localRoute)) {
-      // A routed deletion is resolved against its own project first. A
-      // completed primary deletion has already removed its provider comment
-      // and exact DynamoDB mapping; its webhook echo is then a read-only no-op.
-      // If any exact legacy owner remains, fall through to guarded cross-profile
-      // resolution so moves and partial cleanup are never mistaken for echoes.
-      const localClients=await this.clients(delivery.profile);
-      mapping=await this.delegate.providerMappingByTask(delivery.profile,eventTask.id,localClients.todoist);
-      if(!mapping) {
-        const legacyOwner=await this.state.getMappingByTaskAnyProfile?.(eventTask.id,[delivery.profile]);
-        if(legacyOwner?.profile!==undefined&&legacyOwner.profile!==delivery.profile)
-          mapping=await this.delegate.providerMappingByTaskAnyProfile(eventTask.id)||legacyOwner;
-        else if(legacyOwner) mapping=legacyOwner;
-        else {
-          const {todoist,calendar}=localClients;
-          const calendarAlias=await calendar.findByTodoistTaskId?.(eventTask.id);
-          if(calendarAlias&&calendarAlias.status!=="cancelled") {
-            // Provider-native Calendar correlation still proves this may be a
-            // legitimate Todoist-origin deletion. Let the normal guarded path
-            // process it rather than acknowledging it as a completed echo.
-            mapping=undefined;
-          } else {
-            try {
-              const current=await todoist.getTask(eventTask.id);
-              if(!current.is_deleted) return this.state.audit(delivery.profile,"todoist_stale_delete_replay_suppressed",{
-                taskId:eventTask.id,currentUpdatedAt:current.updated_at,
-              });
-            } catch(error) {
-              if(Number((error as {status?:number}).status)!==404) throw error;
-            }
-            return this.state.audit(delivery.profile,"todoist_deleted_echo_noop",{
-              taskId:eventTask.id,verifiedLocalRoute:true,meaningfulMutation:false,
-            });
-          }
+    const sameProjectDeletion=deletion?.reason==="deleted"&&localRoute===delivery.profile
+      &&(!deletionOldProjectId||deletionOldProjectId===eventTask.project_id);
+    const localClients=sameProjectDeletion?await this.clients(delivery.profile):undefined;
+    let mapping:Mapping|undefined=sameProjectDeletion
+      ? await this.delegate.providerMappingByTask(delivery.profile,eventTask.id,localClients!.todoist)
+      : await this.delegate.providerMappingByTaskAnyProfile(eventTask.id);
+    if(sameProjectDeletion&&!mapping)
+      mapping=await this.state.getMappingByTaskAnyProfile?.(eventTask.id);
+    const retainedBeforeDeletion = deletion?.reason === "deleted"
+      ? await this.completedProjectionsByTaskAnyProfile(eventTask.id) : [];
+    if (!mapping && !retainedBeforeDeletion.length
+      && deletion?.reason === "deleted" && localRoute === delivery.profile) {
+      // A missing mapping does not prove that another calendar has no native
+      // correlation. Resolve every managed calendar before choosing an owner.
+      const aliases: Mapping[] = [];
+      for (const profile of Object.keys(profiles) as Profile[]) {
+        const clients=profile===delivery.profile&&localClients?localClients:await this.clients(profile);
+        const alias = await clients.calendar.findByTodoistTaskId?.(eventTask.id);
+        if (alias && alias.status !== "cancelled"
+          && !retainedBeforeDeletion.some(item => item.profile === profile && item.eventId === alias.id)) {
+          const correlated = this.delegate.mappingFromCalendarCorrelation(profile, alias);
+          if (correlated && correlated.taskId !== eventTask.id)
+            throw new Error(`Calendar correlation does not match Todoist task ${eventTask.id}`);
+          aliases.push(correlated || { profile, eventId: alias.id, taskId: eventTask.id, updatedAt: alias.updated || new Date().toISOString() });
         }
       }
-    } else {
-      mapping=await this.delegate.providerMappingByTaskAnyProfile(eventTask.id);
+      if (aliases.length > 1) throw new Error(`Todoist task ${eventTask.id} has Calendar correlations in multiple profiles`);
+      mapping = aliases[0];
+      if (!mapping) {
+        try {
+          const current = await localClients!.todoist.getTask(eventTask.id);
+          if (!current.is_deleted) return this.state.audit(delivery.profile,"todoist_stale_delete_replay_suppressed",{
+            taskId:eventTask.id,currentUpdatedAt:current.updated_at,
+          });
+        } catch(error) {
+          if (Number((error as {status?:number}).status)!==404) throw error;
+        }
+        return this.state.audit(delivery.profile,"todoist_deleted_echo_noop",{
+          taskId:eventTask.id,verifiedLocalRoute:true,verifiedNoCrossProfileCorrelation:true,
+          meaningfulMutation:false,
+        });
+      }
     }
     const controlProfile = mapping?.profile || profileForTodoistProject(rawPayload.event_data.project_id) || delivery.profile;
     if (await this.state.syncBlocked(controlProfile, { taskId: rawPayload.event_data.id, eventId: mapping?.eventId })) {
@@ -439,11 +440,23 @@ export class ProjectAwareSynchronizer {
     const lifecycle = todoistCalendarLifecycle(payload);
     if (!lifecycle) return;
 
+    // Retained completions can belong to a different profile than the live
+    // projection. Give each owner its own guarded deletion decision.
+    if (mapping && lifecycle.reason === "deleted") {
+      for (const owner of new Set(retainedBeforeDeletion.map(item => item.profile))) {
+        if (owner === mapping.profile) continue;
+        const release = await acquireMoveWriterLeases([owner], delivery.profile);
+        try { await this.delegate.process({ ...delivery, profile: owner, body: JSON.stringify(payload) }); }
+        finally { await release(); }
+      }
+    }
+
     // Completed projections remain terminal even after their active mapping is
     // removed. Resolve the durable owner before project-transition handling so
     // a later item:updated/project move cannot rediscover and delete history.
     if (!mapping) {
-      const retained = await this.completedProjectionsByTaskAnyProfile(task.id);
+      const retained = deletion?.reason === "deleted" ? retainedBeforeDeletion
+        : await this.completedProjectionsByTaskAnyProfile(task.id);
       if (retained.length) {
         const ownerProfiles = [...new Set(retained.map((projection) => projection.profile))];
         if (lifecycle.reason === "deleted") {
@@ -476,6 +489,14 @@ export class ProjectAwareSynchronizer {
           ownerProfiles,
         });
       }
+    }
+
+    if (mapping && lifecycle.reason === "deleted" && localRoute === delivery.profile
+      && (!rawPayload.event_data_extra?.old_item?.project_id
+        || rawPayload.event_data_extra.old_item.project_id === eventTask.project_id)) {
+      const release = await acquireMoveWriterLeases([mapping.profile], delivery.profile);
+      try { return await this.delegate.process({ ...delivery, profile: mapping.profile, body: JSON.stringify(payload) }); }
+      finally { await release(); }
     }
 
     // Completion is terminal for synchronization. Preserve the projection in
@@ -654,7 +675,8 @@ export class ProjectAwareSynchronizer {
       }
     }
 
-    const destinationProfile = transition.toProfile || mapping?.profile;
+    const destinationProfile = lifecycle.reason === "deleted" && mapping?.profile
+      ? mapping.profile : transition.toProfile || mapping?.profile;
     if (!destinationProfile) return;
     const releaseDestinationWriter = await acquireMoveWriterLeases([destinationProfile], delivery.profile);
     try {

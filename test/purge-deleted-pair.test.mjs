@@ -6,7 +6,8 @@ import { StateRepository } from "../dist/repository.js";
 
 const base={profile:"home",taskId:"task-1",eventId:"event-1",updatedAt:"2026-11-28T10:00:00.000Z"};
 
-test("verified pair purge removes only exact operational rows with observed versions",async()=>{
+test("verified pair purge removes exact rows and reports request counts plus capacity",async t=>{
+  const log=t.mock.method(console,"log",()=>{});
   const old=documentClient.send;let transaction;const readKeys=[];
   const rows=new Map([
     ["TASK#home#task-1",{...base,pk:"TASK#home#task-1",sk:"MAP"}],
@@ -29,17 +30,22 @@ test("verified pair purge removes only exact operational rows with observed vers
     ["DELIVERY#delivery-1",{taskId:"task-1",pk:"DELIVERY#delivery-1",sk:"COMPLETED"}],
   ]);
   documentClient.send=async command=>{
-    if(command instanceof GetCommand){readKeys.push(command.input.Key.pk);return {Item:rows.get(command.input.Key.pk)};}
+    if(command instanceof GetCommand){readKeys.push(command.input.Key.pk);assert.equal(command.input.ReturnConsumedCapacity,"TOTAL");return {Item:rows.get(command.input.Key.pk),ConsumedCapacity:{CapacityUnits:0.5}};}
     if(command instanceof TransactWriteCommand){
+      assert.equal(command.input.ReturnConsumedCapacity,"TOTAL");
       transaction=command.input.TransactItems;
       for(const item of transaction)if(item.Delete)rows.delete(item.Delete.Key.pk);
-      return {};
+      return {ConsumedCapacity:[{CapacityUnits:2}]};
     }
     throw new Error("unexpected DynamoDB command");
   };
   try {
     assert.equal(await new StateRepository().purgeDeletedPair({profile:"home",taskId:"task-1",eventIds:["event-1","master-1"],seriesIds:["series-1"]}),true);
     assert.equal(transaction.length,11,"all mapping families, task-scoped recovery records and the second event index are deleted atomically");
+    const metric=log.mock.calls.map(call=>JSON.parse(call.arguments[0])).find(item=>item.event==="dynamodb_verified_deletion_cleanup");
+    assert.deepEqual({readCount:metric.readCount,readCapacityUnits:metric.readCapacityUnits,
+      candidateDeleteCount:metric.candidateDeleteCount,writeCapacityUnits:metric.writeCapacityUnits,outcome:metric.outcome},
+    {readCount:12,readCapacityUnits:6,candidateDeleteCount:11,writeCapacityUnits:2,outcome:"deleted"});
     const deleted=transaction.map(item=>item.Delete);
     assert.ok(deleted.every(Boolean));
     assert.ok(deleted.every(item=>item.ConditionExpression.includes("#a0 = :v0")));

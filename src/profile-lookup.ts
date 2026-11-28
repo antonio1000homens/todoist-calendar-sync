@@ -174,6 +174,7 @@ interface ProfileLookupQueryOptions {
   operation: string;
   component: string;
   queryInput: Record<string, unknown>;
+  maxPages?: number;
 }
 
 export async function readProfileLookup<T>(options: ProfileLookupQueryOptions): Promise<T[]> {
@@ -194,6 +195,14 @@ export async function readProfileLookup<T>(options: ProfileLookupQueryOptions): 
     consumedCapacityUnits += Number(result.ConsumedCapacity?.CapacityUnits || 0);
     items.push(...((result.Items || []) as T[]));
     exclusiveStartKey = result.LastEvaluatedKey;
+    if (exclusiveStartKey && options.maxPages !== undefined && pages >= options.maxPages) {
+      logEvent("dynamodb_query_complete", {
+        operation: options.operation, profile: options.profile, accessMethod: "query",
+        pages, returnedCount: items.length, evaluatedCount, consumedCapacityUnits,
+        durationMs: Date.now() - startedAt, outcome: "page_limit_exceeded",
+      }, options.component);
+      throw new Error(`${options.operation}: ownership inventory exceeded ${options.maxPages} pages for ${options.profile}; manual review required`);
+    }
   } while (exclusiveStartKey);
 
   logEvent("dynamodb_query_complete", {
