@@ -254,7 +254,8 @@ test("verified same-profile deletion echo is a read-only no-op without cross-pro
     const sync=new ProjectAwareSynchronizer(state,undefined,clientFactory);
     await sync.process({id:`delete-echo-${fixture}`,kind:"todoist",profile:"home",mode:"aws",
       receivedAt:"2026-11-28T08:41:00Z",headers:{},
-      body:JSON.stringify({event_name:"item:deleted",event_data:{id:taskId,project_id:HOME,is_deleted:true}})});
+      body:JSON.stringify({event_name:"item:deleted",event_data:{id:taskId,project_id:HOME,is_deleted:true},
+        event_data_extra:{old_item:{project_id:HOME}}})});
     assert.deepEqual(profilesRequested,["home"],"exact local deletion must not query other profile clients");
     assert.equal(calls.comments,1);
     assert.equal(calls.ownerReads,1,"uses one exact legacy-owner read");

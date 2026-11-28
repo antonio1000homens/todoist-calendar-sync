@@ -371,9 +371,11 @@ export class ProjectAwareSynchronizer {
     const eventTask=rawPayload.event_data;
     const localRoute=profileForTodoistProject(eventTask.project_id);
     const deletion=todoistCalendarLifecycle(rawPayload);
+    const deletionOldProjectId=rawPayload.event_data_extra?.old_item?.project_id;
+    const deletionOldRoute=profileForTodoistProject(deletionOldProjectId);
     let mapping:Mapping|undefined;
     if(deletion?.reason==="deleted"&&localRoute===delivery.profile
-      && !rawPayload.event_data_extra?.old_item?.project_id) {
+      && (!deletionOldProjectId||deletionOldRoute===localRoute)) {
       // A routed deletion is resolved against its own project first. A
       // completed primary deletion has already removed its provider comment
       // and exact DynamoDB mapping; its webhook echo is then a read-only no-op.
