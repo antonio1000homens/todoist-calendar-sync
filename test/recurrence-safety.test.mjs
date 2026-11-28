@@ -1688,7 +1688,7 @@ test("Calendar-owned native task creation echo never PUTs the generated Calendar
   assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
 });
 
-test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calendar master", async () => {
+test("genuine Todoist title and description edits PATCH only the Calendar master", async () => {
   const current = instance("oct-28", "2026-10-28", "2026-10-29");
   current.summary = "Weekly test";
   const master = { id: MASTER, etag: '"v1"', iCalUID: SERIES, status: "confirmed",
@@ -1698,7 +1698,7 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
     syncedTitle: "Weekly test", syncedDescription: "" };
   const state = new FakeState(link);
   const task = { id: link.taskId, project_id: "home-project",
-    content: "Renamed from Todoist", description: "",
+    content: "Renamed from Todoist", description: "Updated from Todoist",
     due: { date: "2026-11-04", string: "every Wednesday", is_recurring: true } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
   const clients = fakeClients(state, [current], tasks, undefined, [master]);
@@ -1706,14 +1706,16 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
     id: "edit", kind: "todoist", profile: PROFILE, mode: "aws",
     receivedAt: "2026-10-26T15:10:27Z", headers: {},
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
-      event_data_extra: { old_item: { ...task, content: "Weekly test" } } }),
+      event_data_extra: { old_item: { ...task, content: "Weekly test", description: "" } } }),
   });
   assert.equal(clients.calendarUpserts.length, 1);
   assert.equal(clients.calendarUpserts[0].metadataOnly, true);
   assert.equal(clients.events.get(MASTER).summary, "Renamed from Todoist");
+  assert.equal(clients.events.get(MASTER).description, "Updated from Todoist");
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;BYDAY=WE"]);
   assert.equal(tasks.get(task.id).due.date, "2026-11-04");
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
+  assert.equal(state.mappingsByTask.get(task.id).syncedDescription, "Updated from Todoist");
 });
 
 test("an explicit annual Todoist cadence edit creates a Calendar-owned future successor and preserves history", async (t) => {
