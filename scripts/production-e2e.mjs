@@ -11,6 +11,7 @@ import {
   uniqueProjectTaskMappingForEvent,
   calendarResourceAbsent,
   calendarOwnedRecurrenceCorrelationMatches,
+  sameProviderInstant,
   unsupportedCalendarRecurrencePreserved,
 } from "./production-e2e-assertions.mjs";
 import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
@@ -500,7 +501,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       () => todoist.getTask(recurringTaskId),
       (candidate) => candidate.id === recurringTaskId && candidate.content === currentOccurrenceTitle
         && candidate.due?.is_recurring
-        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+        && sameProviderInstant(candidate.due?.datetime || candidate.due?.date, completedDue),
     );
     const restoredCurrent = await calendar.getEvent(currentInstance.id);
     await calendar.upsertEvent({ ...restoredCurrent, summary: recurringTitle }, currentInstance.id);
@@ -509,7 +510,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       () => todoist.getTask(recurringTaskId),
       (candidate) => candidate.id === recurringTaskId && candidate.content === recurringTitle
         && candidate.due?.is_recurring
-        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+        && sameProviderInstant(candidate.due?.datetime || candidate.due?.date, completedDue),
     );
     const currentForMove = await calendar.getEvent(currentInstance.id);
     const currentOriginalStart = currentForMove.originalStartTime?.dateTime || currentForMove.originalStartTime?.date;
@@ -615,7 +616,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       ({ moved, cancelled, currentTask }) => moved.summary === exceptionTitle
         && timestampsMatch(moved.start?.dateTime, movedStart.toISOString())
         && cancelled.status === "cancelled" && currentTask.id === recurringTaskId
-        && (currentTask.due?.datetime || currentTask.due?.date) === completedDue
+        && sameProviderInstant(currentTask.due?.datetime || currentTask.due?.date, completedDue)
         && currentTask.due?.is_recurring,
     );
     log("future_calendar_exceptions_verified", { profile, moved: true, cancelled: true, currentTaskUnchanged: true });
@@ -626,7 +627,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       `${profile} Calendar series metadata propagation`, timeoutMs,
       () => todoist.getTask(recurringTaskId),
       (candidate) => candidate.content === calendarSeriesTitle && candidate.due?.is_recurring
-        && (candidate.due?.datetime || candidate.due?.date) === completedDue,
+        && sameProviderInstant(candidate.due?.datetime || candidate.due?.date, completedDue),
     );
     await todoist.updateTaskMetadata(recurringTaskId, {
       content: todoistSeriesTitle,
@@ -641,7 +642,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
     const seriesEditTask = await todoist.getTask(recurringTaskId);
     if (preservedException.summary !== exceptionTitle
       || !timestampsMatch(preservedException.start?.dateTime, movedStart.toISOString())
-      || (seriesEditTask.due?.datetime || seriesEditTask.due?.date) !== completedDue
+      || !sameProviderInstant(seriesEditTask.due?.datetime || seriesEditTask.due?.date, completedDue)
       || !seriesEditTask.due?.is_recurring
       || todoistSeriesEditMaster.extendedProperties?.shared?.taskId !== recurringTaskId) {
       throw new Error("Bidirectional series title edits changed recurrence identity or erased an explicit Calendar exception");

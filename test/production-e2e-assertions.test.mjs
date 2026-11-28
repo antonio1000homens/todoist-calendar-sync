@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   calendarResourceAbsent,
   calendarOwnedRecurrenceCorrelationMatches,
+  sameProviderInstant,
   uniqueProjectEventMapping,
   uniqueProjectTaskMapping,
   uniqueProjectTaskMappingForEvent,
@@ -13,6 +14,13 @@ test("Calendar cleanup treats cancelled resources as deleted", () => {
   assert.equal(calendarResourceAbsent(undefined), true);
   assert.equal(calendarResourceAbsent({ status: "cancelled" }), true);
   assert.equal(calendarResourceAbsent({ status: "confirmed" }), false);
+});
+
+test("provider due values compare by instant across serialization formats", () => {
+  assert.equal(sameProviderInstant("2026-11-30T15:00:00Z", "2026-11-30T15:00:00.000Z"), true);
+  assert.equal(sameProviderInstant("2026-11-30T15:00:00Z", "2026-11-30T16:00:00+01:00"), true);
+  assert.equal(sameProviderInstant("2026-11-30T15:00:00Z", "2026-11-30T15:30:00Z"), false);
+  assert.equal(sameProviderInstant(undefined, "2026-11-30T15:00:00Z"), false);
 });
 
 test("Calendar recurrence correlation uses the active occurrence and explicit master link", () => {
