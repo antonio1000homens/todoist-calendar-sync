@@ -639,30 +639,47 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
         && sameProviderInstant(task.due?.datetime || task.due?.date, completedDue)
         && mapping?.syncedTitle === calendarSeriesTitle,
     );
-    await todoist.updateTaskMetadata(recurringTaskId, {
+    const writtenSeriesTask = await todoist.updateTaskMetadata(recurringTaskId, {
       content: todoistSeriesTitle,
       description: calendarSeriesEdit.task.description || "",
     });
+    const todoistWriteReadback = {
+      task_title: writtenSeriesTask.content === todoistSeriesTitle,
+      task_recurring: Boolean(writtenSeriesTask.due?.is_recurring),
+      task_due_preserved: sameProviderInstant(
+        writtenSeriesTask.due?.datetime || writtenSeriesTask.due?.date, completedDue,
+      ),
+    };
+    log("todoist_series_metadata_write_readback", { profile, ...todoistWriteReadback });
+    if (Object.values(todoistWriteReadback).some((passed) => !passed)) {
+      throw new Error(`series_edit_todoist_write_failed:${Object.entries(todoistWriteReadback)
+        .map(([name, passed]) => `${name}=${passed}`).join(",")}`);
+    }
     let todoistSeriesPropagationState;
     let todoistSeriesEdit;
     try {
       todoistSeriesEdit = await poll(
         `${profile} Todoist series metadata propagation`, timeoutMs,
         async () => {
-          const [master, mapping] = await Promise.all([
+          const [master, mapping, task] = await Promise.all([
             calendar.getEvent(recurringEventId),
             providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+            todoist.getTask(recurringTaskId),
           ]);
-          return { master, mapping };
+          return { master, mapping, task };
         },
-        ({ master, mapping }) => {
+        ({ master, mapping, task }) => {
           todoistSeriesPropagationState = {
+            task_title: task.content === todoistSeriesTitle,
+            task_recurring: Boolean(task.due?.is_recurring),
+            task_due_preserved: sameProviderInstant(task.due?.datetime || task.due?.date, completedDue),
             master_title: master.summary === todoistSeriesTitle,
             master_recurrence: Boolean(master.recurrence?.length),
             mapping_title: mapping?.syncedTitle === todoistSeriesTitle,
           };
-          return todoistSeriesPropagationState.master_title && todoistSeriesPropagationState.master_recurrence
-            && todoistSeriesPropagationState.mapping_title;
+          return todoistSeriesPropagationState.task_title && todoistSeriesPropagationState.task_recurring
+            && todoistSeriesPropagationState.task_due_preserved && todoistSeriesPropagationState.master_title
+            && todoistSeriesPropagationState.master_recurrence && todoistSeriesPropagationState.mapping_title;
         },
       );
     } catch (error) {
