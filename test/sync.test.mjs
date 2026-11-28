@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasConflictingCalendarCandidate, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
+import { calendarEventHasElapsed, ignorableElapsedStandaloneCalendarEvent, canRecreateCalendarProjection, calendarDeltaIsStaleAgainstTodoist, compatibleCalendarCandidateOwnerConflicts, discoverCompatibleCalendarCandidates, hasConflictingCalendarCandidate, hasCanonicalState, matchingTask, Synchronizer, toCalendarEvent, toTodoistTask, todoistCalendarLifecycle } from "../dist/sync.js";
 import { Todoist, todoistTaskPayload } from "../dist/providers.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 import { calendarRecurrenceMatchesTodoist, todoistRecurrenceToRrule } from "../dist/todoist-recurrence.js";
@@ -18,6 +18,16 @@ test("matches a unique Calendar counterpart by exact normalized fields and all-d
   assert.equal(matchingTask(event, tasks)?.id, "match");
   assert.equal(matchingTask(event, [...tasks, { ...tasks[1], id: "second-compatible" }]), undefined);
   assert.equal(matchingTask(event, [{ ...tasks[1], description: "different details" }]), undefined);
+});
+
+test("a delayed Calendar delta preserves a newer Todoist edit against the last mirrored baseline", () => {
+  const baseline = { syncedTitle: "Original", syncedDescription: "", syncedDue: "2026-11-30T10:00:00Z" };
+  const event = { summary: "Original", description: "", start: { dateTime: "2026-11-30T10:00:00Z" } };
+  const task = { content: "Edited in Todoist", description: "", due: { datetime: "2026-11-30T11:00:00Z" } };
+  assert.equal(calendarDeltaIsStaleAgainstTodoist(baseline, event, task), true);
+  assert.equal(calendarDeltaIsStaleAgainstTodoist(baseline,
+    { ...event, summary: "Edited in Calendar" }, task), false,
+  "a real Calendar edit must continue through normal conflict resolution");
 });
 
 test("discovers an untagged recurring master from its current occurrence and equivalent cadence", async () => {
