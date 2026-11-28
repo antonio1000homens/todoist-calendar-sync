@@ -973,12 +973,14 @@ export class Synchronizer {
     const recurrenceAnchor = masterStart ? { start: masterStart, timeZone: master.start?.timeZone } : undefined;
     const nextRule = recurrenceAnchor ? todoistRecurrenceToRrule(task, recurrenceAnchor) : undefined;
     const oldRule = oldTask && recurrenceAnchor ? todoistRecurrenceToRrule(oldTask, recurrenceAnchor) : nextRule;
+    const sameRecurringText = Boolean(oldTask && oldTask.due?.is_recurring && task.due?.is_recurring
+      && todoistRecurrenceKey(oldTask) === todoistRecurrenceKey(task)
+      && oldTask.due?.timezone === task.due?.timezone);
+    const boundedFiniteWeekly = finiteWeeklyCalendarRuleCandidate(master) && sameRecurringText;
     if (!mapping.masterEventId || !mapping.activeInstanceId || !mapping.originalStart
       || (oldTask && !oldTask.due?.is_recurring) || !task.due?.is_recurring || !oldDue || !nextDue
-      || !nextRule
-      || (oldTask && (oldRule !== nextRule
-        || todoistRecurrenceKey(oldTask) !== todoistRecurrenceKey(task)
-        || oldTask.due?.timezone !== task.due?.timezone))) return unsupported("recurrence_or_identity_changed");
+      || (!nextRule && !boundedFiniteWeekly)
+      || (oldTask && (oldRule !== nextRule && !boundedFiniteWeekly || !sameRecurringText))) return unsupported("recurrence_or_identity_changed");
     if (!modeAllowsMutations(delivery, await this.state.mutationAllowed(delivery.profile))) {
       return this.state.audit(delivery.profile, "todoist_recurring_occurrence_reschedule_suppressed", {
         taskId: task.id, masterEventId: mapping.masterEventId, eventId: mapping.activeInstanceId,
@@ -987,6 +989,23 @@ export class Synchronizer {
     }
 
     const current = await calendar.getEvent(mapping.activeInstanceId);
+    let boundedRecurrence: Awaited<ReturnType<typeof verifiedCalendarOwnedRecurrence>>;
+    let boundedTimeZone: string | undefined;
+    if (boundedFiniteWeekly) {
+      boundedTimeZone = await this.verifiedCalendarRecurrenceTimeZone(delivery.profile, calendar, todoist, master, {
+        seriesId: mapping.seriesId || master.iCalUID || master.id, masterEventId: master.id, taskId: task.id,
+      });
+      if (!boundedTimeZone || !calendar.listInstances || !calendar.listExplicitSeriesExceptions) {
+        return unsupported("finite_exception_inventory_unavailable");
+      }
+      const completeInstances = await calendar.listInstances(master.id);
+      boundedRecurrence = await verifiedCalendarOwnedRecurrence(master, completeInstances, boundedTimeZone,
+        calendar.listExplicitSeriesExceptions.bind(calendar));
+      if (!boundedRecurrence || !oldTask
+        || !calendarOwnedRecurringTaskReadback(oldTask, current, boundedRecurrence, boundedTimeZone).matches) {
+        return unsupported("finite_recurrence_or_active_occurrence_unverified");
+      }
+    }
     const masterTaskId = master.extendedProperties?.shared?.taskId;
     const masterShared = master.extendedProperties?.shared;
     const original = current.originalStartTime?.dateTime || current.originalStartTime?.date;
@@ -1006,7 +1025,8 @@ export class Synchronizer {
       || sameStart(mapping.activeEffectiveStart, oldDue);
     if (mapping.profile !== delivery.profile || mapping.taskId !== task.id
       || task.project_id !== profiles[delivery.profile].todoistProjectId
-      || master.id !== mapping.masterEventId || master.status !== "confirmed" || !calendarRuleMatches(master, nextRule)
+      || master.id !== mapping.masterEventId || master.status !== "confirmed"
+      || (nextRule ? !calendarRuleMatches(master, nextRule) : !boundedFiniteWeekly)
       || masterTaskId !== task.id
       || (masterShared?.todoistRecurrence && masterShared.todoistRecurrence !== todoistRecurrenceKey(task))
       || (masterShared?.syncProfile && masterShared.syncProfile !== delivery.profile)
@@ -4383,7 +4403,24 @@ export class Synchronizer {
       if (alreadyAdvanced && currentRecurringTask) {
         nextTask = currentRecurringTask;
       } else if (currentCalendarRecurrence && currentRecurringTask?.due?.is_recurring) {
-        nextTask = await todoist.updateRecurringOccurrence(currentRecurringTask, toTodoistTask(next));
+        // Keep the canonical Calendar DTSTART explicit when advancing onto a
+        // moved exception. An ending-only Todoist phrase normally treats the
+        // current due date as its implicit start; carrying it onto an
+        // occurrence whose effective date differs from DTSTART would re-anchor
+        // the recurrence and can change its weekday/phase.
+        const movedNextOccurrence = compareLogicalStarts(
+          recurrenceOriginalStart(next) || "", eventEffectiveStart(next) || "",
+        ) !== 0;
+        const canonicalProjection = movedNextOccurrence
+          ? calendarOwnedRecurringTaskPayload(next, currentCalendarRecurrence, verifiedCalendarTimeZone)
+          : undefined;
+        const recurrenceTask = {
+          ...currentRecurringTask,
+          due: { ...currentRecurringTask.due,
+            ...(canonicalProjection?.due?.string ? { string: canonicalProjection.due.string } : {}),
+          },
+        };
+        nextTask = await todoist.updateRecurringOccurrence(recurrenceTask, toTodoistTask(next));
       } else if (currentCalendarRecurrence && currentRecurringTask) {
         // Upgrade a supported legacy rolling mirror in place. Retaining the
         // Todoist task ID avoids a successor chain and keeps provider

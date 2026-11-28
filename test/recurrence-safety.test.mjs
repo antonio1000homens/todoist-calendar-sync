@@ -1350,26 +1350,43 @@ test("completion skips a deleted future Calendar occurrence", async () => {
   assert.equal(state.links[0].activeEffectiveStart, "2026-09-08");
 });
 
-test("Todoist canonical echo preserves Calendar recurrence ownership before completion skips a canceled occurrence", async () => {
+test("finite weekly lifecycle preserves canceled and moved exceptions through completion and reschedule", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2099-09-06T08:00:00Z") });
   const dates = ["2099-09-06", "2099-09-13", "2099-09-20", "2099-09-27"];
   const master = {
-    id: MASTER, iCalUID: SERIES, summary: "Water plants", status: "confirmed",
-    start: { date: dates[0] }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    id: MASTER, iCalUID: SERIES, etag: '"finite-master-v1"', summary: "Water plants", status: "confirmed",
+    start: { date: dates[0] }, end: { date: addDay(dates[0]) }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=4"],
+    extendedProperties: { shared: { taskId: "task-calendar-owned", syncSeriesId: SERIES } },
   };
   const current = instance("instance-1", dates[0], addDay(dates[0]));
+  current.etag = '"finite-current-v1"';
   const cancelled = instance("instance-2", dates[1], addDay(dates[1]), "cancelled");
-  const next = instance("instance-3", dates[2], addDay(dates[2]));
+  const next = instance("instance-3", dates[2], dates[2]);
+  next.start = { date: "2099-09-25" };
+  next.end = { date: "2099-09-26" };
+  next.etag = '"finite-moved-v1"';
   const final = instance("instance-4", dates[3], addDay(dates[3]));
   for (const occurrence of [current, cancelled, next, final]) occurrence.summary = "Water plants";
   const recurrenceText = "every Sunday ending 27 Sep 2099";
   const initialTask = {
-    id: "task-calendar-owned", content: "Water plants", description: "", project_id: "home-project",
+    id: "task-calendar-owned", content: "Water plants", description: "", project_id: profiles[PROFILE].todoistProjectId,
     due: { date: dates[0], is_recurring: true, string: recurrenceText },
   };
   const link = linkFor(current, initialTask.id);
   const state = new FakeState(link);
   const tasks = new Map([[initialTask.id, structuredClone(initialTask)]]);
   const clients = fakeClients(state, [current, cancelled, next, final], tasks, undefined, [master]);
+  clients.calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+    const existing = clients.events.get(eventId);
+    assert.equal(existing.etag, etag);
+    const updated = { ...structuredClone(existing), ...structuredClone(payload), id: eventId,
+      etag: '"finite-moved-rescheduled-v1"' };
+    clients.events.set(eventId, updated);
+    const inInventory = [current, cancelled, next, final].find((event) => event.id === eventId);
+    if (inInventory) Object.assign(inInventory, structuredClone(updated));
+    clients.calendarUpserts.push({ id: eventId, payload: structuredClone(payload) });
+    return structuredClone(updated);
+  };
   const sync = new Synchronizer(state, undefined, async () => clients);
 
   await sync.process({
@@ -1401,14 +1418,68 @@ test("Todoist canonical echo preserves Calendar recurrence ownership before comp
   });
 
   assert.equal(clients.todoistRecurringUpdates.length, 1);
-  assert.equal(clients.todoistRecurringUpdates[0].stored.due.date, dates[2]);
+  assert.equal(clients.todoistRecurringUpdates[0].stored.due.date, "2099-09-25");
   assert.equal(state.links[0].owner, "calendar");
   assert.equal(state.links[0].activeInstanceId, next.id);
+  assert.equal(state.links[0].originalStart, dates[2]);
+  assert.equal(state.links[0].activeEffectiveStart, "2099-09-25");
   assert.equal(state.links[0].masterEventId, MASTER);
   assert.equal(clients.calendarUpserts.length, 0, "completion must advance the existing Calendar series without creating a standalone event");
   assert.deepEqual(clients.calendarDeletes, []);
   assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;COUNT=4"]);
   assert.equal(clients.events.has(final.id), true);
+  assert.equal(clients.events.get(cancelled.id).status, "cancelled");
+  assert.equal(clients.events.get(next.id).originalStartTime.date, dates[2]);
+  assert.equal(clients.events.get(next.id).start.date, "2099-09-25");
+
+  const advanced = clients.todoistRecurringUpdates[0].stored;
+  const rescheduled = { ...advanced, due: { ...advanced.due, date: "2099-09-26" } };
+  tasks.set(advanced.id, rescheduled);
+  await sync.process({
+    id: "todoist-finite-moved-reschedule", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-25T09:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: rescheduled,
+      event_data_extra: { update_intent: "item_updated", old_item: advanced } }),
+  });
+  const movedAfterReschedule = clients.events.get(next.id);
+  assert.equal(movedAfterReschedule.originalStartTime.date, dates[2]);
+  assert.equal(movedAfterReschedule.start.date, "2099-09-26");
+  assert.equal(clients.events.get(cancelled.id).status, "cancelled");
+  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=WEEKLY;COUNT=4"]);
+  assert.equal(state.links[0].activeInstanceId, next.id);
+  assert.equal(state.links[0].originalStart, dates[2]);
+  assert.equal(state.links[0].activeEffectiveStart, "2099-09-26");
+
+  const writesBeforeSnapshot = clients.calendarUpserts.length + clients.todoistUpserts.length
+    + clients.todoistRecurringUpdates.length;
+  const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+    total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+  }));
+  const snapshotResult = await snapshot.reconcile(PROFILE);
+  assert.equal(snapshotResult.counts.noop, 1);
+  assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length
+    + clients.todoistRecurringUpdates.length, writesBeforeSnapshot,
+  "snapshot after moved finite completion and reschedule makes no provider writes");
+
+  const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+  tasks.delete(rescheduled.id);
+  await sync.process({
+    id: "todoist-finite-series-delete", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-26T10:00:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:deleted", event_data: { ...rescheduled, is_deleted: true },
+      event_data_extra: { old_item: rescheduled } }),
+  });
+  assert.ok(clients.calendarDeletes.includes(MASTER));
+  assert.equal(clients.events.has(MASTER), false);
+  assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0);
+  await sync.process({
+    id: "todoist-finite-stale-completion-after-delete", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2099-09-26T10:01:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduled,
+      event_data_extra: { old_item: rescheduled } }),
+  });
+  assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion);
+  assert.equal(clients.events.has(MASTER), false, "stale finite completion cannot resurrect the deleted series");
 });
 
 test("moved Calendar exception can cross another occurrence without changing logical identity", () => {
