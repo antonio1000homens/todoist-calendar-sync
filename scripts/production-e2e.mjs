@@ -9,6 +9,7 @@ import {
   uniqueProjectEventMapping,
   uniqueProjectTaskMapping,
   uniqueProjectTaskMappingForEvent,
+  calendarResourceAbsent,
   unsupportedCalendarRecurrencePreserved,
 } from "./production-e2e-assertions.mjs";
 import { providerNotFound, providerStatus, safeDeleteCalendar, safeDeleteTodoist } from "./production-provider-cleanup.mjs";
@@ -366,7 +367,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           try { return await calendar.getEvent(reverseEventId); }
           catch (error) { if (providerNotFound(error)) return undefined; throw error; }
         },
-        (event) => !event,
+        calendarResourceAbsent,
       );
       await poll(
         `${profile} Todoist-originated provider correlation cleanup`,
@@ -424,7 +425,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
           try { return await calendar.getEvent(todoistRecurringEventId); }
           catch (error) { if (providerNotFound(error)) return undefined; throw error; }
         },
-        (master) => !master,
+        calendarResourceAbsent,
       );
       await poll(
         `${profile} Todoist-originated recurring correlation cleanup`,

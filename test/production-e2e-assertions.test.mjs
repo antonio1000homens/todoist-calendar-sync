@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  calendarResourceAbsent,
   uniqueProjectEventMapping,
   uniqueProjectTaskMapping,
   uniqueProjectTaskMappingForEvent,
   unsupportedCalendarRecurrencePreserved,
 } from "../scripts/production-e2e-assertions.mjs";
+
+test("Calendar cleanup treats cancelled resources as deleted", () => {
+  assert.equal(calendarResourceAbsent(undefined), true);
+  assert.equal(calendarResourceAbsent({ status: "cancelled" }), true);
+  assert.equal(calendarResourceAbsent({ status: "confirmed" }), false);
+});
 
 const rule = "RRULE:FREQ=MONTHLY;BYDAY=MO,TU;BYSETPOS=1";
 const title = "[E2E fixture] Unsupported Calendar recurrence";
