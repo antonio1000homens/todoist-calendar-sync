@@ -623,20 +623,34 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
 
     const recurringMaster = await calendar.getEvent(recurringEventId);
     await calendar.upsertEvent({ ...recurringMaster, summary: calendarSeriesTitle }, recurringEventId);
-    const calendarSeriesEditTask = await poll(
+    const calendarSeriesEdit = await poll(
       `${profile} Calendar series metadata propagation`, timeoutMs,
-      () => todoist.getTask(recurringTaskId),
-      (candidate) => candidate.content === calendarSeriesTitle && candidate.due?.is_recurring
-        && sameProviderInstant(candidate.due?.datetime || candidate.due?.date, completedDue),
+      async () => {
+        const [task, mapping] = await Promise.all([
+          todoist.getTask(recurringTaskId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { task, mapping };
+      },
+      ({ task, mapping }) => task.content === calendarSeriesTitle && task.due?.is_recurring
+        && sameProviderInstant(task.due?.datetime || task.due?.date, completedDue)
+        && mapping?.syncedTitle === calendarSeriesTitle,
     );
     await todoist.updateTaskMetadata(recurringTaskId, {
       content: todoistSeriesTitle,
-      description: calendarSeriesEditTask.description || "",
+      description: calendarSeriesEdit.task.description || "",
     });
-    const todoistSeriesEditMaster = await poll(
+    const todoistSeriesEdit = await poll(
       `${profile} Todoist series metadata propagation`, timeoutMs,
-      () => calendar.getEvent(recurringEventId),
-      (candidate) => candidate.summary === todoistSeriesTitle && candidate.recurrence?.length > 0,
+      async () => {
+        const [master, mapping] = await Promise.all([
+          calendar.getEvent(recurringEventId),
+          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+        ]);
+        return { master, mapping };
+      },
+      ({ master, mapping }) => master.summary === todoistSeriesTitle && master.recurrence?.length > 0
+        && mapping?.syncedTitle === todoistSeriesTitle,
     );
     const preservedException = await calendar.getEvent(movedInstance.id);
     const seriesEditTask = await todoist.getTask(recurringTaskId);
@@ -644,7 +658,7 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       || !timestampsMatch(preservedException.start?.dateTime, movedStart.toISOString())
       || !sameProviderInstant(seriesEditTask.due?.datetime || seriesEditTask.due?.date, completedDue)
       || !seriesEditTask.due?.is_recurring
-      || todoistSeriesEditMaster.extendedProperties?.shared?.taskId !== recurringTaskId) {
+      || todoistSeriesEdit.master.extendedProperties?.shared?.taskId !== recurringTaskId) {
       throw new Error("Bidirectional series title edits changed recurrence identity or erased an explicit Calendar exception");
     }
     log("bidirectional_series_edits_verified", {
