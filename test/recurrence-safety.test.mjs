@@ -1716,6 +1716,35 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
 });
 
+test("an explicit Calendar-owned Todoist cadence edit emits a versioned review without rewriting the old master", async () => {
+  const current = instance("annual-2027", "2027-01-01", "2027-01-02");
+  current.summary = "Annual review";
+  const master = { id: MASTER, etag: '"annual-master-v4"', iCalUID: SERIES, status: "confirmed",
+    summary: "Annual review", description: "", start: { date: "2026-01-01" }, end: { date: "2026-01-02" },
+    recurrence: ["RRULE:FREQ=YEARLY"],
+    extendedProperties: { shared: { taskId: "annual-task", syncSeriesId: SERIES, syncProgressVersion: "1" } } };
+  const link = { ...linkFor(current, "annual-task"), syncedTitle: "Annual review", syncedDescription: "" };
+  const state = new FakeState(link);
+  const oldTask = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId,
+    content: "Annual review", description: "", updated_at: "2026-11-28T10:00:00Z",
+    due: { date: "2027-01-01", string: "every year", is_recurring: true } };
+  const task = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 years" } };
+  const tasks = new Map([[task.id, structuredClone(task)]]);
+  const clients = fakeClients(state, [current], tasks, undefined, [master]);
+  await new Synchronizer(state, undefined, async () => clients).process({
+    id: "annual-cadence-edit", kind: "todoist", profile: PROFILE, mode: "aws",
+    receivedAt: "2026-11-28T10:01:00Z", headers: {},
+    body: JSON.stringify({ event_name: "item:updated", event_data: task,
+      event_data_extra: { update_intent: "item_updated", old_item: oldTask } }),
+  });
+  assert.equal(clients.calendarUpserts.length, 0);
+  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=YEARLY"]);
+  const review = state.audits.find((item) => item.action === "calendar_owned_todoist_recurrence_requires_review");
+  assert.equal(review.detail.reason, "explicit_todoist_recurrence_change");
+  assert.equal(review.detail.taskUpdatedAt, task.updated_at);
+  assert.equal(review.detail.calendarEtag, master.etag);
+});
+
 test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-26T12:00:00Z") });
   const current = instance("oct-28", "2026-10-28", "2026-10-29");

@@ -204,6 +204,30 @@ test("conflict fingerprints distinguish mismatch categories and preserve long ca
     retainedConflictIdentity(cancelledAction,{...cancelled,tombstoneReason:"project_exit"}));
 });
 
+test("Calendar-owned recurrence review alerts deduplicate only while both provider versions are unchanged", () => {
+  const action = "calendar_owned_todoist_recurrence_requires_review";
+  const stable = { taskId: "annual-task", masterEventId: "annual-master",
+    taskUpdatedAt: "2026-11-28T10:00:00Z", calendarEtag: '"master-v7"',
+    reason: "explicit_todoist_recurrence_change" };
+  const first = retainedConflictIdentity(action, stable);
+  assert.ok(first);
+  assert.equal(retainedConflictIdentity(action, { ...stable }), first);
+  assert.notEqual(retainedConflictIdentity(action, { ...stable, taskUpdatedAt: "2026-11-28T10:01:00Z" }), first);
+  assert.notEqual(retainedConflictIdentity(action, { ...stable, calendarEtag: '"master-v8"' }), first);
+  assert.equal(retainedConflictIdentity(action, { ...stable, calendarEtag: undefined }), undefined);
+});
+
+test("a moved finite recurrence occurrence review deduplicates by its Calendar event version", () => {
+  const action = "calendar_recurrence_todoist_moved_occurrence_requires_review";
+  const stable = { seriesId: "finite-series", masterEventId: "finite-master", eventId: "finite-instance",
+    calendarEtag: '"instance-v3"', reason: "active_moved_occurrence_cannot_anchor_finite_todoist_projection" };
+  const first = retainedConflictIdentity(action, stable);
+  assert.ok(first);
+  assert.equal(retainedConflictIdentity(action, { ...stable }), first);
+  assert.notEqual(retainedConflictIdentity(action, { ...stable, calendarEtag: '"instance-v4"' }), first);
+  assert.equal(retainedConflictIdentity(action, { ...stable, calendarEtag: undefined }), undefined);
+});
+
 test("a resolved conflict reappearing unchanged receives a new retained incident ID", () => {
   const fingerprint = retainedConflictIdentity("todoist_snapshot_reconcile_unmapped_conflict", {
     taskId: "task-1", eventId: "event-1", mismatchCategories: ["title_mismatch"],

@@ -624,6 +624,43 @@ test("snapshot recovery projects a finite historical weekly series without reset
   assert.equal(master.start.date, "2026-10-30");
 });
 
+test("snapshot recovery raises one actionable conflict for a moved active finite occurrence without creating a task", async () => {
+  const master = { id: "moved-finite-master", iCalUID: "moved-finite-series",
+    status: "confirmed", summary: "Weekly review", description: "",
+    start: { date: "2026-10-30" }, recurrence: ["RRULE:FREQ=WEEKLY;COUNT=8"], etag: '"master-v1"' };
+  const dates = ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-20",
+    "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18"];
+  const occurrences = dates.map((date, index) => ({ id: "moved-finite-" + index,
+    status: "confirmed", recurringEventId: master.id, originalStartTime: { date },
+    start: { date: index === 4 ? "2026-11-28" : date },
+    end: { date: new Date(Date.parse((index === 4 ? "2026-11-28" : date) + "T00:00:00Z")
+      + 86_400_000).toISOString().slice(0, 10) }, etag: '"instance-v1"' }));
+  const state = fakeState(), tasks = [];
+  let creates = 0;
+  const clients = {
+    calendar: { async listDelta() { return { items: [master] }; }, async listInstances() { return occurrences; },
+      async getTimeZone() { return "Europe/London"; } },
+    todoist: {
+      async listProjectComments() { return []; }, async listTasks() { return tasks; },
+      async getTimeZone() { return "Europe/London"; },
+      async upsertTask() { creates += 1; throw new Error("moved finite occurrence must not create a projection"); },
+      async deleteTask() {}, async findComment() { return undefined; }, async upsertComment() { return { id: "comment" }; },
+    },
+  };
+  const originalNow = Date.now;
+  Date.now = () => Date.parse("2026-11-27T12:00:00Z");
+  try {
+    const summary = await reconcileUnmappedCalendar("home", state, async () => clients);
+    assert.equal(summary.conflicts, 1);
+    assert.equal(summary.imported, 0);
+  } finally { Date.now = originalNow; }
+  assert.equal(creates, 0);
+  assert.equal(tasks.length, 0);
+  const alert = state.audits.find((item) => item.action === "calendar_recurrence_todoist_moved_occurrence_requires_review");
+  assert.equal(alert.detail.eventId, "moved-finite-4");
+  assert.equal(alert.detail.masterEventId, master.id);
+});
+
 test("all-day recurrence timezone mismatch fails closed before Todoist or mapping writes", async () => {
   const master = {
     id: "all-day-master", iCalUID: "all-day-series", status: "confirmed", summary: "All-day task", description: "",

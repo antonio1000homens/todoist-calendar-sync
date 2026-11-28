@@ -502,6 +502,22 @@ export async function reconcileUnmappedCalendar(
       summary.skipped += 1;
       return;
     }
+    const activeOriginal = active.originalStartTime?.dateTime || active.originalStartTime?.date;
+    const activeEffective = active.start?.dateTime || active.start?.date;
+    const activeMoved = Boolean(activeOriginal && activeEffective && (activeOriginal.includes("T") || activeEffective.includes("T")
+      ? !Number.isFinite(Date.parse(activeOriginal)) || !Number.isFinite(Date.parse(activeEffective))
+        || Date.parse(activeOriginal) !== Date.parse(activeEffective)
+      : activeOriginal !== activeEffective));
+    if (finiteWeekly && activeMoved) {
+      summary.conflicts += 1;
+      await state.audit(profile, "calendar_recurrence_todoist_moved_occurrence_requires_review", {
+        seriesId, masterEventId: master.id, eventId: active.id,
+        reason: "active_moved_occurrence_cannot_anchor_finite_todoist_projection",
+        calendarUpdatedAt: active.updated || master.updated,
+        calendarEtag: active.etag || master.etag,
+      });
+      return;
+    }
     eventsById.set(active.id, active);
     if (await controlsBlockRecovery([master.id,active.id])) return;
     const existingMapping = await mappingSync.providerMappingByEvent(profile, active.id, pair.todoist)

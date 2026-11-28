@@ -3834,6 +3834,7 @@ export class Synchronizer {
         || !task.due?.is_recurring) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
           taskId: task.id, masterEventId: mapping.masterEventId,
+          taskUpdatedAt: task.updated_at, calendarEtag: master.etag,
           reason: "missing_or_changed_recurring_rule",
         });
       }
@@ -3843,6 +3844,7 @@ export class Synchronizer {
           || previousDue.timezone && previousDue.timezone !== task.due?.timezone)) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
           taskId: task.id, masterEventId: mapping.masterEventId,
+          taskUpdatedAt: task.updated_at, calendarEtag: master.etag,
           reason: "explicit_todoist_recurrence_change",
         });
       }
@@ -3855,7 +3857,8 @@ export class Synchronizer {
         try { zone = await resolveCalendarTimeZone(master, calendar.getTimeZone?.bind(calendar)); }
         catch {
           return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
-            taskId: task.id, masterEventId: mapping.masterEventId, reason: "calendar_timezone_unverified",
+            taskId: task.id, masterEventId: mapping.masterEventId,
+            taskUpdatedAt: task.updated_at, calendarEtag: master.etag, reason: "calendar_timezone_unverified",
           });
         }
         const phaseC = mapping.calendarProgressVersion === 1 && isPhaseCNativeCandidate(master)
@@ -3866,13 +3869,16 @@ export class Synchronizer {
           : Boolean(expectedRule && matchesCalendarOwnedRecurringRule(task, expectedRule, zone));
         if (!matches) {
           return this.state.audit(delivery.profile, "calendar_owned_todoist_recurrence_requires_review", {
-            taskId: task.id, masterEventId: mapping.masterEventId, reason: "native_rule_changed_or_unsupported",
+            taskId: task.id, masterEventId: mapping.masterEventId,
+            taskUpdatedAt: task.updated_at, calendarEtag: master.etag,
+            reason: "native_rule_changed_or_unsupported",
           });
         }
       }
       if (recurringDateEdit) {
         return this.state.audit(delivery.profile, "calendar_owned_todoist_date_edit_requires_review", {
           taskId: task.id, masterEventId: mapping.masterEventId,
+          taskUpdatedAt: task.updated_at, calendarEtag: master.etag,
           reason: "explicit_todoist_date_change",
         });
       }
