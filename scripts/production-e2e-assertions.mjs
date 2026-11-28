@@ -29,6 +29,11 @@ export function uniqueProjectEventMapping(index, projectId, eventId) {
   return entries[0];
 }
 
+/** Google Calendar retains a cancelled resource ID after DELETE. */
+export function calendarResourceAbsent(event) {
+  return !event || event.status === "cancelled";
+}
+
 export function unsupportedCalendarRecurrencePreserved({
   readback,
   expectedEventId,
