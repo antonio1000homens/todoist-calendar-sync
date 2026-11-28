@@ -8,6 +8,7 @@ import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, 
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
 import { SnapshotReconciler } from "../dist/reconciliation.js";
+import { calendarOwnedRecurringTaskPayload, calendarOwnedTodoistRecurrence } from "../dist/calendar-owned-todoist-recurrence.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
@@ -1988,6 +1989,83 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion,
     "a stale completion cannot recreate the deleted task or recurrence");
 
+});
+
+test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, selector and DST series", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-28T12:00:00Z") });
+  const cases = [
+    { name: "daily interval", rule: "RRULE:FREQ=DAILY;INTERVAL=2", anchor: "2023-01-01", active: "2026-11-29" },
+    { name: "weekly cadence", rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", anchor: "2023-01-04", active: "2026-12-02" },
+    { name: "monthly interval", rule: "RRULE:FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15" },
+    { name: "monthly selector", rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", anchor: "2023-01-10", active: "2026-12-08" },
+    { name: "yearly interval selector", rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=15", anchor: "2023-01-15", active: "2027-01-15" },
+    { name: "weekly London DST", rule: "RRULE:FREQ=WEEKLY;BYDAY=SU",
+      anchor: "2023-03-26T09:00:00+01:00", active: "2027-03-28T09:00:00+01:00", timed: true },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const at = (value, durationHours = 24) => {
+      if (!item.timed) {
+        const date = new Date(`${value}T00:00:00Z`);
+        date.setUTCDate(date.getUTCDate() + 1);
+        return { start: { date: value }, end: { date: date.toISOString().slice(0, 10) } };
+      }
+      const dateTime = new Date(Date.parse(value) + durationHours * 3_600_000).toISOString();
+      // Preserve the London wall-clock offset represented by this case.
+      return { start: { dateTime: value, timeZone: "Europe/London" },
+        end: { dateTime: dateTime.replace("Z", "+01:00"), timeZone: "Europe/London" } };
+    };
+    const anchorSpan = at(item.anchor);
+    const master = { id: MASTER, etag: `"matrix-${index}-v1"`, iCalUID: SERIES, status: "confirmed",
+      summary: `Historical ${item.name}`, description: "Original description",
+      ...anchorSpan, recurrence: [item.rule],
+      extendedProperties: { shared: { taskId: `matrix-task-${index}`, syncSeriesId: SERIES,
+        syncProgressVersion: "1" } } };
+    const activeSpan = at(item.active, 1);
+    const active = { id: `matrix-active-${index}`, status: "confirmed", recurringEventId: MASTER,
+      iCalUID: SERIES, originalStartTime: structuredClone(activeSpan.start), ...activeSpan,
+      summary: master.summary, description: master.description, etag: `"matrix-active-${index}-v1"` };
+    const recurrence = calendarOwnedTodoistRecurrence(master, [], "Europe/London");
+    assert.ok(recurrence, `${item.name} recurrence projects`);
+    const payload = calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London");
+    const task = { id: `matrix-task-${index}`, project_id: profiles[PROFILE].todoistProjectId,
+      ...payload, updated_at: "2026-11-28T10:00:00Z" };
+    const value = (point) => point.dateTime || point.date;
+    const link = { ...linkFor(active, task.id), seriesId: SERIES, masterEventId: MASTER,
+      originalStart: value(active.originalStartTime), activeEffectiveStart: value(active.start),
+      syncedTitle: task.content, syncedDescription: task.description };
+    link.syncBaseline = providerSyncBaseline(task, active, master);
+    const state = new FakeState(link);
+    state.storeMapping(mappingFromLink(link));
+    state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+    const tasks = new Map([[task.id, structuredClone(task)]]);
+    const clients = fakeClients(state, [active], tasks, undefined, [master]);
+    const sync = new Synchronizer(state, undefined, async () => clients);
+    const edited = { ...task, content: `${task.content} updated`, description: "New description",
+      updated_at: "2026-11-28T10:01:00Z" };
+    tasks.set(task.id, edited);
+    const delivery = { id: `matrix-metadata-${index}`, kind: "todoist", profile: PROFILE, mode: "aws",
+      receivedAt: "2026-11-28T10:02:00Z", headers: {},
+      body: JSON.stringify({ event_name: "item:updated", event_data: edited,
+        event_data_extra: { old_item: task } }) };
+    await sync.process(delivery);
+    const storedMaster = clients.events.get(MASTER);
+    assert.equal(storedMaster.summary, edited.content, `${item.name} metadata converges to Calendar`);
+    assert.equal(storedMaster.description, edited.description);
+    assert.equal(storedMaster.start.dateTime || storedMaster.start.date, item.anchor,
+      `${item.name} historical DTSTART remains fixed`);
+    assert.deepEqual(storedMaster.recurrence, [item.rule], `${item.name} RRULE remains unchanged`);
+    const mapping = state.mappingsByTask.get(task.id);
+    assert.equal(mapping.masterEventId, MASTER);
+    assert.equal(mapping.activeInstanceId, active.id);
+    assert.equal(mapping.originalStart, value(active.originalStartTime));
+    assert.equal(mapping.activeEffectiveStart, value(active.start));
+    assert.deepEqual(mapping.syncBaseline,
+      providerSyncBaseline(edited, active, storedMaster), `${item.name} baseline follows verified metadata readback`);
+    const writes = clients.calendarUpserts.length;
+    await sync.process(delivery);
+    assert.equal(clients.calendarUpserts.length, writes, `${item.name} echo/replay does not patch again`);
+    assert.equal(state.mappingsByTask.get(task.id).masterEventId, MASTER);
+  }
 });
 
 test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {
