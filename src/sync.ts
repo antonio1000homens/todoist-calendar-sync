@@ -3664,8 +3664,8 @@ export class Synchronizer {
       return decline("semantic_baseline_does_not_prove_todoist_only_edit");
     }
     if (oldRule === newRule) return false;
-    if (!sameSafeYearlyRecurrenceRule(master.recurrence?.[0], master.recurrence?.[0])
-      || !sameSafeYearlyRecurrenceRule(oldRule, master.recurrence?.[0])
+    if (!sameSafeYearlyRecurrenceRule(baselineMaster.recurrence?.[0], baselineMaster.recurrence?.[0])
+      || !sameSafeYearlyRecurrenceRule(oldRule, baselineMaster.recurrence?.[0])
       || !sameSafeYearlyRecurrenceRule(newRule, newRule)) {
       return decline("future_only_edit_supports_plain_all_day_annual_rules");
     }
@@ -3691,27 +3691,33 @@ export class Synchronizer {
     }
     const currentDate = new Date(delivery.receivedAt);
     const [liveTask, liveMaster, active, freshMapping, allTasks, exceptions] = await Promise.all([
-      todoist.getTask(task.id), calendar.getEvent(master.id), calendar.getEvent(mapping.activeInstanceId),
+      todoist.getTask(task.id), calendar.getEvent(master.id), calendar.getEvent(mapping.activeInstanceId).catch((error) => {
+        // Once the old RRULE has been capped, Google may remove its previously
+        // future instance. A retry can still prove the edit from the archived
+        // master, Todoist task and exact mapping without that obsolete instance.
+        if (archived && calendarEventGoneOnDirectRead(error)) return undefined;
+        throw error;
+      }),
       this.providerMappingByTask(profile, task.id, todoist), todoist.listTasks(),
       calendar.listExplicitSeriesExceptions(master.id),
     ]);
-    const expectedActiveStart = active.start?.date;
+    const expectedActiveStart = active?.start?.date;
     if (freshMapping?.updatedAt !== mapping.updatedAt || freshMapping?.masterEventId !== master.id
       || freshMapping?.activeInstanceId !== mapping.activeInstanceId
       || liveTask.id !== task.id || liveTask.updated_at !== task.updated_at
       || liveTask.due?.string !== task.due?.string || liveTask.due?.date !== task.due?.date
-      || liveMaster.etag !== master.etag || active.id !== mapping.activeInstanceId
-      || active.status !== "confirmed" || active.recurringEventId !== master.id
-      || (active.originalStartTime?.date || active.start?.date) !== mapping.originalStart
-      || expectedActiveStart !== mapping.activeEffectiveStart || expectedActiveStart !== task.due.date
+      || liveMaster.etag !== master.etag || (!archived && (!active || active.id !== mapping.activeInstanceId
+        || active.status !== "confirmed" || active.recurringEventId !== master.id
+        || (active.originalStartTime?.date || active.start?.date) !== mapping.originalStart
+        || expectedActiveStart !== mapping.activeEffectiveStart || expectedActiveStart !== task.due.date))
       || allTasks.some((other) => other.id !== task.id
         && !other.is_deleted && normalizedText(other.content).toLowerCase() === normalizedText(task.content).toLowerCase())) {
       return decline("fresh_provider_identity_or_exception_check_failed");
     }
     if (!await modeAllowsMutations(delivery, await this.state.mutationAllowed(profile))
       || await this.state.syncBlocked(profile, { taskId: task.id, eventId: master.id })
-      || await this.state.syncBlocked(profile, { taskId: task.id, eventId: active.id })
-      || await this.calendarMutationBlockedByCompletion(delivery, active.id)) {
+      || await this.state.syncBlocked(profile, { taskId: task.id, eventId: active?.id || mapping.activeInstanceId })
+      || await this.calendarMutationBlockedByCompletion(delivery, active?.id || mapping.activeInstanceId)) {
       return decline("sync_safety_control_blocked");
     }
 

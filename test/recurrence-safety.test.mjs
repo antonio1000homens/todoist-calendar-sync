@@ -1758,11 +1758,20 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
       if (fixtureInstances[index].recurringEventId === eventId
         && (fixtureInstances[index].originalStartTime?.date || fixtureInstances[index].start.date) > "2026-01-01")
         fixtureInstances.splice(index, 1);
+    for (const [id, event] of clients.events) {
+      if (event.recurringEventId === eventId
+        && (event.originalStartTime?.date || event.start?.date) > "2026-01-01") clients.events.delete(id);
+    }
     clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
     return structuredClone(updated);
   };
+  let failSuccessorCreationOnce = true;
   calendar.createFutureMasterOnce = async (event) => {
     if (clients.events.has(event.id)) return clients.events.get(event.id);
+    if (failSuccessorCreationOnce) {
+      failSuccessorCreationOnce = false;
+      throw new Error("simulated transient successor creation failure");
+    }
     const created = { ...structuredClone(event), status: "confirmed", etag: '"future-master-v1"' };
     clients.events.set(event.id, created);
     const date = event.start.date;
@@ -1784,6 +1793,9 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
       event_data_extra: { update_intent: "item_updated", old_item: oldTask } }),
   };
+  await assert.rejects(() => sync.process(delivery), /needs retry/);
+  assert.equal(clients.events.get(MASTER).extendedProperties.shared.syncHistoryOnly, "true",
+    "the first attempt safely caps history before a transient successor failure");
   await sync.process(delivery);
   const oldAfter = clients.events.get(MASTER);
   assert.equal(oldAfter.start.date, "2026-01-01");
@@ -1794,7 +1806,7 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
     "historical moved exception remains unchanged");
   const newMaster = [...clients.events.values()].find((event) => event.id !== MASTER
     && event.extendedProperties?.shared?.taskId === task.id);
-  assert.ok(newMaster);
+  assert.ok(newMaster, JSON.stringify(state.audits.slice(-3)));
   assert.deepEqual(newMaster.recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
   const mapping = state.mappingsByTask.get(task.id);
   assert.equal(mapping.masterEventId, newMaster.id);
