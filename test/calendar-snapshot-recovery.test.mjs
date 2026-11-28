@@ -279,6 +279,54 @@ test("snapshot recovery creates one finite weekly Todoist recurrence when accoun
   assert.equal(state.mappings[0].seriesId, master.iCalUID || master.id);
 });
 
+test("finite historical import rolls back a first readback mismatch and succeeds on fresh processing", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:00Z") });
+  const master = { id: "finite-history-master", iCalUID: "finite-history-series", status: "confirmed",
+    summary: "Historical weekly task", description: "Keep this description",
+    start: { date: "2026-10-30" }, end: { date: "2026-10-31" },
+    recurrence: ["RRULE:FREQ=WEEKLY;COUNT=8"], etag: '"finite-history-v1"' };
+  const occurrences = ["2026-10-30", "2026-11-06", "2026-11-13", "2026-11-20",
+    "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18"].map((date, index) => ({
+    id: `finite-history-${index}`, status: "confirmed", summary: master.summary,
+    description: master.description, recurringEventId: master.id, iCalUID: master.iCalUID,
+    originalStartTime: { date }, start: { date },
+    end: { date: new Date(Date.parse(`${date}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10) },
+  }));
+  const state = fakeState();
+  const clients = fakeClients([master]);
+  clients.pair.calendar.listInstances = async () => occurrences.map((event) => structuredClone(event));
+  clients.pair.calendar.listExplicitSeriesExceptions = async () => [];
+  let createAttempt = 0;
+  let breakFirstReadback = true;
+  clients.pair.todoist.upsertTask = async (payload) => {
+    createAttempt += 1;
+    const created = { id: `finite-provisional-${createAttempt}`, project_id: profiles.home.todoistProjectId, ...structuredClone(payload) };
+    if (breakFirstReadback) created.due.string = "every Friday";
+    return structuredClone(created);
+  };
+
+  const failed = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(failed.imported, 0);
+  assert.equal(failed.conflicts, 1);
+  assert.equal(clients.tasks.length, 0);
+  assert.equal(clients.deletions, 1);
+  assert.equal(clients.projectComments.length, 0);
+  assert.equal(state.mappings.length, 0, "no mapping is committed before recurrence readback verifies");
+  assert.ok(state.audits.some((entry) => entry.action === "calendar_recurrence_todoist_readback_mismatch"));
+
+  breakFirstReadback = false;
+  const recovered = await reconcileUnmappedCalendar("home", state, async () => clients.pair);
+  assert.equal(recovered.imported, 1);
+  assert.equal(recovered.conflicts, 0);
+  assert.ok(clients.tasks.length > 0);
+  assert.ok(clients.tasks.every((task) => task.id === "finite-provisional-2"));
+  assert.equal(clients.tasks[0].id, "finite-provisional-2");
+  assert.equal(clients.tasks[0].due.string, "every Friday starting 27 Nov 2026 and ending 18 Dec 2026");
+  assert.equal(state.mappings.length, 1);
+  assert.equal(state.mappings[0].taskId, "finite-provisional-2");
+  assert.equal(state.mappings[0].masterEventId, master.id);
+});
+
 
 test("snapshot import creates one native recurring Todoist task for indefinite weekly, monthly and yearly series", async () => {
   const cases = [
