@@ -34,6 +34,12 @@ export function calendarResourceAbsent(event) {
   return !event || event.status === "cancelled";
 }
 
+export function sameProviderInstant(left, right) {
+  const leftTime = Date.parse(left || "");
+  const rightTime = Date.parse(right || "");
+  return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime === rightTime;
+}
+
 export function calendarOwnedRecurrenceCorrelationMatches({ event, mapping, profile, calendarId, masterEventId }) {
   const shared = event?.extendedProperties?.shared;
   return Boolean(shared && mapping
