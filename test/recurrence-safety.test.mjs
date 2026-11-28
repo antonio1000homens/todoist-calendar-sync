@@ -1734,7 +1734,7 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   link.syncBaseline = providerSyncBaseline(oldTask, current, master);
   state.storeMapping(mappingFromLink(link));
   state.links[0].syncBaseline = structuredClone(link.syncBaseline);
-  const task = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 years" } };
+  let task = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 years" } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
   const fixtureInstances = [current];
   const clients = fakeClients(state, fixtureInstances, tasks, undefined, [master]);
@@ -1856,7 +1856,30 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
   assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
 
-  const calendarEditBack = { ...newMaster, recurrence: ["RRULE:FREQ=YEARLY"], etag: '"future-master-v2"' };
+  const metadataTask = { ...task, content: "Annual review updated", description: "Annual details",
+    updated_at: "2026-11-28T10:02:00Z" };
+  tasks.set(task.id, metadataTask);
+  const recurrenceBeforeMetadata = [...clients.events.get(newMaster.id).recurrence];
+  const writesBeforeMetadata = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-metadata-edit", body: JSON.stringify({
+    event_name: "item:updated", event_data: metadataTask, event_data_extra: { old_item: task },
+  }) });
+  assert.equal(clients.calendarUpserts.length, writesBeforeMetadata + 1);
+  assert.equal(clients.calendarUpserts.at(-1).metadataOnly, true);
+  assert.deepEqual(clients.events.get(newMaster.id).recurrence, recurrenceBeforeMetadata);
+  assert.equal(clients.events.get(newMaster.id).summary, metadataTask.content);
+  assert.equal(clients.events.get(newMaster.id).description, metadataTask.description);
+  assert.equal(state.mappingsByTask.get(task.id).syncedTitle, metadataTask.content);
+  assert.equal(state.mappingsByTask.get(task.id).syncedDescription, metadataTask.description);
+  const writesAfterMetadata = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "annual-metadata-edit-replay", body: JSON.stringify({
+    event_name: "item:updated", event_data: metadataTask, event_data_extra: { old_item: task },
+  }) });
+  assert.equal(clients.calendarUpserts.length, writesAfterMetadata,
+    "a replayed metadata edit does not issue another Calendar patch");
+  task = metadataTask;
+
+  const calendarEditBack = { ...clients.events.get(newMaster.id), recurrence: ["RRULE:FREQ=YEARLY"], etag: '"future-master-v2"' };
   clients.events.set(newMaster.id, calendarEditBack);
   clients.calendar.listDelta = async () => ({ items: [structuredClone(calendarEditBack)], nextSyncToken: "sync-next" });
   await sync.process({ ...delivery, id: "calendar-edit-back", kind: "calendar", body: "",
