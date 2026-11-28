@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizedText } from "./security.js";
 import { todoistRecurrenceToRrule } from "./todoist-recurrence.js";
+import { classifyCalendarRule, recurrenceIncludesDate } from "./recurrence-semantics.js";
 import type { CalendarEvent, Profile, TodoistTask } from "./types.js";
 
 /**
@@ -45,10 +46,18 @@ function day(value: string): number {
   }
   return stamp;
 }
-function yearlyOccurrence(anchor: string, year: number): string {
-  const candidate = String(year).padStart(4, "0") + anchor.slice(4);
-  day(candidate); // Reject leap-day shifts rather than guessing.
-  return candidate;
+function futureSplitSupported(semantic: import("./recurrence-semantics.js").RecurrenceSemantics): boolean {
+  if (semantic.frequency === "DAILY") return !semantic.byDay && !semantic.byMonthDay && !semantic.byMonth;
+  if (semantic.frequency === "WEEKLY") return !semantic.byMonth && !semantic.byMonthDay
+    && !semantic.byDay?.some((value) => value.length !== 2)
+    && !(semantic.interval > 1 && (semantic.byDay?.length || 0) > 1);
+  if (semantic.frequency === "MONTHLY") return !semantic.byMonth
+    && (semantic.byMonthDay?.length || 0) <= 1
+    && (!semantic.byDay || semantic.byDay.length === 1
+      && /^(?:-1|[1-5])(?:MO|TU|WE|TH|FR|SA|SU)$/.test(semantic.byDay[0])
+      && !semantic.byMonthDay);
+  return !semantic.byDay && (semantic.byMonth?.length || 0) <= 1
+    && (semantic.byMonthDay?.length || 0) <= 1;
 }
 /**
  * Google Calendar may reorder RRULE components on a successful PUT. Compare
@@ -82,20 +91,34 @@ export function sameSafeYearlyRecurrenceRule(left: string | undefined, right: st
   return normalizedLeft !== undefined && normalizedLeft === parse(right);
 }
 
-function annualRule(rule: string): { interval: number; until?: string } {
-  // Reject any component whose semantics we cannot preserve (COUNT, BYxxx,
-  // RDATE, EXDATE, duplicate keys, timed UNTIL, etc). DATE UNTIL is safe
-  // only when it has already expired: the existing master is left unchanged.
-  if (!sameSafeYearlyRecurrenceRule(rule, rule)) {
-    throw new Error("Future-only split requires a plain YEARLY RRULE with optional INTERVAL and expired DATE UNTIL; COUNT, BYxxx, RDATE and EXDATE need manual review");
-  }
-  const components = new Map(rule.slice("RRULE:".length).split(";").map(part => part.split("=") as [string, string]));
-  const untilValue = components.get("UNTIL");
-  return {
-    interval: Number(components.get("INTERVAL") || 1),
-    ...(untilValue ? { until: `${untilValue.slice(0, 4)}-${untilValue.slice(4, 6)}-${untilValue.slice(6)}` } : {}),
+/** Compare only the reviewed all-day recurrence subset used by safe future
+ * splits. Semantic classification rejects duplicate, unknown, or unsupported
+ * RRULE components instead of quietly dropping them during readback. */
+export function sameSafeAllDayRecurrenceRule(
+  left: string | undefined, right: string | undefined, startDate: string,
+): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) return false;
+  const shape = (rule: string | undefined): string | undefined => {
+    if (!rule) return undefined;
+    const classification = classifyCalendarRule(rule, { start: startDate });
+    const semantic = classification.semantic;
+    if (!semantic || classification.disposition === "unsupported" || !futureSplitSupported(semantic)
+      || semantic.localTime || semantic.count !== undefined) return undefined;
+    const date = new Date(`${startDate}T00:00:00Z`);
+    const weekDay = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"][(date.getUTCDay() + 6) % 7];
+    const monthDay = date.getUTCDate(), month = date.getUTCMonth() + 1;
+    const byDay = semantic.frequency === "WEEKLY" ? semantic.byDay || [weekDay] : semantic.byDay || [];
+    const byMonthDay = semantic.frequency === "MONTHLY" || semantic.frequency === "YEARLY"
+      ? semantic.byMonthDay || (semantic.byDay?.length ? [] : [monthDay])
+      : [];
+    const byMonth = semantic.frequency === "YEARLY" ? semantic.byMonth || [month] : [];
+    return JSON.stringify([semantic.frequency, semantic.interval,
+      byDay, byMonthDay, byMonth, semantic.until || ""]);
   };
+  const normalizedLeft = shape(left);
+  return normalizedLeft !== undefined && normalizedLeft === shape(right);
 }
+
 function approvedTaskFingerprint(task: TodoistTask): string {
   const due = task.due;
   return createHash("sha256").update(JSON.stringify([
@@ -152,27 +175,54 @@ export function planFutureSeriesSplit(
     ? old.extendedProperties?.shared?.syncHistoryOriginalRule
     : old.recurrence[0];
   if (!priorRule) throw new Error("Cannot verify the original historical recurrence");
-  const { interval, until } = annualRule(priorRule);
+  const priorClassification = classifyCalendarRule(priorRule, { start });
+  const priorSemantic = priorClassification.semantic;
+  if (!priorSemantic || priorClassification.disposition === "unsupported" || !futureSplitSupported(priorSemantic)
+    || priorSemantic.localTime || priorSemantic.count !== undefined) {
+    throw new Error("Future-only split requires a supported all-day recurrence without COUNT; unsupported schedules need manual review");
+  }
+  const until = priorSemantic.until ? `${priorSemantic.until.slice(0, 4)}-${priorSemantic.until.slice(4, 6)}-${priorSemantic.until.slice(6, 8)}` : undefined;
   if (until && day(until) >= day(today)) {
     throw new Error("Calendar UNTIL is not yet expired; review the still-active series and its occurrences separately");
   }
   const newRule = todoistRecurrenceToRrule(task, {
     start: task.due.date, timeZone,
   });
-  if (!newRule || !newRule.startsWith("RRULE:FREQ=YEARLY")) {
-    throw new Error("The Todoist future schedule must be a supported yearly recurrence");
+  const newClassification = newRule ? classifyCalendarRule(newRule, { start: task.due.date }) : undefined;
+  const newSemantic = newClassification?.semantic;
+  if (!newRule || !newSemantic || newClassification?.disposition === "unsupported"
+    || !futureSplitSupported(newSemantic)
+    || newSemantic.localTime || newSemantic.count !== undefined
+    || newSemantic.until !== undefined || !recurrenceIncludesDate(newSemantic, task.due.date)) {
+    throw new Error("The Todoist future schedule must be a supported all-day recurrence");
   }
   const duration = day(old.end.date) - startMs;
   if (duration !== 86400000) throw new Error("Historical series must consist of one-day all-day events");
-  let previous = start;
+  let previous: string | undefined;
   let upcoming: string | undefined;
-  const startYear = Number(start.slice(0, 4));
-  for (let i = 1; i <= 300; i++) {
-    const next = yearlyOccurrence(start, startYear + i * interval);
-    if (day(next) >= day(today)) { upcoming = next; break; }
-    previous = next;
+  const todayMs = day(today);
+  const horizon = todayMs + 10 * 366 * 86_400_000;
+  if (until && day(until) < todayMs) {
+    for (let stamp = startMs; stamp <= day(until); stamp += 86_400_000) {
+      const candidate = new Date(stamp).toISOString().slice(0, 10);
+      if (recurrenceIncludesDate(priorSemantic, candidate)) previous = candidate;
+    }
+    const openSemantic = { ...priorSemantic, until: undefined };
+    for (let stamp = todayMs; stamp <= horizon; stamp += 86_400_000) {
+      const candidate = new Date(stamp).toISOString().slice(0, 10);
+      if (recurrenceIncludesDate(openSemantic, candidate)) { upcoming = candidate; break; }
+    }
+  } else {
+    for (let stamp = startMs; stamp <= horizon; stamp += 86_400_000) {
+      const candidate = new Date(stamp).toISOString().slice(0, 10);
+      if (!recurrenceIncludesDate(priorSemantic, candidate)) continue;
+      if (stamp < todayMs) previous = candidate;
+      else { upcoming = candidate; break; }
+    }
   }
-  if (!upcoming) throw new Error("Unable to determine the next historical occurrence");
+  if (!upcoming || (!previous && !(until && day(until) < startMs)))
+    throw new Error("Unable to determine the prior and next historical occurrences");
+  if (!until && !previous) throw new Error("A live future recurrence requires a verified prior occurrence");
   // An already-capped series may be resumed only when its lineage and exact
   // cap match this same deterministic successor; no new split is inferred.
   const newMasterId = createHash("sha256")
@@ -183,16 +233,10 @@ export function planFutureSeriesSplit(
   // later cutoff would CREATE old occurrences that never existed (including
   // when UNTIL precedes DTSTART); leave it byte-for-byte unchanged.
   const truncatedRule = until ? originalRule
-    : `${originalRule};UNTIL=${previous.replace(/-/g, "")}`;
+    : `${originalRule};UNTIL=${previous!.replace(/-/g, "")}`;
   let historicalLastOccurrence: string | undefined;
-  if (until) {
-    for (let i = 0; i <= 300; i++) {
-      const candidate = yearlyOccurrence(start, startYear + i * interval);
-      if (day(candidate) > day(until)) break;
-      historicalLastOccurrence = candidate;
-    }
-  }
-  if (archived && (!sameSafeYearlyRecurrenceRule(old.recurrence[0], truncatedRule)
+  if (until) historicalLastOccurrence = previous;
+  if (archived && (!sameSafeAllDayRecurrenceRule(old.recurrence[0], truncatedRule, start)
     || old.extendedProperties?.shared?.syncHistorySuccessorId !== newMasterId
     || old.extendedProperties?.shared?.syncHistoryTaskId !== task.id)) {
     throw new Error("Already archived Calendar master does not match this split");

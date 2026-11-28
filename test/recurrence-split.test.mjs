@@ -90,8 +90,8 @@ test("archived master cannot be silently claimed for a different Todoist task or
 });
 
 test("split refuses unsupported RRULEs, timed events and already elapsed first new dates", () => {
-  for (const rrule of ["RRULE:FREQ=MONTHLY", "RRULE:FREQ=YEARLY;COUNT=30",
-    "RRULE:FREQ=YEARLY;BYMONTH=5", "RRULE:FREQ=YEARLY;INTERVAL=1;EXDATE=20250503"]) {
+  for (const rrule of ["RRULE:FREQ=DAILY;COUNT=30", "RRULE:FREQ=YEARLY;COUNT=30",
+    "RRULE:FREQ=YEARLY;BYDAY=1MO", "RRULE:FREQ=YEARLY;INTERVAL=1;EXDATE=20250503"]) {
     const e = old();
     e.recurrence = [rrule];
     assert.throws(() => planFutureSeriesSplit("antonio", task(), e, new Date("2026-10-19T12:00:00Z")));
@@ -102,6 +102,30 @@ test("split refuses unsupported RRULEs, timed events and already elapsed first n
   const overdue = task();
   overdue.due.date = "2024-07-01";
   assert.throws(() => planFutureSeriesSplit("antonio", overdue, old(), new Date("2026-10-19T12:00:00Z")));
+});
+
+test("future-only split preserves the last real occurrence for supported all-day cadences", () => {
+  const cases = [
+    { rule: "RRULE:FREQ=DAILY;INTERVAL=2", start: "2024-01-01", due: "2026-11-29",
+      dueString: "every Sunday", next: "2026-11-28", prior: "2026-11-26", newRule: "RRULE:FREQ=WEEKLY;BYDAY=SU" },
+    { rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", start: "2024-01-03", due: "2026-12-02",
+      dueString: "every 2 weeks", next: "2026-12-02", prior: "2026-11-25", newRule: "RRULE:FREQ=WEEKLY;INTERVAL=2" },
+    { rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", start: "2024-01-09", due: "2026-12-08",
+      dueString: "every 2 months", next: "2026-12-08", prior: "2026-11-10", newRule: "RRULE:FREQ=MONTHLY;INTERVAL=2" },
+  ];
+  for (const item of cases) {
+    const source = task();
+    source.due = { date: item.due, is_recurring: true, string: item.dueString };
+    const master = old();
+    master.start = { date: item.start };
+    master.end = { date: new Date(Date.parse(item.start + "T00:00:00Z") + 86400000).toISOString().slice(0, 10) };
+    master.recurrence = [item.rule];
+    const p = planFutureSeriesSplit("antonio", source, master, new Date("2026-11-28T12:00:00Z"));
+    assert.equal(p.previousOccurrence, item.prior, item.rule);
+    assert.equal(p.nextOldOccurrence, item.next, item.rule);
+    assert.equal(p.truncatedRule, `${item.rule};UNTIL=${item.prior.replace(/-/g, "")}`, item.rule);
+    assert.equal(p.newRule, item.newRule, item.rule);
+  }
 });
 
 test("old modified, cancelled or missing historical instances require operator review", () => {
@@ -173,7 +197,7 @@ test("expired UNTIL after DTSTART verifies actual history and preserves the old 
 test("unsupported or ambiguous expiry clauses fail closed with actionable guidance", () => {
   for (const rule of [
     "RRULE:FREQ=YEARLY;COUNT=3", "RRULE:FREQ=YEARLY;RDATE=20270502",
-    "RRULE:FREQ=YEARLY;EXDATE=20250502", "RRULE:FREQ=YEARLY;UNTIL=20231231;BYMONTH=5",
+    "RRULE:FREQ=YEARLY;EXDATE=20250502", "RRULE:FREQ=YEARLY;UNTIL=20231231;BYDAY=1MO",
     "RRULE:FREQ=YEARLY;UNTIL=20231231T000000Z", "RRULE:FREQ=YEARLY;UNTIL=20231231;UNTIL=20231231",
   ]) {
     const master = old(); master.recurrence = [rule];

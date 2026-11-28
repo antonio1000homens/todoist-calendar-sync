@@ -1991,6 +1991,113 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
 
 });
 
+test("explicit all-day daily, weekly, monthly and yearly cadence edits preserve their provider history", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-27T12:00:00Z") });
+  const cases = [
+    { name: "daily interval", rule: "RRULE:FREQ=DAILY;INTERVAL=2", anchor: "2024-01-01",
+      previous: "2026-11-26", active: "2026-11-28", nextDue: "2026-11-28", editedRule: "RRULE:FREQ=WEEKLY", editedPhrase: "every week" },
+    { name: "weekly cadence", rule: "RRULE:FREQ=WEEKLY;BYDAY=WE", anchor: "2024-01-03",
+      previous: "2026-11-25", active: "2026-12-02", nextDue: "2026-12-02", editedRule: "RRULE:FREQ=MONTHLY;INTERVAL=2", editedPhrase: "every 2 months" },
+    { name: "monthly selector", rule: "RRULE:FREQ=MONTHLY;BYDAY=2TU", anchor: "2024-01-09",
+      previous: "2026-11-10", active: "2026-12-08", nextDue: "2026-12-08", editedRule: "RRULE:FREQ=YEARLY;INTERVAL=2", editedPhrase: "every 2 years" },
+    { name: "yearly interval selector", rule: "RRULE:FREQ=YEARLY;INTERVAL=2;BYMONTH=1;BYMONTHDAY=15", anchor: "2023-01-15",
+      previous: "2025-01-15", active: "2027-01-15", nextDue: "2027-01-15", editedRule: "RRULE:FREQ=YEARLY;INTERVAL=3", editedPhrase: "every 3 years" },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const taskId = `cadence-matrix-task-${index}`;
+    const makeInstance = (id, date) => ({ id, status: "confirmed", recurringEventId: MASTER, iCalUID: SERIES,
+      originalStartTime: { date }, start: { date }, end: { date: addDay(date) },
+      summary: `Cadence ${item.name}`, description: "Preserve history" });
+    const master = { id: MASTER, etag: `"cadence-matrix-${index}-v1"`, iCalUID: SERIES, status: "confirmed",
+      summary: `Cadence ${item.name}`, description: "Preserve history",
+      start: { date: item.anchor }, end: { date: addDay(item.anchor) }, recurrence: [item.rule],
+      extendedProperties: { shared: { taskId, syncSeriesId: SERIES, syncProgressVersion: "1" } } };
+    const historical = makeInstance(`cadence-history-${index}`, item.previous);
+    const active = makeInstance(`cadence-active-${index}`, item.active);
+    const instances = [historical, active];
+    const recurrence = calendarOwnedTodoistRecurrence(master, instances, "Europe/London");
+    assert.ok(recurrence, `${item.name} original recurrence projects to Todoist`);
+    const link = { ...linkFor(active, taskId), syncedTitle: master.summary, syncedDescription: master.description };
+    const state = new FakeState(link);
+    const oldTask = { id: taskId, project_id: profiles[PROFILE].todoistProjectId,
+      ...calendarOwnedRecurringTaskPayload(active, recurrence, "Europe/London"),
+      updated_at: "2026-11-27T10:00:00Z" };
+    link.syncBaseline = providerSyncBaseline(oldTask, active, master);
+    state.storeMapping(mappingFromLink(link));
+    state.links[0].syncBaseline = structuredClone(link.syncBaseline);
+    const editedTask = { ...structuredClone(oldTask), due: { ...oldTask.due, string: item.editedPhrase },
+      updated_at: "2026-11-27T10:01:00Z" };
+    const tasks = new Map([[taskId, editedTask]]);
+    const clients = fakeClients(state, instances, tasks, undefined, [master]);
+    clients.events.set(MASTER, structuredClone(master));
+    clients.calendar.listInstancesInWindow = async (masterId, from, to) => {
+      const event = clients.events.get(masterId);
+      if (!event) return [];
+      const until = event.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8})/)?.[1];
+      const cap = until && `${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}`;
+      return instances.filter((candidate) => candidate.recurringEventId === masterId
+        && (candidate.originalStartTime.date >= from.slice(0, 10))
+        && (candidate.originalStartTime.date <= to.slice(0, 10))
+        && (!cap || candidate.originalStartTime.date <= cap)).map((candidate) => structuredClone(candidate));
+    };
+    clients.calendar.listExplicitSeriesExceptions = async () => [];
+    clients.calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+      const existing = clients.events.get(eventId);
+      assert.equal(existing.etag, etag, `${item.name} uses the fresh master ETag`);
+      const updated = { ...structuredClone(payload), id: eventId, etag: `"cadence-matrix-${index}-capped"` };
+      clients.events.set(eventId, updated);
+      for (let cursor = instances.length - 1; cursor >= 0; cursor -= 1) {
+        const candidate = instances[cursor];
+        if (candidate.recurringEventId === eventId && candidate.originalStartTime.date > item.previous) {
+          clients.events.delete(candidate.id);
+          instances.splice(cursor, 1);
+        }
+      }
+      clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
+      return structuredClone(updated);
+    };
+    clients.calendar.createFutureMasterOnce = async (event) => {
+      const created = { ...structuredClone(event), status: "confirmed", etag: `"cadence-matrix-${index}-successor"` };
+      clients.events.set(created.id, created);
+      const future = makeInstance(`cadence-successor-${index}`, item.nextDue);
+      future.recurringEventId = created.id;
+      future.iCalUID = created.iCalUID;
+      future.summary = created.summary;
+      future.description = created.description;
+      instances.push(future);
+      clients.events.set(future.id, structuredClone(future));
+      return structuredClone(created);
+    };
+    const sync = new Synchronizer(state, undefined, async () => clients);
+    const delivery = { id: `cadence-matrix-edit-${index}`, kind: "todoist", profile: PROFILE, mode: "aws",
+      receivedAt: "2026-11-27T10:02:00Z", headers: {},
+      body: JSON.stringify({ event_name: "item:updated", event_data: editedTask,
+        event_data_extra: { update_intent: "item_updated", old_item: oldTask } }) };
+    await sync.process(delivery);
+
+    const archived = clients.events.get(MASTER);
+    assert.equal(archived.extendedProperties.shared.syncHistoryOnly, "true", `${item.name} archives old owner safely ${JSON.stringify(state.audits.slice(-3))}`);
+    assert.equal(archived.start.date, item.anchor, `${item.name} keeps historical DTSTART`);
+    assert.deepEqual(archived.recurrence, [`${item.rule};UNTIL=${item.previous.replace(/-/g, "")}`]);
+    assert.ok(instances.some((event) => event.id === historical.id), `${item.name} retains history instance`);
+    assert.equal(instances.some((event) => event.id === active.id), false, `${item.name} caps old future instance`);
+    const successor = [...clients.events.values()].find((event) => event.id !== MASTER
+      && event.extendedProperties?.shared?.taskId === taskId);
+    assert.ok(successor, `${item.name} creates exact successor`);
+    assert.deepEqual(successor.recurrence, [item.editedRule]);
+    assert.equal(successor.start.date, item.nextDue);
+    const mapping = state.mappingsByTask.get(taskId);
+    assert.equal(mapping.masterEventId, successor.id);
+    assert.equal(mapping.activeInstanceId, `cadence-successor-${index}`);
+    assert.equal(mapping.syncBaseline.calendar.recurrence, providerSyncBaseline(editedTask,
+      instances.find((event) => event.id === `cadence-successor-${index}`), successor).calendar.recurrence);
+    const writes = clients.calendarUpserts.length;
+    await sync.process(delivery);
+    assert.equal(clients.calendarUpserts.length, writes, `${item.name} replay does not create another successor`);
+    assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === taskId).length, 1);
+  }
+});
+
 test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, selector and DST series", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-28T12:00:00Z") });
   const cases = [
@@ -2248,7 +2355,7 @@ test("unchanged v2 one-off on moved final annual occurrence avoids correlation a
   };
   clients.projectComments.push({ id: "exact-v2", project_id: projectId,
     content: serializeMappingComment(mapping, projectId) });
-  const sync = new Synchronizer(state, undefined, async () => clients);
+    const sync = new Synchronizer(state, undefined, async () => clients);
   let crossProfileReads = 0, taskReads = 0, correlationAttempts = 0, replayVerified = 0;
   sync.providerMappingByTaskAnyProfile = async () => { crossProfileReads++; return mapping; };
   const getTask = clients.todoist.getTask.bind(clients.todoist);

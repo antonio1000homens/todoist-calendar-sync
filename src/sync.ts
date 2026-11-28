@@ -28,7 +28,7 @@ import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFinger
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "./todoist-phase-b-native-admission.js";
 import { SafeProviderReplayError } from "./safe-provider-replay.js";
-import { planFutureSeriesSplit, sameSafeYearlyRecurrenceRule } from "./recurrence-split.js";
+import { planFutureSeriesSplit, sameSafeAllDayRecurrenceRule } from "./recurrence-split.js";
 import { calendarPhaseCCandidate, matchesCalendarPhaseCTask } from "./calendar-todoist-phase-c.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -3603,10 +3603,10 @@ export class Synchronizer {
     return true;
   }
 
-  /** Apply the narrowly supported all-day annual edit as a Calendar-owned
+  /** Apply a narrowly supported all-day recurrence edit as a Calendar-owned
    * future-only split. The historical master is capped in place and the new
    * master keeps Calendar ownership; unsupported schedules remain reviewable. */
-  private async applyCalendarOwnedAnnualFutureEdit(
+  private async applyCalendarOwnedFutureRecurrenceEdit(
     delivery: Delivery,
     task: TodoistTask,
     oldTask: TodoistTask,
@@ -3640,7 +3640,7 @@ export class Synchronizer {
       || !mapping.activeInstanceId || !mapping.originalStart || !mapping.activeEffectiveStart
       || normalizedText(task.content).toLowerCase() !== normalizedText(master.summary).toLowerCase()
       || normalizedDescription(task.description) !== normalizedDescription(master.description)) {
-      return decline("mapped_annual_identity_or_date_shape_unverified");
+      return decline("mapped_recurrence_identity_or_date_shape_unverified");
     }
     const shared = master.extendedProperties?.shared || {};
     const archived = shared.syncHistoryOnly === "true";
@@ -3653,7 +3653,7 @@ export class Synchronizer {
       ? { ...master, recurrence: [shared.syncHistoryOriginalRule] } : master;
     const oldRule = todoistRecurrenceToRrule(oldTask, { start: anchor, timeZone: master.start?.timeZone });
     const newRule = todoistRecurrenceToRrule(task, { start: anchor, timeZone: master.start?.timeZone });
-    if (!oldRule || !newRule) return decline("annual_rule_translation_unverified");
+    if (!oldRule || !newRule) return decline("recurrence_rule_translation_unverified");
     // A delayed/replayed webhook after the successor was committed is an
     // echo: the current mapped master already matches the fresh Todoist rule.
     if (!archived && calendarRuleMatches(master, newRule)) return false;
@@ -3664,10 +3664,10 @@ export class Synchronizer {
       return decline("semantic_baseline_does_not_prove_todoist_only_edit");
     }
     if (oldRule === newRule) return false;
-    if (!sameSafeYearlyRecurrenceRule(baselineMaster.recurrence?.[0], baselineMaster.recurrence?.[0])
-      || !sameSafeYearlyRecurrenceRule(oldRule, baselineMaster.recurrence?.[0])
-      || !sameSafeYearlyRecurrenceRule(newRule, newRule)) {
-      return decline("future_only_edit_supports_plain_all_day_annual_rules");
+    if (!sameSafeAllDayRecurrenceRule(baselineMaster.recurrence?.[0], baselineMaster.recurrence?.[0], anchor)
+      || !sameSafeAllDayRecurrenceRule(oldRule, baselineMaster.recurrence?.[0], anchor)
+      || !sameSafeAllDayRecurrenceRule(newRule, newRule, task.due.date)) {
+      return decline("future_only_edit_requires_supported_all_day_rules");
     }
     if (master.status !== "confirmed" || master.recurringEventId || !master.etag
       || !calendar.listInstancesInWindow || !calendar.listExplicitSeriesExceptions
@@ -3772,12 +3772,12 @@ export class Synchronizer {
         await this.state.recordMutation(profile);
       } else if (shared.syncHistorySuccessorId !== plan.newMasterId
         || shared.syncHistoryCutoff !== plan.previousOccurrence
-        || !sameSafeYearlyRecurrenceRule(shared.syncHistoryOriginalRule, plan.originalRule)) {
+        || !sameSafeAllDayRecurrenceRule(shared.syncHistoryOriginalRule, plan.originalRule, anchor)) {
         throw new Error("Archived history marker does not match this exact future edit");
       }
       const capped = await calendar.getEvent(master.id);
       const cappedShared = capped.extendedProperties?.shared || {};
-      if (capped.status !== "confirmed" || !sameSafeYearlyRecurrenceRule(capped.recurrence?.[0], plan.truncatedRule)
+      if (capped.status !== "confirmed" || !sameSafeAllDayRecurrenceRule(capped.recurrence?.[0], plan.truncatedRule, anchor)
         || cappedShared.syncHistoryOnly !== "true" || cappedShared.syncHistoryTaskId !== task.id
         || cappedShared.syncHistorySuccessorId !== plan.newMasterId || cappedShared.taskId) {
         throw new Error("Old Calendar history cap did not verify");
@@ -3833,7 +3833,7 @@ export class Synchronizer {
         || Object.entries(requested.extendedProperties?.private || {}).some(([key, value]) =>
           future.extendedProperties?.private?.[key] !== value);
       if (future.id !== plan.newMasterId || future.status !== "confirmed"
-        || !sameSafeYearlyRecurrenceRule(future.recurrence?.[0], plan.newRule)
+        || !sameSafeAllDayRecurrenceRule(future.recurrence?.[0], plan.newRule, plan.newStart)
         || future.start?.date !== plan.newStart || futureShared.taskId !== task.id
         || futureShared.syncSeriesId !== plan.newMasterId || futureShared.syncProgressVersion !== "1"
         || metadataReadbackMismatch
@@ -4118,7 +4118,7 @@ export class Synchronizer {
         && (previousDue.string && previousDue.string !== task.due?.string
           || previousDue.timezone && previousDue.timezone !== task.due?.timezone)) {
         const oldTask = payload.event_data_extra?.old_item;
-        if (oldTask && await this.applyCalendarOwnedAnnualFutureEdit(
+        if (oldTask && await this.applyCalendarOwnedFutureRecurrenceEdit(
           delivery, task, oldTask, mapping, master, calendar, todoist,
         )) return;
       }
