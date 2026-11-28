@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   planFutureSeriesSplit, assertUnmodifiedHistoricalOccurrences, sameSafeYearlyRecurrenceRule,
+  sameSafeFutureRecurrenceRule,
 } from "../dist/recurrence-split.js";
 
 const task = () => ({
@@ -126,6 +127,44 @@ test("future-only split preserves the last real occurrence for supported all-day
     assert.equal(p.truncatedRule, `${item.rule};UNTIL=${item.prior.replace(/-/g, "")}`, item.rule);
     assert.equal(p.newRule, item.newRule, item.rule);
   }
+});
+
+test("timed future-only split cuts the old RRULE at the exact pre-DST occurrence instant", () => {
+  const master = { id: "london-weekly-master", iCalUID: "london-weekly-series", status: "confirmed",
+    etag: '"london-master-v1"', summary: task().content,
+    start: { dateTime: "2026-03-29T09:00:00+01:00", timeZone: "Europe/London" },
+    end: { dateTime: "2026-03-29T10:00:00+01:00", timeZone: "Europe/London" },
+    recurrence: ["RRULE:FREQ=WEEKLY"],
+    extendedProperties: { shared: { taskId: task().id, syncSeriesId: "london-weekly-series" } } };
+  const timedTask = { ...task(), due: { datetime: "2027-03-28T09:00:00+01:00", timezone: "Europe/London",
+    is_recurring: true, string: "every 2 weeks" } };
+  const plan = planFutureSeriesSplit("antonio", timedTask, master,
+    new Date("2027-03-27T12:00:00Z"), "Europe/London", undefined, "london-weekly-series");
+  assert.equal(plan.previousOccurrence, "2027-03-21T09:00:00.000Z");
+  assert.equal(plan.nextOldOccurrence, "2027-03-28");
+  assert.equal(plan.truncatedRule, "RRULE:FREQ=WEEKLY;UNTIL=20270321T090000Z");
+  assert.equal(plan.newRule, "RRULE:FREQ=WEEKLY;INTERVAL=2");
+  assert.equal(plan.newStart, timedTask.due.datetime);
+  assert.equal(sameSafeFutureRecurrenceRule(plan.truncatedRule, "RRULE:UNTIL=20270321T090000Z;FREQ=WEEKLY",
+    master.start.dateTime, "Europe/London"), true);
+  assert.equal(sameSafeFutureRecurrenceRule(plan.truncatedRule, "RRULE:FREQ=WEEKLY;INTERVAL=2;UNTIL=20270321T090000Z",
+    master.start.dateTime, "Europe/London"), false);
+});
+
+test("timed future-only split rejects ambiguous local wall times", () => {
+  const makePlan = (start, due) => {
+    const master = { id: "london-wall-time-master", iCalUID: "london-wall-time-series", status: "confirmed",
+      etag: '"london-wall-time-v1"', summary: task().content,
+      start: { dateTime: start, timeZone: "Europe/London" },
+      end: { dateTime: new Date(Date.parse(start) + 3_600_000).toISOString(), timeZone: "Europe/London" },
+      recurrence: ["RRULE:FREQ=WEEKLY"],
+      extendedProperties: { shared: { taskId: task().id, syncSeriesId: "london-wall-time-series" } } };
+    const timedTask = { ...task(), due: { datetime: due, timezone: "Europe/London",
+      is_recurring: true, string: "every 2 weeks" } };
+    return () => planFutureSeriesSplit("antonio", timedTask, master,
+      new Date("2027-03-27T12:00:00Z"), "Europe/London", undefined, "london-wall-time-series");
+  };
+  assert.throws(makePlan("2026-10-25T01:30:00+01:00", "2027-03-28T09:00:00+01:00"), /missing or ambiguous/);
 });
 
 test("old modified, cancelled or missing historical instances require operator review", () => {

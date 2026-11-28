@@ -28,7 +28,7 @@ import { recoveryPolicyForTask, recoveryReceiptMatchesTask, recoverySourceFinger
 import { todoistPhaseBCandidate } from "./todoist-calendar-phase-b.js";
 import { admitNewTodoistPhaseBNative, verifyInitialPhaseBCalendarWrite } from "./todoist-phase-b-native-admission.js";
 import { SafeProviderReplayError } from "./safe-provider-replay.js";
-import { planFutureSeriesSplit, sameSafeAllDayRecurrenceRule } from "./recurrence-split.js";
+import { planFutureSeriesSplit, sameSafeFutureRecurrenceRule } from "./recurrence-split.js";
 import { calendarPhaseCCandidate, matchesCalendarPhaseCTask } from "./calendar-todoist-phase-c.js";
 import {
   calendarOwnedRecurringTaskPayload,
@@ -3603,7 +3603,7 @@ export class Synchronizer {
     return true;
   }
 
-  /** Apply a narrowly supported all-day recurrence edit as a Calendar-owned
+  /** Apply a narrowly supported recurrence edit as a Calendar-owned
    * future-only split. The historical master is capped in place and the new
    * master keeps Calendar ownership; unsupported schedules remain reviewable. */
   private async applyCalendarOwnedFutureRecurrenceEdit(
@@ -3629,10 +3629,17 @@ export class Synchronizer {
       || !/\bitem_updated\b/.test(String((JSON.parse(delivery.body) as TodoistWebhookPayload)
         .event_data_extra?.update_intent || ""))) return decline("explicit_edit_evidence_incomplete");
 
-    const anchor = master.start?.date;
+    const anchor = master.start?.dateTime || master.start?.date;
+    const allDay = Boolean(master.start?.date && !master.start.dateTime);
+    const taskDue = taskDateTime(task) || task.due?.date;
+    const oldTaskDue = taskDateTime(oldTask) || oldTask.due?.date;
     const seriesId = master.iCalUID || master.id;
-    if (!anchor || master.start?.dateTime || !master.end?.date || master.end.dateTime
-      || !task.due?.date || task.due.datetime || !oldTask.due?.date || oldTask.due.datetime
+    if (!anchor || (allDay ? !master.end?.date || Boolean(master.end.dateTime)
+      : !master.start?.timeZone || !master.end?.dateTime || !task.due?.timezone
+        || !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(anchor) || !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(taskDue || "")
+        || task.due.timezone !== master.start.timeZone)
+      || !taskDue || !oldTaskDue || allDay !== Boolean(task.due?.date && !taskDateTime(task))
+      || allDay !== Boolean(oldTask.due?.date && !taskDateTime(oldTask))
       || mapping.profile !== profile || mapping.taskId !== task.id
       || mapping.projectId !== profiles[profile].todoistProjectId
       || mapping.masterEventId !== master.id || mapping.seriesId !== seriesId
@@ -3664,10 +3671,11 @@ export class Synchronizer {
       return decline("semantic_baseline_does_not_prove_todoist_only_edit");
     }
     if (oldRule === newRule) return false;
-    if (!sameSafeAllDayRecurrenceRule(baselineMaster.recurrence?.[0], baselineMaster.recurrence?.[0], anchor)
-      || !sameSafeAllDayRecurrenceRule(oldRule, baselineMaster.recurrence?.[0], anchor)
-      || !sameSafeAllDayRecurrenceRule(newRule, newRule, task.due.date)) {
-      return decline("future_only_edit_requires_supported_all_day_rules");
+    const ruleTimeZone = master.start?.timeZone || task.due?.timezone;
+    if (!sameSafeFutureRecurrenceRule(baselineMaster.recurrence?.[0], baselineMaster.recurrence?.[0], anchor, ruleTimeZone)
+      || !sameSafeFutureRecurrenceRule(oldRule, baselineMaster.recurrence?.[0], anchor, ruleTimeZone)
+      || !sameSafeFutureRecurrenceRule(newRule, newRule, taskDue, ruleTimeZone)) {
+      return decline("future_only_edit_requires_supported_calendar_rules");
     }
     if (master.status !== "confirmed" || master.recurringEventId || !master.etag
       || !calendar.listInstancesInWindow || !calendar.listExplicitSeriesExceptions
@@ -3701,15 +3709,16 @@ export class Synchronizer {
       this.providerMappingByTask(profile, task.id, todoist), todoist.listTasks(),
       calendar.listExplicitSeriesExceptions(master.id),
     ]);
-    const expectedActiveStart = active?.start?.date;
+    const expectedActiveStart = active ? eventEffectiveStart(active) : undefined;
     if (freshMapping?.updatedAt !== mapping.updatedAt || freshMapping?.masterEventId !== master.id
       || freshMapping?.activeInstanceId !== mapping.activeInstanceId
       || liveTask.id !== task.id || liveTask.updated_at !== task.updated_at
-      || liveTask.due?.string !== task.due?.string || liveTask.due?.date !== task.due?.date
+      || liveTask.due?.string !== task.due?.string || (taskDateTime(liveTask) || liveTask.due?.date) !== taskDue
       || liveMaster.etag !== master.etag || (!archived && (!active || active.id !== mapping.activeInstanceId
         || active.status !== "confirmed" || active.recurringEventId !== master.id
-        || (active.originalStartTime?.date || active.start?.date) !== mapping.originalStart
-        || expectedActiveStart !== mapping.activeEffectiveStart || expectedActiveStart !== task.due.date))
+        || compareLogicalStarts(recurrenceOriginalStart(active) || "", mapping.originalStart || "") !== 0
+        || compareLogicalStarts(expectedActiveStart || "", mapping.activeEffectiveStart || "") !== 0
+        || compareLogicalStarts(expectedActiveStart || "", taskDue) !== 0))
       || allTasks.some((other) => other.id !== task.id
         && !other.is_deleted && normalizedText(other.content).toLowerCase() === normalizedText(task.content).toLowerCase())) {
       return decline("fresh_provider_identity_or_exception_check_failed");
@@ -3721,9 +3730,13 @@ export class Synchronizer {
       return decline("sync_safety_control_blocked");
     }
 
-    const historyStart = new Date(`${anchor}T00:00:00Z`).toISOString();
+    const anchorInstant = allDay ? Date.parse(`${anchor}T00:00:00Z`) : Date.parse(anchor);
+    const historyStart = new Date(anchorInstant - 86_400_000).toISOString();
+    const historyEnd = plan.previousOccurrence
+      ? new Date(Date.parse(plan.previousOccurrence) + (allDay ? 86_400_000 : 1)).toISOString()
+      : new Date(anchorInstant).toISOString();
     const [history, upcoming] = await Promise.all([
-      calendar.listInstancesInWindow(master.id, historyStart, currentDate.toISOString()),
+      calendar.listInstancesInWindow(master.id, historyStart, historyEnd),
       calendar.listInstancesInWindow(master.id, currentDate.toISOString(),
         new Date(Date.parse(plan.nextOldOccurrence + "T00:00:00Z") + 10 * 366 * 86_400_000).toISOString()),
     ]);
@@ -3734,18 +3747,22 @@ export class Synchronizer {
         event.start?.dateTime || event.start?.date || null, event.end?.dateTime || event.end?.date || null,
         event.summary || "", event.description || ""])
       .sort(([left], [right]) => String(left).localeCompare(String(right))));
-    const historicalOriginals = history.map((event) => event.originalStartTime?.date || event.start?.date)
-      .filter((date): date is string => Boolean(date)).sort();
+    const historicalOriginals = history.map((event) => historyStartOf(event))
+      .filter((value): value is string => Boolean(value)).sort((left, right) => compareLogicalStarts(left, right));
     if (history.some((event) => event.recurringEventId !== master.id || !historyStartOf(event))
-      || historicalOriginals.at(-1) !== plan.previousOccurrence
-      || exceptions.some((event) => !event.originalStartTime?.date
-        || event.originalStartTime.date > (plan.previousOccurrence || ""))) {
+      || (plan.previousOccurrence && (!historicalOriginals.at(-1)
+        || compareLogicalStarts(historicalOriginals.at(-1)!, plan.previousOccurrence) !== 0))
+      || (!plan.previousOccurrence && historicalOriginals.length > 0)
+      || exceptions.some((event) => {
+        const original = event.originalStartTime?.dateTime || event.originalStartTime?.date;
+        return !original || Boolean(plan.previousOccurrence && compareLogicalStarts(original, plan.previousOccurrence) > 0);
+      })) {
       return decline("historical_or_future_exception_inventory_unverified");
     }
     const preservedHistory = historyFingerprint(history);
     if (upcoming.some((event) => event.status !== "confirmed"
       || event.recurringEventId !== master.id
-      || (event.originalStartTime?.date || event.start?.date) !== event.start?.date
+      || compareLogicalStarts(recurrenceOriginalStart(event) || "", eventEffectiveStart(event) || "") !== 0
       || event.summary !== master.summary || (event.description || "") !== (master.description || ""))) {
       return decline("future_occurrence_exception_requires_review");
     }
@@ -3772,12 +3789,12 @@ export class Synchronizer {
         await this.state.recordMutation(profile);
       } else if (shared.syncHistorySuccessorId !== plan.newMasterId
         || shared.syncHistoryCutoff !== plan.previousOccurrence
-        || !sameSafeAllDayRecurrenceRule(shared.syncHistoryOriginalRule, plan.originalRule, anchor)) {
+        || !sameSafeFutureRecurrenceRule(shared.syncHistoryOriginalRule, plan.originalRule, anchor, ruleTimeZone)) {
         throw new Error("Archived history marker does not match this exact future edit");
       }
       const capped = await calendar.getEvent(master.id);
       const cappedShared = capped.extendedProperties?.shared || {};
-      if (capped.status !== "confirmed" || !sameSafeAllDayRecurrenceRule(capped.recurrence?.[0], plan.truncatedRule, anchor)
+      if (capped.status !== "confirmed" || !sameSafeFutureRecurrenceRule(capped.recurrence?.[0], plan.truncatedRule, anchor, ruleTimeZone)
         || cappedShared.syncHistoryOnly !== "true" || cappedShared.syncHistoryTaskId !== task.id
         || cappedShared.syncHistorySuccessorId !== plan.newMasterId || cappedShared.taskId) {
         throw new Error("Old Calendar history cap did not verify");
@@ -3791,6 +3808,14 @@ export class Synchronizer {
         throw new Error("Historical Calendar instances changed during the future-only edit");
 
       const requested = toCalendarEvent(task);
+      if (!allDay) {
+        const duration = Date.parse(master.end?.dateTime || "") - Date.parse(master.start?.dateTime || "");
+        if (!Number.isFinite(duration) || duration <= 0 || !requested.start?.dateTime) {
+          throw new Error("Timed Calendar duration or successor start did not verify");
+        }
+        requested.end = { dateTime: addMilliseconds(requested.start.dateTime, duration),
+          timeZone: master.start?.timeZone || ruleTimeZone };
+      }
       // A cadence split changes recurrence identity and DTSTART, but it must
       // keep the Calendar-owned event's independent presentation and sharing
       // metadata. Do not carry old sync correlation onto the successor.
@@ -3822,9 +3847,9 @@ export class Synchronizer {
       await calendar.createFutureMasterOnce(requested, master.id);
       await this.state.recordMutation(profile);
       const future = await calendar.getEvent(plan.newMasterId);
+      const newStartMs = Date.parse(allDay ? `${plan.newStart}T00:00:00Z` : plan.newStart);
       const futureInstances = await calendar.listInstancesInWindow(plan.newMasterId,
-        new Date(Date.parse(plan.newStart + "T00:00:00Z") - 86_400_000).toISOString(),
-        new Date(Date.parse(plan.newStart + "T00:00:00Z") + 2 * 86_400_000).toISOString());
+        new Date(newStartMs - 86_400_000).toISOString(), new Date(newStartMs + 2 * 86_400_000).toISOString());
       const nextActive = selectTodoistCurrentInstance(futureInstances, liveTask);
       const futureShared = future.extendedProperties?.shared || {};
       const metadataReadbackMismatch = preservedCalendarKeys.some((key) =>
@@ -3833,11 +3858,12 @@ export class Synchronizer {
         || Object.entries(requested.extendedProperties?.private || {}).some(([key, value]) =>
           future.extendedProperties?.private?.[key] !== value);
       if (future.id !== plan.newMasterId || future.status !== "confirmed"
-        || !sameSafeAllDayRecurrenceRule(future.recurrence?.[0], plan.newRule, plan.newStart)
-        || future.start?.date !== plan.newStart || futureShared.taskId !== task.id
+        || !sameSafeFutureRecurrenceRule(future.recurrence?.[0], plan.newRule, plan.newStart, ruleTimeZone)
+        || compareLogicalStarts(future.start?.dateTime || future.start?.date || "", plan.newStart) !== 0 || futureShared.taskId !== task.id
         || futureShared.syncSeriesId !== plan.newMasterId || futureShared.syncProgressVersion !== "1"
         || metadataReadbackMismatch
-        || !nextActive || nextActive.recurringEventId !== future.id || nextActive.start?.date !== plan.newStart) {
+        || !nextActive || nextActive.recurringEventId !== future.id
+        || compareLogicalStarts(eventEffectiveStart(nextActive) || "", plan.newStart) !== 0) {
         throw new Error("Future Calendar recurrence or active occurrence did not verify");
       }
       const nextMapping: Mapping = {
