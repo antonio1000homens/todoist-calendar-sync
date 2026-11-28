@@ -7,6 +7,7 @@ import { mappingFromProjectMappingComment, parseMappingComment, serializeMapping
 import { nativeRecurrenceShape, Synchronizer, selectCalendarRecurrenceInstance, toCalendarEvent } from "../dist/sync.js";
 import { selectNextEffectiveTodoistInstance } from "../dist/todoist-recurrence.js";
 import { providerSyncBaseline } from "../dist/provider-sync-baseline.js";
+import { SnapshotReconciler } from "../dist/reconciliation.js";
 
 const PROFILE = "home";
 const MASTER = "calendar-master";
@@ -1874,6 +1875,14 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.equal(clients.calendarUpserts.length, writesAfterApply, "replay must not cap history or create another successor");
   assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
   assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
+  const writesBeforeSnapshot = clients.calendarUpserts.length + clients.todoistUpserts.length;
+  const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+    total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+  }));
+  const snapshotResult = await snapshot.reconcile(PROFILE);
+  assert.equal(snapshotResult.counts.noop, 1, "snapshot preserves the exact correlated recurrence pair");
+  assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length, writesBeforeSnapshot,
+    "snapshot after the future split makes no unnecessary provider writes");
 
   const metadataTask = { ...task, content: "Annual review updated", description: "Annual details",
     updated_at: "2026-11-28T10:02:00Z" };
