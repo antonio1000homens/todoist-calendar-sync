@@ -1739,6 +1739,17 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   const fixtureInstances = [current];
   const clients = fakeClients(state, fixtureInstances, tasks, undefined, [master]);
   const calendar = clients.calendar;
+  calendar.listExplicitSeriesExceptions = async (masterId) => {
+    const masterEvent = clients.events.get(masterId);
+    if (!masterEvent) return [];
+    return fixtureInstances.filter((event) => event.recurringEventId === masterId && (
+      event.status === "cancelled"
+      || (event.originalStartTime?.date || event.originalStartTime?.dateTime)
+        !== (event.start?.date || event.start?.dateTime)
+      || event.summary !== masterEvent.summary
+      || (event.description || "") !== (masterEvent.description || "")
+    )).map((event) => structuredClone(event));
+  };
   calendar.listInstancesInWindow = async (masterId, start, end) => {
     const masterEvent = clients.events.get(masterId);
     const until = masterEvent?.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8})/)?.[1];
@@ -1756,6 +1767,8 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
     assert.equal(existing.etag, etag);
     const updated = { ...structuredClone(payload), id: eventId, etag: '"annual-master-capped"' };
     clients.events.set(eventId, updated);
+    const instanceIndex = fixtureInstances.findIndex((event) => event.id === eventId);
+    if (instanceIndex >= 0) fixtureInstances[instanceIndex] = structuredClone(updated);
     for (let index = fixtureInstances.length - 1; index >= 0; index -= 1)
       if (fixtureInstances[index].recurringEventId === eventId
         && (fixtureInstances[index].originalStartTime?.date || fixtureInstances[index].start.date) > "2026-01-01")
@@ -1867,6 +1880,19 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.equal(clients.calendarUpserts.length, calendarWritesBeforeConflict);
   assert.deepEqual(clients.events.get(newMaster.id).recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
   assert.ok(state.audits.some((entry) => entry.action === "calendar_owned_todoist_recurrence_requires_review"));
+  const rescheduledTask = { ...task, due: { ...task.due, date: "2027-01-02" } };
+  tasks.set(task.id, rescheduledTask);
+  const masterRuleBeforeReschedule = [...clients.events.get(newMaster.id).recurrence];
+  await sync.process({ ...delivery, id: "reschedule-successor-occurrence", receivedAt: "2026-11-28T10:06:00Z",
+    body: JSON.stringify({ event_name: "item:updated", event_data: rescheduledTask,
+      event_data_extra: { update_intent: "item_updated", old_item: task } }) });
+  const activeAfterReschedule = clients.events.get("future-annual-2027");
+  assert.equal(activeAfterReschedule.originalStartTime.date, "2027-01-01");
+  assert.equal(activeAfterReschedule.start.date, "2027-01-02");
+  assert.deepEqual(clients.events.get(newMaster.id).recurrence, masterRuleBeforeReschedule,
+    "a current-occurrence reschedule changes only its exception, not the RRULE master");
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "rescheduling the successor leaves the historical moved exception unchanged");
 
 });
 
