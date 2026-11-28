@@ -2068,6 +2068,14 @@ test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, 
     await sync.process(delivery);
     assert.equal(clients.calendarUpserts.length, writes, `${item.name} echo/replay does not patch again`);
     assert.equal(state.mappingsByTask.get(task.id).masterEventId, MASTER);
+    const snapshotWrites = clients.calendarUpserts.length + clients.todoistUpserts.length;
+    const snapshot = new SnapshotReconciler(state, async () => clients, undefined, undefined, async () => ({
+      total: 0, converged: 0, repaired: 0, unsupported: 0, excluded: 0, blocked: 0, stale: 0, unverified: 0,
+    }));
+    const snapshotResult = await snapshot.reconcile(PROFILE);
+    assert.equal(snapshotResult.counts.noop, 1, `${item.name} snapshot preserves the exact native recurrence pair`);
+    assert.equal(clients.calendarUpserts.length + clients.todoistUpserts.length, snapshotWrites,
+      `${item.name} snapshot makes no unnecessary provider writes`);
     if (item.timed) continue;
 
     const nextSpan = at(item.next, 1);
@@ -2124,6 +2132,22 @@ test("historical Calendar-owned metadata edits preserve daily, weekly, monthly, 
     assert.equal(state.mappingsByTask.get(task.id).activeInstanceId, next.id);
     assert.equal(state.mappingsByTask.get(task.id).originalStart, nextValue);
     assert.equal(state.mappingsByTask.get(task.id).activeEffectiveStart, rescheduledStartDate);
+    const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+    tasks.delete(task.id);
+    await sync.process({ ...delivery, id: `matrix-delete-${index}`,
+      receivedAt: new Date(activeEnd + 180_000).toISOString(),
+      body: JSON.stringify({ event_name: "item:deleted", event_data: { ...rescheduledTask, is_deleted: true },
+        event_data_extra: { old_item: rescheduledTask } }) });
+    assert.ok(clients.calendarDeletes.includes(MASTER), `${item.name} deletion removes the exact Calendar master`);
+    assert.equal(clients.events.has(MASTER), false);
+    assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0,
+      `${item.name} deletion cleans the provider-native mapping`);
+    await sync.process({ ...delivery, id: `matrix-stale-completion-${index}`,
+      receivedAt: new Date(activeEnd + 240_000).toISOString(),
+      body: JSON.stringify({ event_name: "item:completed", event_data: advancedTask,
+        event_data_extra: { old_item: advancedTask } }) });
+    assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion,
+      `${item.name} stale completion cannot recreate the deleted task`);
     if (existingInstanceWrite) calendar.upsertEventIfUnchanged = existingInstanceWrite;
   }
 });
