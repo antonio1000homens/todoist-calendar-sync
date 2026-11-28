@@ -701,6 +701,21 @@ export function sameCalendarDeltaTaskEvidence(before: TodoistTask, current: Todo
   return JSON.stringify(evidence(before)) === JSON.stringify(evidence(current));
 }
 
+/** A delayed Calendar delta must not roll back a Todoist edit made since the
+ * last confirmed mirror. The Todoist webhook will write that newer state to
+ * Calendar; if it is lost, snapshot reconciliation can still repair the pair. */
+export function calendarDeltaIsStaleAgainstTodoist(mapping: Mapping | undefined, event: CalendarEvent, task: TodoistTask): boolean {
+  if (!mapping || mapping.syncedTitle === undefined || mapping.syncedDue === undefined
+    || event.recurrence?.length || event.recurringEventId || task.due?.is_recurring) return false;
+  const calendarStillAtBaseline = normalizedText(event.summary) === normalizedText(mapping.syncedTitle)
+    && normalizedDescription(event.description) === normalizedDescription(mapping.syncedDescription)
+    && (event.start?.dateTime || event.start?.date) === mapping.syncedDue;
+  if (!calendarStillAtBaseline) return false;
+  return normalizedText(task.content) !== normalizedText(mapping.syncedTitle)
+    || normalizedDescription(task.description) !== normalizedDescription(mapping.syncedDescription)
+    || !startsMatch(event, task);
+}
+
 export async function verifyCalendarDeltaTaskUnchanged(todoist: Pick<Todoist, "getTask">, task: TodoistTask): Promise<void> {
   const changed = () => Object.assign(new Error("Todoist task changed before Calendar delta update"), {
     code: "calendar_delta_task_changed",
@@ -2689,6 +2704,13 @@ export class Synchronizer {
       return this.state.audit(delivery.profile, "calendar_mutation_suppressed", { eventId: event.id, taskId: task?.id, mode: delivery.mode });
     }
     if (await this.calendarMutationBlockedByCompletion(delivery, event.id)) return;
+    if (task && calendarDeltaIsStaleAgainstTodoist(mapping, event, task)) {
+      await this.state.audit(delivery.profile, "calendar_stale_delta_todoist_state_preserved", {
+        eventId: event.id, taskId: task.id,
+      });
+      markReplayVerified();
+      return;
+    }
     if (task && hasCanonicalState(event, task)) {
       const baseline = providerSyncBaseline(task, event);
       if (exactLocalPair && mapping?.syncBaseline
