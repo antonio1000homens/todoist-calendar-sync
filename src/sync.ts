@@ -6,7 +6,7 @@ import { otherProfileCalendarOrganizer } from "./calendar-profile-ownership.js";
 import { attachProjectCommentReference, buildProjectMappingIndex,
   deleteExactTaskProjectMappingComments, deleteMappingComments, mappingFromProjectMappingComment,
   upsertProjectMappingComment, serializeMappingComment } from "./mapping-comments.js";
-import { GoogleCalendar, Todoist, withTodoistInventoryScope } from "./providers.js";
+import { GoogleCalendar, Todoist, withTodoistInventoryScope, readScopedExactState, invalidateScopedExactState } from "./providers.js";
 import { StateRepository } from "./repository.js";
 import { ReconciliationItemError } from "./reconciliation-diagnostics.js";
 import { normalizedDescription, normalizedStart, normalizedText } from "./security.js";
@@ -911,6 +911,12 @@ export class Synchronizer {
     return clients;
   }
 
+  private async purgeDeletedPair(input:{profile:Profile;taskId:string;eventIds:string[];seriesIds:string[]}):Promise<void> {
+    if(await this.state.purgeDeletedPair?.(input)===false)
+      throw new Error(`Deletion state cleanup changed concurrently for task ${input.taskId}; retry or review`);
+    for(const eventId of input.eventIds) invalidateScopedExactState(`event-mapping:${input.profile}:${eventId}`);
+  }
+
   async persistProviderMapping(mapping: Mapping, todoist?: Todoist): Promise<Mapping> {
     const projectId = mapping.projectId || profiles[mapping.profile].todoistProjectId;
     let next: Mapping = { ...mapping, projectId, calendarId: profiles[mapping.profile].calendarId };
@@ -1302,11 +1308,31 @@ export class Synchronizer {
     currentProfile: Profile, eventIds: string[], currentTodoist?: Todoist,
   ): Promise<Mapping[]> {
     const ids = new Set(eventIds.filter(Boolean));
+    if(ids.size>1000) throw new Error("Calendar identity ownership lookup exceeded the exact-ID limit");
     const mappings: Mapping[] = [];
     for (const profile of Object.keys(profiles) as Profile[]) {
-      const values = await this.providerMappings(profile, profile === currentProfile ? currentTodoist : undefined);
-      mappings.push(...values.filter(mapping => [mapping.eventId, mapping.masterEventId, mapping.activeInstanceId]
-        .some(id => Boolean(id && ids.has(id)))));
+      const todoist=profile===currentProfile&&currentTodoist
+        ? currentTodoist:(await this.clients(profile)).todoist;
+      const providerMappings=this.providerCommentReaderAvailable(todoist)
+        ? await this.providerCommentMappings(profile,todoist)
+        : this.isLegacyTestAdapter(todoist)&&typeof this.state.listMappings==="function"
+          ? await this.state.listMappings(profile):[];
+      const exactLegacyMappings=typeof this.state.getMappingByEvent==="function"
+        ? (await Promise.all([...ids].map(eventId=>readScopedExactState(
+          `event-mapping:${profile}:${eventId}`,()=>this.state.getMappingByEvent!(profile,eventId),
+        ))))
+          .filter((mapping):mapping is Mapping=>Boolean(mapping&&mapping.profile===profile
+            &&[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].some(id=>Boolean(id&&ids.has(id)))))
+        : this.isLegacyTestAdapter(todoist)&&typeof this.state.listMappings==="function"
+          ? (await this.state.listMappings(profile)).filter(mapping=>[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
+            .some(id=>Boolean(id&&ids.has(id)))):[];
+      const providerTasks=new Set(providerMappings.map(mapping=>mapping.taskId));
+      const providerEvents=new Set(providerMappings.flatMap(mapping=>[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
+        .filter((id):id is string=>Boolean(id))));
+      mappings.push(...providerMappings.filter(mapping=>[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId]
+        .some(id=>Boolean(id&&ids.has(id)))));
+      mappings.push(...exactLegacyMappings.filter(mapping=>!providerTasks.has(mapping.taskId)
+        &&!providerEvents.has(mapping.eventId)));
     }
     return mappings;
   }
@@ -2369,7 +2395,12 @@ export class Synchronizer {
           await this.state.recordMutation(delivery.profile);
         }
         const projectId = profiles[delivery.profile].todoistProjectId;
-        const projectComments = await todoist.listProjectComments(projectId, true);
+        // The invocation-scoped inventory was already used to resolve this
+        // exact Calendar mapping. deleteExactTaskProjectMappingComments does
+        // fresh ID-level reads and post-delete readbacks before removal, so a
+        // second paginated project inventory adds cost without strengthening
+        // its concurrency guard.
+        const projectComments = await todoist.listProjectComments(projectId);
         await deleteExactTaskProjectMappingComments(todoist, projectComments, {
           profile: delivery.profile,
           projectId,
@@ -2377,6 +2408,10 @@ export class Synchronizer {
           eventIds: [event.id, mapping.eventId],
         });
         const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, mapping.taskId, calendar, event.id);
+        await this.purgeDeletedPair({profile:delivery.profile,taskId:mapping.taskId,
+          eventIds:[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId,event.id].filter((id):id is string=>Boolean(id)),
+          seriesIds:[mapping.seriesId,mapping.masterEventId,event.iCalUID,event.recurringEventId]
+            .filter((id):id is string=>Boolean(id))});
         return this.state.audit(delivery.profile, "calendar_recurrence_master_deleted_counterpart", {
           eventId: event.id, taskId: mapping.taskId, removedHistory,
         });
@@ -2507,7 +2542,7 @@ export class Synchronizer {
             if (Number((error as { status?: number }).status) !== 404) throw error;
           });
           const projectId = profiles[delivery.profile].todoistProjectId;
-          await deleteExactTaskProjectMappingComments(todoist, await todoist.listProjectComments(projectId, true), {
+          await deleteExactTaskProjectMappingComments(todoist, await todoist.listProjectComments(projectId), {
             profile: delivery.profile, projectId, taskId: existingRecurrence.taskId,
             eventIds: [existingRecurrence.eventId, event.id],
           });
@@ -2601,10 +2636,14 @@ export class Synchronizer {
         return this.state.audit(delivery.profile, "calendar_orphan_recheck_scheduled", { eventId: event.id, taskId: mapping.taskId });
       }
       const projectId = profiles[delivery.profile].todoistProjectId;
-      await deleteExactTaskProjectMappingComments(todoist, await todoist.listProjectComments(projectId, true), {
+      await deleteExactTaskProjectMappingComments(todoist, await todoist.listProjectComments(projectId), {
         profile: delivery.profile, projectId, taskId: mapping.taskId,
         eventIds: [mapping.eventId, event.id],
       });
+      await this.purgeDeletedPair({profile:delivery.profile,taskId:mapping.taskId,
+        eventIds:[mapping.eventId,event.id],
+        seriesIds:[mapping.seriesId,mapping.masterEventId,event.iCalUID,event.recurringEventId]
+          .filter((id):id is string=>Boolean(id))});
       await this.state.recordMutation?.(delivery.profile);
       return this.state.audit(delivery.profile, "calendar_deleted_task", { eventId: event.id, taskId: mapping.taskId });
     }
@@ -4871,6 +4910,9 @@ export class Synchronizer {
           profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
         });
         const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, task.id, calendar, mapping.masterEventId);
+        await this.purgeDeletedPair({profile:delivery.profile,taskId:task.id,
+          eventIds:[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter((id):id is string=>Boolean(id)),
+          seriesIds:[mapping.seriesId,mapping.masterEventId].filter((id):id is string=>Boolean(id))});
         await this.state.recordMutation(delivery.profile);
         return this.state.audit(delivery.profile, "todoist_deleted_calendar_recurrence", { taskId: task.id, masterEventId: mapping.masterEventId, removedHistory });
       }
@@ -4883,6 +4925,9 @@ export class Synchronizer {
         profile: delivery.profile, projectId: profiles[delivery.profile].todoistProjectId, taskId: task.id,
       });
       const removedHistory = await this.deleteCompletedCalendarHistory(delivery.profile, task.id, calendar, mapping.eventId);
+      await this.purgeDeletedPair({profile:delivery.profile,taskId:task.id,
+        eventIds:[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter((id):id is string=>Boolean(id)),
+        seriesIds:[mapping.seriesId,mapping.masterEventId].filter((id):id is string=>Boolean(id))});
       await this.state.recordMutation?.(delivery.profile);
       return this.state.audit(delivery.profile, isTodoistNativeSeries(mapping) ? "todoist_deleted_calendar_recurrence_projection" : "todoist_deleted_calendar", { taskId: task.id, eventId: mapping.eventId, removedHistory });
     }
@@ -5692,6 +5737,9 @@ export class Synchronizer {
     // the provider-native correlation only after that proof so a retry can
     // still identify the same pair if Calendar deletion fails or is ambiguous.
     await deleteMappingComments(todoist, mapping);
+    await this.purgeDeletedPair({profile:delivery.profile,taskId:mapping.taskId,
+      eventIds:[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter((id):id is string=>Boolean(id)),
+      seriesIds:[mapping.seriesId,mapping.masterEventId].filter((id):id is string=>Boolean(id))});
     await this.state.recordMutation?.(delivery.profile);
     await this.state.audit(delivery.profile, "orphan_confirmed_deleted", {
       ...orphan,

@@ -410,6 +410,13 @@ export class SnapshotReconciler {
     if (process.env.NODE_ENV === "test") await this.store?.deleteBaseline(profile, taskId);
   }
 
+  private async purgeVerifiedDeletion(profile:Profile,mapping:Mapping):Promise<void> {
+    const eventIds=[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter((id):id is string=>Boolean(id));
+    const ok=await this.state.purgeDeletedPair?.({profile,taskId:mapping.taskId,eventIds,
+      seriesIds:[mapping.seriesId,mapping.masterEventId].filter((id):id is string=>Boolean(id))});
+    if(ok===false) throw new Error(`Verified deletion cleanup changed concurrently for task ${mapping.taskId}; retry or review`);
+  }
+
   private async providerMappingByTaskAnyProfile(taskId: string): Promise<Mapping | undefined> {
     const client = (await this.clients("home")).todoist;
     if (typeof client.listProjectComments !== "function") {
@@ -577,6 +584,7 @@ export class SnapshotReconciler {
         });
       }
       await deleteMappingComments(clients.todoist, mapping);
+      if(!task) await this.purgeVerifiedDeletion(profile,mapping);
       await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_projection_removed", {
@@ -600,6 +608,7 @@ export class SnapshotReconciler {
         if (Number((error as { status?: number }).status) !== 404) throw error;
       });
       await deleteMappingComments(clients.todoist, mapping);
+      await this.purgeVerifiedDeletion(profile,mapping);
       await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_calendar_deletion_propagated", {
@@ -665,6 +674,7 @@ export class SnapshotReconciler {
         });
       }
       await deleteMappingComments(clients.todoist, mapping);
+      await this.purgeVerifiedDeletion(profile,mapping);
       await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_task_removed", {
@@ -680,6 +690,7 @@ export class SnapshotReconciler {
         if (![404, 410].includes(Number((error as { status?: number }).status))) throw error;
       });
       await deleteMappingComments(clients.todoist, mapping);
+      await this.purgeVerifiedDeletion(profile,mapping);
       await this.deleteReconciliationBaseline(profile, mapping.taskId);
       await this.state.recordMutation(profile);
       await this.state.audit(profile, "todoist_snapshot_reconcile_task_deletion_propagated", {
@@ -702,6 +713,7 @@ export class SnapshotReconciler {
           if (![404, 410].includes(Number((deleteError as { status?: number }).status))) throw deleteError;
         });
         await deleteMappingComments(clients.todoist, mapping);
+        await this.purgeVerifiedDeletion(profile,mapping);
         await this.deleteReconciliationBaseline(profile, mapping.taskId);
         await this.state.recordMutation(profile);
         await this.state.audit(profile, "todoist_snapshot_reconcile_task_deletion_propagated", {
@@ -788,6 +800,7 @@ export class SnapshotReconciler {
     // retirement.
     if (await this.state.syncBlocked(profile, { taskId: mapping.taskId, eventId: mapping.masterEventId })) return undefined;
     await deleteMappingComments(clients.todoist, mapping);
+    await this.purgeVerifiedDeletion(profile,mapping);
     await this.deleteReconciliationBaseline(profile, mapping.taskId);
     await this.state.audit(profile, "todoist_snapshot_reconcile_verified_deletion_retired", {
       taskId: mapping.taskId, eventId: mapping.eventId, seriesId: mapping.seriesId,

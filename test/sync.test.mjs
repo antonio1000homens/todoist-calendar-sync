@@ -1003,6 +1003,7 @@ test("Calendar deletion failure preserves project-comment correlation for retry"
     async mutationAllowed() { return true; },
     async listCompletedCalendarProjectionsByTask() { return []; },
     async deleteMapping() { assert.equal(commentExists, false); effects.push("mapping-delete"); },
+    async purgeDeletedPair(input) { assert.equal(input.taskId, taskId); effects.push("state-purge"); return true; },
     async deleteCalendarProjectionTombstone() {},
     async recordMutation() {},
     async audit() {},
@@ -1036,7 +1037,7 @@ test("Calendar deletion failure preserves project-comment correlation for retry"
   assert.deepEqual(effects, ["calendar-delete"], "keep the exact provider mapping until Calendar confirms deletion");
   assert.equal(commentExists, true);
   await sync.process(delivery);
-  assert.deepEqual(effects, ["calendar-delete", "calendar-delete", "comment-delete"],
+  assert.deepEqual(effects, ["calendar-delete", "calendar-delete", "comment-delete", "state-purge"],
     "the retry uses the same provider-native mapping and retires it after Calendar confirms absence");
   assert.equal(commentExists, false);
 });

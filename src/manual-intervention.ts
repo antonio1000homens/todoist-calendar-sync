@@ -1331,7 +1331,7 @@ export class ManualInterventionService {
     return new Synchronizer(state, undefined, async () => pair).persistProviderMapping(mapping, pair.todoist);
   }
 
-  private async retireProviderMapping(state: StateRepository, pair: Awaited<ReturnType<ManualInterventionService["providerClients"]>>, mapping: Mapping): Promise<boolean> {
+  private async retireProviderMapping(state: StateRepository, pair: Awaited<ReturnType<ManualInterventionService["providerClients"]>>, mapping: Mapping, verifiedDeletion=false): Promise<boolean> {
     // Provider comments are the correlation source. Old DynamoDB rows are
     // cleaned up opportunistically and never decide whether a repair worked.
     const current = await this.providerMappingByTask(state, mapping.profile, mapping.taskId);
@@ -1341,6 +1341,9 @@ export class ManualInterventionService {
       return false;
     }
     await deleteMappingComments(pair.todoist, mapping);
+    if(verifiedDeletion && await state.purgeDeletedPair?.({profile:mapping.profile,taskId:mapping.taskId,
+      eventIds:[mapping.eventId,mapping.masterEventId,mapping.activeInstanceId].filter((id):id is string=>Boolean(id)),
+      seriesIds:[mapping.seriesId,mapping.masterEventId].filter((id):id is string=>Boolean(id))})===false) return false;
     return true;
   }
 
@@ -2165,6 +2168,12 @@ export class ManualInterventionService {
           await pair.todoist.deleteTask(duplicateId).catch((error: unknown) => {
             if (Number((error as { status?: number }).status) !== 404) throw error;
           });
+          if(!await state.purgeDeletedPair({profile:decision.profile,taskId:duplicateId,
+            eventIds:[alias.cancelledEventId||cancelledId,alias.previousMapping?.eventId,
+              alias.previousMapping?.masterEventId,alias.previousMapping?.activeInstanceId].filter((id):id is string=>Boolean(id)),
+            seriesIds:[alias.previousMapping?.seriesId,alias.previousMapping?.masterEventId]
+              .filter((id):id is string=>Boolean(id))}))
+            throw new Error("Discarded duplicate state changed during cleanup and needs review");
           await state.completeFutureSeriesSplit(decision.profile, decision.taskId, approvedPlan.newMasterId);
           await state.audit(decision.profile, "manual_duplicate_consolidation_completed", {
             decisionId: decision.decisionId, retainedTaskId: decision.taskId,
@@ -2432,7 +2441,7 @@ export class ManualInterventionService {
         }
       }
       await pair.calendar.deleteEvent(mapping.eventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-      if (!await this.retireProviderMapping(state, pair, mapping)) {
+      if (!await this.retireProviderMapping(state, pair, mapping, true)) {
         return this.markStale(decision, "Calendar deletion finished but provider mapping ownership changed; the newer mapping was preserved for review.", slackUserId);
       }
       return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
@@ -2446,7 +2455,7 @@ export class ManualInterventionService {
           if (!providerNotFound(error)) throw error;
           seriesAlreadyAbsent = true;
         }
-        await this.retireProviderMapping(state, pair, mapping);
+        if(!await this.retireProviderMapping(state, pair, mapping, true)) throw new Error("Calendar series was deleted but its exact state cleanup needs review");
         // Auto-policy decisions that find the exact mapped Calendar series
         // already absent need no Slack alert. Keep the durable decision
         // receipt and exact mapping/link cleanup, but don't post the alert
@@ -2485,13 +2494,13 @@ export class ManualInterventionService {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
         // A failed post-delete cleanup is retried through the existing
         // quarantined manual delivery, never by creating a new series.
-        await this.retireProviderMapping(state, pair, mapping);
+        if(!await this.retireProviderMapping(state, pair, mapping, true)) throw new Error("Calendar series was deleted but its exact state cleanup needs review");
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
       if (action === "delete_whole_series" && decision.type === "calendar_owned_recurrence_task_deleted") {
         await pair.calendar.deleteEvent(mapping.masterEventId).catch((error: unknown) => { if (!providerNotFound(error)) throw error; });
-        await this.retireProviderMapping(state, pair, mapping);
+        if(!await this.retireProviderMapping(state, pair, mapping, true)) throw new Error("Calendar series was deleted but its exact state cleanup needs review");
         return this.finishResolutionWithoutReconciliation(decision, state, action, slackUserId);
       }
 
