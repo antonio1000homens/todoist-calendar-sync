@@ -2546,6 +2546,11 @@ export class Synchronizer {
             profile: delivery.profile, projectId, taskId: existingRecurrence.taskId,
             eventIds: [existingRecurrence.eventId, event.id],
           });
+          await this.purgeDeletedPair({profile:delivery.profile,taskId:existingRecurrence.taskId,
+            eventIds:[existingRecurrence.eventId,existingRecurrence.masterEventId,existingRecurrence.activeInstanceId,event.id]
+              .filter((id):id is string=>Boolean(id)),
+            seriesIds:[existingRecurrence.seriesId,existingRecurrence.masterEventId,series,event.iCalUID,event.recurringEventId]
+              .filter((id):id is string=>Boolean(id))});
           await this.state.recordMutation(delivery.profile);
           return this.state.audit(delivery.profile, "calendar_recurrence_master_deleted", { seriesId: series });
         }

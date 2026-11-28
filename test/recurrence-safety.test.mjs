@@ -1155,6 +1155,8 @@ test("cancelled Calendar master still terminates a Calendar-owned recurrence", a
   const current = instance("current", "2099-01-01", "2099-01-02");
   const link = linkFor(current, "task-current");
   const state = new FakeState(link);
+  const purges=[];
+  state.purgeDeletedPair=async input=>{purges.push(input);return true;};
   const task = { id: link.taskId, content: current.summary, description: "", due: { date: current.start.date } };
   const tasks = new Map([[task.id, task]]);
   const cancelledMaster = {
@@ -1179,6 +1181,11 @@ test("cancelled Calendar master still terminates a Calendar-owned recurrence", a
 
   assert.deepEqual(clients.todoistDeletes, [task.id]);
   assert.equal(clients.projectComments.filter(comment => comment.is_deleted !== true).length, 0, JSON.stringify(clients.projectComments));
+  assert.equal(purges.length,1,"verified whole-series deletion purges operational correlation state");
+  assert.equal(purges[0].taskId,task.id);
+  assert.ok(purges[0].eventIds.includes(MASTER));
+  assert.ok(purges[0].eventIds.includes(current.id));
+  assert.ok(purges[0].seriesIds.includes(SERIES));
   assert.equal(state.audits.some((entry) => entry.action === "calendar_recurrence_master_deleted"), true);
 });
 
