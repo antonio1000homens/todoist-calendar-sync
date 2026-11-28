@@ -3791,17 +3791,34 @@ export class Synchronizer {
         throw new Error("Historical Calendar instances changed during the future-only edit");
 
       const requested = toCalendarEvent(task);
+      // A cadence split changes recurrence identity and DTSTART, but it must
+      // keep the Calendar-owned event's independent presentation and sharing
+      // metadata. Do not carry old sync correlation onto the successor.
+      const preservedCalendarKeys = ["colorId", "location", "visibility", "transparency", "attendees", "reminders",
+        "guestsCanInviteOthers", "guestsCanModify", "guestsCanSeeOtherGuests", "conferenceData", "source",
+        "attachments"] as const;
+      for (const key of preservedCalendarKeys) {
+        const value = master[key];
+        if (value !== undefined) requested[key] = structuredClone(value) as never;
+      }
+      const inheritedShared = Object.fromEntries(Object.entries(shared)
+        .filter(([key]) => key !== "taskId" && key !== "todoistPhaseBVersion" && !key.startsWith("sync")));
       requested.id = plan.newMasterId;
       requested.recurrence = [plan.newRule];
-      requested.extendedProperties ||= {};
-      requested.extendedProperties.shared ||= {};
-      Object.assign(requested.extendedProperties.shared, {
+      requested.extendedProperties = {
+        ...(master.extendedProperties?.private ? { private: structuredClone(master.extendedProperties.private) } : {}),
+        ...(requested.extendedProperties || {}),
+        shared: { ...inheritedShared, ...(requested.extendedProperties?.shared || {}) },
+      };
+      const successorShared = requested.extendedProperties.shared || {};
+      Object.assign(successorShared, {
         taskId: task.id, syncProfile: profile, syncCalendarId: profiles[profile].calendarId,
         syncSeriesId: plan.newMasterId, syncProgressVersion: "1",
         syncHistoryMasterId: master.id,
         ...(plan.previousOccurrence ? { syncHistoryCutoff: plan.previousOccurrence } : {}),
         syncSplitVersion: "1",
       });
+      requested.extendedProperties.shared = successorShared;
       await calendar.createFutureMasterOnce(requested, master.id);
       await this.state.recordMutation(profile);
       const future = await calendar.getEvent(plan.newMasterId);
@@ -3810,10 +3827,16 @@ export class Synchronizer {
         new Date(Date.parse(plan.newStart + "T00:00:00Z") + 2 * 86_400_000).toISOString());
       const nextActive = selectTodoistCurrentInstance(futureInstances, liveTask);
       const futureShared = future.extendedProperties?.shared || {};
+      const metadataReadbackMismatch = preservedCalendarKeys.some((key) =>
+        JSON.stringify(future[key]) !== JSON.stringify(requested[key]))
+        || Object.entries(inheritedShared).some(([key, value]) => futureShared[key] !== value)
+        || Object.entries(requested.extendedProperties?.private || {}).some(([key, value]) =>
+          future.extendedProperties?.private?.[key] !== value);
       if (future.id !== plan.newMasterId || future.status !== "confirmed"
         || !sameSafeYearlyRecurrenceRule(future.recurrence?.[0], plan.newRule)
         || future.start?.date !== plan.newStart || futureShared.taskId !== task.id
         || futureShared.syncSeriesId !== plan.newMasterId || futureShared.syncProgressVersion !== "1"
+        || metadataReadbackMismatch
         || !nextActive || nextActive.recurringEventId !== future.id || nextActive.start?.date !== plan.newStart) {
         throw new Error("Future Calendar recurrence or active occurrence did not verify");
       }

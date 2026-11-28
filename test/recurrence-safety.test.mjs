@@ -1724,12 +1724,16 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   current.summary = "Annual review";
   const master = { id: MASTER, etag: '"annual-master-v4"', iCalUID: SERIES, status: "confirmed",
     summary: "Annual review", description: "", start: { date: "2026-01-01" }, end: { date: "2026-01-02" },
+    colorId: "5", location: "Studio 2", visibility: "private", transparency: "transparent",
+    reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 30 }] },
     recurrence: ["RRULE:FREQ=YEARLY"],
-    extendedProperties: { shared: { taskId: "annual-task", syncSeriesId: SERIES, syncProgressVersion: "1" } } };
+    extendedProperties: { shared: { taskId: "annual-task", syncSeriesId: SERIES,
+      syncProgressVersion: "1", externalLabel: "blue" }, private: { clientRef: "review-42" } } };
   const link = { ...linkFor(current, "annual-task"), syncedTitle: "Annual review", syncedDescription: "" };
   const state = new FakeState(link);
   const oldTask = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId,
-    content: "Annual review", description: "", updated_at: "2026-11-28T10:00:00Z",
+    content: "Annual review", description: "", labels: ["annual", "work"], priority: 3,
+    updated_at: "2026-11-28T10:00:00Z",
     due: { date: "2027-01-01", string: "every year", is_recurring: true } };
   link.syncBaseline = providerSyncBaseline(oldTask, current, master);
   state.storeMapping(mappingFromLink(link));
@@ -1739,6 +1743,14 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   const fixtureInstances = [current];
   const clients = fakeClients(state, fixtureInstances, tasks, undefined, [master]);
   const calendar = clients.calendar;
+  const providerUpsertTask = clients.todoist.upsertTask.bind(clients.todoist);
+  clients.todoist.upsertTask = async (payload, existingId, requestKey) => {
+    const existing = existingId ? tasks.get(existingId) : undefined;
+    return providerUpsertTask({ ...payload,
+      ...(existing?.labels && payload.labels === undefined ? { labels: existing.labels } : {}),
+      ...(existing?.priority !== undefined && payload.priority === undefined ? { priority: existing.priority } : {}),
+    }, existingId, requestKey);
+  };
   calendar.listExplicitSeriesExceptions = async (masterId) => {
     const masterEvent = clients.events.get(masterId);
     if (!masterEvent) return [];
@@ -1839,6 +1851,13 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
     && event.extendedProperties?.shared?.taskId === task.id);
   assert.ok(newMaster, JSON.stringify(state.audits.slice(-3)));
   assert.deepEqual(newMaster.recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
+  assert.equal(newMaster.colorId, "5");
+  assert.equal(newMaster.location, "Studio 2");
+  assert.equal(newMaster.visibility, "private");
+  assert.equal(newMaster.transparency, "transparent");
+  assert.deepEqual(newMaster.reminders, { useDefault: false, overrides: [{ method: "popup", minutes: 30 }] });
+  assert.equal(newMaster.extendedProperties.shared.externalLabel, "blue");
+  assert.equal(newMaster.extendedProperties.private.clientRef, "review-42");
   const mapping = state.mappingsByTask.get(task.id);
   assert.equal(mapping.masterEventId, newMaster.id);
   assert.equal(mapping.seriesId, newMaster.id);
@@ -1871,6 +1890,11 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.equal(clients.events.get(newMaster.id).description, metadataTask.description);
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, metadataTask.content);
   assert.equal(state.mappingsByTask.get(task.id).syncedDescription, metadataTask.description);
+  assert.deepEqual(state.mappingsByTask.get(task.id).syncBaseline,
+    providerSyncBaseline(metadataTask, fixtureInstances.find((event) => event.id === "future-annual-2027"),
+      clients.events.get(newMaster.id)), "metadata baseline is committed only after Calendar readback");
+  assert.deepEqual(tasks.get(task.id).labels, ["annual", "work"]);
+  assert.equal(tasks.get(task.id).priority, 3);
   const writesAfterMetadata = clients.calendarUpserts.length;
   await sync.process({ ...delivery, id: "annual-metadata-edit-replay", body: JSON.stringify({
     event_name: "item:updated", event_data: metadataTask, event_data_extra: { old_item: task },
@@ -1885,6 +1909,8 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   await sync.process({ ...delivery, id: "calendar-edit-back", kind: "calendar", body: "",
     receivedAt: "2026-11-28T10:03:00Z" });
   assert.equal(tasks.get(task.id).due.string, "every 1 Jan starting 1 Jan 2027");
+  assert.deepEqual(tasks.get(task.id).labels, ["annual", "work"]);
+  assert.equal(tasks.get(task.id).priority, 3);
   assert.equal(state.mappingsByTask.get(task.id).masterEventId, newMaster.id);
   assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
   const todoistWritesAfterCalendarEdit = clients.todoistUpserts.length;
