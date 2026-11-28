@@ -4130,7 +4130,11 @@ export class Synchronizer {
     if (!recurringDateEdit && lifecycle.action === "upsert"
       && payload.event_name === "item:updated"
       && payload.event_data_extra?.update_intent === "item_updated"
-      && task.due?.is_recurring && mapping?.masterEventId && mapping.activeEffectiveStart) {
+      && task.due?.is_recurring && mapping?.masterEventId && mapping.activeEffectiveStart
+      // Todoist may advance a Calendar-owned recurring task after completion.
+      // Without old_item, a due later than the mapped occurrence is not proof
+      // that the user explicitly rescheduled the task; keep metadata edits flowing.
+      && nativeRecurrenceShape(mapping) !== "calendar") {
       const due = taskDateTime(task) || task.due.date;
       const previous = mapping.activeEffectiveStart;
       const allDay = /^\d{4}-\d{2}-\d{2}$/.test(previous);
