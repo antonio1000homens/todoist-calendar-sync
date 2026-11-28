@@ -1894,6 +1894,42 @@ test("an explicit annual Todoist cadence edit creates a Calendar-owned future su
   assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
     "rescheduling the successor leaves the historical moved exception unchanged");
 
+  const nextOccurrence = { id: "future-annual-2029", status: "confirmed", recurringEventId: newMaster.id,
+    originalStartTime: { date: "2029-01-01" }, start: { date: "2029-01-01" }, end: { date: "2029-01-02" },
+    summary: task.content, description: task.description, etag: '"future-instance-2029-v1"' };
+  fixtureInstances.push(nextOccurrence);
+  clients.events.set(nextOccurrence.id, structuredClone(nextOccurrence));
+  const advancedTask = { ...rescheduledTask, due: { ...rescheduledTask.due, date: "2029-01-01" } };
+  tasks.set(task.id, advancedTask);
+  t.mock.timers.setTime(Date.parse("2027-01-03T12:00:00Z"));
+  const calendarWritesBeforeCompletion = clients.calendarUpserts.length;
+  await sync.process({ ...delivery, id: "complete-successor-occurrence", receivedAt: "2027-01-03T12:00:00Z",
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduledTask,
+      event_data_extra: { old_item: rescheduledTask } }) });
+  assert.equal(state.mappingsByTask.get(task.id).activeInstanceId, nextOccurrence.id);
+  assert.equal(state.mappingsByTask.get(task.id).originalStart, "2029-01-01");
+  assert.equal(clients.calendarUpserts.length, calendarWritesBeforeCompletion,
+    "completing the active task advances mapping without rewriting the historical master");
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "completion leaves the original moved historical exception unchanged");
+
+  const todoistWritesBeforeDeletion = clients.todoistUpserts.length;
+  tasks.delete(task.id);
+  await sync.process({ ...delivery, id: "delete-successor-series", receivedAt: "2027-01-03T12:01:00Z",
+    body: JSON.stringify({ event_name: "item:deleted", event_data: { ...advancedTask, is_deleted: true },
+      event_data_extra: { old_item: advancedTask } }) });
+  assert.ok(clients.calendarDeletes.includes(newMaster.id), "whole-series deletion removes the mapped successor master");
+  assert.ok(!clients.calendarDeletes.includes(MASTER), "deletion leaves the historical master untouched");
+  assert.equal(clients.projectComments.filter((comment) => comment.is_deleted !== true).length, 0,
+    "deletion removes the provider-native task mapping");
+  assert.equal(clients.events.has(newMaster.id), false);
+  assert.equal(clients.events.get(MASTER).extendedProperties.shared.syncHistoryOnly, "true");
+  await sync.process({ ...delivery, id: "stale-completion-after-series-delete", receivedAt: "2027-01-03T12:02:00Z",
+    body: JSON.stringify({ event_name: "item:completed", event_data: rescheduledTask,
+      event_data_extra: { old_item: rescheduledTask } }) });
+  assert.equal(clients.todoistUpserts.length, todoistWritesBeforeDeletion,
+    "a stale completion cannot recreate the deleted task or recurrence");
+
 });
 
 test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {
