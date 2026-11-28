@@ -1716,7 +1716,8 @@ test("genuine Todoist title edit on Calendar-owned series PATCHes only the Calen
   assert.equal(state.mappingsByTask.get(task.id).syncedTitle, "Renamed from Todoist");
 });
 
-test("an explicit Calendar-owned Todoist cadence edit emits a versioned review without rewriting the old master", async () => {
+test("an explicit annual Todoist cadence edit creates a Calendar-owned future successor and preserves history", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-28T12:00:00Z") });
   const current = instance("annual-2027", "2027-01-01", "2027-01-02");
   current.summary = "Annual review";
   const master = { id: MASTER, etag: '"annual-master-v4"', iCalUID: SERIES, status: "confirmed",
@@ -1728,21 +1729,89 @@ test("an explicit Calendar-owned Todoist cadence edit emits a versioned review w
   const oldTask = { id: link.taskId, project_id: profiles[PROFILE].todoistProjectId,
     content: "Annual review", description: "", updated_at: "2026-11-28T10:00:00Z",
     due: { date: "2027-01-01", string: "every year", is_recurring: true } };
+  link.syncBaseline = providerSyncBaseline(oldTask, current, master);
+  state.storeMapping(mappingFromLink(link));
+  state.links[0].syncBaseline = structuredClone(link.syncBaseline);
   const task = { ...structuredClone(oldTask), due: { ...oldTask.due, string: "every 2 years" } };
   const tasks = new Map([[task.id, structuredClone(task)]]);
-  const clients = fakeClients(state, [current], tasks, undefined, [master]);
-  await new Synchronizer(state, undefined, async () => clients).process({
+  const fixtureInstances = [current];
+  const clients = fakeClients(state, fixtureInstances, tasks, undefined, [master]);
+  const calendar = clients.calendar;
+  calendar.listInstancesInWindow = async (masterId, start, end) => {
+    const masterEvent = clients.events.get(masterId);
+    const until = masterEvent?.recurrence?.[0]?.match(/(?:^|;)UNTIL=(\d{8})/)?.[1];
+    const cap = until && until.slice(0, 4) + "-" + until.slice(4, 6) + "-" + until.slice(6, 8);
+    const fromDate = start.slice(0, 10), toDate = end.slice(0, 10);
+    return fixtureInstances.filter((event) => event.recurringEventId === masterId
+      && (event.originalStartTime?.date || event.start?.date) >= fromDate
+      && (event.originalStartTime?.date || event.start?.date) <= toDate
+      && (!cap || (event.originalStartTime?.date || event.start?.date) <= cap)
+      && (event.originalStartTime?.date || event.start?.date) <= "2036-01-01")
+      .map((event) => structuredClone(event));
+  };
+  calendar.upsertEventIfUnchanged = async (payload, eventId, etag) => {
+    const existing = clients.events.get(eventId);
+    assert.equal(existing.etag, etag);
+    const updated = { ...structuredClone(payload), id: eventId, etag: '"annual-master-capped"' };
+    clients.events.set(eventId, updated);
+    for (let index = fixtureInstances.length - 1; index >= 0; index -= 1)
+      if (fixtureInstances[index].recurringEventId === eventId
+        && (fixtureInstances[index].originalStartTime?.date || fixtureInstances[index].start.date) > "2026-01-01")
+        fixtureInstances.splice(index, 1);
+    clients.calendarUpserts.push({ id: eventId, recurrence: structuredClone(updated.recurrence) });
+    return structuredClone(updated);
+  };
+  calendar.createFutureMasterOnce = async (event) => {
+    if (clients.events.has(event.id)) return clients.events.get(event.id);
+    const created = { ...structuredClone(event), status: "confirmed", etag: '"future-master-v1"' };
+    clients.events.set(event.id, created);
+    const date = event.start.date;
+    fixtureInstances.push({ id: "future-annual-2027", status: "confirmed", recurringEventId: event.id,
+      originalStartTime: { date }, start: { date }, end: { date: "2027-01-02" },
+      summary: event.summary, description: event.description, etag: '"future-instance-v1"' });
+    return structuredClone(created);
+  };
+  fixtureInstances.splice(0, fixtureInstances.length,
+    { ...instance("annual-2026", "2026-01-01", "2026-01-02"), summary: "Annual review",
+      start: { date: "2026-01-03" }, end: { date: "2026-01-04" } },
+    current,
+  );
+  clients.events.set(MASTER, structuredClone(master));
+  const sync = new Synchronizer(state, undefined, async () => clients);
+  const delivery = {
     id: "annual-cadence-edit", kind: "todoist", profile: PROFILE, mode: "aws",
     receivedAt: "2026-11-28T10:01:00Z", headers: {},
     body: JSON.stringify({ event_name: "item:updated", event_data: task,
       event_data_extra: { update_intent: "item_updated", old_item: oldTask } }),
-  });
-  assert.equal(clients.calendarUpserts.length, 0);
-  assert.deepEqual(clients.events.get(MASTER).recurrence, ["RRULE:FREQ=YEARLY"]);
-  const review = state.audits.find((item) => item.action === "calendar_owned_todoist_recurrence_requires_review");
-  assert.equal(review.detail.reason, "explicit_todoist_recurrence_change");
-  assert.equal(review.detail.taskUpdatedAt, task.updated_at);
-  assert.equal(review.detail.calendarEtag, master.etag);
+  };
+  await sync.process(delivery);
+  const oldAfter = clients.events.get(MASTER);
+  assert.equal(oldAfter.start.date, "2026-01-01");
+  assert.equal(oldAfter.extendedProperties.shared.syncHistoryOnly, "true");
+  assert.equal(oldAfter.extendedProperties.shared.syncHistoryCutoff, "2026-01-01");
+  assert.deepEqual(oldAfter.recurrence, ["RRULE:FREQ=YEARLY;UNTIL=20260101"]);
+  assert.ok(fixtureInstances.some((event) => event.id === "annual-2026" && event.start.date === "2026-01-03"),
+    "historical moved exception remains unchanged");
+  const newMaster = [...clients.events.values()].find((event) => event.id !== MASTER
+    && event.extendedProperties?.shared?.taskId === task.id);
+  assert.ok(newMaster);
+  assert.deepEqual(newMaster.recurrence, ["RRULE:FREQ=YEARLY;INTERVAL=2"]);
+  const mapping = state.mappingsByTask.get(task.id);
+  assert.equal(mapping.masterEventId, newMaster.id);
+  assert.equal(mapping.seriesId, newMaster.id);
+  assert.notEqual(mapping.seriesId, task.id, "Calendar ownership remains with the successor series");
+  assert.equal(mapping.activeInstanceId, "future-annual-2027");
+  assert.equal(mapping.originalStart, "2027-01-01");
+  assert.equal(mapping.activeEffectiveStart, "2027-01-01");
+  assert.deepEqual(state.links.map((item) => item.seriesId), [newMaster.id]);
+  assert.equal(providerSyncBaseline(task, fixtureInstances.at(-1), newMaster).calendar.recurrence,
+    mapping.syncBaseline.calendar.recurrence);
+  assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_future_recurrence_edit_applied");
+  const writesAfterApply = clients.calendarUpserts.length;
+  await sync.process(delivery);
+  assert.equal(clients.calendarUpserts.length, writesAfterApply, "replay must not cap history or create another successor");
+  assert.equal([...clients.events.values()].filter((event) => event.extendedProperties?.shared?.taskId === task.id).length, 1);
+  assert.equal(state.audits.at(-1).action, "calendar_owned_todoist_echo_ignored");
 });
 
 test("Calendar rename updates a native Todoist task without rewinding its automatically advanced due date", async (t) => {

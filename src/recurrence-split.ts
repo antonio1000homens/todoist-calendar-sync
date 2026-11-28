@@ -113,6 +113,7 @@ export function planFutureSeriesSplit(
   now = new Date(),
   timeZone = "UTC",
   expectedPreviousTaskId?: string,
+  expectedCalendarSeriesId?: string,
 ): FutureSeriesSplitPlan {
   if (old.status !== "confirmed" || !old.etag || !old.id || old.recurringEventId) {
     throw new Error("A live recurring master with a stable ETag is required");
@@ -125,6 +126,12 @@ export function planFutureSeriesSplit(
   const previousTaskMatches = expectedPreviousTaskId
     ? old.extendedProperties?.shared?.taskId === expectedPreviousTaskId
       && old.extendedProperties?.shared?.syncSeriesId !== expectedPreviousTaskId
+    : expectedCalendarSeriesId
+      ? (old.extendedProperties?.shared?.syncHistoryOnly === "true"
+        ? old.extendedProperties.shared.syncHistoryTaskId === task.id
+        : old.extendedProperties?.shared?.taskId === task.id
+          && old.extendedProperties?.shared?.syncSeriesId === expectedCalendarSeriesId)
+        && (old.iCalUID || old.id) === expectedCalendarSeriesId
     : old.extendedProperties?.shared?.taskId === task.id
       && (!old.extendedProperties?.shared?.syncSeriesId
         || old.extendedProperties.shared.syncSeriesId === task.id);
@@ -149,7 +156,9 @@ export function planFutureSeriesSplit(
   if (until && day(until) >= day(today)) {
     throw new Error("Calendar UNTIL is not yet expired; review the still-active series and its occurrences separately");
   }
-  const newRule = todoistRecurrenceToRrule(task);
+  const newRule = todoistRecurrenceToRrule(task, {
+    start: task.due.date, timeZone,
+  });
   if (!newRule || !newRule.startsWith("RRULE:FREQ=YEARLY")) {
     throw new Error("The Todoist future schedule must be a supported yearly recurrence");
   }
