@@ -59,7 +59,7 @@ function log(event, detail = {}) {
 }
 
 function safeFailure(error) {
-  if (typeof error?.message === "string" && error.message.startsWith("series_edit_invariants_failed:")) {
+  if (typeof error?.message === "string" && error.message.startsWith("series_edit_")) {
     return error.message;
   }
   if (error instanceof AcceptanceTimeoutError) {
@@ -643,18 +643,35 @@ async function runProfile(profile, { timeoutMs, cleanup, runTag }) {
       content: todoistSeriesTitle,
       description: calendarSeriesEdit.task.description || "",
     });
-    const todoistSeriesEdit = await poll(
-      `${profile} Todoist series metadata propagation`, timeoutMs,
-      async () => {
-        const [master, mapping] = await Promise.all([
-          calendar.getEvent(recurringEventId),
-          providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
-        ]);
-        return { master, mapping };
-      },
-      ({ master, mapping }) => master.summary === todoistSeriesTitle && master.recurrence?.length > 0
-        && mapping?.syncedTitle === todoistSeriesTitle,
-    );
+    let todoistSeriesPropagationState;
+    let todoistSeriesEdit;
+    try {
+      todoistSeriesEdit = await poll(
+        `${profile} Todoist series metadata propagation`, timeoutMs,
+        async () => {
+          const [master, mapping] = await Promise.all([
+            calendar.getEvent(recurringEventId),
+            providerMapping(todoist, config.todoistProjectId, recurringEventId, recurringTaskId),
+          ]);
+          return { master, mapping };
+        },
+        ({ master, mapping }) => {
+          todoistSeriesPropagationState = {
+            master_title: master.summary === todoistSeriesTitle,
+            master_recurrence: Boolean(master.recurrence?.length),
+            mapping_title: mapping?.syncedTitle === todoistSeriesTitle,
+          };
+          return todoistSeriesPropagationState.master_title && todoistSeriesPropagationState.master_recurrence
+            && todoistSeriesPropagationState.mapping_title;
+        },
+      );
+    } catch (error) {
+      if (error instanceof AcceptanceTimeoutError && todoistSeriesPropagationState) {
+        throw new Error(`series_edit_propagation_failed:${Object.entries(todoistSeriesPropagationState)
+          .map(([name, passed]) => `${name}=${passed}`).join(",")}`);
+      }
+      throw error;
+    }
     const preservedException = await calendar.getEvent(movedInstance.id);
     const seriesEditTask = await todoist.getTask(recurringTaskId);
     const failedSeriesEditInvariants = [
