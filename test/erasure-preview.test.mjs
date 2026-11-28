@@ -222,7 +222,7 @@ test("an active tombstone for another task that overlaps a known alias blocks de
     identityRefs:{taskIds:[taskId],eventIds:[eventId,otherEventId],seriesIds:[]},
     completedAt:"2026-11-08T12:00:00.000Z",expiresAt:1_800_000_000};
   const event={id:eventId,etag:"etag-alias-primary",extendedProperties:{shared:{taskId}}};
-  const createdAt="2026-11-10T12:00:00.000Z";
+  const createdAt=new Date().toISOString();
   const tombstone={id:"other-task-tombstone",content:serializeDeletionTombstoneComment({schemaVersion:1,
     profile:"home",projectId:"test-home-project",taskId:"other-task",eventIds:[otherEventId],createdAt,
     expiresAt:projectDeletionTombstoneExpiry(createdAt)}),project_id:"test-home-project"};

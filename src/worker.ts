@@ -382,6 +382,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
     // Separate delivery-wide diagnostics from an in-flight Calendar item.
     let calendarItemMutationObserved: boolean | undefined;
     let earlierCalendarMutationUnverified = false;
+    let earlierCalendarMutationObserved = false;
     let calendarMutationBlocked = false;
     let suppressCompletionReceipt = false;
     let calendarSyncGeneration: number | undefined;
@@ -665,6 +666,7 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       await withTodoistInventoryScope(() =>
         new OrphanRecoveringSynchronizer(state, scheduleOrphan, observedClientFactory, replayVerified => {
           if (calendarItemMutationObserved !== undefined) {
+            if (calendarItemMutationObserved) earlierCalendarMutationObserved = true;
             if (calendarItemMutationObserved && !replayVerified) earlierCalendarMutationUnverified = true;
             calendarItemMutationObserved = false;
           }
@@ -736,7 +738,8 @@ const handleDeliveries = async (event: Parameters<SQSHandler>[0], context: Conte
       // The actual Todoist request boundary persists credential-specific
       // cooldowns. Calendar Retry-After hints only affect FIFO visibility.
       const disposition = failedDeliveryDisposition(error, delivery, meaningfulMutation, receiveCount,
-        earlierCalendarMutationUnverified ? true : calendarItemMutationObserved);
+        earlierCalendarMutationUnverified ? true : calendarItemMutationObserved,
+        earlierCalendarMutationObserved);
       if (disposition.kind === "retry_fifo") {
         // SQS retains the same payload at the head of the original profile
         // group; no new message is enqueued and no completion receipt is

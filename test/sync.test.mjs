@@ -922,7 +922,7 @@ test("missing Todoist tasks are confirmed from live provider reads before stale 
     async listProjectComments() { return []; },
     async getTask() { const error = new Error("not found"); error.status = 404; throw error; },
   };
-  const sync = new Synchronizer(state, undefined, async () => ({ calendar: {}, todoist }));
+  const sync = new Synchronizer(state, undefined, async () => ({ calendar: { async findByTodoistTaskId() { return undefined; } }, todoist }));
   const erasedTask = { id: "erased-task-id", content: "Old item", due: { date: "2026-10-23" } };
   for (const eventName of ["item:updated", "item:completed", "item:deleted"]) {
     await sync.process({
@@ -1037,7 +1037,7 @@ test("Calendar deletion failure preserves project-comment correlation for retry"
   assert.deepEqual(effects, ["calendar-delete"], "keep the exact provider mapping until Calendar confirms deletion");
   assert.equal(commentExists, true);
   await sync.process(delivery);
-  assert.deepEqual(effects, ["calendar-delete", "calendar-delete", "comment-delete", "state-purge"],
+  assert.deepEqual(effects, ["calendar-delete", "calendar-delete", "state-purge", "comment-delete"],
     "the retry uses the same provider-native mapping and retires it after Calendar confirms absence");
   assert.equal(commentExists, false);
 });

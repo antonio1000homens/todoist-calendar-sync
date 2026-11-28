@@ -232,7 +232,7 @@ test("mapped -> Inbox deletes the old projection and does not create another", a
   assert.equal(state.tombstones.has(`home:${task.id}`), false);
 });
 
-test("verified same-profile deletion echo is a read-only no-op without cross-profile lookups",async()=>{
+test("same-profile deletion checks other profiles before treating it as an echo",async()=>{
   for(const [fixture,taskId] of [["standalone-1","deleted-home-1"],["standalone-2","deleted-home-2"],["recurring","deleted-home-series"]]) {
     const profilesRequested=[];const calls={comments:0,taskReads:0,calendarDeletes:0,audits:[],ownerReads:0};
     const state={
@@ -256,14 +256,15 @@ test("verified same-profile deletion echo is a read-only no-op without cross-pro
       receivedAt:"2026-11-28T08:41:00Z",headers:{},
       body:JSON.stringify({event_name:"item:deleted",event_data:{id:taskId,project_id:HOME,is_deleted:true},
         event_data_extra:{old_item:{project_id:HOME}}})});
-    assert.deepEqual(profilesRequested,["home"],"exact local deletion must not query other profile clients");
-    assert.equal(calls.comments,1);
-    assert.equal(calls.ownerReads,1,"uses one exact legacy-owner read");
-    assert.equal(calls.taskReads,1,"freshly confirms Todoist absence");
+    assert.ok(profilesRequested.includes("work"));
+    assert.ok(profilesRequested.includes("antonio"));
+    assert.equal(calls.comments,1,"same-project deletion reads only its own Todoist project mapping inventory");
+    assert.equal(calls.ownerReads,1,"the cross-profile task owner lookup is a point read");
+    assert.equal(calls.taskReads,1);
     assert.equal(calls.calendarDeletes,0);
-    assert.deepEqual(calls.audits,[{profile:"home",action:"todoist_deleted_echo_noop",detail:{
-      taskId,verifiedLocalRoute:true,meaningfulMutation:false,
-    }}]);
+    assert.equal(calls.audits.at(-1).action,"todoist_deleted_echo_noop");
+    assert.equal(calls.audits.at(-1).detail.verifiedNoCrossProfileCorrelation,true);
+    assert.equal(calls.audits.at(-1).detail.meaningfulMutation,false);
   }
 });
 
@@ -719,4 +720,76 @@ test("Phase B tagged orphan cannot be stripped when its mapping has vanished",as
     orphan:{taskId:task.id,eventId:"phase-b-orphan-master"}});
   assert.equal(state.tombstones.size,0);
   assert.equal(state.audits.at(-1).action,"todoist_phase_b_cross_profile_move_requires_review");
+});
+
+test("same-project deletion routes surviving cross-profile Calendar correlation to its owner", async () => {
+  const task = { id: "cross-profile-deleted", project_id: HOME, is_deleted: true };
+  const calendars = calendarSet();
+  calendars.work.events.set("work-correlated", { id: "work-correlated", status: "confirmed",
+    extendedProperties: { shared: { taskId: task.id } } });
+  const state = new FakeState();
+  const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
+  const routed = [];
+  sync.delegate.process = async item => { routed.push(item.profile); };
+  await sync.process({ ...delivery("cross-profile-deletion", task, task),
+    body: JSON.stringify({ event_name: "item:deleted", event_data: task, event_data_extra: { old_item: task } }) });
+  assert.deepEqual(routed, ["work"]);
+});
+
+test("same-project deletion routes retained completed projections to their owner", async () => {
+  const task = { id: "retained-deleted", project_id: HOME, is_deleted: true };
+  const calendars = calendarSet();
+  const state = new FakeState();
+  state.completedProjections.push({ profile: "work", taskId: task.id, eventId: "retained-event", completedAt: "2026-09-03T10:00:00Z" });
+  const sync = new ProjectAwareSynchronizer(state, undefined, fakeClients({ value: task }, calendars));
+  const routed = [];
+  sync.delegate.process = async item => { routed.push(item.profile); };
+  await sync.process({ ...delivery("retained-deletion", task, task),
+    body: JSON.stringify({ event_name: "item:deleted", event_data: task, event_data_extra: { old_item: task } }) });
+  assert.deepEqual(routed, ["work"]);
+});
+
+test("same-project deletion removes recent retained history through the real delegate", async () => {
+  for (const owner of ["home", "work"]) {
+    const task = { id: `retained-real-${owner}`, project_id: HOME, is_deleted: true };
+    const calendars = calendarSet();
+    const state = new FakeState();
+    state.completedProjections.push(
+      { profile: owner, taskId: task.id, eventId: "retained-event", completedAt: "2026-09-03T10:00:00Z" },
+      { profile: owner, taskId: "unrelated", eventId: "unrelated-event", completedAt: "2026-09-03T10:00:00Z" },
+    );
+    state.listCompletedCalendarProjectionsByTask = async (profile, taskId) => state.completedProjections.filter(item => item.profile === profile && item.taskId === taskId);
+    state.deleteCompletedCalendarProjection = async projection => { state.completedProjections = state.completedProjections.filter(item => item !== projection); };
+    const base = fakeClients({ value: task }, calendars, {});
+    const factory = async profile => {
+      const clients = await base(profile);
+      clients.todoist.getTask = async () => { throw Object.assign(new Error("gone"), { status: 404 }); };
+      return clients;
+    };
+    const sync = new ProjectAwareSynchronizer(state, undefined, factory);
+    await sync.process({ ...delivery(`retained-real-${owner}`, task, task),
+      body: JSON.stringify({ event_name: "item:deleted", event_data: task, event_data_extra: { old_item: task } }) });
+    assert.deepEqual(calendars[owner].deleted, ["retained-event"]);
+    assert.deepEqual(state.completedProjections.map(item => item.eventId), ["unrelated-event"]);
+  }
+});
+
+test("native-only cross-profile deletion reaches the real owner and leaves other calendars alone", async () => {
+  const task = { id: "native-only-real", project_id: HOME, is_deleted: true };
+  const calendars = calendarSet();
+  calendars.work.events.set("work-event", { id: "work-event", status: "confirmed", extendedProperties: { shared: { taskId: task.id } } });
+  calendars.home.events.set("unrelated-event", { id: "unrelated-event", status: "confirmed", extendedProperties: { shared: { taskId: "other" } } });
+  const state = new FakeState();
+  const base = fakeClients({ value: task }, calendars, {});
+  const factory = async profile => {
+    const clients = await base(profile);
+    clients.todoist.getTask = async () => { throw Object.assign(new Error("gone"), { status: 404 }); };
+    return clients;
+  };
+  const sync = new ProjectAwareSynchronizer(state, undefined, factory);
+  await sync.process({ ...delivery("native-only-real", task, task),
+    body: JSON.stringify({ event_name: "item:deleted", event_data: task, event_data_extra: { old_item: task } }) });
+  assert.deepEqual(calendars.work.deleted, ["work-event"], JSON.stringify(state.audits));
+  assert.deepEqual(calendars.home.deleted, []);
+  assert.ok(calendars.home.events.has("unrelated-event"));
 });

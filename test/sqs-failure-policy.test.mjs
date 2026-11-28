@@ -14,6 +14,7 @@ import { OrphanRecoveringSynchronizer } from "../dist/orphan-recovery.js";
 import { syncMessageGroupId } from "../dist/types.js";
 import { createObservedProviderClientFactory } from "../dist/mutation-budget.js";
 import { SafeProviderReplayError } from "../dist/safe-provider-replay.js";
+import { SafeCalendarDeletionReplayError } from "../dist/safe-provider-replay.js";
 
 function namedError(name, fields = {}) {
   const e = new Error(name);
@@ -113,6 +114,18 @@ test("only explicitly deterministic provider replays may retry after a write", (
   assert.equal(failedDeliveryDisposition(replay, {kind:"reconcile"}, true, 1).reason,
     "unverified_delivery_type");
   assert.equal(failedDeliveryDisposition({cause:replay}, {kind:"todoist"}, true, 1).kind, "retry_fifo");
+});
+
+test("verified Calendar master deletion cleanup retries after writes only without earlier delta mutations",()=>{
+  const replay=new SafeCalendarDeletionReplayError("exact cancelled master cleanup can resume");
+  assert.deepEqual(failedDeliveryDisposition(replay,{kind:"calendar"},true,1,true,false),{
+    kind:"retry_fifo",reason:"transient_provider",receiveCount:1,
+  });
+  assert.equal(failedDeliveryDisposition(replay,{kind:"calendar"},true,1,true,true).reason,"partial_provider_mutation");
+  assert.equal(failedDeliveryDisposition(replay,{kind:"todoist"},true,1).reason,"non_transient");
+  assert.equal(failedDeliveryDisposition(replay,{kind:"calendar"},true,MAX_SYNC_RECEIVES,true,false).reason,"retries_exhausted");
+  const throttled=new SafeCalendarDeletionReplayError("exact cleanup transaction throttled",{cause:throttle()});
+  assert.equal(failedDeliveryDisposition(throttled,{kind:"calendar"},true,1,true,false).kind,"retry_fifo");
 });
 
 test("the earliest provider write boundary prevents retry of a later DynamoDB mapping throttle", async () => {

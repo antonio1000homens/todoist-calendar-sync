@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { SQSRecord } from "aws-lambda";
 import type { Delivery, DeliveryKind, Profile } from "./types.js";
 import { syncMessageGroupId } from "./types.js";
-import { isSafeProviderReplay } from "./safe-provider-replay.js";
+import { isSafeCalendarDeletionReplay, isSafeProviderReplay } from "./safe-provider-replay.js";
 
 /**
  * The source FIFO queue is the retry buffer. Never enqueue a replacement
@@ -110,9 +110,12 @@ export function failedDeliveryDisposition(
   providerMutationObserved: boolean,
   receiveCount: number,
   calendarItemMutationObserved?: boolean,
+  earlierCalendarMutationObserved = false,
 ): FailedDeliveryDisposition {
   const attempts = Number.isInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1;
   const safeReplay = isSafeProviderReplay(error);
+  const calendarDeletionReplayMarker = delivery?.kind === "calendar" && isSafeCalendarDeletionReplay(error);
+  const safeCalendarDeletionReplay = calendarDeletionReplayMarker && !earlierCalendarMutationObserved;
   let accountCooldown = false;
   let calendarTaskChanged = false;
   const seen = new Set<object>();
@@ -126,7 +129,8 @@ export function failedDeliveryDisposition(
   }
   const transientDynamoDb = isTransientDynamoDbFailure(error);
   const calendarChange = delivery?.kind === "calendar" && calendarTaskChanged;
-  const transientProvider = !transientDynamoDb && (accountCooldown || calendarChange || safeReplay || isTransientProviderFailure(error));
+  const transientProvider = !transientDynamoDb && (accountCooldown || calendarChange || safeReplay
+    || calendarDeletionReplayMarker || isTransientProviderFailure(error));
   if (!transientDynamoDb && !transientProvider) return { kind:"quarantine", reason:"non_transient", receiveCount:attempts };
   // A provider write may already have happened. The DynamoDB state write may
   // have failed after it, so automated replay could duplicate provider writes.
@@ -136,12 +140,13 @@ export function failedDeliveryDisposition(
   // other delivery/error types retain the conservative partial-write guard.
   const resumableCalendarBoundary = delivery?.kind === "calendar"
     && calendarItemMutationObserved === false && (accountCooldown || calendarChange);
-  if (providerMutationObserved && !safeReplay && !resumableCalendarBoundary)
+  if (providerMutationObserved && !safeReplay && !safeCalendarDeletionReplay && !resumableCalendarBoundary)
     return { kind:"quarantine", reason:"partial_provider_mutation", receiveCount:attempts };
   // Retry only deliveries whose state is safe to re-read. Reconciliation chunks
   // are idempotent when no provider write has been attempted; repair and
   // erasure-sensitive operations remain quarantined.
   const retryableKinds: DeliveryKind[] = accountCooldown ? ["calendar", "todoist", "orphan", "reconcile", "manual", "repair"]
+    : safeCalendarDeletionReplay ? ["calendar"]
     : safeReplay ? ["todoist"]
     : transientProvider ? ["calendar", "todoist", "reconcile"] : ["calendar", "todoist"];
   if (!delivery || !retryableKinds.includes(delivery.kind)) {
